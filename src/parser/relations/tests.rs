@@ -1449,7 +1449,11 @@ fn make() -> WidgetConfig { WidgetConfig {} }
     let rels = extract_relations(src, "rust").unwrap();
     let ref_count = rels.iter().filter(|r|
         r.relation == REL_REFERENCES && r.target_name == "WidgetConfig").count();
-    assert!(ref_count >= 1, "expected a references edge to the type WidgetConfig; got: {:?}",
+    // Exactly 2: the field type + the return type. The `WidgetConfig {}`
+    // struct-expr name is skipped (already a `calls` edge), and the struct's
+    // own `name` (AppConfig) is not WidgetConfig.
+    assert_eq!(ref_count, 2,
+        "expected exactly 2 references edges to WidgetConfig (field type + return type); got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
 
@@ -1459,5 +1463,44 @@ fn test_rust_type_definition_name_does_not_self_reference() {
     let rels = extract_relations(src, "rust").unwrap();
     assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Foo"),
         "a struct's own name must not be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_rust_inherent_impl_header_does_not_emit_references_edge() {
+    // `impl Widget` — the impl-header type name is already covered by the impl
+    // machinery; a references edge would defeat dead-code detection (Widget
+    // would always look used).
+    let src = r#"impl Widget { fn f() {} }"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
+        "an inherent impl header type must not be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_rust_trait_impl_header_does_not_emit_references_edge() {
+    // `impl MyTrait for Widget` — neither the trait name nor the type name
+    // should yield a references edge (both are IMPLEMENTS-edge territory).
+    let src = r#"impl MyTrait for Widget {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
+            && (r.target_name == "Widget" || r.target_name == "MyTrait")),
+        "a trait impl header (type or trait) must not be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_rust_return_type_still_emits_references_edge_alongside_impl() {
+    // Guard against the impl-header skip over-reaching: a real type usage in a
+    // return position must still emit a references edge even when the same type
+    // also appears in an impl header.
+    let src = r#"
+impl Widget { fn f() {} }
+fn make() -> Widget { todo!() }
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
+        "a return-type usage of Widget must still emit a references edge; got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }

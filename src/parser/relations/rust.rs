@@ -1,6 +1,9 @@
 //! Rust-specific extraction: `use` declarations (simple/grouped/nested/aliased)
 //! and `impl Trait for Type` blocks (emits both type-level and method-level
 //! IMPLEMENTS edges so the dead-code pass sees incoming edges on trait methods).
+//! Also extracts REFERENCES edges for edgeless usages: path-qualified value
+//! paths (`crate::domain::FOO`) and type-position usages (`field: MyType`,
+//! `-> MyType`, `Vec<MyType>`).
 
 use super::ParsedRelation;
 use super::super::node_text;
@@ -163,10 +166,19 @@ pub(super) fn extract_rust_path_reference(
 }
 
 /// Emit a `references` edge for a `type_identifier` used in type position
-/// (field type, return type, generic arg). Skips the type's own definition name
-/// (the `name` field of struct/enum/type/trait/union items) so a type does not
-/// reference itself, the `name` of a `struct_expression` (already a `calls`
-/// edge — avoids a double edge), and `Self`.
+/// (field type, return type, generic arg). Skips these non-usage / already-edged
+/// cases so the references edge stays a pure "edgeless usage" signal:
+/// - the type's own definition name (the `name` field of
+///   struct/enum/type/trait/union items) — declaration, not a usage;
+/// - the `name` of a bare `struct_expression` (`Foo { .. }`) — already a `calls`
+///   edge, avoids a double edge;
+/// - the inner `type_identifier` of a `scoped_type_identifier` that is a
+///   `struct_expression` name (`mod::Foo { .. }`) — same `calls` double-edge;
+/// - the `type` / `trait` field of an `impl_item` (`impl Foo` /
+///   `impl Trait for Foo`) — already an IMPLEMENTS edge, and a references edge
+///   there would defeat dead-code detection (direct-parent `impl_item` only;
+///   generic / path-qualified impl headers are a documented residual);
+/// - `Self`.
 pub(super) fn extract_rust_type_reference(
     node: &tree_sitter::Node,
     source: &str,
@@ -176,6 +188,21 @@ pub(super) fn extract_rust_type_reference(
         // The `name` field of a definition is the declaration, not a usage.
         if matches!(parent.kind(), "struct_item" | "enum_item" | "type_item" | "trait_item" | "union_item")
             && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())
+        {
+            return None;
+        }
+        // Impl-header type/trait names (`impl Widget` / `impl Trait for Widget`).
+        // The impl relationship is already an IMPLEMENTS edge (see
+        // extract_rust_impl_trait); a references edge here is redundant noise
+        // AND defeats dead-code detection — every impl'd type would get an
+        // incoming reference and could never be flagged dead. Only the
+        // direct-parent `impl_item` case is covered: generic (`impl Container<T>`,
+        // type field = generic_type) and path-qualified (`impl mod::Trait for
+        // mod::Type`, fields = scoped_type_identifier) impl headers put the
+        // type_identifier one level deeper and are a documented residual.
+        if parent.kind() == "impl_item"
+            && (parent.child_by_field_name("type").map(|n| n.id()) == Some(node.id())
+                || parent.child_by_field_name("trait").map(|n| n.id()) == Some(node.id()))
         {
             return None;
         }
