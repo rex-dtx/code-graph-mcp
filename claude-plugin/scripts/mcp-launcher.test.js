@@ -33,12 +33,12 @@ function hasBuiltBinary() {
  * Run the launcher, send one MCP message on stdin, collect stdout/stderr,
  * resolve once we either see a JSON-RPC response on stdout or hit timeout.
  */
-function runLauncherInitialize(timeoutMs = 15000, extraEnv = {}) {
+function runLauncherInitialize(timeoutMs = 15000, extraEnv = {}, cwd = REPO_ROOT) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [LAUNCHER], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ...extraEnv },
-      cwd: REPO_ROOT,
+      cwd,
     });
 
     let stdout = '';
@@ -113,6 +113,30 @@ test('mcp-launcher enters dedup stub when project .mcp.json registers a code-gra
     `serverInfo.name should indicate stub mode, got ${JSON.stringify(resp.result.serverInfo)}`);
   assert.match(stderr, /plugin MCP serving 0 tools/,
     `stderr should explain the dedup, got: ${stderr.slice(0, 400)}`);
+});
+
+test('mcp-launcher serves 0-tool stub in a non-project cwd (no binary spawn, no index created)', async (t) => {
+  const os = require('os');
+  // A bare temp dir with no .git/manifest → isNonProjectCwd → the launcher
+  // serves the 0-tool stub WITHOUT spawning the binary, so no .code-graph is
+  // created and no `instructions` block is injected. This is the fix for the
+  // ~2035 headless /tmp mem-lite calls that half-activated code-graph.
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-launcher-nonproj-'));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  const { stdout, stderr } = await runLauncherInitialize(15000, {}, cwd);
+  const respLine = stdout.trim().split('\n').find((l) => l.includes('"result"'));
+  assert.ok(respLine,
+    `expected stub JSON-RPC result on stdout, got: ${stdout.slice(0, 400)} | stderr: ${stderr.slice(0, 400)}`);
+  const resp = JSON.parse(respLine);
+  assert.match(resp.result.serverInfo.name, /stub/i,
+    `serverInfo.name should indicate stub mode, got ${JSON.stringify(resp.result.serverInfo)}`);
+  assert.equal(resp.result.instructions, undefined,
+    'stub initialize must NOT carry an instructions block (the ~780B NOISY tax)');
+  assert.match(stderr, /non-project cwd/,
+    `stderr should explain the non-project gate, got: ${stderr.slice(0, 400)}`);
+  assert.ok(!fs.existsSync(path.join(cwd, '.code-graph')),
+    'must NOT create .code-graph in a non-project cwd');
 });
 
 test('mcp-launcher sets _FIND_BINARY_ROOT from __dirname (does not trust CLAUDE_PLUGIN_ROOT)', () => {

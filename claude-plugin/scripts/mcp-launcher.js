@@ -10,6 +10,7 @@
 const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { isNonProjectCwd } = require('./project-detect');
 
 // Set plugin root so find-binary.js can locate bundled/dev binaries
 // Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
@@ -86,6 +87,22 @@ if (process.env.CODE_GRAPH_FORCE_PLUGIN_MCP !== '1' && projectHasLocalCodeGraphM
   );
   serveEmptyMcpStub();
   return; // top-level function scope of mcp-launcher.js
+}
+
+// --- Non-project cwd gate ---------------------------------------------------
+// In a non-project working directory (no .git/manifest — e.g. /tmp, where
+// claude-mem-lite spawns ~2035 headless `claude -p` JSON-extraction calls that
+// never use code-graph), don't spawn the binary at all: serve the same 0-tool
+// stub. Eliminates the MCP-server spin-up + the ~780B `instructions` block +
+// an empty .code-graph/index.db being created in throwaway dirs. Same
+// CODE_GRAPH_FORCE_PLUGIN_MCP=1 override as the dedup gate above.
+if (process.env.CODE_GRAPH_FORCE_PLUGIN_MCP !== '1' && isNonProjectCwd(process.cwd())) {
+  process.stderr.write(
+    '[code-graph] non-project cwd (no .git/manifest); plugin MCP serving 0 tools, ' +
+    'no index created. Set CODE_GRAPH_FORCE_PLUGIN_MCP=1 to override.\n'
+  );
+  serveEmptyMcpStub();
+  return;
 }
 
 const { findBinary, clearCache } = require('./find-binary');

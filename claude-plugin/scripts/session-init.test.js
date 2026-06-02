@@ -72,10 +72,31 @@ test('launchBackgroundAutoUpdate spawns detached silent updater', () => {
   assert.equal(calls[0].unrefCalled, true);
 });
 
-const { consistencyCheck } = require('./session-init');
+const { consistencyCheck, runSessionInit } = require('./session-init');
 
 test('consistencyCheck is exported as a function', () => {
   assert.equal(typeof consistencyCheck, 'function');
+});
+
+test('runSessionInit no-ops (nonProject) in a non-project cwd', (t) => {
+  // /tmp-style cwd (no .git/manifest) → the gate returns BEFORE
+  // syncLifecycleConfig / verifyBinary / ensureIndexFresh / maybeAutoAdopt /
+  // injectProjectMap, leaving zero footprint. Safe to call: the early return
+  // precedes every side-effectful step.
+  const os = require('os');
+  const origCwd = process.cwd();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-nonproj-'));
+  process.chdir(tmp);
+  try {
+    const res = runSessionInit();
+    if (res.inactive) { t.skip('plugin seen inactive in this env — gate not reached'); return; }
+    assert.equal(res.nonProject, true);
+    assert.equal(res.lifecycle, 'noop');
+    assert.equal(res.autoUpdateLaunched, false);
+  } finally {
+    process.chdir(origCwd);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test('consistencyCheck returns empty array when binary version matches plugin', () => {

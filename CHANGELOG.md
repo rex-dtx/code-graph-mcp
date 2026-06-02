@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.33.0 — plugin no-ops in non-project directories
+
+**Behavior change (opt-out available).** The plugin now fully no-ops in working
+directories that are not a project — i.e. that carry none of the recognized
+project markers (`.git`, `package.json`, `Cargo.toml`, `pyproject.toml`,
+`go.mod`, `pom.xml`, `build.gradle`). In such a cwd the MCP launcher serves a
+0-tool stub instead of spawning the binary, and the SessionStart hook +
+auto-adopt short-circuit.
+
+Why: a cross-project audit found code-graph half-activating on the ~2035
+headless `claude -p` calls claude-mem-lite spawns with `cwd=/tmp` ("Return ONLY
+valid JSON") — none of which ever use code-graph. Each one paid an MCP-server
+spin-up, a ~780-byte `instructions` block injected into a JSON-only task, a
+SessionStart map probe, and an empty `/tmp/.code-graph/index.db`, plus an
+adopted decision-table sentinel in `~/.claude/projects/-tmp/memory/MEMORY.md`.
+Net waste, zero usage. A real git repo cloned under `/tmp` still activates —
+detection is marker-based, not a literal path check.
+
+### Migration / opt-out
+
+- No action needed for normal use; real projects (with a project marker)
+  activate exactly as before.
+- To force the full plugin MCP in a marker-less cwd, set
+  `CODE_GRAPH_FORCE_PLUGIN_MCP=1` (the same override that bypasses the
+  tool-catalog dedup gate).
+- `.code-graph` is no longer treated as a project marker for activation — a
+  directory whose only marker is a previously-created `.code-graph` is now
+  considered non-project (prevents a polluted `/tmp` from self-certifying).
+
+### Changed
+
+- New `claude-plugin/scripts/project-detect.js` centralizes project detection
+  (`isProjectRoot` / `isNonProjectCwd`, marker set sans `.code-graph`); the MCP
+  launcher, the SessionStart hook, and `adopt()` all gate on it.
+- `adopt()` now refuses a non-project cwd **even when the memory dir already
+  exists** — the prior guard sat inside `if (!fs.existsSync(dir))` and was
+  bypassed because Claude Code pre-creates `~/.claude/projects/<slug>/memory`
+  for every session (including the headless `/tmp` calls).
+
 ## v0.32.3 — CLI path normalization + enum-arg early validation
 
 Three-fix patch bundling end-to-end dogfood findings. Two of the three

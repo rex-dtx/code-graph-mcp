@@ -10,6 +10,7 @@ const {
 } = require('./lifecycle');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const { maybeAutoAdopt, isAdopted } = require('./adopt');
+const { isNonProjectCwd } = require('./project-detect');
 
 // v0.17.0 — quietHooks: unconditional quiet 默认。
 // 项目地图与 MEMORY.md plugin contract + on-demand `project_map` 工具高度重叠，
@@ -266,6 +267,16 @@ function runSessionInit() {
   if (isPluginInactive()) {
     cleanupDisabledStatusline();
     return { inactive: true, lifecycle: 'noop', autoUpdateLaunched: false };
+  }
+
+  // Non-project cwd (no .git/manifest — e.g. /tmp, where claude-mem-lite
+  // spawns headless `claude -p` calls that never use code-graph): fully no-op.
+  // Returns BEFORE syncLifecycleConfig / verifyBinary / ensureIndexFresh /
+  // maybeAutoAdopt / injectProjectMap so the plugin leaves zero footprint
+  // (no incremental-index spawn, no map injection, no adoption). The MCP
+  // launcher applies the same gate — see project-detect.js.
+  if (isNonProjectCwd(process.cwd())) {
+    return { inactive: false, nonProject: true, lifecycle: 'noop', autoUpdateLaunched: false };
   }
 
   const conflict = checkScopeConflict();

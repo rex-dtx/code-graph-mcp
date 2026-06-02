@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { PROJECT_MARKERS, isProjectRoot, isNonProjectCwd } = require('./project-detect');
 
 const SENTINEL_BEGIN = '<!-- code-graph-mcp:begin v1 -->';
 const SENTINEL_END = '<!-- code-graph-mcp:end -->';
@@ -314,32 +315,26 @@ function platformGuard() {
   return null;
 }
 
-// Project-marker check: cwd looks like a real project (not /tmp / $HOME).
-// Used to gate auto-mkdir of the auto-memory dir so adopt doesn't pollute
-// random directories. Mirrors the markers Claude Code itself recognizes.
-const PROJECT_MARKERS = [
-  '.git', '.code-graph', 'package.json', 'Cargo.toml',
-  'pyproject.toml', 'go.mod', 'pom.xml', 'build.gradle',
-];
-function isProjectRoot(cwd) {
-  return PROJECT_MARKERS.some(m => fs.existsSync(path.join(cwd, m)));
-}
+// Project-marker detection (PROJECT_MARKERS / isProjectRoot / isNonProjectCwd)
+// now lives in project-detect.js — the single activation gate shared with
+// mcp-launcher.js and session-init.js. Imported above and re-exported below.
 
 function adopt({ cwd, home, templatePath } = {}) {
   const blocked = platformGuard();
   if (blocked) return blocked;
 
   const effectiveCwd = cwd || process.cwd();
-  const dir = memoryDir(cwd, home);
-  if (!fs.existsSync(dir)) {
-    // Auto-create only when cwd has a project marker. Without markers the
-    // user is likely in /tmp or $HOME, where adopt would litter
-    // ~/.claude/projects/ with bogus slugs.
-    if (!isProjectRoot(effectiveCwd)) {
-      return { ok: false, reason: 'not-a-project', dir, cwd: effectiveCwd };
-    }
-    fs.mkdirSync(dir, { recursive: true });
+  // Gate adoption on a real-project cwd BEFORE touching the filesystem. The
+  // check must run even when the memory dir already exists: Claude Code
+  // pre-creates ~/.claude/projects/<slug>/memory for every session (including
+  // the ~2035 headless /tmp mem-lite calls), and the old guard — nested inside
+  // `if (!fs.existsSync(dir))` — was bypassed in exactly that case, letting
+  // /tmp get adopted (sentinel written into its MEMORY.md). See project-detect.js.
+  if (isNonProjectCwd(effectiveCwd)) {
+    return { ok: false, reason: 'not-a-project', dir: memoryDir(cwd, home), cwd: effectiveCwd };
   }
+  const dir = memoryDir(cwd, home);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const target = path.join(dir, TARGET_NAME);
   const tpl = templatePath || TEMPLATE_PATH;
   if (!fs.existsSync(tpl)) {
@@ -549,5 +544,5 @@ module.exports = {
   detectProjectType, buildIndexLine,
   extractCargoRuntimeDeps, extractPyRuntimeDeps, extractGoDirectRequires,
   SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH, TARGET_NAME,
-  PROJECT_MARKERS, PROJECT_TYPES,
+  PROJECT_MARKERS, PROJECT_TYPES, isNonProjectCwd,
 };

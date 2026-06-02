@@ -15,6 +15,10 @@ const {
 function makeSandbox() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-home-'));
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-cwd-'));
+  // Mark the sandbox cwd as a real project — adopt() now gates on a project
+  // marker unconditionally (see project-detect.js), so a bare mkdtemp would be
+  // treated as a non-project and refused.
+  fs.mkdirSync(path.join(cwd, '.git'));
   // Pre-create the memory dir (claude-mem convention — we don't create it).
   const dir = memoryDir(cwd, home);
   fs.mkdirSync(dir, { recursive: true });
@@ -84,6 +88,31 @@ test('adopt preserves existing MEMORY.md content and appends', () => {
     assert.ok(index.includes('existing entry'), 'preserves prior entries');
     assert.ok(index.includes(SENTINEL_BEGIN), 'appends sentinel');
   } finally { sb.cleanup(); }
+});
+
+test('adopt refuses a non-project cwd even when the memory dir already exists (regression: /tmp adoption)', () => {
+  // Bug: the isProjectRoot guard was nested inside `if (!fs.existsSync(dir))`,
+  // so when Claude Code had already created ~/.claude/projects/<slug>/memory
+  // (it does this for every session, incl. the ~2035 headless /tmp mem-lite
+  // calls), adopt() sailed past the guard and wrote its sentinel into /tmp's
+  // MEMORY.md. Pre-fix this test FAILS (adopt returns ok:true and writes).
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-home-'));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-cwd-')); // no project marker
+  const dir = memoryDir(cwd, home);
+  fs.mkdirSync(dir, { recursive: true }); // simulate CC pre-creating the memory dir
+  try {
+    const res = adopt({ cwd, home });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, 'not-a-project');
+    const indexPath = path.join(dir, 'MEMORY.md');
+    assert.ok(
+      !fs.existsSync(indexPath) || !fs.readFileSync(indexPath, 'utf8').includes(SENTINEL_BEGIN),
+      'must NOT write the code-graph sentinel into a non-project MEMORY.md'
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test('adopt fails gracefully when cwd is not a project root', () => {
