@@ -254,6 +254,26 @@ fn run_serve() -> Result<()> {
         .with_writer(io::stderr)
         .init();
 
+    // P0.1 — non-project cwd guard (Rust counterpart to mcp-launcher.js's
+    // isNonProjectCwd gate). When the binary is invoked directly — bypassing the
+    // JS launcher, e.g. a dev `.mcp.json` or a global MCP config pointing at the
+    // binary — in a dir with no project marker, serve a 0-tool stub: no database,
+    // no embedding model, no `.code-graph/`, no NOISY instructions. Otherwise the
+    // plugin half-activates in throwaway dirs (the ~2035 headless /tmp `claude -p`
+    // calls). CODE_GRAPH_FORCE_PLUGIN_MCP=1 overrides, same as the launcher.
+    let force_plugin = std::env::var("CODE_GRAPH_FORCE_PLUGIN_MCP").ok().as_deref() == Some("1");
+    let cwd = std::env::current_dir()?;
+    if !force_plugin && code_graph_mcp::cli::is_non_project_cwd(&cwd) {
+        eprintln!(
+            "[code-graph] non-project cwd (no .git/manifest); serving 0 tools, \
+             no index created. Set CODE_GRAPH_FORCE_PLUGIN_MCP=1 to override."
+        );
+        let stdin = io::stdin();
+        let stdout = io::stdout();
+        code_graph_mcp::cli::serve_non_project_stub(stdin.lock(), stdout.lock())?;
+        return Ok(());
+    }
+
     let project_root = code_graph_mcp::cli::resolve_project_root()?;
     let server = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root)?;
     let session_start = std::time::Instant::now();

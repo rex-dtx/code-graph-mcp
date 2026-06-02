@@ -13,6 +13,15 @@ fn binary_path() -> String {
 /// Spawn the MCP server process with stdin/stdout piped.
 /// `cwd` sets the working directory (the server indexes from cwd).
 fn spawn_server(cwd: &std::path::Path) -> std::process::Child {
+    // v0.34.0: `run_serve` serves a 0-tool stub in a non-project cwd (one with
+    // no project marker). These tests exercise the *full* stdio server, so drop
+    // a minimal project marker into the bare TempDir — the same condition a real
+    // project satisfies — instead of relying on the deprecated "full server
+    // anywhere" behavior.
+    let _ = std::fs::write(
+        cwd.join("Cargo.toml"),
+        "[package]\nname = \"e2e-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    );
     Command::new(binary_path())
         .current_dir(cwd)
         .stdin(Stdio::piped())

@@ -89,6 +89,7 @@ struct McpClient {
     child: Child,
     next_id: i64,
     reader: BufReader<std::process::ChildStdout>,
+    init_response: Value,
 }
 
 impl McpClient {
@@ -103,7 +104,7 @@ impl McpClient {
             .expect("spawn mcp server");
         let stdout = child.stdout.take().expect("stdout piped");
         let reader = BufReader::new(stdout);
-        let mut client = Self { child, next_id: 1, reader };
+        let mut client = Self { child, next_id: 1, reader, init_response: Value::Null };
 
         // Initialize handshake — required before tools/list or tools/call
         let init = client.request("initialize", json!({
@@ -116,6 +117,7 @@ impl McpClient {
             "initialize failed: {:?}",
             init
         );
+        client.init_response = init;
         client
     }
 
@@ -183,6 +185,101 @@ fn extract_tool_payload(resp: &Value) -> Value {
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// P0.1: `run_serve` must serve a 0-tool stub in a non-project cwd (no
+/// .git/manifest), mirroring the JS launcher gate (mcp-launcher.js). It must
+/// NOT create `.code-graph/` in the throwaway dir. Closes the parallel path
+/// the v0.33.0 launcher gate left open for direct-binary invocations.
+#[test]
+fn mcp_non_project_cwd_serves_zero_tool_stub() {
+    let bare = TempDir::new().unwrap(); // no Cargo.toml / .git / package.json
+    let mut client = McpClient::spawn(bare.path());
+
+    // initialize response must identify the non-project stub
+    let name = client.init_response["result"]["serverInfo"]["name"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        name.contains("stub"),
+        "expected non-project stub serverInfo, got: {}",
+        client.init_response
+    );
+
+    // tools/list must be empty
+    let resp = client.request("tools/list", json!({}), Duration::from_secs(10));
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools not an array: {}", resp));
+    assert!(
+        tools.is_empty(),
+        "non-project stub must serve 0 tools, got {}",
+        tools.len()
+    );
+
+    // unknown method → -32601 stub error
+    let err = client.request("tools/call", json!({"name": "get_call_graph"}), Duration::from_secs(10));
+    assert_eq!(
+        err["error"]["code"].as_i64(),
+        Some(-32601),
+        "stub must reject tool calls: {}",
+        err
+    );
+
+    // and no index must have been created in the throwaway dir
+    assert!(
+        !bare.path().join(".code-graph").exists(),
+        "stub must not create .code-graph/ in a non-project cwd"
+    );
+}
+
+/// Positive control: CODE_GRAPH_FORCE_PLUGIN_MCP=1 overrides the gate, so even
+/// a bare dir gets the full server (non-empty tool catalog).
+#[test]
+fn mcp_force_plugin_mcp_overrides_non_project_gate() {
+    let bare = TempDir::new().unwrap();
+    let mut child = Command::new(binary_path())
+        .arg("serve")
+        .current_dir(bare.path())
+        .env("CODE_GRAPH_FORCE_PLUGIN_MCP", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp server");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let stdin = child.stdin.as_mut().expect("stdin piped");
+
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#).unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#).unwrap();
+    stdin.flush().unwrap();
+
+    let start = Instant::now();
+    let mut tools_len = None;
+    while start.elapsed() < Duration::from_secs(20) {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if v.get("id").and_then(|i| i.as_i64()) == Some(2) {
+                tools_len = v["result"]["tools"].as_array().map(|a| a.len());
+                break;
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        tools_len.unwrap_or(0) > 0,
+        "FORCE_PLUGIN_MCP=1 must serve the full tool catalog even in a bare dir, got {:?}",
+        tools_len
+    );
+}
 
 /// R1 fix: get_ast_node called_by must put prod callers first when test-heavy.
 /// Without the sort, post-truncation `called_by` would be all-test (the bug).

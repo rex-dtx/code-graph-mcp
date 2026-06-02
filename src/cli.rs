@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,6 +31,92 @@ pub fn resolve_project_root_from(cwd: &Path) -> PathBuf {
 /// Resolve the project root from the current working directory.
 pub fn resolve_project_root() -> std::io::Result<PathBuf> {
     Ok(resolve_project_root_from(&std::env::current_dir()?))
+}
+
+/// Project-root markers — the literal set the JS activation gate uses
+/// (`claude-plugin/scripts/project-detect.js` `PROJECT_MARKERS`). Both layers
+/// must agree on "what is a real project"; kept in sync by hand.
+pub const PROJECT_MARKERS: &[&str] = &[
+    ".git",
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+];
+
+/// True when `cwd` carries none of the recognized project markers — e.g. `/tmp`
+/// or Claude Code's `$TMPDIR`, where claude-mem-lite spawns headless `claude -p`
+/// calls that never use code-graph. The MCP launcher gates the same way
+/// (`mcp-launcher.js` → `isNonProjectCwd`); this is the Rust counterpart so the
+/// binary self-protects even when invoked directly (bypassing the launcher).
+///
+/// Marker-based and cwd-only — deliberately NOT keyed on an existing
+/// `.code-graph/index.db`: that file is created BY this tool, so counting it
+/// would let a once-polluted dir self-certify as a project on the next run
+/// (same rationale as `project-detect.js`).
+pub fn is_non_project_cwd(cwd: &Path) -> bool {
+    !PROJECT_MARKERS.iter().any(|m| cwd.join(m).exists())
+}
+
+/// Minimal JSON-RPC loop that answers `initialize` / `tools/list` with an empty
+/// catalog and rejects everything else, WITHOUT opening a database, loading the
+/// embedding model, or creating `.code-graph/`. Mirrors the JS launcher's
+/// `serveEmptyMcpStub`. Driven by `run_serve` when `is_non_project_cwd` holds
+/// and `CODE_GRAPH_FORCE_PLUGIN_MCP` is unset.
+pub fn serve_non_project_stub<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+) -> std::io::Result<()> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break; // EOF
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let req: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let method = match req.get("method").and_then(|m| m.as_str()) {
+            Some(m) => m,
+            None => continue,
+        };
+        // JSON-RPC notifications (no `id`) get no response.
+        let id = match req.get("id") {
+            Some(id) => id.clone(),
+            None => continue,
+        };
+        let response = match method {
+            "initialize" => serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": {
+                        "name": "code-graph-mcp (non-project stub)",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+            "tools/list" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [] } }),
+            "resources/list" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "resources": [] } }),
+            "prompts/list" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "prompts": [] } }),
+            "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            _ => serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": -32601, "message": "method not found (non-project stub mode)" }
+            }),
+        };
+        writeln!(writer, "{}", response)?;
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 /// Remove empty legacy database files left behind from past naming migrations.
@@ -3393,6 +3479,55 @@ mod tests {
         // canonicalize both sides: on macOS `/tmp` ↔ `/private/tmp` symlinking;
         // on Linux they match directly, so this is a no-op but keeps the test portable.
         assert_eq!(resolve_project_root_from(cwd), cwd);
+    }
+
+    #[test]
+    fn is_non_project_cwd_bare_dir_is_non_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(is_non_project_cwd(tmp.path()));
+    }
+
+    #[test]
+    fn is_non_project_cwd_each_marker_makes_it_a_project() {
+        for marker in PROJECT_MARKERS {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(marker), b"").unwrap();
+            assert!(
+                !is_non_project_cwd(tmp.path()),
+                "{marker} should classify cwd as a project"
+            );
+        }
+    }
+
+    #[test]
+    fn non_project_stub_answers_initialize_tools_list_and_rejects_rest() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"x"}}"#,
+            "\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        serve_non_project_stub(std::io::Cursor::new(input), &mut out).unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+        // The notification (no `id`) produces no response → exactly 3 responses.
+        assert_eq!(lines.len(), 3, "got: {lines:?}");
+
+        let init: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            init["result"]["serverInfo"]["name"],
+            "code-graph-mcp (non-project stub)"
+        );
+
+        let tl: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(tl["result"]["tools"], serde_json::json!([]));
+
+        let call: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(call["error"]["code"], -32601);
     }
 
     #[test]

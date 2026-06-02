@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.34.0 — Rust binary no-ops in non-project directories
+
+**Behavior change (opt-out available).** `code-graph-mcp serve` now serves a
+0-tool stub when launched directly in a non-project working directory (no
+`.git`/manifest marker), mirroring the v0.33.0 MCP-launcher gate. It opens no
+database, loads no embedding model, creates no `.code-graph/`, and emits no
+tool-decision `instructions`.
+
+Why: v0.33.0 gated the JS launcher path, but a binary invoked directly —
+bypassing the launcher (a dev `.mcp.json`, or any MCP config pointing straight
+at the binary) — still half-activated in a marker-less cwd. This closes that
+parallel path so the activation boundary holds at the Rust layer regardless of
+entry point. Detection is marker-based (`.git`, `package.json`, `Cargo.toml`,
+`pyproject.toml`, `go.mod`, `pom.xml`, `build.gradle`), not a literal path
+check — a real git repo under `/tmp` still activates.
+
+### Migration / opt-out
+
+- No action needed; real projects (with a project marker) serve the full tool
+  catalog exactly as before.
+- To force the full plugin MCP in a marker-less cwd, set
+  `CODE_GRAPH_FORCE_PLUGIN_MCP=1` (same override as the launcher gate).
+
 ## v0.33.0 — plugin no-ops in non-project directories
 
 **Behavior change (opt-out available).** The plugin now fully no-ops in working
