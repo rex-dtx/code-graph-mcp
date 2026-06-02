@@ -1593,3 +1593,107 @@ fn test_ts_type_alias_rhs_emits_but_name_does_not() {
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
 
+// --- Python type-annotation REFERENCES edges ---
+// tree-sitter-python wraps annotation types in a `type` node; the type NAME is a
+// plain `identifier` (same kind as value identifiers), so the gate is the
+// annotation context (`type`-node ancestor), not the node kind. Base classes
+// live in `argument_list [field=superclasses]` (not a `type` node) → naturally
+// excluded; value identifiers (`u`, `account`, `compute`) never sit under a
+// `type` node.
+
+#[test]
+fn test_python_param_and_return_annotation_emit_references() {
+    // `def make(u: User) -> Account:` — param type `User` + return type `Account`
+    // must emit references edges; the value identifier `u` and the attribute read
+    // `account` (`u.account`) must NOT.
+    let src = "def make(u: User) -> Account:\n    return u.account\n";
+    let rels = extract_relations(src, "python").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"User"),
+        "param annotation `User` must emit a references edge; got: {:?}", refs);
+    assert!(refs.contains(&"Account"),
+        "return annotation `Account` must emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"u"),
+        "value identifier `u` must NOT be a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"account"),
+        "attribute read `account` must NOT be a references edge; got: {:?}", refs);
+}
+
+#[test]
+fn test_python_annotated_class_attr_emits_references() {
+    // `class Service:\n    cache: Cache` — annotated class attribute → reference
+    // to `Cache`.
+    let src = "class Service:\n    cache: Cache\n";
+    let rels = extract_relations(src, "python").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"Cache"),
+        "annotated class attr `Cache` must emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"cache"),
+        "the annotated name `cache` (LHS) must NOT be a references edge; got: {:?}", refs);
+}
+
+#[test]
+fn test_python_base_class_does_not_emit_references() {
+    // `class Foo(Base):` — Base is an inherits edge (extracted by inheritance),
+    // NOT a references edge (avoid double-emit).
+    let src = "class Foo(Base):\n    pass\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Base"),
+        "base class `Base` must NOT be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_python_builtin_annotation_does_not_emit_references() {
+    // `x: int = 3` — `int` is a builtin, must NOT emit a references edge (noise).
+    let src = "x: int = 3\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
+        "builtin `int` must NOT be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_python_generic_arg_annotation_emits_references_skips_typing_generic() {
+    // `def g(items: List[User]) -> Dict[str, User]:` — `User` (generic arg) is a
+    // project type → reference; the `typing` generics `List`/`Dict` and builtin
+    // `str` are stdlib → skipped.
+    let src = "def g(items: List[User]) -> Dict[str, User]:\n    return {}\n";
+    let rels = extract_relations(src, "python").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"User"),
+        "generic arg `User` must emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"List") && !refs.contains(&"Dict"),
+        "typing generics `List`/`Dict` must be skipped; got: {:?}", refs);
+    assert!(!refs.contains(&"str"),
+        "builtin `str` must be skipped; got: {:?}", refs);
+}
+
+#[test]
+fn test_python_dotted_annotation_emits_tail_only_and_no_value_attr_noise() {
+    // `meta: mod.Meta = None` (dotted annotation) → reference to the tail `Meta`
+    // only, NOT the module path head `mod`. And a value attribute read
+    // `obj.method` in non-annotation position must NOT emit any reference.
+    let src = "def f(self):\n    meta: mod.Meta = None\n    v = obj.attr\n    return v\n";
+    let rels = extract_relations(src, "python").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"Meta"),
+        "dotted annotation tail `Meta` must emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"mod"),
+        "dotted annotation head `mod` (module path) must NOT be a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"obj") && !refs.contains(&"attr"),
+        "value attribute read `obj.attr` must NOT emit any references edge; got: {:?}", refs);
+}
+

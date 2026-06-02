@@ -233,6 +233,22 @@ pub const CROSS_FILE_CALL_NOISE: &[&str] = &[
     "flush", "close", "read", "write",
 ];
 
+// -- Python type-annotation noise filter --
+// Builtin types + `typing` generics that appear in annotation positions but
+// resolve to the stdlib, not to a project symbol. Emitting `references` edges to
+// them is pure noise (they'd inflate find_references / suppress dead-code on
+// names like `List`/`Optional`). Mirrors CROSS_FILE_CALL_NOISE's role for calls,
+// but is Python-type-specific. Kept case-sensitive: only the exact stdlib spellings.
+pub const PYTHON_TYPE_REFERENCE_NOISE: &[&str] = &[
+    // builtins
+    "str", "int", "float", "bool", "bytes", "None", "object",
+    "list", "dict", "set", "tuple", "frozenset", "complex", "type",
+    // typing generics / special forms
+    "Any", "List", "Dict", "Set", "Tuple", "FrozenSet", "Optional", "Union",
+    "Callable", "Sequence", "Iterable", "Iterator", "Mapping", "MutableMapping",
+    "Type", "ClassVar", "Final", "Literal", "Annotated", "NoReturn", "Self",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
