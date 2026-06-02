@@ -1437,3 +1437,27 @@ fn test_non_rust_callee_metadata_unchanged() {
         );
     }
 }
+
+#[test]
+fn test_rust_type_usage_emits_references_edge() {
+    let src = r#"
+struct AppConfig {
+    widget: WidgetConfig,
+}
+fn make() -> WidgetConfig { WidgetConfig {} }
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let ref_count = rels.iter().filter(|r|
+        r.relation == REL_REFERENCES && r.target_name == "WidgetConfig").count();
+    assert!(ref_count >= 1, "expected a references edge to the type WidgetConfig; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_rust_type_definition_name_does_not_self_reference() {
+    let src = r#"struct Foo { x: u32 }"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Foo"),
+        "a struct's own name must not be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}

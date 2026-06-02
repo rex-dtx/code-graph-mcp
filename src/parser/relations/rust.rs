@@ -161,3 +161,56 @@ pub(super) fn extract_rust_path_reference(
         source_language: String::new(),
     })
 }
+
+/// Emit a `references` edge for a `type_identifier` used in type position
+/// (field type, return type, generic arg). Skips the type's own definition name
+/// (the `name` field of struct/enum/type/trait/union items) so a type does not
+/// reference itself, the `name` of a `struct_expression` (already a `calls`
+/// edge — avoids a double edge), and `Self`.
+pub(super) fn extract_rust_type_reference(
+    node: &tree_sitter::Node,
+    source: &str,
+    scope: Option<&str>,
+) -> Option<ParsedRelation> {
+    if let Some(parent) = node.parent() {
+        // The `name` field of a definition is the declaration, not a usage.
+        if matches!(parent.kind(), "struct_item" | "enum_item" | "type_item" | "trait_item" | "union_item")
+            && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())
+        {
+            return None;
+        }
+        // The `name` of `Foo { .. }` already yields a `calls` edge — don't double-emit.
+        if parent.kind() == "struct_expression"
+            && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())
+        {
+            return None;
+        }
+        // Path-qualified struct expr `mod::Foo { .. }`: the `name` field is a
+        // `scoped_type_identifier` whose inner `name` is this `type_identifier`
+        // ("Foo"). The `struct_expression` arm already strips the path and emits
+        // a `calls` edge to "Foo", so this inner type_identifier must not also
+        // emit a `references` edge (would be a double edge — same target).
+        if parent.kind() == "scoped_type_identifier"
+            && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())
+        {
+            if let Some(grandparent) = parent.parent() {
+                if grandparent.kind() == "struct_expression"
+                    && grandparent.child_by_field_name("name").map(|n| n.id()) == Some(parent.id())
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    let name = node_text(node, source);
+    if name.is_empty() || name == "Self" {
+        return None;
+    }
+    Some(ParsedRelation {
+        source_name: scope.unwrap_or("<module>").to_string(),
+        target_name: name.to_string(),
+        relation: REL_REFERENCES.into(),
+        metadata: None,
+        source_language: String::new(),
+    })
+}

@@ -59,7 +59,7 @@ use imports::{extract_import_names, extract_python_import_names, extract_python_
 use inherits::{extract_superclasses, extract_implements};
 use exports::extract_export_names;
 use routes::{extract_route_pattern, extract_python_route};
-use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference};
+use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference};
 use dart::{extract_dart_imports, extract_dart_calls};
 
 pub struct ParsedRelation {
@@ -172,15 +172,29 @@ fn walk_for_relations(
 
     let active_scope = scope_name.as_deref().or(current_scope);
 
-    // Additive Rust pass: emit a `references` edge for an edgeless
-    // path-qualified value usage (`crate::domain::FOO`). Runs before the
-    // `match kind` call-dispatch so it does not disturb existing arms or the
-    // child recursion below; the extractor self-excludes call callees, `use`
-    // paths, type-position paths, and intermediate path segments so it never
-    // double-counts a node already covered by a `calls`/`imports` edge.
-    if language == "rust" && kind == "scoped_identifier" {
-        if let Some(r) = extract_rust_path_reference(&node, source, active_scope) {
-            results.push(r);
+    // Additive Rust pass: emit a `references` edge for an edgeless usage.
+    // Runs before the `match kind` call-dispatch so it does not disturb
+    // existing arms or the child recursion below; both extractors self-exclude
+    // nodes already covered by a `calls`/`imports` edge.
+    //   - `scoped_identifier`: path-qualified value usage (`crate::domain::FOO`)
+    //     — skips call callees, `use` paths, type-position paths, intermediate
+    //     path segments.
+    //   - `type_identifier`: type-position usage (`field: MyType`, `-> MyType`,
+    //     `Vec<MyType>`) — skips the type's own definition name and the
+    //     `struct_expression` name (already a `calls` edge) and `Self`.
+    if language == "rust" {
+        match kind {
+            "scoped_identifier" => {
+                if let Some(r) = extract_rust_path_reference(&node, source, active_scope) {
+                    results.push(r);
+                }
+            }
+            "type_identifier" => {
+                if let Some(r) = extract_rust_type_reference(&node, source, active_scope) {
+                    results.push(r);
+                }
+            }
+            _ => {}
         }
     }
 
