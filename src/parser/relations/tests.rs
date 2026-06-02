@@ -559,6 +559,38 @@ fn create() {
 }
 
 #[test]
+fn test_rust_path_reference_to_const_emits_references_edge() {
+    let src = r#"
+fn build() -> String {
+    let w = crate::domain::SHARED;
+    w.to_string()
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let has_ref = rels.iter().any(|r|
+        r.relation == crate::domain::REL_REFERENCES && r.target_name == "SHARED");
+    assert!(has_ref, "expected a references edge to SHARED; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+
+    let src_call = r#"fn build() { crate::domain::compute(); }"#;
+    let rels2 = extract_relations(src_call, "rust").unwrap();
+    assert!(rels2.iter().any(|r| r.relation == REL_CALLS && r.target_name == "compute"),
+        "call must be a calls edge");
+    assert!(!rels2.iter().any(|r| r.relation == crate::domain::REL_REFERENCES && r.target_name == "compute"),
+        "a called fn must NOT also be a references edge");
+
+    // Path-qualified struct instantiation uses `scoped_type_identifier`, whose
+    // inner segments are `scoped_identifier` nodes. They must NOT leak a
+    // `references` edge to an intermediate path segment ("parser") — that path
+    // is already covered by the `calls` edge to the struct ("NodeRecord").
+    let src_struct = r#"fn create() { let node = crate::parser::NodeRecord { name: 1 }; }"#;
+    let rels3 = extract_relations(src_struct, "rust").unwrap();
+    assert!(!rels3.iter().any(|r| r.relation == crate::domain::REL_REFERENCES),
+        "struct-expr type path must not emit references edges; got: {:?}",
+        rels3.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
 fn test_extract_go_http_routes() {
     let code = r#"
 package main

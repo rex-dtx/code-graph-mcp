@@ -59,7 +59,7 @@ use imports::{extract_import_names, extract_python_import_names, extract_python_
 use inherits::{extract_superclasses, extract_implements};
 use exports::extract_export_names;
 use routes::{extract_route_pattern, extract_python_route};
-use rust::{extract_rust_use_imports, extract_rust_impl_trait};
+use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference};
 use dart::{extract_dart_imports, extract_dart_calls};
 
 pub struct ParsedRelation {
@@ -171,6 +171,18 @@ fn walk_for_relations(
     };
 
     let active_scope = scope_name.as_deref().or(current_scope);
+
+    // Additive Rust pass: emit a `references` edge for an edgeless
+    // path-qualified value usage (`crate::domain::FOO`). Runs before the
+    // `match kind` call-dispatch so it does not disturb existing arms or the
+    // child recursion below; the extractor self-excludes call callees, `use`
+    // paths, type-position paths, and intermediate path segments so it never
+    // double-counts a node already covered by a `calls`/`imports` edge.
+    if language == "rust" && kind == "scoped_identifier" {
+        if let Some(r) = extract_rust_path_reference(&node, source, active_scope) {
+            results.push(r);
+        }
+    }
 
     // Call-expression dispatch — adding a new language with a non-standard
     // call node kind MUST add its own arm below. Tree-sitter grammars don't

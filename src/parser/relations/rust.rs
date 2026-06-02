@@ -5,7 +5,7 @@
 use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
-use crate::domain::{REL_IMPORTS, REL_IMPLEMENTS};
+use crate::domain::{REL_IMPORTS, REL_IMPLEMENTS, REL_REFERENCES};
 
 /// Extract import names from Rust `use` declarations by walking the tree-sitter AST.
 /// Handles simple (`use foo::Bar`), grouped (`use foo::{Bar, Baz}`),
@@ -108,6 +108,55 @@ pub(super) fn extract_rust_impl_trait(node: &tree_sitter::Node, source: &str) ->
         source_name: type_name,
         target_name: trait_name,
         relation: REL_IMPLEMENTS.into(),
+        metadata: None,
+        source_language: String::new(),
+    })
+}
+
+/// Emit a `references` edge for a path-qualified usage (`a::b::FOO`) that is
+/// neither a call (its parent is a `call_expression` `function` field) nor part
+/// of a `use` declaration, and is the outermost `scoped_identifier`.
+///
+/// Outermost-only is enforced by rejecting a `scoped_identifier` whose parent is
+/// itself a `scoped_identifier` (intermediate path segments). Type-position
+/// paths (`scoped_type_identifier`, e.g. the inner segments of a struct-expr
+/// path `crate::parser::NodeRecord { .. }`) are excluded too — that usage is
+/// already covered by the `calls` edge to the struct/type name, so re-emitting a
+/// `references` edge to an intermediate path segment ("parser") would be a false
+/// positive.
+pub(super) fn extract_rust_path_reference(
+    node: &tree_sitter::Node,
+    source: &str,
+    scope: Option<&str>,
+) -> Option<ParsedRelation> {
+    let parent = node.parent()?;
+    match parent.kind() {
+        // Callee of a call (`crate::foo::bar()`) — already a `calls` edge.
+        // A `call_expression` parent where this node is NOT the `function`
+        // field (e.g. a path passed as an argument) falls through to `_`.
+        "call_expression"
+            if parent.child_by_field_name("function").map(|f| f.id()) == Some(node.id()) =>
+        {
+            return None;
+        }
+        "use_declaration" | "scoped_use_list" | "use_list" | "use_as_clause" => return None,
+        // Intermediate path segment of a longer `a::b::c` chain.
+        "scoped_identifier" => return None,
+        // Type-position path (struct-expr type, generic bounds, etc.). The
+        // type name is already a `calls` edge; intermediate segments here are
+        // module path, not a value reference.
+        "scoped_type_identifier" => return None,
+        _ => {}
+    }
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(&name_node, source);
+    if name.is_empty() || name == "self" || name == "Self" || name == "*" {
+        return None;
+    }
+    Some(ParsedRelation {
+        source_name: scope.unwrap_or("<module>").to_string(),
+        target_name: name.to_string(),
+        relation: REL_REFERENCES.into(),
         metadata: None,
         source_language: String::new(),
     })
