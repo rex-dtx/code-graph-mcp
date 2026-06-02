@@ -2979,7 +2979,7 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
         let raw_symbol = get_positional(args, 0)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!(
-                "Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation calls|imports|inherits|implements] [--compact] [--json]"
+                "Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation calls|imports|inherits|implements|references] [--compact] [--json]"
             ))?;
         let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
         let file_path = explicit_file.or(resolved_file.as_deref());
@@ -3034,14 +3034,15 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
     // return doesn't get dropped across the .as_str() borrow.
     let symbol = symbol.as_str();
 
-    use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_IMPLEMENTS};
+    use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_IMPLEMENTS, REL_REFERENCES};
     let relation_filter = match relation {
         Some("calls") => Some(REL_CALLS),
         Some("imports") => Some(REL_IMPORTS),
         Some("inherits") => Some(REL_INHERITS),
         Some("implements") => Some(REL_IMPLEMENTS),
+        Some("references") => Some(REL_REFERENCES),
         Some("all") | None => None,
-        Some(other) => anyhow::bail!("Unknown relation '{}'. Valid: calls, imports, inherits, implements, all", other),
+        Some(other) => anyhow::bail!("Unknown relation '{}'. Valid: calls, imports, inherits, implements, references, all", other),
     };
 
     let mut all_refs = Vec::new();

@@ -1278,6 +1278,45 @@ fn test_find_references_invalid_relation_errors() {
     assert!(text.contains("Unknown relation"), "should explain the typo; got: {text}");
 }
 
+/// Task 5: the new `references` relation filter must be ACCEPTED (not rejected
+/// as "Unknown relation filter") and must surface the `references` edge(s).
+///
+/// `make_widget() -> WidgetConfig` emits a `references` edge from `make_widget`
+/// to `WidgetConfig` (return-type usage), so a `relation:"references"` query on
+/// `WidgetConfig` must return `make_widget` and nothing about an unknown filter.
+#[test]
+fn test_find_references_references_relation_accepted() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub struct WidgetConfig { pub size: u32 }
+pub fn make_widget() -> WidgetConfig { WidgetConfig { size: 1 } }
+"#).unwrap();
+    let server = common::init_server(&project);
+    let warm = tool_call_json("semantic_code_search", serde_json::json!({"query": "WidgetConfig"}));
+    let _ = server.handle_message(&warm);
+
+    let msg = tool_call_json("find_references", serde_json::json!({
+        "symbol_name": "WidgetConfig",
+        "relation": "references",
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+
+    // Must NOT be rejected as an unknown filter.
+    assert_ne!(parsed["result"]["isError"], serde_json::Value::Bool(true),
+        "relation:\"references\" must be accepted, not rejected: {parsed:?}");
+    let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(!text.contains("Unknown relation"),
+        "relation:\"references\" must not hit the unknown-filter path; got: {text}");
+
+    // Must surface the real references edge (make_widget -> WidgetConfig).
+    let result = parse_tool_result(&resp);
+    let refs = result["references"].as_array().unwrap();
+    assert!(refs.iter().any(|r|
+        r["name"] == "make_widget" && r["relation"] == "references"),
+        "expected a references edge from make_widget to WidgetConfig; got: {refs:?}");
+}
+
 #[test]
 fn test_get_call_graph_symbol_and_route_mutually_exclusive() {
     // Regression: passing both symbol_name and route_path used to silently dispatch
