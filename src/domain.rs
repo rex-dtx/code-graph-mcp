@@ -12,6 +12,10 @@ pub const REL_IMPORTS: &str = "imports";
 pub const REL_ROUTES_TO: &str = "routes_to";
 pub const REL_IMPLEMENTS: &str = "implements";
 pub const REL_EXPORTS: &str = "exports";
+/// A symbol *uses* another symbol without calling/importing/inheriting it:
+/// a path-qualified const/static reference (`crate::a::FOO`) or a type-position
+/// usage (`field: MyStruct`). Edgeless under calls/imports, so tracked separately.
+pub const REL_REFERENCES: &str = "references";
 
 // -- Index version --
 // Bump this when parser/indexer logic changes in a way that produces different
@@ -307,5 +311,10 @@ mod tests {
         assert!(!is_function_node_type("type_alias"));
         assert!(!is_function_node_type("module"));
         assert!(!is_function_node_type(""));
+    }
+
+    #[test]
+    fn test_rel_references_constant() {
+        assert_eq!(crate::domain::REL_REFERENCES, "references");
     }
 }
