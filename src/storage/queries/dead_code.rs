@@ -106,36 +106,82 @@ pub fn find_dead_code(
            -- not affected.)
            AND (
                length(n.name) < 3
-               OR NOT EXISTS (
-                   SELECT 1 FROM nodes n2
-                   WHERE n2.file_id = n.file_id
-                     AND n2.id != n.id
-                     AND n2.type IN ('function', 'method')
-                     AND (
-                         instr(n2.code_content, n.name || '(') > 0
-                         OR instr(n2.code_content, n.name || ')') > 0
-                         OR instr(n2.code_content, n.name || ',') > 0
-                         OR instr(n2.code_content, n.name || ' ') > 0
-                         OR instr(n2.code_content, n.name || ';') > 0
-                         OR instr(n2.code_content, n.name || char(10)) > 0
-                         OR instr(n2.code_content, n.name || ':') > 0
-                         OR instr(n2.code_content, n.name || '<') > 0
-                         OR instr(n2.code_content, n.name || '.') > 0
-                         OR instr(n2.code_content, n.name || '{{') > 0
-                         OR instr(n2.code_content, n.name || '}}') > 0
-                         OR (
-                             -- Truncation co-signal: must have BOTH the
-                             -- `truncate_code_content` `...` sentinel AND a
-                             -- significant gap between declared span and
-                             -- stored newline count. Either alone produces
-                             -- false positives (Python `def stub(): ...`,
-                             -- or compact fixtures with short content).
-                             substr(n2.code_content, -3) = '...'
-                             AND (n2.end_line - n2.start_line + 1)
-                                 - (length(n2.code_content) - length(replace(n2.code_content, char(10), '')))
-                                 > 5
+               OR (
+                   -- Same-file probe: name appears as a standalone identifier in
+                   -- another declaration body in THIS file (catches callbacks /
+                   -- function-pointer args / same-file struct-field types / type
+                   -- aliases / const-in-const refs the parser doesn't track as
+                   -- edges). Scans function/method bodies AND data-declaration
+                   -- bodies (struct/enum/type_alias/interface/trait/constant) so
+                   -- a struct used only as a same-file field type (`pub w: Foo`)
+                   -- isn't falsely reported dead. `module`/markdown nodes are
+                   -- excluded — their bodies can span a whole file and would
+                   -- over-suppress. Delimiter-aware to avoid prefix matches
+                   -- (e.g. `get_x` inside `get_x_batch`).
+                   NOT EXISTS (
+                       SELECT 1 FROM nodes n2
+                       WHERE n2.file_id = n.file_id
+                         AND n2.id != n.id
+                         AND n2.type IN ('function', 'method', 'struct', 'enum', 'type_alias', 'interface', 'trait', 'constant')
+                         AND (
+                             instr(n2.code_content, n.name || '(') > 0
+                             OR instr(n2.code_content, n.name || ')') > 0
+                             OR instr(n2.code_content, n.name || ',') > 0
+                             OR instr(n2.code_content, n.name || ' ') > 0
+                             OR instr(n2.code_content, n.name || ';') > 0
+                             OR instr(n2.code_content, n.name || char(10)) > 0
+                             OR instr(n2.code_content, n.name || ':') > 0
+                             OR instr(n2.code_content, n.name || '<') > 0
+                             OR instr(n2.code_content, n.name || '.') > 0
+                             OR instr(n2.code_content, n.name || '{{') > 0
+                             OR instr(n2.code_content, n.name || '}}') > 0
+                             OR (
+                                 -- Truncation co-signal: must have BOTH the
+                                 -- `truncate_code_content` `...` sentinel AND a
+                                 -- significant gap between declared span and
+                                 -- stored newline count. Either alone produces
+                                 -- false positives (Python `def stub(): ...`,
+                                 -- or compact fixtures with short content).
+                                 substr(n2.code_content, -3) = '...'
+                                 AND (n2.end_line - n2.start_line + 1)
+                                     - (length(n2.code_content) - length(replace(n2.code_content, char(10), '')))
+                                     > 5
+                             )
                          )
-                     )
+                   )
+                   -- Cross-file probe for EDGELESS node kinds. constant/struct/
+                   -- enum/type_alias/interface/trait produce no call/import edge
+                   -- for path-qualified references (`crate::domain::FOO`) or
+                   -- type-position usages (`field: MyStruct`), so a same-file-only
+                   -- scan falsely reports them dead — which can drive an agent to
+                   -- delete live code. Probe OTHER files' bodies with the same
+                   -- delimiter-aware matching, gated to length>=5 to avoid common
+                   -- short-name collisions. Biases toward false-negatives (missing
+                   -- some dead code) over false-positives, the safe direction for
+                   -- an LLM-facing tool. Functions/methods are intentionally NOT
+                   -- probed cross-file: their cross-file uses must be real call
+                   -- edges, and a textual scan would over-suppress on comments.
+                   AND (
+                       n.type NOT IN ('constant', 'struct', 'enum', 'type_alias', 'interface', 'trait')
+                       OR length(n.name) < 5
+                       OR NOT EXISTS (
+                           SELECT 1 FROM nodes n3
+                           WHERE n3.file_id != n.file_id
+                             AND (
+                                 instr(n3.code_content, n.name || '(') > 0
+                                 OR instr(n3.code_content, n.name || ')') > 0
+                                 OR instr(n3.code_content, n.name || ',') > 0
+                                 OR instr(n3.code_content, n.name || ' ') > 0
+                                 OR instr(n3.code_content, n.name || ';') > 0
+                                 OR instr(n3.code_content, n.name || char(10)) > 0
+                                 OR instr(n3.code_content, n.name || ':') > 0
+                                 OR instr(n3.code_content, n.name || '<') > 0
+                                 OR instr(n3.code_content, n.name || '.') > 0
+                                 OR instr(n3.code_content, n.name || '{{') > 0
+                                 OR instr(n3.code_content, n.name || '}}') > 0
+                             )
+                       )
+                   )
                )
            )
          ORDER BY (n.end_line - n.start_line + 1) DESC
@@ -439,5 +485,120 @@ mod tests {
         assert!(!names.contains(&"target_callback"),
             "target_callback must NOT be reported dead — long_caller's truncated body \
              may reference it in the tail; got: {:?}", names);
+    }
+
+    /// Regression: a `pub const` (or type/struct) referenced cross-file via a
+    /// path expression (`crate::domain::FOO`) produces NO call/import edge —
+    /// Rust const/type path references are neither `use` imports nor calls. The
+    /// same-file-only instr fallback can't see the reference, so such *live*
+    /// constants were reported dead (exported-unused), which can drive an agent
+    /// to delete working code. Edgeless node kinds (const/type/enum/struct/
+    /// interface) must therefore also probe OTHER files' code_content. A
+    /// genuinely-unreferenced const must still be flagged (no over-rescue).
+    #[test]
+    fn test_find_dead_code_cross_file_const_reference() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let domain_fid = upsert_file(conn, &FileRecord {
+            path: "src/domain.rs".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+        let consumer_fid = upsert_file(conn, &FileRecord {
+            path: "src/consumer.rs".into(), blake3_hash: "h2".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+
+        // Live const, referenced cross-file via `crate::domain::SHARED_FILTER`.
+        // No edge: Rust const path-refs are not `use` imports and not calls.
+        insert_node(conn, &NodeRecord {
+            file_id: domain_fid, node_type: "constant".into(), name: "SHARED_FILTER".into(),
+            qualified_name: None, start_line: 1, end_line: 4,
+            code_content: "pub const SHARED_FILTER: &str =\n    \"is_test = 0\";".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Genuinely-dead const: referenced nowhere. Must STILL be flagged.
+        insert_node(conn, &NodeRecord {
+            file_id: domain_fid, node_type: "constant".into(), name: "UNUSED_FILTER".into(),
+            qualified_name: None, start_line: 6, end_line: 9,
+            code_content: "pub const UNUSED_FILTER: &str =\n    \"never read\";".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Consumer function references SHARED_FILTER by path in another file. No edge.
+        insert_node(conn, &NodeRecord {
+            file_id: consumer_fid, node_type: "function".into(), name: "build_query".into(),
+            qualified_name: None, start_line: 1, end_line: 6,
+            code_content: "fn build_query() -> String {\n    let w = crate::domain::SHARED_FILTER;\n    w.to_string()\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let results = find_dead_code(conn, None, None, false, 1, 100).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(!names.contains(&"SHARED_FILTER"),
+            "SHARED_FILTER is referenced cross-file via crate::domain::SHARED_FILTER \
+             (edgeless const path ref) and must NOT be reported dead; got: {:?}", names);
+        assert!(names.contains(&"UNUSED_FILTER"),
+            "UNUSED_FILTER is referenced nowhere and must still be reported dead; got: {:?}", names);
+    }
+
+    /// Regression: a struct/type referenced only SAME-FILE as a field type
+    /// (`pub widget: WidgetConfig`) lives inside another struct's definition,
+    /// not a function/method body. The same-file probe scanned only
+    /// function/method bodies, so such live types were reported dead (the live
+    /// `SnapshotConfig` repro). Declaration nodes (struct/enum/type_alias/
+    /// interface/trait/constant) must also count as same-file reference sites.
+    /// A genuinely-unreferenced struct must still be flagged (no over-rescue).
+    #[test]
+    fn test_find_dead_code_same_file_struct_field_type() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let fid = upsert_file(conn, &FileRecord {
+            path: "src/config.rs".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+
+        // Live struct, referenced only as a field type inside AppConfig (same
+        // file). No edge: a field-type usage produces no call/import/inherit edge.
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "struct".into(), name: "WidgetConfig".into(),
+            qualified_name: None, start_line: 1, end_line: 4,
+            code_content: "pub struct WidgetConfig {\n    pub size: u32,\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Genuinely-dead struct: referenced nowhere. Must STILL be flagged.
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "struct".into(), name: "OrphanConfig".into(),
+            qualified_name: None, start_line: 6, end_line: 9,
+            code_content: "pub struct OrphanConfig {\n    pub n: u32,\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // AppConfig references WidgetConfig as a field type, in the same file.
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "struct".into(), name: "AppConfig".into(),
+            qualified_name: None, start_line: 11, end_line: 14,
+            code_content: "pub struct AppConfig {\n    pub widget: WidgetConfig,\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let results = find_dead_code(conn, None, None, false, 1, 100).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(!names.contains(&"WidgetConfig"),
+            "WidgetConfig is referenced as a field type in same-file AppConfig and must \
+             NOT be reported dead; got: {:?}", names);
+        assert!(names.contains(&"OrphanConfig"),
+            "OrphanConfig is referenced nowhere and must still be reported dead; got: {:?}", names);
     }
 }
