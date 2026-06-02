@@ -325,3 +325,124 @@ fn path_qualifier_keeps_same_file_target() {
         callers
     );
 }
+
+#[test]
+fn receiver_call_resolves_unique_method() {
+    // `let f = Foo::new(); f.unique_method();` — the receiver `f` has no
+    // statically-knowable type at the call site, so the parser stamps a
+    // Receiver qualifier. There is EXACTLY ONE same-language method named
+    // `unique_method` in the project, and the name is not stdlib noise, so the
+    // resolver should bind the call to it (instead of dropping the edge and
+    // marking `unique_method` as dead). This is the live-method-dead-code bug:
+    // `file_exists` / `validate` were dropped this way.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "src/lib.rs", r#"
+        pub struct Foo;
+        impl Foo {
+            pub fn new() -> Self { Foo }
+            pub fn unique_method(&self) -> i32 { 7 }
+        }
+        pub fn caller() -> i32 {
+            let f = Foo::new();
+            f.unique_method()
+        }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let callers = callers_of(&db, "unique_method");
+    assert!(
+        callers.iter().any(|c| c == "caller"),
+        "caller→f.unique_method() must resolve when `unique_method` is the unique same-language method; got: {:?}",
+        callers
+    );
+}
+
+#[test]
+fn receiver_call_resolves_method_not_free_function_same_name() {
+    // The `validate` regression shape: a free function `validate(...)` AND a
+    // method `Req::validate(&self)` share the name. A receiver call
+    // `req.validate()` can only target a METHOD, never the free function, so
+    // the resolver must treat the method as the unique candidate (the free
+    // function is excluded by qualified_name having no `.`), bind the edge to
+    // the method, and NOT to the free function.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "src/req.rs", r#"
+        pub struct Req;
+        impl Req {
+            pub fn validate(&self) -> bool { true }
+        }
+        pub fn use_it() -> bool {
+            let r = make_req();
+            r.validate()
+        }
+        fn make_req() -> Req { Req }
+    "#);
+    // Free function with the SAME bare name in another module — must NOT
+    // receive the receiver-call edge.
+    write(root, "src/install.rs", r#"
+        pub fn validate(path: &str) -> bool { !path.is_empty() }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let method_callers = callers_of_in_file(&db, "validate", "src/req.rs");
+    let free_fn_callers = callers_of_in_file(&db, "validate", "src/install.rs");
+    assert!(
+        method_callers.iter().any(|c| c.contains("use_it")),
+        "Req::validate (method) should have `use_it` as caller via r.validate(); got: {:?}",
+        method_callers
+    );
+    assert!(
+        !free_fn_callers.iter().any(|c| c.contains("use_it")),
+        "free-fn validate must NOT get the receiver-call edge (receiver targets a method); got: {:?}",
+        free_fn_callers
+    );
+}
+
+#[test]
+fn receiver_call_with_ambiguous_method_name_stays_unresolved() {
+    // NEGATIVE: two DISTINCT structs each define a method `ambiguous`. A
+    // receiver call `x.ambiguous()` where `x`'s type is unknown must NOT
+    // fan out to both methods — there is no unique same-language method, so
+    // the edge is dropped (no false-positive impact inflation).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "src/a.rs", r#"
+        pub struct A;
+        impl A {
+            pub fn ambiguous(&self) -> i32 { 1 }
+        }
+    "#);
+    write(root, "src/b.rs", r#"
+        pub struct B;
+        impl B {
+            pub fn ambiguous(&self) -> i32 { 2 }
+        }
+    "#);
+    write(root, "src/caller.rs", r#"
+        pub fn caller(x: SomeOpaque) -> i32 {
+            x.ambiguous()
+        }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let callers = callers_of(&db, "ambiguous");
+    assert!(
+        !callers.iter().any(|c| c.contains("caller")),
+        "ambiguous() defined on two structs must NOT resolve a receiver call to either (no unique target); got: {:?}",
+        callers
+    );
+}

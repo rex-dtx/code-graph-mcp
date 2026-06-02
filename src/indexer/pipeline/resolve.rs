@@ -344,6 +344,40 @@ pub(super) fn self_filter_candidates(
     Ok(kept)
 }
 
+/// Filter candidates to those whose `qualified_name` denotes a METHOD — i.e.
+/// contains a `.` separator (`Type.method`), as opposed to a free function
+/// whose `qualified_name` equals its bare name. A receiver call `obj.method()`
+/// can only bind to a method, never a free function, so this is the gate the
+/// receiver-resolution arm uses to exclude same-named free functions before
+/// deciding whether a unique target exists.
+///
+/// Storage encodes methods as `Type.method` (treesitter.rs qualified_name
+/// assignment) and free functions as just `name`.
+pub(super) fn method_candidates(
+    candidates: &[i64],
+    db: &crate::storage::db::Database,
+) -> anyhow::Result<Vec<i64>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: String = std::iter::repeat_n("?", candidates.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    // qualified_name LIKE '%.%' — any node whose qualified_name carries a
+    // `Type.` prefix. NULL qualified_name (rare) is excluded by LIKE.
+    let sql = format!(
+        "SELECT id FROM nodes WHERE id IN ({}) AND qualified_name LIKE '%.%'",
+        placeholders
+    );
+    let mut stmt = db.conn().prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = candidates
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
