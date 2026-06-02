@@ -29,7 +29,7 @@ pub fn find_dead_code(
     min_lines: u32,
     limit: i64,
 ) -> Result<Vec<DeadCodeResult>> {
-    use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_IMPLEMENTS, REL_ROUTES_TO, REL_EXPORTS};
+    use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_IMPLEMENTS, REL_ROUTES_TO, REL_EXPORTS, REL_REFERENCES};
 
     let mut conditions = vec![
         "n.type != 'module'".to_string(),
@@ -80,7 +80,7 @@ pub fn find_dead_code(
            AND NOT EXISTS (
                SELECT 1 FROM edges
                WHERE target_id = n.id
-                 AND relation IN (:rel_calls, :rel_imports, :rel_inherits, :rel_implements)
+                 AND relation IN (:rel_calls, :rel_imports, :rel_inherits, :rel_implements, :rel_references)
            )
            AND NOT EXISTS (
                SELECT 1 FROM edges
@@ -204,6 +204,7 @@ pub fn find_dead_code(
         (":rel_inherits", &REL_INHERITS),
         (":rel_implements", &REL_IMPLEMENTS),
         (":rel_routes_to", &REL_ROUTES_TO),
+        (":rel_references", &REL_REFERENCES),
     ];
 
     // Bind type filter placeholders (parameterized to prevent SQL injection)
@@ -423,6 +424,37 @@ mod tests {
         let big_names: Vec<&str> = results_big.iter().map(|r| r.name.as_str()).collect();
         assert!(big_names.contains(&"orphan_fn"), "orphan_fn (20 lines) should pass min_lines=18");
         assert!(!big_names.contains(&"exported_unused"), "exported_unused (15 lines) should fail min_lines=18");
+    }
+
+    #[test]
+    fn test_find_dead_code_excludes_nodes_with_references_edge() {
+        use crate::domain::REL_REFERENCES;
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "src/x.rs".into(), blake3_hash: "h".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+        // A const with ONLY an incoming `references` edge must NOT be dead.
+        let used = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "constant".into(), name: "REFERENCED_CONST".into(),
+            qualified_name: None, start_line: 1, end_line: 4,
+            code_content: "pub const REFERENCED_CONST: u32 = 1;".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        let user = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "user".into(),
+            qualified_name: None, start_line: 6, end_line: 9,
+            code_content: "fn user() {}".into(), signature: None, doc_comment: None,
+            context_string: None, name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        insert_edge(conn, user, used, REL_REFERENCES, None).unwrap();
+
+        let names: Vec<String> = find_dead_code(conn, None, None, false, 1, 100)
+            .unwrap().into_iter().map(|r| r.name).collect();
+        assert!(!names.contains(&"REFERENCED_CONST".to_string()),
+            "a node with an incoming references edge must not be dead; got: {:?}", names);
     }
 
     /// Regression: when a function's `code_content` is truncated by
