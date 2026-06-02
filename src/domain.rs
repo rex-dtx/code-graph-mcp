@@ -269,6 +269,35 @@ pub const GO_TYPE_REFERENCE_NOISE: &[&str] = &[
     "comparable",
 ];
 
+// -- Java type-position noise filter --
+// Java type names in type position are `type_identifier` (UNLIKE primitives —
+// `int`/`long`/`double`/`boolean`/`void`/... parse as distinct
+// `integral_type`/`floating_point_type`/`boolean_type`/`void_type` kinds and
+// never reach the references extractor). The common JDK reference types below
+// ARE `type_identifier`, so without filtering they would emit `references` edges
+// to symbols that resolve to the JDK, not a project node. They drop at cross-file
+// resolution anyway (no project node exists), but skipping at extraction keeps
+// the edge set clean and avoids mis-binding if a project coincidentally defines a
+// same-named type. This is a MODERATE set of the very common ones (java.lang
+// auto-imports, common java.util collections, common annotations), NOT an attempt
+// to enumerate all of java.* . Kept case-sensitive: only the exact JDK spellings.
+pub const JAVA_TYPE_REFERENCE_NOISE: &[&str] = &[
+    // java.lang (auto-imported)
+    "String", "Object", "Integer", "Long", "Double", "Float", "Boolean",
+    "Character", "Byte", "Short", "Number", "Void", "Class",
+    "Exception", "RuntimeException", "Throwable", "Error",
+    "Comparable", "Runnable", "Thread", "Iterable",
+    // common annotations (java.lang / java.lang.annotation)
+    "Override", "Deprecated", "SuppressWarnings",
+    // common java.util collections + utilities
+    "List", "ArrayList", "LinkedList",
+    "Map", "HashMap", "TreeMap", "LinkedHashMap",
+    "Set", "HashSet", "TreeSet",
+    "Collection", "Optional", "Iterator",
+    // java.util.stream
+    "Stream",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

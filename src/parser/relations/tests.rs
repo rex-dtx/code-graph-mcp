@@ -1774,3 +1774,109 @@ fn test_go_builtin_type_does_not_emit_references() {
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
 
+#[test]
+fn test_java_param_and_return_and_new_type_emit_references() {
+    // `class Svc { Account make(User u) { return new Account(); } }` — param type
+    // `User`, return type `Account`, and `new Account()` type all emit references.
+    // The class's OWN definition names `Account`/`Svc` (the `name` field of a
+    // class_declaration, which is an `identifier`, NOT a `type_identifier`) must
+    // NOT self-reference. Primitives must not emit.
+    let src = "class Account {}\nclass Svc { Account make(User u) { return new Account(); } }\n";
+    let rels = extract_relations(src, "java").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"User"),
+        "param type `User` must emit a references edge; got: {:?}", refs);
+    assert!(refs.contains(&"Account"),
+        "return type / `new Account()` type `Account` must emit a references edge; got: {:?}", refs);
+    // Class definition names must never self-reference.
+    let account_self = rels.iter().any(|r|
+        r.relation == REL_REFERENCES && r.target_name == "Account" && r.source_name == "Account");
+    assert!(!account_self,
+        "the class's own name `Account` must not self-reference; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+    assert!(!refs.contains(&"Svc"),
+        "the class's own name `Svc` must NOT emit a references edge; got: {:?}", refs);
+}
+
+#[test]
+fn test_java_field_type_emits_references() {
+    // `class S { Conn conn; }` — field type `Conn` is a usage → reference; the
+    // field NAME `conn` (an `identifier`, not a `type_identifier`) and the class
+    // name `S` must not.
+    let src = "class S { Conn conn; }\n";
+    let rels = extract_relations(src, "java").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"Conn"),
+        "field type `Conn` must emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"conn"),
+        "the field name `conn` must NOT emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"S"),
+        "the class's own name `S` must NOT self-reference; got: {:?}", refs);
+}
+
+#[test]
+fn test_java_heritage_types_do_not_emit_references() {
+    // `class Foo extends Bar implements Baz {}` — `Bar` (superclass clause) and
+    // `Baz` (super_interfaces clause) already yield inherits/implements edges, so
+    // they must NOT also emit references edges.
+    let src = "class Foo extends Bar implements Baz {}\n";
+    let rels = extract_relations(src, "java").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Bar"),
+        "superclass `Bar` must NOT emit a references edge (heritage); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Baz"),
+        "interface `Baz` must NOT emit a references edge (heritage); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_java_jdk_noise_type_does_not_emit_references() {
+    // `class S { String name; }` — `String` is a JDK common type (noise); it must
+    // be filtered out by JAVA_TYPE_REFERENCE_NOISE.
+    let src = "class S { String name; }\n";
+    let rels = extract_relations(src, "java").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "String"),
+        "JDK type `String` must NOT emit a references edge (noise); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_java_primitive_type_does_not_emit_references() {
+    // `class S { int x; }` — `int` is `integral_type`, a SEPARATE kind from
+    // `type_identifier`, so it is naturally excluded (never reaches the extractor).
+    let src = "class S { int x; }\n";
+    let rels = extract_relations(src, "java").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
+        "primitive `int` must NOT emit a references edge (separate kind); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_java_generic_arg_and_qualified_tail_emit_only_tail() {
+    // Generic arg `List<Foo>` → `Foo` emits. Qualified type `pkg.Sub.Deep field;`
+    // → only the chain TAIL `Deep` emits; the package-path segments `pkg`/`Sub`
+    // (also `type_identifier`s under nested `scoped_type_identifier`) must NOT.
+    let src = "class A { java.util.List<Foo> g() { return null; } pkg.Sub.Deep d; }\n";
+    let rels = extract_relations(src, "java").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"Foo"),
+        "generic arg `Foo` in `List<Foo>` must emit a references edge; got: {:?}", refs);
+    assert!(refs.contains(&"Deep"),
+        "qualified-type tail `Deep` in `pkg.Sub.Deep` must emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"pkg"),
+        "qualified-type package segment `pkg` must NOT emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"Sub"),
+        "qualified-type package segment `Sub` must NOT emit a references edge; got: {:?}", refs);
+    // `java.util.List` is JDK noise on the tail (List) and path segments java/util.
+    assert!(!refs.contains(&"java") && !refs.contains(&"util"),
+        "qualified-type package segments `java`/`util` must NOT emit a references edge; got: {:?}", refs);
+}

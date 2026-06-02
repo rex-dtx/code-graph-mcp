@@ -34,6 +34,7 @@ mod rust;
 mod typescript;
 mod python;
 mod go;
+mod java;
 mod dart;
 
 /// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
@@ -66,6 +67,7 @@ use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_
 use typescript::extract_ts_type_reference;
 use python::extract_python_type_reference;
 use go::extract_go_type_reference;
+use java::extract_java_type_reference;
 use dart::{extract_dart_imports, extract_dart_calls};
 
 pub struct ParsedRelation {
@@ -246,6 +248,26 @@ fn walk_for_relations(
     // `config.name == "go"`.
     if config.name == "go" && kind == "type_identifier" {
         if let Some(r) = extract_go_type_reference(&node, source, active_scope) {
+            results.push(r);
+        }
+    }
+
+    // Additive Java pass: emit a `references` edge for a type-position
+    // `type_identifier` (field/param/return/local type, generic arg, array
+    // element, `new` type, qualified-type tail). Like Rust/TS/Go, Java uses a
+    // distinct `type_identifier` kind for type names, so this gates on kind. The
+    // extractor self-excludes heritage types (`extends`/`implements` — already an
+    // inherits/implements edge), qualified-type package-path segments (only the
+    // chain tail emits), and JDK common reference types
+    // (JAVA_TYPE_REFERENCE_NOISE). The type's OWN definition name needs no skip:
+    // Java class/interface/enum/record names are plain `identifier`s, not
+    // `type_identifier`s. Primitives are distinct kinds
+    // (`integral_type`/`floating_point_type`/`boolean_type`/`void_type`) and never
+    // reach here. Value field-access / method calls use `identifier` /
+    // `field_access` / `method_invocation`, never `type_identifier`. Gated to
+    // `config.name == "java"`.
+    if config.name == "java" && kind == "type_identifier" {
+        if let Some(r) = extract_java_type_reference(&node, source, active_scope) {
             results.push(r);
         }
     }
