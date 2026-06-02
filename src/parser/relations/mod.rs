@@ -33,6 +33,7 @@ mod routes;
 mod rust;
 mod typescript;
 mod python;
+mod go;
 mod dart;
 
 /// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
@@ -64,6 +65,7 @@ use routes::{extract_route_pattern, extract_python_route};
 use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference};
 use typescript::extract_ts_type_reference;
 use python::extract_python_type_reference;
+use go::extract_go_type_reference;
 use dart::{extract_dart_imports, extract_dart_calls};
 
 pub struct ParsedRelation {
@@ -226,6 +228,24 @@ fn walk_for_relations(
     // inherits edge). Gated to `config.name == "python"` (matches the call arm).
     if config.name == "python" && kind == "identifier" {
         if let Some(r) = extract_python_type_reference(&node, source, active_scope) {
+            results.push(r);
+        }
+    }
+
+    // Additive Go pass: emit a `references` edge for a type-position
+    // `type_identifier` (field type, param/return type, var type, slice/map
+    // element, composite literal, generic constraint, qualified-type tail).
+    // Like Rust/TS, Go uses a distinct `type_identifier` kind for type names, so
+    // this gates on kind. The extractor self-excludes the type's own definition
+    // name (`type_spec[field=name]`) and Go predeclared builtins
+    // (GO_TYPE_REFERENCE_NOISE — UNLIKE TS, Go builtins are `type_identifier`).
+    // Value selectors (`pkg.Func()` / `obj.field`) use `field_identifier` /
+    // `identifier`, never `type_identifier`, so they never reach here. The
+    // qualified-type head (`pkg` in `pkg.Type`) is a `package_identifier` (also
+    // not `type_identifier`), so only the tail type name emits. Gated to
+    // `config.name == "go"`.
+    if config.name == "go" && kind == "type_identifier" {
+        if let Some(r) = extract_go_type_reference(&node, source, active_scope) {
             results.push(r);
         }
     }

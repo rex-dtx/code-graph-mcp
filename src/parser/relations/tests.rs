@@ -1697,3 +1697,80 @@ fn test_python_dotted_annotation_emits_tail_only_and_no_value_attr_noise() {
         "value attribute read `obj.attr` must NOT emit any references edge; got: {:?}", refs);
 }
 
+// --- Go type-position REFERENCES edges ---
+// tree-sitter-go represents a type name in type position as a `type_identifier`
+// (like Rust/TS, a distinct kind from value identifiers). UNLIKE TS, Go builtins
+// (`int`, `string`, ...) are ALSO `type_identifier`, so a builtin skip-set
+// (GO_TYPE_REFERENCE_NOISE) is required. Value selectors (`pkg.Func()`,
+// `obj.field`) use `field_identifier`/`identifier`, never `type_identifier`, so
+// they are naturally excluded. The qualified-type head (`pkg` in `pkg.Type`) is a
+// `package_identifier` (naturally excluded); only the tail `Type` is a
+// `type_identifier`.
+
+#[test]
+fn test_go_param_and_return_type_emit_references() {
+    // `func make(u User) Account { return Account{} }` — param type `User` +
+    // return type `Account` must emit references; the struct's OWN definition
+    // name `Account` (from `type Account struct {}`) must NOT self-reference, and
+    // builtins must not emit.
+    let src = "type Account struct {}\nfunc make(u User) Account { return Account{} }\n";
+    let rels = extract_relations(src, "go").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"User"),
+        "param type `User` must emit a references edge; got: {:?}", refs);
+    assert!(refs.contains(&"Account"),
+        "return type `Account` must emit a references edge; got: {:?}", refs);
+    // The struct's own definition name must not self-reference.
+    let account_self_ref = rels.iter().any(|r|
+        r.relation == REL_REFERENCES && r.target_name == "Account" && r.source_name == "Account");
+    assert!(!account_self_ref,
+        "the struct's own name `Account` must not self-reference; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_go_struct_field_type_emits_references() {
+    // `type S struct { conn Conn }` — the field type `Conn` is a usage → reference.
+    // The field NAME `conn` (`field_identifier`) and the struct name `S` must not.
+    let src = "type S struct {\n\tconn Conn\n}\n";
+    let rels = extract_relations(src, "go").unwrap();
+    let refs: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(refs.contains(&"Conn"),
+        "struct field type `Conn` must emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"conn"),
+        "the field name `conn` must NOT emit a references edge; got: {:?}", refs);
+    assert!(!refs.contains(&"S"),
+        "the struct's own name `S` must NOT self-reference; got: {:?}", refs);
+}
+
+#[test]
+fn test_go_value_selector_does_not_emit_references() {
+    // `pkg.DoThing()` — `DoThing` is a `field_identifier` on a value selector, NOT
+    // a `type_identifier`, so it must not emit a references edge.
+    let src = "func run() {\n\tpkg.DoThing()\n}\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "DoThing"),
+        "a value selector call `pkg.DoThing()` must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "pkg"),
+        "the selector operand `pkg` must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_go_builtin_type_does_not_emit_references() {
+    // `var x int` — `int` is a `type_identifier` in tree-sitter-go but a builtin,
+    // so it must be filtered out by GO_TYPE_REFERENCE_NOISE.
+    let src = "var x int\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
+        "builtin `int` must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+

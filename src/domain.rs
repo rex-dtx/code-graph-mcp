@@ -249,6 +249,26 @@ pub const PYTHON_TYPE_REFERENCE_NOISE: &[&str] = &[
     "Type", "ClassVar", "Final", "Literal", "Annotated", "NoReturn", "Self",
 ];
 
+// -- Go type-position noise filter --
+// UNLIKE TypeScript (where primitives are a distinct `predefined_type` kind),
+// tree-sitter-go parses builtin type names (`int`, `string`, `error`, ...) as
+// `type_identifier` — the SAME kind as project types. So a builtin in type
+// position (`var x int`, the `string` key of `map[string]T`, `func() error`)
+// would otherwise emit a `references` edge to the builtin, inflating
+// find_references and suppressing dead-code on a name like `error`/`any`. This
+// set lists the Go predeclared type identifiers so they can be skipped. Builtin
+// FUNCTIONS (`len`, `make`, `append`, ...) and constants (`true`, `nil`) are not
+// `type_identifier`, so they never reach the type-reference extractor and are
+// intentionally omitted. Kept case-sensitive: only the exact predeclared
+// spellings.
+pub const GO_TYPE_REFERENCE_NOISE: &[&str] = &[
+    "bool", "string", "error", "any", "rune", "byte", "uintptr",
+    "int", "int8", "int16", "int32", "int64",
+    "uint", "uint8", "uint16", "uint32", "uint64",
+    "float32", "float64", "complex64", "complex128",
+    "comparable",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
