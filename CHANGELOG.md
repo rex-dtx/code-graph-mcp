@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.35.0 — Reference edges + receiver-call resolution sharpen dead-code & find_references
+
+**Feature (additive).** A new `references` graph relation captures edgeless
+symbol *usages* — types used only in annotation/type position (`field: Foo`,
+`func g() Bar`, `List<Foo>`) and Rust path-qualified const references
+(`crate::a::FOO`). It is extracted for **Rust, TypeScript/TSX, Python, Go, and
+Java**, each gated to that language's real type-position AST nodes and filtered
+against per-language builtin/JDK noise sets so it points only at project
+symbols. `find_dead_code` now counts incoming `references` edges as usage, and
+`find_references` gains a `relation: "references"` filter (additive enum value
+on the tool schema + CLI `--relation references`).
+
+Why: a type/interface/enum/const that is defined and used **only** as a type
+annotation or a path-qualified constant produced no `calls`/`imports` edge, so
+`find_dead_code` reported it as dead (an agent acting on that could delete live
+code) and `find_references`/`impact` were blind to it. Reference edges are
+produced at parse time from the full source, so they are immune to the
+`code_content` truncation that the same-file `instr` fallback suffered.
+
+**Fix — receiver-method calls.** `obj.method()` calls whose receiver type can't
+be statically inferred were dropped entirely, marking uniquely-named live
+methods (e.g. `file_exists`, `validate`) as dead and hiding their callers from
+`impact`/`callers`. They now resolve to a real `calls` edge **only when
+unambiguous** — exactly one same-language method of that name (non-stdlib),
+preferring a same-file match. Ambiguous or stdlib-noise names still drop, so
+`impact` cannot fan out across unrelated modules.
+
+**Fix — dead-code false positives.** The dead-code reference fallback now also
+probes other files for edgeless node kinds (const/struct/enum/type/interface/
+trait, name length ≥ 5, delimiter-aware) and scans same-file declaration bodies
+(not just function/method bodies), rescuing cross-file path-qualified consts and
+same-file struct-field type usages.
+
+### Migration
+
+- `INDEX_VERSION` is bumped 5 → 6: the server detects the mismatch on first run
+  and automatically clears + rebuilds `.code-graph/index.db` so the new edges
+  are present. No action needed.
+- The `references` relation is additive; existing `find_references` calls
+  (`calls`/`imports`/`inherits`/`implements`/`all`) are unchanged.
+
 ## v0.34.0 — Rust binary no-ops in non-project directories
 
 **Behavior change (opt-out available).** `code-graph-mcp serve` now serves a
