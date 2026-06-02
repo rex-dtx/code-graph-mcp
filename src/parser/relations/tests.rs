@@ -1513,3 +1513,83 @@ fn test_rust_inferred_type_placeholder_does_not_emit_references_edge() {
         "inferred-type placeholder `_` must not emit a references edge; got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
+
+#[test]
+fn test_ts_type_usage_emits_references_edge() {
+    // A type used in type position (interface field type, return type, var
+    // annotation) must emit a `references` edge. The interface's OWN name
+    // `Widget` must NOT self-reference.
+    let src = r#"interface Widget { size: number } function make(): Widget { return null as any; } const w: Widget = make();"#;
+    let rels = extract_relations(src, "typescript").unwrap();
+    let has_ref = rels.iter().any(|r|
+        r.relation == REL_REFERENCES && r.target_name == "Widget");
+    assert!(has_ref,
+        "expected a references edge to Widget (return type / annotation); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+    // The interface's own name must not self-reference.
+    let widget_self_ref = rels.iter().any(|r|
+        r.relation == REL_REFERENCES && r.target_name == "Widget" && r.source_name == "Widget");
+    assert!(!widget_self_ref,
+        "the interface's own name `Widget` must not self-reference; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_ts_generic_arg_emits_references_edge() {
+    // Type used as a generic argument (`Array<Foo>`) is a real type-position
+    // usage and must emit a references edge.
+    let src = r#"function g(): Array<Foo> { return []; }"#;
+    let rels = extract_relations(src, "typescript").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Foo"),
+        "a generic-arg type usage of Foo must emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_ts_extends_clause_does_not_emit_references_edge() {
+    // `class Foo extends Bar {}` — Bar is an inherits/extends edge, NOT a
+    // references edge (avoid double-emit).
+    let src = r#"class Foo extends Bar {}"#;
+    let rels = extract_relations(src, "typescript").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Bar"),
+        "an extends-clause superclass must not be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_ts_implements_clause_does_not_emit_references_edge() {
+    // `class Foo implements Iface {}` — Iface is an implements edge, NOT a
+    // references edge.
+    let src = r#"class Foo implements Iface {}"#;
+    let rels = extract_relations(src, "typescript").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Iface"),
+        "an implements-clause interface must not be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_ts_predefined_types_do_not_emit_references_edge() {
+    // Primitives (string/number/boolean) parse as `predefined_type`, not
+    // `type_identifier`, so they are naturally excluded.
+    let src = r#"function f(x: number, y: string): boolean { return true; }"#;
+    let rels = extract_relations(src, "typescript").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
+            && matches!(r.target_name.as_str(), "number" | "string" | "boolean")),
+        "predefined primitive types must not emit references edges; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_ts_type_alias_rhs_emits_but_name_does_not() {
+    // `type Alias = Widget;` — the RHS `Widget` is a usage (emit), the alias
+    // name `Alias` is a declaration (skip).
+    let src = r#"type Alias = Widget;"#;
+    let rels = extract_relations(src, "typescript").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
+        "type-alias RHS Widget must emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Alias"),
+        "type-alias own name Alias must not self-reference; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+

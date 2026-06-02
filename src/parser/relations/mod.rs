@@ -31,6 +31,7 @@ mod inherits;
 mod exports;
 mod routes;
 mod rust;
+mod typescript;
 mod dart;
 
 /// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
@@ -60,6 +61,7 @@ use inherits::{extract_superclasses, extract_implements};
 use exports::extract_export_names;
 use routes::{extract_route_pattern, extract_python_route};
 use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference};
+use typescript::extract_ts_type_reference;
 use dart::{extract_dart_imports, extract_dart_calls};
 
 pub struct ParsedRelation {
@@ -195,6 +197,20 @@ fn walk_for_relations(
                 }
             }
             _ => {}
+        }
+    }
+
+    // Additive TS/TSX pass: emit a `references` edge for a type-position
+    // `type_identifier` (type annotation, return type, generic arg, field
+    // type). Runs before the `match kind` dispatch so it does not disturb
+    // existing arms; the extractor self-excludes the type's own definition
+    // name and heritage (extends/implements) types already covered by an
+    // inherits/implements edge. Gated to TS/TSX — JS has no type annotations
+    // so the node kind never appears there anyway, and `javascript` config
+    // would otherwise sweep value identifiers in non-type contexts.
+    if matches!(language, "typescript" | "tsx") && kind == "type_identifier" {
+        if let Some(r) = extract_ts_type_reference(&node, source, active_scope) {
+            results.push(r);
         }
     }
 
