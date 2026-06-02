@@ -22,7 +22,7 @@ pub const REL_REFERENCES: &str = "references";
 // nodes or edges for the same source files. The server will detect a mismatch
 // and automatically clear + rebuild the index.
 // This is separate from SCHEMA_VERSION (which tracks table structure changes).
-pub const INDEX_VERSION: i32 = 5;
+pub const INDEX_VERSION: i32 = 6;
 
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;
