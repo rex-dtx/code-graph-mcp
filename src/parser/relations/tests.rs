@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{REL_ROUTES_TO, REL_EXPORTS};
+use crate::domain::{REL_ROUTES_TO, REL_EXPORTS, REL_REFERENCES};
 
 #[test]
 fn test_extract_bash_call_relations() {
@@ -568,26 +568,46 @@ fn build() -> String {
 "#;
     let rels = extract_relations(src, "rust").unwrap();
     let has_ref = rels.iter().any(|r|
-        r.relation == crate::domain::REL_REFERENCES && r.target_name == "SHARED");
+        r.relation == REL_REFERENCES && r.target_name == "SHARED");
     assert!(has_ref, "expected a references edge to SHARED; got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
 
-    let src_call = r#"fn build() { crate::domain::compute(); }"#;
-    let rels2 = extract_relations(src_call, "rust").unwrap();
-    assert!(rels2.iter().any(|r| r.relation == REL_CALLS && r.target_name == "compute"),
-        "call must be a calls edge");
-    assert!(!rels2.iter().any(|r| r.relation == crate::domain::REL_REFERENCES && r.target_name == "compute"),
-        "a called fn must NOT also be a references edge");
+#[test]
+fn test_rust_path_reference_as_call_argument_emits_references_edge() {
+    // A path-qualified value passed as a call ARGUMENT (not the callee) is a
+    // real value usage and MUST still emit a references edge — distinct from
+    // the callee case, where the `function`-field path is already a calls edge.
+    let src = r#"fn f() { do_thing(crate::domain::CB); }"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "CB"),
+        "arg-position path must emit a references edge to CB; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
 
+#[test]
+fn test_rust_path_reference_call_callee_does_not_emit_references_edge() {
+    let src = r#"fn build() { crate::domain::compute(); }"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_CALLS && r.target_name == "compute"),
+        "call must be a calls edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "compute"),
+        "a called fn must NOT also be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_rust_path_reference_struct_expr_path_does_not_emit_references_edge() {
     // Path-qualified struct instantiation uses `scoped_type_identifier`, whose
     // inner segments are `scoped_identifier` nodes. They must NOT leak a
     // `references` edge to an intermediate path segment ("parser") — that path
     // is already covered by the `calls` edge to the struct ("NodeRecord").
-    let src_struct = r#"fn create() { let node = crate::parser::NodeRecord { name: 1 }; }"#;
-    let rels3 = extract_relations(src_struct, "rust").unwrap();
-    assert!(!rels3.iter().any(|r| r.relation == crate::domain::REL_REFERENCES),
+    let src = r#"fn create() { let node = crate::parser::NodeRecord { name: 1 }; }"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES),
         "struct-expr type path must not emit references edges; got: {:?}",
-        rels3.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
 
 #[test]
