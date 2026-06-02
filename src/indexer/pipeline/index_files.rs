@@ -537,8 +537,15 @@ pub(super) fn index_files(
                                     }
                                 }
                                 None => {
-                                    // Zero or multiple method candidates → ambiguous,
-                                    // drop without buffering (re-scan won't change it).
+                                    // Ambiguous → drop without buffering (re-scan
+                                    // won't change it). "Multiple" here covers BOTH
+                                    // shapes: (a) >1 cross-file methods with no
+                                    // same-file candidate, and (b) >1 same-file
+                                    // methods (two structs in one file each defining
+                                    // a method of this name) — the same-file>1 case
+                                    // is intentionally ambiguous, not resolved, since
+                                    // the receiver's type still can't pick between them.
+                                    // (a) is also reached for zero method candidates.
                                 }
                             }
                             continue;

@@ -446,3 +446,49 @@ fn receiver_call_with_ambiguous_method_name_stays_unresolved() {
         callers
     );
 }
+
+#[test]
+fn receiver_call_prefers_same_file_method_over_cross_file_ambiguity() {
+    // The `same_file_methods.len() == 1 && methods.len() > 1` branch: the
+    // method name `process` is defined on TWO structs in TWO files, so it is
+    // NOT globally unique. But the caller lives in the SAME file as struct A's
+    // method, so same-file preference resolves the receiver call to A.process
+    // and NOT to the cross-file B.process — even though >1 global candidates
+    // exist. (Without the same-file branch this would drop as ambiguous; with
+    // it, locality breaks the tie toward the in-file method.)
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "src/a.rs", r#"
+        pub struct A;
+        impl A {
+            pub fn process(&self) -> i32 { 1 }
+        }
+        pub fn caller(a: A) -> i32 {
+            a.process()
+        }
+    "#);
+    write(root, "src/b.rs", r#"
+        pub struct B;
+        impl B {
+            pub fn process(&self) -> i32 { 2 }
+        }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let a_callers = callers_of_in_file(&db, "process", "src/a.rs");
+    let b_callers = callers_of_in_file(&db, "process", "src/b.rs");
+    assert!(
+        a_callers.iter().any(|c| c.contains("caller")),
+        "A::process (same file as caller) should get the receiver-call edge; got: {:?}",
+        a_callers
+    );
+    assert!(
+        !b_callers.iter().any(|c| c.contains("caller")),
+        "B::process (cross-file) must NOT get the edge — same-file wins the tie; got: {:?}",
+        b_callers
+    );
+}
