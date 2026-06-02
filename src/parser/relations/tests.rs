@@ -1504,3 +1504,12 @@ fn make() -> Widget { todo!() }
         "a return-type usage of Widget must still emit a references edge; got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
+
+#[test]
+fn test_rust_inferred_type_placeholder_does_not_emit_references_edge() {
+    let src = r#"fn f() { let v: Vec<_> = items.collect::<Vec<_>>(); }"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "_"),
+        "inferred-type placeholder `_` must not emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}

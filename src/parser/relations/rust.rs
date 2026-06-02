@@ -126,7 +126,7 @@ pub(super) fn extract_rust_impl_trait(node: &tree_sitter::Node, source: &str) ->
 /// path `crate::parser::NodeRecord { .. }`) are excluded too — that usage is
 /// already covered by the `calls` edge to the struct/type name, so re-emitting a
 /// `references` edge to an intermediate path segment ("parser") would be a false
-/// positive.
+/// positive. `self`/`Self`/glob `*`/inferred-placeholder `_` names are skipped.
 pub(super) fn extract_rust_path_reference(
     node: &tree_sitter::Node,
     source: &str,
@@ -153,7 +153,8 @@ pub(super) fn extract_rust_path_reference(
     }
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(&name_node, source);
-    if name.is_empty() || name == "self" || name == "Self" || name == "*" {
+    // `_` added defensively (inferred-type placeholder) alongside self/Self/glob.
+    if name.is_empty() || name == "self" || name == "Self" || name == "*" || name == "_" {
         return None;
     }
     Some(ParsedRelation {
@@ -178,7 +179,9 @@ pub(super) fn extract_rust_path_reference(
 ///   `impl Trait for Foo`) — already an IMPLEMENTS edge, and a references edge
 ///   there would defeat dead-code detection (direct-parent `impl_item` only;
 ///   generic / path-qualified impl headers are a documented residual);
-/// - `Self`.
+/// - `Self`;
+/// - `_`, the inferred-type placeholder (`Vec<_>`, `collect::<Vec<_>>()`), which
+///   tree-sitter parses as a `type_identifier` but is not a real type usage.
 pub(super) fn extract_rust_type_reference(
     node: &tree_sitter::Node,
     source: &str,
@@ -230,7 +233,12 @@ pub(super) fn extract_rust_type_reference(
         }
     }
     let name = node_text(node, source);
-    if name.is_empty() || name == "Self" {
+    // `_` is the inferred-type placeholder (`Vec<_>`, `collect::<Vec<_>>()`),
+    // which tree-sitter parses as a `type_identifier`. It is not a real type
+    // usage; emitting a `references` edge to "_" piles every occurrence onto
+    // whatever node happens to be named "_" (e.g. the `const _: () = assert!(..)`
+    // guard), inflating its caller/impact counts with phantom edges.
+    if name.is_empty() || name == "Self" || name == "_" {
         return None;
     }
     Some(ParsedRelation {
