@@ -159,19 +159,17 @@ fn main() -> Result<()> {
         Some("adopt") => run_node_script("adopt.js", &[]),
         Some("unadopt") => run_node_script("adopt.js", &["unadopt".to_string()]),
         Some("snapshot") => {
-            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
-            match sub {
-                "create" => {
+            // clap-migrated (audit #4): nested #[command(subcommand)] replaces the
+            // hand-rolled args[2]/args[3] dispatch. clap owns the no-subcommand and
+            // unknown-subcommand errors (exit 2). `inspect` stays project-root-free.
+            let snapshot_args = code_graph_mcp::cli::SnapshotArgs::parse_from(args.iter().skip(1));
+            match snapshot_args.command {
+                code_graph_mcp::cli::SnapshotCommand::Create(create_args) => {
                     let project_root = code_graph_mcp::cli::resolve_project_root()?;
-                    code_graph_mcp::cli::cmd_snapshot_create(&project_root, &args)
+                    code_graph_mcp::cli::cmd_snapshot_create(&project_root, create_args)
                 }
-                "inspect" => code_graph_mcp::cli::cmd_snapshot_inspect(&args),
-                _ => {
-                    eprintln!("Usage:");
-                    eprintln!("  snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]");
-                    eprintln!("                  (auto-zstd when --out ends in .db.zst)");
-                    eprintln!("  snapshot inspect <file>          (accepts .db or .db.zst)");
-                    std::process::exit(2);
+                code_graph_mcp::cli::SnapshotCommand::Inspect(inspect_args) => {
+                    code_graph_mcp::cli::cmd_snapshot_inspect(inspect_args)
                 }
             }
         }

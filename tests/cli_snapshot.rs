@@ -62,3 +62,48 @@ fn cli_snapshot_inspect_missing_file_exits_nonzero() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+// clap-migrated (audit #4 Step 4): `snapshot` is now a nested #[command(subcommand)].
+// clap owns --help for the parent and each sub, plus no-subcommand /
+// unknown-subcommand rejection (exit 2), replacing the hand-rolled args[2]/args[3]
+// dispatch. These lock the new surface and guard against internal-note leak.
+
+const INTERNAL_TOKENS: &[&str] = &["audit #", "clap-migrat", "args[3]", "hand-rolled"];
+
+#[test]
+fn cli_snapshot_help_lists_subcommands_no_leak() {
+    let out = Command::new(cli_bin()).args(["snapshot", "--help"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "snapshot --help should exit 0");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("create") && s.contains("inspect"),
+        "parent help must list both subcommands; got: {s}");
+    let low = s.to_lowercase();
+    for tok in INTERNAL_TOKENS {
+        assert!(!low.contains(&tok.to_lowercase()), "snapshot --help leaked {tok:?}; got: {s}");
+    }
+}
+
+#[test]
+fn cli_snapshot_create_help_shows_out_no_leak() {
+    let out = Command::new(cli_bin()).args(["snapshot", "create", "--help"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "snapshot create --help should exit 0");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("--out"), "create help must show --out; got: {s}");
+    let low = s.to_lowercase();
+    for tok in INTERNAL_TOKENS {
+        assert!(!low.contains(&tok.to_lowercase()), "snapshot create --help leaked {tok:?}; got: {s}");
+    }
+}
+
+#[test]
+fn cli_snapshot_no_subcommand_exits_2() {
+    // clap requires a subcommand (was: hand-rolled Usage + exit 2).
+    let out = Command::new(cli_bin()).args(["snapshot"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "snapshot with no subcommand must exit 2");
+}
+
+#[test]
+fn cli_snapshot_unknown_subcommand_exits_2() {
+    let out = Command::new(cli_bin()).args(["snapshot", "bogus"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "unknown snapshot subcommand must exit 2");
+}

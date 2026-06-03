@@ -96,6 +96,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
         "map", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
+        "snapshot",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");

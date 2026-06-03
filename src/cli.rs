@@ -4,7 +4,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::domain::CODE_GRAPH_DIR;
 use crate::storage::db::Database;
@@ -3614,15 +3614,56 @@ pub fn cmd_benchmark(project_root: &Path, args: BenchmarkArgs) -> Result<()> {
     Ok(())
 }
 
-/// `snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]`
-pub fn cmd_snapshot_create(project_root: &Path, args: &[String]) -> Result<()> {
-    let out = get_flag_value(args, "--out")
-        .ok_or_else(|| anyhow::anyhow!("--out <path> is required"))?
-        .to_string();
-    let include = has_flag(args, "--include-embeddings");
-    let quiet = has_flag(args, "--quiet");
+// --- snapshot subcommand (nested create/inspect) ---
 
-    let root = get_flag_value(args, "--root")
+/// CLI arguments for the `snapshot` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp snapshot",
+          about = "Build or inspect a portable graph snapshot")]
+pub struct SnapshotArgs {
+    #[command(subcommand)]
+    pub command: SnapshotCommand,
+}
+
+/// `snapshot` sub-subcommands (replaces the hand-rolled args[2]/args[3] dispatch).
+#[derive(Subcommand, Debug)]
+pub enum SnapshotCommand {
+    /// Build a portable graph snapshot (auto zstd when --out ends in .db.zst)
+    Create(SnapshotCreateArgs),
+    /// Print snapshot metadata as JSON (accepts .db or .db.zst)
+    Inspect(SnapshotInspectArgs),
+}
+
+/// `snapshot create` arguments.
+#[derive(Parser, Debug)]
+pub struct SnapshotCreateArgs {
+    /// Output path (auto zstd-compresses when it ends in .db.zst)
+    #[arg(long)]
+    pub out: String,
+    /// Include embedding vectors in the snapshot
+    #[arg(long)]
+    pub include_embeddings: bool,
+    /// Project root to snapshot (default: the resolved project root)
+    #[arg(long)]
+    pub root: Option<String>,
+    /// Suppress the "snapshot created" confirmation
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+/// `snapshot inspect` arguments.
+#[derive(Parser, Debug)]
+pub struct SnapshotInspectArgs {
+    /// Snapshot file to inspect (.db or .db.zst; format from magic bytes)
+    pub file: String,
+}
+
+/// Build a portable graph snapshot. `snapshot create --out <path>
+/// [--include-embeddings] [--root <dir>] [--quiet]`.
+pub fn cmd_snapshot_create(project_root: &Path, args: SnapshotCreateArgs) -> Result<()> {
+    let SnapshotCreateArgs { out, include_embeddings: include, root, quiet } = args;
+
+    let root = root
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| project_root.to_path_buf());
 
@@ -3658,19 +3699,10 @@ pub fn cmd_snapshot_create(project_root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `snapshot inspect <file>` — JSON output to stdout. Accepts `.db` or `.db.zst`
+/// Print snapshot metadata as JSON to stdout. Accepts `.db` or `.db.zst`
 /// (format detected from magic bytes, not extension).
-pub fn cmd_snapshot_inspect(args: &[String]) -> Result<()> {
-    // get_positional skips args[0] (binary) and args[1] (subcommand) internally;
-    // for `snapshot inspect <file>` the dispatch happens at args[1]="snapshot",
-    // args[2]="inspect", so <file> is the first positional after the subcommand
-    // pair — but get_positional's skip-2 treats args[1] as the single subcommand.
-    // We therefore pass args starting from "inspect" as the subcommand context by
-    // reading args[3] directly (binary=0, "snapshot"=1, "inspect"=2, file=3).
-    let file = args
-        .get(3)
-        .ok_or_else(|| anyhow::anyhow!("snapshot inspect <file> required (.db or .db.zst)"))?;
-    let meta = crate::snapshot::inspect(std::path::Path::new(file))?;
+pub fn cmd_snapshot_inspect(args: SnapshotInspectArgs) -> Result<()> {
+    let meta = crate::snapshot::inspect(std::path::Path::new(&args.file))?;
     println!("{}", serde_json::to_string_pretty(&meta)?);
     Ok(())
 }
