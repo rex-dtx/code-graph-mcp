@@ -102,7 +102,8 @@ fn main() -> Result<()> {
         }
         Some("map" | "project_map") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_map(&project_root, &args)
+            let map_args = code_graph_mcp::cli::MapArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_map(&project_root, map_args)
         }
         Some("overview" | "module_overview") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

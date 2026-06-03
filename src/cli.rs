@@ -1982,6 +1982,21 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// --- map subcommand ---
+
+/// CLI arguments for the `map` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp map",
+          about = "Project architecture map (modules, deps, entry points)")]
+pub struct MapArgs {
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Compact output (top modules/deps/hot functions only)
+    #[arg(long)]
+    pub compact: bool,
+}
+
 /// Project map — aider repo-map style.
 ///
 /// Output format:
@@ -1989,9 +2004,9 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
 /// src/mcp/server.rs (158KB, 98 symbols)
 ///   McpServer: handle_tool_call, process_message, flush_metrics
 /// ```
-pub fn cmd_map(project_root: &Path, args: &[String]) -> Result<()> {
-    let json_mode = has_flag(args, "--json");
-    let compact = has_flag(args, "--compact");
+pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
+    let json_mode = args.json;
+    let compact = args.compact;
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
