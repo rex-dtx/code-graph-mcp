@@ -319,6 +319,81 @@ fn test_cli_impact_json() {
 }
 
 // ============================================================
+// same-file overload ambiguity (audit 2026-06-03 #6)
+// ============================================================
+
+/// Index a project with two non-test `fn new()` in the *same* file (distinct
+/// impl blocks). `file_path` cannot disambiguate these — only `node_id` can.
+fn setup_same_file_overload_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    std::fs::write(project.path().join("lib.rs"), r#"
+pub struct Foo;
+pub struct Bar;
+
+impl Foo {
+    pub fn new() -> Self { Foo }
+}
+
+impl Bar {
+    pub fn new() -> Self { Bar }
+}
+
+pub fn make_them() {
+    let _ = Foo::new();
+    let _ = Bar::new();
+}
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+// Regression (audit #6): a bare name with ≥2 non-test definitions in the SAME
+// file must be flagged ambiguous, matching MCP `get_call_graph`. Before the fix
+// the CLI gated ambiguity on distinct *files*, so same-file overloads silently
+// merged the call graphs of two distinct `new` functions (exit 0, wrong answer).
+#[test]
+fn test_cli_callgraph_same_file_overload_is_ambiguous() {
+    let project = setup_same_file_overload_project();
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "new"]);
+    assert_eq!(code, 1, "same-file overload `new` must error, not silently merge; stderr={stderr:?}");
+    assert!(stderr.contains("Ambiguous symbol 'new'"),
+        "should report ambiguity; got: {stderr:?}");
+    // The guidance must be accurate for same-file overloads: file_path can't
+    // split them, so point at the node_id-capable tools instead.
+    assert!(stderr.contains("same file") && stderr.contains("node-id"),
+        "same-file message must mention 'same file' + a node-id path; got: {stderr:?}");
+}
+
+#[test]
+fn test_cli_callgraph_same_file_overload_is_ambiguous_json() {
+    let project = setup_same_file_overload_project();
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "new", "--json"]);
+    assert_eq!(code, 1, "same-file overload must error in --json mode too");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(v["error"].as_str().unwrap_or("").contains("Ambiguous"),
+        "json error field should report ambiguity; got: {stdout}");
+    let sugg = v["suggestions"].as_array().expect("suggestions array");
+    assert!(sugg.len() >= 2, "expected ≥2 node_id suggestions; got: {stdout}");
+    for s in sugg {
+        assert!(s["node_id"].as_i64().is_some(), "suggestion needs node_id: {s}");
+        assert!(s["start_line"].as_i64().is_some(), "suggestion needs start_line: {s}");
+    }
+}
+
+#[test]
+fn test_cli_impact_same_file_overload_is_ambiguous() {
+    let project = setup_same_file_overload_project();
+    let (_, stderr, code) = run_cli(&project, &["impact", "new"]);
+    assert_eq!(code, 1, "same-file overload `new` must error in impact, not merge callers; stderr={stderr:?}");
+    assert!(stderr.contains("Ambiguous symbol 'new'"),
+        "should report ambiguity; got: {stderr:?}");
+}
+
+// ============================================================
 // show
 // ============================================================
 

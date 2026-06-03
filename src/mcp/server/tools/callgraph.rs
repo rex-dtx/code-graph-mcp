@@ -98,14 +98,16 @@ impl McpServer {
             self.ensure_file_fresh_opt(file_path)?;
         }
 
-        // Disambiguate: if no file_path provided, check if symbol matches multiple distinct nodes
+        // Disambiguate: if no file_path provided, check if symbol matches multiple
+        // distinct nodes (cross-file OR same-file overloads). Message + suggestion
+        // shape are shared with the CLI via crate::resolve (audit #6).
         if file_path.is_none() {
-            if let Some(suggestions) = self.disambiguate_symbol(function_name)? {
+            if let Some(cands) = self.disambiguate_symbol(function_name)? {
                 return Ok(json!({
                     "function": function_name,
                     "direction": direction,
-                    "error": format!("Ambiguous symbol '{}': {} matches in different files. Specify file_path to disambiguate.", function_name, suggestions.len()),
-                    "suggestions": suggestions,
+                    "error": crate::resolve::ambiguity_message(function_name, &cands, crate::resolve::Surface::Mcp),
+                    "suggestions": crate::resolve::candidates_to_json(&cands),
                 }));
             }
         }

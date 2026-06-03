@@ -5,6 +5,7 @@ pub mod graph;
 pub mod indexer;
 pub mod mcp;
 pub mod parser;
+pub mod resolve;
 pub mod sandbox;
 pub mod snapshot;
 pub mod search;

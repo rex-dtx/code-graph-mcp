@@ -334,55 +334,23 @@ fn resolve_fuzzy_name_cli(conn: &rusqlite::Connection, name: &str) -> Result<Cli
     Ok(CliFuzzyResolution::NotFound)
 }
 
-/// Detect exact-name ambiguity: ≥2 non-test definitions of `name` in distinct files.
-/// Returns suggestion candidates when ambiguous; None for unique-match or not-found
-/// (downstream commands emit their own not-found messages). Mirrors the disambiguate
-/// guard in MCP `tool_get_call_graph` so bare-name CLI queries like `impact open`
-/// don't silently merge callers of two distinct `open` functions.
-fn detect_exact_ambiguity(
-    conn: &rusqlite::Connection,
-    name: &str,
-) -> Result<Option<Vec<queries::NameCandidate>>> {
-    let with_files = queries::get_nodes_with_files_by_name(conn, name)?;
-    let non_test: Vec<queries::NameCandidate> = with_files.iter()
-        .filter(|nf| !crate::domain::is_test_symbol(&nf.node.name, &nf.file_path))
-        .map(|nf| queries::NameCandidate {
-            name: nf.node.name.clone(),
-            file_path: nf.file_path.clone(),
-            node_type: nf.node.node_type.clone(),
-            node_id: nf.node.id,
-            start_line: nf.node.start_line,
-        })
-        .collect();
-    // Treat multiple definitions in the *same* file (e.g. overloads) as non-ambiguous;
-    // distinct files are the user-actionable case (needs --file/--node-id).
-    let distinct_files: std::collections::HashSet<&str> =
-        non_test.iter().map(|c| c.file_path.as_str()).collect();
-    if distinct_files.len() > 1 {
-        return Ok(Some(non_test));
-    }
-    Ok(None)
-}
-
 /// Emit the "ambiguous symbol" error in the same shape whether the command was
 /// invoked with --json (one-line JSON) or default (human-readable stderr lines),
-/// then exit(1). Shared by cmd_callgraph, cmd_impact when file_filter is None
-/// and detect_exact_ambiguity returned candidates.
+/// then exit(1). Shared by cmd_callgraph, cmd_impact when no file filter was
+/// given and `crate::resolve::detect_ambiguity` returned candidates. The message
+/// and JSON suggestion shape come from `crate::resolve` so the CLI and MCP give
+/// identical verdicts on same-file overloads (audit 2026-06-03 #6).
 fn emit_exact_ambiguity(symbol: &str, cands: &[queries::NameCandidate], json_mode: bool) -> ! {
+    let message = crate::resolve::ambiguity_message(symbol, cands, crate::resolve::Surface::Cli);
     if json_mode {
-        let sugg: Vec<serde_json::Value> = cands.iter().take(5).map(|c| serde_json::json!({
-            "name": c.name,
-            "file_path": c.file_path,
-            "type": c.node_type,
-            "node_id": c.node_id,
-            "start_line": c.start_line,
-        })).collect();
+        let sugg: Vec<serde_json::Value> =
+            crate::resolve::candidates_to_json(cands).into_iter().take(5).collect();
         println!("{}", serde_json::json!({
-            "error": format!("Ambiguous symbol '{}': {} matches in different files. Specify --file or --node-id to disambiguate.", symbol, cands.len()),
+            "error": message,
             "suggestions": sugg,
         }));
     } else {
-        eprintln!("[code-graph] Ambiguous symbol '{}': {} matches in different files. Specify --file or --node-id:", symbol, cands.len());
+        eprintln!("[code-graph] {}", message);
         for c in cands.iter().take(5) {
             eprintln!("  {} ({}) in {} [node_id {}]", c.name, c.node_type, c.file_path, c.node_id);
         }
@@ -1580,10 +1548,11 @@ pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
     let (symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
     let file_filter = explicit_file.or(resolved_file.as_deref());
 
-    // Exact-name ambiguity guard: bare name with ≥2 non-test definitions in different
-    // files would silently merge call graphs. Prompt for --file before running query.
+    // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
+    // (cross-file OR same-file overloads) would silently merge call graphs.
+    // Shared with MCP via crate::resolve so both surfaces agree (audit #6).
     if file_filter.is_none() {
-        if let Some(cands) = detect_exact_ambiguity(conn, symbol)? {
+        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
     }
@@ -1830,10 +1799,11 @@ pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Exact-name ambiguity guard: bare name with ≥2 non-test definitions in different
-    // files would silently merge callers across both, misreporting risk/blast radius.
+    // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
+    // (cross-file OR same-file overloads) would silently merge callers across
+    // both, misreporting risk/blast radius. Shared with MCP via crate::resolve.
     if file_filter.is_none() {
-        if let Some(cands) = detect_exact_ambiguity(conn, symbol)? {
+        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
     }

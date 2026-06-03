@@ -152,14 +152,16 @@ impl McpServer {
             .clamp(1, 20) as i32;
         let file_path = args.get("file_path").and_then(|v| v.as_str());
 
-        // Disambiguate: check if symbol matches multiple distinct nodes in different files
+        // Disambiguate: check if symbol matches multiple distinct nodes (cross-file
+        // OR same-file overloads). Message + suggestion shape shared with the CLI
+        // and get_call_graph via crate::resolve (audit #6).
         if file_path.is_none() {
-            if let Some(suggestions) = self.disambiguate_symbol(symbol_name)? {
+            if let Some(cands) = self.disambiguate_symbol(symbol_name)? {
                 return Ok(json!({
                     "symbol": symbol_name,
                     "change_type": change_type,
-                    "error": format!("Ambiguous symbol '{}': {} matches in different files. Cannot assess impact without disambiguation.", symbol_name, suggestions.len()),
-                    "suggestions": suggestions,
+                    "error": crate::resolve::ambiguity_message(symbol_name, &cands, crate::resolve::Surface::Mcp),
+                    "suggestions": crate::resolve::candidates_to_json(&cands),
                 }));
             }
         }

@@ -942,30 +942,19 @@ impl McpServer {
         }
     }
 
-    /// Check if a symbol name is ambiguous (multiple non-test definitions).
-    /// Fires on both cross-file collisions AND same-file multi-definitions
-    /// (e.g. two `fn new()` in one module for different impl blocks) — the
-    /// latter needs `node_id`/`start_line` to disambiguate because `file_path`
-    /// alone doesn't uniquely identify the target.
-    /// Returns Some(suggestions) if ambiguous, None if unambiguous or not found.
-    pub(super) fn disambiguate_symbol(&self, name: &str) -> Result<Option<Vec<serde_json::Value>>> {
-        let candidates = queries::get_nodes_with_files_by_name(self.db.conn(), name)?;
-        let non_test: Vec<_> = candidates.iter()
-            .filter(|nf| !is_test_symbol(&nf.node.name, &nf.file_path))
-            .collect();
-        if non_test.len() > 1 {
-            let suggestions: Vec<_> = non_test.iter().map(|nf| {
-                json!({
-                    "name": &nf.node.name,
-                    "file_path": &nf.file_path,
-                    "type": &nf.node.node_type,
-                    "node_id": nf.node.id,
-                    "start_line": nf.node.start_line,
-                })
-            }).collect();
-            return Ok(Some(suggestions));
-        }
-        Ok(None)
+    /// Check if a symbol name is ambiguous (≥2 non-test definitions). Fires on
+    /// both cross-file collisions AND same-file multi-definitions (e.g. two
+    /// `fn new()` in one module for different impl blocks) — the latter needs
+    /// `node_id`/`start_line` to disambiguate because `file_path` alone doesn't
+    /// uniquely identify the target. Delegates to `crate::resolve::detect_ambiguity`
+    /// so the MCP and CLI surfaces share one verdict (audit 2026-06-03 #6).
+    /// Returns the candidate definitions if ambiguous, None otherwise. Use
+    /// `crate::resolve::{ambiguity_message, candidates_to_json}` to render them.
+    pub(super) fn disambiguate_symbol(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<crate::storage::queries::NameCandidate>>> {
+        crate::resolve::detect_ambiguity(self.db.conn(), name)
     }
 
     pub fn db(&self) -> &Database {
