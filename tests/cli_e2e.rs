@@ -95,7 +95,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     let internal_tokens = ["audit #", "clap-migrat", "resolved_format", "plan §", "issue #"];
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
-        "map", "grep", "overview", "dead-code",
+        "map", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -234,6 +234,33 @@ fn test_cli_search_limit() {
     let (stdout, _, _) = run_cli(&project, &["search", "function", "--limit", "2"]);
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     assert!(lines.len() <= 2, "should respect --limit, got {} lines", lines.len());
+}
+
+// clap-migrated (audit #4): clap owns --help + unknown-flag rejection; --top-k is
+// a hidden alias of --limit; the non-empty query guard is preserved in the handler.
+#[test]
+fn test_cli_search_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["search", "--help"]);
+    assert_eq!(code, 0, "search --help should exit 0 (clap help)");
+    assert!(stdout.contains("FTS5") || stdout.contains("QUERY"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_search_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["search", "validateToken", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
+#[test]
+fn test_cli_search_top_k_alias_matches_limit() {
+    let project = setup_indexed_project();
+    let (out_limit, _, code_limit) = run_cli(&project, &["search", "function", "--limit", "2", "--json"]);
+    let (out_topk, _, code_topk) = run_cli(&project, &["search", "function", "--top-k", "2", "--json"]);
+    assert_eq!(code_limit, code_topk, "--top-k must mirror --limit exit code");
+    assert_eq!(out_limit.trim(), out_topk.trim(), "--top-k 2 must equal --limit 2");
 }
 
 // ============================================================
@@ -913,6 +940,25 @@ fn test_cli_deps_json() {
     assert!(v["depended_by"].is_array());
 }
 
+// clap-migrated (audit #4): clap owns --help + unknown-flag rejection. --direction
+// stays a String validated in-handler, so test_cli_deps_invalid_direction's exact
+// "must be one of" + exit-1 contract survives (a clap ValueEnum would change both).
+#[test]
+fn test_cli_deps_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["deps", "--help"]);
+    assert_eq!(code, 0, "deps --help should exit 0 (clap help)");
+    assert!(stdout.contains("dependency graph") || stdout.contains("--direction"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_deps_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["deps", "src/api.ts", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
 // ============================================================
 // ast-search
 // ============================================================
@@ -945,6 +991,36 @@ fn test_cli_ast_search_invalid_type() {
     assert!(stderr.contains("Unknown type filter"), "should explain the typo; got: {stderr}");
 }
 
+// clap-migrated (audit #4): clap owns --help + unknown-flag rejection; the
+// query-or-filter requirement stays a handler bail (exit 1), and clap accepts an
+// empty-string positional so `ast-search ""` still hits that handler check.
+#[test]
+fn test_cli_ast_search_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["ast-search", "--help"]);
+    assert_eq!(code, 0, "ast-search --help should exit 0 (clap help)");
+    assert!(stdout.contains("Structured search") || stdout.contains("--returns"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_ast_search_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["ast-search", "--type", "fn", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
+#[test]
+fn test_cli_ast_search_no_query_no_filter_errors() {
+    // Neither a query nor any filter → handler bail (exit 1 + Usage), NOT a clap
+    // required-arg error: the positional is optional, the requirement is semantic.
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["ast-search"]);
+    assert_eq!(code, 1, "no query and no filter must exit 1; stderr={stderr:?}");
+    assert!(stderr.contains("Usage:") || stderr.contains("at least one filter"),
+        "should explain query-or-filter requirement; got: {stderr:?}");
+}
+
 #[test]
 fn test_cli_overview_empty_path_errors() {
     // Regression: overview "" used to be silently treated like overview "."
@@ -975,6 +1051,31 @@ fn test_cli_trace_no_routes() {
     let (_, stderr, code) = run_cli(&project, &["trace", "/api/login"]);
     assert_eq!(code, 1);
     assert!(stderr.contains("No routes matching"), "should report no routes found");
+}
+
+// clap-migrated (audit #4): clap owns --help + unknown-flag rejection.
+#[test]
+fn test_cli_trace_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["trace", "--help"]);
+    assert_eq!(code, 0, "trace --help should exit 0 (clap help)");
+    assert!(stdout.contains("Trace HTTP") || stdout.contains("--no-middleware"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+// User-approved migration decision (audit #4): --no-middleware is the real flag
+// (middleware shown by default); the previously-advertised-but-ignored phantom
+// --include-middleware is dropped, so it now errors like any stray flag.
+#[test]
+fn test_cli_trace_no_middleware_accepted_include_middleware_rejected() {
+    let project = setup_indexed_project();
+    // --no-middleware is accepted: same no-routes exit 1 as the bare invocation
+    // (NOT a clap unknown-flag exit 2).
+    let (_, _, code_no) = run_cli(&project, &["trace", "/api/nonexistent", "--no-middleware"]);
+    assert_eq!(code_no, 1, "--no-middleware must be accepted (no-routes exit 1, not unknown-flag 2)");
+    // --include-middleware is the dropped phantom: clap unknown-flag exit 2.
+    let (_, _, code_inc) = run_cli(&project, &["trace", "/api/nonexistent", "--include-middleware"]);
+    assert_eq!(code_inc, 2, "dropped phantom --include-middleware must error as unknown flag");
 }
 
 // ============================================================

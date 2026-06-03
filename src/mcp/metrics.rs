@@ -41,6 +41,11 @@ impl ErrKind {
             Self::NotFound
         } else if err_msg.contains("must not be empty")
             || err_msg.contains("Must pass")
+            // NOTE: classify() only runs on MCP tool-call errors (handle_tool in
+            // server/mod.rs). MCP handlers emit "must not be empty"/"Must pass"; the
+            // CLI's "Usage:" errors go anyhow→main()→exit, never through here. So the
+            // CLI clap migration (audit #4) does NOT change usage.jsonl bucketing — the
+            // "Usage:" arm below is defensive only and never fires in the MCP path.
             || err_msg.starts_with("Usage:")
         {
             Self::EmptyInput

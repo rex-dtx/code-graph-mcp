@@ -1261,26 +1261,54 @@ fn find_containing_node_in(
     })
 }
 
+// --- search subcommand ---
+
+/// CLI arguments for the `search` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp search",
+          about = "FTS5 text search by concept (CLI is FTS-only; MCP adds vector+RRF fusion)")]
+pub struct SearchArgs {
+    /// Search query (concept keywords)
+    pub query: String,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Compact output
+    #[arg(long)]
+    pub compact: bool,
+    /// Filter by language
+    #[arg(long)]
+    pub language: Option<String>,
+    /// Filter by node type: fn, class, struct, enum, trait, type, const, var
+    #[arg(long = "node-type")]
+    pub node_type: Option<String>,
+    // --limit and --top-k are the same arg (alias); supplying both is a clap
+    // duplicate-arg error. clamp(1,100) stays in the handler; clap parse-errors
+    // (exit 2) on a non-numeric value, replacing the old warn+fallback.
+    /// Limit results (default: 20, max: 100); alias: --top-k
+    #[arg(long, alias = "top-k")]
+    pub limit: Option<i64>,
+}
+
 /// FTS5 semantic search.
 ///
 /// Output format:
 /// ```text
 /// fn McpServer::handle_tool_call  src/mcp/server.rs:350-420  (name: &str, params: Value) -> Result<Value>
 /// ```
-pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
-    let query = get_positional(args, 0)
-        .filter(|q| !q.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Usage: code-graph-mcp search <query> [--json] [--limit N] [--top-k N] [--language <lang>] [--compact]"))?;
+pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
+    // clap accepts an empty-string positional (e.g. an unset `search "$X"`);
+    // preserve the non-empty query guard with the exact Usage string.
+    let query = args.query.as_str();
+    if query.is_empty() {
+        anyhow::bail!("Usage: code-graph-mcp search <query> [--json] [--limit N] [--top-k N] [--language <lang>] [--compact]");
+    }
 
-    let json_mode = has_flag(args, "--json");
-    let compact = has_flag(args, "--compact");
-    let language_filter = get_flag_value(args, "--language");
-    let node_type_filter = get_flag_value(args, "--node-type");
-    let limit: i64 = if get_flag_value(args, "--limit").is_some() {
-        parse_flag_or(args, "--limit", 20_i64)
-    } else {
-        parse_flag_or(args, "--top-k", 20_i64)
-    }.clamp(1, 100);
+    let json_mode = args.json;
+    let compact = args.compact;
+    let language_filter = args.language.as_deref();
+    let node_type_filter = args.node_type.as_deref();
+    let limit: i64 = args.limit.unwrap_or(20).clamp(1, 100);
 
     // Validate --node-type up-front: unknown alias normalizes to an empty Vec
     // and silently filters every node away (see ast-search same fix).
@@ -1417,17 +1445,45 @@ pub fn cmd_search(project_root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// --- ast-search subcommand ---
+
+/// CLI arguments for the `ast-search` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp ast-search",
+          about = "Structured search with --type/--returns/--params filters")]
+pub struct AstSearchArgs {
+    /// Search query (optional if a --type/--returns/--params filter is given)
+    pub query: Option<String>,
+    /// Filter by node type: fn, class, struct, enum, trait, type, const, var
+    #[arg(long = "type")]
+    pub type_filter: Option<String>,
+    /// Filter by return type
+    #[arg(long)]
+    pub returns: Option<String>,
+    /// Filter by parameter text
+    #[arg(long)]
+    pub params: Option<String>,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Limit results (default: 20, max: 100)
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
 /// Structured AST search: FTS5 + column filtering.
 ///
 /// Flags: --type <type>, --returns <type>, --params <text>
-pub fn cmd_ast_search(project_root: &Path, args: &[String]) -> Result<()> {
-    let query = get_positional(args, 0).filter(|q| !q.is_empty());
+pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
+    // clap accepts an empty-string positional; treat "" as "no query" (the old
+    // .filter(|q| !q.is_empty())) so the query-or-filter requirement still fires.
+    let query = args.query.as_deref().filter(|q| !q.is_empty());
 
-    let type_filter = get_flag_value(args, "--type");
-    let returns_filter = get_flag_value(args, "--returns");
-    let params_filter = get_flag_value(args, "--params");
-    let json_mode = has_flag(args, "--json");
-    let limit: usize = parse_flag_or(args, "--limit", 20_usize).clamp(1, 100);
+    let type_filter = args.type_filter.as_deref();
+    let returns_filter = args.returns.as_deref();
+    let params_filter = args.params.as_deref();
+    let json_mode = args.json;
+    let limit: usize = args.limit.unwrap_or(20).clamp(1, 100);
 
     // Require either a query or at least one structural filter
     let has_filters = type_filter.is_some() || returns_filter.is_some() || params_filter.is_some();
@@ -2560,18 +2616,44 @@ fn read_source_context(project_root: &Path, file_path: &str, start_line: i64, en
     Some(collected.join("\n"))
 }
 
+// --- trace subcommand ---
+
+/// CLI arguments for the `trace` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp trace",
+          about = "Trace HTTP route → handler → downstream calls")]
+pub struct TraceArgs {
+    /// Route to trace (e.g. "/api/login" or "POST /api/login")
+    pub route: String,
+    // clamp(1,20) stays in the handler; clap parse-errors (exit 2) on non-numeric.
+    /// Max traversal depth
+    #[arg(long, default_value_t = 3)]
+    pub depth: i32,
+    // The old usage string advertised a phantom --include-middleware that the code
+    // never read; --no-middleware is the real flag (middleware shown by default).
+    // Migration drops the phantom and advertises --no-middleware (user-approved,
+    // audit #4); --include-middleware now errors like any other stray flag.
+    /// Hide downstream middleware/calls (shown by default)
+    #[arg(long)]
+    pub no_middleware: bool,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Trace HTTP route → handler → downstream calls.
 /// CLI equivalent of MCP `trace_http_chain`.
-pub fn cmd_trace(project_root: &Path, args: &[String]) -> Result<()> {
-    let route_path = get_positional(args, 0)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp trace <route> [--depth N] [--include-middleware] [--json]"
-        ))?;
+pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
+    // clap requires the positional (missing → exit 2) but accepts ""; keep the
+    // non-empty guard with a Usage string (now advertising --no-middleware).
+    let route_path = args.route.as_str();
+    if route_path.is_empty() {
+        anyhow::bail!("Usage: code-graph-mcp trace <route> [--depth N] [--no-middleware] [--json]");
+    }
 
-    let depth: i32 = parse_flag_or(args, "--depth", 3_i32).clamp(1, 20);
-    let json_mode = has_flag(args, "--json");
-    let include_middleware = !has_flag(args, "--no-middleware");
+    let depth: i32 = args.depth.clamp(1, 20);
+    let json_mode = args.json;
+    let include_middleware = !args.no_middleware;
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -2730,22 +2812,50 @@ fn scan_barrel_patterns(project_root: &Path, file_path: &str) -> Option<Vec<(usi
     if hits.is_empty() { None } else { Some(hits) }
 }
 
-pub fn cmd_deps(project_root: &Path, args: &[String]) -> Result<()> {
-    let raw_file_path = get_positional(args, 0)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp deps <file> [--direction outgoing|incoming|both] [--depth N] [--json]"
-        ))?;
+// --- deps subcommand ---
+
+/// CLI arguments for the `deps` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp deps",
+          about = "File-level dependency graph")]
+pub struct DepsArgs {
+    /// File whose dependencies to show (absolute paths under root OK)
+    pub file: String,
+    // --direction stays a String validated in-handler (not a clap ValueEnum) so
+    // the exact "must be one of" message + exit 1 are preserved for callers.
+    /// Direction: outgoing, incoming, or both
+    #[arg(long, default_value = "both")]
+    pub direction: String,
+    // clamp(1,10) stays in the handler; clap parse-errors (exit 2) on non-numeric.
+    /// Max traversal depth
+    #[arg(long, default_value_t = 2)]
+    pub depth: i32,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Compact output
+    #[arg(long)]
+    pub compact: bool,
+}
+
+/// File-level dependency graph. CLI equivalent of MCP `dependency_graph`.
+pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
+    // clap requires the positional (missing → exit 2) but accepts ""; keep the
+    // non-empty guard with the exact Usage string.
+    let raw_file_path = args.file.as_str();
+    if raw_file_path.is_empty() {
+        anyhow::bail!("Usage: code-graph-mcp deps <file> [--direction outgoing|incoming|both] [--depth N] [--json]");
+    }
     let file_path_owned = normalize_user_path(project_root, raw_file_path)?;
     let file_path = file_path_owned.as_str();
 
-    let direction = get_flag_value(args, "--direction").unwrap_or("both");
+    let direction = args.direction.as_str();
     if !matches!(direction, "outgoing" | "incoming" | "both") {
         anyhow::bail!("--direction must be one of: outgoing, incoming, both");
     }
-    let depth: i32 = parse_flag_or(args, "--depth", 2_i32).clamp(1, 10);
-    let json_mode = has_flag(args, "--json");
-    let compact = has_flag(args, "--compact");
+    let depth: i32 = args.depth.clamp(1, 10);
+    let json_mode = args.json;
+    let compact = args.compact;
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();

@@ -87,11 +87,13 @@ fn main() -> Result<()> {
         // FTS5 only — MCP `semantic_code_search` adds vector+RRF fusion.
         Some("search" | "semantic_code_search") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_search(&project_root, &args)
+            let search_args = code_graph_mcp::cli::SearchArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_search(&project_root, search_args)
         }
         Some("ast-search" | "ast_search") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_ast_search(&project_root, &args)
+            let ast_search_args = code_graph_mcp::cli::AstSearchArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_ast_search(&project_root, ast_search_args)
         }
         Some("callgraph" | "get_call_graph") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
@@ -117,11 +119,13 @@ fn main() -> Result<()> {
         }
         Some("trace" | "trace_http_chain") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_trace(&project_root, &args)
+            let trace_args = code_graph_mcp::cli::TraceArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_trace(&project_root, trace_args)
         }
         Some("deps" | "dependency_graph") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_deps(&project_root, &args)
+            let deps_args = code_graph_mcp::cli::DepsArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_deps(&project_root, deps_args)
         }
         Some("similar" | "find_similar_code") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
