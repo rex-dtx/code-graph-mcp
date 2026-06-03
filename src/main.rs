@@ -133,7 +133,8 @@ fn main() -> Result<()> {
         }
         Some("dead-code" | "find_dead_code") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_dead_code(&project_root, &args)
+            let dead_code_args = code_graph_mcp::cli::DeadCodeArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_dead_code(&project_root, dead_code_args)
         }
         Some("benchmark") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

@@ -95,7 +95,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     let internal_tokens = ["audit #", "clap-migrat", "resolved_format", "plan §", "issue #"];
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
-        "map", "grep", "overview",
+        "map", "grep", "overview", "dead-code",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -808,6 +808,38 @@ fn test_cli_dead_code_rejects_misspelled_type() {
     assert_ne!(code, 0, "misspelled --type must error, not exit 0 clean; stderr={stderr:?}");
     assert!(stderr.contains("Unknown type filter"),
         "stderr should name the bad type filter; got: {stderr:?}");
+}
+
+// clap-migrated (audit #4): clap owns --help + unknown-flag rejection. The
+// --node-type/--type alias, repeatable --ignore, and --no-ignore default-clearing
+// are preserved by the handler (see ignore_before_path_equals_after / json_empty).
+#[test]
+fn test_cli_dead_code_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["dead-code", "--help"]);
+    assert_eq!(code, 0, "dead-code --help should exit 0 (clap help)");
+    assert!(stdout.contains("unused code") || stdout.contains("--ignore"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_dead_code_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["dead-code", "src", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
+// The --node-type preferred spelling must work identically to its --type alias.
+#[test]
+fn test_cli_dead_code_node_type_alias_matches_type() {
+    let project = setup_indexed_project();
+    let (out_type, _, code_type) =
+        run_cli(&project, &["dead-code", "src", "--type", "fn", "--json"]);
+    let (out_node, _, code_node) =
+        run_cli(&project, &["dead-code", "src", "--node-type", "fn", "--json"]);
+    assert_eq!(code_type, code_node, "--type and --node-type must agree on exit code");
+    assert_eq!(out_type.trim(), out_node.trim(),
+        "--type fn and --node-type fn must yield identical results");
 }
 
 // Regression: empty `--json` overview must keep stdout clean (`[]`) and avoid the

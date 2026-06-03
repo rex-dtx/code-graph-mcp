@@ -178,8 +178,8 @@ impl CliContext {
 
 /// Flags that take a value argument (not boolean).
 // Any flag whose NEXT arg is its value (consumed via get_flag_value /
-// collect_flag_values / get_path_flag / parse_flag_or) MUST appear here, or
-// get_positional will mistake that value for a positional argument. Enforced by
+// get_path_flag / parse_flag_or) MUST appear here, or get_positional will
+// mistake that value for a positional argument. Enforced by
 // test_value_flags_covers_all_value_consumers.
 const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines", "--out", "--root", "--ignore", "--last"];
 
@@ -219,23 +219,6 @@ fn get_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
-}
-
-/// Collect all repeated values for a flag (e.g. `--ignore a --ignore b` → ["a","b"]).
-fn collect_flag_values(args: &[String], flag: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == flag {
-            if let Some(v) = args.get(i + 1) {
-                out.push(v.clone());
-                i += 2;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
 }
 
 /// Normalize a user-provided path argument to a project-relative string.
@@ -3211,17 +3194,58 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// --- dead-code subcommand ---
+
+/// CLI arguments for the `dead-code` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp dead-code",
+          about = "Find unused code (orphans and exported-unused symbols)")]
+pub struct DeadCodeArgs {
+    /// Restrict the scan to this path prefix (absolute paths under root OK)
+    pub path: Option<String>,
+    // --node-type is preferred (matches `search` CLI + MCP param); --type is the
+    // legacy alias. clap accepts any string here — the handler validates it via
+    // normalize_type_filter so a typo errors loudly instead of false-clean exit 0.
+    /// Filter by node type: fn, class, struct, enum, trait, type, const, var (alias: --type)
+    #[arg(long = "node-type", alias = "type")]
+    pub node_type: Option<String>,
+    /// Show test callers (hidden by default)
+    #[arg(long)]
+    pub include_tests: bool,
+    // clap parse-errors (exit 2) on a non-numeric value, replacing the hand
+    // parser's warn-and-fallback — consistent with `stats --last` under flavor B.
+    /// Minimum lines to report
+    #[arg(long, default_value_t = 3)]
+    pub min_lines: u32,
+    /// Show full code snippets (default: compact, names only)
+    #[arg(long)]
+    pub no_compact: bool,
+    /// Exclude a path prefix (repeatable; default: claude-plugin/, benches/)
+    #[arg(long)]
+    pub ignore: Vec<String>,
+    /// Disable the default --ignore prefixes
+    #[arg(long)]
+    pub no_ignore: bool,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Find dead code: orphans and exported-unused symbols.
 /// CLI equivalent of MCP `find_dead_code`.
-pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
-    let path_filter_owned: Option<String> = match get_positional(args, 0) {
+pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
+    let DeadCodeArgs {
+        path, node_type, include_tests, min_lines, no_compact, ignore, no_ignore,
+        json: json_mode,
+    } = args;
+
+    let path_filter_owned: Option<String> = match path.as_deref() {
         Some(p) => Some(normalize_user_path(project_root, p)?),
         None => None,
     };
     let path_filter = path_filter_owned.as_deref();
-    // Accept both --node-type (preferred, matches `search` CLI + MCP param) and --type (legacy).
-    let type_filter = get_flag_value(args, "--node-type")
-        .or_else(|| get_flag_value(args, "--type"));
+    // --node-type (preferred) and its --type alias both land in `node_type`.
+    let type_filter = node_type.as_deref();
     // Validate --type/--node-type up-front: an unknown alias normalizes to an
     // empty Vec, and find_dead_code then falls through to a literal `n.type = :x`
     // match that returns zero rows — so a typo'd `--type fucntion` prints a
@@ -3234,22 +3258,16 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
             );
         }
     }
-    let include_tests = has_flag(args, "--include-tests");
-    let min_lines: u32 = parse_flag_or(args, "--min-lines", 3_u32);
-    let compact = !has_flag(args, "--no-compact");
-    let json_mode = has_flag(args, "--json");
+    let compact = !no_compact;
 
     // --ignore <pref>: repeatable, prefix-match exclusion. --no-ignore disables defaults.
     // Defaults are owned by `domain::default_dead_code_ignores()` (claude-plugin/, benches/).
-    let ignore_prefixes: Vec<String> = if has_flag(args, "--no-ignore") {
+    let ignore_prefixes: Vec<String> = if no_ignore {
         Vec::new()
+    } else if ignore.is_empty() {
+        crate::domain::default_dead_code_ignores()
     } else {
-        let explicit: Vec<String> = collect_flag_values(args, "--ignore");
-        if explicit.is_empty() {
-            crate::domain::default_dead_code_ignores()
-        } else {
-            explicit
-        }
+        ignore
     };
 
     let ctx = CliContext::open(project_root)?;
@@ -3771,8 +3789,8 @@ mod tests {
         assert_eq!(get_positional(&args2, 0), Some("src"));
     }
 
-    // Every flag consumed for its value (get_flag_value / collect_flag_values /
-    // get_path_flag / parse_flag_or) MUST be registered in VALUE_FLAGS, or
+    // Every flag consumed for its value (get_flag_value / get_path_flag /
+    // parse_flag_or) MUST be registered in VALUE_FLAGS, or
     // get_positional silently swallows its value as a positional. This list is the
     // hand-maintained source of truth; adding a value-consuming flag without
     // registering it here fails this test.
