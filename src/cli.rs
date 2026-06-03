@@ -1054,6 +1054,22 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     Ok(())
 }
 
+// --- grep subcommand ---
+
+/// CLI arguments for the `grep` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp grep",
+          about = "AST-context grep (ripgrep + containing function/class)")]
+pub struct GrepArgs {
+    /// Search pattern (ripgrep regex)
+    pub pattern: String,
+    /// Optional path to restrict the search (must be within the project root)
+    pub path: Option<String>,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// AST-context grep: ripgrep + AST context from index.
 ///
 /// Output format:
@@ -1061,13 +1077,15 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
 /// src/mcp/server.rs:142  let result = handle_request(params);
 ///   → fn McpServer::process_message (lines 130-180)
 /// ```
-pub fn cmd_grep(project_root: &Path, args: &[String]) -> Result<()> {
-    let pattern = get_positional(args, 0)
-        .filter(|p| !p.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Usage: code-graph-mcp grep <pattern> [path] [--json]"))?;
+pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
+    // clap accepts an empty-string positional (e.g. an unset shell var expanding
+    // to ""); preserve the hand-parser's non-empty guard + exact Usage string.
+    let GrepArgs { pattern, path, json: json_mode } = args;
+    if pattern.is_empty() {
+        anyhow::bail!("Usage: code-graph-mcp grep <pattern> [path] [--json]");
+    }
 
-    let search_path = get_positional(args, 1);
-    let json_mode = has_flag(args, "--json");
+    let search_path = path.as_deref();
 
     // Run ripgrep with JSON output for structured parsing
     let mut rg_cmd = Command::new("rg");
@@ -1075,7 +1093,7 @@ pub fn cmd_grep(project_root: &Path, args: &[String]) -> Result<()> {
         .arg("--json")
         .arg("-n")
         .arg("--max-count=100")
-        .arg(pattern);
+        .arg(&pattern);
 
     if let Some(path) = search_path {
         // Validate search_path is within project root to prevent path traversal

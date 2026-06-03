@@ -77,7 +77,8 @@ fn main() -> Result<()> {
         }
         Some("grep") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_grep(&project_root, &args)
+            let grep_args = code_graph_mcp::cli::GrepArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_grep(&project_root, grep_args)
         }
         // MCP tool names (e.g. `semantic_code_search`) accepted as aliases for
         // their CLI short forms. Reason: MCP `instructions` and adopted memory

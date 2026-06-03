@@ -95,7 +95,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     let internal_tokens = ["audit #", "clap-migrat", "resolved_format", "plan §", "issue #"];
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
-        "map",
+        "map", "grep",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -270,6 +270,35 @@ fn test_cli_grep_with_path() {
     let (stdout, _, code) = run_cli(&project, &["grep", "validateToken", "src/auth.ts"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("validateToken"));
+}
+
+// clap-migrated (audit #4): clap owns --help + unknown-flag rejection; the
+// non-empty pattern guard (exit 1 + Usage) is preserved in the handler because
+// clap accepts an empty-string positional.
+#[test]
+fn test_cli_grep_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["grep", "--help"]);
+    assert_eq!(code, 0, "grep --help should exit 0 (clap help)");
+    assert!(stdout.contains("AST-context grep") || stdout.contains("PATTERN"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_grep_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["grep", "validateToken", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
+#[test]
+fn test_cli_grep_empty_pattern_errors() {
+    // An empty-string pattern (e.g. unset `grep "$X"` shell var) must keep
+    // erroring with the Usage hint, not run ripgrep against an empty regex.
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["grep", ""]);
+    assert_eq!(code, 1, "empty pattern should exit 1 with Usage; stderr={stderr:?}");
+    assert!(stderr.contains("Usage:"), "should show usage on empty pattern; got: {stderr:?}");
 }
 
 // ============================================================
