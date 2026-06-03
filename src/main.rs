@@ -68,18 +68,12 @@ fn main() -> Result<()> {
             code_graph_mcp::cli::cmd_reindex(&project_root, reindex_args)
         }
         Some("health-check") => {
-            // Support both --format json and --json for consistency with other commands
-            let format = if args.iter().any(|a| a == "--json") {
-                "json"
-            } else {
-                args.iter()
-                    .position(|a| a == "--format")
-                    .and_then(|i| args.get(i + 1))
-                    .map(|s| s.as_str())
-                    .unwrap_or("oneline")
-            };
+            // clap-migrated (audit #4): --json/--format duality normalized via the
+            // HealthCheckArgs::resolved_format shim (--json wins, else --format,
+            // else oneline), keeping cmd_health_check's `format: &str` contract.
+            let hc_args = code_graph_mcp::cli::HealthCheckArgs::parse_from(args.iter().skip(1));
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_health_check(&project_root, format)
+            code_graph_mcp::cli::cmd_health_check(&project_root, hc_args.resolved_format())
         }
         Some("grep") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

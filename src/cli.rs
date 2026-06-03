@@ -605,6 +605,39 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     cmd_incremental_index(project_root, quiet)
 }
 
+/// `health-check` arguments (clap-migrated, audit #4).
+///
+/// `--json` and `--format <fmt>` coexist for back-compat: `--json` is shorthand
+/// for `--format json` and wins when both are given. `resolved_format` is the
+/// thin normalization shim (plan §2 item 14) that collapses the two into the
+/// single `&str` the handler consumes — so `cmd_health_check`'s signature and
+/// its JSON/oneline branches stay untouched.
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp health-check",
+          about = "Query index status (nodes/edges/files, freshness, embedding coverage)")]
+pub struct HealthCheckArgs {
+    /// JSON output (shorthand for --format json; wins when both are set)
+    #[arg(long)]
+    pub json: bool,
+    /// Output format: oneline (default) or json
+    #[arg(long)]
+    pub format: Option<String>,
+}
+
+impl HealthCheckArgs {
+    /// Collapse `--json`/`--format` into the handler's format string.
+    /// `--json` takes precedence; absent both, defaults to "oneline".
+    /// Unrecognized `--format` values fall through to the handler's oneline branch
+    /// (preserved from the prior hand-parser: only "json" was special-cased).
+    pub fn resolved_format(&self) -> &str {
+        if self.json {
+            "json"
+        } else {
+            self.format.as_deref().unwrap_or("oneline")
+        }
+    }
+}
+
 /// Run health check and print status, including index freshness.
 pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     // JSON callers (doctor.js, scripts, MCP UIs) need a parseable response

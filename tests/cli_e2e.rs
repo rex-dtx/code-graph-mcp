@@ -111,6 +111,40 @@ fn test_cli_health_check_unhealthy_exit_code() {
     assert_ne!(code, 0, "unhealthy should exit non-zero, stderr: {}", stderr);
 }
 
+// clap-migrated (audit #4) contract lock. The --json/--format duality is now
+// normalized by HealthCheckArgs::resolved_format; --json and --format json must
+// stay interchangeable, and clap owns help + unknown-flag rejection.
+#[test]
+fn test_cli_health_check_format_json_equiv_to_json() {
+    // --format json must produce the same JSON envelope as the --json shorthand.
+    let project = setup_indexed_project();
+    let (out_flag, _, code_flag) = run_cli(&project, &["health-check", "--json"]);
+    let (out_fmt, _, code_fmt) = run_cli(&project, &["health-check", "--format", "json"]);
+    assert_eq!(code_flag, 0);
+    assert_eq!(code_fmt, 0);
+    let v_flag: serde_json::Value = serde_json::from_str(out_flag.trim()).unwrap();
+    let v_fmt: serde_json::Value = serde_json::from_str(out_fmt.trim()).unwrap();
+    assert_eq!(v_flag["healthy"], v_fmt["healthy"], "--format json must mirror --json");
+    assert_eq!(v_flag["nodes"], v_fmt["nodes"]);
+}
+
+#[test]
+fn test_cli_health_check_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["health-check", "--help"]);
+    assert_eq!(code, 0, "health-check --help should exit 0 (clap help)");
+    assert!(stdout.contains("index status") || stdout.contains("--format"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_health_check_unknown_flag_errors() {
+    // Flavor-B: clap rejects unknown flags (was: silently ignored by the hand parser).
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["health-check", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
 // ============================================================
 // search
 // ============================================================
