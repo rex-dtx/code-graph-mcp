@@ -111,47 +111,51 @@ impl McpServer {
         // "reciprocal rank fusion"), while FTS5's token-exact match is reliable.
         // Shift the weight toward FTS to let the precise channel dominate.
         let is_acronym_heavy = !meaningful_tokens.is_empty()
-            && meaningful_tokens.len() <= 3
+            && meaningful_tokens.len() <= crate::domain::ACRONYM_MAX_TOKENS
             && meaningful_tokens.iter().all(|t| {
-                let len_ok = t.chars().count() <= 5;
+                let len_ok = t.chars().count() <= crate::domain::ACRONYM_MAX_TOKEN_CHARS;
                 let shape_ok = t.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
                 len_ok && shape_ok
             });
-        let (fts_weight, vec_weight) = if is_acronym_heavy { (2.0, 0.8) } else { (1.0, 1.2) };
-        let fused = weighted_rrf_fusion(&fts_search, &vec_search, 30, fetch_count as usize, fts_weight, vec_weight);
+        let (fts_weight, vec_weight) = if is_acronym_heavy {
+            (crate::domain::ACRONYM_FTS_WEIGHT, crate::domain::ACRONYM_VEC_WEIGHT)
+        } else {
+            (crate::domain::DEFAULT_FTS_WEIGHT, crate::domain::DEFAULT_VEC_WEIGHT)
+        };
+        let fused = weighted_rrf_fusion(&fts_search, &vec_search, crate::domain::RERANK_RRF_K, fetch_count as usize, fts_weight, vec_weight);
 
         // Match confidence: penalize when search signals are weak
         let match_confidence = {
             let mut c = 1.0_f64;
             // FTS-empty penalty: no text match → results are purely vector similarity (often noise)
             if fts_search.is_empty() && !vec_search.is_empty() {
-                c *= 0.35;
+                c *= crate::domain::CONF_VEC_ONLY_PENALTY;
             } else if !fts_search.is_empty() {
                 // OR-fallback penalty: AND mode failed → query terms don't co-occur (weaker match)
-                if fts_or_fallback { c *= 0.6; }
+                if fts_or_fallback { c *= crate::domain::CONF_OR_FALLBACK_PENALTY; }
                 // FTS sparsity: fewer results relative to fetch_count → weaker text match.
                 // Skip the ratio check for precision queries (fts returns ≤4 hits): a
                 // unique-identifier search legitimately has a low ratio but is a strong
                 // signal, not a weak one. Only apply when we have enough FTS breadth to
                 // judge "sparse vs. broad".
-                if fts_search.len() >= 5 {
+                if fts_search.len() >= crate::domain::CONF_SPARSITY_MIN_FTS {
                     let fts_ratio = fts_search.len() as f64 / fetch_count as f64;
-                    if fts_ratio < 0.1 { c *= 0.5; }
-                    else if fts_ratio < 0.25 { c *= 0.65; }
-                    else if fts_ratio < 0.5 { c *= 0.8; }
+                    if fts_ratio < crate::domain::CONF_SPARSITY_R1 { c *= crate::domain::CONF_SPARSITY_P1; }
+                    else if fts_ratio < crate::domain::CONF_SPARSITY_R2 { c *= crate::domain::CONF_SPARSITY_P2; }
+                    else if fts_ratio < crate::domain::CONF_SPARSITY_R3 { c *= crate::domain::CONF_SPARSITY_P3; }
                 }
             }
             // Source intersection: when both sources available, low overlap → less confidence.
             // Only meaningful when FTS returned enough breadth to judge overlap; for
             // precision queries (≤4 FTS hits) the intersection is naturally tiny and
             // should not count against confidence.
-            if fts_search.len() >= 5 && !vec_search.is_empty() {
+            if fts_search.len() >= crate::domain::CONF_SPARSITY_MIN_FTS && !vec_search.is_empty() {
                 let top_ids: Vec<i64> = fused.iter().take(top_k as usize).map(|r| r.node_id).collect();
                 let in_both = top_ids.iter()
                     .filter(|id| fts_node_ids.contains(id) && vec_node_ids.contains(id))
                     .count();
                 let ratio = in_both as f64 / top_ids.len().max(1) as f64;
-                if ratio < 0.2 { c *= 0.75; }
+                if ratio < crate::domain::CONF_INTERSECTION_MIN_RATIO { c *= crate::domain::CONF_INTERSECTION_PENALTY; }
             }
             c
         };
@@ -197,12 +201,13 @@ impl McpServer {
                 let name_match_count = query_terms_lower.iter()
                     .filter(|t| name_lower.contains(t.as_str()))
                     .count();
-                let name_boost = (1.0 + name_match_count as f64 * 0.3).min(2.0);
+                let name_boost = (1.0 + name_match_count as f64 * crate::domain::NAME_BOOST_PER_MATCH)
+                    .min(crate::domain::NAME_BOOST_CAP);
 
                 // Size dampening: counter BM25/vector bias toward very large nodes (>100 lines)
                 let node_lines = (node.end_line.saturating_sub(node.start_line) + 1) as f64;
-                let size_factor = if node_lines > 100.0 {
-                    1.0 / (1.0 + (node_lines / 100.0).ln() * 0.4)
+                let size_factor = if node_lines > crate::domain::SIZE_DAMPEN_LINES {
+                    1.0 / (1.0 + (node_lines / crate::domain::SIZE_DAMPEN_LINES).ln() * crate::domain::SIZE_DAMPEN_COEFF)
                 } else {
                     1.0
                 };
@@ -213,7 +218,7 @@ impl McpServer {
                 // demote them so README/heading prose cannot outrank real code matches.
                 let doc_penalty = if nwf.language.as_deref() == Some("markdown")
                     && language_filter != Some("markdown") {
-                    0.4
+                    crate::domain::DOC_PENALTY_MARKDOWN
                 } else {
                     1.0
                 };
@@ -365,7 +370,7 @@ impl McpServer {
                 "match_confidence": (match_confidence * 100.0).round() / 100.0,
                 "results": compact
             });
-            if match_confidence < 0.5 && !has_exact_name_match {
+            if match_confidence < crate::domain::CONF_WARNING_THRESHOLD && !has_exact_name_match {
                 if let Some(obj) = out.as_object_mut() {
                     obj.insert("low_confidence_warning".into(), json!(format!(
                         "match_confidence={:.2} (< 0.5): FTS found few or no text matches — results are largely vector-similarity noise. Refine the query with concrete identifiers, or use ast_search with type/returns/params filters.",

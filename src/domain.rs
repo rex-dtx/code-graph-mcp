@@ -27,6 +27,49 @@ pub const INDEX_VERSION: i32 = 6;
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;
 
+// -- Semantic-search rerank tuning (search.rs) --
+// Multipliers/thresholds applied AFTER RRF fusion to rerank candidates. Named
+// here (audit §4/§8) so they are tunable + ablatable in one place rather than
+// scattered as magic numbers. Values are the historical ones — extracting them
+// is metric-neutral; change them only with a precision@5/MRR ablation.
+/// RRF constant k: sharper rank sensitivity than the textbook 60 (top hits matter more).
+pub const RERANK_RRF_K: u32 = 30;
+/// Acronym-heavy query detection: ≤N short uppercase tokens are letter-exact identifiers.
+pub const ACRONYM_MAX_TOKENS: usize = 3;
+pub const ACRONYM_MAX_TOKEN_CHARS: usize = 5;
+/// Fusion weights: acronym-heavy shifts toward FTS (token-exact); default favors vector.
+pub const ACRONYM_FTS_WEIGHT: f64 = 2.0;
+pub const ACRONYM_VEC_WEIGHT: f64 = 0.8;
+pub const DEFAULT_FTS_WEIGHT: f64 = 1.0;
+pub const DEFAULT_VEC_WEIGHT: f64 = 1.2;
+/// match_confidence penalties. Vector-only (no FTS hit) = largely similarity noise.
+pub const CONF_VEC_ONLY_PENALTY: f64 = 0.35;
+/// OR-fallback fired (AND mode found no co-occurrence) → weaker match.
+pub const CONF_OR_FALLBACK_PENALTY: f64 = 0.6;
+/// Only judge FTS sparsity/intersection when FTS returned enough breadth (precision
+/// queries with ≤4 hits legitimately have a low ratio and must not be penalized).
+pub const CONF_SPARSITY_MIN_FTS: usize = 5;
+/// FTS-sparsity tiers: (ratio threshold, confidence multiplier), most-sparse first.
+pub const CONF_SPARSITY_R1: f64 = 0.1;
+pub const CONF_SPARSITY_P1: f64 = 0.5;
+pub const CONF_SPARSITY_R2: f64 = 0.25;
+pub const CONF_SPARSITY_P2: f64 = 0.65;
+pub const CONF_SPARSITY_R3: f64 = 0.5;
+pub const CONF_SPARSITY_P3: f64 = 0.8;
+/// Source-intersection: low FTS∩vec overlap in the top-k → less confidence.
+pub const CONF_INTERSECTION_MIN_RATIO: f64 = 0.2;
+pub const CONF_INTERSECTION_PENALTY: f64 = 0.75;
+/// Below this match_confidence, surface a "results are largely vector noise" warning.
+pub const CONF_WARNING_THRESHOLD: f64 = 0.5;
+/// Name-match boost: +per-match, capped, for symbols whose name contains query terms.
+pub const NAME_BOOST_PER_MATCH: f64 = 0.3;
+pub const NAME_BOOST_CAP: f64 = 2.0;
+/// Size dampening: counter BM25/vector bias toward very large nodes (> threshold lines).
+pub const SIZE_DAMPEN_LINES: f64 = 100.0;
+pub const SIZE_DAMPEN_COEFF: f64 = 0.4;
+/// Doc penalty: demote markdown headings for code-intent queries (unless lang=markdown).
+pub const DOC_PENALTY_MARKDOWN: f64 = 0.4;
+
 // -- Token estimation --
 /// Approximate **bytes** per token for code content (1 token ≈ 3 bytes UTF-8).
 ///
