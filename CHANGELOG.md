@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.36.0 — Audit remediation: snapshot supply-chain integrity, CLI/MCP consistency, honest dead-code
+
+Remediation of the 2026-06-03 architecture/security audit. Headline items: two
+supply-chain hardenings on the snapshot install path, and a correctness fix that
+makes the CLI and MCP give the **same** verdict on ambiguous symbols.
+
+**Security — snapshot supply-chain integrity.** First-run snapshot install
+downloads a `.db.zst` that becomes the entire code graph. It now verifies the
+artifact against a published `<url>.blake3` sidecar **before** decompressing
+(hard-fail on mismatch), caps the compressed side against a zip-bomb, and refuses
+to honor a `.code-graph.toml [snapshot] url` override unless the developer opts in
+out-of-band via `CODE_GRAPH_SNAPSHOT_TRUST_URL=1` — so a committed url in a
+malicious repo/PR can no longer silently redirect the graph to an attacker-chosen
+database. The artifact and sidecar fetches also reject HTTPS→HTTP redirect
+downgrades, closing a plaintext-substitution path.
+
+**Behavior change — `callgraph`/`impact` on same-file overloads.** A bare symbol
+name resolving to ≥2 non-test definitions in the **same file** (e.g. two
+`fn new()` in different impl blocks) is now reported as ambiguous instead of
+silently merging their call graphs. Previously the CLI merged them (exit 0, a
+conflated answer) while the MCP tool refused — same input, opposite answers; both
+now refuse consistently via a shared resolver. **Migration:** disambiguate with
+`--file` + `show --node-id <N>` (CLI) or `file_path` + `node_id` / `get_ast_node`
+(MCP). Cross-file collisions still take `--file`/`file_path` as before.
+
+**Output change — dead-code reports "candidates", not "results".** `find_dead_code`
+(CLI + MCP) now frames output as candidates needing human verification and notes
+that receiver-method calls (`obj.method()`) and cross-file const/type uses aren't
+edge-tracked, so a flagged symbol may still be live. The MCP
+`module_overview.include_dead` schema description carries the same caveat. Scripts
+or agents that string-matched the old `results` wording should update.
+
+**Fixes.**
+- Vectors no longer go stale after an incremental edit: a cross-file dirty node
+  whose context changed while the embedding model wasn't loaded now has its vector
+  invalidated so the background embedder regenerates it.
+- Enum arguments (`direction`, `change_type`, `relation`, `deps_direction`) are
+  validated at the tool/command entry on both CLI and MCP, so a typo errors
+  cleanly instead of surfacing as a confusing downstream/freshness error.
+- CLI `--ignore` (dead-code) parses as a value flag, and a misspelled `--type` is
+  rejected loudly instead of silently matching zero rows.
+
+**Internal / hardening.**
+- WAL bounded (`journal_size_limit` + checkpoint TRUNCATE in `run_optimize`).
+- Rerank multipliers extracted to named `domain.rs` constants (value-preserving).
+- `build.rs` pins the vendored `sqlite-vec` C source against a blake3 checksum and
+  fails the build on tamper.
+- Session metrics can tag dogfood traffic via `CODE_GRAPH_DOGFOOD=1`; the
+  `TriggerRate` routing metric gains a soft floor.
+
 ## v0.35.0 — Reference edges + receiver-call resolution sharpen dead-code & find_references
 
 **Feature (additive).** A new `references` graph relation captures edgeless
