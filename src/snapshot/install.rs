@@ -10,23 +10,49 @@ use super::config::load_config;
 /// 2. `[snapshot] disabled = true` → None
 /// 3. Auto-detect from `git remote get-url origin` → GitHub release asset
 pub fn resolve_snapshot_source(root: &Path) -> Option<String> {
+    resolve_snapshot_source_impl(root, url_override_trusted())
+}
+
+/// Out-of-band trust signal for a `.code-graph.toml [snapshot] url` override.
+/// The override lives in the repo, so any clone/PR can set it — a committed url
+/// is therefore NOT honored unless the developer opts in via this environment
+/// variable, which a PR cannot set. This is what blocks malicious-repo snapshot
+/// injection (the audit's top finding): the auto-detected GitHub-release path
+/// (origin remote) stays opt-out, but an arbitrary url override requires consent.
+fn url_override_trusted() -> bool {
+    std::env::var("CODE_GRAPH_SNAPSHOT_TRUST_URL").ok().as_deref() == Some("1")
+}
+
+/// Testable core of [`resolve_snapshot_source`]: `url_trusted` is the out-of-band
+/// consent for a toml url override (env-read in the public wrapper).
+pub(crate) fn resolve_snapshot_source_impl(root: &Path, url_trusted: bool) -> Option<String> {
     let cfg = load_config(root).ok()?;
     if cfg.snapshot.disabled {
         return None;
     }
     if let Some(url) = cfg.snapshot.url {
-        if url.starts_with("https://") {
-            return Some(url);
-        }
         // tracing::warn! is not visible in CLI/MCP startup paths (no subscriber),
         // so users would otherwise just see "No snapshot source resolved" and
         // have no idea their TOML override was rejected. Print to stderr too.
-        let msg = format!(
-            "warning: .code-graph.toml [snapshot] url must start with https:// (got '{url}'), ignoring"
-        );
-        tracing::warn!("{msg}");
-        eprintln!("{msg}");
-        return None;
+        if !url.starts_with("https://") {
+            let msg = format!(
+                "warning: .code-graph.toml [snapshot] url must start with https:// (got '{url}'), ignoring"
+            );
+            tracing::warn!("{msg}");
+            eprintln!("{msg}");
+            return None;
+        }
+        if !url_trusted {
+            let msg = format!(
+                "warning: .code-graph.toml [snapshot] url override ('{url}') is NOT honored by \
+                 default — a committed url could redirect the code graph to an attacker-chosen \
+                 database. Set CODE_GRAPH_SNAPSHOT_TRUST_URL=1 in your environment to trust it."
+            );
+            tracing::warn!("{msg}");
+            eprintln!("{msg}");
+            return None;
+        }
+        return Some(url);
     }
     resolve_from_github(root)
 }
@@ -93,6 +119,9 @@ fn fetch_latest_snapshot_asset_url(owner: &str, repo: &str) -> Option<String> {
 use anyhow::Context;
 
 const MAX_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+// Cap the COMPRESSED payload too — a snapshot zst is single-digit MB in practice,
+// but a missing/lying Content-Length must not let a huge body exhaust memory/disk.
+const MAX_COMPRESSED_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 
 /// Wait up to `cap` for the child to exit; SIGTERM it on Unix if it doesn't,
 /// then collect output. Cancellation-aware so the happy path doesn't leak a
@@ -159,6 +188,8 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
 
     let install_inner = || -> Result<String> {
         download(url, &zst_partial)?;
+        // Verify integrity BEFORE decompressing — never decode untrusted bytes.
+        verify_checksum(url, &zst_partial)?;
         decompress_with_cap(&zst_partial, &db_partial, MAX_DECOMPRESSED_BYTES)?;
         validate(&db_partial, root)?;
 
@@ -206,16 +237,67 @@ fn download(url: &str, dest: &Path) -> Result<()> {
         std::fs::copy(file_path, dest).context("file:// copy")?;
         return Ok(());
     }
-    // TODO: stream to disk (reqwest copy_to) and apply MAX_DECOMPRESSED_BYTES
-    // cap to the compressed payload too — currently buffers the whole response.
-    let bytes = reqwest::blocking::Client::builder()
+    // Stream to disk with a hard cap on the compressed side instead of buffering
+    // the whole response. Reject early if Content-Length advertises oversize, and
+    // cap bytes actually written so a missing/lying length still can't run away.
+    let mut resp = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?
         .get(url)
         .send()?
-        .error_for_status()?
-        .bytes()?;
-    std::fs::write(dest, &bytes).context("write download to disk")?;
+        .error_for_status()?;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_COMPRESSED_BYTES {
+            anyhow::bail!(
+                "snapshot download advertises {len} bytes (> {MAX_COMPRESSED_BYTES} cap)"
+            );
+        }
+    }
+    let mut out = std::fs::File::create(dest).context("create download file")?;
+    let mut writer = CapWriter::new(&mut out, MAX_COMPRESSED_BYTES);
+    std::io::copy(&mut resp, &mut writer).context("stream download to disk")?;
+    Ok(())
+}
+
+/// Verify the downloaded compressed artifact against its `<url>.blake3` sidecar.
+/// Hard-fails on mismatch. When no sidecar is published (a pre-checksum release),
+/// warns loudly and continues — integrity could not be established, but the
+/// download still went over authenticated HTTPS (`gh api` / origin remote). New
+/// releases that ship the `.blake3` sidecar get full verification.
+fn verify_checksum(url: &str, artifact: &Path) -> Result<()> {
+    // file:// is test/config-controlled; no network sidecar to fetch.
+    if url.starts_with("file://") {
+        return Ok(());
+    }
+    let sidecar_url = format!("{url}.blake3");
+    let fetched = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .get(&sidecar_url)
+        .send();
+    let expected = match fetched {
+        Ok(r) if r.status().is_success() => r.text().unwrap_or_default().trim().to_string(),
+        _ => String::new(),
+    };
+    if expected.is_empty() {
+        let msg = format!(
+            "warning: no integrity sidecar at {sidecar_url} — snapshot checksum NOT verified"
+        );
+        tracing::warn!("{msg}");
+        eprintln!("{msg}");
+        return Ok(());
+    }
+    // Stream-hash the artifact (it is capped at MAX_COMPRESSED_BYTES).
+    let mut file = std::fs::File::open(artifact).context("open artifact for checksum")?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).context("hash artifact")?;
+    let actual = hasher.finalize().to_hex().to_string();
+    if !actual.eq_ignore_ascii_case(&expected) {
+        anyhow::bail!(
+            "snapshot checksum mismatch (blake3): expected {expected}, got {actual} — refusing to install"
+        );
+    }
+    tracing::debug!("snapshot checksum verified (blake3 {actual})");
     Ok(())
 }
 

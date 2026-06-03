@@ -153,7 +153,7 @@ fn config_load_rejects_malformed_toml() {
         "got error message: {err}");
 }
 
-use crate::snapshot::install::{resolve_snapshot_source, try_install};
+use crate::snapshot::install::{resolve_snapshot_source, resolve_snapshot_source_impl, try_install};
 use crate::snapshot::meta::{META_SNAPSHOT_FETCHED_AT, META_SNAPSHOT_SOURCE_URL};
 
 #[test]
@@ -162,15 +162,30 @@ fn resolve_returns_none_when_no_git_no_toml() {
     assert_eq!(resolve_snapshot_source(dir.path()), None);
 }
 
+// Security: a .code-graph.toml url override is honored ONLY with the out-of-band
+// trust signal. Without it, a committed url must NOT redirect the graph source
+// (blocks malicious-repo snapshot injection — the audit's top finding).
 #[test]
-fn resolve_returns_url_from_toml_override() {
+fn resolve_rejects_untrusted_url_override() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(".code-graph.toml"),
         "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
     ).unwrap();
+    // url_trusted=false (env var absent) → override ignored.
+    assert_eq!(resolve_snapshot_source_impl(dir.path(), false), None);
+}
+
+#[test]
+fn resolve_returns_url_from_trusted_override() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(".code-graph.toml"),
+        "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
+    ).unwrap();
+    // url_trusted=true (developer set CODE_GRAPH_SNAPSHOT_TRUST_URL=1) → honored.
     assert_eq!(
-        resolve_snapshot_source(dir.path()),
+        resolve_snapshot_source_impl(dir.path(), true),
         Some("https://example.com/x.db.zst".to_string()),
     );
 }
@@ -353,4 +368,30 @@ fn create_writes_raw_db_when_out_endswith_db() {
 
     let head: Vec<u8> = std::fs::read(&db_out).unwrap().into_iter().take(16).collect();
     assert_eq!(&head[..], b"SQLite format 3\0", "expected raw SQLite header");
+}
+
+// Integrity: compressed-output snapshots get a `.blake3` sidecar the consumer
+// verifies before decompressing. Upload BOTH files to the GitHub release.
+#[test]
+fn create_writes_blake3_sidecar_for_compressed_output() {
+    let fixture = init_git_fixture();
+    let zst_out = fixture.path().join("snap.db.zst");
+    crate::snapshot::create(fixture.path(), &zst_out, false).unwrap();
+
+    let sidecar = fixture.path().join("snap.db.zst.blake3");
+    assert!(sidecar.exists(), "producer must write a .blake3 sidecar next to the .db.zst");
+    let recorded = std::fs::read_to_string(&sidecar).unwrap();
+    let actual = blake3::hash(&std::fs::read(&zst_out).unwrap()).to_hex().to_string();
+    assert_eq!(recorded.trim(), actual, "sidecar must hold the blake3 of the compressed artifact");
+}
+
+#[test]
+fn create_no_sidecar_for_raw_db_output() {
+    // Raw .db output is not the consumer-facing artifact (the workflow compresses
+    // + checksums in a later step), so no sidecar.
+    let fixture = init_git_fixture();
+    let db_out = fixture.path().join("snap.db");
+    crate::snapshot::create(fixture.path(), &db_out, false).unwrap();
+    assert!(!fixture.path().join("snap.db.blake3").exists(),
+        "raw .db output must not get a .blake3 sidecar");
 }

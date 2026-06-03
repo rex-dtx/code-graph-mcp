@@ -101,7 +101,16 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
     if compress_output {
         let raw = std::fs::read(&vacuum_target).context("read compacted db")?;
         let compressed = zstd::encode_all(&raw[..], 9).context("zstd encode snapshot")?;
-        std::fs::write(out, compressed).context("write compressed snapshot")?;
+        std::fs::write(out, &compressed).context("write compressed snapshot")?;
+        // Integrity sidecar: blake3 of the compressed artifact, hex-encoded.
+        // Consumers fetch `<asset>.blake3` and verify it before decompressing.
+        // Mirrors the blake3 artifact-integrity convention used for the embedding
+        // model download (src/embedding/model.rs). Upload BOTH the `.db.zst` and
+        // this `.db.zst.blake3` to the GitHub release.
+        let digest = blake3::hash(&compressed).to_hex();
+        let sidecar = format!("{}.blake3", out.display());
+        std::fs::write(&sidecar, digest.as_bytes())
+            .with_context(|| format!("write checksum sidecar {sidecar}"))?;
     }
 
     Ok(())
