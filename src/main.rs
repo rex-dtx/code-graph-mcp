@@ -59,7 +59,8 @@ fn main() -> Result<()> {
         }
         Some("rebuild-index") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_rebuild_index(&project_root, &args)
+            let rebuild_args = code_graph_mcp::cli::RebuildIndexArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_rebuild_index(&project_root, rebuild_args)
         }
         Some("reindex") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

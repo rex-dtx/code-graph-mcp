@@ -559,9 +559,25 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
 /// Drop the existing index.db (plus WAL/SHM) and trigger a full rebuild via
 /// `cmd_incremental_index` (which auto-detects the missing DB and does a full
 /// index). Mirrors MCP `rebuild_index` tool semantics.
-pub fn cmd_rebuild_index(project_root: &Path, args: &[String]) -> Result<()> {
-    let confirm = args.iter().any(|a| a == "--confirm");
-    let quiet = args.iter().any(|a| a == "--quiet");
+/// `rebuild-index` arguments (clap-migrated, audit #4).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp rebuild-index",
+          about = "Drop and rebuild the index from scratch (requires --confirm)")]
+pub struct RebuildIndexArgs {
+    /// Confirm the destructive drop-and-rebuild (required to proceed)
+    #[arg(long)]
+    pub confirm: bool,
+    /// Suppress progress output
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<()> {
+    let confirm = args.confirm;
+    let quiet = args.quiet;
+    // `--confirm` is a business-logic confirmation gate, NOT a clap-required arg:
+    // a missing confirm is a deliberate exit-1 anyhow bail (not a parse error),
+    // preserving the prior contract (test_cli_rebuild_index_requires_confirm).
     if !confirm {
         anyhow::bail!(
             "rebuild-index drops the existing index and re-parses every file. \

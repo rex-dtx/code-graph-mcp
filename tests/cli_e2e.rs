@@ -903,6 +903,27 @@ fn test_cli_rebuild_index_with_confirm_rebuilds() {
     assert!(std::fs::metadata(&db_path).unwrap().len() > 0, "recreated index.db must be non-empty");
 }
 
+// clap-migrated (audit #4) contract lock. The --confirm gate stays an exit-1
+// anyhow bail (not a clap-required arg — see test_cli_rebuild_index_requires_confirm
+// above), while clap now owns help + unknown-flag rejection (exit 2).
+#[test]
+fn test_cli_rebuild_index_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["rebuild-index", "--help"]);
+    assert_eq!(code, 0, "rebuild-index --help should exit 0 (clap help)");
+    assert!(stdout.contains("Drop and rebuild") || stdout.contains("--confirm"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_rebuild_index_unknown_flag_errors() {
+    // Flavor-B: unknown flag is a clap parse error (exit 2), evaluated before the
+    // --confirm business gate — so --bogus exits 2, not 1.
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["rebuild-index", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap (exit 2, before confirm gate)");
+}
+
 // ============================================================
 // refs --node-id (P1-1: MCP parity — node_id is authoritative)
 // ============================================================
