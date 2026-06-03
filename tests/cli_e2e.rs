@@ -1078,6 +1078,19 @@ fn test_cli_trace_no_middleware_accepted_include_middleware_rejected() {
     assert_eq!(code_inc, 2, "dropped phantom --include-middleware must error as unknown flag");
 }
 
+// Numeric flags reject a leading-dash value (`--depth -5`): clap reads `-5` as a
+// stray token → exit 2. The old hand parser accepted it and clamped to 1 (exit 0).
+// Negative depth/limit is nonsensical, so erroring surfaces the typo instead of
+// silently coercing — a deliberate, uniform flavor-B contract across every
+// migrated numeric flag (search/ast-search --limit, deps/trace --depth). Locked
+// here for trace as the representative case (audit #4 Step-3 verify pass).
+#[test]
+fn test_cli_trace_negative_depth_rejected() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["trace", "/api/x", "--depth", "-5"]);
+    assert_eq!(code, 2, "a negative --depth must error (was: silently clamped to 1)");
+}
+
 // ============================================================
 // incremental-index
 // ============================================================
