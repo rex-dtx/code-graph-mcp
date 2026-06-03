@@ -3206,6 +3206,9 @@ pub struct DeadCodeArgs {
     // --node-type is preferred (matches `search` CLI + MCP param); --type is the
     // legacy alias. clap accepts any string here — the handler validates it via
     // normalize_type_filter so a typo errors loudly instead of false-clean exit 0.
+    // --node-type and --type are ONE arg (alias), so supplying both is a clap
+    // duplicate-arg error (exit 2) — deliberately stricter than the old parser,
+    // which silently honored --node-type and ignored --type (masking a bad --type).
     /// Filter by node type: fn, class, struct, enum, trait, type, const, var (alias: --type)
     #[arg(long = "node-type", alias = "type")]
     pub node_type: Option<String>,

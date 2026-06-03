@@ -829,6 +829,19 @@ fn test_cli_dead_code_unknown_flag_errors() {
     assert_eq!(code, 2, "unknown flag must error under clap");
 }
 
+// clap models --node-type and its --type alias as a single arg, so supplying
+// BOTH (a contradictory invocation) is a duplicate-arg error (exit 2). This is
+// deliberately stricter than the old hand parser, which silently honored
+// --node-type and ignored --type — masking a typo'd --type. Locked as an
+// intentional flavor-B contract, not an accident (audit #4 verify pass).
+#[test]
+fn test_cli_dead_code_type_and_node_type_conflict_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) =
+        run_cli(&project, &["dead-code", "src", "--type", "fn", "--node-type", "class"]);
+    assert_eq!(code, 2, "supplying both --type and --node-type must error (clap duplicate-arg)");
+}
+
 // The --node-type preferred spelling must work identically to its --type alias.
 #[test]
 fn test_cli_dead_code_node_type_alias_matches_type() {
