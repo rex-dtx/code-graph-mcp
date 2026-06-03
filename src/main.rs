@@ -136,7 +136,8 @@ fn main() -> Result<()> {
         }
         Some("refs" | "find_references") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_refs(&project_root, &args)
+            let refs_args = code_graph_mcp::cli::RefsArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_refs(&project_root, refs_args)
         }
         Some("dead-code" | "find_dead_code") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

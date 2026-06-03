@@ -96,7 +96,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
         "map", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
-        "snapshot", "callgraph", "impact", "show",
+        "snapshot", "callgraph", "impact", "show", "refs",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -1322,6 +1322,24 @@ fn test_cli_refs_invalid_relation_errors_early() {
     assert_ne!(code2, 0);
     assert!(stderr2.contains("--relation must be one of"),
         "relation validation must precede symbol resolution; got: {stderr2:?}");
+}
+
+// clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection;
+// --relation stays an in-handler String validated before index-open (above).
+#[test]
+fn test_cli_refs_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["refs", "--help"]);
+    assert_eq!(code, 0, "refs --help should exit 0 (clap help)");
+    assert!(stdout.contains("references") || stdout.contains("--relation"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_refs_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["refs", "validateToken", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
 }
 
 // ============================================================

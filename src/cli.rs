@@ -259,16 +259,6 @@ fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
     );
 }
 
-/// Get a flag value that represents a file path, normalized to project-relative.
-/// Returns `Ok(None)` if the flag is absent. Errs if the path is absolute and
-/// outside `project_root` (callers want `.as_deref()` for `Option<&str>` shape).
-fn get_path_flag(args: &[String], project_root: &Path, flag: &str) -> Result<Option<String>> {
-    match get_flag_value(args, flag) {
-        Some(v) => Ok(Some(normalize_user_path(project_root, v)?)),
-        None => Ok(None),
-    }
-}
-
 /// Parse a numeric flag value, printing a warning on invalid input and falling back to default.
 fn parse_flag_or<T: std::str::FromStr + std::fmt::Display>(args: &[String], flag: &str, default: T) -> T {
     match get_flag_value(args, flag) {
@@ -3222,10 +3212,43 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
-    let explicit_file_owned = get_path_flag(args, project_root, "--file")?;
+// --- refs subcommand ---
+
+/// CLI arguments for the `refs` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp refs",
+          about = "Find all references to a symbol (callers, importers, etc.)")]
+pub struct RefsArgs {
+    /// Symbol name (required unless --node-id is given)
+    pub symbol: Option<String>,
+    /// Look up by node ID (authoritative over --file)
+    #[arg(long = "node-id")]
+    pub node_id: Option<i64>,
+    /// Disambiguate same-name symbols by file path
+    #[arg(long)]
+    pub file: Option<String>,
+    // --relation stays an in-handler String validated at entry (before index open),
+    // NOT a clap ValueEnum — so a bad --relation on a nonexistent symbol reports the
+    // relation error (exit 1), not "symbol not found", and the message is preserved.
+    /// Filter: calls, imports, inherits, implements, references, all
+    #[arg(long)]
+    pub relation: Option<String>,
+    /// Compact output
+    #[arg(long)]
+    pub compact: bool,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Find all references to a symbol. CLI equivalent of MCP `find_references`.
+pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
+    let explicit_file_owned: Option<String> = match args.file.as_deref() {
+        Some(f) => Some(normalize_user_path(project_root, f)?),
+        None => None,
+    };
     let explicit_file = explicit_file_owned.as_deref();
-    let relation = get_flag_value(args, "--relation");
+    let relation = args.relation.as_deref();
     // Validate --relation at command entry — before opening the index and before
     // symbol resolution — so a nonexistent symbol with a bad --relation reports the
     // relation error, not "symbol not found". feedback-enum-validate-at-entry.
@@ -3237,13 +3260,9 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
             );
         }
     }
-    let json_mode = has_flag(args, "--json");
-    let compact = has_flag(args, "--compact");
-    let node_id_arg: Option<i64> = if get_flag_value(args, "--node-id").is_some() {
-        Some(parse_flag_or(args, "--node-id", 0_i64))
-    } else {
-        None
-    };
+    let json_mode = args.json;
+    let compact = args.compact;
+    let node_id_arg: Option<i64> = args.node_id;
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -3258,7 +3277,7 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("node_id {} not found in index", nid))?;
         (vec![nid], node.name)
     } else {
-        let raw_symbol = get_positional(args, 0)
+        let raw_symbol = args.symbol.as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation calls|imports|inherits|implements|references] [--compact] [--json]"
