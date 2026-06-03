@@ -144,6 +144,10 @@ impl Database {
             PRAGMA temp_store = MEMORY;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
+            -- Bound the WAL: a checkpoint truncates it back to <= this size, so an
+            -- idle DB doesn't carry a multi-MB resident WAL (audit §8 saw ~4MB WAL
+            -- on a 7.8MB main DB). run_optimize() additionally TRUNCATEs after bulk writes.
+            PRAGMA journal_size_limit = 6291456;
         ")?;
 
         // Check existing schema version — migrate if needed, bail only on future versions
@@ -257,9 +261,14 @@ impl Database {
         self.vec_enabled
     }
 
-    /// Run PRAGMA optimize to rebuild query planner statistics after bulk writes.
+    /// Run PRAGMA optimize to rebuild query planner statistics after bulk writes,
+    /// then checkpoint + TRUNCATE the WAL so the post-index WAL doesn't stay
+    /// resident on disk (audit §8). Best-effort: a concurrent reader can defer the
+    /// truncation, but it never blocks indefinitely or risks the data.
     pub fn run_optimize(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA optimize;")?;
+        // TRUNCATE reclaims the WAL file; tolerate a transient BUSY (best-effort).
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         Ok(())
     }
 

@@ -568,6 +568,18 @@ fn routing_recall_benchmark() {
                     metrics.decoy_preserved_rate * 100.0, metrics.decoy_preserved, metrics.decoy_total,
                     metrics.decoy_leak_rate * 100.0, metrics.decoy_leak, metrics.decoy_total,
                 );
+                // Soft regression tripwire — informational, never gates the build
+                // (the bench is paid + LLM-sampled). Set BELOW the observed
+                // sonnet-4.5 rate (~40% on the 10-query PreferCodeGraph set), not
+                // the aspirational v0.27.0 60% baseline, so normal sampling variance
+                // doesn't trip it; a drop under this signals a real routing regression.
+                const SOFT_TRIGGER_FLOOR: f64 = 0.30;
+                if metrics.trigger_rate < SOFT_TRIGGER_FLOOR {
+                    eprintln!(
+                        "  [warn] trigger rate {:.1}% below soft floor {:.0}% — possible routing regression (non-blocking)",
+                        metrics.trigger_rate * 100.0, SOFT_TRIGGER_FLOOR * 100.0
+                    );
+                }
                 print_misses(&all_misses);
                 metrics.trigger_rate
             }

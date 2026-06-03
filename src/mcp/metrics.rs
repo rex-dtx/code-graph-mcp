@@ -165,9 +165,11 @@ impl SessionMetrics {
         self.tools.is_empty()
     }
 
-    /// Serialize session metrics to one-line JSON and append to the usage file.
-    /// Performs size-based rotation: if file > 1MB, truncate to last 512KB.
-    pub fn flush(&self, usage_path: &Path, version: &str) {
+    /// Build the one-line JSON record for this session. Separated from `flush`
+    /// so the `dogfood` tagging + field shape are unit-testable without env/FS
+    /// races. `dogfood=true` segregates dev self-test traffic from real Claude
+    /// Code usage in usage.jsonl so adoption can be measured (audit §7).
+    fn build_record(&self, version: &str, dogfood: bool) -> serde_json::Value {
         let dur_s = self.start.elapsed().as_secs();
         let ts = iso8601_now();
 
@@ -192,7 +194,7 @@ impl SessionMetrics {
             0.0
         };
 
-        let record = serde_json::json!({
+        let mut record = serde_json::json!({
             "ts": ts,
             "dur_s": dur_s,
             "v": version,
@@ -211,6 +213,20 @@ impl SessionMetrics {
                 "nodes": self.nodes_created,
             },
         });
+        // Additive + only-when-true: older readers ignore it, success lines stay compact.
+        if dogfood {
+            record["dogfood"] = serde_json::json!(true);
+        }
+        record
+    }
+
+    /// Serialize session metrics to one-line JSON and append to the usage file.
+    /// Performs size-based rotation: if file > 1MB, truncate to last 512KB.
+    pub fn flush(&self, usage_path: &Path, version: &str) {
+        // CODE_GRAPH_DOGFOOD=1 tags this session as dev self-test traffic so it
+        // can be filtered out of real-adoption metrics (audit §7).
+        let dogfood = std::env::var("CODE_GRAPH_DOGFOOD").ok().as_deref() == Some("1");
+        let record = self.build_record(version, dogfood);
 
         let line = match serde_json::to_string(&record) {
             Ok(s) => s,
@@ -486,6 +502,18 @@ mod tests {
         let last_line = content.trim().lines().last().unwrap();
         let record: serde_json::Value = serde_json::from_str(last_line).unwrap();
         assert_eq!(record["v"], "0.5.26");
+    }
+
+    #[test]
+    fn build_record_tags_dogfood_when_flagged() {
+        let mut m = SessionMetrics::new();
+        m.record_tool_call("get_call_graph", 5, None);
+        // No env/FS — build_record takes the flag directly (race-free).
+        let plain = m.build_record("0.0.0", false);
+        assert!(plain.get("dogfood").is_none(), "no dogfood field when not flagged");
+        let tagged = m.build_record("0.0.0", true);
+        assert_eq!(tagged["dogfood"], serde_json::json!(true),
+            "CODE_GRAPH_DOGFOOD sessions must be tagged so they can be filtered from adoption metrics");
     }
 
     #[test]
