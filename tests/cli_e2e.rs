@@ -815,6 +815,27 @@ fn test_cli_incremental_index() {
     assert!(stderr.contains("Incremental index:"), "should show index stats");
 }
 
+// clap-migrated (audit #4) contract lock. Flag parsing flipped to clap while the
+// git/index guard stays in main(); --quiet still suppresses output (valid path
+// above), and clap now owns help + unknown-flag rejection.
+#[test]
+fn test_cli_incremental_index_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["incremental-index", "--help"]);
+    assert_eq!(code, 0, "incremental-index --help should exit 0 (clap help)");
+    assert!(stdout.contains("incremental index") || stdout.contains("--quiet"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_incremental_index_unknown_flag_errors() {
+    // Flavor-B: clap rejects unknown flags (was: silently ignored). Parse error
+    // exits 2 before the git/index guard or resolve_project_root run.
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["incremental-index", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
 // ============================================================
 // rebuild-index (§5 hard op — destructive path requires --confirm)
 // ============================================================

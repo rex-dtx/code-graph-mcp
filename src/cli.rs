@@ -453,6 +453,21 @@ fn format_node_compact(node: &queries::NodeResult, file_path: &str) -> String {
 /// Run incremental index update.
 /// If `quiet` is true, suppress non-error output.
 /// Auto-creates the database and runs a full index if no index exists.
+/// `incremental-index` arguments (clap-migrated, audit #4).
+///
+/// Only flag parsing lives here; the git/index existence guard stays in `main()`
+/// — it must run before any `resolve_project_root` indexing side effects and may
+/// skip the run entirely (issue #8). The handler keeps its `quiet: bool` signature
+/// so the internal `reindex`/`rebuild-index` callers are unaffected.
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp incremental-index",
+          about = "Run incremental index update (full index when none exists)")]
+pub struct IncrementalIndexArgs {
+    /// Suppress progress output (used by the PostToolUse hook)
+    #[arg(long)]
+    pub quiet: bool,
+}
+
 pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     let is_new = !db_path.exists();
