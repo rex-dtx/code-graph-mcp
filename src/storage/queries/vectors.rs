@@ -31,6 +31,28 @@ pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)])
     Ok(())
 }
 
+/// Drop vectors for the given node IDs so the background embedder re-selects them
+/// via the `node_vectors.node_id IS NULL` convention in `get_unembedded_nodes`.
+/// Used by the incremental path when context strings changed but no model was
+/// available to re-embed inline (the watcher/drift path passes model=None to avoid
+/// holding the model lock across I/O). Wrapped in a transaction to avoid per-row fsync.
+pub fn delete_node_vectors_batch(conn: &Connection, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut del_stmt = conn.prepare_cached(
+            "DELETE FROM node_vectors WHERE node_id = ?1"
+        )?;
+        for id in ids {
+            del_stmt.execute(rusqlite::params![id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn vector_search(conn: &Connection, query_embedding: &[f32], limit: i64) -> Result<Vec<(i64, f64)>> {
     let bytes: &[u8] = bytemuck::cast_slice(query_embedding);
     let mut stmt = conn.prepare(

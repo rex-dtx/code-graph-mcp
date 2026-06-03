@@ -288,6 +288,51 @@ fn test_incremental_propagates_dirty_context() {
     assert_ne!(beta_ctx_before, beta_ctx_after);
 }
 
+// Regression (#3): when an incremental index runs with model=None (the watcher /
+// drift path, which avoids holding the model lock across I/O), a cross-file dirty
+// node's context_string is regenerated — so its existing vector is now STALE and
+// must be invalidated (dropped) so the background embedder re-selects it. Before
+// the fix the stale vector survived until a full rebuild.
+#[test]
+fn test_edge_flip_invalidates_caller_vector() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    // open_with_vec → vec_enabled()=true so the model=None invalidation branch runs.
+    let db = Database::open_with_vec(&db_dir.path().join("index.db")).unwrap();
+    assert!(db.vec_enabled(), "test requires vec tables");
+
+    // beta (b.ts) calls alpha (a.ts)
+    fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
+    fs::write(project_dir.path().join("b.ts"), "function beta() { alpha(); }").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let beta_nodes = get_nodes_by_name(db.conn(), "beta").unwrap();
+    assert_eq!(beta_nodes.len(), 1);
+    let beta_id = beta_nodes[0].id;
+
+    // Seed a fake vector for beta (indexing ran with model=None, so no real embed).
+    let fake: Vec<f32> = vec![0.1; crate::domain::EMBEDDING_DIM];
+    crate::storage::queries::insert_node_vector(db.conn(), beta_id, &fake).unwrap();
+    assert!(crate::storage::queries::get_node_embedding(db.conn(), beta_id).is_ok(),
+        "fake vector must be present before the edge flip");
+
+    // Flip the edge: rename alpha → alphaRenamed. beta is a cross-file caller, so
+    // its context_string is regenerated (callee set changed) but its node row is NOT
+    // deleted (b.ts unchanged) — exactly the case the AFTER DELETE trigger misses.
+    fs::write(project_dir.path().join("a.ts"), "function alphaRenamed() {}").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let beta_after = get_nodes_by_name(db.conn(), "beta").unwrap();
+    assert_eq!(beta_after.len(), 1);
+    assert_eq!(beta_after[0].id, beta_id, "beta node id stays stable (not recreated)");
+    // Its stale vector must be gone, and beta re-selectable by the background embedder.
+    assert!(crate::storage::queries::get_node_embedding(db.conn(), beta_id).is_err(),
+        "stale vector for cross-file dirty node must be invalidated when model=None");
+    let unembedded = crate::storage::queries::get_unembedded_nodes(db.conn(), 50).unwrap();
+    assert!(unembedded.iter().any(|(id, _)| *id == beta_id),
+        "beta must be re-selectable by the background embedder after invalidation");
+}
+
 #[test]
 fn test_deleted_file_cleanup() {
     let project_dir = TempDir::new().unwrap();

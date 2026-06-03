@@ -15,8 +15,8 @@ use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
 use crate::storage::db::Database;
 use crate::storage::queries::{
-    get_edges_batch, get_nodes_missing_context, get_nodes_with_files_by_ids,
-    update_context_strings_batch, EdgeInfo, NodeResult,
+    delete_node_vectors_batch, get_edges_batch, get_nodes_missing_context,
+    get_nodes_with_files_by_ids, update_context_strings_batch, EdgeInfo, NodeResult,
 };
 use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS};
 
@@ -119,11 +119,23 @@ pub(super) fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>
     update_context_strings_batch(db.conn(), &context_updates)?;
     tx.commit()?;
 
-    // Embed outside the committed tx — recoverable on failure
-    if let Some(m) = model {
-        if db.vec_enabled() {
+    // Embed outside the committed tx — recoverable on failure.
+    match model {
+        Some(m) if db.vec_enabled() => {
             embed_and_store_batch(db, m, &context_updates)?;
         }
+        // No model here: the watcher/drift incremental path passes None to avoid
+        // holding the model lock across I/O. The context strings just changed, so
+        // any existing vectors for these nodes are now STALE (they encode the old
+        // edge relationships). Drop them so the background embedder re-selects them
+        // via the `node_vectors.node_id IS NULL` convention. Without this, a
+        // cross-file dirty node (e.g. a caller whose callee was renamed) keeps a
+        // stale vector until the next full rebuild.
+        None if db.vec_enabled() && !context_updates.is_empty() => {
+            let ids: Vec<i64> = context_updates.iter().map(|(id, _)| *id).collect();
+            delete_node_vectors_batch(db.conn(), &ids)?;
+        }
+        _ => {}
     }
     Ok(())
 }

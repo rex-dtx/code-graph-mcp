@@ -1167,6 +1167,14 @@ impl McpServer {
                     // Invalidate caches when files actually changed
                     *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
                     lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
+                    // Refill vectors: the incremental path runs with model=None, so
+                    // regenerate_context_strings invalidated (dropped) vectors for any
+                    // cross-file dirty nodes, and newly-added nodes have none yet. Spawn
+                    // the background embedder to backfill both. spawn_background_embedding
+                    // self-guards on model-present + vec_enabled + embedding_in_progress,
+                    // so it's a cheap no-op when there's nothing to embed. This single
+                    // call covers both incremental callers (watcher-changes + debounce).
+                    self.spawn_background_embedding();
                 }
                 *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
                 *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
