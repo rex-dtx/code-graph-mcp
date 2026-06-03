@@ -105,7 +105,7 @@ impl ToolRegistry {
                         "include_deps": { "type": "boolean", "description": "When path is a single file: include outgoing/incoming file dependencies (default false)" },
                         "deps_direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "With include_deps: direction filter (default 'both')" },
                         "deps_depth": { "type": "number", "description": "With include_deps: max transitive depth (default 2)" },
-                        "include_dead": { "type": "boolean", "description": "Include unreferenced symbols (orphans + exported-unused) under this path (default false). Macro/shell-invoked entry points are pre-filtered." },
+                        "include_dead": { "type": "boolean", "description": "Include unreferenced symbols (orphans + exported-unused) under this path (default false). Macro/shell-invoked entry points are pre-filtered. Results are candidates to verify: receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked, so a flagged symbol may still be used." },
                         "dead_min_lines": { "type": "number", "description": "With include_dead: min line count to flag (default 3)" }
                     },
                     "required": ["path"]

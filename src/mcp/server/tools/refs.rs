@@ -24,6 +24,18 @@ impl McpServer {
             return Err(anyhow!("symbol_name or node_id is required"));
         }
 
+        // Validate relation at tool entry — before index refresh AND before symbol
+        // resolution. Otherwise a bogus relation surfaces only after a (possibly
+        // failing) symbol lookup, so a typo'd relation on an absent symbol reports
+        // "not found" and hides the real mistake. The exhaustive match below still
+        // maps the validated value to a filter constant. feedback-enum-validate-at-entry.
+        if !matches!(relation, "calls" | "imports" | "inherits" | "implements" | "references" | "all") {
+            return Err(anyhow!(
+                "Unknown relation filter: '{}'. Valid: calls, imports, inherits, implements, references, all",
+                relation
+            ));
+        }
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
             self.ensure_file_fresh_opt(file_path)?;

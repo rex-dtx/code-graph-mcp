@@ -491,6 +491,35 @@ fn test_cli_dead_code_absolute_path_under_root_matches_relative() {
         "abs/rel results must be identical (was: abs silently returned no results)");
 }
 
+// Regression (#4): `--ignore` must take a value (be in VALUE_FLAGS), so its value
+// is not mistaken for the scan path. Before the fix, `dead-code --ignore <pref> <path>`
+// scanned <pref> while `dead-code <path> --ignore <pref>` scanned <path> — same args,
+// opposite answer, both exit 0.
+#[test]
+fn test_cli_dead_code_ignore_before_path_equals_after() {
+    let project = setup_indexed_project();
+    // Use an ignore prefix that excludes nothing real, so the two orderings must
+    // produce the identical (non-trivially-empty when src has dead code) result.
+    let (before, _, before_code) =
+        run_cli(&project, &["dead-code", "--ignore", "zzz_nonexistent/", "src", "--json"]);
+    let (after, _, after_code) =
+        run_cli(&project, &["dead-code", "src", "--ignore", "zzz_nonexistent/", "--json"]);
+    assert_eq!(before_code, after_code, "exit codes must match regardless of flag order");
+    assert_eq!(before.trim(), after.trim(),
+        "--ignore before vs after the path must yield identical results");
+}
+
+// Regression (#4): a misspelled --type must error loudly, not fall through to a
+// literal n.type match that returns zero rows ("No dead code found", exit 0).
+#[test]
+fn test_cli_dead_code_rejects_misspelled_type() {
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["dead-code", "src", "--type", "fucntion"]);
+    assert_ne!(code, 0, "misspelled --type must error, not exit 0 clean; stderr={stderr:?}");
+    assert!(stderr.contains("Unknown type filter"),
+        "stderr should name the bad type filter; got: {stderr:?}");
+}
+
 // Regression: empty `--json` overview must keep stdout clean (`[]`) and avoid the
 // anyhow `Error:` stderr prefix. Exit code stays 1 because the requested path
 // matched nothing — mirrors `show --json` / `trace --json` empty contracts.
@@ -683,6 +712,25 @@ fn test_cli_refs_node_id_envelope() {
     assert!(v["total_references"].is_number(), "envelope must include total_references");
     assert!(v["by_relation"].is_object(), "envelope must include by_relation map");
     assert!(v["references"].is_array(), "envelope must include references array");
+}
+
+// Regression: `--relation` must be validated at the CLI layer, before opening the
+// index and before symbol resolution — so a bad --relation on a nonexistent symbol
+// reports the relation error, not "symbol not found" (which would mask the typo).
+#[test]
+fn test_cli_refs_invalid_relation_errors_early() {
+    let project = setup_indexed_project();
+    // Valid symbol, bad relation → relation error.
+    let (_, stderr, code) = run_cli(&project, &["refs", "validateToken", "--relation", "bogus"]);
+    assert_ne!(code, 0, "bad --relation should error; stderr={stderr:?}");
+    assert!(stderr.contains("--relation must be one of"),
+        "stderr should explain the valid relation set; got: {stderr:?}");
+    // Nonexistent symbol + bad relation → still the RELATION error (validation
+    // precedes resolution), not "Symbol not found".
+    let (_, stderr2, code2) = run_cli(&project, &["refs", "definitely_absent_xyz", "--relation", "bogus"]);
+    assert_ne!(code2, 0);
+    assert!(stderr2.contains("--relation must be one of"),
+        "relation validation must precede symbol resolution; got: {stderr2:?}");
 }
 
 // ============================================================

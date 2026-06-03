@@ -435,4 +435,63 @@ fn mcp_enum_args_validated_at_tool_entry() {
     }));
     assert!(tool_err(&r).contains("deps_direction must be one of"),
         "module_overview should reject bad deps_direction at entry; got: {}", tool_err(&r));
+
+    // module_overview deps_direction must be validated UNCONDITIONALLY — even
+    // without include_deps and for a directory path. Before the fix the check was
+    // gated inside `if include_deps { if path-is-file {...} }`, so this path never
+    // validated and returned a normal OK overview, hiding the typo.
+    let r = client.call_tool("module_overview", json!({
+        "path": "src", "deps_direction": "upside_down",
+    }));
+    assert!(tool_err(&r).contains("deps_direction must be one of"),
+        "module_overview must reject bad deps_direction even without include_deps; got: {}", tool_err(&r));
+
+    // impact_analysis change_type enum (validated at entry, before index work)
+    let r = client.call_tool("impact_analysis", json!({
+        "symbol_name": "target_fn", "change_type": "sideways",
+    }));
+    assert!(tool_err(&r).contains("change_type must be one of"),
+        "impact_analysis should reject bad change_type at entry; got: {}", tool_err(&r));
+
+    // find_references relation enum typo
+    let r = client.call_tool("find_references", json!({
+        "symbol_name": "target_fn", "relation": "call",
+    }));
+    assert!(tool_err(&r).contains("Unknown relation filter"),
+        "find_references should reject bad relation at entry; got: {}", tool_err(&r));
+}
+
+/// Regression: `relation` must be validated BEFORE symbol resolution, so a bogus
+/// relation on a nonexistent symbol reports the relation error — not the
+/// "symbol not found" error that would otherwise mask the real typo.
+#[test]
+fn mcp_find_references_invalid_relation_precedes_resolution() {
+    let project = setup_fixture_project();
+    let mut client = McpClient::spawn(project.path());
+    let r = client.call_tool("find_references", json!({
+        "symbol_name": "definitely_absent_symbol_xyz", "relation": "bogus",
+    }));
+    let text = if r["result"]["isError"].as_bool() == Some(true) {
+        r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+    } else {
+        panic!("expected isError=true, got: {}", r);
+    };
+    assert!(text.contains("Unknown relation filter"),
+        "relation must be validated before symbol resolution; got: '{}'", text);
+}
+
+/// Regression (#4): find_dead_code must reject an unknown node_type loudly rather
+/// than returning a false-clean empty result (a literal `n.type = :x` → 0 rows).
+#[test]
+fn mcp_find_dead_code_rejects_unknown_node_type() {
+    let project = setup_fixture_project();
+    let mut client = McpClient::spawn(project.path());
+    let r = client.call_tool("find_dead_code", json!({ "node_type": "fucntion" }));
+    let text = if r["result"]["isError"].as_bool() == Some(true) {
+        r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+    } else {
+        panic!("expected isError=true, got: {}", r);
+    };
+    assert!(text.contains("Unknown type filter"),
+        "find_dead_code must reject unknown node_type; got: '{}'", text);
 }

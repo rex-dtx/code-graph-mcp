@@ -175,7 +175,11 @@ impl CliContext {
 // --- Argument helpers ---
 
 /// Flags that take a value argument (not boolean).
-const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines", "--out", "--root"];
+// Any flag whose NEXT arg is its value (consumed via get_flag_value /
+// collect_flag_values / get_path_flag / parse_flag_or) MUST appear here, or
+// get_positional will mistake that value for a positional argument. Enforced by
+// test_value_flags_covers_all_value_consumers.
+const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines", "--out", "--root", "--ignore", "--last"];
 
 fn get_positional(args: &[String], index: usize) -> Option<&str> {
     let mut pos = 0;
@@ -2955,6 +2959,17 @@ pub fn cmd_refs(project_root: &Path, args: &[String]) -> Result<()> {
     let explicit_file_owned = get_path_flag(args, project_root, "--file")?;
     let explicit_file = explicit_file_owned.as_deref();
     let relation = get_flag_value(args, "--relation");
+    // Validate --relation at command entry — before opening the index and before
+    // symbol resolution — so a nonexistent symbol with a bad --relation reports the
+    // relation error, not "symbol not found". feedback-enum-validate-at-entry.
+    if let Some(r) = relation {
+        if !matches!(r, "calls" | "imports" | "inherits" | "implements" | "references" | "all") {
+            anyhow::bail!(
+                "--relation must be one of: calls, imports, inherits, implements, references, all (got '{}')",
+                r
+            );
+        }
+    }
     let json_mode = has_flag(args, "--json");
     let compact = has_flag(args, "--compact");
     let node_id_arg: Option<i64> = if get_flag_value(args, "--node-id").is_some() {
@@ -3120,6 +3135,18 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
     // Accept both --node-type (preferred, matches `search` CLI + MCP param) and --type (legacy).
     let type_filter = get_flag_value(args, "--node-type")
         .or_else(|| get_flag_value(args, "--type"));
+    // Validate --type/--node-type up-front: an unknown alias normalizes to an
+    // empty Vec, and find_dead_code then falls through to a literal `n.type = :x`
+    // match that returns zero rows — so a typo'd `--type fucntion` prints a
+    // false-clean "No dead code found" with exit 0. Mirror the cmd_ast_search guard.
+    if let Some(tf) = type_filter {
+        if crate::domain::normalize_type_filter(tf).is_empty() {
+            anyhow::bail!(
+                "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                tf
+            );
+        }
+    }
     let include_tests = has_flag(args, "--include-tests");
     let min_lines: u32 = parse_flag_or(args, "--min-lines", 3_u32);
     let compact = !has_flag(args, "--no-compact");
@@ -3205,11 +3232,12 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    writeln!(stdout, "Dead code: {} results ({} orphan, {} exported-unused)\n",
+    writeln!(stdout, "Dead code: {} candidates ({} orphan, {} exported-unused)",
         results.len(), orphans.len(), exported_unused.len())?;
+    writeln!(stdout, "(candidates to verify — receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked)\n")?;
 
     if !orphans.is_empty() {
-        writeln!(stdout, "ORPHAN ({}) — no references, not exported", orphans.len())?;
+        writeln!(stdout, "ORPHAN ({}) — no tracked references, not exported", orphans.len())?;
         for r in &orphans {
             let lines = r.end_line - r.start_line + 1;
             writeln!(stdout, "  {} {} {}:{} ({} lines)",
@@ -3227,7 +3255,7 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
 
     if !exported_unused.is_empty() {
         if !orphans.is_empty() { writeln!(stdout)?; }
-        writeln!(stdout, "EXPORTED-UNUSED ({}) — exported/public but never called", exported_unused.len())?;
+        writeln!(stdout, "EXPORTED-UNUSED ({}) — exported/public, no tracked callers", exported_unused.len())?;
         for r in &exported_unused {
             let lines = r.end_line - r.start_line + 1;
             writeln!(stdout, "  {} {} {}:{} ({} lines)",
@@ -3392,6 +3420,12 @@ pub fn cmd_snapshot_create(project_root: &Path, args: &[String]) -> Result<()> {
     crate::snapshot::create(&root, out_path, include)?;
     if !quiet {
         eprintln!("snapshot created: {}", out);
+        if out.ends_with(".db.zst") {
+            eprintln!(
+                "integrity sidecar: {out}.blake3 \u{2014} upload BOTH to the release; \
+                 consumers verify the checksum before decompressing"
+            );
+        }
     }
     Ok(())
 }
@@ -3602,6 +3636,51 @@ mod tests {
         // Let's fix the logic to handle boolean flags properly
         // For now, positional extraction with flags interleaved
         assert_eq!(get_positional(&args, 0), Some("query"));
+    }
+
+    // Regression: --ignore (and --last) take a VALUE, so get_positional must skip
+    // that value. Before they were added to VALUE_FLAGS, `dead-code --ignore foo/ src`
+    // resolved foo/ (the --ignore value) as the scan path instead of src — same args,
+    // opposite answer, exit 0.
+    #[test]
+    fn test_get_positional_skips_ignore_value() {
+        let args: Vec<String> = vec![
+            "code-graph-mcp".into(),
+            "dead-code".into(),
+            "--ignore".into(),
+            "foo/".into(),
+            "src".into(),
+        ];
+        assert_eq!(get_positional(&args, 0), Some("src"),
+            "--ignore's value must not be mistaken for the positional path");
+        // --last similarly takes a value.
+        let args2: Vec<String> = vec![
+            "code-graph-mcp".into(),
+            "stats".into(),
+            "--last".into(),
+            "7".into(),
+            "src".into(),
+        ];
+        assert_eq!(get_positional(&args2, 0), Some("src"));
+    }
+
+    // Every flag consumed for its value (get_flag_value / collect_flag_values /
+    // get_path_flag / parse_flag_or) MUST be registered in VALUE_FLAGS, or
+    // get_positional silently swallows its value as a positional. This list is the
+    // hand-maintained source of truth; adding a value-consuming flag without
+    // registering it here fails this test.
+    #[test]
+    fn test_value_flags_covers_all_value_consumers() {
+        const VALUE_CONSUMERS: &[&str] = &[
+            "--limit", "--type", "--returns", "--params", "--direction", "--depth",
+            "--file", "--language", "--change-type", "--top-k", "--max-distance",
+            "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines",
+            "--out", "--root", "--ignore", "--last",
+        ];
+        for flag in VALUE_CONSUMERS {
+            assert!(VALUE_FLAGS.contains(flag),
+                "{flag} consumes a value but is missing from VALUE_FLAGS — get_positional will swallow its value");
+        }
     }
 
     #[test]

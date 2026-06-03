@@ -5,6 +5,20 @@ use super::super::*;
 
 impl McpServer {
     pub(in crate::mcp::server) fn tool_module_overview(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // Validate deps_direction UNCONDITIONALLY at tool entry. It is only consumed
+        // when `include_deps` folds in dependency_graph for a single-file path, but
+        // validating it here — before ensure_indexed, regardless of include_deps or
+        // path shape — stops a bogus value from being silently swallowed into the
+        // `dependencies_unavailable` field (directory paths / include_deps:false
+        // never reached the old gated check). feedback-enum-validate-at-entry.
+        let deps_direction = args.get("deps_direction").and_then(|v| v.as_str()).unwrap_or("both");
+        if !matches!(deps_direction, "outgoing" | "incoming" | "both") {
+            return Err(anyhow!(
+                "deps_direction must be one of: outgoing, incoming, both (got '{}')",
+                deps_direction
+            ));
+        }
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
         }
@@ -173,17 +187,7 @@ impl McpServer {
         // Folds the former dependency_graph tool (v0.18.4).
         if include_deps {
             if path.contains('.') && !path.ends_with('/') {
-                // Pre-validate deps_direction at the outer tool layer. Without this,
-                // a bogus value would be swallowed by the outer Err-→`dependencies_unavailable`
-                // muffler below and the user would see an OK response with the error
-                // buried in a field they likely don't read.
-                let deps_direction = args.get("deps_direction").and_then(|v| v.as_str()).unwrap_or("both");
-                if !matches!(deps_direction, "outgoing" | "incoming" | "both") {
-                    return Err(anyhow!(
-                        "deps_direction must be one of: outgoing, incoming, both (got '{}')",
-                        deps_direction
-                    ));
-                }
+                // deps_direction was validated at function entry (unconditionally).
                 let dep_args = json!({
                     "file_path": path,
                     "direction": deps_direction,

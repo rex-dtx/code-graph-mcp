@@ -126,6 +126,17 @@ impl McpServer {
     }
 
     pub(in crate::mcp::server) fn tool_impact_analysis(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // Validate enum args at tool entry, before any index/freshness work — a
+        // typo'd change_type must error cleanly instead of after ensure_indexed ran
+        // (which both wastes work and can mask the typo behind an index error).
+        // feedback-enum-validate-at-entry.
+        let change_type = args.get("change_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("behavior");
+        if !matches!(change_type, "signature" | "behavior" | "remove") {
+            return Err(anyhow!("change_type must be one of: signature, behavior, remove (got '{}')", change_type));
+        }
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
             // Edit-aware: file_path is the disambiguator for "I just changed
@@ -135,12 +146,6 @@ impl McpServer {
         }
 
         let symbol_name = required_str(args, "symbol_name")?;
-        let change_type = args.get("change_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("behavior");
-        if !matches!(change_type, "signature" | "behavior" | "remove") {
-            return Err(anyhow!("change_type must be one of: signature, behavior, remove"));
-        }
         let depth = args.get("depth")
             .and_then(|v| v.as_i64())
             .unwrap_or(3)
@@ -262,26 +267,27 @@ impl McpServer {
     }
 
     pub(in crate::mcp::server) fn tool_dependency_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
-        if !should_skip_indexing(args) {
-            self.ensure_indexed()?;
-            // Edit-aware: file_path is required for this tool — post-edit
-            // staleness is the canonical failure mode here.
-            self.ensure_file_fresh_opt(args["file_path"].as_str())?;
-        }
-
+        // Validate required + enum args at tool entry, before any index/freshness
+        // work, so a missing file_path or bogus direction errors cleanly instead of
+        // after ensure_indexed ran. feedback-enum-validate-at-entry.
         let file_path = args["file_path"].as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("file_path is required (relative to project root)"))?;
         let direction = args.get("direction")
             .and_then(|v| v.as_str())
             .unwrap_or("both");
-        // Validate at tool entry so the error is clean — `get_import_tree` does
-        // reject bad direction too, but only AFTER index-freshness checks ran.
         if !matches!(direction, "outgoing" | "incoming" | "both") {
             return Err(anyhow!(
                 "direction must be one of: outgoing, incoming, both (got '{}')",
                 direction
             ));
+        }
+
+        if !should_skip_indexing(args) {
+            self.ensure_indexed()?;
+            // Edit-aware: file_path is required for this tool — post-edit
+            // staleness is the canonical failure mode here.
+            self.ensure_file_fresh_opt(Some(file_path))?;
         }
         let depth = args.get("depth")
             .and_then(|v| v.as_i64())
@@ -495,6 +501,17 @@ impl McpServer {
     pub(in crate::mcp::server) fn tool_find_dead_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         let path = args["path"].as_str();
         let node_type = args["node_type"].as_str();
+        // Validate node_type up-front: an unknown alias normalizes to an empty Vec
+        // and find_dead_code falls through to a literal `n.type = :x` match that
+        // returns zero rows — a false-clean empty result. Mirror tool_ast_search.
+        if let Some(tf) = node_type {
+            if crate::domain::normalize_type_filter(tf).is_empty() {
+                return Err(anyhow!(
+                    "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                    tf
+                ));
+            }
+        }
         let include_tests = args["include_tests"].as_bool().unwrap_or(false);
         let min_lines = args["min_lines"].as_u64().unwrap_or(3) as u32;
         let compact = args["compact"].as_bool().unwrap_or(true);
@@ -587,11 +604,14 @@ impl McpServer {
             "ignored_count": ignored_count,
             "ignore_paths_applied": ignore_prefixes,
             "ignore_paths_defaulted": ignore_was_defaulted,
+            // "candidates" not "results": receiver-method calls and cross-file
+            // const/type uses are not edge-tracked, so a flagged symbol may still
+            // be used — the caller should verify before treating it as dead.
             "summary": if ignored_count > 0 {
-                format!("Dead code: {} results ({} orphan, {} exported-unused); {} suppressed by ignore_paths (pass ignore_paths:[] to see them)",
+                format!("Dead code: {} candidates ({} orphan, {} exported-unused); {} suppressed by ignore_paths (pass ignore_paths:[] to see them). Verify — receiver-method/cross-file uses aren't edge-tracked.",
                     all_items.len(), orphan_items.len(), exported_items.len(), ignored_count)
             } else {
-                format!("Dead code: {} results ({} orphan, {} exported-unused)",
+                format!("Dead code: {} candidates ({} orphan, {} exported-unused). Verify — receiver-method/cross-file uses aren't edge-tracked.",
                     all_items.len(), orphan_items.len(), exported_items.len())
             },
         }))
