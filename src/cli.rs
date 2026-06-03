@@ -1631,6 +1631,39 @@ fn normalize_type_filter(input: &str) -> Vec<&'static str> {
     result
 }
 
+// --- callgraph subcommand ---
+
+/// CLI arguments for the `callgraph` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp callgraph",
+          about = "Show call graph (callers/callees)")]
+pub struct CallgraphArgs {
+    /// Symbol name to analyze
+    pub symbol: String,
+    // --direction stays an in-handler String (NOT a clap ValueEnum) so the exact
+    // "must be one of: callers, callees, both" exit-1 message is preserved.
+    /// Direction: callers, callees, or both
+    #[arg(long, default_value = "both")]
+    pub direction: String,
+    // .max(1) only (NOT clamp) stays in the handler: the engine caps depth and
+    // reports requested vs effective separately, so the CLI must not pre-rewrite it.
+    /// Max traversal depth (engine caps internally; default: 3)
+    #[arg(long, default_value_t = 3)]
+    pub depth: i32,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Compact output
+    #[arg(long)]
+    pub compact: bool,
+    /// Show test callers/callees (hidden by default)
+    #[arg(long)]
+    pub include_tests: bool,
+    /// Disambiguate same-name symbols by file path
+    #[arg(long)]
+    pub file: Option<String>,
+}
+
 /// Call graph display.
 ///
 /// Output format:
@@ -1639,30 +1672,25 @@ fn normalize_type_filter(input: &str) -> Vec<&'static str> {
 ///   ← called by: process_message (src/mcp/server.rs:130)
 ///   → calls: tool_semantic_search (src/mcp/server.rs:1360)
 /// ```
-pub fn cmd_callgraph(project_root: &Path, args: &[String]) -> Result<()> {
-    let raw_symbol = get_positional(args, 0)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp callgraph <symbol> [--direction callers|callees|both] [--depth N] [--file <path>] [--json]"
-        ))?;
+pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
+    // clap accepts an empty-string positional; preserve the non-empty guard.
+    let raw_symbol = args.symbol.as_str();
+    if raw_symbol.is_empty() {
+        anyhow::bail!("Usage: code-graph-mcp callgraph <symbol> [--direction callers|callees|both] [--depth N] [--file <path>] [--json]");
+    }
 
-    let direction = get_flag_value(args, "--direction").unwrap_or("both");
-    // Validate --direction at the CLI layer (matches cmd_deps). Without this,
-    // a typo only surfaces *after* ambiguity resolution — confusing UX where
-    // the user fixes ambiguity, retries, and is then told the direction is bad.
+    let direction = args.direction.as_str();
     if !matches!(direction, "callers" | "callees" | "both") {
         anyhow::bail!("--direction must be one of: callers, callees, both");
     }
-    // Lower-bound only: pass user's requested depth to the engine so
-    // `requested_max_depth` in the JSON reflects the actual user input.
-    // The engine caps to CALL_GRAPH_MAX_DEPTH internally and reports the
-    // capped value separately as `effective_max_depth`. CLI pre-clamping
-    // would silently rewrite the request and defeat that truth-telling.
-    let depth: i32 = parse_flag_or(args, "--depth", 3_i32).max(1);
-    let json_mode = has_flag(args, "--json");
-    let compact = has_flag(args, "--compact");
-    let include_tests = has_flag(args, "--include-tests");
-    let explicit_file_owned = get_path_flag(args, project_root, "--file")?;
+    let depth: i32 = args.depth.max(1);
+    let json_mode = args.json;
+    let compact = args.compact;
+    let include_tests = args.include_tests;
+    let explicit_file_owned: Option<String> = match args.file.as_deref() {
+        Some(f) => Some(normalize_user_path(project_root, f)?),
+        None => None,
+    };
     let explicit_file = explicit_file_owned.as_deref();
 
     let ctx = CliContext::open(project_root)?;

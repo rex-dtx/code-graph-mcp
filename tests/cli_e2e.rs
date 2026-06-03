@@ -96,7 +96,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
         "map", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
-        "snapshot",
+        "snapshot", "callgraph",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -389,6 +389,24 @@ fn test_cli_callgraph_json() {
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert!(v["results"].is_array());
+}
+
+// clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection;
+// --direction stays an in-handler String so invalid-direction is exit-1 (above).
+#[test]
+fn test_cli_callgraph_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "--help"]);
+    assert_eq!(code, 0, "callgraph --help should exit 0 (clap help)");
+    assert!(stdout.contains("call graph") || stdout.contains("--direction"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_callgraph_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["callgraph", "validateToken", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
 }
 
 // ============================================================
@@ -1327,13 +1345,16 @@ fn test_cli_missing_required_arg() {
     assert!(stderr.contains("Usage:"), "should show usage on missing arg");
 }
 
+// clap-migrated (audit #4 Step 5, user-approved): a leading-dash numeric value
+// like `--depth -5` is now a stray-token error (exit 2), uniformly across every
+// migrated numeric flag. The old hand parser read `-5`, parsed it, and clamped to
+// 1 (exit 0) — this test asserted that. Flavor-B change: negative depth is
+// nonsensical, so erroring surfaces the typo. Mirrors test_cli_trace_negative_depth_rejected.
 #[test]
-fn test_cli_depth_clamping() {
+fn test_cli_callgraph_negative_depth_rejected() {
     let project = setup_indexed_project();
-    // Negative depth should be clamped to 1 (not error)
-    let (stdout, _, code) = run_cli(&project, &["callgraph", "validateToken", "--depth", "-5"]);
-    assert_eq!(code, 0);
-    assert!(stdout.contains("validateToken"), "should still work with clamped depth");
+    let (_, _, code) = run_cli(&project, &["callgraph", "validateToken", "--depth", "-5"]);
+    assert_eq!(code, 2, "negative --depth must error (was: clamped to 1 / exit 0)");
 }
 
 // ============================================================

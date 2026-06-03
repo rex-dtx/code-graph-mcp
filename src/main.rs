@@ -97,7 +97,8 @@ fn main() -> Result<()> {
         }
         Some("callgraph" | "get_call_graph") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_callgraph(&project_root, &args)
+            let callgraph_args = code_graph_mcp::cli::CallgraphArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_callgraph(&project_root, callgraph_args)
         }
         Some("impact" | "impact_analysis") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
