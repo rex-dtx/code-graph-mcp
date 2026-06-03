@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.37.0 — CLI argument parsing migrated to clap-derive
+
+All 22 `code-graph-mcp` CLI subcommands moved from a hand-rolled argv parser to
+clap-derive; the hand parser is gone entirely. Every success path is preserved —
+queries, filters, JSON envelopes, and the found/not-found exit codes are
+unchanged. The changes are confined to argument-error handling and help, where
+clap now owns parsing. **No MCP tool behavior changes** (the MCP server was never
+hand-parsed).
+
+**User-visible CLI changes** (see `code-graph-mcp <cmd> --help` for each surface):
+
+- **Per-command help.** Every subcommand now has clap-generated `--help`/`-h`
+  (exit 0). Top-level `--version`/`-V` unchanged.
+- **Stricter argument errors → exit 2.** Unknown flags, extra positionals, a
+  missing required argument, and non-numeric or negative-numeric flag values
+  (e.g. `--depth -5`) now error with exit code 2. The old parser silently ignored
+  unknown flags / extra args and clamped-or-defaulted bad numbers (exit 0/1).
+- **`--flag=value` now honored.** `--limit=5`, `--direction=callees`,
+  `--relation=calls`, etc. now parse correctly. The old exact-token parser
+  silently ignored the `=value` form and fell back to defaults — sometimes
+  reporting false success (e.g. `refs --relation=calls` returned *all* references).
+- **`trace`.** The advertised-but-non-functional `--include-middleware` flag is
+  removed; use `--no-middleware` to hide downstream middleware (shown by default),
+  which is what the command always actually did.
+- **`snapshot`** is now a real `create` / `inspect` subcommand pair; an unknown or
+  missing subcommand errors (exit 2).
+
+In-handler validation messages and exit codes for the enum flags (`--direction`,
+`--change-type`, `--relation`) and the symbol-not-found / ambiguous-symbol guards
+are unchanged. clap is added as a runtime dependency.
+
 ## v0.36.0 — Audit remediation: snapshot supply-chain integrity, CLI/MCP consistency, honest dead-code
 
 Remediation of the 2026-06-03 architecture/security audit. Headline items: two
