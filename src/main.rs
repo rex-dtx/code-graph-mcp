@@ -102,7 +102,8 @@ fn main() -> Result<()> {
         }
         Some("impact" | "impact_analysis") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_impact(&project_root, &args)
+            let impact_args = code_graph_mcp::cli::ImpactArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_impact(&project_root, impact_args)
         }
         Some("map" | "project_map") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

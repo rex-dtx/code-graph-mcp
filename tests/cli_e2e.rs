@@ -96,7 +96,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
         "map", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
-        "snapshot", "callgraph",
+        "snapshot", "callgraph", "impact",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -454,6 +454,24 @@ fn test_cli_impact_json() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert!(v["risk"].is_string());
     assert!(v["symbol"].is_string());
+}
+
+// clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection;
+// --change-type stays an in-handler String so invalid-change-type is exit-1 (above).
+#[test]
+fn test_cli_impact_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["impact", "--help"]);
+    assert_eq!(code, 0, "impact --help should exit 0 (clap help)");
+    assert!(stdout.contains("Impact analysis") || stdout.contains("--change-type"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_impact_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["impact", "validateToken", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
 }
 
 // ============================================================

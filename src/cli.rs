@@ -1908,21 +1908,50 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     Ok(())
 }
 
+// --- impact subcommand ---
+
+/// CLI arguments for the `impact` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp impact",
+          about = "Impact analysis (callers, routes, risk level)")]
+pub struct ImpactArgs {
+    /// Symbol name to analyze
+    pub symbol: String,
+    // clamp(1,20) stays in the handler; clap parse-errors (exit 2) on non-numeric.
+    /// Max traversal depth (default: 3)
+    #[arg(long, default_value_t = 3)]
+    pub depth: i32,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Disambiguate same-name symbols by file path
+    #[arg(long)]
+    pub file: Option<String>,
+    // --change-type stays an in-handler String (NOT a clap ValueEnum) so the exact
+    // "must be one of: signature, behavior, remove" exit-1 message is preserved.
+    /// Change type: signature, behavior, or remove
+    #[arg(long = "change-type", default_value = "behavior")]
+    pub change_type: String,
+}
+
 /// Impact analysis.
 ///
 /// Shows callers with route info and risk level.
-pub fn cmd_impact(project_root: &Path, args: &[String]) -> Result<()> {
-    let raw_symbol = get_positional(args, 0)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "Usage: code-graph-mcp impact <symbol> [--depth N] [--file <path>] [--change-type signature|behavior|remove] [--json]"
-        ))?;
+pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
+    // clap accepts an empty-string positional; preserve the non-empty guard.
+    let raw_symbol = args.symbol.as_str();
+    if raw_symbol.is_empty() {
+        anyhow::bail!("Usage: code-graph-mcp impact <symbol> [--depth N] [--file <path>] [--change-type signature|behavior|remove] [--json]");
+    }
 
-    let depth: i32 = parse_flag_or(args, "--depth", 3_i32).clamp(1, 20);
-    let json_mode = has_flag(args, "--json");
-    let explicit_file_owned = get_path_flag(args, project_root, "--file")?;
+    let depth: i32 = args.depth.clamp(1, 20);
+    let json_mode = args.json;
+    let explicit_file_owned: Option<String> = match args.file.as_deref() {
+        Some(f) => Some(normalize_user_path(project_root, f)?),
+        None => None,
+    };
     let explicit_file = explicit_file_owned.as_deref();
-    let change_type = get_flag_value(args, "--change-type").unwrap_or("behavior");
+    let change_type = args.change_type.as_str();
     if !matches!(change_type, "signature" | "behavior" | "remove") {
         anyhow::bail!("--change-type must be one of: signature, behavior, remove");
     }
