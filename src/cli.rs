@@ -3247,13 +3247,23 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `benchmark` arguments (clap-migrated, audit #4).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp benchmark",
+          about = "Benchmark index speed, query latency, token savings")]
+pub struct BenchmarkArgs {
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Run benchmark: full index, incremental index, query latency, DB size, token savings.
-pub fn cmd_benchmark(project_root: &Path, args: &[String]) -> Result<()> {
+pub fn cmd_benchmark(project_root: &Path, args: BenchmarkArgs) -> Result<()> {
     use crate::domain::CODE_GRAPH_DIR;
     use crate::indexer::pipeline::{run_full_index, run_incremental_index};
     use std::time::Instant;
 
-    let json_mode = has_flag(args, "--json");
+    let json_mode = args.json;
 
     // Create a temporary database for benchmarking
     let data_dir = project_root.join(CODE_GRAPH_DIR);

@@ -136,7 +136,8 @@ fn main() -> Result<()> {
         }
         Some("benchmark") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_benchmark(&project_root, &args)
+            let bench_args = code_graph_mcp::cli::BenchmarkArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_benchmark(&project_root, bench_args)
         }
         Some("stats") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

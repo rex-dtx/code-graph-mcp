@@ -453,6 +453,33 @@ fn test_cli_stats_unknown_flag_errors() {
 }
 
 // ============================================================
+// benchmark (clap-migrated, audit #4) — contract lock
+// ============================================================
+
+#[test]
+fn test_cli_benchmark_runs() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["benchmark"]);
+    assert_eq!(code, 0, "benchmark should run to completion on the fixture");
+}
+
+#[test]
+fn test_cli_benchmark_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["benchmark", "--help"]);
+    assert_eq!(code, 0, "benchmark --help should exit 0 (clap help)");
+    assert!(stdout.contains("Benchmark") || stdout.contains("--json"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_benchmark_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["benchmark", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
+// ============================================================
 // show
 // ============================================================
 
