@@ -22,6 +22,9 @@ pub const REL_REFERENCES: &str = "references";
 // nodes or edges for the same source files. The server will detect a mismatch
 // and automatically clear + rebuild the index.
 // This is separate from SCHEMA_VERSION (which tracks table structure changes).
+// Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
+// model=None incremental path) does NOT bump this — only node/edge/FTS output
+// changes do; vectors regenerate via the NULL-vector background-embed convention.
 pub const INDEX_VERSION: i32 = 6;
 
 // -- Embedding --

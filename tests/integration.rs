@@ -1906,6 +1906,54 @@ pub fn make_them() {
         "node_id selection should not be ambiguous: {}", result2);
 }
 
+/// Audit #6: get_call_graph and impact_analysis must flag a same-file overload
+/// (≥2 non-test defs of one name in one file) as ambiguous — matching the CLI
+/// after the shared crate::resolve unification. Closes the MCP-side e2e gap the
+/// branch review flagged (CLI had 3 reproductions; MCP had none).
+#[test]
+fn test_mcp_callgraph_impact_same_file_overload_is_ambiguous() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub struct Foo;
+pub struct Bar;
+
+impl Foo {
+    pub fn new() -> Self { Foo }
+}
+
+impl Bar {
+    pub fn new() -> Self { Bar }
+}
+
+pub fn make_them() {
+    let _ = Foo::new();
+    let _ = Bar::new();
+}
+"#).unwrap();
+    let server = common::init_server(&project);
+
+    for tool in ["get_call_graph", "impact_analysis"] {
+        // No file_path / node_id → must report ambiguity, not silently merge the
+        // two distinct `new` definitions.
+        let msg = tool_call_json(tool, serde_json::json!({"symbol_name": "new"}));
+        let resp = server.handle_message(&msg).unwrap();
+        let result = parse_tool_result(&resp);
+        let err = result.get("error").and_then(|e| e.as_str()).unwrap_or("");
+        assert!(err.contains("Ambiguous symbol 'new'"),
+            "{tool} must report same-file ambiguity for 'new'; got: {result}");
+        // Accurate same-file guidance (not the dead-end "Specify file_path").
+        assert!(err.contains("same file"),
+            "{tool} same-file message must name the same-file case; got: {err}");
+        let suggestions = result["suggestions"].as_array()
+            .unwrap_or_else(|| panic!("{tool}: suggestions array missing: {result}"));
+        assert!(suggestions.len() >= 2,
+            "{tool}: expected ≥2 node_id suggestions; got: {result}");
+        for s in suggestions {
+            assert!(s["node_id"].as_i64().is_some(), "{tool} suggestion needs node_id: {s}");
+        }
+    }
+}
+
 /// v0.11.2 fix: `find_dead_code` must filter out shell-invoked plugin entry
 /// points by default (claude-plugin/** prefix). Users opt in to the full list
 /// by passing `ignore_paths: []`.
