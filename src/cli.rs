@@ -176,51 +176,6 @@ impl CliContext {
 
 // --- Argument helpers ---
 
-/// Flags that take a value argument (not boolean).
-// Any flag whose NEXT arg is its value (consumed via get_flag_value /
-// get_path_flag / parse_flag_or) MUST appear here, or get_positional will
-// mistake that value for a positional argument. Enforced by
-// test_value_flags_covers_all_value_consumers.
-const VALUE_FLAGS: &[&str] = &["--limit", "--type", "--returns", "--params", "--direction", "--depth", "--format", "--file", "--language", "--change-type", "--top-k", "--max-distance", "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines", "--out", "--root", "--ignore", "--last"];
-
-fn get_positional(args: &[String], index: usize) -> Option<&str> {
-    let mut pos = 0;
-    let mut i = 2; // skip binary name and subcommand
-    while i < args.len() {
-        if args[i].starts_with("--") {
-            // Skip the flag itself
-            if VALUE_FLAGS.contains(&args[i].as_str()) {
-                i += 2; // skip flag + its value
-            } else {
-                i += 1; // boolean flag, skip just the flag
-            }
-            continue;
-        }
-        // Skip single-dash flags (e.g., -h, -V)
-        if args[i].starts_with('-') && args[i].len() > 1 {
-            i += 1;
-            continue;
-        }
-        if pos == index {
-            return Some(&args[i]);
-        }
-        pos += 1;
-        i += 1;
-    }
-    None
-}
-
-fn get_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str())
-}
-
-fn has_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|a| a == flag)
-}
-
 /// Normalize a user-provided path argument to a project-relative string.
 ///
 /// - `"."` → `""` (whole project — matches MCP `module_overview` semantics)
@@ -257,20 +212,6 @@ fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
         "path '{}' is outside the project root '{}' \u{2014} use a relative path or one under the project root",
         raw, project_root.display()
     );
-}
-
-/// Parse a numeric flag value, printing a warning on invalid input and falling back to default.
-fn parse_flag_or<T: std::str::FromStr + std::fmt::Display>(args: &[String], flag: &str, default: T) -> T {
-    match get_flag_value(args, flag) {
-        Some(v) => match v.parse::<T>() {
-            Ok(val) => val,
-            Err(_) => {
-                eprintln!("[code-graph] Warning: invalid value '{}' for {}, using default {}", v, flag, default);
-                default
-            }
-        },
-        None => default,
-    }
 }
 
 /// Strip qualified name prefix (e.g. "McpServer.handle_message" -> "handle_message")
@@ -3086,17 +3027,37 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
     Ok(())
 }
 
+// --- similar subcommand ---
+
+/// CLI arguments for the `similar` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp similar",
+          about = "Find semantically similar code (requires embeddings)")]
+pub struct SimilarArgs {
+    /// Symbol name (required unless --node-id is given)
+    pub symbol: Option<String>,
+    /// Look up by node ID instead of name
+    #[arg(long = "node-id")]
+    pub node_id: Option<i64>,
+    // clamp(1,100) stays in the handler; clap parse-errors (exit 2) on non-numeric.
+    /// Number of results (default: 5, max: 100)
+    #[arg(long = "top-k")]
+    pub top_k: Option<i64>,
+    /// Max cosine distance (default: 0.8)
+    #[arg(long = "max-distance")]
+    pub max_distance: Option<f64>,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Find semantically similar code.
 /// CLI equivalent of MCP `find_similar_code`.
-pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
-    let top_k: i64 = parse_flag_or(args, "--top-k", 5_i64).clamp(1, 100);
-    let max_distance: f64 = parse_flag_or(args, "--max-distance", 0.8_f64);
-    let json_mode = has_flag(args, "--json");
-    let node_id_arg: Option<i64> = if get_flag_value(args, "--node-id").is_some() {
-        Some(parse_flag_or(args, "--node-id", 0_i64))
-    } else {
-        None
-    };
+pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
+    let top_k: i64 = args.top_k.unwrap_or(5).clamp(1, 100);
+    let max_distance: f64 = args.max_distance.unwrap_or(0.8);
+    let json_mode = args.json;
+    let node_id_arg: Option<i64> = args.node_id;
 
     // Open with vec support for vector search
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
@@ -3120,7 +3081,7 @@ pub fn cmd_similar(project_root: &Path, args: &[String]) -> Result<()> {
     let (node_id, target_label) = if let Some(nid) = node_id_arg {
         (nid, format!("node_id {}", nid))
     } else {
-        let symbol = get_positional(args, 0)
+        let symbol = args.symbol.as_deref()
             .filter(|s| !s.is_empty())
             .map(strip_qualified_prefix)
             .ok_or_else(|| anyhow::anyhow!(
@@ -3983,105 +3944,6 @@ mod tests {
         std::fs::create_dir_all(&sub_idx).unwrap();
         std::fs::write(sub_idx.join("index.db"), b"").unwrap();
         assert_eq!(resolve_project_root_from(&subdir), subdir);
-    }
-
-    #[test]
-    fn test_get_positional() {
-        let args: Vec<String> = vec![
-            "code-graph-mcp".into(),
-            "grep".into(),
-            "pattern".into(),
-            "src/".into(),
-        ];
-        assert_eq!(get_positional(&args, 0), Some("pattern"));
-        assert_eq!(get_positional(&args, 1), Some("src/"));
-        assert_eq!(get_positional(&args, 2), None);
-    }
-
-    #[test]
-    fn test_get_positional_with_flags() {
-        let args: Vec<String> = vec![
-            "code-graph-mcp".into(),
-            "search".into(),
-            "--json".into(),
-            "query".into(),
-            "--limit".into(),
-            "10".into(),
-        ];
-        // --json is a flag without value (next arg doesn't start with --), so "query" is consumed as its value
-        // Let's fix the logic to handle boolean flags properly
-        // For now, positional extraction with flags interleaved
-        assert_eq!(get_positional(&args, 0), Some("query"));
-    }
-
-    // Regression: --ignore (and --last) take a VALUE, so get_positional must skip
-    // that value. Before they were added to VALUE_FLAGS, `dead-code --ignore foo/ src`
-    // resolved foo/ (the --ignore value) as the scan path instead of src — same args,
-    // opposite answer, exit 0.
-    #[test]
-    fn test_get_positional_skips_ignore_value() {
-        let args: Vec<String> = vec![
-            "code-graph-mcp".into(),
-            "dead-code".into(),
-            "--ignore".into(),
-            "foo/".into(),
-            "src".into(),
-        ];
-        assert_eq!(get_positional(&args, 0), Some("src"),
-            "--ignore's value must not be mistaken for the positional path");
-        // --last similarly takes a value.
-        let args2: Vec<String> = vec![
-            "code-graph-mcp".into(),
-            "stats".into(),
-            "--last".into(),
-            "7".into(),
-            "src".into(),
-        ];
-        assert_eq!(get_positional(&args2, 0), Some("src"));
-    }
-
-    // Every flag consumed for its value (get_flag_value / get_path_flag /
-    // parse_flag_or) MUST be registered in VALUE_FLAGS, or
-    // get_positional silently swallows its value as a positional. This list is the
-    // hand-maintained source of truth; adding a value-consuming flag without
-    // registering it here fails this test.
-    #[test]
-    fn test_value_flags_covers_all_value_consumers() {
-        const VALUE_CONSUMERS: &[&str] = &[
-            "--limit", "--type", "--returns", "--params", "--direction", "--depth",
-            "--file", "--language", "--change-type", "--top-k", "--max-distance",
-            "--node-type", "--node-id", "--context-lines", "--relation", "--min-lines",
-            "--out", "--root", "--ignore", "--last",
-        ];
-        for flag in VALUE_CONSUMERS {
-            assert!(VALUE_FLAGS.contains(flag),
-                "{flag} consumes a value but is missing from VALUE_FLAGS — get_positional will swallow its value");
-        }
-    }
-
-    #[test]
-    fn test_has_flag() {
-        let args: Vec<String> = vec![
-            "code-graph-mcp".into(),
-            "search".into(),
-            "--json".into(),
-            "query".into(),
-        ];
-        assert!(has_flag(&args, "--json"));
-        assert!(!has_flag(&args, "--compact"));
-    }
-
-    #[test]
-    fn test_get_flag_value() {
-        let args: Vec<String> = vec![
-            "code-graph-mcp".into(),
-            "search".into(),
-            "--limit".into(),
-            "10".into(),
-            "query".into(),
-        ];
-        assert_eq!(get_flag_value(&args, "--limit"), Some("10"));
-        assert_eq!(get_flag_value(&args, "--json"), None);
     }
 
     #[test]

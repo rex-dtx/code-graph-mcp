@@ -132,7 +132,8 @@ fn main() -> Result<()> {
         }
         Some("similar" | "find_similar_code") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_similar(&project_root, &args)
+            let similar_args = code_graph_mcp::cli::SimilarArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_similar(&project_root, similar_args)
         }
         Some("refs" | "find_references") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

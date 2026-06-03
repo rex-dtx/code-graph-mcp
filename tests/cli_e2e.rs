@@ -96,7 +96,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
         "map", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
-        "snapshot", "callgraph", "impact", "show", "refs",
+        "snapshot", "callgraph", "impact", "show", "refs", "similar",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -1550,6 +1550,25 @@ fn test_cli_similar_digit_positional_suggests_node_id() {
         stderr.contains("--node-id 9999"),
         "all-digit positional should suggest --node-id flag; got stderr: {stderr}"
     );
+}
+
+// clap-migrated (audit #4 Step 5): `similar` was the last hand-parsed command (the
+// plan's step breakdown omitted it); migrating it decommissioned the whole hand
+// parser. clap owns --help + unknown-flag rejection.
+#[test]
+fn test_cli_similar_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["similar", "--help"]);
+    assert_eq!(code, 0, "similar --help should exit 0 (clap help)");
+    assert!(stdout.contains("similar code") || stdout.contains("--top-k"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_similar_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["similar", "validateToken", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
 }
 
 #[test]
