@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use std::io::{self, BufRead, Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -139,7 +140,11 @@ fn main() -> Result<()> {
         }
         Some("stats") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_stats(&project_root, &args)
+            // clap-migrated (audit #4): parse this subcommand's args via clap,
+            // then dispatch. skip(1) drops argv[0]; clap treats the next token
+            // (the subcommand/alias name) as the binary-name slot and skips it.
+            let stats_args = code_graph_mcp::cli::StatsArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_stats(&project_root, stats_args)
         }
         Some("doctor") => {
             run_node_script("doctor.js", &args.iter().filter(|a| a.as_str() == "--check-only").cloned().collect::<Vec<_>>())

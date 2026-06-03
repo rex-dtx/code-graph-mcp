@@ -4,6 +4,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use clap::Parser;
+
 use crate::domain::CODE_GRAPH_DIR;
 use crate::storage::db::Database;
 use crate::storage::queries;
@@ -859,24 +861,25 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
 /// Print aggregated session metrics from `.code-graph/usage.jsonl`.
 /// Diagnostic: shows which tools you actually use + search/index activity.
 /// `--last N` limits to the most recent N sessions. `--json` emits structured output.
-pub fn cmd_stats(project_root: &Path, args: &[String]) -> Result<()> {
-    let json_mode = has_flag(args, "--json");
-    // `--last abc` used to fall through `.ok()` silently and show all sessions —
-    // exactly opposite of the user's intent. Match other commands' parse_flag_or
-    // pattern (warn + ignore-the-bad-arg) so the contract is consistent.
-    let last_n = match get_flag_value(args, "--last") {
-        Some(s) => match s.parse::<usize>() {
-            Ok(n) => Some(n),
-            Err(_) => {
-                eprintln!(
-                    "[code-graph] Warning: invalid value '{}' for --last, showing all sessions",
-                    s
-                );
-                None
-            }
-        },
-        None => None,
-    };
+/// `stats` arguments (clap-migrated, audit #4).
+///
+/// Idiomatic-flavor UX change: `--last <non-number>` is now a hard parse error
+/// (exit 2, clap message) instead of the prior warn-and-show-all fallback.
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp stats",
+          about = "Aggregate session metrics from .code-graph/usage.jsonl")]
+pub struct StatsArgs {
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Limit to the last N sessions (default: all)
+    #[arg(long)]
+    pub last: Option<usize>,
+}
+
+pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
+    let json_mode = args.json;
+    let last_n = args.last;
 
     let usage_path = project_root.join(CODE_GRAPH_DIR).join("usage.jsonl");
     if !usage_path.exists() {

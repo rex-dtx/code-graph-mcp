@@ -394,6 +394,65 @@ fn test_cli_impact_same_file_overload_is_ambiguous() {
 }
 
 // ============================================================
+// stats (clap-migrated, audit #4) — contract lock
+// ============================================================
+
+#[test]
+fn test_cli_stats_no_data() {
+    // Freshly-indexed project has no usage.jsonl yet → handler returns Ok (exit 0).
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["stats"]);
+    assert_eq!(code, 0, "stats with no usage data should exit 0; stderr={stderr:?}");
+    assert!(stderr.contains("No usage data"), "should explain absence; got: {stderr:?}");
+}
+
+#[test]
+fn test_cli_stats_json_no_data() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["sessions"], 0);
+}
+
+#[test]
+fn test_cli_stats_last_valid_parses() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["stats", "--last", "5"]);
+    assert_eq!(code, 0, "valid --last should parse and run");
+}
+
+// Flavor-B contract: clap rejects a non-numeric --last with exit 2 (was: warn +
+// show-all under the hand parser). Locks the idiomatic parse-error behavior.
+#[test]
+fn test_cli_stats_invalid_last_errors() {
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["stats", "--last", "abc"]);
+    assert_eq!(code, 2, "non-numeric --last must be a clap parse error (exit 2); stderr={stderr:?}");
+    assert!(stderr.contains("invalid value") && stderr.contains("abc"),
+        "clap should name the bad value; got: {stderr:?}");
+}
+
+#[test]
+fn test_cli_stats_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["stats", "--help"]);
+    assert_eq!(code, 0, "stats --help should exit 0 (clap help)");
+    assert!(stdout.contains("Aggregate session metrics") || stdout.contains("--last"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_stats_unknown_flag_errors() {
+    // Flavor-B: clap rejects unknown flags (was: silently ignored).
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["stats", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap; stderr={stderr:?}");
+    assert!(stderr.contains("unexpected") || stderr.contains("--bogus") || stderr.contains("unrecognized"),
+        "clap should name the unknown flag; got: {stderr:?}");
+}
+
+// ============================================================
 // show
 // ============================================================
 
