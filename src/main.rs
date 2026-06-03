@@ -63,7 +63,8 @@ fn main() -> Result<()> {
         }
         Some("reindex") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_reindex(&project_root, &args)
+            let reindex_args = code_graph_mcp::cli::ReindexArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_reindex(&project_root, reindex_args)
         }
         Some("health-check") => {
             // Support both --format json and --json for consistency with other commands

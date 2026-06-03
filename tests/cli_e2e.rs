@@ -837,6 +837,36 @@ fn test_cli_incremental_index_unknown_flag_errors() {
 }
 
 // ============================================================
+// reindex (clap-migrated, audit #4) — contract lock (0 prior tests)
+// ============================================================
+
+#[test]
+fn test_cli_reindex_runs() {
+    // Plain `reindex` (no --from-snapshot) resets + re-indexes via cmd_incremental_index.
+    let project = setup_indexed_project();
+    let (_, stderr, code) = run_cli(&project, &["reindex"]);
+    assert_eq!(code, 0, "reindex should run to completion; stderr={stderr:?}");
+    assert!(stderr.contains("Incremental index:"), "should show index stats; got: {stderr:?}");
+}
+
+#[test]
+fn test_cli_reindex_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["reindex", "--help"]);
+    assert_eq!(code, 0, "reindex --help should exit 0 (clap help)");
+    assert!(stdout.contains("snapshot") || stdout.contains("--from-snapshot"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_reindex_unknown_flag_errors() {
+    // Flavor-B: clap rejects unknown flags (was: silently ignored).
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["reindex", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
+// ============================================================
 // rebuild-index (§5 hard op — destructive path requires --confirm)
 // ============================================================
 

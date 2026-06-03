@@ -3453,8 +3453,18 @@ pub fn cmd_snapshot_inspect(args: &[String]) -> Result<()> {
 ///
 /// Equivalent to user-side `rm -rf .code-graph/index.db*` + restarting the
 /// MCP server, but with optional snapshot-bootstrap acceleration.
-pub fn cmd_reindex(project_root: &Path, args: &[String]) -> Result<()> {
-    let from_snapshot = has_flag(args, "--from-snapshot");
+/// `reindex` arguments (clap-migrated, audit #4).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp reindex",
+          about = "Reset index; with --from-snapshot, refetch the published snapshot")]
+pub struct ReindexArgs {
+    /// Refetch the published snapshot before indexing (falls back to full index)
+    #[arg(long)]
+    pub from_snapshot: bool,
+}
+
+pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
+    let from_snapshot = args.from_snapshot;
     let cg_dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
 
     if from_snapshot && cg_dir.exists() {
