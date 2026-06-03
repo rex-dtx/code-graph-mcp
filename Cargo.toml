@@ -64,6 +64,9 @@ tempfile = "3"
 
 [build-dependencies]
 cc = "1"
+# Supply-chain pin: build.rs verifies the vendored sqlite-vec C against pinned
+# blake3 hashes. blake3 is already a runtime dep (same crate, host-compiled here).
+blake3 = "1"
 
 [profile.release]
 opt-level = 2
