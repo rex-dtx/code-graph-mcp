@@ -81,6 +81,34 @@ fn run_cli(project: &TempDir, args: &[&str]) -> (String, String, i32) {
 }
 
 // ============================================================
+// clap migration (audit #4) — cross-command --help hygiene
+// ============================================================
+
+// Regression guard for the doc-comment-as-long_about leak found by smoke-testing
+// Step 1: clap renders a struct's multi-paragraph `///` doc as `--help` long-about,
+// so internal migration notes (audit refs, shim/impl details, the mis-attached
+// function docs) MUST stay out of the clap struct docs. Asserts the generated help
+// for every clap-migrated subcommand exposes only its user-facing `about`.
+#[test]
+fn test_cli_migrated_help_has_no_internal_notes() {
+    let project = setup_indexed_project();
+    let internal_tokens = ["audit #", "clap-migrat", "resolved_format", "plan §", "issue #"];
+    for cmd in [
+        "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
+    ] {
+        let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
+        assert_eq!(code, 0, "{cmd} --help should exit 0");
+        let low = stdout.to_lowercase();
+        for tok in internal_tokens {
+            assert!(
+                !low.contains(&tok.to_lowercase()),
+                "{cmd} --help leaked internal note {tok:?}; full help:\n{stdout}"
+            );
+        }
+    }
+}
+
+// ============================================================
 // health-check
 // ============================================================
 

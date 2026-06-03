@@ -450,15 +450,12 @@ fn format_node_compact(node: &queries::NodeResult, file_path: &str) -> String {
 
 // --- Subcommands ---
 
-/// Run incremental index update.
-/// If `quiet` is true, suppress non-error output.
-/// Auto-creates the database and runs a full index if no index exists.
-/// `incremental-index` arguments (clap-migrated, audit #4).
-///
-/// Only flag parsing lives here; the git/index existence guard stays in `main()`
-/// — it must run before any `resolve_project_root` indexing side effects and may
-/// skip the run entirely (issue #8). The handler keeps its `quiet: bool` signature
-/// so the internal `reindex`/`rebuild-index` callers are unaffected.
+// Internal notes — `//` (not `///`) so clap leaves them out of `--help`: only flag
+// parsing lives in this struct; the git/index existence guard stays in main() — it
+// must precede any resolve_project_root indexing side effect and may skip the run
+// entirely (issue #8). The handler keeps its `quiet: bool` signature so the internal
+// reindex/rebuild-index callers are unaffected.
+/// CLI arguments for the `incremental-index` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
 #[command(name = "code-graph-mcp incremental-index",
           about = "Run incremental index update (full index when none exists)")]
@@ -468,6 +465,9 @@ pub struct IncrementalIndexArgs {
     pub quiet: bool,
 }
 
+/// Run incremental index update.
+/// If `quiet` is true, suppress non-error output.
+/// Auto-creates the database and runs a full index if no index exists.
 pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     let is_new = !db_path.exists();
@@ -605,13 +605,12 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     cmd_incremental_index(project_root, quiet)
 }
 
-/// `health-check` arguments (clap-migrated, audit #4).
-///
-/// `--json` and `--format <fmt>` coexist for back-compat: `--json` is shorthand
-/// for `--format json` and wins when both are given. `resolved_format` is the
-/// thin normalization shim (plan §2 item 14) that collapses the two into the
-/// single `&str` the handler consumes — so `cmd_health_check`'s signature and
-/// its JSON/oneline branches stay untouched.
+// Internal notes — `//` (not `///`) so clap leaves them out of `--help`: --json and
+// --format coexist for back-compat (--json is shorthand for `--format json` and wins
+// when both are given); resolved_format() below collapses them into the single `&str`
+// the handler consumes, so cmd_health_check's signature and its JSON/oneline branches
+// stay untouched (plan §2 item 14).
+/// CLI arguments for the `health-check` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
 #[command(name = "code-graph-mcp health-check",
           about = "Query index status (nodes/edges/files, freshness, embedding coverage)")]
@@ -922,13 +921,10 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
     summary
 }
 
-/// Print aggregated session metrics from `.code-graph/usage.jsonl`.
-/// Diagnostic: shows which tools you actually use + search/index activity.
-/// `--last N` limits to the most recent N sessions. `--json` emits structured output.
-/// `stats` arguments (clap-migrated, audit #4).
-///
-/// Idiomatic-flavor UX change: `--last <non-number>` is now a hard parse error
-/// (exit 2, clap message) instead of the prior warn-and-show-all fallback.
+// Idiomatic-flavor UX change — `//` (not `///`) so it stays out of clap `--help`:
+// `--last <non-number>` is now a hard parse error (exit 2, clap message) instead of
+// the prior warn-and-show-all fallback.
+/// CLI arguments for the `stats` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
 #[command(name = "code-graph-mcp stats",
           about = "Aggregate session metrics from .code-graph/usage.jsonl")]
@@ -941,6 +937,9 @@ pub struct StatsArgs {
     pub last: Option<usize>,
 }
 
+/// Print aggregated session metrics from `.code-graph/usage.jsonl`.
+/// Diagnostic: shows which tools you actually use + search/index activity.
+/// `--last N` limits to the most recent N sessions. `--json` emits structured output.
 pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     let json_mode = args.json;
     let last_n = args.last;
@@ -3311,7 +3310,7 @@ pub fn cmd_dead_code(project_root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `benchmark` arguments (clap-migrated, audit #4).
+/// CLI arguments for the `benchmark` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
 #[command(name = "code-graph-mcp benchmark",
           about = "Benchmark index speed, query latency, token savings")]
@@ -3496,13 +3495,7 @@ pub fn cmd_snapshot_inspect(args: &[String]) -> Result<()> {
 
 // --- reindex subcommand ---
 
-/// `reindex [--from-snapshot]` — wipe `.code-graph/` index files and re-fetch
-/// snapshot (or full-index if no snapshot available). Without `--from-snapshot`,
-/// behaves identically to `incremental-index`.
-///
-/// Equivalent to user-side `rm -rf .code-graph/index.db*` + restarting the
-/// MCP server, but with optional snapshot-bootstrap acceleration.
-/// `reindex` arguments (clap-migrated, audit #4).
+/// CLI arguments for the `reindex` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
 #[command(name = "code-graph-mcp reindex",
           about = "Reset index; with --from-snapshot, refetch the published snapshot")]
@@ -3512,6 +3505,12 @@ pub struct ReindexArgs {
     pub from_snapshot: bool,
 }
 
+/// `reindex [--from-snapshot]` — wipe `.code-graph/` index files and re-fetch
+/// snapshot (or full-index if no snapshot available). Without `--from-snapshot`,
+/// behaves identically to `incremental-index`.
+///
+/// Equivalent to user-side `rm -rf .code-graph/index.db*` + restarting the
+/// MCP server, but with optional snapshot-bootstrap acceleration.
 pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
     let from_snapshot = args.from_snapshot;
     let cg_dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
