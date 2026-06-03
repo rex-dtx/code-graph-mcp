@@ -108,7 +108,8 @@ fn main() -> Result<()> {
         }
         Some("overview" | "module_overview") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_overview(&project_root, &args)
+            let overview_args = code_graph_mcp::cli::OverviewArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_overview(&project_root, overview_args)
         }
         Some("show" | "get_ast_node") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

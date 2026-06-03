@@ -95,7 +95,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     let internal_tokens = ["audit #", "clap-migrat", "resolved_format", "plan §", "issue #"];
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
-        "map", "grep",
+        "map", "grep", "overview",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -691,6 +691,25 @@ fn test_cli_overview_compact() {
     assert!(stdout.contains("validateToken"));
     // Compact: no caller counts
     assert!(!stdout.contains("×)"), "compact should not show caller counts");
+}
+
+// clap-migrated (audit #4): clap owns --help + unknown-flag rejection; the
+// empty-path guard (test_cli_overview_empty_path_errors) is preserved in the
+// handler since clap accepts an empty-string positional.
+#[test]
+fn test_cli_overview_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["overview", "--help"]);
+    assert_eq!(code, 0, "overview --help should exit 0 (clap help)");
+    assert!(stdout.contains("Module overview") || stdout.contains("PATH"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_overview_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["overview", "src/", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
 }
 
 #[test]

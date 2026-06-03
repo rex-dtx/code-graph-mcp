@@ -2150,10 +2150,28 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
     Ok(())
 }
 
+// --- overview subcommand ---
+
+/// CLI arguments for the `overview` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp overview",
+          about = "Module overview (symbols grouped by file and type)")]
+pub struct OverviewArgs {
+    /// Path prefix to scan ('.' = whole project; absolute paths under root OK)
+    pub path: String,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Compact output (no caller counts)
+    #[arg(long)]
+    pub compact: bool,
+}
+
 /// Module overview: all symbols in files under a path prefix.
-pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
-    let raw_path = get_positional(args, 0)
-        .ok_or_else(|| anyhow::anyhow!("Usage: code-graph-mcp overview <path> [--json] [--compact]"))?;
+pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
+    // clap requires the positional (missing → exit 2), but accepts an empty
+    // string; preserve the empty-path guard below for unset-shell-var `overview "$X"`.
+    let raw_path = args.path.as_str();
     // Reject empty-string path: mirrors MCP `tool_module_overview` (script users
     // hit this when a shell variable is unset and overview "$X" expands to "").
     if raw_path.is_empty() {
@@ -2167,8 +2185,8 @@ pub fn cmd_overview(project_root: &Path, args: &[String]) -> Result<()> {
     let path_prefix_owned = normalize_user_path(project_root, raw_path)?;
     let path_prefix = path_prefix_owned.as_str();
 
-    let json_mode = has_flag(args, "--json");
-    let compact = has_flag(args, "--compact");
+    let json_mode = args.json;
+    let compact = args.compact;
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
