@@ -231,6 +231,31 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
     }
 }
 
+/// Build a blocking HTTP client that follows redirects ONLY while every hop
+/// stays on HTTPS. A redirect to a non-`https` location is rejected instead of
+/// followed: otherwise a network attacker could downgrade the snapshot artifact
+/// or its `.blake3` integrity sidecar to plaintext and substitute content,
+/// silently defeating the checksum verification this module performs (audit
+/// 2026-06-03 #1 — redirect-downgrade gap caught in branch review).
+fn https_only_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Client> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.url().scheme() != "https" {
+            let bad = attempt.url().clone();
+            attempt.error(format!(
+                "refusing redirect to non-HTTPS location '{bad}' (integrity downgrade)"
+            ))
+        } else if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects".to_string())
+        } else {
+            attempt.follow()
+        }
+    });
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(policy)
+        .build()?)
+}
+
 fn download(url: &str, dest: &Path) -> Result<()> {
     if let Some(file_path) = url.strip_prefix("file://") {
         // file:// is test-only and config-controlled; no path sanitisation.
@@ -240,9 +265,8 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     // Stream to disk with a hard cap on the compressed side instead of buffering
     // the whole response. Reject early if Content-Length advertises oversize, and
     // cap bytes actually written so a missing/lying length still can't run away.
-    let mut resp = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?
+    // https_only_client rejects redirect-downgrade to plaintext.
+    let mut resp = https_only_client(std::time::Duration::from_secs(30))?
         .get(url)
         .send()?
         .error_for_status()?;
@@ -270,9 +294,9 @@ fn verify_checksum(url: &str, artifact: &Path) -> Result<()> {
         return Ok(());
     }
     let sidecar_url = format!("{url}.blake3");
-    let fetched = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?
+    // Same https-only redirect guard as the artifact download: a downgraded
+    // sidecar would let an attacker hand us a checksum matching their artifact.
+    let fetched = https_only_client(std::time::Duration::from_secs(15))?
         .get(&sidecar_url)
         .send();
     let expected = match fetched {
@@ -390,6 +414,70 @@ mod tests {
     /// hit mmap/disk-pressure boundaries on the small CI tmpfs. The cap
     /// behavior lives entirely inside `decompress_with_cap`/`CapWriter`, so
     /// scoping the test here keeps the same coverage at 5 KiB instead.
+    /// Minimal local HTTP server: the first request gets a 302 redirect to a
+    /// plaintext `http://` location on the same port; that location serves
+    /// attacker-controlled bytes. Reproduces an HTTPS→HTTP downgrade-via-redirect
+    /// (the initial request here is http for test simplicity; the redirect *target*
+    /// being non-https is what the integrity gate must reject). Detached thread.
+    fn spawn_downgrade_redirect_server() -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let evil_target = format!("http://127.0.0.1:{port}/evil.db.zst");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/");
+                let resp = if path.contains("evil") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nevil".to_string()
+                } else {
+                    format!("HTTP/1.1 302 Found\r\nLocation: {evil_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                };
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        base
+    }
+
+    // Security regression (audit #1 follow-up, branch review H1): the snapshot
+    // download MUST NOT follow a redirect that downgrades to a non-HTTPS location.
+    // Following it lets a network attacker serve a crafted artifact (and matching
+    // .blake3 sidecar) over plaintext, defeating the checksum gate entirely.
+    #[test]
+    fn download_rejects_http_redirect_downgrade() {
+        let base = spawn_downgrade_redirect_server();
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("snapshot.db.zst");
+        let res = download(&format!("{base}/snapshot.db.zst"), &dest);
+        assert!(
+            res.is_err(),
+            "download must reject a redirect to a non-HTTPS location (integrity downgrade); got {res:?}"
+        );
+        // The error must fire before any attacker bytes are persisted.
+        if dest.exists() {
+            let got = std::fs::read(&dest).unwrap_or_default();
+            assert_ne!(
+                got, b"evil",
+                "must not persist content fetched over a downgraded redirect"
+            );
+        }
+    }
+
     #[test]
     fn decompress_with_cap_rejects_oversized() {
         let payload = vec![0u8; 5 * 1024]; // 5 KiB decompressed
