@@ -2394,25 +2394,55 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
     Ok(())
 }
 
+// --- show subcommand ---
+
+/// CLI arguments for the `show` subcommand (audit #4 clap migration).
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp show",
+          about = "Show symbol details (code, type, signature)")]
+pub struct ShowArgs {
+    /// Symbol name (required unless --node-id is given)
+    pub symbol: Option<String>,
+    /// Look up by node ID instead of name
+    #[arg(long = "node-id")]
+    pub node_id: Option<i64>,
+    /// Disambiguate same-name symbols by file path
+    #[arg(long)]
+    pub file: Option<String>,
+    /// Show callers/callees (hidden aliases: --include-refs, --include-references)
+    #[arg(long = "refs", aliases = ["include-refs", "include-references"])]
+    pub refs: bool,
+    /// Show impact summary (hidden alias: --include-impact)
+    #[arg(long = "impact", alias = "include-impact")]
+    pub impact: bool,
+    /// Show test callers/callees in the --refs section (hidden by default)
+    #[arg(long)]
+    pub include_tests: bool,
+    /// Surrounding source lines (default: 3 with --node-id, else 0)
+    #[arg(long = "context-lines")]
+    pub context_lines: Option<usize>,
+    /// Compact output
+    #[arg(long)]
+    pub compact: bool,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Show symbol details (code, type, signature).
 /// CLI equivalent of MCP `get_ast_node`.
-pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
-    let json_mode = has_flag(args, "--json");
-    let compact = has_flag(args, "--compact");
-    let include_refs = has_flag(args, "--include-refs") || has_flag(args, "--include-references") || has_flag(args, "--refs");
-    let include_impact = has_flag(args, "--include-impact") || has_flag(args, "--impact");
-    let file_filter_owned = get_path_flag(args, project_root, "--file")?;
+pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
+    let json_mode = args.json;
+    let compact = args.compact;
+    let include_refs = args.refs;
+    let include_impact = args.impact;
+    let file_filter_owned: Option<String> = match args.file.as_deref() {
+        Some(f) => Some(normalize_user_path(project_root, f)?),
+        None => None,
+    };
     let file_filter = file_filter_owned.as_deref();
-    let context_lines_explicit: Option<usize> = if get_flag_value(args, "--context-lines").is_some() {
-        Some(parse_flag_or(args, "--context-lines", 0_usize))
-    } else {
-        None
-    };
-    let node_id_arg: Option<i64> = if get_flag_value(args, "--node-id").is_some() {
-        Some(parse_flag_or(args, "--node-id", 0_i64))
-    } else {
-        None
-    };
+    let context_lines_explicit: Option<usize> = args.context_lines;
+    let node_id_arg: Option<i64> = args.node_id;
     // Default context_lines=3 when using --node-id (align with MCP behavior), 0 otherwise
     let context_lines: usize = context_lines_explicit
         .unwrap_or(if node_id_arg.is_some() { 3 } else { 0 });
@@ -2420,7 +2450,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
     // If positional arg points at a real file on disk (has a recognized code
     // extension), nudge the user toward `overview` — `show` takes symbol names.
     if node_id_arg.is_none() {
-        if let Some(arg) = get_positional(args, 0) {
+        if let Some(arg) = args.symbol.as_deref() {
             if !arg.is_empty()
                 && crate::utils::config::detect_language(arg).is_some()
                 && project_root.join(arg).is_file()
@@ -2455,7 +2485,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
             }
         }
     } else {
-        let symbol = get_positional(args, 0)
+        let symbol = args.symbol.as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!(
                 "Usage: code-graph-mcp show <symbol> [--node-id N] [--file <path>] [--refs] [--impact] [--context-lines N] [--compact] [--json]"
@@ -2552,7 +2582,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
             }
             if include_refs {
                 use crate::domain::REL_CALLS;
-                let include_tests = has_flag(args, "--include-tests");
+                let include_tests = args.include_tests;
                 let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
                 let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
                 obj["calls"] = serde_json::json!(callees.iter().map(|(n, f)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
@@ -2611,7 +2641,7 @@ pub fn cmd_show(project_root: &Path, args: &[String]) -> Result<()> {
         }
         if include_refs {
             use crate::domain::REL_CALLS;
-            let include_tests = has_flag(args, "--include-tests");
+            let include_tests = args.include_tests;
             let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
             let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
             if !callees.is_empty() {

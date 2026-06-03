@@ -96,7 +96,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
         "map", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
-        "snapshot", "callgraph", "impact",
+        "snapshot", "callgraph", "impact", "show",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -684,6 +684,39 @@ fn test_cli_show_json() {
     let arr = v.as_array().unwrap();
     assert!(!arr.is_empty());
     assert!(arr[0]["code_content"].is_string(), "should include code_content field");
+}
+
+// clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection. The
+// optional positional is gated on --node-id in the handler (exit-1 Usage when both
+// absent), and the three --refs spellings stay accepted via hidden clap aliases.
+#[test]
+fn test_cli_show_help_exits_zero() {
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["show", "--help"]);
+    assert_eq!(code, 0, "show --help should exit 0 (clap help)");
+    assert!(stdout.contains("symbol details") || stdout.contains("--node-id"),
+        "help should describe the command; got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_show_unknown_flag_errors() {
+    let project = setup_indexed_project();
+    let (_, _, code) = run_cli(&project, &["show", "validateToken", "--bogus"]);
+    assert_eq!(code, 2, "unknown flag must error under clap");
+}
+
+// The three --refs spellings (--refs / --include-refs / --include-references) must
+// stay interchangeable as hidden aliases of one flag.
+#[test]
+fn test_cli_show_refs_aliases_equivalent() {
+    let project = setup_indexed_project();
+    let (out_a, _, code_a) = run_cli(&project, &["show", "validateToken", "--refs", "--json"]);
+    let (out_b, _, code_b) = run_cli(&project, &["show", "validateToken", "--include-refs", "--json"]);
+    let (out_c, _, code_c) = run_cli(&project, &["show", "validateToken", "--include-references", "--json"]);
+    assert_eq!(code_a, 0);
+    assert_eq!((code_a, code_b, code_c), (0, 0, 0), "all three --refs spellings must succeed");
+    assert_eq!(out_a.trim(), out_b.trim(), "--refs and --include-refs must be identical");
+    assert_eq!(out_a.trim(), out_c.trim(), "--refs and --include-references must be identical");
 }
 
 // ============================================================

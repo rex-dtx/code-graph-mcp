@@ -117,7 +117,8 @@ fn main() -> Result<()> {
         }
         Some("show" | "get_ast_node") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_show(&project_root, &args)
+            let show_args = code_graph_mcp::cli::ShowArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_show(&project_root, show_args)
         }
         Some("trace" | "trace_http_chain") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
