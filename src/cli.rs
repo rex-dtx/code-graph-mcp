@@ -851,6 +851,26 @@ pub struct StatsArgs {
     pub last: Option<usize>,
 }
 
+/// Numeric (semver) sort key for a version string. `versions` is stored in a
+/// BTreeSet, which orders lexically — so "0.5.40" sorted AFTER "0.32.2". Parse the
+/// leading digits of the first three dot-separated components so ordering is by
+/// (major, minor, patch); non-numeric/missing components fall back to 0, keeping
+/// the sort total and panic-free for odd version strings.
+fn version_sort_key(v: &str) -> (u64, u64, u64) {
+    let mut parts = v.split('.').map(|part| {
+        part.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .unwrap_or(0)
+    });
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
 /// Print aggregated session metrics from `.code-graph/usage.jsonl`.
 /// Diagnostic: shows which tools you actually use + search/index activity.
 /// `--last N` limits to the most recent N sessions. `--json` emits structured output.
@@ -896,10 +916,12 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             summary.search_quality_weighted_sum / summary.search_queries as f64
         } else { 0.0 };
         let full_avg = summary.full_index_ms_sum.checked_div(summary.full_index_count).unwrap_or(0);
+        let mut sorted_versions: Vec<String> = summary.versions.iter().cloned().collect();
+        sorted_versions.sort_by_key(|v| version_sort_key(v));
         println!("{}", serde_json::json!({
             "sessions": summary.sessions,
             "parse_errors": summary.parse_errors,
-            "versions": summary.versions.iter().cloned().collect::<Vec<_>>(),
+            "versions": sorted_versions,
             "first_ts": summary.first_ts,
             "last_ts": summary.last_ts,
             "total_tool_calls": summary.total_tool_calls(),
@@ -919,7 +941,8 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             },
         }));
     } else {
-        let versions: Vec<&str> = summary.versions.iter().map(|s| s.as_str()).collect();
+        let mut versions: Vec<&str> = summary.versions.iter().map(|s| s.as_str()).collect();
+        versions.sort_by_key(|v| version_sort_key(v));
         println!("Sessions: {}   versions: {}   {} → {}",
             summary.sessions,
             if versions.is_empty() { "-".into() } else { versions.join(",") },
@@ -1255,9 +1278,13 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    // Fetch more results if filtering, to ensure enough after filtering
-    let has_filter = language_filter.is_some() || node_type_filter.is_some();
-    let fetch_limit = if has_filter { limit * 4 } else { limit };
+    // Over-fetch unconditionally so post-fetch filtering can still return `limit`
+    // results. The filter below ALWAYS drops <module> and test symbols (not only
+    // when a language/node-type filter is set), so fetching exactly `limit` rows
+    // under-returns whenever any of the top rows are test/module — and the gap
+    // grows with `limit`. Mirrors MCP semantic_code_search ((top_k*4).max(20))
+    // and ast_search (limit*4), which over-fetch for the same reason.
+    let fetch_limit = (limit * 4).max(20);
     let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
     if fts_result.nodes.is_empty() {
         if json_mode {
@@ -3079,6 +3106,17 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     // is what we display in error messages — symbol name when resolved by name,
     // "node_id N" when resolved by --node-id.
     let (node_id, target_label) = if let Some(nid) = node_id_arg {
+        // Validate existence up-front — BEFORE the embedding checks below. The
+        // symbol path already validates (get_first_node_id_by_name); the --node-id
+        // path used not to, so a missing id fell through to the embedded_count==0
+        // guard and reported a misleading "No embeddings found" instead of the
+        // true cause. This check is embedding-independent → reachable and testable
+        // in the default (no embed-model) build, and mirrors refs --node-id.
+        if queries::get_node_by_id(conn, nid)?.is_none() {
+            if json_mode { println!("[]"); }
+            eprintln!("[code-graph] node_id {} not found in index", nid);
+            std::process::exit(1);
+        }
         (nid, format!("node_id {}", nid))
     } else {
         let symbol = args.symbol.as_deref()
@@ -3109,6 +3147,11 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     // Check embedding exists
     let (embedded_count, total_nodes) = queries::count_nodes_with_vectors(conn)?;
     if embedded_count == 0 {
+        // Empty-JSON contract: every --json exit path must emit parseable stdout
+        // (feedback_cli_json_empty_contract.md). This path (vec extension present
+        // but no embeddings generated yet) is the only one in cmd_similar that was
+        // missing it — a consumer piping stdout got an empty string → parse error.
+        if json_mode { println!("[]"); }
         eprintln!("[code-graph] No embeddings found ({}/{} nodes embedded).", embedded_count, total_nodes);
         eprintln!("  To enable: build with `cargo build --release --features embed-model`,");
         eprintln!("  then restart the MCP server to generate embeddings.");
@@ -3117,11 +3160,20 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     }
 
     let embedding: Vec<f32> = {
-        let bytes = queries::get_node_embedding(conn, node_id)
-            .map_err(|_| anyhow::anyhow!(
-                "No embedding for {} ({}/{} nodes embedded \u{2014} embeddings still generating; try again shortly or pick a node with `--node-id` from `show {}`)",
-                target_label, embedded_count, total_nodes, target_label
-            ))?;
+        let bytes = match queries::get_node_embedding(conn, node_id) {
+            Ok(b) => b,
+            Err(_) => {
+                // Node exists (validated above) but this one has no embedding yet —
+                // embeddings still generating. Empty-JSON contract: emit [] under
+                // --json instead of bailing with empty stdout.
+                if json_mode { println!("[]"); }
+                eprintln!(
+                    "[code-graph] No embedding for {} ({}/{} nodes embedded \u{2014} embeddings still generating; try again shortly or pick a node with `--node-id` from `show {}`).",
+                    target_label, embedded_count, total_nodes, target_label
+                );
+                std::process::exit(1);
+            }
+        };
         bytemuck::cast_slice(&bytes).to_vec()
     };
 
@@ -3202,6 +3254,21 @@ pub struct RefsArgs {
     pub json: bool,
 }
 
+/// Emit the refs not-found JSON envelope on stdout. Mirrors the success-case
+/// envelope shape (object with `references`/`by_relation`) plus an `error` key,
+/// so a single consumer parser handles found, empty, and not-found alike — and
+/// every `--json` exit path produces parseable stdout (empty-JSON contract).
+/// Used by all three not-found branches: symbol, --file miss, and --node-id miss.
+fn print_refs_notfound_json(symbol: &str) {
+    println!("{}", serde_json::json!({
+        "symbol": symbol,
+        "total_references": 0,
+        "by_relation": {},
+        "references": [],
+        "error": "Symbol not found",
+    }));
+}
+
 /// Find all references to a symbol. CLI equivalent of MCP `find_references`.
 pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     let explicit_file_owned: Option<String> = match args.file.as_deref() {
@@ -3234,8 +3301,15 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         eprintln!("[code-graph] Note: --file is ignored when --node-id is given (node_id is authoritative).");
     }
     let (target_ids, symbol): (Vec<i64>, String) = if let Some(nid) = node_id_arg {
-        let node = queries::get_node_by_id(conn, nid)?
-            .ok_or_else(|| anyhow::anyhow!("node_id {} not found in index", nid))?;
+        let node = match queries::get_node_by_id(conn, nid)? {
+            Some(n) => n,
+            None => {
+                // Empty-JSON contract: emit a parseable envelope, not empty stdout.
+                if json_mode { print_refs_notfound_json(&format!("node_id {}", nid)); }
+                eprintln!("[code-graph] node_id {} not found in index", nid);
+                std::process::exit(1);
+            }
+        };
         (vec![nid], node.name)
     } else {
         let raw_symbol = args.symbol.as_deref()
@@ -3250,7 +3324,10 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             let nodes = queries::get_nodes_by_file_path(conn, fp)?;
             let matched: Vec<i64> = nodes.iter().filter(|n| n.name == base).map(|n| n.id).collect();
             if matched.is_empty() {
-                anyhow::bail!("Symbol '{}' not found in file '{}'.", base, fp);
+                // Empty-JSON contract: emit a parseable envelope, not empty stdout.
+                if json_mode { print_refs_notfound_json(base); }
+                eprintln!("[code-graph] Symbol '{}' not found in file '{}'.", base, fp);
+                std::process::exit(1);
             }
             (matched, base.to_string())
         } else {
@@ -3281,7 +3358,12 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         std::process::exit(1);
                     }
                     CliFuzzyResolution::NotFound => {
-                        if json_mode { println!("[]"); }
+                        // Match the success-case envelope shape (object with
+                        // references/by_relation), not a bare `[]`. Object-success
+                        // commands (callgraph/trace/deps) all emit an object on the
+                        // empty/error path so one parser handles both — refs was the
+                        // outlier returning `[]`, which broke `.references` access.
+                        if json_mode { print_refs_notfound_json(base); }
                         eprintln!("[code-graph] Symbol not found: {}", base);
                         std::process::exit(1);
                     }
@@ -4036,6 +4118,26 @@ mod tests {
         assert!(s.versions.contains("0.12.0") && s.versions.contains("0.12.1"));
         assert_eq!(s.first_ts.as_deref(), Some("2026-04-19T10:00:00Z"));
         assert_eq!(s.last_ts.as_deref(), Some("2026-04-20T10:00:00Z"));
+    }
+
+    #[test]
+    fn test_version_sort_key_is_numeric_not_lexical() {
+        // Regression: the stats `versions:` list is stored in a BTreeSet (lexical),
+        // so "0.5.40" sorted AFTER "0.32.2". version_sort_key must order by numeric
+        // (major, minor, patch) so the displayed list reads in true version order.
+        let mut vs = vec!["0.32.2", "0.5.40", "0.11.0", "0.9.0", "0.5.43", "0.7.1"];
+        vs.sort_by_key(|v| version_sort_key(v));
+        assert_eq!(vs, vec!["0.5.40", "0.5.43", "0.7.1", "0.9.0", "0.11.0", "0.32.2"]);
+        // Lexical sort would have put "0.11.0"/"0.32.2" before "0.5.40" — guard that.
+        assert!(
+            vs.iter().position(|v| *v == "0.5.40").unwrap()
+                < vs.iter().position(|v| *v == "0.11.0").unwrap(),
+            "0.5.40 must sort before 0.11.0 (numeric), not after (lexical)"
+        );
+        // Odd/suffixed components fall back to 0 without panicking.
+        assert_eq!(version_sort_key("0.5.40-rc1"), (0, 5, 40));
+        assert_eq!(version_sort_key("weird"), (0, 0, 0));
+        assert_eq!(version_sort_key("1.2"), (1, 2, 0));
     }
 
     #[test]

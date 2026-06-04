@@ -1431,6 +1431,61 @@ fn test_cli_callgraph_negative_depth_rejected() {
 // ============================================================
 
 #[test]
+fn test_cli_search_limit_not_shrunk_by_test_filter() {
+    // Regression: cmd_search over-fetched (limit*4) ONLY when a language/node-type
+    // filter was set, but the post-fetch filter ALWAYS drops <module> and test
+    // symbols. So a plain `search foo --limit K` fetched exactly K FTS rows, dropped
+    // the test/module ones, and returned fewer than K — even with K+ real matches in
+    // the index. MCP semantic_code_search/ast_search over-fetch unconditionally; the
+    // CLI must too. Fixture: 9 real matches + 12 test-file matches for one query.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // 9 real (production) functions sharing the FTS token "gadget". snake_case so
+    // the FTS5 tokenizer splits on `_` and "gadget" matches (camelCase would index
+    // as one opaque token and never match a sub-word query).
+    let mut real = String::new();
+    for i in 0..9 {
+        real.push_str(&format!("export function find_gadget_real_{i}(): number {{ return {i}; }}\n"));
+    }
+    std::fs::write(src.join("widgets.ts"), real).unwrap();
+
+    // 12 test-file functions sharing the same token — is_test_symbol drops these
+    // via the `.test.ts` path suffix, so they must NOT crowd out the real results.
+    let mut testfns = String::new();
+    for i in 0..12 {
+        testfns.push_str(&format!("export function find_gadget_case_{i}(): number {{ return {i}; }}\n"));
+    }
+    std::fs::write(src.join("widgets.test.ts"), testfns).unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    // Ask for 6; there are 9 real matches, so we must get exactly 6 — the test-file
+    // matches in the top FTS window must be backfilled past, not subtracted.
+    let (stdout, _, code) = run_cli(&project, &["search", "gadget", "--limit", "6", "--json"]);
+    assert_eq!(code, 0, "search should succeed; stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON array");
+    let arr = v.as_array().expect("search --json is an array");
+    assert_eq!(
+        arr.len(),
+        6,
+        "search --limit 6 with 9 real matches must return 6 (not shrunk by the always-on \
+         test/module filter); got {} results: {stdout}",
+        arr.len()
+    );
+    // None of the returned results may come from the .test.ts file.
+    for r in arr {
+        let fp = r["file_path"].as_str().unwrap_or("");
+        assert!(!fp.ends_with(".test.ts"), "test-file symbol leaked into results: {fp}");
+    }
+}
+
+#[test]
 fn test_cli_json_empty_search() {
     let project = setup_indexed_project();
     let (stdout, stderr, code) = run_cli(&project, &["search", "xyznonexistent", "--json"]);
@@ -1537,6 +1592,74 @@ fn test_cli_json_empty_deps() {
         .expect("deps --json must output valid JSON even on no-match");
     assert!(v.is_object(), "JSON deps error should output JSON object");
     assert_eq!(v["file"], "src/nonexistent_file_xyz.rs");
+}
+
+#[test]
+fn test_cli_json_empty_refs() {
+    // Regression: `refs <unknown-symbol> --json` returned a bare `[]`, but the
+    // success case returns an object {symbol,total_references,by_relation,references}.
+    // Object-success commands must emit an object on the empty/error path too so a
+    // single consumer parser handles both (matches callgraph/trace/deps). refs was
+    // the outlier — `.references` access broke on not-found.
+    let project = setup_indexed_project();
+    // All three not-found branches must emit the same parseable object envelope:
+    // bare symbol, --file (symbol absent from that file), and --node-id (missing id).
+    // Previously the --file and --node-id branches bailed via anyhow with EMPTY
+    // stdout under --json; only the bare-symbol branch emitted (a wrong `[]`).
+    let cases: [&[&str]; 3] = [
+        &["refs", "xyznonexistent", "--json"],
+        &["refs", "validateToken", "--file", "src/utils.ts", "--json"],
+        &["refs", "--node-id", "99999999", "--json"],
+    ];
+    for args in cases {
+        let (stdout, _, code) = run_cli(&project, args);
+        assert_eq!(code, 1, "{args:?} should exit 1");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|_| panic!("{args:?}: refs --json must output valid JSON even on not-found; got: {stdout:?}"));
+        assert!(v.is_object(), "{args:?}: refs --json not-found should be an object, not a bare array; got: {stdout}");
+        assert!(v["references"].is_array(), "{args:?}: envelope must include references array");
+        assert!(v["by_relation"].is_object(), "{args:?}: envelope must include by_relation map");
+    }
+}
+
+#[test]
+fn test_cli_json_empty_similar_existing_symbol() {
+    // Regression: `similar <existing-symbol> --json` against an index with no
+    // generated embeddings (vec extension present, embedded_count == 0) hit the
+    // "No embeddings found" path, which exited 1 with EMPTY stdout — breaking JSON
+    // consumers piping stdout. Every --json exit path must emit parseable stdout.
+    // Feature-agnostic: with embed-model + embeddings it returns a results array;
+    // without, []. Both are valid JSON — the bug was an empty string.
+    let project = setup_indexed_project();
+    let (stdout, _, _code) = run_cli(&project, &["similar", "validateToken", "--json"]);
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(stdout.trim());
+    assert!(
+        parsed.is_ok(),
+        "similar --json for an existing symbol must emit parseable JSON on stdout, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn test_cli_similar_node_id_missing_accurate_and_json() {
+    // Regression: `similar --node-id <missing>` skipped existence validation, so a
+    // missing id fell through to the embedded_count==0 guard and reported a
+    // MISLEADING "No embeddings found" instead of "not found". The check now runs
+    // up-front (embedding-independent → reachable in the default no-embed build).
+    // Must: exit 1, emit parseable JSON on stdout (empty-JSON contract), and the
+    // stderr must name the real cause — not the embeddings red herring.
+    let project = setup_indexed_project();
+    let (stdout, stderr, code) = run_cli(&project, &["similar", "--node-id", "99999999", "--json"]);
+    assert_eq!(code, 1);
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .unwrap_or_else(|_| panic!("similar --node-id missing --json must emit valid JSON; got: {stdout:?}"));
+    assert!(
+        stderr.contains("not found"),
+        "stderr should state the node_id was not found; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No embeddings"),
+        "missing node_id must NOT be misreported as an embeddings problem; got: {stderr}"
+    );
 }
 
 #[test]
