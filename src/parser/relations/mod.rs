@@ -123,11 +123,29 @@ fn walk_for_relations(
         | "async_function_definition"
         | "method" | "singleton_method" => {
             node.child_by_field_name("name")
-                .map(|n| {
-                    let name = node_text(&n, source).to_string();
-                    match current_class {
-                        Some(cls) => format!("{}.{}", cls, name),
-                        None => name,
+                .map(|n| node_text(&n, source).to_string())
+                .or_else(|| {
+                    // C/C++ function/method names live in the declarator subtree,
+                    // not a `name` field (so this arm used to return None and the
+                    // call's source attributed to `<module>` / got dropped). Pull
+                    // the declarator name, e.g. `void Foo::bar(){}` → "Foo::bar".
+                    if config.name == "c" || config.name == "cpp" {
+                        node.child_by_field_name("declarator")
+                            .and_then(|d| cpp_declarator_name(&d, source, 0))
+                    } else {
+                        None
+                    }
+                })
+                .map(|name| {
+                    // An out-of-class `Foo::bar` carries its own class; otherwise
+                    // inherit the enclosing class context (current_class).
+                    let (own_cls, method) = match name.rsplit_once("::") {
+                        Some((c, m)) => (Some(c.rsplit("::").next().unwrap_or(c).to_string()), m.to_string()),
+                        None => (None, name),
+                    };
+                    match own_cls.as_deref().or(current_class) {
+                        Some(cls) => format!("{}.{}", cls, method),
+                        None => method,
                     }
                 })
         }
@@ -879,7 +897,8 @@ fn walk_for_relations(
     // Determine class context for children: when entering a class body,
     // pass the class name so methods can build qualified scope names.
     let child_class = match kind {
-        "class_declaration" | "class_definition" | "class" => {
+        "class_declaration" | "class_definition" | "class"
+        | "class_specifier" | "struct_specifier" => {
             node.child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string())
         }
@@ -914,4 +933,27 @@ fn walk_for_relations(
             walk_for_relations(child, source, language, config, active_scope, effective_class, effective_rust_impl, results, depth + 1);
         }
     }
+}
+
+/// Extract a C/C++ function/method name from a declarator subtree, returning the
+/// declarator text of the innermost `function_declarator` — e.g.
+/// `void Foo::bar()` → "Foo::bar", `void bar()` → "bar". The caller splits the
+/// `Foo::` scope. Recursion stays in the declarator subtree (the function body
+/// is a separate `body` field), so it is shallow; the depth cap is a backstop.
+fn cpp_declarator_name(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    if node.kind() == "function_declarator" {
+        return node.child_by_field_name("declarator")
+            .map(|d| node_text(&d, source).to_string());
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if let Some(name) = cpp_declarator_name(&child, source, depth + 1) {
+                return Some(name);
+            }
+        }
+    }
+    None
 }

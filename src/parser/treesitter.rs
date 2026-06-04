@@ -181,10 +181,25 @@ fn extract_nodes(
                         .or_else(|| extract_declarator_name(&declarator, source));
                     if let Some(name) = name {
                         let sig_info = extract_c_signature_info(&node, source);
+                        // C/C++ method scope. gtest macro names ("Suite.Name")
+                        // and free functions stay bare; an out-of-class
+                        // definition `int Foo::bar(){}` (name = "Foo::bar") or an
+                        // in-class definition (parent_class = Some) becomes
+                        // node_type "method" + qualified_name "Foo.bar".
+                        let (bare, qual, nt): (String, String, &str) = if is_gtest {
+                            (name.clone(), name.clone(), "function")
+                        } else if let Some((cls, method)) = name.rsplit_once("::") {
+                            let cls = cls.rsplit("::").next().unwrap_or(cls);
+                            (method.to_string(), format!("{}.{}", cls, method), "method")
+                        } else if let Some(cls) = parent_class {
+                            (name.clone(), format!("{}.{}", cls, name), "method")
+                        } else {
+                            (name.clone(), name.clone(), "function")
+                        };
                         results.push(ParsedNode {
-                            node_type: "function".into(),
-                            name: name.clone(),
-                            qualified_name: Some(name),
+                            node_type: nt.into(),
+                            name: bare,
+                            qualified_name: Some(qual),
                             start_line: node.start_position().row as u32 + 1,
                             end_line: node.end_position().row as u32 + 1,
                             code_content: truncate_code_content(node_text(&node, source)).into_owned(),
@@ -1059,6 +1074,26 @@ describe('Widget', () => {
             nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
         assert_eq!(by_name.get("regular_func").copied(), Some(false),
             "non-gtest function should not be is_test");
+    }
+
+    #[test]
+    fn test_parse_cpp_method_scope_qualified() {
+        // C++ method scope: in-class methods and out-of-class `Type::method`
+        // definitions should carry node_type "method" + qualified_name
+        // "Class.method"; free functions stay bare.
+        let code = "class Calculator {\n    int add(int a, int b) { return a + b; }\n};\nint Calculator::multiply(int a, int b) { return a * b; }\nint free_fn() { return 0; }\n";
+        let nodes = parse_code(code, "cpp").unwrap();
+        let dump: Vec<_> = nodes.iter()
+            .map(|n| (n.name.clone(), n.node_type.clone(), n.qualified_name.clone()))
+            .collect();
+        let find = |name: &str| nodes.iter().find(|n| n.name == name)
+            .map(|n| (n.node_type.as_str(), n.qualified_name.as_deref()));
+        assert_eq!(find("add"), Some(("method", Some("Calculator.add"))),
+            "in-class method should be Calculator.add; got: {:?}", dump);
+        assert_eq!(find("multiply"), Some(("method", Some("Calculator.multiply"))),
+            "out-of-class def should be Calculator.multiply; got: {:?}", dump);
+        assert_eq!(find("free_fn"), Some(("function", Some("free_fn"))),
+            "free function should stay bare; got: {:?}", dump);
     }
 
     #[test]

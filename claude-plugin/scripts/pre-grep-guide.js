@@ -29,6 +29,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
+const { recordRecommendation } = require('./recommendation-log');
 
 // --- Pure logic (testable) ---
 
@@ -194,6 +195,7 @@ function runMain() {
     // ignored by Claude Code — the grep ran anyway. The hookSpecificOutput form
     // is the documented modern path. Exit 0 — this is a routing decision, not
     // a hook failure (exit 2 would mark the tool call as "hook errored").
+    recordRecommendation(cwd, { hook: 'grep', action: 'deny' });
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
@@ -204,6 +206,7 @@ function runMain() {
     return;
   }
 
+  recordRecommendation(cwd, { hook: 'grep', action: 'hint' });
   process.stdout.write(buildHint() + '\n');
 }
 

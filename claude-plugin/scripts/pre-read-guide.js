@@ -26,6 +26,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
+const { recordRecommendation } = require('./recommendation-log');
 
 // --- Configuration ---
 
@@ -158,7 +159,10 @@ function runMain() {
     fired = true;
   }
   saveState(cwd, state);
-  if (fired) process.stdout.write(buildHint(dir) + '\n');
+  if (fired) {
+    recordRecommendation(cwd, { hook: 'read', action: 'hint' });
+    process.stdout.write(buildHint(dir) + '\n');
+  }
 }
 
 if (require.main === module) {

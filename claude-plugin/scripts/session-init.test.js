@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, verifyBinary, computeQuietHooks } = require('./session-init');
+const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, verifyBinary, computeQuietHooks, shouldInjectMap } = require('./session-init');
 
 test('syncLifecycleConfig is exported as a callable helper', () => {
   assert.equal(typeof syncLifecycleConfig, 'function');
@@ -145,6 +145,20 @@ test('computeQuietHooks: legacy `adopted` param is ignored under new default', (
   // adopted=false used to imply noisy; now still quiet by default.
   assert.equal(computeQuietHooks({ adopted: true, env: {} }), true);
   assert.equal(computeQuietHooks({ adopted: false, env: {} }), true);
+});
+
+test('shouldInjectMap: only injects when available + not-quiet + adopted', () => {
+  // The single positive case: opted into verbose AND adopted.
+  assert.equal(shouldInjectMap({ available: true, quietHooks: false, adopted: true }), true);
+  // Adopted-only gate: verbose but unadopted → no injection (the zero-referenced
+  // case cross-project-interference flagged).
+  assert.equal(shouldInjectMap({ available: true, quietHooks: false, adopted: false }), false);
+  // Quiet default suppresses regardless of adoption.
+  assert.equal(shouldInjectMap({ available: true, quietHooks: true, adopted: true }), false);
+  // No binary → nothing to inject.
+  assert.equal(shouldInjectMap({ available: false, quietHooks: false, adopted: true }), false);
+  // Missing args default to falsey → no injection.
+  assert.equal(shouldInjectMap(), false);
 });
 
 test('consistencyCheck returns version-mismatch when versions differ', (t) => {

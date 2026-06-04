@@ -30,6 +30,16 @@ function computeQuietHooks({ env = {} } = {}) {
   return true;
 }
 
+// SessionStart project-map injection gate. Beyond the (already default-quiet)
+// verbose opt-in, the map is now also ADOPTED-ONLY: cross-project measurement
+// (memory cross-project-interference) found the ≈2 KB dump is zero-referenced
+// in projects the user hasn't adopted into their MEMORY.md workflow, so it only
+// earns its standing-context cost for adopted projects. Unadopted projects get
+// no map even under CODE_GRAPH_VERBOSE_HOOKS / legacy QUIET_HOOKS=0.
+function shouldInjectMap({ available, quietHooks, adopted } = {}) {
+  return !!(available && !quietHooks && adopted);
+}
+
 function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
   try {
     const child = spawnFn(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check', '--silent'], {
@@ -316,11 +326,14 @@ function runSessionInit() {
 
   // quietHooks: default quiet (project_map injection duplicates MEMORY.md +
   // on-demand tool). CODE_GRAPH_VERBOSE_HOOKS=1 to opt in to the dump;
-  // legacy CODE_GRAPH_QUIET_HOOKS=0/1 still force the old behavior.
+  // legacy CODE_GRAPH_QUIET_HOOKS=0/1 still force the old behavior. The opt-in
+  // dump is further gated to adopted projects (shouldInjectMap).
   const adopted = isAdopted();
   const quietHooks = computeQuietHooks({ env: process.env });
 
-  const mapInjected = binaryCheck.available && !quietHooks ? injectProjectMap() : false;
+  const mapInjected = shouldInjectMap({ available: binaryCheck.available, quietHooks, adopted })
+    ? injectProjectMap()
+    : false;
   const consistencyIssues = binaryCheck.available
     ? consistencyCheck(binaryCheck.binary)
     : [];
@@ -369,6 +382,7 @@ module.exports = {
   consistencyCheck,
   runSessionInit,
   computeQuietHooks,
+  shouldInjectMap,
 };
 
 if (require.main === module) {

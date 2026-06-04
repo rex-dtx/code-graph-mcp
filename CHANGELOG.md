@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.39.0 — C++ method scope, real-session conversion metric, adopted-only map
+
+Parser + metrics release. The index format bumped (`INDEX_VERSION` 7 → 8), so the
+first run after upgrade rebuilds the index once automatically.
+
+**C++ `Class::method` scope.** C/C++ method extraction was previously bare-name
+only — in-class methods, out-of-class `Type::method` definitions, and qualified
+`Foo::bar()` calls all lost their type scope, and qualified calls produced no
+edge at all. Now:
+
+- In-class methods (`class Foo { void bar(){} }`) and out-of-class definitions
+  (`void Foo::bar(){}`) carry `node_type: "method"` + `qualified_name: "Foo.bar"`.
+- Call sources inside C/C++ functions/methods now attribute to the function
+  (`Foo.bar`) instead of `<module>` (`scope_name` had no `name` field for C/C++).
+- Qualified calls `Foo::bar()` now produce a `calls` edge (resolved by rightmost
+  name, same-language) — they were silently dropped before.
+
+So call-graph / impact / dead-code for C and C++ are materially more accurate.
+
+**Real-session conversion metric.** The PreToolUse hooks now record each
+recommendation (raw-grep hint/deny, read-fanout hint) to
+`.code-graph/recommendations.jsonl`, and `code-graph-mcp stats` reports the
+field conversion signal — cg tool calls vs recommendations emitted — that the
+synthetic routing benchmark can't see. `--json` gains a `recommendations` block
+(`total` / `by_action` / `by_hook` / `cg_tool_calls` / `conversion_ratio`). The
+recorder is append-only and never creates `.code-graph`, so non-project / tmp
+cwds leave zero footprint.
+
+**SessionStart map injection is adopted-only.** On top of the existing
+quiet-by-default behavior (the map is opt-in via `CODE_GRAPH_VERBOSE_HOOKS=1`),
+the project-map dump now also requires the project to be adopted into your
+MEMORY.md workflow. Unadopted projects get no map even under verbose — the dump
+was measured to be zero-referenced there.
+
 ## v0.38.0 — call-graph precision: prune import-contradicted edges
 
 Graph-output release: `get_call_graph` / `get_ast_node include_impact` / dead-code

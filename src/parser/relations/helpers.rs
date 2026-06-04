@@ -36,6 +36,17 @@ pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Opt
             function.child_by_field_name("field")
                 .map(|n| node_text(&n, source).to_string())
         }
+        "qualified_identifier" => {
+            // C++: Foo::bar(), ns::A::make() — extract the final identifier (the
+            // function actually called). `name` may itself nest for A::B::c, so
+            // take the rightmost `::` segment of the node text. Same-language
+            // resolution then binds it like any bare call, mirroring Rust's
+            // scoped_identifier handling above. Without this arm the call falls
+            // to `_ => None` and the edge is silently dropped.
+            node_text(&function, source).rsplit("::").next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
         "navigation_expression" => {
             // Kotlin/Swift: obj.method() — last named child is the method name
             // Swift wraps it in navigation_suffix → simple_identifier

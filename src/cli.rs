@@ -835,6 +835,38 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
     summary
 }
 
+/// Aggregate of `.code-graph/recommendations.jsonl` — the JS PreToolUse hooks'
+/// record of how often a code-graph tool was RECOMMENDED (raw-grep hint/deny,
+/// read-fanout hint). Joined against actual tool calls in `stats` to surface the
+/// real-session conversion rate the synthetic routing_bench oracle can't see.
+#[derive(Default)]
+pub struct RecommendationSummary {
+    pub total: u64,
+    /// "hint" / "deny" → count
+    pub by_action: std::collections::BTreeMap<String, u64>,
+    /// "grep" / "read" → count
+    pub by_hook: std::collections::BTreeMap<String, u64>,
+}
+
+/// Parse and aggregate `recommendations.jsonl` content. Pure: no IO, no panics —
+/// malformed lines are skipped silently (telemetry, not a contract surface).
+pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
+    let mut s = RecommendationSummary::default();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else { continue; };
+        s.total += 1;
+        if let Some(a) = v.get("action").and_then(|x| x.as_str()) {
+            *s.by_action.entry(a.to_string()).or_insert(0) += 1;
+        }
+        if let Some(h) = v.get("hook").and_then(|x| x.as_str()) {
+            *s.by_hook.entry(h.to_string()).or_insert(0) += 1;
+        }
+    }
+    s
+}
+
 // Idiomatic-flavor UX change — `//` (not `///`) so it stays out of clap `--help`:
 // `--last <non-number>` is now a hard parse error (exit 2, clap message) instead of
 // the prior warn-and-show-all fallback.
@@ -904,6 +936,14 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     let content = std::fs::read_to_string(&usage_path)?;
     let summary = aggregate_usage_jsonl(&content, last_n);
 
+    // Conversion metric: cg tool calls vs PreToolUse recommendations. The JSONL
+    // has no per-session boundary, so it is aggregated whole (last_n applies only
+    // to usage sessions). Absent file → empty (default) summary.
+    let rec_path = project_root.join(CODE_GRAPH_DIR).join("recommendations.jsonl");
+    let recs = std::fs::read_to_string(&rec_path).ok()
+        .map(|c| aggregate_recommendations_jsonl(&c))
+        .unwrap_or_default();
+
     if summary.sessions == 0 {
         if json_mode {
             println!("{}", serde_json::json!({"sessions": 0, "tools": {}}));
@@ -946,6 +986,17 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 "full_avg_ms": full_avg,
                 "incr_count": summary.incr_count,
                 "files_indexed": summary.files_indexed,
+            },
+            "recommendations": {
+                "total": recs.total,
+                "by_action": recs.by_action.iter().map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+                "by_hook": recs.by_hook.iter().map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+                "cg_tool_calls": summary.total_tool_calls(),
+                "conversion_ratio": if recs.total > 0 {
+                    (summary.total_tool_calls() as f64 / recs.total as f64 * 100.0).round() / 100.0
+                } else { 0.0 },
             },
         }));
     } else {
@@ -993,6 +1044,17 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             };
             println!("Index:  {} full{}, {} incremental, {} files indexed",
                 summary.full_index_count, full_part, summary.incr_count, summary.files_indexed);
+        }
+
+        if recs.total > 0 {
+            println!();
+            let actions: Vec<String> = recs.by_action.iter().map(|(k, v)| format!("{v} {k}")).collect();
+            let ratio = summary.total_tool_calls() as f64 / recs.total as f64;
+            println!("Recommendations: {} emitted ({})", recs.total, actions.join(", "));
+            // Field conversion signal the synthetic routing_bench oracle can't see:
+            // cg tool calls vs hook recommendations. ≪1 = recommendations ignored.
+            println!("Conversion (proxy): {} cg tool calls / {} recommendations = {ratio:.2}",
+                summary.total_tool_calls(), recs.total);
         }
     }
 
@@ -4160,6 +4222,31 @@ mod tests {
         // Last 2 sessions: ms 40 + 50 = 90
         assert_eq!(t.total_ms, 90);
         assert_eq!(t.max_ms, 50);
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_counts_by_action_and_hook() {
+        let content = [
+            r#"{"ts":"t1","hook":"grep","action":"deny"}"#,
+            r#"{"ts":"t2","hook":"grep","action":"hint"}"#,
+            r#"  "#,                                   // blank → skipped
+            r#"{not json}"#,                           // malformed → skipped, not counted
+            r#"{"ts":"t3","hook":"read","action":"hint"}"#,
+        ].join("\n");
+        let s = aggregate_recommendations_jsonl(&content);
+        assert_eq!(s.total, 3, "only 3 well-formed lines counted");
+        assert_eq!(s.by_action.get("hint").copied(), Some(2));
+        assert_eq!(s.by_action.get("deny").copied(), Some(1));
+        assert_eq!(s.by_hook.get("grep").copied(), Some(2));
+        assert_eq!(s.by_hook.get("read").copied(), Some(1));
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_empty() {
+        let s = aggregate_recommendations_jsonl("");
+        assert_eq!(s.total, 0);
+        assert!(s.by_action.is_empty());
+        assert!(s.by_hook.is_empty());
     }
 
     #[test]

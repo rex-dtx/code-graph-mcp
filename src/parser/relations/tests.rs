@@ -72,6 +72,32 @@ fn test_extract_cpp_include_imports() {
 }
 
 #[test]
+fn test_cpp_qualified_call_and_method_scope() {
+    // C++ Class::method scope: qualified calls must produce edges (previously
+    // dropped at extract_callee_name's `_ => None`), and method call sources
+    // must be scoped as Class.method (previously `<module>` — scope_name has no
+    // `name` field for C/C++ function_definition).
+    let code = r#"
+class Engine {
+    void start() { ignite(); }
+};
+void Engine::ignite() { }
+void run() { Engine::ignite(); }
+"#;
+    let relations = extract_relations(code, "cpp").unwrap();
+    let calls: Vec<(&str, &str)> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    // (1) qualified call `Engine::ignite()` inside run() must be an edge to `ignite`
+    assert!(calls.iter().any(|(s, t)| *s == "run" && *t == "ignite"),
+        "Engine::ignite() qualified call should yield run→ignite; got: {:?}", calls);
+    // (2) in-class method scope: start() calls ignite() → source Engine.start
+    assert!(calls.iter().any(|(s, t)| *s == "Engine.start" && *t == "ignite"),
+        "in-class method call source should be Engine.start; got: {:?}", calls);
+}
+
+#[test]
 fn test_extract_bash_source_imports() {
     let code = r#"#!/usr/bin/env bash
 source ./lib/utils.sh
