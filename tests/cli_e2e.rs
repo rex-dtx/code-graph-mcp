@@ -549,6 +549,80 @@ fn test_cli_impact_same_file_overload_is_ambiguous() {
         "should report ambiguity; got: {stderr:?}");
 }
 
+#[test]
+fn test_cli_callgraph_import_disambiguates_same_name() {
+    // Regression (Phase 2d): `run()` does `from db import save` and calls save()
+    // once, but ambiguous same-language resolution fanned the bare call out to
+    // EVERY same-name `save` (db.py AND cache.py). The import edge binds the name
+    // to db.save, so the cache.save edge is a FALSE caller — it inflated
+    // impact/call-graph and hid cache.save from dead-code. The prune drops
+    // import-contradicted bare call edges: the correct edge survives, the false
+    // one is dropped, dead-code regains precision.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("db.py"),
+        "def save(record):\n    return _write(record)\n\ndef _write(record):\n    return True\n").unwrap();
+    std::fs::write(src.join("cache.py"),
+        "def save(item):\n    return _store(item)\n\ndef _store(item):\n    return True\n").unwrap();
+    std::fs::write(src.join("app.py"),
+        "from db import save\n\ndef run():\n    return save({\"id\": 1})\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    // run() must call EXACTLY ONE save — the imported db.save — not fan out.
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "run", "--json"]);
+    assert_eq!(code, 0, "callgraph run should succeed; {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let results = v["results"].as_array().expect("results array");
+    let save_callees: Vec<&serde_json::Value> =
+        results.iter().filter(|r| r["name"] == "save").collect();
+    assert_eq!(save_callees.len(), 1,
+        "run must call exactly one save (the imported db.save), not fan out to cache.save; got: {stdout}");
+    assert_eq!(save_callees[0]["file_path"], "src/db.py",
+        "the surviving save edge must be db.save (imported), not cache.save; got: {stdout}");
+
+    // cache.save must have NO caller — `run` imports from db, not cache.
+    let (stdout2, _, _) = run_cli(&project, &["callgraph", "save", "--file", "src/cache.py", "--json"]);
+    let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
+    let cache_results = v2["results"].as_array().cloned().unwrap_or_default();
+    assert!(!cache_results.iter().any(|r| r["name"] == "run"),
+        "cache.save must have no `run` caller (run imports save from db, not cache); got: {stdout2}");
+}
+
+#[test]
+fn test_cli_callgraph_no_import_tie_keeps_both() {
+    // No-regression guard for the Phase 2d prune: when a bare call ties across
+    // same-name same-language nodes with NO disambiguating import edge,
+    // refine_ambiguous_targets deliberately keeps BOTH (so Rust scoped-call
+    // dead-code precision holds). The import-contradiction prune must NOT fire
+    // here — there is no import edge to contradict either target.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.rs"), "pub fn thing() -> i32 { 1 }\n").unwrap();
+    std::fs::write(src.join("b.rs"), "pub fn thing() -> i32 { 2 }\n").unwrap();
+    std::fs::write(src.join("main.rs"),
+        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "main", "--json"]);
+    assert_eq!(code, 0, "callgraph main should succeed; {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let results = v["results"].as_array().expect("results array");
+    let thing_callees: Vec<&serde_json::Value> =
+        results.iter().filter(|r| r["name"] == "thing").collect();
+    assert_eq!(thing_callees.len(), 2,
+        "with no import to disambiguate, both tied `thing` edges must be kept (no over-prune); got: {stdout}");
+}
+
 // ============================================================
 // stats (clap-migrated, audit #4) — contract lock
 // ============================================================

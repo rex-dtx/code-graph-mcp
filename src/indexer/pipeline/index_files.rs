@@ -47,7 +47,7 @@ use super::{IndexResult, IndexStats, ProgressFn};
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
-use super::resolve::{refine_ambiguous_targets, resolve_pending_calls};
+use super::resolve::{prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
 
 /// Batch size for streaming indexing. Each batch processes Phase 1+2
 /// then drops heavyweight data (ASTs, source strings) before the next batch.
@@ -980,6 +980,21 @@ pub(super) fn index_files(
         tracing::info!(
             "[index] Phase 2c: resolved {} pending unresolved calls",
             pending_resolved
+        );
+    }
+
+    // Phase 2d: drop bare-name call edges contradicted by an explicit import in
+    // the caller's file. `refine_ambiguous_targets` keeps every tied same-name
+    // candidate when it has no disambiguating info; an import edge IS that info,
+    // so a bare `save()` in a file that does `from db import save` must bind to
+    // db.save only — the fanned-out edge to a sibling `save` elsewhere is a false
+    // caller. Removes those false positives without touching the correct edge.
+    let contradicted = prune_import_contradicted_call_edges(db)?;
+    if contradicted > 0 {
+        total_edges_created = total_edges_created.saturating_sub(contradicted);
+        tracing::info!(
+            "[index] Phase 2d: pruned {} import-contradicted call edges",
+            contradicted
         );
     }
 

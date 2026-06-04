@@ -240,6 +240,67 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
     Ok(edges_added)
 }
 
+/// Remove bare-name `calls` edges that an explicit import in the caller's file
+/// contradicts. Runs once after all call edges exist (post Phase-2 + pending
+/// sweep).
+///
+/// Motivation: when a caller makes a bare call `save()` whose name matches
+/// several same-language nodes across files, `refine_ambiguous_targets`
+/// deliberately keeps every tied candidate rather than drop (so Rust
+/// `crate::domain::foo()` scoped calls with no disambiguating info don't get
+/// reported as dead). But when the caller's file carries an `imports` edge that
+/// binds that exact name to ONE specific node, the language's scoping rules say
+/// the bare call resolves to the imported node — every other same-name target is
+/// a false caller that inflates impact/call-graph and pollutes dead-code
+/// (`feedback_edge_resolution_same_language.md`). This prunes only those
+/// import-contradicted edges, which removes false positives while keeping the
+/// correct edge — so it never regresses dead-code (the imported target stays
+/// linked) and never fires for the no-import tie case the tie-keeping protects.
+///
+/// Conservative by construction:
+/// - only bare-name edges (NULL/empty metadata) are eligible — qualified calls
+///   (`cache.save()`, `crate::x::foo()`) carry receiver/path metadata and are
+///   left alone, so an explicit cross-module call is never pruned;
+/// - same-file targets are never pruned (a local `def save` shadows an import
+///   and is authoritative — resolved by the same-file tier);
+/// - an edge is pruned only when the caller's file imports the SAME NAME bound
+///   to a DIFFERENT node AND does not import this target.
+///
+/// Returns the number of edges removed.
+pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usize> {
+    use crate::domain::{REL_CALLS, REL_IMPORTS};
+    let removed = db.conn().execute(
+        "DELETE FROM edges WHERE id IN (
+            SELECT e.id FROM edges e
+            JOIN nodes sn ON sn.id = e.source_id
+            JOIN nodes tn ON tn.id = e.target_id
+            WHERE e.relation = ?1
+              AND (e.metadata IS NULL OR e.metadata = '')
+              AND tn.file_id <> sn.file_id
+              -- caller's file imports the SAME name bound to a DIFFERENT node
+              AND EXISTS (
+                  SELECT 1 FROM edges ie
+                  JOIN nodes mn  ON mn.id  = ie.source_id
+                  JOIN nodes itn ON itn.id = ie.target_id
+                  WHERE ie.relation = ?2
+                    AND mn.file_id = sn.file_id
+                    AND itn.name = tn.name
+                    AND ie.target_id <> e.target_id
+              )
+              -- ... and does NOT import THIS target (so it is contradicted)
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges ie2
+                  JOIN nodes mn2 ON mn2.id = ie2.source_id
+                  WHERE ie2.relation = ?2
+                    AND mn2.file_id = sn.file_id
+                    AND ie2.target_id = e.target_id
+              )
+        )",
+        rusqlite::params![REL_CALLS, REL_IMPORTS],
+    )?;
+    Ok(removed)
+}
+
 /// Filter a candidate set down to those matching the Path qualifier:
 ///   (1) file path contains "/seg1/seg2/" OR starts with "seg1/seg2/", OR
 ///   (2) qualified_name contains the segment chain joined by `.` as a
