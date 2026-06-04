@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.38.0 — call-graph precision: prune import-contradicted edges
+
+Graph-output release: `get_call_graph` / `get_ast_node include_impact` / dead-code
+results change for repos with same-named functions across files. The index format
+bumped (`INDEX_VERSION` 6 → 7), so the first run after upgrade rebuilds the index
+once automatically.
+
+**Call-graph false positives removed.** When a file makes a bare call `save()`
+whose name matches several functions across files, the resolver used to fan the
+edge out to every candidate (to protect dead-code precision when it had no way to
+choose). When the caller's file has an explicit `imports` edge binding that name
+to one node — e.g. Python `from db import save` — the bare call resolves to the
+imported node, so the other same-name edges are false callers. Those are now
+pruned: impact/call-graph no longer lists phantom callers, and the genuinely
+uncalled sibling is correctly reported by dead-code. The prune is conservative —
+it only touches bare-name edges contradicted by an import, never qualified calls
+(`cache.save()`, `crate::x::foo()`), same-file targets, or the no-import tie case
+(so Rust scoped-call dead-code precision is preserved). Languages whose imports
+themselves fan out (JS/TS, Rust `use`) safely no-op.
+
+**Other fixes:**
+
+- **CLI `--json` empty/error paths** now always emit success-shaped JSON: `refs`
+  (all three not-found branches), `similar` (no-embeddings / missing `--node-id`),
+  and `search` no longer under-returns below `--limit` when the always-on
+  test/module filter drops top rows.
+- **`stats` version list** sorts numerically (major.minor.patch) instead of
+  lexically, so `0.5.40` no longer sorts after `0.32.2`.
+- **Index version-mismatch is now visible.** When two binaries of different
+  `INDEX_VERSION` share one `.code-graph/index.db` and clear each other's data,
+  the cause is printed to stderr (was a silent "index is empty").
+- **Grammar.** Module-overview and dead-code entries print `1 file` / `1 line`
+  instead of `1 files` / `1 lines`.
+
 ## v0.37.0 — CLI argument parsing migrated to clap-derive
 
 All 22 `code-graph-mcp` CLI subcommands moved from a hand-rolled argv parser to
