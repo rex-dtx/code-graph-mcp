@@ -277,6 +277,15 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
             WHERE e.relation = ?1
               AND (e.metadata IS NULL OR e.metadata = '')
               AND tn.file_id <> sn.file_id
+              -- Don't false-prune a real qualified call. A `module.func()` /
+              -- `obj.method()` call can be extracted WITHOUT receiver metadata
+              -- (e.g. Python `cache.save()` lands as a bare NULL-metadata row) and
+              -- then dedups into the same edge as the bare import-resolved call.
+              -- If the caller's source contains a `.<name>(` qualified call, this
+              -- edge may legitimately bind to a different same-name target, so keep
+              -- it — biasing toward keeping edges (the safe direction). Verified by
+              -- `test_cli_callgraph_prune_keeps_qualified_call_to_same_name`.
+              AND instr(sn.code_content, '.' || tn.name || '(') = 0
               -- caller's file imports the SAME name bound to a DIFFERENT node
               AND EXISTS (
                   SELECT 1 FROM edges ie

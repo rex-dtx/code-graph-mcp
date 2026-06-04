@@ -623,6 +623,45 @@ fn test_cli_callgraph_no_import_tie_keeps_both() {
         "with no import to disambiguate, both tied `thing` edges must be kept (no over-prune); got: {stdout}");
 }
 
+#[test]
+fn test_cli_callgraph_prune_keeps_qualified_call_to_same_name() {
+    // Regression for the Phase 2d false-prune guard. A file that BOTH bare-calls
+    // an imported `save` (from db) AND qualified-calls `cache.save()` produces two
+    // call edges that dedup into NULL-metadata rows — Python extracts
+    // `cache.save()` WITHOUT receiver metadata, so it looks identical to a bare
+    // fan-out edge. Without the guard, the import-contradiction prune deleted the
+    // legitimate run→cache.save edge (worst-direction regression: dropping a real
+    // edge). The guard (caller source contains `.save(`) keeps it.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("db.py"),
+        "def save(r):\n    return _w(r)\n\ndef _w(r):\n    return True\n").unwrap();
+    std::fs::write(src.join("cache.py"),
+        "def save(i):\n    return _s(i)\n\ndef _s(i):\n    return True\n").unwrap();
+    // bare imported call to db.save + qualified call to cache.save — both legit.
+    std::fs::write(src.join("app.py"),
+        "from db import save\nimport cache\n\ndef run():\n    save({\"id\": 1})\n    return cache.save({\"id\": 2})\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "run", "--json"]);
+    assert_eq!(code, 0, "callgraph run should succeed; {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let results = v["results"].as_array().expect("results array");
+    let save_files: std::collections::HashSet<&str> = results.iter()
+        .filter(|r| r["name"] == "save")
+        .filter_map(|r| r["file_path"].as_str())
+        .collect();
+    assert!(save_files.contains("src/db.py"),
+        "the bare imported call must keep run→db.save; got: {stdout}");
+    assert!(save_files.contains("src/cache.py"),
+        "the qualified cache.save() call must NOT be false-pruned; got: {stdout}");
+}
+
 // ============================================================
 // stats (clap-migrated, audit #4) — contract lock
 // ============================================================
