@@ -871,6 +871,14 @@ fn version_sort_key(v: &str) -> (u64, u64, u64) {
     )
 }
 
+/// Pluralize a count for human-readable output: `1 file`, `0 files`, `2 files`.
+/// Avoids the "1 files"/"1 lines" grammar glitch on single-item results (common
+/// for single-file modules and one-line dead-code candidates). Naive `+s` only —
+/// callers pass already-plural-friendly stems (file, line, symbol).
+fn plural(n: i64, singular: &str) -> String {
+    if n == 1 { format!("1 {singular}") } else { format!("{n} {singular}s") }
+}
+
 /// Print aggregated session metrics from `.code-graph/usage.jsonl`.
 /// Diagnostic: shows which tools you actually use + search/index activity.
 /// `--last N` limits to the most recent N sessions. `--json` emits structured output.
@@ -2154,8 +2162,8 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
         let total_symbols = m.functions + m.classes + m.interfaces_traits;
         write!(
             stdout,
-            "{} ({} files, {} symbols",
-            m.path, m.files, total_symbols
+            "{} ({}, {}",
+            m.path, plural(m.files as i64, "file"), plural(total_symbols as i64, "symbol")
         )?;
         if !m.languages.is_empty() {
             write!(stdout, ", {}", m.languages.join("/"))?;
@@ -3607,8 +3615,8 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         writeln!(stdout, "ORPHAN ({}) — no tracked references, not exported", orphans.len())?;
         for r in &orphans {
             let lines = r.end_line - r.start_line + 1;
-            writeln!(stdout, "  {} {} {}:{} ({} lines)",
-                r.node_type, r.name, r.file_path, r.start_line, lines)?;
+            writeln!(stdout, "  {} {} {}:{} ({})",
+                r.node_type, r.name, r.file_path, r.start_line, plural(lines, "line"))?;
             if !compact {
                 for line in r.code_content.lines().take(5) {
                     writeln!(stdout, "    {}", line)?;
@@ -3625,8 +3633,8 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         writeln!(stdout, "EXPORTED-UNUSED ({}) — exported/public, no tracked callers", exported_unused.len())?;
         for r in &exported_unused {
             let lines = r.end_line - r.start_line + 1;
-            writeln!(stdout, "  {} {} {}:{} ({} lines)",
-                r.node_type, r.name, r.file_path, r.start_line, lines)?;
+            writeln!(stdout, "  {} {} {}:{} ({})",
+                r.node_type, r.name, r.file_path, r.start_line, plural(lines, "line"))?;
             if !compact {
                 for line in r.code_content.lines().take(5) {
                     writeln!(stdout, "    {}", line)?;

@@ -222,6 +222,19 @@ impl Database {
                 "[index] Index version changed ({} → {}), clearing stale data for rebuild",
                 stored_index_version, crate::domain::INDEX_VERSION
             );
+            // Double-write to stderr: the CLI/MCP startup paths install no tracing
+            // subscriber (feedback_tracing_invisible_in_cli.md), so the tracing line
+            // above is invisible to users. Without this, a version-mismatch wipe
+            // surfaces only as a confusing "index is empty" — most often when two
+            // code-graph binaries of different INDEX_VERSION (e.g. a stale server +
+            // a freshly-built one) share one .code-graph/index.db and clear each
+            // other's data on every open. Name the cause so the fix (restart all
+            // servers / rebuild to one version) is obvious.
+            eprintln!(
+                "[code-graph] Index version mismatch (stored v{} ≠ binary v{}): clearing + rebuilding. \
+If you see this repeatedly, another code-graph server of a different version is sharing this index — restart all servers so they run one version.",
+                stored_index_version, crate::domain::INDEX_VERSION
+            );
             conn.execute_batch(
                 "BEGIN; DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; COMMIT;"
             )?;
