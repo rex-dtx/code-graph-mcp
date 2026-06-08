@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.44.0 — value references Phase 3a: C / C++ function pointers
+
+Extends callback / function-pointer reference tracking to C and C++ — where function
+pointers are the primary callback mechanism. The index format bumped (`INDEX_VERSION`
+13 → 14), so the first run after upgrade rebuilds the index once.
+
+- **C/C++ value references.** A function named by a bare identifier now emits a
+  `references` edge when passed as a call argument (`qsort(a, n, s, compare)`), taken by
+  address (`signal(2, &handler)`), used as a designated or positional initializer value —
+  the vtable idiom `struct ops o = { .read = my_read }` — assigned (`ops->read = my_read`),
+  bound (`fn_t cb = handler`), or returned.
+- **Precision.** A C/C++ local — function parameters and body declarations — is excluded
+  by resolving the declared name from the declarator chain (handling
+  `int *x` / `void (*cb)(int)` / multi-declarator forms), never from an initializer value,
+  so a local passed by name does not fabricate an edge to a same-named global function.
+  References still resolve same-file or same-language only.
+
 ## v0.43.0 — value references Phase 2: more positions + Python/Go
 
 Extends callback / function-pointer reference tracking (v0.41.0) to more syntactic

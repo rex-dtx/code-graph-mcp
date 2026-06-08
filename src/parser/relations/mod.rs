@@ -36,6 +36,7 @@ mod python;
 mod go;
 mod java;
 mod dart;
+mod cpp;
 
 /// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
 /// Bare → None (matches non-Rust callers and old DB rows).
@@ -67,6 +68,7 @@ use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_
 use typescript::{extract_ts_type_reference, extract_js_value_reference};
 use python::{extract_python_type_reference, extract_python_value_reference};
 use go::{extract_go_type_reference, extract_go_value_reference};
+use cpp::extract_cpp_value_reference;
 use java::extract_java_type_reference;
 use dart::{extract_dart_imports, extract_dart_calls};
 
@@ -302,6 +304,17 @@ fn walk_for_relations(
     // call callees and enclosing-fn params/locals (M2/M2.5).
     if config.name == "go" && kind == "identifier" {
         if let Some(r) = extract_go_value_reference(&node, source, active_scope) {
+            results.push(r);
+        }
+    }
+
+    // Additive C/C++ value-reference pass: a bare `identifier` passed/stored/
+    // returned as a function value (function pointer) — C's primary callback
+    // mechanism. Call-arg / `&fn` / designated-or-positional initializer (vtable) /
+    // init-declarator RHS / assignment RHS / return. Self-excludes call callees and
+    // enclosing-fn params/locals (M2/M2.5). Member accesses are `field_identifier`.
+    if matches!(config.name, "c" | "cpp") && kind == "identifier" {
+        if let Some(r) = extract_cpp_value_reference(&node, source, active_scope) {
             results.push(r);
         }
     }

@@ -1919,7 +1919,7 @@ fn test_java_generic_arg_and_qualified_tail_emit_only_tail() {
 
 #[test]
 fn test_r1_rust_bare_fn_call_arg_emits_references_edge() {
-    let src = r#"fn caller() { register(handler); } fn handler() {}"#;
+    let src = r#"fn caller() { install(handler); } fn handler() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
     assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
         && r.target_name == "handler" && r.source_name == "caller"),
@@ -2265,7 +2265,7 @@ fn test_q3_js_object_property_key_does_not_emit_references_edge() {
 
 #[test]
 fn test_b1_python_call_arg_fn_emits_references_edge() {
-    let src = "def caller():\n    register(handler)\n\ndef handler():\n    pass\n";
+    let src = "def caller():\n    install(handler)\n\ndef handler():\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
     assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
         && r.target_name == "handler" && r.source_name == "caller"),
@@ -2305,7 +2305,7 @@ fn test_b4_python_return_fn_emits_references_edge() {
 
 #[test]
 fn test_b5_python_param_does_not_emit_references_edge() {
-    let src = "def caller(handler):\n    register(handler)\n";
+    let src = "def caller(handler):\n    install(handler)\n";
     let rels = extract_relations(src, "python").unwrap();
     assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
         "python parameter passed through must NOT emit a references edge; got: {:?}",
@@ -2334,7 +2334,7 @@ fn test_b7_python_call_in_arg_does_not_emit_references_edge() {
 
 #[test]
 fn test_c1_go_call_arg_fn_emits_references_edge() {
-    let src = "package main\nfunc caller() { register(handler) }\nfunc handler() {}\n";
+    let src = "package main\nfunc caller() { install(handler) }\nfunc handler() {}\n";
     let rels = extract_relations(src, "go").unwrap();
     assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
         && r.target_name == "handler" && r.source_name == "caller"),
@@ -2364,7 +2364,7 @@ fn test_c3_go_return_fn_emits_references_edge() {
 
 #[test]
 fn test_c4_go_param_does_not_emit_references_edge() {
-    let src = "package main\nfunc caller(handler func()) { register(handler) }\n";
+    let src = "package main\nfunc caller(handler func()) { install(handler) }\n";
     let rels = extract_relations(src, "go").unwrap();
     assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
         "go parameter passed through must NOT emit a references edge; got: {:?}",
@@ -2387,4 +2387,94 @@ fn test_c6_go_call_in_arg_does_not_emit_references_edge() {
     assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
         "a called fn in arg position must NOT emit a references edge; got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+// ── Phase 3a: C/C++ value references (call-arg / &fn / designated init / RHS / return) ──
+
+#[test]
+fn test_d1_c_call_arg_fn_emits_references_edge() {
+    let src = "void handler(void) {}\nvoid caller(void) { install(handler); }\n";
+    let rels = extract_relations(src, "c").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "c call-arg fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_d2_c_address_of_fn_emits_references_edge() {
+    let src = "void handler(int s) {}\nvoid caller(void) { signal(2, &handler); }\n";
+    let rels = extract_relations(src, "c").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "c &fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_d3_c_designated_initializer_vtable_emits_references_edge() {
+    let src = "int my_read(void) { return 0; }\nvoid caller(void) { struct ops o = { .read = my_read }; }\n";
+    let rels = extract_relations(src, "c").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "my_read" && r.source_name == "caller"),
+        "c designated-init vtable field must emit references caller->my_read; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_d4_c_init_declarator_rhs_fn_emits_references_edge() {
+    let src = "void handler(void) {}\nvoid caller(void) { fn_t cb = handler; (void)cb; }\n";
+    let rels = extract_relations(src, "c").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "c init-declarator RHS fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_d5_c_return_fn_emits_references_edge() {
+    let src = "void handler(void) {}\nfn_t caller(void) { return handler; }\n";
+    let rels = extract_relations(src, "c").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "c return fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_d6_c_param_does_not_emit_references_edge() {
+    let src = "void caller(fn_t handler) { install(handler); }\n";
+    let rels = extract_relations(src, "c").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
+        "c parameter passed through must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_d7_c_local_declaration_does_not_emit_references_edge() {
+    let src = "void use(void* p) {}\nvoid db(void) {}\nvoid caller(void) { void* db = get(); use(db); }\n";
+    let rels = extract_relations(src, "c").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
+        "a c local declaration must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_d8_c_call_in_arg_does_not_emit_references_edge() {
+    let src = "int bar(void) { return 0; }\nvoid caller(void) { foo(bar()); }\n";
+    let rels = extract_relations(src, "c").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+        "a called fn in arg position must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_d9_cpp_call_arg_fn_emits_references_edge() {
+    // Confirm the cpp config dispatches the value-reference pass too.
+    let src = "void handler() {}\nvoid caller() { install(handler); }\n";
+    let rels = extract_relations(src, "cpp").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "cpp call-arg fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
