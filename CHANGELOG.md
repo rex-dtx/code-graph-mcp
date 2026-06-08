@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.45.0 — value references Phase 3b: JSX, Go composites, tuples, primitive paths
+
+More value-reference coverage and precision. The index format bumped (`INDEX_VERSION`
+14 → 15), so the first run after upgrade rebuilds the index once.
+
+- **JSX attribute callbacks (JS/TSX).** `<Button onClick={handleClick} />` now emits a
+  `references` edge to `handleClick`. Inline-arrow attributes (`onClick={() => …}`) and
+  JSX child expressions are not treated as bare references.
+- **Go composite-literal field values.** `Handler{ OnEvent: handler }` (and positional
+  `[]fn{a, b}`) now reference the field-value function; the field-name key does not.
+- **Python tuple return / RHS.** `return f, g` and `a, b = f, g` now reference both `f`
+  and `g` (previously only single-value forms were tracked).
+- **Primitive-type-head paths suppressed.** `str::trim` / `u32::MAX` and similar no longer
+  emit a `references` edge to the bare tail — like the existing PascalCase-type-head rule,
+  these associated items can't be resolved and would bind a wrong same-named local.
+
 ## v0.44.0 — value references Phase 3a: C / C++ function pointers
 
 Extends callback / function-pointer reference tracking to C and C++ — where function

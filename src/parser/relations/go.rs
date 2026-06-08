@@ -107,6 +107,22 @@ pub(super) fn extract_go_value_reference(
             None => false,
         },
         "var_spec" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
+        // Phase 3b: composite-literal field value (`Handler{OnEvent: handler}` /
+        // positional `[]fn{a, b}`). A keyed element is `key : value` — only the
+        // value (last named child) emits, never the field-name key.
+        "keyed_element" => {
+            let n = parent.named_child_count();
+            n >= 2 && parent.named_child(n - 1).map(|c| c.id()) == Some(node.id())
+        }
+        "literal_value" => true,
+        "literal_element" => match parent.parent() {
+            Some(gp) if gp.kind() == "keyed_element" => {
+                let n = gp.named_child_count();
+                n >= 2 && gp.named_child(n - 1).map(|c| c.id()) == Some(parent.id())
+            }
+            Some(gp) => gp.kind() == "literal_value",
+            None => false,
+        },
         _ => false,
     };
     if !in_value_position {

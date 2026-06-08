@@ -2478,3 +2478,60 @@ fn test_d9_cpp_call_arg_fn_emits_references_edge() {
         "cpp call-arg fn must emit references caller->handler; got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
+
+// ── Phase 3b Inc E: JSX attribute callbacks (`onClick={handleClick}`) ──
+
+#[test]
+fn test_e1_tsx_jsx_attr_callback_emits_references_edge() {
+    let src = r#"function caller() { return <Button onClick={handleClick} />; } function handleClick() {}"#;
+    let rels = extract_relations(src, "tsx").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handleClick" && r.source_name == "caller"),
+        "JSX attr callback must emit references caller->handleClick; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_e2_tsx_jsx_attr_arrow_does_not_emit_bare_reference() {
+    // An inline arrow attr (`onClick={() => h()}`) is not a bare-id value reference.
+    let src = r#"function caller() { return <Button onClick={() => other()} />; } function other() {}"#;
+    let rels = extract_relations(src, "tsx").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "other"),
+        "an inline-arrow JSX attr must NOT emit a bare references edge to its call; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+// ── Phase 3b Inc F: Go composite-literal field values (`T{cb: fn}`) ──
+
+#[test]
+fn test_f1_go_composite_keyed_field_fn_emits_references_edge() {
+    let src = "package main\nfunc caller() { _ = Handler{OnEvent: handler} }\nfunc handler() {}\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "go composite keyed field fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+// ── Phase 3b Inc G: tuple return / RHS (Python `return f, g`) ──
+
+#[test]
+fn test_g1_python_tuple_return_emits_references_edges() {
+    let src = "def caller():\n    return f, g\n\ndef f():\n    pass\n\ndef g():\n    pass\n";
+    let rels = extract_relations(src, "python").unwrap();
+    let got: Vec<&str> = rels.iter().filter(|r| r.relation == REL_REFERENCES && r.source_name == "caller")
+        .map(|r| r.target_name.as_str()).collect();
+    assert!(got.contains(&"f") && got.contains(&"g"),
+        "python tuple return must emit references to both f and g; got: {:?}", got);
+}
+
+// ── Phase 3b Inc H: primitive-type-head path residual (`str::trim`) ──
+
+#[test]
+fn test_h1_rust_primitive_head_path_does_not_emit_references_edge() {
+    let src = r#"fn caller() { let _ = xs.iter().map(str::trim); } fn trim() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "trim"),
+        "a primitive-type-head path (`str::trim`) must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}

@@ -115,6 +115,13 @@ pub(super) fn extract_js_value_reference(
         "arrow_function" => {
             parent.child_by_field_name("body").map(|b| b.id()) == Some(node.id())
         }
+        // Phase 3b: JSX attribute callback (`onClick={handleClick}`) — a bare
+        // identifier inside a `jsx_expression` container whose parent is a
+        // `jsx_attribute`. JSX children expressions (`<div>{x}</div>`) are excluded
+        // (their `jsx_expression` parent is a jsx element, not an attribute).
+        "jsx_expression" => {
+            parent.parent().map(|gp| gp.kind() == "jsx_attribute").unwrap_or(false)
+        }
         _ => false,
     };
     if !in_value_position {

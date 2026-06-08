@@ -160,9 +160,19 @@ pub(super) fn extract_rust_path_reference(
     // (std methods aren't indexed; a same-named local fn is the wrong target), so
     // suppress. Heuristic: a PascalCase head segment is a type; lowercase heads
     // (`crate`, `self`, `super`, snake_case module names like `domain`) are genuine
-    // module-path values and still emit. Primitive-type heads (`str::trim`) are a
-    // documented residual — lowercase, not caught.
-    if node_text(node, source).chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+    // module-path values and still emit. Lowercase PRIMITIVE-type heads (`str::trim`,
+    // `u32::MAX`) are also type-associated and are caught by the primitive list below.
+    let path_text = node_text(node, source);
+    if path_text.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+        return None;
+    }
+    let head = path_text.split("::").next().unwrap_or(path_text);
+    if matches!(head,
+        "str" | "bool" | "char"
+        | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+        | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+        | "f32" | "f64"
+    ) {
         return None;
     }
     let name_node = node.child_by_field_name("name")?;

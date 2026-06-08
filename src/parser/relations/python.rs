@@ -158,6 +158,16 @@ pub(super) fn extract_python_value_reference(
         "assignment" => parent.child_by_field_name("right").map(|v| v.id()) == Some(node.id()),
         "return_statement" => true,
         "pair" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
+        // Phase 3b: tuple return (`return f, g`) / tuple RHS (`a, b = f, g`) wrap the
+        // values in an `expression_list` under the return / assignment-right.
+        "expression_list" => match parent.parent() {
+            Some(gp) => match gp.kind() {
+                "return_statement" => true,
+                "assignment" => gp.child_by_field_name("right").map(|r| r.id()) == Some(parent.id()),
+                _ => false,
+            },
+            None => false,
+        },
         _ => false,
     };
     if !in_value_position {
