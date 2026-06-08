@@ -65,8 +65,8 @@ use exports::extract_export_names;
 use routes::{extract_route_pattern, extract_python_route};
 use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference, extract_rust_value_reference};
 use typescript::{extract_ts_type_reference, extract_js_value_reference};
-use python::extract_python_type_reference;
-use go::extract_go_type_reference;
+use python::{extract_python_type_reference, extract_python_value_reference};
+use go::{extract_go_type_reference, extract_go_value_reference};
 use java::extract_java_type_reference;
 use dart::{extract_dart_imports, extract_dart_calls};
 
@@ -270,6 +270,12 @@ fn walk_for_relations(
         if let Some(r) = extract_python_type_reference(&node, source, active_scope) {
             results.push(r);
         }
+        // Value reference (callback / fn pointer by bare name) in call-arg / keyword
+        // / assignment-RHS / return / dict-value position. Mutually exclusive with
+        // the type-annotation pass above (annotation context vs value position).
+        if let Some(r) = extract_python_value_reference(&node, source, active_scope) {
+            results.push(r);
+        }
     }
 
     // Additive Go pass: emit a `references` edge for a type-position
@@ -286,6 +292,16 @@ fn walk_for_relations(
     // `config.name == "go"`.
     if config.name == "go" && kind == "type_identifier" {
         if let Some(r) = extract_go_type_reference(&node, source, active_scope) {
+            results.push(r);
+        }
+    }
+
+    // Additive Go value-reference pass: a bare `identifier` (Go value names are
+    // `identifier`, types are `type_identifier`) passed/stored/returned as a fn
+    // value — call-arg / `:=`-or-`=` RHS / return / `var` value. Self-excludes
+    // call callees and enclosing-fn params/locals (M2/M2.5).
+    if config.name == "go" && kind == "identifier" {
+        if let Some(r) = extract_go_value_reference(&node, source, active_scope) {
             results.push(r);
         }
     }

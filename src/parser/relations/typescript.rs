@@ -96,7 +96,28 @@ pub(super) fn extract_js_value_reference(
     scope: Option<&str>,
 ) -> Option<ParsedRelation> {
     let parent = node.parent()?;
-    if parent.kind() != "arguments" {
+    let in_value_position = match parent.kind() {
+        // Phase 1: call argument.
+        "arguments" => true,
+        // Phase 2: binding RHS (`const cb = handler`) — the `value` field only, never
+        // the `name` (a local binding, handled by M2.5).
+        "variable_declarator" => {
+            parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id())
+        }
+        // Phase 2: object property value (`{ onClick: handler }`) — `value` field
+        // only, never the property key.
+        "pair" => {
+            parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id())
+        }
+        // Phase 2: explicit `return handler;`.
+        "return_statement" => true,
+        // Phase 2: arrow implicit-return body (`() => handler`) — the `body` field.
+        "arrow_function" => {
+            parent.child_by_field_name("body").map(|b| b.id()) == Some(node.id())
+        }
+        _ => false,
+    };
+    if !in_value_position {
         return None;
     }
     let name = node_text(node, source);

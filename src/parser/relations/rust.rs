@@ -285,15 +285,34 @@ pub(super) fn extract_rust_value_reference(
     scope: Option<&str>,
 ) -> Option<ParsedRelation> {
     let parent = node.parent()?;
-    let in_arg_position = match parent.kind() {
+    let in_value_position = match parent.kind() {
+        // Phase 1: call argument, or `&fn` argument.
         "arguments" => true,
-        // `&expr` argument: identifier → reference_expression → arguments.
         "reference_expression" => {
             parent.parent().map(|gp| gp.kind() == "arguments").unwrap_or(false)
         }
+        // Phase 2: binding RHS (`let cb = handler`) — only the `value` field, never
+        // the `pattern` (which is a local binding, handled by M2.5).
+        "let_declaration" => {
+            parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id())
+        }
+        // Phase 2: struct field value (`Config { cb: handler }`) — `value` field
+        // only, never the `field` name.
+        "field_initializer" => {
+            parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id())
+        }
+        // Phase 2: explicit `return handler;`.
+        "return_expression" => true,
+        // Phase 2: tail expression of a block (`fn f() -> F { handler }`) — the last
+        // named child with no trailing `;` (a `;` would reparent to
+        // expression_statement). M2.5 still excludes a tail that is a local.
+        "block" => {
+            let n = parent.named_child_count();
+            n > 0 && parent.named_child(n - 1).map(|c| c.id()) == Some(node.id())
+        }
         _ => false,
     };
-    if !in_arg_position {
+    if !in_value_position {
         return None;
     }
     let name = node_text(node, source);

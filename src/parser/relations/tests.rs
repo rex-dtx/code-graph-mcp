@@ -2129,3 +2129,262 @@ fn test_r21_rust_match_arm_binding_does_not_emit_references_edge() {
         "match-arm pattern bindings must NOT emit references edges; got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 2: value references in BINDING-RHS and RETURN positions (callbacks /
+// fn pointers stored or returned by name). Same gates as Phase 1 (M2/M2.5
+// local-binding exclusion, same-language resolution, self/Self/_ skip).
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_p1_rust_let_rhs_fn_emits_references_edge() {
+    // `let cb = handler;` stores a fn by name — RHS value reference.
+    let src = r#"fn caller() { let cb = handler; use_it(cb); } fn handler() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "let-binding RHS fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_p2_js_const_rhs_fn_emits_references_edge() {
+    let src = r#"function caller() { const cb = handler; } function handler() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "const-binding RHS fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_p3_rust_let_rhs_param_does_not_emit_references_edge() {
+    // RHS is a parameter, not a global fn — M2 excludes.
+    let src = r#"fn caller(p: i32) { let x = p; } fn p() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "p"),
+        "let RHS that is a parameter must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_p4_rust_explicit_return_fn_emits_references_edge() {
+    let src = r#"fn caller() -> F { return handler; } fn handler() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "explicit `return fn` must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_p5_rust_tail_expr_fn_emits_references_edge() {
+    // Rust tail expression (no `return`, no trailing `;`) returns the fn by name.
+    let src = r#"fn caller() -> F { handler } fn handler() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "Rust tail-expr fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_p6_js_return_fn_emits_references_edge() {
+    let src = r#"function caller() { return handler; } function handler() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "JS `return fn` must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_p7_js_arrow_body_fn_emits_references_edge() {
+    // `const f = () => handler` is an implicit-return of the fn by name.
+    let src = r#"const f = () => handler; function handler() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "f"),
+        "JS arrow implicit-return fn must emit references f->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_p8_rust_tail_expr_local_does_not_emit_references_edge() {
+    // Returning a LOCAL by tail expression must NOT reference a same-named fn (M2.5).
+    let src = r#"fn caller() -> X { let r = compute(); r } fn r() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "r"),
+        "tail-expr returning a local must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_p9_rust_return_call_does_not_emit_references_edge() {
+    // `return helper();` is a CALL, not a value reference.
+    let src = r#"fn caller() -> X { return helper(); } fn helper() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "helper"),
+        "returning a call result must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+// ── Phase 2 Inc A: struct / object field VALUES (`Config { cb: handler }`) ──
+
+#[test]
+fn test_q1_rust_struct_field_value_fn_emits_references_edge() {
+    let src = r#"fn caller() { let _c = Config { cb: handler }; } fn handler() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "struct field value fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_q2_js_object_property_value_fn_emits_references_edge() {
+    let src = r#"function caller() { const o = { onClick: handler }; } function handler() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "object property value fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_q3_js_object_property_key_does_not_emit_references_edge() {
+    // The property KEY (`handler:`) is not a value reference — only the value is.
+    let src = r#"function caller() { const o = { handler: compute() }; } function handler() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
+        "an object property key must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+// ── Phase 2 Inc B: Python value references (call-arg / keyword / RHS / return) ──
+
+#[test]
+fn test_b1_python_call_arg_fn_emits_references_edge() {
+    let src = "def caller():\n    register(handler)\n\ndef handler():\n    pass\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "python call-arg fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_b2_python_keyword_arg_fn_emits_references_edge() {
+    let src = "def caller():\n    sorted(xs, key=my_key)\n\ndef my_key():\n    pass\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "my_key" && r.source_name == "caller"),
+        "python keyword-arg fn value must emit references caller->my_key; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_b3_python_assignment_rhs_fn_emits_references_edge() {
+    let src = "def caller():\n    cb = handler\n\ndef handler():\n    pass\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "python assignment RHS fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_b4_python_return_fn_emits_references_edge() {
+    let src = "def caller():\n    return handler\n\ndef handler():\n    pass\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "python return fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_b5_python_param_does_not_emit_references_edge() {
+    let src = "def caller(handler):\n    register(handler)\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
+        "python parameter passed through must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_b6_python_local_assignment_target_does_not_emit_references_edge() {
+    let src = "def caller():\n    db = get()\n    use(db)\n\ndef db():\n    pass\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
+        "a python local assignment target must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_b7_python_call_in_arg_does_not_emit_references_edge() {
+    let src = "def caller():\n    foo(bar())\n\ndef bar():\n    pass\n";
+    let rels = extract_relations(src, "python").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+        "a called fn in arg position must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+// ── Phase 2 Inc C: Go value references (call-arg / := RHS / return) ──
+
+#[test]
+fn test_c1_go_call_arg_fn_emits_references_edge() {
+    let src = "package main\nfunc caller() { register(handler) }\nfunc handler() {}\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "go call-arg fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_c2_go_short_var_rhs_fn_emits_references_edge() {
+    let src = "package main\nfunc caller() { cb := handler; _ = cb }\nfunc handler() {}\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "go := RHS fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_c3_go_return_fn_emits_references_edge() {
+    let src = "package main\nfunc caller() func() { return handler }\nfunc handler() {}\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "go return fn must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_c4_go_param_does_not_emit_references_edge() {
+    let src = "package main\nfunc caller(handler func()) { register(handler) }\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
+        "go parameter passed through must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_c5_go_short_var_local_does_not_emit_references_edge() {
+    let src = "package main\nfunc caller() { db := get(); use(db) }\nfunc db() {}\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
+        "a go := local must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_c6_go_call_in_arg_does_not_emit_references_edge() {
+    let src = "package main\nfunc caller() { foo(bar()) }\nfunc bar() {}\n";
+    let rels = extract_relations(src, "go").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+        "a called fn in arg position must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}

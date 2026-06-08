@@ -25,7 +25,7 @@ pub const REL_REFERENCES: &str = "references";
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 11;
+pub const INDEX_VERSION: i32 = 13;
 
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;

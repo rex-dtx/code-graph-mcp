@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.43.0 — value references Phase 2: more positions + Python/Go
+
+Extends callback / function-pointer reference tracking (v0.41.0) to more syntactic
+positions and two more languages. The index format bumped (`INDEX_VERSION` 11 → 13), so
+the first run after upgrade rebuilds the index once.
+
+- **More value positions (Rust + JS/TS).** Beyond call arguments, a function named by a
+  bare identifier now emits a `references` edge when it is: a binding RHS (`let cb =
+  handler` / `const cb = handler`), a return value (`return handler`, Rust tail
+  expression `{ … handler }`, JS arrow body `() => handler`), or a struct / object field
+  value (`Config { cb: handler }`, `{ onClick: handler }`).
+- **Python value references.** Python now tracks callbacks passed by bare name in call
+  arguments (`register(handler)`), keyword arguments (`sorted(xs, key=my_key)`),
+  assignment RHS (`cb = handler`), `return`, and dict values — in addition to the
+  existing type-annotation references.
+- **Go value references.** Go now tracks callbacks in call arguments
+  (`http.HandleFunc(p, handler)`), `:=` / `=` / `var` right-hand sides, and `return`.
+- **Precision.** Each language excludes local bindings (parameters, `let`/`const`/`:=`/
+  `var` declarations, and Rust `if let` / `match` / `for` patterns, Python assignment /
+  `for` targets, Go `:=` / `range` targets) so a bare name that is a local — not a global
+  function — does not emit a false reference. References still resolve same-file or
+  same-language only.
+
 ## v0.42.0 — reference precision: drop macro-path and type-associated false positives
 
 Follow-up to v0.41.0. The `references` edge extractor for Rust path-qualified values

@@ -129,3 +129,121 @@ pub(super) fn extract_python_type_reference(
         source_language: String::new(),
     })
 }
+
+/// Emit a `references` edge for a Python `identifier` used as a function VALUE —
+/// a callback passed/stored/returned by bare name. Value positions:
+///   - call argument (`register(handler)`) — identifier under an `argument_list`
+///     whose parent is a `call` (a `class_definition` superclass list is excluded —
+///     that is already an inherits edge);
+///   - keyword-argument value (`sorted(xs, key=my_key)`);
+///   - assignment RHS (`cb = handler`) — the `right` field;
+///   - `return handler`;
+///   - dict value (`{ "k": handler }`).
+///
+/// Self-exclusion is structural: a call's callee is the `function` field of `call`
+/// (parent `call`, not `argument_list`); `attribute` reads (`obj.method`) are not
+/// bare identifiers in these slots. M2/M2.5: a name equal to a parameter or local
+/// binding (assignment / for target) of an enclosing function is a local, not a
+/// global-fn reference — skip. Mutually exclusive with the type-annotation pass
+/// (annotation context vs value position), so both can run on the same identifier.
+pub(super) fn extract_python_value_reference(
+    node: &tree_sitter::Node,
+    source: &str,
+    scope: Option<&str>,
+) -> Option<ParsedRelation> {
+    let parent = node.parent()?;
+    let in_value_position = match parent.kind() {
+        "argument_list" => parent.parent().map(|gp| gp.kind() == "call").unwrap_or(false),
+        "keyword_argument" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
+        "assignment" => parent.child_by_field_name("right").map(|v| v.id()) == Some(node.id()),
+        "return_statement" => true,
+        "pair" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
+        _ => false,
+    };
+    if !in_value_position {
+        return None;
+    }
+    let name = node_text(node, source);
+    if name.is_empty() || name == "_" {
+        return None;
+    }
+    if py_enclosing_fn_local_names(node, source).contains(name) {
+        return None;
+    }
+    Some(ParsedRelation {
+        source_name: scope.unwrap_or("<module>").to_string(),
+        target_name: name.to_string(),
+        relation: REL_REFERENCES.into(),
+        metadata: None,
+        source_language: String::new(),
+    })
+}
+
+/// Collect local binding names visible to a Python value-reference candidate:
+/// parameters of every enclosing `function_definition` (closures capture outer
+/// scope) + assignment / for targets in the nearest function body. Used for
+/// M2/M2.5 exclusion. Over-collection (param type names, default-value idents) is
+/// precision-safe — it only suppresses a candidate.
+fn py_enclosing_fn_local_names(node: &tree_sitter::Node, source: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut nearest_body_done = false;
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "function_definition" {
+            if let Some(p) = n.child_by_field_name("parameters") {
+                collect_py_idents(&p, source, &mut names, 0);
+            }
+            if !nearest_body_done {
+                if let Some(body) = n.child_by_field_name("body") {
+                    collect_py_local_targets(&body, source, &mut names, 0);
+                }
+                nearest_body_done = true;
+            }
+        }
+        cur = n.parent();
+    }
+    names
+}
+
+/// Walk a function body collecting assignment / for TARGET names (the `left` field),
+/// not RHS values. Recurses into nested blocks.
+fn collect_py_local_targets(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if matches!(node.kind(), "assignment" | "for_statement") {
+        if let Some(l) = node.child_by_field_name("left") {
+            collect_py_idents(&l, source, out, 0);
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_py_local_targets(&child, source, out, depth + 1);
+        }
+    }
+}
+
+/// Collect all `identifier` names in a subtree.
+fn collect_py_idents(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if node.kind() == "identifier" {
+        out.insert(node_text(node, source).to_string());
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_py_idents(&child, source, out, depth + 1);
+        }
+    }
+}
