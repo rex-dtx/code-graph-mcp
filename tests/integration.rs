@@ -2011,3 +2011,129 @@ function uninstall() {
     assert_eq!(result2["ignore_paths_defaulted"], false,
         "explicit [] must not be flagged as defaulted: {}", result2);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 1: bare-identifier function-value references — integration RED tests.
+// R12 + R15 are EXPECTED TO FAIL until candidate generation + impact wiring
+// land. R13 (cross-language drop) + R14 (calls/references separation) are
+// guardrails that lock the precision boundary and may already pass.
+// ─────────────────────────────────────────────────────────────────────────
+
+const INIT_MSG: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+
+#[test]
+fn test_r12_callback_reference_resolves_cross_file() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/handlers.rs"), r#"
+pub fn handler() {}
+"#).unwrap();
+    fs::write(project.path().join("src/app.rs"), r#"
+pub fn caller() {
+    register(handler);
+}
+fn register<F>(_f: F) {}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    server.handle_message(INIT_MSG).unwrap();
+    let _ = server.handle_message(&tool_call_json("semantic_code_search",
+        serde_json::json!({"query": "handler"}))).unwrap();
+
+    let resp = server.handle_message(&tool_call_json("find_references",
+        serde_json::json!({"symbol_name": "handler", "relation": "references"}))).unwrap();
+    let result = parse_tool_result(&resp);
+    let names: Vec<&str> = result["references"].as_array().unwrap()
+        .iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(names.contains(&"caller"),
+        "find_references(handler, references) should include caller via a value-reference edge; got {:?}", names);
+}
+
+#[test]
+fn test_r13_value_reference_does_not_cross_language() {
+    // Rust `caller` passes bare `process`; `process` exists ONLY as a JS function.
+    // Same-language resolution must DROP the Rust edge — the JS `process` must
+    // stay unreferenced (cross-language attribution is a fatal false positive).
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/app.rs"), r#"
+pub fn caller() { schedule(process); }
+fn schedule<F>(_f: F) {}
+"#).unwrap();
+    fs::write(project.path().join("src/worker.js"), r#"
+function process() {}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    server.handle_message(INIT_MSG).unwrap();
+    let _ = server.handle_message(&tool_call_json("semantic_code_search",
+        serde_json::json!({"query": "process"}))).unwrap();
+
+    let resp = server.handle_message(&tool_call_json("find_references",
+        serde_json::json!({"symbol_name": "process", "relation": "references"}))).unwrap();
+    let result = parse_tool_result(&resp);
+    let names: Vec<&str> = result["references"].as_array().unwrap()
+        .iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(!names.contains(&"caller"),
+        "a Rust value-reference must NOT resolve to a same-named JS function (cross-language drop); got {:?}", names);
+}
+
+#[test]
+fn test_r14_value_reference_excluded_from_call_graph() {
+    // `handler` is passed as a callback (referenced) but NEVER called. It must
+    // surface in find_references but NOT as a direct CALLER in impact_analysis
+    // (the calls-vs-references separation that keeps the call graph pure).
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/app.rs"), r#"
+pub fn caller() { register(handler); }
+fn register<F>(_f: F) {}
+fn handler() {}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    server.handle_message(INIT_MSG).unwrap();
+    let _ = server.handle_message(&tool_call_json("semantic_code_search",
+        serde_json::json!({"query": "handler"}))).unwrap();
+
+    // Calls-based impact must NOT count the referencer as a direct caller.
+    let impact = parse_tool_result(&server.handle_message(&tool_call_json("impact_analysis",
+        serde_json::json!({"symbol_name": "handler"}))).unwrap());
+    let caller_names: Vec<&str> = impact["direct_callers"].as_array()
+        .map(|a| a.iter().filter_map(|c| c["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(!caller_names.contains(&"caller"),
+        "a callback referencer must NOT appear as a direct CALLER (calls vs references); got {:?}", caller_names);
+
+    // find_references must surface the referencer.
+    let fr = parse_tool_result(&server.handle_message(&tool_call_json("find_references",
+        serde_json::json!({"symbol_name": "handler", "relation": "references"}))).unwrap());
+    let ref_names: Vec<&str> = fr["references"].as_array().unwrap()
+        .iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(ref_names.contains(&"caller"),
+        "find_references should surface the callback referencer; got {:?}", ref_names);
+}
+
+#[test]
+fn test_r15_impact_reports_value_references() {
+    // After a fn is passed as a callback, impact_analysis must surface a
+    // `value_references` count so rename / signature-change risk includes
+    // callback coupling.
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/app.rs"), r#"
+pub fn caller() { register(handler); }
+fn register<F>(_f: F) {}
+fn handler() {}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    server.handle_message(INIT_MSG).unwrap();
+    let _ = server.handle_message(&tool_call_json("semantic_code_search",
+        serde_json::json!({"query": "handler"}))).unwrap();
+
+    let impact = parse_tool_result(&server.handle_message(&tool_call_json("impact_analysis",
+        serde_json::json!({"symbol_name": "handler"}))).unwrap());
+    assert!(impact["value_references"].as_u64().unwrap_or(0) >= 1,
+        "impact_analysis(handler) should report value_references >= 1; got {}", impact);
+}

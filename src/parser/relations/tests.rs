@@ -1906,3 +1906,190 @@ fn test_java_generic_arg_and_qualified_tail_emit_only_tail() {
     assert!(!refs.contains(&"java") && !refs.contains(&"util"),
         "qualified-type package segments `java`/`util` must NOT emit a references edge; got: {:?}", refs);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 1: bare-identifier function-VALUE references (callbacks / fn pointers)
+//
+// RED tests (Inc 0). Existing `references` extraction covers type-position and
+// path-qualified value usages; the gap is a BARE `identifier` used as a function
+// value (passed as a callback / fn pointer). Positive cases (R1–R3, R8–R9) are
+// EXPECTED TO FAIL until candidate generation lands. Negative/guard cases
+// (R4–R7, R10–R11) lock the precision boundary and may already pass.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_r1_rust_bare_fn_call_arg_emits_references_edge() {
+    let src = r#"fn caller() { register(handler); } fn handler() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "bare fn passed as a call argument must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r2_rust_bare_fn_hof_arg_emits_references_edge() {
+    let src = r#"fn caller() { let _ = xs.iter().map(double); } fn double() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "double" && r.source_name == "caller"),
+        "bare fn passed to a HOF (.map) must emit references caller->double; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r3_rust_address_of_fn_arg_emits_references_edge() {
+    let src = r#"fn caller() { signal(&shutdown); } fn shutdown() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "shutdown" && r.source_name == "caller"),
+        "address-of fn passed as arg (&shutdown) must emit references caller->shutdown; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r4_rust_param_passed_as_arg_does_not_emit_references_edge() {
+    // `handler` is a PARAMETER of `run`, not the global fn — passing it through
+    // must NOT emit a references edge (M2 param exclusion).
+    let src = r#"fn run<F>(handler: F) { spawn(handler); } fn handler() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "run"),
+        "a parameter passed through must NOT emit a references edge (M2); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r5_rust_call_in_arg_position_does_not_emit_references_edge() {
+    let src = r#"fn caller() { foo(bar()); } fn bar() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+        "a called fn in arg position (bar()) is a calls edge, not references; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r6_rust_field_access_arg_does_not_emit_references_edge() {
+    let src = r#"fn caller() { foo(x.field); }"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
+        && (r.target_name == "field" || r.target_name == "x")),
+        "member access in arg position must not emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r7_rust_call_callee_does_not_also_emit_value_reference() {
+    let src = r#"fn caller() { register(handler); } fn handler() {} fn register<F>(_f: F) {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_CALLS && r.target_name == "register"),
+        "the callee must still be a calls edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "register"),
+        "the callee must NOT also be a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r8_js_bare_fn_call_arg_emits_references_edge() {
+    let src = r#"function caller() { arr.map(myFunc); } function myFunc() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "myFunc" && r.source_name == "caller"),
+        "bare fn passed to .map must emit references caller->myFunc; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r9_js_callback_arg_emits_references_edge() {
+    let src = r#"function caller() { on('click', handler); } function handler() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "handler" && r.source_name == "caller"),
+        "bare fn passed as a callback arg must emit references caller->handler; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r10_ts_param_passed_as_arg_does_not_emit_references_edge() {
+    let src = r#"function run(cb: Fn) { q(cb); }"#;
+    let rels = extract_relations(src, "typescript").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "cb" && r.source_name == "run"),
+        "a TS parameter passed through must NOT emit a references edge (M2); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r11_js_call_in_arg_position_does_not_emit_references_edge() {
+    let src = r#"function caller() { foo(bar()); } function bar() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+        "a called fn in arg position (bar()) is a calls edge, not references; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r16_rust_local_let_binding_does_not_emit_references_edge() {
+    // `db` is a LOCAL `let` binding (holds a value), not the global fn `db` — passing
+    // it by `&` or as an arg must NOT emit a reference to the same-named fn (M2.5).
+    // This is the dominant Phase-1 false positive: idiomatic `let db = open();
+    // run(&db)` where an accessor fn/method `db` also exists.
+    let src = r#"fn caller() { let db = open(); run(&db); use_it(db); } fn db() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
+        "a local `let` binding passed as arg must NOT emit a references edge (M2.5); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r17_js_local_const_binding_does_not_emit_references_edge() {
+    let src = r#"function caller() { const cb = make(); run(cb); } function cb() {}"#;
+    let rels = extract_relations(src, "javascript").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "cb"),
+        "a local const binding passed as arg must NOT emit a references edge (M2.5); got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r18_rust_genuine_fn_pointer_still_emits_after_m2_5() {
+    // M2.5 must NOT over-suppress: a module-level fn passed as a callback (no local
+    // binding shadows it) still emits. Guards against the local-binding exclusion
+    // accidentally killing real callbacks.
+    let src = r#"fn caller() { query_map(params, map_row); } fn map_row() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
+        && r.target_name == "map_row" && r.source_name == "caller"),
+        "a genuine fn-pointer callback (no local shadow) must still emit references; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r19_rust_if_let_binding_does_not_emit_references_edge() {
+    // `node` bound by `if let Some(node) = ...` is a local, not the global fn `node`.
+    // if-let/while-let bindings are `let_condition` patterns, NOT `let_declaration`.
+    let src = r#"fn caller() { if let Some(node) = g() { use_it(node); } } fn node() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "node"),
+        "an if-let pattern binding must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r20_rust_for_loop_binding_does_not_emit_references_edge() {
+    let src = r#"fn caller() { for item in xs { take(item); } } fn item() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "item"),
+        "a for-loop pattern binding must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_r21_rust_match_arm_binding_does_not_emit_references_edge() {
+    let src = r#"fn caller() { match g() { Ok(val) => keep(val), Err(error) => log(error) } } fn val() {} fn error() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
+        && (r.target_name == "val" || r.target_name == "error")),
+        "match-arm pattern bindings must NOT emit references edges; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}

@@ -249,3 +249,145 @@ pub(super) fn extract_rust_type_reference(
         source_language: String::new(),
     })
 }
+
+/// Emit a `references` edge for a BARE `identifier` used as a function VALUE —
+/// a callback / function pointer passed in a call-argument position. Two shapes:
+///   - direct argument:  `register(handler)` → identifier parent is `arguments`;
+///   - address-of arg:   `signal(&shutdown)` → identifier under `reference_expression`
+///     whose parent is `arguments`.
+///
+/// Self-exclusion is structural: a call's *callee* identifier has parent
+/// `call_expression` (the `function` field), never `arguments`, so it never fires
+/// here (and remains a `calls` edge). Path-qualified values (`crate::foo::bar`) are
+/// `scoped_identifier`, handled by `extract_rust_path_reference`. `self/Self/_` skip.
+///
+/// M2 (param exclusion): a bare id equal to a parameter of the enclosing function
+/// (or an enclosing closure) is a pass-through of a LOCAL binding, not a reference to
+/// a same-named global fn — skip it. Without M2, `fn run(handler: F){ spawn(handler) }`
+/// would fabricate an edge to whatever global `handler` happens to exist (FP-a).
+pub(super) fn extract_rust_value_reference(
+    node: &tree_sitter::Node,
+    source: &str,
+    scope: Option<&str>,
+) -> Option<ParsedRelation> {
+    let parent = node.parent()?;
+    let in_arg_position = match parent.kind() {
+        "arguments" => true,
+        // `&expr` argument: identifier → reference_expression → arguments.
+        "reference_expression" => {
+            parent.parent().map(|gp| gp.kind() == "arguments").unwrap_or(false)
+        }
+        _ => false,
+    };
+    if !in_arg_position {
+        return None;
+    }
+    let name = node_text(node, source);
+    if name.is_empty() || name == "self" || name == "Self" || name == "_" {
+        return None;
+    }
+    if enclosing_fn_local_names(node, source).contains(name) {
+        return None;
+    }
+    Some(ParsedRelation {
+        source_name: scope.unwrap_or("<module>").to_string(),
+        target_name: name.to_string(),
+        relation: REL_REFERENCES.into(),
+        metadata: None,
+        source_language: String::new(),
+    })
+}
+
+/// Collect LOCAL binding names visible to a value-reference candidate so M2/M2.5
+/// can suppress them — a bare id equal to a local is a pass-through of that local,
+/// not a reference to a same-named global fn. Collects:
+///   - parameters of the nearest enclosing `function_item` + any enclosing closures
+///     (M2 — `type_identifier` types are excluded since only `identifier` nodes are
+///     gathered; generic `<F>` params live in `type_parameters`, not collected);
+///   - `let` binding names in the nearest function body (M2.5) — gathered from the
+///     `let_declaration` `pattern` field ONLY (never the RHS `value`), so
+///     `let db = open()` contributes `db` but not `open`. This kills the dominant
+///     Phase-1 false positive: `let db = open(); run(&db)` where an accessor fn/
+///     method `db` also exists (`conn`, `db`, `picks` … measured in dogfooding).
+///
+/// Rust `let` scope is function-local (nested fns don't capture), so the nearest
+/// `function_item` is the correct boundary.
+fn enclosing_fn_local_names(node: &tree_sitter::Node, source: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "closure_expression" => {
+                if let Some(p) = n.child_by_field_name("parameters") {
+                    collect_param_idents(&p, source, &mut names, 0);
+                }
+            }
+            "function_item" => {
+                if let Some(p) = n.child_by_field_name("parameters") {
+                    collect_param_idents(&p, source, &mut names, 0);
+                }
+                if let Some(body) = n.child_by_field_name("body") {
+                    collect_rust_binding_names(&body, source, &mut names, 0);
+                }
+                break;
+            }
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    names
+}
+
+/// Walk a function body collecting binding names from every pattern-introducing
+/// node's `pattern` field (not RHS values / scrutinees), so M2.5 suppresses bare
+/// ids that are locals rather than global-fn references:
+///   - `let_declaration`  (`let db = …`)
+///   - `let_condition`    (`if let Some(node) = …` / `while let`)
+///   - `match_arm`        (`Ok(val) => …`, `Err(error) => …`)
+///   - `for_expression`   (`for item in …`)
+///
+/// Collecting from the `pattern` field gathers binding idents (and harmlessly any
+/// enum-variant/const names in the pattern — over-collection is precision-safe).
+/// Recurses to reach bindings in nested blocks. Used by `enclosing_fn_local_names`.
+fn collect_rust_binding_names(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "let_declaration" | "let_condition" | "match_arm" | "for_expression"
+    ) {
+        if let Some(pat) = node.child_by_field_name("pattern") {
+            collect_param_idents(&pat, source, out, 0);
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_rust_binding_names(&child, source, out, depth + 1);
+        }
+    }
+}
+
+fn collect_param_idents(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if node.kind() == "identifier" {
+        out.insert(node_text(node, source).to_string());
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_param_idents(&child, source, out, depth + 1);
+        }
+    }
+}

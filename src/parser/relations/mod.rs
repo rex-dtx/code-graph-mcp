@@ -63,8 +63,8 @@ use imports::{extract_import_names, extract_python_import_names, extract_python_
 use inherits::{extract_superclasses, extract_implements};
 use exports::extract_export_names;
 use routes::{extract_route_pattern, extract_python_route};
-use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference};
-use typescript::extract_ts_type_reference;
+use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference, extract_rust_value_reference};
+use typescript::{extract_ts_type_reference, extract_js_value_reference};
 use python::extract_python_type_reference;
 use go::extract_go_type_reference;
 use java::extract_java_type_reference;
@@ -220,6 +220,15 @@ fn walk_for_relations(
                     results.push(r);
                 }
             }
+            // Bare `identifier` used as a function value (callback / fn pointer)
+            // in call-argument or address-of position. Self-excludes call callees
+            // (parent `call_expression`, not `arguments`) and enclosing-fn params
+            // (M2). Path-qualified values are `scoped_identifier` (above).
+            "identifier" => {
+                if let Some(r) = extract_rust_value_reference(&node, source, active_scope) {
+                    results.push(r);
+                }
+            }
             _ => {}
         }
     }
@@ -234,6 +243,17 @@ fn walk_for_relations(
     // would otherwise sweep value identifiers in non-type contexts.
     if matches!(language, "typescript" | "tsx") && kind == "type_identifier" {
         if let Some(r) = extract_ts_type_reference(&node, source, active_scope) {
+            results.push(r);
+        }
+    }
+
+    // Additive JS/TS/TSX pass: emit a `references` edge for a BARE `identifier`
+    // passed as a function value (callback) in call-argument position. Gated to
+    // the JS-family `config.name` (same as the call-expression arm). Self-excludes
+    // call callees (parent is `call_expression`/`member_expression`, not
+    // `arguments`) and enclosing-function params (M2).
+    if matches!(config.name, "javascript" | "typescript" | "tsx") && kind == "identifier" {
+        if let Some(r) = extract_js_value_reference(&node, source, active_scope) {
             results.push(r);
         }
     }

@@ -246,6 +246,28 @@ impl McpServer {
             )
         };
 
+        // Value references: callers that mention this symbol as a VALUE (callback /
+        // fn pointer / type-position) rather than calling it — coupling the call
+        // graph misses. Separate depth-1 signal; NEVER folded into the calls-based
+        // caller counts so `direct_callers` stays pure control-flow. Prod sources,
+        // deduped by referencing symbol.
+        let value_references = {
+            let nodes = queries::get_nodes_by_name(self.db.conn(), &resolved_name)?;
+            let mut seen = std::collections::HashSet::new();
+            for n in &nodes {
+                let refs = queries::get_incoming_references(
+                    self.db.conn(), n.id, Some(crate::domain::REL_REFERENCES)
+                )?;
+                for r in refs {
+                    if is_test_symbol(&r.name, &r.file_path) {
+                        continue;
+                    }
+                    seen.insert((r.name.clone(), r.file_path.clone()));
+                }
+            }
+            seen.len()
+        };
+
         let mut result = json!({
             "symbol": &resolved_name,
             "change_type": change_type,
@@ -257,6 +279,7 @@ impl McpServer {
             })).collect::<Vec<_>>(),
             "affected_routes": affected_routes,
             "affected_files": affected_files.len(),
+            "value_references": value_references,
             "risk_level": risk_level,
             "tests_affected": test_callers.len(),
             "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}] ({} tests affected)",

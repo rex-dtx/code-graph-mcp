@@ -40,7 +40,7 @@ use crate::storage::queries::{
     update_context_strings_batch, upsert_file,
     FileRecord, NodeRecord, NodeResult,
 };
-use crate::domain::{REL_CALLS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, max_file_size, CROSS_FILE_CALL_NOISE};
+use crate::domain::{REL_CALLS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_REFERENCES, max_file_size, CROSS_FILE_CALL_NOISE};
 use crate::utils::config::detect_language;
 
 use super::{IndexResult, IndexStats, ProgressFn};
@@ -688,6 +688,17 @@ pub(super) fn index_files(
                             rel.metadata.as_deref(),
                         )?;
                     }
+                    continue;
+                } else if rel.relation == REL_REFERENCES {
+                    // Bare-name value references (callbacks / fn pointers) share the
+                    // cross-language collision risk of bare-name calls: short common
+                    // names like `process` / `handler` / `run` exist in many
+                    // languages. Without a same-file or same-language target, DROP
+                    // rather than fall through to the global pool — a Rust
+                    // `references → process` must never bind a JS `function
+                    // process()` (feedback_edge_resolution_same_language). Precision
+                    // over recall; no pending buffer in Phase 1 (full rebuild
+                    // resolves; incremental-timing gap is the documented calls limit).
                     continue;
                 } else {
                     all_target_ids

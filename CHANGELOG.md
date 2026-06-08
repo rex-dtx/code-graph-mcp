@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.41.0 — callback / function-pointer references (Phase 1)
+
+A function passed as a *value* — a callback or function pointer — is referenced by a
+bare identifier in a non-call position (`register(handler)`, `xs.iter().map(map_row)`,
+`addEventListener('click', handler)`, `signal(&shutdown)`). The parser only emitted a
+`calls` edge for actual call expressions, so these usages produced no edge:
+`find_references`, `impact_analysis`, and dead-code all missed them. This release tracks
+them as `references` edges (Rust + JS/TS/TSX). The index format bumped
+(`INDEX_VERSION` 9 → 10), so the first run after upgrade rebuilds the index once.
+
+- **Bare-identifier value references.** A bare function name in call-argument position
+  (or Rust address-of `&fn`) now emits a `references` edge to the function, distinct
+  from `calls` — a registered callback is coupling, not a synchronous call. They surface
+  in `find_references` and as a new `value_references` count in `impact_analysis`, but
+  stay out of the call graph and the calls-based hot-function / caller counts.
+- **Precision gates.** Bare identifiers are only emitted as references when they are not
+  a local binding: enclosing-function parameters, `let` bindings, and `if let` /
+  `while let` / `match`-arm / `for` pattern bindings are all excluded (they shadow
+  same-named accessor functions like `db` / `conn` / `node`). Resolution requires a
+  same-file or same-language target — a reference is dropped rather than bound to a
+  cross-language same-named function.
+- **Cross-language resolution fix.** The Phase-2 edge resolver previously let non-`calls`
+  relations fall through to a global, cross-language name pool. `references` now drops on
+  no same-language match (like `calls`), so a Rust value-reference can never bind a
+  same-named JavaScript function.
+
 ## v0.40.0 — dogfooding fixes: project_map accuracy, trace/grep, build-dir exclusion
 
 End-to-end dogfooding pass. The index format bumped (`INDEX_VERSION` 8 → 9, for the

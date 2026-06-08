@@ -15,6 +15,7 @@
 
 use super::ParsedRelation;
 use super::super::node_text;
+use super::helpers::MAX_SUBTREE_DEPTH;
 use crate::domain::REL_REFERENCES;
 
 /// Emit a `references` edge for a `type_identifier` used in type position.
@@ -72,4 +73,127 @@ pub(super) fn extract_ts_type_reference(
         metadata: None,
         source_language: String::new(),
     })
+}
+
+/// Emit a `references` edge for a BARE `identifier` used as a function VALUE —
+/// a callback passed in a call-argument position (`arr.map(myFunc)`,
+/// `addEventListener('click', handler)`). JS/TS/TSX. No address-of in JS, so the
+/// only shape is a direct `arguments` child.
+///
+/// Self-exclusion is structural: a call's *callee* identifier has parent
+/// `call_expression` (or sits under a `member_expression`), never `arguments`, so it
+/// never fires here. `member_expression` selectors (`obj.method`) are
+/// `property_identifier`, not `identifier`, so `foo(obj.method)` does not emit a
+/// reference to `method` (Phase 2 scope).
+///
+/// M2 (param exclusion): a bare id equal to a parameter of ANY enclosing function
+/// is a local binding, not a global-fn reference — skip. UNLIKE Rust, JS closures
+/// capture outer-function params, so we collect params from every enclosing
+/// function up to the root (no break at the nearest one).
+pub(super) fn extract_js_value_reference(
+    node: &tree_sitter::Node,
+    source: &str,
+    scope: Option<&str>,
+) -> Option<ParsedRelation> {
+    let parent = node.parent()?;
+    if parent.kind() != "arguments" {
+        return None;
+    }
+    let name = node_text(node, source);
+    if name.is_empty() {
+        return None;
+    }
+    if js_enclosing_fn_local_names(node, source).contains(name) {
+        return None;
+    }
+    Some(ParsedRelation {
+        source_name: scope.unwrap_or("<module>").to_string(),
+        target_name: name.to_string(),
+        relation: REL_REFERENCES.into(),
+        metadata: None,
+        source_language: String::new(),
+    })
+}
+
+/// Collect LOCAL binding names visible to a value-reference candidate (M2 + M2.5):
+///   - parameters of EVERY enclosing function (closures capture outer params) —
+///     `formal_parameters` and the single-param `parameter` field (`x => ...`);
+///   - `var`/`let`/`const` binding names from the NEAREST enclosing function body
+///     (M2.5) — `variable_declarator` `name` field only, not the RHS `value`.
+///
+/// The nearest-function bound on var collection caps cost (a candidate inside a big
+/// module IIFE would otherwise re-scan the whole file); outer-function *locals*
+/// captured by an inner closure are a documented Phase-1 residual, outer *params*
+/// are still covered. Default-value expressions over-collect, which only suppresses
+/// a candidate (precision-safe).
+fn js_enclosing_fn_local_names(node: &tree_sitter::Node, source: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut nearest_fn_vars_done = false;
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            "function_declaration" | "function_expression" | "arrow_function"
+                | "method_definition" | "generator_function_declaration"
+                | "generator_function" | "function"
+        ) {
+            if let Some(p) = n.child_by_field_name("parameters") {
+                collect_js_param_idents(&p, source, &mut names, 0);
+            }
+            if let Some(p) = n.child_by_field_name("parameter") {
+                collect_js_param_idents(&p, source, &mut names, 0);
+            }
+            if !nearest_fn_vars_done {
+                if let Some(body) = n.child_by_field_name("body") {
+                    collect_js_var_names(&body, source, &mut names, 0);
+                }
+                nearest_fn_vars_done = true;
+            }
+        }
+        cur = n.parent();
+    }
+    names
+}
+
+/// Walk a function body collecting `variable_declarator` binding names from the
+/// `name` field (not the RHS `value`). Recurses to reach declarations in nested
+/// blocks. Used by `js_enclosing_fn_local_names` for M2.5.
+fn collect_js_var_names(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if node.kind() == "variable_declarator" {
+        if let Some(name) = node.child_by_field_name("name") {
+            collect_js_param_idents(&name, source, out, 0);
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_js_var_names(&child, source, out, depth + 1);
+        }
+    }
+}
+
+fn collect_js_param_idents(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if node.kind() == "identifier" {
+        out.insert(node_text(node, source).to_string());
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_js_param_idents(&child, source, out, depth + 1);
+        }
+    }
 }
