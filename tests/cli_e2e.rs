@@ -292,6 +292,18 @@ fn test_cli_grep_no_matches() {
 }
 
 #[test]
+fn test_cli_grep_invalid_regex_exits_nonzero() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // Unescaped `(` is an invalid regex — ripgrep exits 2. The CLI must surface
+    // a non-zero exit (not silently succeed like a no-match).
+    let (_, stderr, code) = run_cli(&project, &["grep", "res.json("]);
+    assert_ne!(code, 0, "invalid regex must exit non-zero, not silently succeed");
+    assert!(stderr.contains("ripgrep error") || stderr.to_lowercase().contains("regex"),
+        "should surface the ripgrep error, got: {stderr}");
+}
+
+#[test]
 fn test_cli_grep_with_path() {
     if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();

@@ -46,8 +46,9 @@ pub fn get_import_tree(
                   AND ('|' || dt.visited_ids || '|') NOT LIKE '%|' || CAST(f2.id AS TEXT) || '|%'
             )
             SELECT dt.file_path, MIN(dt.depth) as min_depth,
-                -- Count actual cross-file edges from root to this file
-                (SELECT COUNT(*)
+                -- Count distinct cross-file target symbols from root to this file
+                -- (a symbol both imported and called is one symbol, not two).
+                (SELECT COUNT(DISTINCT nb.id)
                  FROM nodes na JOIN files fa ON fa.id = na.file_id
                  JOIN edges ea ON ea.source_id = na.id AND ea.relation IN (?1, ?3)
                  JOIN nodes nb ON nb.id = ea.target_id
@@ -94,8 +95,9 @@ pub fn get_import_tree(
                   AND ('|' || dt.visited_ids || '|') NOT LIKE '%|' || CAST(f1.id AS TEXT) || '|%'
             )
             SELECT dt.file_path, MIN(dt.depth) as min_depth,
-                -- Count actual cross-file edges from this file to root
-                (SELECT COUNT(*)
+                -- Count distinct cross-file target symbols from this file to root
+                -- (a symbol both imported and called is one symbol, not two).
+                (SELECT COUNT(DISTINCT nb.id)
                  FROM nodes na JOIN files fa ON fa.id = na.file_id
                  JOIN edges ea ON ea.source_id = na.id AND ea.relation IN (?1, ?3)
                  JOIN nodes nb ON nb.id = ea.target_id

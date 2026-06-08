@@ -53,14 +53,21 @@ fn dir_of(path: &str) -> &str {
 #[allow(clippy::type_complexity)]
 pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<ModuleDep>, Vec<EntryPoint>, Vec<HotFunction>)> {
     // 1. Module map: SQL-level aggregation (C3: use constants, I1: GROUP BY in SQL)
+    // `method` counts toward the function bucket so the per-module symbol total
+    // matches what `overview` and `key_symbols` actually list (methods are
+    // symbols too — excluding them undercounts OO modules and contradicts the
+    // listed key_symbols). The synthetic `<external>` pseudo-file (unresolved
+    // import/trait targets like `Drop`, `std::io::Write`) is not a real module
+    // and its nodes are not project symbols — exclude it.
     let sql = "SELECT f.path, \
-                SUM(CASE WHEN n.type = 'function' THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN n.type IN ('function', 'method') THEN 1 ELSE 0 END), \
                 SUM(CASE WHEN n.type IN ('class', 'struct', 'enum') THEN 1 ELSE 0 END), \
                 SUM(CASE WHEN n.type IN ('interface', 'trait') THEN 1 ELSE 0 END), \
                 GROUP_CONCAT(DISTINCT f.language) \
          FROM nodes n JOIN files f ON f.id = n.file_id \
          WHERE n.type != 'module' AND n.name != '<module>' \
            AND n.is_test = 0 \
+           AND f.path != '<external>' \
          GROUP BY f.path"
         .to_string();
     let mut dir_files: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
@@ -103,6 +110,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              JOIN edges e ON e.target_id = n.id \
              WHERE e.relation = ?1 AND n.type != 'module' AND n.name != '<module>' \
                AND n.is_test = 0 \
+               AND f.path != '<external>' \
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
                AND f.path NOT LIKE 'benches/%' \
@@ -129,7 +137,8 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
         let sql = "SELECT DISTINCT n.name, f.path FROM edges e \
              JOIN nodes n ON n.id = e.target_id \
              JOIN files f ON f.id = n.file_id \
-             WHERE e.relation = ?1 AND n.name != '<module>'";
+             WHERE e.relation = ?1 AND n.name != '<module>' \
+               AND f.path != '<external>'";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_EXPORTS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -161,6 +170,10 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     // 3. Cross-module dependencies (C3: use REL_IMPORTS constant)
     let mut dep_map: HashMap<(String, String), usize> = HashMap::new();
     {
+        // Exclude the synthetic `<external>` bucket: imports of external/builtin
+        // packages must not surface as an internal `→ <root>` dependency (they
+        // otherwise dominate the Dependencies section and collide with the real
+        // root source module).
         let sql = "SELECT sf.path, tf.path, COUNT(*) \
              FROM edges e \
              JOIN nodes sn ON sn.id = e.source_id \
@@ -168,6 +181,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              JOIN files sf ON sf.id = sn.file_id \
              JOIN files tf ON tf.id = tn.file_id \
              WHERE e.relation = ?1 AND sf.path != tf.path \
+               AND sf.path != '<external>' AND tf.path != '<external>' \
              GROUP BY sf.path, tf.path";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_IMPORTS], |row| {
@@ -276,4 +290,40 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     }
 
     Ok((modules, deps, entry_points, hot_functions))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::helpers::test_db;
+
+    #[test]
+    fn test_project_map_excludes_external_and_counts_methods() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        // Real source file: 1 class + 1 method + 1 function = 3 symbols.
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/svc.py', 'h1', 0, 'python', 0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Svc', 'Svc', 1, 9, 'class Svc')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'handle', 'Svc.handle', 2, 4, 'def handle')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'helper', 'helper', 6, 8, 'def helper')", []).unwrap();
+        // Synthetic <external> pseudo-file: an unresolved external trait — must
+        // not be counted as a project symbol nor surface as a module/dependency.
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('<external>', 'h2', 0, 'python', 0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'trait', 'Drop', 'Drop', 0, 0, '')", []).unwrap();
+        // svc.py imports the external symbol (should NOT become a `→ <root>` dep).
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (1, 4, 'imports')", []).unwrap();
+
+        let (modules, deps, _eps, _hot) = get_project_map(conn).unwrap();
+
+        let src = modules.iter().find(|m| m.path == "src").expect("src module present");
+        // class(1) + method(1) + function(1) — method must count toward the total.
+        assert_eq!(src.functions + src.classes + src.interfaces_traits, 3,
+            "symbol total must include the method");
+        // No module derived from the synthetic <external> bucket (dir_of → "<root>").
+        assert!(modules.iter().all(|m| m.path != "<root>"),
+            "external pseudo-file must not appear as a <root> module");
+        // The external import must not surface as an internal dependency.
+        assert!(deps.iter().all(|d| d.to != "<root>" && d.from != "<root>"),
+            "external import must not surface as a <root> dependency");
+    }
 }

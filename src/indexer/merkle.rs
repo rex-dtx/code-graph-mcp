@@ -49,6 +49,19 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Well-known dependency/build directories that must never be indexed, even
+/// when the project has no `.gitignore` (or isn't a git repo, so the `ignore`
+/// crate's gitignore rules don't apply). Hidden dirs (`.git`, `.venv`,
+/// `.code-graph`, `.mypy_cache`, …) are already skipped via `.hidden(true)`;
+/// this covers the *non-hidden* ones that contain real, indexable source —
+/// `node_modules/` (JS/TS), `vendor/` (Go), `target/` (Rust/Maven build output).
+/// Matched on whole path segments so a directory `target/` is excluded but a
+/// file `target.rs` is not, at any nesting depth (e.g. `packages/x/node_modules`).
+fn is_excluded_build_dir(rel_str: &str) -> bool {
+    const EXCLUDED: &[&str] = &["node_modules", "vendor", "target", "bower_components"];
+    rel_str.split('/').any(|seg| EXCLUDED.contains(&seg))
+}
+
 pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
     // Collect eligible file paths first, then hash in parallel
     let walker = WalkBuilder::new(root)
@@ -79,7 +92,7 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
             if rel_str == ".git" || rel_str.starts_with(".git/") {
                 continue;
             }
-            if rel_str.starts_with("vendor/") {
+            if is_excluded_build_dir(&rel_str) {
                 continue;
             }
             if detect_language(&rel_str).is_none() {
@@ -194,7 +207,7 @@ pub fn scan_directory_cached(
             if rel_str == ".git" || rel_str.starts_with(".git/") {
                 continue;
             }
-            if rel_str.starts_with("vendor/") {
+            if is_excluded_build_dir(&rel_str) {
                 continue;
             }
             if detect_language(&rel_str).is_none() {
@@ -386,5 +399,40 @@ mod tests {
         assert!(hashes.contains_key("src/main.rs"));
         assert!(!hashes.contains_key("node_modules/pkg.js"));
         assert!(!hashes.contains_key("debug.log"));
+    }
+
+    #[test]
+    fn test_scan_excludes_build_dirs_without_gitignore() {
+        // No .git / .gitignore — the `ignore` crate's gitignore rules don't
+        // apply, so build/dependency dirs must be excluded by the hardcoded
+        // safety net. A *file* named `target.rs` must still be indexed.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main(){}").unwrap();
+        fs::write(tmp.path().join("src/target.rs"), "pub fn t() -> i32 { 1 }").unwrap();
+        fs::create_dir_all(tmp.path().join("node_modules/pkg")).unwrap();
+        fs::write(tmp.path().join("node_modules/pkg/i.js"), "function dep(){}").unwrap();
+        fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
+        fs::write(tmp.path().join("target/debug/junk.rs"), "pub fn j(){}").unwrap();
+        fs::create_dir_all(tmp.path().join("packages/a/node_modules/b")).unwrap();
+        fs::write(tmp.path().join("packages/a/node_modules/b/c.js"), "function nested(){}").unwrap();
+
+        let hashes = scan_directory(tmp.path()).unwrap();
+        assert!(hashes.contains_key("src/main.rs"));
+        assert!(hashes.contains_key("src/target.rs"), "a file named target.rs is source, not a build dir");
+        assert!(!hashes.contains_key("node_modules/pkg/i.js"));
+        assert!(!hashes.contains_key("target/debug/junk.rs"));
+        assert!(!hashes.contains_key("packages/a/node_modules/b/c.js"), "nested node_modules must be excluded");
+    }
+
+    #[test]
+    fn test_is_excluded_build_dir() {
+        assert!(is_excluded_build_dir("node_modules/x.js"));
+        assert!(is_excluded_build_dir("packages/a/node_modules/b.js"));
+        assert!(is_excluded_build_dir("target/debug/x.rs"));
+        assert!(is_excluded_build_dir("vendor/lib/x.go"));
+        assert!(!is_excluded_build_dir("src/target.rs"));
+        assert!(!is_excluded_build_dir("src/vendoring.rs"));
+        assert!(!is_excluded_build_dir("src/main.rs"));
     }
 }

@@ -1124,6 +1124,23 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
+    // ripgrep exit codes: 0 = matched, 1 = no match, 2 = error (invalid regex,
+    // unreadable path). Treat code 2 as a hard failure so the CLI exit code
+    // reflects it — otherwise a regex parse error (e.g. an unescaped `(` in a
+    // pattern like `res.json(`) prints to stderr but still exits 0, hiding the
+    // failure from scripts.
+    if rg_output.status.code() == Some(2) {
+        if json_mode {
+            println!("[]");
+        }
+        let stderr = String::from_utf8_lossy(&rg_output.stderr);
+        let stderr = stderr.trim();
+        anyhow::bail!(
+            "[code-graph] ripgrep error: {}",
+            if stderr.is_empty() { "invalid pattern or unreadable path" } else { stderr }
+        );
+    }
+
     // Parse rg JSON output into matches
     let matches = parse_rg_json(&rg_output.stdout, project_root);
     if matches.is_empty() {
@@ -2853,9 +2870,16 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     }
 
     for rm in &rows {
+        // Render the route label as "METHOD path" from the routes_to metadata
+        // (matching the map's Entry Points) instead of dumping the raw JSON blob.
+        let route_label = rm.metadata.as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .map(|v| format!("{} {}",
+                v["method"].as_str().unwrap_or("ALL"),
+                v["path"].as_str().unwrap_or(path)))
+            .unwrap_or_else(|| path.to_string());
         writeln!(stdout, "{} → {} ({}:{})",
-            rm.metadata.as_deref().unwrap_or(path),
-            rm.handler_name, rm.file_path, rm.start_line)?;
+            route_label, rm.handler_name, rm.file_path, rm.start_line)?;
 
         if include_middleware {
             if let Some(downstream) = downstream_map.get(&rm.node_id) {

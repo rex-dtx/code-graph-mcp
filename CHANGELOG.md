@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.40.0 — dogfooding fixes: project_map accuracy, trace/grep, build-dir exclusion
+
+End-to-end dogfooding pass. The index format bumped (`INDEX_VERSION` 8 → 9, for the
+build-dir exclusion below), so the first run after upgrade rebuilds the index once
+automatically.
+
+Read-side query fixes for `map` / `project_map`. Dogfooding surfaced three
+count/labeling defects in the project map:
+
+- **Synthetic `<external>` bucket excluded.** Unresolved external-import targets
+  (e.g. `os`, and external traits like `Drop` / `std::io::Write` / `Default`) live
+  in a virtual `<external>` file. These leaked into the module map as a phantom
+  `<root>` module ("0 symbols, external") and were counted as project symbols, and
+  every external/builtin import surfaced as a misleading `→ <root>` dependency
+  (dominating the Dependencies section). `<external>` is now excluded from the
+  module list, symbol counts, key-symbols, and the cross-module dependency graph —
+  Dependencies now shows genuine internal module coupling only.
+- **Methods counted toward the symbol total.** The per-module "N symbols" count
+  summed only functions + classes/structs/enums + interfaces/traits, silently
+  dropping `method` nodes. For OO modules this undercounted, and contradicted the
+  `key_symbols` list (which includes methods) — a class file could read "3 symbols"
+  while listing 4. Methods now count, matching `overview`.
+- **`deps` counts distinct symbols, not edges.** File-level dependencies labeled
+  "N symbols" actually counted cross-file edges, so a symbol both imported and
+  called inflated the count (2 symbols → "4 symbols"). Now counts distinct target
+  symbols.
+- **`trace` renders the route label, not raw JSON.** The CLI `trace` text output
+  printed the raw `routes_to` metadata blob (`{"handler_end_line":10,...}`) as the
+  route label instead of `GET /users` like the map already does. Now formatted as
+  `METHOD path`.
+- **`grep` exits non-zero on a ripgrep error.** An invalid regex (e.g. an
+  unescaped `(` in `res.json(`) or unreadable path printed the error to stderr but
+  still exited 0, hiding the failure from scripts. ripgrep's error exit code (2) is
+  now surfaced as a non-zero CLI exit; a valid no-match still exits 0.
+- **Build/dependency dirs excluded without a `.gitignore`.** Indexing relied on
+  the `ignore` crate's gitignore rules, so a project with no `.gitignore` (or that
+  isn't a git repo) indexed `node_modules/` (JS/TS source), `target/` (Rust/Maven
+  build), and nested copies — bloating the index and polluting the graph with
+  dependency/build code. These (plus `vendor/`, `bower_components/`) are now
+  excluded by a hardcoded safety net, matched on whole path segments at any depth
+  so a directory `target/` is skipped while a file `target.rs` is still indexed.
+  Hidden dirs (`.git`, `.venv`, `.code-graph`, …) were already skipped.
+
 ## v0.39.0 — C++ method scope, real-session conversion metric, adopted-only map
 
 Parser + metrics release. The index format bumped (`INDEX_VERSION` 7 → 8), so the
