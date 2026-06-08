@@ -143,6 +143,10 @@ pub(super) fn extract_rust_path_reference(
             return None;
         }
         "use_declaration" | "scoped_use_list" | "use_list" | "use_as_clause" => return None,
+        // Macro path (`tracing::error!`, `serde_json::json!`): the `macro` field of
+        // a `macro_invocation`. The macro name tail is not a value reference — it
+        // collides with same-named fns (`error`, `warn`).
+        "macro_invocation" => return None,
         // Intermediate path segment of a longer `a::b::c` chain.
         "scoped_identifier" => return None,
         // Type-position path (struct-expr type, generic bounds, etc.). The
@@ -150,6 +154,16 @@ pub(super) fn extract_rust_path_reference(
         // module path, not a value reference.
         "scoped_type_identifier" => return None,
         _ => {}
+    }
+    // Type-associated path used as a value (`String::as_str`, `MyType::method` passed
+    // as a fn pointer): the bare tail cannot resolve to the correct associated item
+    // (std methods aren't indexed; a same-named local fn is the wrong target), so
+    // suppress. Heuristic: a PascalCase head segment is a type; lowercase heads
+    // (`crate`, `self`, `super`, snake_case module names like `domain`) are genuine
+    // module-path values and still emit. Primitive-type heads (`str::trim`) are a
+    // documented residual — lowercase, not caught.
+    if node_text(node, source).chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+        return None;
     }
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(&name_node, source);

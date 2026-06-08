@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.42.0 — reference precision: drop macro-path and type-associated false positives
+
+Follow-up to v0.41.0. The `references` edge extractor for Rust path-qualified values
+(`extract_rust_path_reference`) emitted two classes of false positive that predate
+v0.41.0; both are now suppressed. The index format bumped (`INDEX_VERSION` 10 → 11), so
+the first run after upgrade rebuilds the index once.
+
+- **Macro paths.** `tracing::error!(…)` / `serde_json::json!(…)` parse as a macro
+  invocation whose macro name is a scoped path (`tracing::error`). The extractor treated
+  the tail (`error`) as a value reference, colliding with same-named functions. Macro
+  paths no longer emit a reference.
+- **Type-associated paths.** `String::as_str` passed as a function pointer (e.g.
+  `.map(String::as_str)`) emitted a reference to the bare tail `as_str`, which then
+  bound to an unrelated local function — the associated item can't be resolved (std
+  methods aren't indexed). A PascalCase path head (a type) now suppresses the reference;
+  lowercase module heads (`crate::domain::SHARED`) still emit. Primitive-type heads
+  (`str::trim`) are a documented residual.
+
+On this repo these removed 14 phantom reference edges (504 → 490) with zero genuine
+references lost.
+
 ## v0.41.0 — callback / function-pointer references (Phase 1)
 
 A function passed as a *value* — a callback or function pointer — is referenced by a

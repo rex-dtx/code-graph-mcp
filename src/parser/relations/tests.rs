@@ -2065,6 +2065,42 @@ fn test_r18_rust_genuine_fn_pointer_still_emits_after_m2_5() {
 }
 
 #[test]
+fn test_n1_rust_macro_path_does_not_emit_references_edge() {
+    // `tracing::error!(...)` is a macro_invocation whose `macro` field is the scoped
+    // path `tracing::error`. The path-reference extractor must NOT treat the macro
+    // name tail (`error`) as a value reference — it collides with same-named fns.
+    let src = r#"fn f() { tracing::error!("boom {}", x); } fn error() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "error"),
+        "a macro path tail must NOT emit a references edge; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_n2_rust_type_associated_path_does_not_emit_references_edge() {
+    // `String::as_str` passed as a fn pointer is a Type::method associated path. We
+    // cannot resolve the associated item (std method, not in the index), and binding
+    // the bare tail `as_str` to an unrelated local fn is a false positive. Suppress
+    // PascalCase-head (type-associated) value paths.
+    let src = r#"fn f() { let _ = xs.iter().map(String::as_str); } fn as_str() {}"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "as_str"),
+        "a Type::method associated path must NOT emit a references edge to the bare tail; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_n3_rust_module_path_value_still_emits_after_noise_fix() {
+    // Guard: the noise fix (macro + type-associated suppression) must NOT touch
+    // legitimate lowercase module-path value references (`crate::domain::SHARED`).
+    let src = r#"fn build() { let w = crate::domain::SHARED; }"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "SHARED"),
+        "a lowercase module-path value reference must still emit; got: {:?}",
+        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
 fn test_r19_rust_if_let_binding_does_not_emit_references_edge() {
     // `node` bound by `if let Some(node) = ...` is a local, not the global fn `node`.
     // if-let/while-let bindings are `let_condition` patterns, NOT `let_declaration`.
