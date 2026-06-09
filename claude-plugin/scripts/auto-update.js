@@ -183,6 +183,21 @@ function cachedBinaryPath() {
 }
 
 /**
+ * Decide whether the cached native binary must be (re)downloaded: true when it
+ * is missing OR its actual version differs from the latest release. Version-aware
+ * rather than existence-only — a stale-but-present binary must still self-heal
+ * even when the plugin shell version already matches latest. manifest.version
+ * tracks the plugin shell (the marketplace bumps it independently of the native
+ * binary), so an existence-only check leaves the engine permanently pinned to an
+ * old binary while the updater reports "up to date".
+ */
+function cachedBinaryNeedsUpdate(latest, { binaryPath = cachedBinaryPath(), readVersion = readBinaryVersion } = {}) {
+  if (!latest || !latest.binaryUrl) return false;
+  if (!fs.existsSync(binaryPath)) return true;
+  return readVersion(binaryPath) !== latest.version;
+}
+
+/**
  * Download just the platform binary from a GitHub release into the cache.
  * Used in two paths:
  *   1. As part of `downloadAndInstall` after a plugin tarball update.
@@ -222,15 +237,21 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion) {
     const stat = fs.statSync(binaryTmp);
     if (stat.size <= 1_000_000) return false;
 
+    // chmod BEFORE reading the version. readBinaryVersion executes the binary
+    // (`--version`), which requires the exec bit; `curl -o` writes the tmp file
+    // as 0644 (no exec bit), so reading the version first fails with EACCES →
+    // null → false, which silently wedged every download path. rename preserves
+    // the mode, so the promoted dst ends up 0755.
+    if (os.platform() !== 'win32') {
+      fs.chmodSync(binaryTmp, 0o755);
+    }
+
     const actualVersion = readBinaryVersion(binaryTmp);
     if (!actualVersion || (expectedVersion && actualVersion !== expectedVersion)) {
       return false;
     }
 
     fs.renameSync(binaryTmp, binaryDst);
-    if (os.platform() !== 'win32') {
-      fs.chmodSync(binaryDst, 0o755);
-    }
     clearBinaryCache();
     return true;
   } catch {
@@ -392,12 +413,13 @@ async function checkForUpdate({ installMissing = false } = {}) {
       };
     }
 
-    // No update needed — but self-heal if cache binary is missing.
-    // State file alone is not authoritative; previous download may have failed
-    // silently, cache may have been wiped, or `npm install -g` optionalDependency
-    // may have dropped the platform package.
+    // No plugin-shell update — but self-heal the native binary if it is missing
+    // OR stale. The shell version (manifest.version) can match latest while the
+    // cached binary lags (a previous download failed silently, the cache was
+    // wiped, an `npm install -g` optionalDependency dropped the platform package,
+    // or the marketplace bumped the shell without re-fetching the binary).
     let selfHealedBinary = false;
-    if (latest.binaryUrl && !fs.existsSync(cachedBinaryPath())) {
+    if (cachedBinaryNeedsUpdate(latest)) {
       selfHealedBinary = await downloadBinary(latest);
     }
 
@@ -424,7 +446,7 @@ module.exports = {
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
   isSilentMode, isInstallMissingMode,
   requestJson, parseLatestRelease, fetchLatestRelease,
-  downloadBinary, cachedBinaryPath,
+  downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate,
 };
 
 // CLI: node auto-update.js [check|status] [--silent] [--install-missing]

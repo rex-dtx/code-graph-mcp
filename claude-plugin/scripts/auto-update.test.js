@@ -13,6 +13,7 @@ const {
   readBinaryVersion,
   promoteVerifiedBinary,
   cachedBinaryPath,
+  cachedBinaryNeedsUpdate,
   downloadBinary,
   isInstallMissingMode,
   isSilentMode,
@@ -32,7 +33,7 @@ test('getExtractedPluginVersion reads extracted plugin manifest version', (t) =>
   assert.equal(getExtractedPluginVersion(root), '1.2.3');
 });
 
-function writeFakeBinary(filePath, version) {
+function writeFakeBinary(filePath, version, mode = 0o755) {
   const script = [
     '#!/usr/bin/env bash',
     'if [ "$1" = "--version" ]; then',
@@ -44,7 +45,7 @@ function writeFakeBinary(filePath, version) {
     '',
   ].join('\n');
   fs.writeFileSync(filePath, script);
-  fs.chmodSync(filePath, 0o755);
+  fs.chmodSync(filePath, mode);
 }
 
 test('promoteVerifiedBinary accepts a runnable binary with the expected version', (t) => {
@@ -68,6 +69,51 @@ test('promoteVerifiedBinary rejects binaries with mismatched version', (t) => {
   assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3'), false);
   assert.equal(fs.existsSync(tmp), false);
   assert.equal(fs.existsSync(dst), false);
+});
+
+test('promoteVerifiedBinary promotes a non-executable (0644) download — curl -o regression', (t) => {
+  // `curl -o` writes the tmp file as 0644 (no exec bit). promoteVerifiedBinary
+  // must chmod before reading the version (readBinaryVersion executes the
+  // binary), otherwise the version read fails with EACCES → null → false and
+  // every download path silently wedges. Regression for the binary-stuck-at-old
+  // -version deadlock.
+  if (process.platform === 'win32') return; // no exec bit on win32
+  const dir = mkDir(t, 'code-graph-bin-');
+  const tmp = path.join(dir, 'code-graph-mcp.tmp');
+  const dst = path.join(dir, 'code-graph-mcp');
+  writeFakeBinary(tmp, '1.2.3', 0o644);
+
+  assert.equal(readBinaryVersion(tmp), null, 'precondition: 0644 binary is not executable');
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3'), true);
+  assert.equal(fs.existsSync(dst), true);
+  assert.equal(fs.statSync(dst).mode & 0o111, 0o111, 'promoted binary is executable');
+  assert.equal(readBinaryVersion(dst), '1.2.3');
+});
+
+test('cachedBinaryNeedsUpdate is version-aware, not existence-only', (t) => {
+  const dir = mkDir(t, 'code-graph-heal-');
+  const binaryPath = path.join(dir, 'code-graph-mcp');
+  const latest = { version: '0.45.0', binaryUrl: 'https://example.com/bin' };
+
+  // missing binary → needs update
+  assert.equal(cachedBinaryNeedsUpdate(latest, { binaryPath }), true);
+
+  // present but stale (the actual deadlock: shell at 0.45.0, binary at 0.16.6)
+  fs.writeFileSync(binaryPath, 'x');
+  assert.equal(
+    cachedBinaryNeedsUpdate(latest, { binaryPath, readVersion: () => '0.16.6' }),
+    true,
+  );
+
+  // present and current → no update
+  assert.equal(
+    cachedBinaryNeedsUpdate(latest, { binaryPath, readVersion: () => '0.45.0' }),
+    false,
+  );
+
+  // no binaryUrl / null latest → no-op (nothing to download)
+  assert.equal(cachedBinaryNeedsUpdate({ version: '0.45.0', binaryUrl: null }, { binaryPath }), false);
+  assert.equal(cachedBinaryNeedsUpdate(null, { binaryPath }), false);
 });
 
 test('parseLatestRelease selects the matching platform asset', () => {

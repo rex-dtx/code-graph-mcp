@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.45.1 — fix: plugin auto-update could pin the native binary at an old version
+
+The plugin shell would update while the cached native binary (`~/.cache/code-graph/bin/`)
+stayed stuck at whatever version was first installed, with the updater reporting "up to
+date". Three compounding defects in `claude-plugin/scripts/auto-update.js`:
+
+- **Binary download never succeeded.** `promoteVerifiedBinary` read the downloaded
+  binary's version (which runs `<binary> --version`) *before* `chmod +x`. `curl -o` writes
+  the temp file as `0644`, so the exec failed with `EACCES`, the version read as `null`, and
+  verification rejected every download. The `chmod` now happens before the version read.
+- **Self-heal was existence-only.** The "no update needed" path re-downloaded the binary
+  only when the file was *missing*, never when it was present-but-stale. It is now
+  version-aware (new `cachedBinaryNeedsUpdate`): a cached binary whose version differs from
+  the latest release self-heals even when the plugin shell version already matches.
+- Together these caused a permanent deadlock once the shell version caught up to the
+  release while the binary lagged. Existing installs heal automatically on the next update
+  check after upgrading to this version.
+
 ## v0.45.0 — value references Phase 3b: JSX, Go composites, tuples, primitive paths
 
 More value-reference coverage and precision. The index format bumped (`INDEX_VERSION`
