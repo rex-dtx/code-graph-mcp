@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.45.3 — chore: regression-test the binary self-heal wiring (no behavior change)
+
+Hardening follow-up to v0.45.1/v0.45.2. Those two patches both broke in the *orchestration*
+that calls `downloadBinary` on a present-but-stale binary — the shell-matches-latest branch of
+`checkForUpdate` — while the underlying decision predicate (`cachedBinaryNeedsUpdate`) was
+correct and unit-tested the whole time. Predicate tests don't cover whether anything actually
+*calls* the predicate, so the exact glue that regressed twice had no test. Extracted that glue
+into `selfHealStaleBinary(latest, { needsUpdate, download })` with injected dependencies and a
+wiring test (download-invoked when stale / no-op when current / returns false so the next
+session retries when the download fails). No runtime behavior change — the self-heal path is
+identical; it is now guarded against a third silent regression.
+
 ## v0.45.2 — fix: stale binary self-heals on the next session, not up to 6h later
 
 Follow-up to v0.45.1. The binary self-heal added there only ran after the time-based

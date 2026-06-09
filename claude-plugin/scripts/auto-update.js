@@ -367,6 +367,19 @@ async function downloadAndInstall(latest) {
 
 // ── Main Entry ─────────────────────────────────────────────
 
+/**
+ * Self-heal the cached native binary when the plugin shell is already at latest
+ * but the binary lags (missing OR a different version). This is the orchestration
+ * glue that broke twice in the field (v0.45.1, v0.45.2): the decision predicate
+ * was correct, but nothing guaranteed checkForUpdate actually invoked the download
+ * on the shell-matches-latest path. Extracted + injectable so the wiring itself is
+ * regression-tested, not just the predicate. Returns true iff a download promoted.
+ */
+async function selfHealStaleBinary(latest, { needsUpdate = cachedBinaryNeedsUpdate, download = downloadBinary } = {}) {
+  if (!needsUpdate(latest)) return false;
+  return await download(latest);
+}
+
 async function checkForUpdate({ installMissing = false } = {}) {
   try {
     // Skip in dev mode — unless the launcher explicitly requested a missing-
@@ -431,14 +444,10 @@ async function checkForUpdate({ installMissing = false } = {}) {
     }
 
     // No plugin-shell update — but self-heal the native binary if it is missing
-    // OR stale. The shell version (manifest.version) can match latest while the
-    // cached binary lags (a previous download failed silently, the cache was
-    // wiped, an `npm install -g` optionalDependency dropped the platform package,
-    // or the marketplace bumped the shell without re-fetching the binary).
-    let selfHealedBinary = false;
-    if (cachedBinaryNeedsUpdate(latest)) {
-      selfHealedBinary = await downloadBinary(latest);
-    }
+    // OR stale (see selfHealStaleBinary). The shell version (manifest.version)
+    // can match latest while the cached binary lags — this is exactly the wild
+    // failure observed in the field (shell at v0.45, binary pinned at v0.16.6).
+    const selfHealedBinary = await selfHealStaleBinary(latest);
 
     saveState({
       ...state,
@@ -464,6 +473,7 @@ module.exports = {
   isSilentMode, isInstallMissingMode,
   requestJson, parseLatestRelease, fetchLatestRelease,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
+  selfHealStaleBinary,
 };
 
 // CLI: node auto-update.js [check|status] [--silent] [--install-missing]

@@ -16,6 +16,7 @@ const {
   cachedBinaryNeedsUpdate,
   cachedBinaryStaleVsState,
   downloadBinary,
+  selfHealStaleBinary,
   isInstallMissingMode,
   isSilentMode,
 } = require('./auto-update');
@@ -141,6 +142,35 @@ test('cachedBinaryStaleVsState bypasses throttle only for a present-but-stale bi
   // missing binary → false here (the separate binaryMissing bypass handles it)
   fs.rmSync(binaryPath);
   assert.equal(cachedBinaryStaleVsState({ latestVersion: '0.45.1' }, { binaryPath }), false);
+});
+
+test('selfHealStaleBinary wires the stale-binary check to a download (the v0.45.x glue)', async () => {
+  const latest = { version: '0.45.2', binaryUrl: 'https://example/bin' };
+
+  // Field failure mode: shell already at latest, binary pinned stale → MUST download.
+  let downloaded = false;
+  const healed = await selfHealStaleBinary(latest, {
+    needsUpdate: () => true,
+    download: async () => { downloaded = true; return true; },
+  });
+  assert.equal(downloaded, true, 'stale binary must trigger a download');
+  assert.equal(healed, true);
+
+  // Binary current → no download, no-op.
+  let touched = false;
+  const noop = await selfHealStaleBinary(latest, {
+    needsUpdate: () => false,
+    download: async () => { touched = true; return true; },
+  });
+  assert.equal(touched, false, 'current binary must not download');
+  assert.equal(noop, false);
+
+  // Download fails (no curl / network) → returns false so the next session retries.
+  const failed = await selfHealStaleBinary(latest, {
+    needsUpdate: () => true,
+    download: async () => false,
+  });
+  assert.equal(failed, false);
 });
 
 test('parseLatestRelease selects the matching platform asset', () => {
