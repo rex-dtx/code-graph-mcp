@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.46.0 — feat: measure whether the DENY stick converts + honest conversion metric
+
+The recommend→use conversion metric (v0.39.0) was producing **zero usable data** in this repo
+and failing silently. This release makes it honest and adds the first real attribution of the
+PreToolUse **DENY** intervention — without adding or broadening any intervention itself.
+
+- **Honest, visible metric.** `stats` (text + JSON `recommendations.state`) and `health-check`
+  now surface `absent | empty | live` instead of silently skipping the block — "hooks not
+  recording here" can no longer be mistaken for "feature absent".
+- **Test-leak fixed.** `resolve_project_root_from` walks up to the nearest ancestor `.git`;
+  `plugin_e2e::spawn_server` wrote only a `Cargo.toml`, so a fixture nested under the repo
+  flushed test metrics (`nonexistent_tool`, `dur_s:0`) into the **real** `usage.jsonl`,
+  corrupting the conversion denominator. Fixed by test isolation (a `.git` marker) — prod
+  resolution is unchanged (subdir-CLI behavior is intended). Regression-tested.
+- **Per-session deny→use funnel.** `SessionMetrics` stamps a wallclock start; flush
+  window-joins in-session `deny`/`hint` events from `recommendations.jsonl` into the usage
+  record (`recs`, additive — no schema change). `stats` prints `Deny→use: M/N = X%` (+ hint);
+  JSON gains `recommendations.funnel`.
+- **doctor stale-path detection.** A registered-but-stale-version PreToolUse hook (e.g. an old
+  plugin-cache path) fires but may run pre-`recordRecommendation` code, keeping the metric
+  silently dark. `doctor` now flags such entries and routes to the existing re-register fix.
+
 ## v0.45.4 — fix: intra-class method calls were dropped from the graph in OO languages
 
 The call graph silently omitted every **method → sibling-method** edge for class-based
