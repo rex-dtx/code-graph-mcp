@@ -507,6 +507,30 @@ fn walk_for_relations(
             }
         }
 
+        // Java: tree-sitter-java uses `method_invocation` (NOT `call_expression`)
+        // for every method call — `foo()`, `this.foo()`, `obj.foo()`, `Type.foo()`.
+        // The callee name is the `name` field; the optional `object` field is the
+        // receiver. Without this arm ALL Java call edges were silently dropped
+        // despite Java being documented Full tier — callgraph / impact_analysis /
+        // find_dead_code all depend on these edges. Bare callee name mirrors the
+        // Python/Ruby arms; downstream target resolution disambiguates same names.
+        "method_invocation" if config.name == "java" => {
+            if let Some(scope) = active_scope {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let callee = node_text(&name_node, source).to_string();
+                    if !callee.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: scope.to_string(),
+                            target_name: callee,
+                            relation: REL_CALLS.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
         // PHP: function_call_expression (doSomething()), member_call_expression ($this->move()),
         // scoped_call_expression (User::all())
         "function_call_expression" | "member_call_expression" | "scoped_call_expression"

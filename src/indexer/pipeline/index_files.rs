@@ -183,6 +183,11 @@ pub(super) fn index_files(
         file_id: i64,
         node_ids: Vec<i64>,
         node_names: Vec<String>,
+        // Qualified names parallel to node_ids/node_names (None for <module>).
+        // Needed so Phase-2 source resolution can match a relation's
+        // qualified scope_name (`Class.method`) against class-based-language
+        // method nodes, whose bare `name` is just `method`.
+        node_qualified_names: Vec<Option<String>>,
     }
 
     // Process files in batches — each batch does Phase 1 + Phase 2
@@ -285,6 +290,7 @@ pub(super) fn index_files(
 
             let mut node_ids = Vec::new();
             let mut node_names = Vec::new();
+            let mut node_qualified_names: Vec<Option<String>> = Vec::new();
 
             let module_node_id = insert_node_cached(db.conn(), &NodeRecord {
                 file_id,
@@ -304,6 +310,8 @@ pub(super) fn index_files(
             })?;
             node_ids.push(module_node_id);
             node_names.push("<module>".into());
+            // <module> resolves by its bare name; no qualified form.
+            node_qualified_names.push(None);
             total_nodes_created += 1;
 
             for pn in &pp.parsed_nodes {
@@ -326,6 +334,7 @@ pub(super) fn index_files(
                 })?;
                 node_ids.push(node_id);
                 node_names.push(pn.name.clone());
+                node_qualified_names.push(pn.qualified_name.clone());
                 total_nodes_created += 1;
             }
 
@@ -337,6 +346,7 @@ pub(super) fn index_files(
                 file_id,
                 node_ids,
                 node_names,
+                node_qualified_names,
             });
         }
 
@@ -402,10 +412,20 @@ pub(super) fn index_files(
                     );
                 }
 
-                let source_ids = pf.node_names.iter()
-                    .zip(pf.node_ids.iter())
-                    .filter(|(name, _)| *name == &rel.source_name)
-                    .map(|(_, id)| *id)
+                // Match the relation's enclosing scope (source_name) to a node.
+                // Class-based languages (Python/TS/JS/Java/Ruby) qualify a
+                // method's scope as `Class.method`, but the node's bare `name`
+                // is just `method` — so match qualified_name too, else every
+                // intra-class method-to-method edge is silently dropped.
+                // Bare-scope sources (Rust impl, Go receivers, free functions)
+                // still match on `name`.
+                let source_ids = (0..pf.node_ids.len())
+                    .filter(|&i| {
+                        pf.node_names[i] == rel.source_name
+                            || pf.node_qualified_names[i].as_deref()
+                                == Some(rel.source_name.as_str())
+                    })
+                    .map(|i| pf.node_ids[i])
                     .collect::<Vec<_>>();
 
                 // Try Python module-constrained resolution for import edges

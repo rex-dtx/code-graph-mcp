@@ -106,6 +106,57 @@ function caller_js() { update(); }
 }
 
 #[test]
+fn test_intra_class_method_call_edges_resolve() {
+    // Regression: class-based languages qualify a method's enclosing scope as
+    // `Class.method`, but the node's bare `name` is just `method`. Phase-2 source
+    // resolution matched only bare node_names, so EVERY intra-class method →
+    // sibling-method call edge was silently dropped (TS/JS/Python/Java/Ruby).
+    // Rust/Go were unaffected (bare scope), which masked the bug. Fix: also match
+    // the relation's qualified source_name against each node's qualified_name.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+
+    fs::write(project_dir.path().join("src/svc.py"), r#"
+class UserSvc:
+    def get_user(self, uid):
+        return self._fetch(uid)
+    def _fetch(self, uid):
+        return uid
+"#).unwrap();
+    fs::write(project_dir.path().join("src/Svc.java"), r#"
+class Svc {
+    void run() { helper(); }
+    void helper() {}
+}
+"#).unwrap();
+    fs::write(project_dir.path().join("src/svc.ts"), r#"
+class TsSvc {
+    outer(): void { this.inner(); }
+    inner(): void {}
+}
+"#).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Each outer method must have a calls edge to its sibling.
+    for (caller, callee) in [("get_user", "_fetch"), ("run", "helper"), ("outer", "inner")] {
+        let nodes = get_nodes_by_name(db.conn(), caller).unwrap();
+        let node = nodes.first().unwrap_or_else(|| panic!("{caller} should be indexed"));
+        let edges = get_edges_from(db.conn(), node.id).unwrap();
+        let has_call = edges.iter().any(|e| {
+            if e.relation != REL_CALLS { return false; }
+            let tgt: Option<String> = db.conn().query_row(
+                "SELECT name FROM nodes WHERE id = ?1", [e.target_id], |r| r.get(0),
+            ).ok();
+            tgt.as_deref() == Some(callee)
+        });
+        assert!(has_call, "{caller} → {callee} method-call edge was dropped");
+    }
+}
+
+#[test]
 fn test_js_require_creates_external_import_edges() {
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();

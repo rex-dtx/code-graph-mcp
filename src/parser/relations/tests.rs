@@ -302,6 +302,24 @@ fn test_extract_java_inheritance() {
     assert!(inherits.contains(&"Animal"), "got: {:?}", inherits);
 }
 
+// Regression: tree-sitter-java uses `method_invocation` (NOT `call_expression`),
+// which had no dispatch arm in walk_for_relations — so every Java call edge was
+// silently dropped even though Java is documented Full tier. Verify bare `foo()`,
+// `this.foo()`, and receiver `obj.foo()` all emit calls under the qualified
+// method scope `Svc.run`.
+#[test]
+fn test_extract_java_method_calls() {
+    let code = "class Svc {\n  void run() { helper(); this.other(); dep.work(); }\n  void helper() {}\n  void other() {}\n}\n";
+    let relations = extract_relations(code, "java").unwrap();
+    let calls: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.source_name == "Svc.run")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(calls.contains(&"helper"), "bare call helper() missing; got: {:?}", calls);
+    assert!(calls.contains(&"other"), "this.other() call missing; got: {:?}", calls);
+    assert!(calls.contains(&"work"), "receiver dep.work() call missing; got: {:?}", calls);
+}
+
 // --- Task 3: Python imports ---
 
 #[test]

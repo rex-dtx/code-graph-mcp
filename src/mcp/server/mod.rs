@@ -1368,10 +1368,23 @@ impl McpServer {
             }
             Err(e) => {
                 tracing::warn!("[tool-error] {}: {}", tool_name, e);
+                let err_str = e.to_string();
+                let mut text = format!("Error: {}", err_str);
+                // Secondary (read-only) instances never reindex, so a "not found"
+                // can mean the symbol exists on disk but the primary hasn't indexed
+                // it yet — otherwise indistinguishable from a typo. Disambiguate it.
+                if !self.is_primary && err_str.contains("not found in") {
+                    text.push_str(
+                        " Note: this code-graph instance is in read-only secondary mode \
+                         (another instance holds the index lock) and does not reindex on \
+                         its own — if you recently edited files, the symbol may not be \
+                         indexed here yet; the primary instance will pick it up shortly."
+                    );
+                }
                 JsonRpcResponse::success(id, json!({
                     "content": [{
                         "type": "text",
-                        "text": format!("Error: {}", e)
+                        "text": text
                     }],
                     "isError": true
                 }))
@@ -1874,6 +1887,43 @@ function handleLogin(req: Request) {
         // Stop watching
         let req = tool_call_json("stop_watch", json!({}));
         let _ = server.handle_message(&req).unwrap();
+    }
+
+    #[test]
+    fn test_secondary_not_found_includes_stale_hint() {
+        // A read-only secondary instance never reindexes, so a "not found" may mean
+        // the symbol is on disk but the primary hasn't indexed it yet. The error
+        // message must disambiguate that from a plain typo; the primary must not.
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("a.ts"), "function realFn() {}").unwrap();
+
+        // Populate the shared on-disk index as a primary.
+        let primary = McpServer::new_test_with_project(project_dir.path());
+        primary.ensure_indexed().unwrap();
+
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({"symbol_name": "zzz_absent_symbol", "direction": "callees"}),
+        );
+
+        // Secondary: same DB file, is_primary flipped off → hint appended.
+        let mut secondary = McpServer::new_test_with_project(project_dir.path());
+        secondary.is_primary = false;
+        let resp = secondary.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(parsed["result"]["isError"], serde_json::json!(true));
+        assert!(text.contains("not found"), "should still report not found: {text}");
+        assert!(text.contains("secondary mode"),
+            "secondary not-found must carry the stale-index hint: {text}");
+
+        // Primary: identical query must NOT carry the secondary hint.
+        let resp2 = primary.handle_message(&req).unwrap().unwrap();
+        let parsed2: serde_json::Value = serde_json::from_str(&resp2).unwrap();
+        let text2 = parsed2["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text2.contains("not found"), "primary should report not found: {text2}");
+        assert!(!text2.contains("secondary mode"),
+            "primary must not add the secondary hint: {text2}");
     }
 
     #[test]

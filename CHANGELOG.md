@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.45.4 — fix: intra-class method calls were dropped from the graph in OO languages
+
+The call graph silently omitted every **method → sibling-method** edge for class-based
+languages (TypeScript, JavaScript, Python, Java, Ruby). Only Rust (impl methods carry a bare
+scope) and Go (receiver methods carry a bare qualified name) were unaffected — which is why
+self-dogfooding on this Rust codebase never surfaced it. Two independent root causes:
+
+- **Qualified scope vs. bare source lookup.** A class method's enclosing scope is recorded as
+  `Class.method`, but Phase-2 source resolution matched the relation's `source_name` only
+  against each node's bare `name` (`method`), so the source never resolved and the edge was
+  dropped. Resolution now also matches `qualified_name`.
+- **Java calls were never extracted.** tree-sitter-java emits `method_invocation` (not
+  `call_expression`), which had no dispatch arm — so *all* Java call edges were missing despite
+  Java being a documented Full-tier language. Added the `method_invocation` arm.
+
+Impact: `get_call_graph` / impact analysis / `find_references` undercounted, and
+`find_dead_code` produced false positives (a method called only by its siblings looked like an
+orphan). `INDEX_VERSION` is bumped 15 → 16, so existing indexes auto-rebuild on first use.
+
+Also: a read-only **secondary** MCP instance (a second editor window on the same project) now
+explains a stale "symbol not found" — it does not reindex on its own, so a just-edited symbol
+may not be present yet — instead of a bare not-found that's indistinguishable from a typo.
+
 ## v0.45.3 — chore: regression-test the binary self-heal wiring (no behavior change)
 
 Hardening follow-up to v0.45.1/v0.45.2. Those two patches both broke in the *orchestration*
