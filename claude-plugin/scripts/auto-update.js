@@ -198,6 +198,20 @@ function cachedBinaryNeedsUpdate(latest, { binaryPath = cachedBinaryPath(), read
 }
 
 /**
+ * Throttle-bypass predicate: is a *present* cached binary stale relative to the
+ * last known latest release (`state.latestVersion`, set on the previous fetch —
+ * no network here)? Used so a present-but-stale binary skips the time-based
+ * throttle instead of staying pinned for up to a full check interval. Returns
+ * false when there is no prior latestVersion (first run fetches anyway) or the
+ * binary is missing (handled by the separate `binaryMissing` bypass).
+ */
+function cachedBinaryStaleVsState(state, { binaryPath = cachedBinaryPath(), readVersion = readBinaryVersion } = {}) {
+  if (!state || !state.latestVersion) return false;
+  if (!fs.existsSync(binaryPath)) return false;
+  return readVersion(binaryPath) !== state.latestVersion;
+}
+
+/**
  * Download just the platform binary from a GitHub release into the cache.
  * Used in two paths:
  *   1. As part of `downloadAndInstall` after a plugin tarball update.
@@ -365,11 +379,14 @@ async function checkForUpdate({ installMissing = false } = {}) {
     // bypasses auto-update.js, so re-sync state.installedVersion every call.
     const installedVersion = readManifest().version || '0.0.0';
 
-    // Time-based throttle. A missing cache binary is a hard failure (launcher
-    // cannot start) so it overrides the throttle — without this bypass the
-    // session wedges for up to 6h waiting for the next check window.
+    // Time-based throttle. Two conditions override it: a missing cache binary
+    // (launcher cannot start) and a present-but-stale binary (otherwise it stays
+    // pinned to the old version for up to a full check interval — the binary
+    // self-heal would never run inside the throttle window). Both bypass to the
+    // fetch + self-heal path below.
     const binaryMissing = !fs.existsSync(cachedBinaryPath());
-    if (!binaryMissing && !shouldCheck(state)) {
+    const binaryStale = cachedBinaryStaleVsState(state);
+    if (!binaryMissing && !binaryStale && !shouldCheck(state)) {
       if (state.installedVersion !== installedVersion) {
         saveState({ ...state, installedVersion });
       }
@@ -446,7 +463,7 @@ module.exports = {
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
   isSilentMode, isInstallMissingMode,
   requestJson, parseLatestRelease, fetchLatestRelease,
-  downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate,
+  downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
 };
 
 // CLI: node auto-update.js [check|status] [--silent] [--install-missing]

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.45.2 — fix: stale binary self-heals on the next session, not up to 6h later
+
+Follow-up to v0.45.1. The binary self-heal added there only ran after the time-based
+update throttle (`shouldCheck`, 6h) had elapsed, so a present-but-stale binary could stay
+pinned for up to a full check interval after the plugin shell updated. The throttle now
+also yields to a present-but-stale binary (compared against the last known release version
+— no extra network call), so the self-heal runs on the next session instead of waiting out
+the window. Binary still loads into the running MCP server on the next Claude Code restart.
+
 ## v0.45.1 — fix: plugin auto-update could pin the native binary at an old version
 
 The plugin shell would update while the cached native binary (`~/.cache/code-graph/bin/`)

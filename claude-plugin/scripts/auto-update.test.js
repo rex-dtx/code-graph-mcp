@@ -14,6 +14,7 @@ const {
   promoteVerifiedBinary,
   cachedBinaryPath,
   cachedBinaryNeedsUpdate,
+  cachedBinaryStaleVsState,
   downloadBinary,
   isInstallMissingMode,
   isSilentMode,
@@ -114,6 +115,32 @@ test('cachedBinaryNeedsUpdate is version-aware, not existence-only', (t) => {
   // no binaryUrl / null latest → no-op (nothing to download)
   assert.equal(cachedBinaryNeedsUpdate({ version: '0.45.0', binaryUrl: null }, { binaryPath }), false);
   assert.equal(cachedBinaryNeedsUpdate(null, { binaryPath }), false);
+});
+
+test('cachedBinaryStaleVsState bypasses throttle only for a present-but-stale binary', (t) => {
+  const dir = mkDir(t, 'code-graph-throttle-');
+  const binaryPath = path.join(dir, 'code-graph-mcp');
+  fs.writeFileSync(binaryPath, 'x'); // present
+
+  // no prior latestVersion → don't bypass (first run fetches anyway)
+  assert.equal(cachedBinaryStaleVsState({}, { binaryPath }), false);
+  assert.equal(cachedBinaryStaleVsState(null, { binaryPath }), false);
+
+  // present + stale vs last known latest → bypass throttle (the 6h-gap fix)
+  assert.equal(
+    cachedBinaryStaleVsState({ latestVersion: '0.45.1' }, { binaryPath, readVersion: () => '0.16.6' }),
+    true,
+  );
+
+  // present + current → stay throttled
+  assert.equal(
+    cachedBinaryStaleVsState({ latestVersion: '0.45.1' }, { binaryPath, readVersion: () => '0.45.1' }),
+    false,
+  );
+
+  // missing binary → false here (the separate binaryMissing bypass handles it)
+  fs.rmSync(binaryPath);
+  assert.equal(cachedBinaryStaleVsState({ latestVersion: '0.45.1' }, { binaryPath }), false);
 });
 
 test('parseLatestRelease selects the matching platform asset', () => {
