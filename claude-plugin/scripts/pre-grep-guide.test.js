@@ -7,6 +7,9 @@ const {
   extractPatterns,
   extractSearchPath,
   normalizeCommandPaths,
+  resolveProjectRoot,
+  rebaseRelativePaths,
+  commandHasBypass,
   pickBlockPattern,
   buildHint,
   buildBlockReason,
@@ -651,15 +654,28 @@ test('pickBlockPattern: no identifier-like pattern → undefined', () => {
 
 // ── v0.47.0 deny-with-answer: message builders + env gate ───────────
 
-test('buildBlockReasonWithAnswer: embeds results, command, and escape hatch', () => {
+test('buildBlockReasonWithAnswer: embeds results and command', () => {
   const reason = buildBlockReasonWithAnswer('fts5_search', 'src/storage/', {
     status: 'hits', text: 'src/storage/db.rs:42  fn fts5_search()', truncated: false,
   });
   assert.match(reason, /already ran/);
   assert.match(reason, /code-graph-mcp grep "fts5_search" src\/storage\//);
   assert.match(reason, /src\/storage\/db\.rs:42/);
-  assert.match(reason, /CODE_GRAPH_NO_BLOCK_GREP=1/);
   assert.doesNotMatch(reason, /truncated/);
+});
+
+test('buildBlockReasonWithAnswer: NEVER advertises the bypass (v0.48 — one deny taught a 14-grep permanent prefix)', () => {
+  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/storage/', {
+    status: 'hits', text: 'hit', truncated: false,
+  });
+  assert.doesNotMatch(reason, /CODE_GRAPH_NO_BLOCK_GREP/);
+});
+
+test('buildBlockReason: scopes the escape to THIS command only', () => {
+  const reason = buildBlockReason();
+  assert.match(reason, /CODE_GRAPH_NO_BLOCK_GREP=1/);
+  assert.match(reason, /THIS command only/);
+  assert.match(reason, /not a default/);
 });
 
 test('buildBlockReasonWithAnswer: no searchPath → command has no path arg', () => {
@@ -706,9 +722,9 @@ function e2eFixture(stubBody) {
   return { dir, stub };
 }
 
-function runHook(cmd, fixture) {
+function runHook(cmd, fixture, cwdOverride) {
   const res = spawnHook(process.execPath, [pathE2e.join(__dirname, 'pre-grep-guide.js')], {
-    cwd: fixture.dir,
+    cwd: cwdOverride || fixture.dir,
     input: JSON.stringify({ tool_input: { command: cmd } }),
     encoding: 'utf8',
     env: {
@@ -836,4 +852,191 @@ test('e2e: CODE_GRAPH_NO_ANSWER_IN_DENY=1 → static deny even when stub would h
   } finally {
     cleanupFixture(fixture, cmd);
   }
+});
+
+// ── v0.48 subdir-cwd dark fix: resolveProjectRoot / rebaseRelativePaths ──
+// daagu 2026-06-11: the persistent shell `cd backend/` darkened 38/40
+// head-greps for the rest of the night — gate 5 checked process.cwd() only.
+
+const { sanitizeSearchPath } = require('./cg-answer');
+
+test('resolveProjectRoot: index at start dir', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    fsE2e.mkdirSync(pathE2e.join(base, 'proj', '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(base, 'proj', '.code-graph', 'index.db'), '');
+    assert.equal(
+      resolveProjectRoot(pathE2e.join(base, 'proj'), { home: base }),
+      pathE2e.join(base, 'proj'));
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: walks up from nested subdir to the indexed root', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const proj = pathE2e.join(base, 'proj');
+    fsE2e.mkdirSync(pathE2e.join(proj, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(proj, '.code-graph', 'index.db'), '');
+    const deep = pathE2e.join(proj, 'backend', 'app', 'services');
+    fsE2e.mkdirSync(deep, { recursive: true });
+    assert.equal(resolveProjectRoot(deep, { home: base }), proj);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: no index up to $HOME → null (home itself still checked)', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const deep = pathE2e.join(base, 'somewhere', 'deep');
+    fsE2e.mkdirSync(deep, { recursive: true });
+    assert.equal(resolveProjectRoot(deep, { home: base }), null);
+    // home itself holding an index is honored
+    fsE2e.mkdirSync(pathE2e.join(base, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(base, '.code-graph', 'index.db'), '');
+    assert.equal(resolveProjectRoot(deep, { home: base }), base);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('rebaseRelativePaths: daagu shape — bare `app` from backend/ cwd', () => {
+  const exists = (p) => p.endsWith(pathE2e.join('backend', 'app'));
+  const cmd = 'grep -rn "rr_source\\|max_retries" app --include=*.py';
+  const rebased = rebaseRelativePaths(cmd, 'backend', '/proj', exists);
+  assert.equal(rebased, 'grep -rn "rr_source\\|max_retries" backend/app --include=*.py');
+  assert.equal(shouldHint(rebased), true);
+  assert.equal(extractSearchPath(rebased), 'backend/app');
+});
+
+test('rebaseRelativePaths: deep relPrefix, multiple file args', () => {
+  const exists = (p) => p.endsWith('.py');
+  const rel = 'backend/app/services/scheduler/tasks';
+  const cmd = 'grep -n "except Exception" asr_preload.py xuanlun_pro_scan.py';
+  const rebased = rebaseRelativePaths(cmd, rel, '/proj', exists);
+  assert.match(rebased, /backend\/app\/services\/scheduler\/tasks\/asr_preload\.py/);
+  assert.match(rebased, /backend\/app\/services\/scheduler\/tasks\/xuanlun_pro_scan\.py/);
+  assert.equal(shouldHint(rebased), true);
+});
+
+test('rebaseRelativePaths: quoted patterns are never rebased even if a same-named path exists', () => {
+  const exists = () => true; // adversarial: everything "exists"
+  const cmd = 'grep -rn "retry" app';
+  const rebased = rebaseRelativePaths(cmd, 'backend', '/proj', exists);
+  assert.equal(rebased, 'grep -rn "retry" backend/app');
+});
+
+test('rebaseRelativePaths: flags, absolute, traversal, operators untouched', () => {
+  const exists = () => true;
+  const cmd = 'grep -rn "X" /etc/hosts ../up --include=*.py 2>/dev/null';
+  assert.equal(rebaseRelativePaths(cmd, 'backend', '/proj', exists), cmd);
+});
+
+test('rebaseRelativePaths: non-source relPrefix (docs/) → unchanged', () => {
+  const exists = () => true;
+  const cmd = 'grep -rn "X" app';
+  assert.equal(rebaseRelativePaths(cmd, 'docs', '/proj', exists), cmd);
+});
+
+test('rebaseRelativePaths: unquoted pattern word does not exist → untouched', () => {
+  const exists = (p) => p.endsWith('/backend/app');
+  const cmd = 'grep -rn retry_count app';
+  const rebased = rebaseRelativePaths(cmd, 'backend', '/proj', exists);
+  assert.equal(rebased, 'grep -rn retry_count backend/app');
+});
+
+// ── v0.48 bypass visibility: GREP_HEAD bare-prefix + commandHasBypass ──
+
+test('shouldHint: bare KEY=VALUE prefixed grep now matches GREP_HEAD', () => {
+  assert.equal(shouldHint('CODE_GRAPH_NO_BLOCK_GREP=1 grep -rn "fts5_search" src/'), true);
+});
+
+test('extractPatterns: bare KEY=VALUE prefix stripped with the verb', () => {
+  assert.deepEqual(
+    extractPatterns('CODE_GRAPH_NO_BLOCK_GREP=1 grep -rn "split_identifier" src/'),
+    ['split_identifier']);
+});
+
+test('commandHasBypass: =1 prefix detected, other values / absence are not', () => {
+  assert.equal(commandHasBypass('CODE_GRAPH_NO_BLOCK_GREP=1 grep -rn "X" src/'), true);
+  assert.equal(commandHasBypass('FOO=1 CODE_GRAPH_NO_BLOCK_GREP=1 grep "X" src/'), true);
+  assert.equal(commandHasBypass('CODE_GRAPH_NO_BLOCK_GREP=0 grep -rn "X" src/'), false);
+  assert.equal(commandHasBypass('grep -rn "CODE_GRAPH_NO_BLOCK_GREP=1" src/'), false);
+  assert.equal(commandHasBypass('grep -rn "X" src/'), false);
+});
+
+// ── v0.48 replay: the exact command behind the night's only deny ──
+// (answered:false — glob path reached rg literally and exited 1)
+
+test('replay: daagu denied glob command → block + sanitized search path', () => {
+  const cmd = 'grep -rn "async def chat\\|def chat\\|retry\\|rate.limit\\|rate-limit\\|RateLimit\\|429\\|max_retries\\|backoff\\|fallback_model\\|temporarily" backend/app/services/llm_engine/*.py | head -40';
+  assert.equal(shouldHint(cmd), true);
+  assert.equal(shouldBlock(cmd), true);
+  const raw = extractSearchPath(cmd);
+  assert.equal(raw, 'backend/app/services/llm_engine/*.py');
+  assert.equal(sanitizeSearchPath(raw), 'backend/app/services/llm_engine');
+});
+
+// ── v0.48 e2e: hook process spawned exactly as CC does ──
+
+test('e2e: subdir cwd — hook resolves root, rebases path, records at root', () => {
+  const uniq = `sub_dir_fix_${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('backend/app/x.py:1  fn hit()\\n');`);
+  const cmd = `grep -rn "${uniq}\\|max_retries" app`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'backend', 'app'), { recursive: true });
+    const res = runHook(cmd, fixture, pathE2e.join(fixture.dir, 'backend'));
+    const out = JSON.parse(res.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    const recs = fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    assert.match(recs, /"action":"deny"/);
+    // never creates .code-graph in the subdir
+    assert.equal(fsE2e.existsSync(pathE2e.join(fixture.dir, 'backend', '.code-graph')), false);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: bypassed grep is silent but recorded as action:bypass', () => {
+  const uniq = `bypass_vis_${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('never called\\n');`);
+  const cmd = `CODE_GRAPH_NO_BLOCK_GREP=1 grep -rn "${uniq}\\|fts5_search" src/`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    const res = runHook(cmd, fixture);
+    assert.equal(res.stdout, '');
+    const recs = fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    assert.match(recs, /"action":"bypass"/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: glob path arg → answer runs against the glob-truncated dir', () => {
+  const uniq = `GlobTrunc${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('args=' + JSON.stringify(process.argv.slice(2)) + '\\n');`);
+  const cmd = `grep -rn "${uniq}" src/storage/*.rs`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src', 'storage'), { recursive: true });
+    const res = runHook(cmd, fixture);
+    const out = JSON.parse(res.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(out.hookSpecificOutput.permissionDecisionReason,
+      new RegExp(`args=\\["grep","${uniq}","src/storage"\\]`));
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('rebaseRelativePaths: glob token rebases when its glob-truncated dir exists', () => {
+  // daagu shape: shell in backend/, command scopes a glob under it. Without
+  // the truncated probe the token stayed subdir-relative while the answer ran
+  // from the root → rg ENOENT → answered:false (the original night bug).
+  const exists = (p) => p.endsWith(pathE2e.join('backend', 'app', 'services', 'llm_engine'));
+  const cmd = 'grep -rn "def chat\\|max_retries" app/services/llm_engine/*.py';
+  const rebased = rebaseRelativePaths(cmd, 'backend', '/proj', exists);
+  assert.equal(
+    extractSearchPath(rebased), 'backend/app/services/llm_engine/*.py');
+  assert.equal(
+    sanitizeSearchPath(extractSearchPath(rebased)), 'backend/app/services/llm_engine');
 });

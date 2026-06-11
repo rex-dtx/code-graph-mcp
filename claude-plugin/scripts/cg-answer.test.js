@@ -133,3 +133,30 @@ test('truncateAtLine: single oversized line → hard cut', () => {
   assert.equal(truncated, true);
   assert.equal(Buffer.byteLength(text, 'utf8'), 10);
 });
+
+// ── v0.48 sanitizeSearchPath: glob args reach rg literally (no shell) ──
+
+test('sanitizeSearchPath: truncates at first glob segment (daagu denied command)', () => {
+  const { sanitizeSearchPath } = require('./cg-answer');
+  assert.equal(
+    sanitizeSearchPath('backend/app/services/llm_engine/*.py'),
+    'backend/app/services/llm_engine');
+});
+
+test('sanitizeSearchPath: clean path unchanged; leading glob drops scope; falsy → undefined', () => {
+  const { sanitizeSearchPath } = require('./cg-answer');
+  assert.equal(sanitizeSearchPath('src/storage/'), 'src/storage/');
+  assert.equal(sanitizeSearchPath('*.py'), undefined);
+  assert.equal(sanitizeSearchPath('src/**/x.rs'), 'src');
+  assert.equal(sanitizeSearchPath('src/file[1].rs'), 'src');
+  assert.equal(sanitizeSearchPath(''), undefined);
+  assert.equal(sanitizeSearchPath(undefined), undefined);
+});
+
+test('runGrepAnswer: glob searchPath is truncated before spawn (defensive layer)', () => {
+  const r = runGrepAnswer({
+    cwd: stubDir, pattern: 'fts5_search', searchPath: 'src/storage/*.rs', binary: stubBinary(),
+  });
+  assert.equal(r.status, 'hits');
+  assert.match(r.text, /args=\["grep","fts5_search","src\/storage"\]/);
+});

@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.48.0 — fix: grep guard survives `cd` into subdirs; deny stops teaching its own bypass
+
+Field reading of the v0.46 deny→use funnel on a real consumer project (daagu, 4 sessions /
+~3h real coding, 2026-06-11) found the instrument itself mostly dark: of ~98 grep-bearing
+commands the hook engaged with only 3. Four independent causes, all fixed:
+
+- **Subdir-cwd dark (38/40 head-greps)**: the hook's `process.cwd()` follows the
+  persistent shell, so after the model ran `cd backend/`, the `.code-graph/index.db`
+  gate failed silently for the rest of the session. Now `resolveProjectRoot` walks up
+  to the nearest ancestor holding the index (stops at `$HOME`), and bare
+  subdir-relative path args (`app --include=*.py` from `backend/`) are rebased onto
+  the project root with existence-verified probing. Recommendations are always
+  recorded at the root; no `.code-graph` is ever created in subdirs.
+- **Deny no longer advertises its own escape**: the answered deny used to end with
+  "re-run with `CODE_GRAPH_NO_BLOCK_GREP=1` prepended" — one deny taught the model a
+  permanent prefix within 5 seconds (14 subsequent greps that night, including symbol
+  searches). The answered deny now carries no escape line (the results are already
+  there); the static deny scopes it to "THIS command only — a per-command escape,
+  not a default prefix".
+- **Bypassed greps are now visible to the funnel**: `CODE_GRAPH_NO_BLOCK_GREP=1 grep …`
+  (bare KEY=VALUE prefix, exactly what the deny taught) failed the command-head regex
+  and was invisible — not even recorded. The head regex now accepts bare assignment
+  prefixes and a bypassed source-grep records `{action:"bypass"}` then stays silent.
+- **Glob search paths no longer break answer-in-the-deny**: the hook spawns the CLI
+  without a shell, so a literal `backend/…/llm_engine/*.py` reached ripgrep as a
+  nonexistent file → exit 1 → static deny with `answered:false` (the night's only
+  deny failed exactly this way — on a query that should have been the honest
+  no-hits→allow). Glob segments are now truncated (`…/llm_engine/*.py` →
+  `…/llm_engine`) before both the run and the displayed command.
+
+**Opt-out / revert**: unchanged — `CODE_GRAPH_QUIET_HOOKS=1` silences the hook,
+`CODE_GRAPH_NO_BLOCK_GREP=1` downgrades block→hint (now per-command and measured),
+`CODE_GRAPH_NO_ANSWER_IN_DENY=1` restores the static deny, or pin `@sdsrs/code-graph@0.47.1`.
+Rust/SQLite surface untouched (the stats aggregator accepts the new `bypass` action
+generically); no index rebuild needed.
+
 ## v0.47.1 — fix: grep guard now matches absolute paths (it was missing ~97% of real traffic)
 
 The deny/hint tier of `pre-grep-guide.js` only matched **relative** source paths

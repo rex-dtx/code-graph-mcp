@@ -12,7 +12,10 @@
 //   2. Args include an indexed source-tree path (src/ tests/ lib/ scripts/ ...)
 //   3. Not searching only a config/lockfile (Cargo.toml/.gitignore/*.md/*.json)
 //   4. Command doesn't already invoke code-graph-mcp (no double-suggest)
-//   5. .code-graph/index.db exists in CWD
+//   5. .code-graph/index.db exists in CWD or a parent up to $HOME (v0.48: the
+//      hook's cwd follows the persistent shell — after `cd backend/` every
+//      gate used to fail silently for the rest of the session; daagu
+//      2026-06-11 replay: 38/40 head-greps dark to this)
 //   6. Same command-hash not hinted within last 60s (per-command cooldown)
 //
 // BLOCK fires when shouldHint AND (shouldBlock):
@@ -22,19 +25,28 @@
 //   9. Pattern is not a bare marker word (TODO/FIXME/XXX/HACK/WARN/ERROR/NOTE)
 //  10. CODE_GRAPH_NO_BLOCK_GREP != "1" (block escape, independent of QUIET_HOOKS)
 //
+// A `CODE_GRAPH_NO_BLOCK_GREP=1`-prefixed grep that would otherwise hint is
+// recorded as `action:'bypass'` and allowed silently (v0.48) — previously the
+// bare KEY=VALUE prefix failed GREP_HEAD and the escape was invisible to the
+// conversion funnel (daagu 2026-06-11: 14 bypassed greps, 0 recorded).
+//
 // Exits silently otherwise — zero noise for build greps, log filters, config
 // lookups, or the rare legitimate use of raw grep on indexed source.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
-const { runGrepAnswer } = require('./cg-answer');
+const { runGrepAnswer, sanitizeSearchPath } = require('./cg-answer');
 
 // --- Pure logic (testable) ---
 
-const GREP_HEAD = /^\s*(?:env\s+\S+=\S+\s+)*(grep|rg|ag)\b/;
+// v0.48: also match bare `KEY=VALUE grep` prefixes (no `env` verb) — the shape
+// the deny message itself teaches (`CODE_GRAPH_NO_BLOCK_GREP=1 grep …`). With
+// the old `env`-only form those commands failed gate 1 and were invisible.
+const GREP_HEAD = /^\s*(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(grep|rg|ag)\b/;
 // Source-tree prefix list. Expanded v0.27+ Phase C: original `src/tests/lib/...`
 // missed real-world backend conventions where the prefix list term is preceded
 // by something else (`backend/app/...` — `app/` doesn't match because `/` isn't
@@ -99,8 +111,8 @@ const MARKER_ONLY =
 // symbol-shaped target".
 function extractPatterns(cmd) {
   if (!cmd || typeof cmd !== 'string') return [];
-  // Strip leading verb + env prefix
-  const stripped = cmd.replace(/^\s*(?:env\s+\S+=\S+\s+)*(?:grep|rg|ag)\s+/, '');
+  // Strip leading verb + env/assignment prefix (kept in sync with GREP_HEAD)
+  const stripped = cmd.replace(/^\s*(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:grep|rg|ag)\s+/, '');
   // Collect every quoted argument — first one is the pattern in standard grep
   // usage; subsequent ones (e.g. `-e "second"`) are also patterns or filter
   // expressions and worth screening too.
@@ -129,6 +141,69 @@ function normalizeCommandPaths(cmd, cwd) {
   if (!cmd || typeof cmd !== 'string') return cmd;
   if (!cwd || typeof cwd !== 'string' || cwd === '/') return cmd;
   return cmd.split(cwd.endsWith('/') ? cwd : cwd + '/').join('');
+}
+
+// v0.48 — the hook's process.cwd() follows the PERSISTENT shell, not the
+// project root: after the model runs `cd backend/`, every later bare grep used
+// to fail the index.db gate silently for the rest of the session (daagu
+// 2026-06-11: 38/40 head-greps dark). Walk up to the nearest ancestor holding
+// `.code-graph/index.db`; stop at $HOME (checked, not crossed) and fs root.
+function resolveProjectRoot(startDir, opts = {}) {
+  const home = opts.home !== undefined ? opts.home : os.homedir();
+  const exists = opts.exists || fs.existsSync;
+  let dir = path.resolve(startDir || '.');
+  for (;;) {
+    if (exists(path.join(dir, '.code-graph', 'index.db'))) return dir;
+    if (dir === home) return null;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+// v0.48 — companion to resolveProjectRoot: when the shell sits in a subdir,
+// bare relative path args (`app --include=*.py` from backend/) are
+// subdir-relative and never match the root-relative SRC_PATH prefixes. Rebase
+// each candidate token onto the project root; a token only counts as a path
+// when the rebased form EXISTS under the root — quoted patterns, flags,
+// operators, absolute and traversal tokens are never touched. Existence is the
+// workhorse gate: it keeps unquoted pattern words from masquerading as paths
+// (the exact shape that would re-create the answered:false glob failure).
+function rebaseRelativePaths(cmd, relPrefix, rootDir, exists = fs.existsSync) {
+  if (!cmd || typeof cmd !== 'string' || !relPrefix || !rootDir) return cmd;
+  const prefix = relPrefix.split(path.sep).join('/');
+  // Shell sits outside any known source dir (docs/, target/, …) — don't guess.
+  if (!SRC_PATH_TOKEN.test(prefix + '/')) return cmd;
+  let verbSeen = false;
+  return cmd.split(/(\s+)/).map((tok) => {
+    if (!tok || /^\s+$/.test(tok)) return tok;
+    if (!verbSeen) {
+      if (/^(?:env|[A-Za-z_][A-Za-z0-9_]*=\S*)$/.test(tok)) return tok;
+      verbSeen = true; // the verb itself (grep/rg/ag) — never a path
+      return tok;
+    }
+    if (/^["']/.test(tok)) return tok;          // quoted → pattern
+    if (tok.startsWith('-')) return tok;         // flag
+    if (tok.startsWith('/')) return tok;         // absolute (foreign — root strip already ran)
+    if (tok.includes('..')) return tok;          // traversal
+    if (/[|;&<>=\\$`'"]/.test(tok)) return tok;  // operators / redirects / assignments / escapes
+    const candidate = prefix + '/' + tok;
+    // Probe existence on the glob-truncated form: `app/…/llm_engine/*.py`
+    // must still rebase (its dir exists) or the deny-answer would run a
+    // subdir-relative path from the root and fail (answered:false again).
+    const probe = sanitizeSearchPath(candidate);
+    try {
+      if (!probe || !exists(path.join(rootDir, probe))) return tok;
+    } catch { return tok; }
+    return candidate;
+  }).join('');
+}
+
+// v0.48 — bypass detection on the RAW command. The deny message documents
+// `CODE_GRAPH_NO_BLOCK_GREP=1` as a per-command escape; record its use so the
+// conversion funnel can see escape adoption instead of going dark.
+function commandHasBypass(cmd) {
+  return typeof cmd === 'string' && /(?:^|\s)CODE_GRAPH_NO_BLOCK_GREP=1(?:\s|$)/.test(cmd);
 }
 
 // v0.47.0 — pull the first source-tree path token out of the denied command so
@@ -188,14 +263,18 @@ function buildBlockReason() {
     '  code-graph-mcp grep "<pattern>" <path>          # FTS + AST context per hit',
     '  code-graph-mcp ast-search "<pattern>" --type fn # filter by node type',
     '  code-graph-mcp callgraph SYMBOL                 # callers + callees',
-    'For raw-text scans (log/comment/marker), re-run with `CODE_GRAPH_NO_BLOCK_GREP=1` prepended.',
+    'If this specific search truly needs raw-text regex (log/comment scan), prepend',
+    '`CODE_GRAPH_NO_BLOCK_GREP=1` to THIS command only — a per-command escape, not a default prefix.',
   ].join('\n');
 }
 
 // v0.47.0 — deny WITH the answer inline. Hint-only had ~0% transfer and a bare
 // deny still asks the model to initiate a new tool call; embedding the actual
-// results removes that choice entirely. Keep the escape hatch line — raw-text
-// regex (BRE alternation, log scans) remains a legitimate need.
+// results removes that choice entirely.
+// v0.48 — NO escape-hatch line here: the model already has the results, and
+// advertising the bypass taught it a permanent prefix within 5 seconds (daagu
+// 2026-06-11: one deny → 14 bypassed greps). The static deny keeps a scoped
+// escape because there we give no answer.
 function buildBlockReasonWithAnswer(pattern, searchPath, answer) {
   const cmdShown = `code-graph-mcp grep "${pattern}"${searchPath ? ` ${searchPath}` : ''}`;
   const lines = [
@@ -208,7 +287,6 @@ function buildBlockReasonWithAnswer(pattern, searchPath, answer) {
   }
   lines.push(
     'Each hit shows its containing fn/module — use these results directly instead of re-running the search.',
-    'For raw-text regex (alternation, log/comment scans), re-run with `CODE_GRAPH_NO_BLOCK_GREP=1` prepended.',
   );
   return lines.join('\n');
 }
@@ -245,9 +323,11 @@ function isAnswerDisabled(env = process.env) {
 
 function runMain() {
   if (isSilenced()) return;
-  const cwd = process.cwd();
-  const dbPath = path.join(cwd, '.code-graph', 'index.db');
-  if (!fs.existsSync(dbPath)) return;  // no index — no hint
+  // v0.48 — process.cwd() follows the persistent shell; resolve the project
+  // root by walking up so `cd backend/` no longer darkens the whole session.
+  const shellCwd = process.cwd();
+  const root = resolveProjectRoot(shellCwd);
+  if (root === null) return;  // no index anywhere up to $HOME — no hint
 
   let input;
   try {
@@ -258,11 +338,22 @@ function runMain() {
   } catch { return; }
 
   const rawCmd = (input.tool_input && input.tool_input.command) || '';
-  // v0.47.1 — match against the cwd-stripped form so absolute paths under the
-  // project root behave exactly like their relative spelling. Cooldown stays
-  // keyed on the raw command (what Claude actually sent).
-  const cmd = normalizeCommandPaths(rawCmd, cwd);
+  // v0.47.1 — match against the root-stripped form so absolute paths under the
+  // project root behave exactly like their relative spelling. v0.48 — then
+  // rebase bare subdir-relative tokens onto the root. Cooldown stays keyed on
+  // the raw command (what Claude actually sent).
+  let cmd = normalizeCommandPaths(rawCmd, root);
+  const relPrefix = path.relative(root, shellCwd);
+  if (relPrefix) cmd = rebaseRelativePaths(cmd, relPrefix, root);
   if (!shouldHint(cmd)) return;
+
+  // v0.48 — deliberate escape: record it (funnel visibility) and stay silent.
+  // Before GREP_HEAD accepted bare KEY=VALUE prefixes these were invisible.
+  if (commandHasBypass(rawCmd)) {
+    recordRecommendation(root, { hook: 'grep', action: 'bypass' });
+    return;
+  }
+
   if (isOnCooldown(rawCmd)) return;
 
   markCooldown(rawCmd);
@@ -274,12 +365,15 @@ function runMain() {
     // (regex-dialect differences mean 0 hits ≠ proof of absence).
     let answer = { status: 'unavailable' };
     const pattern = pickBlockPattern(cmd);
+    // v0.48 — glob-truncated once, shared by the run and the deny message
+    // (a literal `dir/*.py` argv made rg exit 1 → answered:false static deny).
+    const searchPath = sanitizeSearchPath(extractSearchPath(cmd));
     if (!isAnswerDisabled() && pattern) {
-      answer = runGrepAnswer({ cwd, pattern, searchPath: extractSearchPath(cmd) });
+      answer = runGrepAnswer({ cwd: root, pattern, searchPath });
     }
 
     if (answer.status === 'no-hits') {
-      recordRecommendation(cwd, { hook: 'grep', action: 'hint', fallthrough: 'no-hits' });
+      recordRecommendation(root, { hook: 'grep', action: 'hint', fallthrough: 'no-hits' });
       process.stdout.write(buildNoHitsFyi(pattern) + '\n');
       return;
     }
@@ -289,7 +383,7 @@ function runMain() {
     // ignored by Claude Code — the grep ran anyway. The hookSpecificOutput form
     // is the documented modern path. Exit 0 — this is a routing decision, not
     // a hook failure (exit 2 would mark the tool call as "hook errored").
-    recordRecommendation(cwd, {
+    recordRecommendation(root, {
       hook: 'grep', action: 'deny', answered: answer.status === 'hits',
     });
     process.stdout.write(JSON.stringify({
@@ -297,14 +391,14 @@ function runMain() {
         hookEventName: 'PreToolUse',
         permissionDecision: 'deny',
         permissionDecisionReason: answer.status === 'hits'
-          ? buildBlockReasonWithAnswer(pattern, extractSearchPath(cmd), answer)
+          ? buildBlockReasonWithAnswer(pattern, searchPath, answer)
           : buildBlockReason(),
       },
     }) + '\n');
     return;
   }
 
-  recordRecommendation(cwd, { hook: 'grep', action: 'hint' });
+  recordRecommendation(root, { hook: 'grep', action: 'hint' });
   process.stdout.write(buildHint() + '\n');
 }
 
@@ -318,6 +412,9 @@ module.exports = {
   extractPatterns,    // v0.32.1 — exposed for tests
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix
+  resolveProjectRoot,    // v0.48 — subdir-cwd dark fix
+  rebaseRelativePaths,   // v0.48 — subdir-cwd dark fix
+  commandHasBypass,      // v0.48 — bypass funnel visibility
   pickBlockPattern,
   buildHint,
   buildBlockReason,

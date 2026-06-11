@@ -49,6 +49,24 @@ function truncateAtLine(text, maxBytes) {
 }
 
 /**
+ * v0.48 — drop glob segments from a search path. The hook extracts path tokens
+ * verbatim from the denied command, and spawnSync runs WITHOUT a shell, so a
+ * literal `backend/…/llm_engine/*.py` reaches rg as a nonexistent file →
+ * exit 1 → `unavailable` → static deny with no answer (daagu 2026-06-11: the
+ * night's only deny failed exactly this way). Truncate at the first segment
+ * containing a glob metacharacter; widening the scope to the parent dir is
+ * always safe. A leading glob (`*.py`) drops the scope entirely (repo-wide).
+ */
+function sanitizeSearchPath(searchPath) {
+  if (!searchPath || typeof searchPath !== 'string') return undefined;
+  const segs = searchPath.split('/');
+  const i = segs.findIndex((s) => /[*?[\]{}]/.test(s));
+  if (i === -1) return searchPath;
+  const kept = segs.slice(0, i).join('/');
+  return kept || undefined;
+}
+
+/**
  * Run `code-graph-mcp grep <pattern> [searchPath]` synchronously.
  *
  * @param {object} opts
@@ -81,8 +99,11 @@ function runGrepAnswer(opts = {}) {
     }
     if (!binary) return { status: 'unavailable' };
 
+    // Defensive re-sanitize: callers should pass a clean path, but a glob
+    // reaching argv is a guaranteed nonzero exit (see sanitizeSearchPath).
+    const scope = sanitizeSearchPath(searchPath);
     const args = ['grep', pattern];
-    if (searchPath) args.push(searchPath);
+    if (scope) args.push(scope);
     const res = spawnSync(binary, args, {
       cwd,
       timeout: timeoutMs,
@@ -104,4 +125,4 @@ function runGrepAnswer(opts = {}) {
   }
 }
 
-module.exports = { runGrepAnswer, truncateAtLine };
+module.exports = { runGrepAnswer, truncateAtLine, sanitizeSearchPath };
