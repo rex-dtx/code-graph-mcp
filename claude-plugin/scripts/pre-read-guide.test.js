@@ -8,7 +8,8 @@ const crypto = require('crypto');
 
 const {
   isSourceFile, dirOf, recordRead, shouldHint, markHint,
-  buildHint, isSilenced,
+  buildHint, buildHintWithAnswer, isSilenced, isAnswerDisabled,
+  trackReadAndMaybeHint,
   FANOUT_THRESHOLD, COOLDOWN_MS, STATE_TTL_MS,
   loadState, saveState, statePath,
 } = require('./pre-read-guide');
@@ -242,4 +243,61 @@ test('flow: 5 reads to same dir → hint, 6th read same dir → no hint (cooldow
   // Read 6 within cooldown: no hint
   recordRead(s, 'src/foo', 1005);
   assert.equal(shouldHint(s, 'src/foo', 1005), false);
+});
+
+// ── v0.49: answer-in-hint + shared tracking core ─────────────────────
+
+test('buildHintWithAnswer: embeds overview text and truncation pointer', () => {
+  const out = buildHintWithAnswer('src/storage', { text: 'Module src/storage\n  conn (57 callers)', truncated: true });
+  assert.match(out, /^\[code-graph\] 5\+ Reads into src\/storage\//);
+  assert.match(out, /conn \(57 callers\)/);
+  assert.match(out, /truncated — `code-graph-mcp overview src\/storage\/`/);
+});
+
+test('isAnswerDisabled: CODE_GRAPH_NO_ANSWER_IN_DENY=1 → advice-only hints', () => {
+  assert.equal(isAnswerDisabled({ CODE_GRAPH_NO_ANSWER_IN_DENY: '1' }), true);
+  assert.equal(isAnswerDisabled({}), false);
+});
+
+test('trackReadAndMaybeHint: fires on 5th read with stubbed overview answer', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-track-'));
+  // Stub CLI: prints a fake overview (hook resolves binary via _CG_ANSWER_BINARY).
+  const stub = path.join(root, 'stub.js');
+  fs.writeFileSync(stub, '#!/usr/bin/env node\nprocess.stdout.write("Module overview stub: 3 symbols\\n");');
+  fs.chmodSync(stub, 0o755);
+  const oldEnv = process.env._CG_ANSWER_BINARY;
+  process.env._CG_ANSWER_BINARY = stub;
+  // .code-graph present so recordRecommendation appends.
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+
+  const written = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { written.push(String(chunk)); return true; };
+  try {
+    let fired = false;
+    for (let i = 0; i < 5; i++) {
+      fired = trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs');
+    }
+    assert.equal(fired, true, '5th same-dir read must fire');
+    assert.match(written.join(''), /Module overview stub/, 'hint must EMBED the overview answer');
+    const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    assert.match(recs, /"hook":"read"/);
+    assert.match(recs, /"answered":true/);
+  } finally {
+    process.stdout.write = origWrite;
+    if (oldEnv === undefined) delete process.env._CG_ANSWER_BINARY;
+    else process.env._CG_ANSWER_BINARY = oldEnv;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('trackReadAndMaybeHint: top-level and outside-root paths never fire', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-skip-'));
+  try {
+    assert.equal(trackReadAndMaybeHint(root, 'main.rs'), false);
+    assert.equal(trackReadAndMaybeHint(root, '../other/file.rs'), false);
+    assert.equal(trackReadAndMaybeHint(root, '/abs/file.rs'), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

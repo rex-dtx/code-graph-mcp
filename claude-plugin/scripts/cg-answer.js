@@ -176,4 +176,47 @@ function runShowAnswer(opts = {}) {
   }
 }
 
-module.exports = { runGrepAnswer, runShowAnswer, truncateAtLine, sanitizeSearchPath };
+/**
+ * v0.49 — Run `code-graph-mcp overview <dir>` for the read-fanout hint, so the
+ * hint DELIVERS the module map instead of advising a tool call (hints measured
+ * 0/40 transfer on 2026-06-12; delivered answers satisfied 5/5 in place).
+ */
+function runOverviewAnswer(opts = {}) {
+  const {
+    cwd,
+    dir,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    maxBytes = DEFAULT_MAX_BYTES,
+  } = opts;
+  try {
+    if (!dir || typeof dir !== 'string' || dir.length > 300) {
+      return { status: 'unavailable' };
+    }
+    let binary = opts.binary;
+    if (binary === undefined) {
+      binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
+    }
+    if (!binary) return { status: 'unavailable' };
+    const res = spawnSync(binary, ['overview', dir], {
+      cwd,
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
+    });
+    if (res.error || res.signal || res.status !== 0) {
+      return { status: 'unavailable' };
+    }
+    const out = (res.stdout || '').trim();
+    if (!out || out.startsWith(NO_MATCH_PREFIX)) return { status: 'no-hits' };
+    const { text, truncated } = truncateAtLine(out, maxBytes);
+    return { status: 'hits', text, truncated };
+  } catch {
+    return { status: 'unavailable' };
+  }
+}
+
+module.exports = {
+  runGrepAnswer, runShowAnswer, runOverviewAnswer, truncateAtLine, sanitizeSearchPath,
+};

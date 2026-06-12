@@ -27,6 +27,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
+const { resolveProjectRoot } = require('./project-root');
+const { runOverviewAnswer } = require('./cg-answer');
 
 // --- Configuration ---
 
@@ -119,50 +121,87 @@ function buildHint(dir) {
   return `[code-graph] 5+ Reads into ${dir}/ — \`code-graph-mcp overview ${dir}/\` gives symbols+callers in one call (MCP: \`module_overview path=${dir}\`). Skip if you need raw file contents.`;
 }
 
+// v0.49 — the hint DELIVERS the overview instead of advising a tool call
+// (advice measured 0/40 transfer on 2026-06-12; delivered answers satisfied
+// 5/5 in place). Falls back to the advice-only line when the CLI is
+// unavailable or the dir has no overview.
+function buildHintWithAnswer(dir, answer) {
+  const lines = [
+    `[code-graph] 5+ Reads into ${dir}/ — module overview from the AST index (saves the remaining file-by-file reads):`,
+    answer.text,
+  ];
+  if (answer.truncated) {
+    lines.push(`(truncated — \`code-graph-mcp overview ${dir}/\` for the full map)`);
+  }
+  return lines.join('\n');
+}
+
 function isSilenced(env = process.env) {
   return env.CODE_GRAPH_QUIET_HOOKS === '1';
 }
 
-// --- Main execution ---
+// v0.49 — answer tier opt-out, shared name with the grep hook's deny-answer
+// opt-out: =1 restores advice-only hints (no CLI run inside the hook).
+function isAnswerDisabled(env = process.env) {
+  return env.CODE_GRAPH_NO_ANSWER_IN_DENY === '1';
+}
 
-function runMain() {
-  if (isSilenced()) return;
-  const cwd = process.cwd();
-  const dbPath = path.join(cwd, '.code-graph', 'index.db');
-  if (!fs.existsSync(dbPath)) return;
+// --- Shared tracking core (also driven by pre-grep-guide's sed-range path) ---
 
-  let input;
-  try {
-    input = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
-  } catch { return; }
-
-  const filePath = (input.tool_input && input.tool_input.file_path) || '';
-  if (!isSourceFile(filePath)) return;
-
-  // Normalize to a cwd-relative path. If the file is outside cwd, skip —
-  // a hint pointing at an unrelated dir helps no one.
-  let rel;
-  try {
-    rel = path.relative(cwd, filePath);
-  } catch { return; }
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return;
-
+/// Record one read of `rel` (project-root-relative source path) and fire the
+/// fanout hint when the threshold crosses. Emits to stdout + records the
+/// recommendation. Returns true when a hint fired.
+function trackReadAndMaybeHint(root, rel, now = Date.now()) {
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
   const dir = path.dirname(rel);
-  if (!dir || dir === '.' || dir === '') return;  // top-level file: not fanout
+  if (!dir || dir === '.' || dir === '') return false;  // top-level file: not fanout
 
-  const now = Date.now();
-  const state = loadState(cwd, now);
+  const state = loadState(root, now);
   recordRead(state, dir, now);
   let fired = false;
   if (shouldHint(state, dir, now)) {
     markHint(state, dir, now);
     fired = true;
   }
-  saveState(cwd, state);
-  if (fired) {
-    recordRecommendation(cwd, { hook: 'read', action: 'hint' });
-    process.stdout.write(buildHint(dir) + '\n');
+  saveState(root, state);
+  if (!fired) return false;
+
+  let answer = { status: 'unavailable' };
+  if (!isAnswerDisabled()) {
+    answer = runOverviewAnswer({ cwd: root, dir });
   }
+  const answered = answer.status === 'hits';
+  recordRecommendation(root, { hook: 'read', action: 'hint', answered });
+  process.stdout.write((answered ? buildHintWithAnswer(dir, answer) : buildHint(dir)) + '\n');
+  return true;
+}
+
+// --- Main execution ---
+
+function runMain() {
+  if (isSilenced()) return;
+  // v0.49 — walk up from the shell cwd (subdir-cwd fix; the read hook had
+  // recorded NOTHING in daagu history because sessions sat in backend/).
+  const root = resolveProjectRoot(process.cwd());
+  if (root === null) return;
+
+  let input;
+  try {
+    // fd 0, not '/dev/stdin': the path form fails ENXIO on socketpair stdin.
+    input = JSON.parse(fs.readFileSync(0, 'utf8'));
+  } catch { return; }
+
+  const filePath = (input.tool_input && input.tool_input.file_path) || '';
+  if (!isSourceFile(filePath)) return;
+
+  // Normalize to a root-relative path. Read sends absolute paths; files
+  // outside the project (other repos, ~/.claude/) stay silent.
+  let rel;
+  try {
+    rel = path.relative(root, filePath);
+  } catch { return; }
+
+  trackReadAndMaybeHint(root, rel);
 }
 
 if (require.main === module) {
@@ -172,6 +211,7 @@ if (require.main === module) {
 module.exports = {
   isSourceFile, dirOf, cwdHash, statePath,
   loadState, saveState, recordRead, shouldHint, markHint,
-  buildHint, isSilenced,
+  buildHint, buildHintWithAnswer, isSilenced, isAnswerDisabled,
+  trackReadAndMaybeHint,   // v0.49 — shared with pre-grep-guide's sed-range path
   FANOUT_THRESHOLD, COOLDOWN_MS, STATE_TTL_MS, SRC_EXT,
 };

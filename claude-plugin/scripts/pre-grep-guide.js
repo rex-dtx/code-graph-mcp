@@ -37,7 +37,6 @@
 // lookups, or the rare legitimate use of raw grep on indexed source.
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
@@ -178,23 +177,9 @@ function normalizeCommandPaths(cmd, cwd) {
   return cmd.split(cwd.endsWith('/') ? cwd : cwd + '/').join('');
 }
 
-// v0.48 — the hook's process.cwd() follows the PERSISTENT shell, not the
-// project root: after the model runs `cd backend/`, every later bare grep used
-// to fail the index.db gate silently for the rest of the session (daagu
-// 2026-06-11: 38/40 head-greps dark). Walk up to the nearest ancestor holding
-// `.code-graph/index.db`; stop at $HOME (checked, not crossed) and fs root.
-function resolveProjectRoot(startDir, opts = {}) {
-  const home = opts.home !== undefined ? opts.home : os.homedir();
-  const exists = opts.exists || fs.existsSync;
-  let dir = path.resolve(startDir || '.');
-  for (;;) {
-    if (exists(path.join(dir, '.code-graph', 'index.db'))) return dir;
-    if (dir === home) return null;
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
-}
+// v0.48 — subdir-cwd fix; v0.49 — extracted to project-root.js so the read
+// hook shares it. Re-exported below for test/back-compat.
+const { resolveProjectRoot } = require('./project-root');
 
 // v0.48 — companion to resolveProjectRoot: when the shell sits in a subdir,
 // bare relative path args (`app --include=*.py` from backend/) are
@@ -234,11 +219,27 @@ function rebaseRelativePaths(cmd, relPrefix, rootDir, exists = fs.existsSync) {
   }).join('');
 }
 
-// v0.48 — bypass detection on the RAW command. The deny message documents
-// `CODE_GRAPH_NO_BLOCK_GREP=1` as a per-command escape; record its use so the
-// conversion funnel can see escape adoption instead of going dark.
+// v0.48 — bypass detection on the RAW command. (The deny copy stopped teaching
+// the escape in v0.49, but models that already know it — or learned it from a
+// session summary — must stay visible to the funnel.)
 function commandHasBypass(cmd) {
   return typeof cmd === 'string' && /(?:^|\s)CODE_GRAPH_NO_BLOCK_GREP=1(?:\s|$)/.test(cmd);
+}
+
+// v0.49 — `sed -n X,Yp file.py` is a Read the Read hook can't see; the
+// 2026-06-12 night used it heavily for structure exploration (four sed-range
+// reads of stock_picker/ in 3 min). Extract targets so they count toward the
+// shared read-fanout state.
+const SED_RANGE = /(?:^|[|;&]\s*)sed\s+-n\s+(?:['"]\d+,\d+p['"]|\d+,\d+p)\s+("[^"]+"|'[^']+'|[^\s;|&]+)/g;
+
+function extractSedReadTargets(cmd) {
+  if (!cmd || typeof cmd !== 'string' || cmd.length > 2000) return [];
+  const out = [];
+  for (const m of cmd.matchAll(SED_RANGE)) {
+    const tok = m[1].replace(/^["']|["']$/g, '');
+    if (tok && !out.includes(tok)) out.push(tok);
+  }
+  return out;
 }
 
 // v0.47.0 — pull the first source-tree path token out of the denied command so
@@ -406,6 +407,24 @@ function runMain() {
   } catch { return; }
 
   const rawCmd = (input.tool_input && input.tool_input.command) || '';
+
+  // v0.49 — sed-range reads count toward the read-fanout state (the Read hook
+  // never sees Bash-side file reads). A fired fanout hint already delivered an
+  // overview — skip grep hinting for this command to avoid double output.
+  const sedTargets = extractSedReadTargets(rawCmd);
+  if (sedTargets.length > 0) {
+    const readGuide = require('./pre-read-guide');
+    let fanoutFired = false;
+    for (const t of sedTargets) {
+      if (!readGuide.isSourceFile(t)) continue;
+      const abs = path.isAbsolute(t) ? t : path.resolve(shellCwd, t);
+      if (readGuide.trackReadAndMaybeHint(root, path.relative(root, abs))) {
+        fanoutFired = true;
+      }
+    }
+    if (fanoutFired) return;
+  }
+
   // v0.47.1 — match against the root-stripped form so absolute paths under the
   // project root behave exactly like their relative spelling. v0.48 — then
   // rebase bare subdir-relative tokens onto the root. Cooldown stays keyed on
@@ -498,6 +517,7 @@ module.exports = {
   extractDeclSymbols,    // v0.49 — show-mode symbol extraction
   translateBreToRg,      // v0.49 — BRE→rust-regex dialect bridge
   buildShowDenyReason,   // v0.49 — show-mode deny copy
+  extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
   extractPatterns,    // v0.32.1 — exposed for tests
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix

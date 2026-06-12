@@ -8,6 +8,7 @@ const {
   extractDeclSymbols,
   translateBreToRg,
   buildShowDenyReason,
+  extractSedReadTargets,
   extractPatterns,
   extractSearchPath,
   normalizeCommandPaths,
@@ -1087,4 +1088,31 @@ test('rebaseRelativePaths: glob token rebases when its glob-truncated dir exists
     extractSearchPath(rebased), 'backend/app/services/llm_engine/*.py');
   assert.equal(
     sanitizeSearchPath(extractSearchPath(rebased)), 'backend/app/services/llm_engine');
+});
+
+// ── extractSedReadTargets (v0.49) — sed-range reads feed read-fanout ──
+
+test('extractSedReadTargets: plain and quoted ranges, abs and rel paths', () => {
+  assert.deepEqual(
+    extractSedReadTargets('sed -n 620,700p /abs/proj/backend/app/services/market.py'),
+    ['/abs/proj/backend/app/services/market.py']);
+  assert.deepEqual(
+    extractSedReadTargets("sed -n '230,310p' backend/app/services/tushare.py"),
+    ['backend/app/services/tushare.py']);
+});
+
+test('extractSedReadTargets: multiple segments in one command, deduped', () => {
+  const cmd = 'sed -n 60,200p src/a.py; echo ===; sed -n 250,300p src/b.py && sed -n 250,300p src/b.py';
+  assert.deepEqual(extractSedReadTargets(cmd), ['src/a.py', 'src/b.py']);
+});
+
+test('extractSedReadTargets: non-range sed (substitution) ignored', () => {
+  assert.deepEqual(extractSedReadTargets("sed -i 's/a/b/' src/a.py"), []);
+  assert.deepEqual(extractSedReadTargets('sed -n /pattern/p src/a.py'), []);
+});
+
+test('extractSedReadTargets: pipeline sed after grep still extracted', () => {
+  assert.deepEqual(
+    extractSedReadTargets('grep -n "x" src/a.py | sed -n 1,5p src/b.py'),
+    ['src/b.py']);
 });
