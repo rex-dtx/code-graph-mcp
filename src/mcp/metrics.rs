@@ -175,6 +175,19 @@ impl SessionMetrics {
         self.tools.is_empty()
     }
 
+    /// True if any recommendation event fired inside this session's window.
+    /// Lets `flush_metrics` write a usage record for 0-tool-call sessions that
+    /// still saw deny/hint/bypass/cli-use traffic — without this, the funnel
+    /// denominator only ever contains sessions that already converted (the
+    /// 2026-06-12 daagu night: 53 recs, 0 MCP calls, zero usage records).
+    pub fn has_recs_in_window(&self, cg_dir: &Path) -> bool {
+        let Ok(content) = std::fs::read_to_string(cg_dir.join("recommendations.jsonl")) else {
+            return false;
+        };
+        let c = count_recs_in_window(&content, &self.started_at);
+        c.deny > 0 || c.hint > 0 || c.cli_use > 0 || c.bypass > 0
+    }
+
     /// Build the one-line JSON record for this session. Separated from `flush`
     /// so the `dogfood` tagging + field shape are unit-testable without env/FS
     /// races. `dogfood=true` segregates dev self-test traffic from real Claude
@@ -243,9 +256,18 @@ impl SessionMetrics {
         // only-when-non-zero: older readers ignore it, success lines stay compact.
         if let Some(dir) = usage_path.parent() {
             if let Ok(content) = std::fs::read_to_string(dir.join("recommendations.jsonl")) {
-                let (deny, hint) = count_recs_in_window(&content, &self.started_at);
-                if deny > 0 || hint > 0 {
-                    record["recs"] = serde_json::json!({ "deny": deny, "hint": hint });
+                let c = count_recs_in_window(&content, &self.started_at);
+                if c.deny > 0 || c.hint > 0 || c.cli_use > 0 || c.bypass > 0 {
+                    // deny/hint always present (v0.46 shape); cli_use/bypass
+                    // additive, emitted only when non-zero.
+                    let mut recs = serde_json::json!({ "deny": c.deny, "hint": c.hint });
+                    if c.cli_use > 0 {
+                        recs["cli_use"] = serde_json::json!(c.cli_use);
+                    }
+                    if c.bypass > 0 {
+                        recs["bypass"] = serde_json::json!(c.bypass);
+                    }
+                    record["recs"] = recs;
                 }
             }
         }
@@ -305,13 +327,25 @@ impl SessionMetrics {
     }
 }
 
-/// Count PreToolUse recommendation events (`recommendations.jsonl` content) whose
-/// `ts` falls inside the current session window `[started_at, ∞)`. Returns
-/// `(deny, hint)`. Pure: ISO-8601 UTC strings compare lexicographically at second
-/// granularity (a sub-second boundary event may be off by one — accepted per spec).
-pub(crate) fn count_recs_in_window(rec_content: &str, started_at: &str) -> (u64, u64) {
-    let mut deny = 0u64;
-    let mut hint = 0u64;
+/// Per-window recommendation-event counts (see `count_recs_in_window`).
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct RecWindowCounts {
+    pub(crate) deny: u64,
+    pub(crate) hint: u64,
+    /// Model-initiated `code-graph-mcp <query>` runs (action:"use", recorded by
+    /// the CLI itself; hook-internal answer runs set CODE_GRAPH_INTERNAL=1 and
+    /// are never recorded).
+    pub(crate) cli_use: u64,
+    pub(crate) bypass: u64,
+}
+
+/// Count recommendation events (`recommendations.jsonl` content) whose `ts`
+/// falls inside the current session window `[started_at, ∞)`. Pure: ISO-8601
+/// UTC strings compare lexicographically at second granularity (a sub-second
+/// boundary event may be off by one — accepted per spec). Unknown actions are
+/// ignored so future hook vocabularies stay additive.
+pub(crate) fn count_recs_in_window(rec_content: &str, started_at: &str) -> RecWindowCounts {
+    let mut c = RecWindowCounts::default();
     for line in rec_content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -325,16 +359,19 @@ pub(crate) fn count_recs_in_window(rec_content: &str, started_at: &str) -> (u64,
             continue;
         }
         match v.get("action").and_then(|a| a.as_str()) {
-            Some("deny") => deny += 1,
-            Some("hint") => hint += 1,
+            Some("deny") => c.deny += 1,
+            Some("hint") => c.hint += 1,
+            Some("use") => c.cli_use += 1,
+            Some("bypass") => c.bypass += 1,
             _ => {}
         }
     }
-    (deny, hint)
+    c
 }
 
 /// Generate an ISO 8601 timestamp from SystemTime (no chrono dependency).
-fn iso8601_now() -> String {
+/// pub(crate): also stamps CLI `use` records in `cli::record_cli_use`.
+pub(crate) fn iso8601_now() -> String {
     use std::time::SystemTime;
     let duration = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -396,16 +433,45 @@ mod tests {
 {\"ts\":\"2026-06-10T01:00:05Z\",\"hook\":\"read\",\"action\":\"hint\"}
 {\"ts\":\"2026-06-10T01:00:09Z\",\"hook\":\"grep\",\"action\":\"hint\"}
 not json
+{\"ts\":\"2026-06-10T01:30:00Z\",\"hook\":\"cli\",\"action\":\"use\",\"cmd\":\"callgraph\"}
+{\"ts\":\"2026-06-10T01:31:00Z\",\"hook\":\"grep\",\"action\":\"bypass\"}
 {\"ts\":\"2026-06-10T02:00:00Z\",\"hook\":\"grep\",\"action\":\"deny\"}
 ";
-        // Window starts at 01:00:00 → the 00:00:00 deny is excluded; 2 denies + 2 hints remain.
-        let (deny, hint) = count_recs_in_window(content, "2026-06-10T01:00:00Z");
-        assert_eq!((deny, hint), (2, 2), "in-window deny/hint count, pre-window excluded, malformed skipped");
+        // Window starts at 01:00:00 → the 00:00:00 deny is excluded.
+        let c = count_recs_in_window(content, "2026-06-10T01:00:00Z");
+        assert_eq!(
+            c,
+            RecWindowCounts { deny: 2, hint: 2, cli_use: 1, bypass: 1 },
+            "in-window counts per action, pre-window excluded, malformed skipped"
+        );
 
         // Window after everything → nothing in range.
-        assert_eq!(count_recs_in_window(content, "2026-06-10T03:00:00Z"), (0, 0));
+        assert_eq!(count_recs_in_window(content, "2026-06-10T03:00:00Z"), RecWindowCounts::default());
         // Empty content → zero, no panic.
-        assert_eq!(count_recs_in_window("", "2026-06-10T01:00:00Z"), (0, 0));
+        assert_eq!(count_recs_in_window("", "2026-06-10T01:00:00Z"), RecWindowCounts::default());
+    }
+
+    #[test]
+    fn test_has_recs_in_window_gates_empty_session_flush() {
+        let tmp = std::env::temp_dir().join(format!("cg-recs-window-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let m = SessionMetrics::new();
+        // No recommendations.jsonl at all → false.
+        assert!(!m.has_recs_in_window(&tmp));
+        // A rec stamped AFTER session start (started_at captured at new()) → true.
+        let future_ts = "2999-01-01T00:00:00Z";
+        std::fs::write(
+            tmp.join("recommendations.jsonl"),
+            format!("{{\"ts\":\"{}\",\"hook\":\"grep\",\"action\":\"deny\"}}\n", future_ts),
+        ).unwrap();
+        assert!(m.has_recs_in_window(&tmp));
+        // Only pre-window recs → false.
+        std::fs::write(
+            tmp.join("recommendations.jsonl"),
+            "{\"ts\":\"2000-01-01T00:00:00Z\",\"hook\":\"grep\",\"action\":\"deny\"}\n",
+        ).unwrap();
+        assert!(!m.has_recs_in_window(&tmp));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

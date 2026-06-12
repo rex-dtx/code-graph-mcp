@@ -58,6 +58,19 @@ test('runGrepAnswer: passes grep subcommand, pattern and path as argv', () => {
   assert.match(r.text, /args=\["grep","fts5_search","src\/storage\/"\]/);
 });
 
+test('runGrepAnswer: child env carries CODE_GRAPH_INTERNAL=1 (not a funnel conversion)', () => {
+  // Stub variant that echoes the marker back in its output.
+  const envStub = path.join(stubDir, 'cg-env-stub.js');
+  fs.writeFileSync(envStub, `#!/usr/bin/env node
+process.stdout.write('internal=' + (process.env.CODE_GRAPH_INTERNAL || '') + '\\n');
+`);
+  fs.chmodSync(envStub, 0o755);
+  const r = runGrepAnswer({ cwd: stubDir, pattern: 'whatever', binary: envStub });
+  assert.equal(r.status, 'hits');
+  assert.match(r.text, /internal=1/,
+    'hook-internal CLI runs must be marked so record_cli_use skips them');
+});
+
 test('runGrepAnswer: omits path argv when no searchPath', () => {
   const r = runGrepAnswer({ cwd: stubDir, pattern: 'fts5_search', binary: stubBinary() });
   assert.match(r.text, /args=\["grep","fts5_search"\]/);

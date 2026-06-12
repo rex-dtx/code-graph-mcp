@@ -20,6 +20,15 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(|s| s.as_str());
 
+    // Funnel visibility: a model-initiated CLI query IS the conversion the deny
+    // hook works toward — record it (best-effort, never creates .code-graph/;
+    // hook-internal answer runs carry CODE_GRAPH_INTERNAL=1 and are skipped).
+    if let Some(cmd) = subcommand.and_then(code_graph_mcp::cli::canonical_query_cmd) {
+        if let Ok(root) = code_graph_mcp::cli::resolve_project_root() {
+            code_graph_mcp::cli::record_cli_use(&root, cmd);
+        }
+    }
+
     match subcommand {
         Some("serve") | None => run_serve(),
         Some("--help" | "-h" | "help") => {

@@ -110,6 +110,9 @@ function runGrepAnswer(opts = {}) {
       encoding: 'utf8',
       maxBuffer: 4 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'ignore'],
+      // Hook-internal run: a delivered answer, not a model-initiated conversion.
+      // The CLI skips its recommendations.jsonl `use` record when this is set.
+      env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
     });
     if (res.error || res.signal || res.status !== 0) {
       return { status: 'unavailable' };

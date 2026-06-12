@@ -477,17 +477,21 @@ impl McpServer {
     }
 
     /// Flush aggregated session metrics to .code-graph/usage.jsonl.
-    /// Called once at server shutdown (EOF). Skips if no tool calls were made.
+    /// Called once at server shutdown (EOF). Skips only when the session had
+    /// neither tool calls nor in-window recommendation events — a 0-tool-call
+    /// session that saw deny/hint/bypass/cli-use traffic still writes, so the
+    /// deny→use funnel denominator includes non-converting sessions (without
+    /// this, 0% conversion was structurally unobservable).
     /// Also releases the index lock if this instance is the primary.
     pub fn flush_metrics(&self) {
         if let Some(ref root) = self.project_root {
             let metrics = lock_or_recover(&self.metrics, "metrics");
-            if !metrics.is_empty() {
-                let usage_path = root.join(CODE_GRAPH_DIR).join("usage.jsonl");
-                metrics.flush(&usage_path, env!("CARGO_PKG_VERSION"));
+            let cg_dir = root.join(CODE_GRAPH_DIR);
+            if !metrics.is_empty() || metrics.has_recs_in_window(&cg_dir) {
+                metrics.flush(&cg_dir.join("usage.jsonl"), env!("CARGO_PKG_VERSION"));
             }
             if self.is_primary {
-                release_index_lock(&root.join(CODE_GRAPH_DIR));
+                release_index_lock(&cg_dir);
             }
         }
     }

@@ -744,6 +744,59 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     Ok(())
 }
 
+/// Canonical name for a CLI *query* subcommand (incl. MCP-name aliases), or
+/// None for housekeeping (serve/index/stats/doctor/...). Drives `record_cli_use`:
+/// only code-understanding queries count as funnel conversions.
+pub fn canonical_query_cmd(sub: &str) -> Option<&'static str> {
+    Some(match sub {
+        "grep" => "grep",
+        "search" | "semantic_code_search" => "search",
+        "ast-search" | "ast_search" => "ast-search",
+        "callgraph" | "get_call_graph" => "callgraph",
+        "impact" | "impact_analysis" => "impact",
+        "map" | "project_map" => "map",
+        "overview" | "module_overview" => "overview",
+        "show" | "get_ast_node" => "show",
+        "trace" | "trace_http_chain" => "trace",
+        "deps" | "dependency_graph" => "deps",
+        "similar" | "find_similar_code" => "similar",
+        "refs" | "find_references" => "refs",
+        "dead-code" | "find_dead_code" => "dead-code",
+        "file-impact" => "file-impact",
+        _ => return None,
+    })
+}
+
+/// Append a `{hook:"cli",action:"use",cmd}` line to recommendations.jsonl so the
+/// deny→use funnel can see model-initiated CLI conversions (the 2026-06-12 daagu
+/// night: 3 post-deny CLI calls, all invisible to the funnel). Mirrors the JS
+/// recordRecommendation posture: best-effort, NEVER creates `.code-graph/`
+/// (zero footprint outside indexed projects). Hook-internal answer runs set
+/// `CODE_GRAPH_INTERNAL=1` and are skipped — they are deliveries, not conversions.
+pub fn record_cli_use(project_root: &Path, cmd: &str) {
+    if std::env::var("CODE_GRAPH_INTERNAL").ok().as_deref() == Some("1") {
+        return;
+    }
+    let dir = project_root.join(CODE_GRAPH_DIR);
+    if !dir.is_dir() {
+        return;
+    }
+    let line = serde_json::json!({
+        "ts": crate::mcp::metrics::iso8601_now(),
+        "hook": "cli",
+        "action": "use",
+        "cmd": cmd,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("recommendations.jsonl"))
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
 /// Aggregated per-tool counts across sessions.
 pub struct ToolAgg {
     pub n: u64,
@@ -774,6 +827,13 @@ pub struct UsageSummary {
     pub sessions_with_deny_and_cg: u64,
     pub sessions_with_hint: u64,
     pub sessions_with_hint_and_cg: u64,
+    /// CLI-conversion legs (recs.cli_use > 0 in the session window) and the
+    /// combined "any use" legs (MCP cg tool OR CLI query) — the honest funnel
+    /// numerator now that deny→CLI is the proven conversion path.
+    pub sessions_with_deny_and_cli: u64,
+    pub sessions_with_hint_and_cli: u64,
+    pub sessions_with_deny_and_use: u64,
+    pub sessions_with_hint_and_use: u64,
 }
 
 impl UsageSummary {
@@ -844,6 +904,10 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
         sessions_with_deny_and_cg: 0,
         sessions_with_hint: 0,
         sessions_with_hint_and_cg: 0,
+        sessions_with_deny_and_cli: 0,
+        sessions_with_hint_and_cli: 0,
+        sessions_with_deny_and_use: 0,
+        sessions_with_hint_and_use: 0,
     };
 
     for rec in &records {
@@ -894,13 +958,20 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
         if let Some(recs) = rec.get("recs") {
             let deny = recs.get("deny").and_then(|v| v.as_u64()).unwrap_or(0);
             let hint = recs.get("hint").and_then(|v| v.as_u64()).unwrap_or(0);
+            // CLI query runs window-joined into the session (additive v0.49 field).
+            let used_cli = recs.get("cli_use").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
+            let used_any = used_cg || used_cli;
             if deny > 0 {
                 summary.sessions_with_deny += 1;
                 if used_cg { summary.sessions_with_deny_and_cg += 1; }
+                if used_cli { summary.sessions_with_deny_and_cli += 1; }
+                if used_any { summary.sessions_with_deny_and_use += 1; }
             }
             if hint > 0 {
                 summary.sessions_with_hint += 1;
                 if used_cg { summary.sessions_with_hint_and_cg += 1; }
+                if used_cli { summary.sessions_with_hint_and_cli += 1; }
+                if used_any { summary.sessions_with_hint_and_use += 1; }
             }
         }
     }
@@ -913,11 +984,20 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
 /// real-session conversion rate the synthetic routing_bench oracle can't see.
 #[derive(Default)]
 pub struct RecommendationSummary {
+    /// Recommendation events only (deny/hint/bypass…) — `action:"use"` lines are
+    /// conversions, counted in `cli_uses` instead.
     pub total: u64,
-    /// "hint" / "deny" → count
+    /// "hint" / "deny" / "bypass" → count
     pub by_action: std::collections::BTreeMap<String, u64>,
     /// "grep" / "read" → count
     pub by_hook: std::collections::BTreeMap<String, u64>,
+    /// Model-initiated `code-graph-mcp <query>` runs (action:"use").
+    pub cli_uses: u64,
+    /// Deny segmentation: answered:true denies satisfied the need in-place, so a
+    /// low deny→use read is EXPECTED for them; only static (unanswered) denies
+    /// ask the model to convert. Pre-v0.47 denies lack the field → unanswered.
+    pub deny_answered: u64,
+    pub deny_unanswered: u64,
 }
 
 /// Parse and aggregate `recommendations.jsonl` content. Pure: no IO, no panics —
@@ -928,9 +1008,21 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else { continue; };
+        let action = v.get("action").and_then(|x| x.as_str());
+        if action == Some("use") {
+            s.cli_uses += 1;
+            continue;
+        }
         s.total += 1;
-        if let Some(a) = v.get("action").and_then(|x| x.as_str()) {
+        if let Some(a) = action {
             *s.by_action.entry(a.to_string()).or_insert(0) += 1;
+            if a == "deny" {
+                if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
+                    s.deny_answered += 1;
+                } else {
+                    s.deny_unanswered += 1;
+                }
+            }
         }
         if let Some(h) = v.get("hook").and_then(|x| x.as_str()) {
             *s.by_hook.entry(h.to_string()).or_insert(0) += 1;
@@ -1019,7 +1111,7 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     // Recording-side state of the conversion metric, made explicit so a dark
     // metric (file absent → PreToolUse hooks not recording here) is never
     // silently indistinguishable from "feature absent" or "no data yet".
-    let rec_state = if recs.total > 0 { "live" } else if rec_exists { "empty" } else { "absent" };
+    let rec_state = if recs.total > 0 || recs.cli_uses > 0 { "live" } else if rec_exists { "empty" } else { "absent" };
 
     if summary.sessions == 0 {
         if json_mode {
@@ -1072,17 +1164,27 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 "by_hook": recs.by_hook.iter().map(|(k, v)| (k.clone(), serde_json::json!(v)))
                     .collect::<serde_json::Map<String, serde_json::Value>>(),
                 "cg_tool_calls": summary.total_tool_calls(),
+                "cli_uses": recs.cli_uses,
+                "deny_answered": recs.deny_answered,
+                "deny_unanswered": recs.deny_unanswered,
                 "conversion_ratio": if recs.total > 0 {
                     (summary.total_tool_calls() as f64 / recs.total as f64 * 100.0).round() / 100.0
                 } else { 0.0 },
                 // Per-session deny→use / hint→use funnel (window-joined attribution).
+                // v0.49: *_conversion is ANY-use (MCP cg tool OR CLI query) — the
+                // deny→CLI leg is the proven conversion path; *_then_cg / *_then_cli
+                // keep the legs separable.
                 "funnel": {
                     "deny_sessions": summary.sessions_with_deny,
                     "deny_then_cg": summary.sessions_with_deny_and_cg,
-                    "deny_conversion": session_conversion(summary.sessions_with_deny_and_cg, summary.sessions_with_deny),
+                    "deny_then_cli": summary.sessions_with_deny_and_cli,
+                    "deny_then_use": summary.sessions_with_deny_and_use,
+                    "deny_conversion": session_conversion(summary.sessions_with_deny_and_use, summary.sessions_with_deny),
                     "hint_sessions": summary.sessions_with_hint,
                     "hint_then_cg": summary.sessions_with_hint_and_cg,
-                    "hint_conversion": session_conversion(summary.sessions_with_hint_and_cg, summary.sessions_with_hint),
+                    "hint_then_cli": summary.sessions_with_hint_and_cli,
+                    "hint_then_use": summary.sessions_with_hint_and_use,
+                    "hint_conversion": session_conversion(summary.sessions_with_hint_and_use, summary.sessions_with_hint),
                 },
             },
         }));
@@ -1138,6 +1240,15 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             let actions: Vec<String> = recs.by_action.iter().map(|(k, v)| format!("{v} {k}")).collect();
             let ratio = summary.total_tool_calls() as f64 / recs.total as f64;
             println!("Recommendations: {} emitted ({})", recs.total, actions.join(", "));
+            if recs.deny_answered + recs.deny_unanswered > 0 {
+                // answered:true denies satisfy the need in-place — read their
+                // conversion separately or the funnel under-reports the feature.
+                println!("Denies: {} answered in-place, {} static",
+                    recs.deny_answered, recs.deny_unanswered);
+            }
+            if recs.cli_uses > 0 {
+                println!("CLI uses: {} model-initiated code-graph-mcp queries", recs.cli_uses);
+            }
             // Field conversion signal the synthetic routing_bench oracle can't see:
             // cg tool calls vs hook recommendations. ≪1 = recommendations ignored.
             println!("Conversion (proxy): {} cg tool calls / {} recommendations = {ratio:.2}",
@@ -1157,14 +1268,16 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         // Per-session funnel: of sessions that saw a deny/hint, how many also called
         // a cg query tool. This is the deny→use attribution the aggregate ratio can't give.
         if summary.sessions_with_deny > 0 {
-            let pct = (summary.sessions_with_deny_and_cg as f64 / summary.sessions_with_deny as f64 * 100.0).round() as u64;
-            println!("Deny→use: {}/{} deny-sessions also called cg = {}%",
-                summary.sessions_with_deny_and_cg, summary.sessions_with_deny, pct);
+            let pct = (summary.sessions_with_deny_and_use as f64 / summary.sessions_with_deny as f64 * 100.0).round() as u64;
+            println!("Deny→use: {}/{} deny-sessions used cg = {}% (mcp {}, cli {})",
+                summary.sessions_with_deny_and_use, summary.sessions_with_deny, pct,
+                summary.sessions_with_deny_and_cg, summary.sessions_with_deny_and_cli);
         }
         if summary.sessions_with_hint > 0 {
-            let pct = (summary.sessions_with_hint_and_cg as f64 / summary.sessions_with_hint as f64 * 100.0).round() as u64;
-            println!("Hint→use: {}/{} hint-sessions also called cg = {}%",
-                summary.sessions_with_hint_and_cg, summary.sessions_with_hint, pct);
+            let pct = (summary.sessions_with_hint_and_use as f64 / summary.sessions_with_hint as f64 * 100.0).round() as u64;
+            println!("Hint→use: {}/{} hint-sessions used cg = {}% (mcp {}, cli {})",
+                summary.sessions_with_hint_and_use, summary.sessions_with_hint, pct,
+                summary.sessions_with_hint_and_cg, summary.sessions_with_hint_and_cli);
         }
     }
 
@@ -4393,6 +4506,27 @@ mod tests {
         assert_eq!(s.by_action.get("deny").copied(), Some(1));
         assert_eq!(s.by_hook.get("grep").copied(), Some(2));
         assert_eq!(s.by_hook.get("read").copied(), Some(1));
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_cli_uses_and_answered_split() {
+        let content = [
+            // answered deny (v0.47+) vs static deny (no field = pre-v0.47 or fallback)
+            r#"{"ts":"t1","hook":"grep","action":"deny","answered":true}"#,
+            r#"{"ts":"t2","hook":"grep","action":"deny","answered":false}"#,
+            r#"{"ts":"t3","hook":"grep","action":"deny"}"#,
+            r#"{"ts":"t4","hook":"grep","action":"bypass"}"#,
+            // CLI conversions: counted in cli_uses, NOT in total/by_action/by_hook
+            r#"{"ts":"t5","hook":"cli","action":"use","cmd":"callgraph"}"#,
+            r#"{"ts":"t6","hook":"cli","action":"use","cmd":"grep"}"#,
+        ].join("\n");
+        let s = aggregate_recommendations_jsonl(&content);
+        assert_eq!(s.total, 4, "use lines are conversions, not recommendations");
+        assert_eq!(s.cli_uses, 2);
+        assert_eq!(s.deny_answered, 1);
+        assert_eq!(s.deny_unanswered, 2, "answered:false and missing field are both static");
+        assert_eq!(s.by_action.get("bypass").copied(), Some(1));
+        assert!(s.by_hook.get("cli").is_none(), "cli use lines stay out of by_hook");
     }
 
     #[test]

@@ -780,22 +780,46 @@ fn test_cli_stats_recommendations_empty_distinct_from_absent() {
 fn test_cli_stats_deny_to_use_funnel() {
     let project = setup_indexed_project();
     let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
-    // Two deny-sessions, one of which called a cg query tool → 1/2 = 50%.
+    // Three deny-sessions: one converted via MCP cg tool, one via CLI query
+    // (recs.cli_use, v0.49), one not at all → any-use 2/3 = 67%.
     let s1 = "{\"ts\":\"2026-06-10T10:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}},\"recs\":{\"deny\":1,\"hint\":0}}";
     let s2 = "{\"ts\":\"2026-06-10T11:00:00Z\",\"v\":\"0.45.4\",\"tools\":{},\"recs\":{\"deny\":1,\"hint\":0}}";
-    std::fs::write(cg.join("usage.jsonl"), format!("{s1}\n{s2}\n")).unwrap();
+    let s3 = "{\"ts\":\"2026-06-10T12:00:00Z\",\"v\":\"0.49.0\",\"tools\":{},\"recs\":{\"deny\":2,\"hint\":1,\"cli_use\":3}}";
+    std::fs::write(cg.join("usage.jsonl"), format!("{s1}\n{s2}\n{s3}\n")).unwrap();
     let (stdout, _, code) = run_cli(&project, &["stats"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Deny→use: 1/2 deny-sessions also called cg = 50%"),
-        "stats must print the deny→use funnel; got: {stdout:?}");
+    assert!(stdout.contains("Deny→use: 2/3 deny-sessions used cg = 67% (mcp 1, cli 1)"),
+        "stats must print the deny→use funnel with mcp/cli legs; got: {stdout:?}");
 
     let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
     assert_eq!(jcode, 0);
     let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
     let funnel = &v["recommendations"]["funnel"];
-    assert_eq!(funnel["deny_sessions"], 2);
+    assert_eq!(funnel["deny_sessions"], 3);
     assert_eq!(funnel["deny_then_cg"], 1);
-    assert_eq!(funnel["deny_conversion"], 0.5);
+    assert_eq!(funnel["deny_then_cli"], 1);
+    assert_eq!(funnel["deny_then_use"], 2);
+    assert_eq!(funnel["deny_conversion"], 0.67);
+}
+
+// P0a (v0.49): a session with ZERO tool calls but in-window recommendation
+// traffic must still flush a usage record — otherwise the funnel denominator
+// only ever contains converted sessions (2026-06-12 daagu: 53 recs, 0 records).
+#[test]
+fn test_cli_stats_zero_tool_session_with_recs_counts_in_funnel() {
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    // What flush now writes for such a session: empty tools, recs present.
+    let s = "{\"ts\":\"2026-06-12T22:00:00Z\",\"v\":\"0.49.0\",\"tools\":{},\"recs\":{\"deny\":1,\"hint\":5,\"bypass\":2}}";
+    std::fs::write(cg.join("usage.jsonl"), format!("{s}\n")).unwrap();
+    let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(jcode, 0);
+    let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
+    assert_eq!(v["sessions"], 1, "0-tool session must appear in stats");
+    let funnel = &v["recommendations"]["funnel"];
+    assert_eq!(funnel["deny_sessions"], 1);
+    assert_eq!(funnel["deny_then_use"], 0);
+    assert_eq!(funnel["deny_conversion"], 0.0, "0% conversion must be observable, not absent");
 }
 
 // ============================================================
