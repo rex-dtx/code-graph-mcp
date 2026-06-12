@@ -7,7 +7,7 @@ const os = require('os');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const {
   getPluginVersion, readJson, healthCheck, CACHE_DIR,
-  isOurHookEntry, settingsPath, buildSettingsHookEntries,
+  settingsPath, surveyHookCoverage,
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 
@@ -234,49 +234,6 @@ function runDiagnostics() {
   return results;
 }
 
-// Inventory of (event, matcher) tuples we expect to find in settings.json after
-// install. Used by doctor to detect missing entries.
-function surveyHookCoverage(settings) {
-  const desired = buildSettingsHookEntries();
-  const expected = [];
-  const desiredCmd = {}; // key -> command string we would write now
-  for (const [event, entries] of Object.entries(desired)) {
-    for (const e of entries) {
-      const key = `${event}:${e.matcher || '*'}`;
-      expected.push(key);
-      desiredCmd[key] = e.hooks && e.hooks[0] && e.hooks[0].command;
-    }
-  }
-
-  const present = new Set();
-  const presentCmd = {}; // key -> command currently registered
-  if (settings && settings.hooks) {
-    for (const [event, entries] of Object.entries(settings.hooks)) {
-      if (!Array.isArray(entries)) continue;
-      for (const entry of entries) {
-        if (isOurHookEntry(entry)) {
-          const key = `${event}:${entry.matcher || '*'}`;
-          present.add(key);
-          if (entry.hooks && entry.hooks[0] && entry.hooks[0].command) {
-            presentCmd[key] = entry.hooks[0].command;
-          }
-        }
-      }
-    }
-  }
-
-  const missing = expected.filter(k => !present.has(k));
-  // Stale = present but the registered command no longer matches what we'd write
-  // now (points at an old plugin-cache version dir / moved path). A stale path can
-  // run pre-recordRecommendation hook code, so the hook fires but the conversion
-  // metric stays dark — invisible to a present/absent check. This is the
-  // 0.45.1-registered-while-0.45.4-active case the RCA surfaced.
-  const stale = expected.filter(k =>
-    present.has(k) && desiredCmd[k] && presentCmd[k] && presentCmd[k] !== desiredCmd[k]
-  );
-  return { expected, present: [...present], missing, stale };
-}
-
 // ── Report Formatting ─────────────────────────────────────
 
 const STATUS_ICONS = { ok: '\u2705', warn: '\u26a0\ufe0f', error: '\u274c', skip: '\u2796' };
@@ -305,6 +262,26 @@ function formatReport(results) {
 }
 
 // ── Repair Actions ────────────────────────────────────────
+
+/**
+ * v0.50.0: settings-writing repairs get the same stale-relic guard as
+ * session-init. A doctor launched from an old plugin-cache version dir would
+ * otherwise install() and re-anchor manifest + settings.json hook paths to the
+ * relic — the exact downgrade war the guard exists for, just user-triggered.
+ * Returns true (and prints redirection) when this copy must NOT write config.
+ * `relic` is injectable for tests.
+ */
+function relicRepairGuard({ log = console.log, relic = undefined } = {}) {
+  const { isStaleRelicContext, activeInstallPath } = require('./lifecycle');
+  const isRelic = relic !== undefined ? relic : isStaleRelicContext();
+  if (!isRelic) return false;
+  const active = activeInstallPath();
+  log('  ⚠ This doctor copy is not the active install (installed_plugins.json points elsewhere) — skipping settings repair.');
+  if (active) {
+    log(`  Run the active copy instead: node "${path.join(active, 'scripts', 'doctor.js')}"`);
+  }
+  return true;
+}
 
 function runRepairs(results) {
   const fixable = results.filter(r => r.fixId);
@@ -425,6 +402,7 @@ function runRepairs(results) {
 
       case 'hooks-invalid': {
         console.log('\n  Repairing hooks...');
+        if (relicRepairGuard()) break;
         const { install } = require('./lifecycle');
         install();
         console.log('  \u2705 Hooks repaired \u2014 restart Claude Code to apply');
@@ -434,6 +412,7 @@ function runRepairs(results) {
 
       case 'missing-hooks-in-settings': {
         console.log('\n  Registering code-graph hooks in settings.json...');
+        if (relicRepairGuard()) break;
         const { install } = require('./lifecycle');
         const r = install();
         if (r.hooksRegistered) {
@@ -474,7 +453,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, surveyHookCoverage };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, surveyHookCoverage, relicRepairGuard };
 
 if (require.main === module) {
   const args = process.argv.slice(2);

@@ -25,8 +25,20 @@ const CURRENT_VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json
 const PLATFORM = os.platform();
 const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
 
+// Sandbox HOMEs are removed when the run ends — under Claude Code $TMPDIR is
+// ~/.claude/tmp, and leaked mkdtemp dirs accumulate there (223 observed before
+// this cleanup existed).
+const CREATED_HOMES = [];
+test.after(() => {
+  for (const d of CREATED_HOMES) {
+    try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+});
+
 function mkHome() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'install-e2e-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'install-e2e-'));
+  CREATED_HOMES.push(dir);
+  return dir;
 }
 
 function writeJson(filePath, value) {
@@ -36,6 +48,28 @@ function writeJson(filePath, value) {
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+// v0.32.0 contract: install()/update() register these (event, matcher, script)
+// tuples in settings.json with current PLUGIN_ROOT paths.
+const EXPECTED_SETTINGS_HOOKS = [
+  ['PreToolUse', 'Edit', 'pre-edit-guide.js'],
+  ['PreToolUse', 'Bash', 'pre-grep-guide.js'],
+  ['PreToolUse', 'Read', 'pre-read-guide.js'],
+  ['PostToolUse', 'Write|Edit', 'incremental-index.js'],
+  ['UserPromptSubmit', '', 'user-prompt-context.js'],
+];
+
+function assertCurrentSettingsHooks(settings) {
+  for (const [event, matcher, script] of EXPECTED_SETTINGS_HOOKS) {
+    const entries = settings.hooks?.[event] || [];
+    const entry = entries.find(e => (e.matcher || '') === matcher &&
+      JSON.stringify(e.hooks || []).includes(script));
+    assert.ok(entry, `settings.json must have ${event}:${matcher || '*'} → ${script}`);
+    const expectedPath = path.join(PLUGIN_ROOT, 'scripts', script);
+    assert.equal(entry.hooks[0].command, `node "${expectedPath}"`,
+      `${event}:${matcher || '*'} must point at the current plugin root`);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -77,29 +111,24 @@ test('§1.3 .mcp.json points to valid launcher script', () => {
   assert.ok(fs.existsSync(launcherPath), `Launcher script missing: ${launcherPath}`);
 });
 
-test('§1.4 cache/<ver>/hooks/hooks.json covers all 4 hook events (authoritative source)', () => {
-  // As of v0.8.3, hook registration lives in the plugin cache — Claude Code
-  // loads it from cache/<mp>/<plugin>/<ver>/hooks/hooks.json. install() does
-  // NOT write hooks to settings.json (that was the old, broken bootstrap).
+test('§1.4 hook split: cache hooks.json carries SessionStart only; install() registers the rest in settings.json', () => {
+  // v0.32.0 contract: current Claude Code only loads SessionStart from
+  // cache/<mp>/<plugin>/<ver>/hooks/hooks.json — PreToolUse/PostToolUse/
+  // UserPromptSubmit entries there are silently ignored (dead config), so
+  // lifecycle.js install/update writes those to ~/.claude/settings.json.
   const cacheHooks = readJson(path.join(PLUGIN_ROOT, 'hooks', 'hooks.json'));
   assert.ok(cacheHooks.hooks, 'cache hooks.json must have a hooks key');
 
-  const expectedEvents = ['SessionStart', 'PreToolUse', 'PostToolUse', 'UserPromptSubmit'];
-  for (const event of expectedEvents) {
-    assert.ok(cacheHooks.hooks[event], `cache hooks.${event} must be defined`);
-    assert.ok(Array.isArray(cacheHooks.hooks[event]), `cache hooks.${event} must be an array`);
-    assert.ok(cacheHooks.hooks[event].length > 0, `cache hooks.${event} must have entries`);
+  assert.ok(Array.isArray(cacheHooks.hooks.SessionStart) && cacheHooks.hooks.SessionStart.length > 0,
+    'cache hooks.SessionStart must have entries');
+  assert.ok(cacheHooks.hooks.SessionStart[0].hooks[0].command.includes('session-init.js'));
+  assert.match(cacheHooks.hooks.SessionStart[0].matcher, /startup/);
+  for (const event of ['PreToolUse', 'PostToolUse', 'UserPromptSubmit']) {
+    assert.equal(cacheHooks.hooks[event], undefined,
+      `cache hooks.${event} would be dead config (CC ignores it) — it belongs in settings.json`);
   }
 
-  assert.ok(cacheHooks.hooks.SessionStart[0].hooks[0].command.includes('session-init.js'));
-  assert.ok(cacheHooks.hooks.PreToolUse[0].hooks[0].command.includes('pre-edit-guide.js'));
-  assert.ok(cacheHooks.hooks.PostToolUse[0].hooks[0].command.includes('incremental-index.js'));
-  assert.ok(cacheHooks.hooks.UserPromptSubmit[0].hooks[0].command.includes('user-prompt-context.js'));
-  assert.match(cacheHooks.hooks.SessionStart[0].matcher, /startup/);
-  assert.match(cacheHooks.hooks.PreToolUse[0].matcher, /Edit/);
-  assert.match(cacheHooks.hooks.PostToolUse[0].matcher, /Write|Edit/);
-
-  // install() must not write code-graph hooks into settings.json.
+  // install() must register the settings.json-owned events with current paths.
   const homeDir = mkHome();
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
   const installedPath = path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
@@ -112,9 +141,7 @@ test('§1.4 cache/<ver>/hooks/hooks.json covers all 4 hook events (authoritative
     stdio: 'pipe',
   });
   const settings = readJson(settingsPath);
-  const hookSerialized = JSON.stringify(settings.hooks || {});
-  assert.ok(!hookSerialized.includes('code-graph'),
-    `install() must not register code-graph hooks in settings.json, got: ${hookSerialized}`);
+  assertCurrentSettingsHooks(settings);
 });
 
 test('§1.5 plugin install creates install manifest with version', () => {
@@ -204,12 +231,118 @@ test('§1.7 plugin update strips legacy settings.json hooks and clears update ca
   });
 
   const settings = readJson(settingsPath);
-  // Legacy code-graph entries must be gone (cache hooks.json is authoritative).
+  // Legacy v0.8.2-era entry (old path) must be gone, replaced by fresh
+  // v0.32+ entries pointing at the current plugin root.
   const hookSerialized = JSON.stringify(settings.hooks || {});
-  assert.ok(!hookSerialized.includes('code-graph'),
-    `update() must strip legacy code-graph hooks from settings.json, got: ${hookSerialized}`);
+  assert.ok(!hookSerialized.includes('/old/code-graph/path/'),
+    `update() must strip the legacy old-path hook entry, got: ${hookSerialized}`);
+  assertCurrentSettingsHooks(settings);
   // Update-check cache cleared (forces freshness post-update).
   assert.equal(fs.existsSync(updateCache), false);
+});
+
+function runSyncLifecycleConfig(homeDir) {
+  const sessionInit = path.join(PLUGIN_ROOT, 'scripts', 'session-init.js');
+  return execFileSync(process.execPath, [
+    '-e', `console.log(require(${JSON.stringify(sessionInit)}).syncLifecycleConfig())`,
+  ], { env: { ...process.env, HOME: homeDir }, stdio: 'pipe' }).toString().trim();
+}
+
+function installIntoSandbox() {
+  const homeDir = mkHome();
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  writeJson(settingsPath, { enabledPlugins: { 'code-graph-mcp@code-graph-mcp': true } });
+  writeJson(path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json'), {
+    plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
+  });
+  execFileSync(process.execPath, [LIFECYCLE, 'install'], {
+    env: { ...process.env, HOME: homeDir }, stdio: 'pipe',
+  });
+  return { homeDir, settingsPath };
+}
+
+test('§1.9 session-init self-heals a stale-but-existing settings.json hook path', () => {
+  // The binary-pin sibling: after a failed auto-update re-register, hooks can
+  // point at an old plugin-cache version dir that still EXISTS on disk. The
+  // pre-v0.49.1 self-heal only checked existence + matcher presence, so users
+  // kept running old hook code until doctor. session-init must heal it.
+  const { homeDir, settingsPath } = installIntoSandbox();
+
+  // Simulate: pre-edit-guide hook pinned at an old-version path that exists.
+  const staleScript = path.join(homeDir, 'old-cache', '0.45.1', 'scripts', 'pre-edit-guide.js');
+  fs.mkdirSync(path.dirname(staleScript), { recursive: true });
+  fs.writeFileSync(staleScript, '// stale copy\n');
+  const settings = readJson(settingsPath);
+  const entry = settings.hooks.PreToolUse.find(e => e.matcher === 'Edit');
+  entry.hooks[0].command = `node "${staleScript}"`;
+  writeJson(settingsPath, settings);
+
+  assert.equal(runSyncLifecycleConfig(homeDir), 'self-healed-stale-settings-hook');
+  assertCurrentSettingsHooks(readJson(settingsPath));
+  // Idempotent: second run is a noop.
+  assert.equal(runSyncLifecycleConfig(homeDir), 'noop');
+});
+
+test('§1.10 session-init self-heals a stale-but-existing composite statusline path', () => {
+  const { homeDir, settingsPath } = installIntoSandbox();
+
+  const staleComposite = path.join(homeDir, 'old-cache', '0.45.1', 'scripts', 'statusline-composite.js');
+  fs.mkdirSync(path.dirname(staleComposite), { recursive: true });
+  fs.writeFileSync(staleComposite, '// stale copy\n');
+  const settings = readJson(settingsPath);
+  settings.statusLine.command = `node "${staleComposite}"`;
+  writeJson(settingsPath, settings);
+
+  assert.equal(runSyncLifecycleConfig(homeDir), 'self-healed-stale-statusline');
+  const healed = readJson(settingsPath);
+  assert.equal(healed.statusLine.command,
+    `node "${path.join(PLUGIN_ROOT, 'scripts', 'statusline-composite.js')}"`);
+  assert.equal(runSyncLifecycleConfig(homeDir), 'noop');
+});
+
+test('§1.11 a stale-relic session-init defers to the active install (downgrade-war guard)', () => {
+  // Field repro 2026-06-12: auto-update installed 0.49.0 (manifest + hooks
+  // re-anchored), then 15 minutes later a SessionStart fired by the STILL
+  // RUNNING Claude Code process executed the 0.48.0 scripts, whose
+  // syncLifecycleConfig saw manifest.version !== its own version and called
+  // update() — dragging manifest + every settings.json hook back to 0.48.0.
+  // The relic must defer to installed_plugins.json instead.
+  const homeDir = mkHome();
+  const cacheBase = path.join(homeDir, '.claude', 'plugins', 'cache',
+    'code-graph-mcp', 'code-graph-mcp');
+  const relicDir = path.join(cacheBase, '0.48.0');
+  const activeDir = path.join(cacheBase, '0.49.0');
+
+  // Relic = a real copy of the plugin tree, version-stamped 0.48.0.
+  fs.cpSync(PLUGIN_ROOT, relicDir, { recursive: true });
+  const relicManifest = path.join(relicDir, '.claude-plugin', 'plugin.json');
+  writeJson(relicManifest, { ...readJson(relicManifest), version: '0.48.0' });
+
+  // Active install: newer dir that exists with a lifecycle to defer to.
+  fs.mkdirSync(path.join(activeDir, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(activeDir, 'scripts', 'lifecycle.js'), '// active install\n');
+  writeJson(path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json'), {
+    plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: activeDir, version: '0.49.0', scope: 'user' }] },
+  });
+
+  // Auto-update just anchored the manifest at 0.49.0.
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+  writeJson(manifestPath, { version: '0.49.0', config: {} });
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  writeJson(settingsPath, { enabledPlugins: { 'code-graph-mcp@code-graph-mcp': true } });
+
+  // The relic's session-init must NOT downgrade anything.
+  const relicSessionInit = path.join(relicDir, 'scripts', 'session-init.js');
+  const out = execFileSync(process.execPath, [
+    '-e', `console.log(require(${JSON.stringify(relicSessionInit)}).syncLifecycleConfig())`,
+  ], { env: { ...process.env, HOME: homeDir }, stdio: 'pipe' }).toString().trim();
+
+  assert.equal(out, 'deferred-to-active-install');
+  assert.equal(readJson(manifestPath).version, '0.49.0',
+    'relic must not drag the manifest back to its own version');
+  const settings = readJson(settingsPath);
+  assert.equal(JSON.stringify(settings).includes('0.48.0'), false,
+    'relic must not anchor any settings.json path to its own version dir');
 });
 
 test('§1.8 plugin uninstall removes all traces', () => {
@@ -730,11 +863,9 @@ test('§6.1 full lifecycle: fresh install → use → update → uninstall', () 
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], { env, stdio: 'pipe' });
   let settings = readJson(settingsPath);
-  // install() no longer writes hooks to settings.json (cache hooks.json is
-  // authoritative as of v0.8.3). Only statusLine + registry should be set.
-  const hooksSerialized = JSON.stringify(settings.hooks || {});
-  assert.ok(!hooksSerialized.includes('code-graph'),
-    `install() must not register code-graph hooks in settings.json, got: ${hooksSerialized}`);
+  // v0.32.0: install() registers PreToolUse/PostToolUse/UserPromptSubmit in
+  // settings.json (cache hooks.json only carries SessionStart).
+  assertCurrentSettingsHooks(settings);
   assert.ok(settings.statusLine, 'StatusLine configured');
   assert.match(settings.statusLine.command, /statusline-composite/);
   assert.ok(fs.existsSync(manifestPath), 'Manifest created');

@@ -661,3 +661,42 @@ test('scanForBrokenPaths is exported and returns the issue structure', (t) => {
   assert.ok(issues.some(i => i.type === 'hook' && i.event === 'PreToolUse' && i.path.includes('/nonexistent/')),
     'scanForBrokenPaths must report the seeded broken hook entry');
 });
+// ── isStaleRelicContext (v0.49.1 downgrade-war guard) ──────────────────────
+
+test('isStaleRelicContext: relic in plugins cache defers to a different active install', (t) => {
+  const { isStaleRelicContext } = require('./lifecycle');
+  const cacheRoot = '/home/u/.claude/plugins/cache';
+  const relicRoot = `${cacheRoot}/code-graph-mcp/code-graph-mcp/0.48.0`;
+  const activeRoot = `${cacheRoot}/code-graph-mcp/code-graph-mcp/0.49.0`;
+
+  // The downgrade-war case: running from old cache dir, active points elsewhere.
+  assert.equal(isStaleRelicContext({
+    pluginRoot: relicRoot, cacheRoot, activePath: activeRoot,
+    existsSync: () => true,
+  }), true);
+
+  // Running FROM the active install → full self-heal rights.
+  assert.equal(isStaleRelicContext({
+    pluginRoot: activeRoot, cacheRoot, activePath: activeRoot,
+    existsSync: () => true,
+  }), false);
+
+  // Dev checkout / npm install (pluginRoot outside the plugins cache) → exempt.
+  assert.equal(isStaleRelicContext({
+    pluginRoot: '/repo/code-graph-mcp/claude-plugin', cacheRoot, activePath: activeRoot,
+    existsSync: () => true,
+  }), false);
+
+  // No installed_plugins record → exempt (nothing authoritative to defer to).
+  assert.equal(isStaleRelicContext({
+    pluginRoot: relicRoot, cacheRoot, activePath: null,
+    existsSync: () => true,
+  }), false);
+
+  // Active path recorded but its lifecycle.js is gone (cache wiped) → the
+  // relic is the only working copy left; keep self-heal rights.
+  assert.equal(isStaleRelicContext({
+    pluginRoot: relicRoot, cacheRoot, activePath: activeRoot,
+    existsSync: () => false,
+  }), false);
+});

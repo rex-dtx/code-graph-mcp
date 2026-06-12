@@ -56,11 +56,14 @@ if $version_staged; then
 fi
 
 # ── 2. Plugin JS tests ───────────────────────────────────────
-# Run plugin tests if any JS file under claude-plugin/ is staged.
-js_staged=$(echo "$staged_files" | grep -c '^claude-plugin/.*\.js$' || true)
+# Run all JS tests if any JS file under claude-plugin/ or scripts/ is staged.
+# scripts/*.test.js included since v0.49.1: install-e2e.test.js asserts
+# lifecycle.js behavior but lived outside this gate (and outside CI), so the
+# v0.32.0 hooks-to-settings.json inversion silently stranded it for 3 months.
+js_staged=$(echo "$staged_files" | grep -c '^\(claude-plugin\|scripts\)/.*\.js$' || true)
 if [ "$js_staged" -gt 0 ]; then
   echo "Running plugin JS tests..."
-  for t in "$ROOT"/claude-plugin/scripts/*.test.js; do
+  for t in "$ROOT"/claude-plugin/scripts/*.test.js "$ROOT"/scripts/*.test.js; do
     [ -f "$t" ] || continue
     if ! node --test "$t" > /dev/null 2>&1; then
       echo "❌ Test failed: $(basename "$t")"

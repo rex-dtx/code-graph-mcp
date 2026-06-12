@@ -186,6 +186,13 @@ jobs:
         # tarball sha256 would only validate the bundle against itself, not
         # against a known-good upstream. --fail makes curl exit non-zero on
         # HTTP 4xx/5xx so a 404 HTML page can't masquerade as model.safetensors.
+        # Content pins below verify the downloaded bytes against known-good
+        # hashes of the pinned revision, so even a compromised HF response (or
+        # a silent revision bump in this file) fails the release instead of
+        # shipping different weights. When HF_REVISION changes, recompute all
+        # three sha256s AND bump MODEL_CONTENT_BLAKE3 in src/embedding/model.rs
+        # (the client-side verifier) in the same commit — clients reject any
+        # models.tar.gz whose model.safetensors doesn't match that constant.
         run: |
           mkdir -p models-pkg
           HF_REVISION=c9745ed1d9f207416be6d2e6f8de32d1f16199bf
@@ -193,6 +200,11 @@ jobs:
             curl -L --fail -o models-pkg/$f \
               "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/$HF_REVISION/$f"
           done
+          sha256sum -c - <<'PINS'
+          53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db  models-pkg/model.safetensors
+          be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  models-pkg/tokenizer.json
+          953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41  models-pkg/config.json
+          PINS
           tar czf release-assets/models.tar.gz -C models-pkg .
           sha256sum release-assets/models.tar.gz | cut -d' ' -f1 > release-assets/models.tar.gz.sha256
 

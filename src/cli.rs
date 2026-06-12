@@ -1291,13 +1291,38 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
 #[command(name = "code-graph-mcp grep",
           about = "AST-context grep (ripgrep + containing function/class)")]
 pub struct GrepArgs {
-    /// Search pattern (ripgrep regex)
+    /// Search pattern (ripgrep regex; use -F for literal strings)
+    #[arg(allow_hyphen_values = true)]
     pub pattern: String,
-    /// Optional path to restrict the search (must be within the project root)
-    pub path: Option<String>,
+    /// Optional paths to restrict the search (must be within the project root)
+    pub paths: Vec<String>,
     /// JSON output
     #[arg(long)]
     pub json: bool,
+    /// Case-insensitive search
+    #[arg(short = 'i', long)]
+    pub ignore_case: bool,
+    /// Only match whole words
+    #[arg(short = 'w', long)]
+    pub word_regexp: bool,
+    /// Treat the pattern as a literal string, not a regex
+    #[arg(short = 'F', long)]
+    pub fixed_strings: bool,
+    /// Print only the names of files with matches
+    #[arg(short = 'l', long)]
+    pub files_with_matches: bool,
+    /// Show N lines before and after each match
+    #[arg(short = 'C', long, value_name = "N")]
+    pub context: Option<u64>,
+    /// Show N lines after each match
+    #[arg(short = 'A', long, value_name = "N")]
+    pub after_context: Option<u64>,
+    /// Show N lines before each match
+    #[arg(short = 'B', long, value_name = "N")]
+    pub before_context: Option<u64>,
+    /// Max matches per file; 0 = unlimited
+    #[arg(long, default_value_t = 100)]
+    pub max_count: u64,
 }
 
 /// AST-context grep: ripgrep + AST context from index.
@@ -1307,61 +1332,228 @@ pub struct GrepArgs {
 /// src/mcp/server.rs:142  let result = handle_request(params);
 ///   → fn McpServer::process_message (lines 130-180)
 /// ```
-pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
-    // clap accepts an empty-string positional (e.g. an unset shell var expanding
-    // to ""); preserve the hand-parser's non-empty guard + exact Usage string.
-    let GrepArgs { pattern, path, json: json_mode } = args;
-    if pattern.is_empty() {
-        anyhow::bail!("Usage: code-graph-mcp grep <pattern> [path] [--json]");
+/// grep-parity exit codes (v0.50): 0 = matched, 1 = no match, 2 = error/usage.
+/// Flushes stdout before exiting so piped consumers see complete output.
+fn grep_exit(code: i32) -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    std::process::exit(code);
+}
+
+/// git-tracked files that ripgrep's walk skips: tracked ∖ `rg --files`.
+/// Three blind-spot classes share this root cause (rg prunes by its own
+/// ignore/hidden rules without checking tracked status):
+///   1. tracked file under a gitignored dir (`docs/` ignored, doc force-added)
+///   2. `dir/` + `!dir/keep/` negation — git whitelists the file, rg prunes
+///      `dir/` during the walk before evaluating the negation (rg 14.x)
+///   3. tracked hidden files (rg skips hidden by default)
+///
+/// Passing the difference as explicit file args restores `git grep` semantics.
+/// Empty when git is absent / not a work tree (then rg's walk is the answer).
+/// `scope_rels` (relative, validated) restricts both sides to the user paths.
+fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> Vec<String> {
+    let mut ls = Command::new("git");
+    ls.args(["ls-files", "-z"]).current_dir(project_root);
+    for rel in scope_rels {
+        ls.arg(rel);
+    }
+    let Ok(out) = ls.output() else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let tracked: Vec<String> = out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| String::from_utf8(s.to_vec()).ok())
+        .collect();
+    if tracked.is_empty() {
+        return Vec::new();
     }
 
-    let search_path = path.as_deref();
+    // The same walk the search performs (cwd-relative output).
+    let mut rg_files = Command::new("rg");
+    rg_files.arg("--files").current_dir(project_root);
+    for rel in scope_rels {
+        rg_files.arg(rel);
+    }
+    let walked: std::collections::HashSet<String> = match rg_files.output() {
+        // rg --files exits 1 with empty stdout when the walk finds nothing —
+        // same parse either way; only spawn failure disables the supplement.
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim_start_matches("./").to_string())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
 
-    // Run ripgrep with JSON output for structured parsing
-    let mut rg_cmd = Command::new("rg");
-    rg_cmd
-        .arg("--json")
-        .arg("-n")
-        .arg("--max-count=100")
-        .arg(&pattern);
+    tracked.into_iter().filter(|t| !walked.contains(t)).collect()
+}
 
-    if let Some(path) = search_path {
-        // Validate search_path is within project root to prevent path traversal
+pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
+    let GrepArgs {
+        pattern, paths, json: json_mode,
+        ignore_case, word_regexp, fixed_strings, max_count,
+        files_with_matches, context, after_context, before_context,
+    } = args;
+    let context_requested = context.is_some() || after_context.is_some() || before_context.is_some();
+    // clap accepts an empty-string positional (e.g. an unset shell var expanding
+    // to ""); preserve the non-empty guard + Usage string. Usage error → exit 2.
+    if pattern.is_empty() {
+        if json_mode {
+            println!("[]");
+        }
+        eprintln!("Usage: code-graph-mcp grep <pattern> [paths...] [-i] [-w] [-F] [--max-count N] [--json]");
+        grep_exit(2);
+    }
+
+    let root_canonical = project_root.canonicalize().unwrap_or(project_root.to_path_buf());
+
+    // Validate every search path is within the project root (path traversal guard).
+    let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut search_rels: Vec<String> = Vec::new();
+    for path in &paths {
         let resolved = project_root.join(path);
         let canonical = resolved.canonicalize().unwrap_or(resolved);
-        let root_canonical = project_root.canonicalize().unwrap_or(project_root.to_path_buf());
         if !canonical.starts_with(&root_canonical) {
-            anyhow::bail!("search path must be within project root");
+            if json_mode {
+                println!("[]");
+            }
+            eprintln!("[code-graph] search path must be within project root: {}", path);
+            grep_exit(2);
         }
-        rg_cmd.arg(canonical);
+        if let Ok(rel) = canonical.strip_prefix(&root_canonical) {
+            search_rels.push(rel.to_string_lossy().into_owned());
+        }
+        search_paths.push(canonical);
+    }
+
+    let mut rg_cmd = Command::new("rg");
+    if files_with_matches {
+        // -l: plain one-path-per-line output (rg stops at the first match per
+        // file); context flags are meaningless here, like grep, and ignored.
+        rg_cmd.arg("-l");
     } else {
+        rg_cmd.arg("--json").arg("-n");
+        if let Some(n) = context {
+            rg_cmd.arg(format!("--context={}", n));
+        }
+        if let Some(n) = after_context {
+            rg_cmd.arg(format!("--after-context={}", n));
+        }
+        if let Some(n) = before_context {
+            rg_cmd.arg(format!("--before-context={}", n));
+        }
+        if max_count > 0 {
+            rg_cmd.arg(format!("--max-count={}", max_count));
+        }
+    }
+    if ignore_case {
+        rg_cmd.arg("-i");
+    }
+    if word_regexp {
+        rg_cmd.arg("-w");
+    }
+    if fixed_strings {
+        rg_cmd.arg("-F");
+    }
+    // `--` so leading-dash patterns (e.g. searching for "--no-default-features")
+    // reach rg as the pattern instead of being parsed as flags.
+    rg_cmd.arg("--").arg(&pattern);
+
+    if search_paths.is_empty() {
         rg_cmd.arg(project_root);
+    } else {
+        for p in &search_paths {
+            rg_cmd.arg(p);
+        }
+    }
+
+    // git-grep parity: append tracked files the rg walk misses as explicit
+    // args (explicit file args bypass rg's ignore rules). git ls-files
+    // pathspecs + rg --files args are both scoped to the user's paths, so the
+    // supplement honors path restrictions; files passed explicitly by the
+    // user appear in the walk output and dedup naturally.
+    const SUPPLEMENT_CAP: usize = 500;
+    let mut supplement = tracked_files_missed_by_walk(project_root, &search_rels);
+    if supplement.len() > SUPPLEMENT_CAP {
+        eprintln!(
+            "[code-graph] {} tracked files outside the rg walk; searching the first {} only",
+            supplement.len(), SUPPLEMENT_CAP
+        );
+        supplement.truncate(SUPPLEMENT_CAP);
+    }
+    for rel in &supplement {
+        // Join on project_root (not the canonicalized root) so parse_rg_json's
+        // prefix-strip produces relative paths in the output.
+        let abs = project_root.join(rel);
+        if abs.is_file() {
+            rg_cmd.arg(abs);
+        }
     }
 
     let rg_output = rg_cmd.output();
     let rg_output = match rg_output {
         Ok(output) => output,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep");
+            if json_mode {
+                println!("[]");
+            }
+            eprintln!("[code-graph] ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep");
+            grep_exit(2);
         }
         Err(e) => return Err(e.into()),
     };
 
     // ripgrep exit codes: 0 = matched, 1 = no match, 2 = error (invalid regex,
-    // unreadable path). Treat code 2 as a hard failure so the CLI exit code
-    // reflects it — otherwise a regex parse error (e.g. an unescaped `(` in a
-    // pattern like `res.json(`) prints to stderr but still exits 0, hiding the
-    // failure from scripts.
+    // unreadable path). grep-parity: surface as exit 2 — a regex parse error
+    // (e.g. an unescaped `(` in `res.json(`) must not look like a no-match.
     if rg_output.status.code() == Some(2) {
         if json_mode {
             println!("[]");
         }
         let stderr = String::from_utf8_lossy(&rg_output.stderr);
         let stderr = stderr.trim();
-        anyhow::bail!(
+        eprintln!(
             "[code-graph] ripgrep error: {}",
             if stderr.is_empty() { "invalid pattern or unreadable path" } else { stderr }
         );
+        grep_exit(2);
+    }
+
+    // -l mode: rg already printed one path per line; relativize and pass through.
+    if files_with_matches {
+        let root_str = project_root.to_string_lossy().into_owned();
+        let files: Vec<String> = String::from_utf8_lossy(&rg_output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| relativize_path(l, &root_str).to_string())
+            .collect();
+        if files.is_empty() {
+            if json_mode {
+                println!("[]");
+            }
+            eprintln!("[code-graph] No matches for: {}", pattern);
+            grep_exit(1);
+        }
+        let write_result: std::io::Result<()> = (|| {
+            let mut stdout = std::io::stdout().lock();
+            if json_mode {
+                let serialized = serde_json::to_string(&files)
+                    .unwrap_or_else(|_| "[]".to_string());
+                writeln!(stdout, "{}", serialized)?;
+            } else {
+                for f in &files {
+                    writeln!(stdout, "{}", f)?;
+                }
+            }
+            Ok(())
+        })();
+        match write_result {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => grep_exit(0),
+            other => other?,
+        }
+        return Ok(());
     }
 
     // Parse rg JSON output into matches
@@ -1370,7 +1562,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         if json_mode {
             println!("[]");
         }
-        // Surface ripgrep errors (e.g., path not found) instead of silent exit
+        // Surface ripgrep errors (e.g., path not found) instead of a silent exit
         let stderr = String::from_utf8_lossy(&rg_output.stderr);
         let stderr = stderr.trim();
         if !stderr.is_empty() {
@@ -1378,54 +1570,172 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         } else {
             eprintln!("[code-graph] No matches for: {}", pattern);
         }
-        return Ok(());
+        // grep parity: no match exits 1.
+        grep_exit(1);
     }
 
-    // Try to open index for AST context
-    let ctx = CliContext::try_open(project_root);
-    let mut stdout = std::io::stdout().lock();
+    // Per-file cap honesty: a file whose match count equals the cap was likely
+    // truncated — silent truncation reads as "complete results" to the caller.
+    // Context lines don't count toward the cap.
+    let capped_files: Vec<&str> = if max_count > 0 {
+        let mut counts: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for m in matches.iter().filter(|m| !m.is_context) {
+            *counts.entry(m.file.as_str()).or_insert(0) += 1;
+        }
+        let mut capped: Vec<&str> = counts
+            .iter()
+            .filter(|(_, &c)| c >= max_count)
+            .map(|(&f, _)| f)
+            .collect();
+        capped.sort_unstable();
+        capped
+    } else {
+        Vec::new()
+    };
 
-    if json_mode {
-        let mut json_results = Vec::new();
-        for m in &matches {
-            let mut entry = serde_json::json!({
-                "file": m.file,
-                "line": m.line,
-                "text": m.text,
-            });
-            if let Some(ref ctx) = ctx {
-                if let Some(container) = find_containing_node(ctx, &m.file, m.line) {
-                    entry["container"] = serde_json::json!({
+    // Try to open index for AST context; cache per-file nodes for both modes.
+    let ctx = CliContext::try_open(project_root);
+    if let Some(ref c) = ctx {
+        // Annotation syncs below may write; never let a concurrent writer
+        // (MCP server watcher, another index run) stall an interactive grep
+        // for the default 5s busy_timeout — fail fast and mark stale instead.
+        let _ = c.db.conn().execute_batch("PRAGMA busy_timeout = 250;");
+    }
+    // Lazy query-time freshness (parity with the MCP file_path tools'
+    // ensure_file_indexed, v0.18.0): before annotating from the index,
+    // hash-compare the file and re-index it when dirty — bounded by a sync
+    // budget so a repo-wide grep over many dirty files keeps its latency.
+    // Beyond budget (or on write contention) annotations carry [stale].
+    let sync_budget: usize = std::env::var("CODE_GRAPH_GREP_SYNC_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let mut synced = 0usize;
+    let mut stale_count = 0usize;
+    let mut node_cache: std::collections::HashMap<String, (Vec<queries::NodeResult>, bool)> =
+        std::collections::HashMap::new();
+    let mut lookup_container = |file: &str, line: u64| -> Option<(String, String, i64, i64, bool)> {
+        let ctx = ctx.as_ref()?;
+        if !node_cache.contains_key(file) {
+            let mut stale = false;
+            // Only files already in the index are sync candidates: indexing a
+            // brand-new path here could pull gitignored supplement files into
+            // the index, diverging from scan_directory's scope.
+            let stored: Option<String> = ctx
+                .db
+                .conn()
+                .query_row("SELECT blake3_hash FROM files WHERE path = ?1", [file], |r| r.get(0))
+                .ok();
+            if let Some(stored_hash) = stored {
+                let abs = ctx.project_root.join(file);
+                let disk = crate::indexer::merkle::hash_file(&abs).ok();
+                if disk.as_deref() != Some(stored_hash.as_str()) {
+                    if synced < sync_budget {
+                        match crate::indexer::pipeline::ensure_file_indexed(
+                            &ctx.db, &ctx.project_root, file, None,
+                        ) {
+                            Ok(changed) => {
+                                if changed {
+                                    synced += 1;
+                                }
+                            }
+                            // SQLITE_BUSY / parse failure: annotate honestly.
+                            Err(_) => stale = true,
+                        }
+                    } else {
+                        stale = true;
+                    }
+                }
+            }
+            if stale {
+                stale_count += 1;
+            }
+            let nodes = queries::get_nodes_by_file_path(ctx.db.conn(), file).unwrap_or_default();
+            node_cache.insert(file.to_string(), (nodes, stale));
+        }
+        let (nodes, stale) = node_cache.get(file)?;
+        find_containing_node_in(nodes, line).map(|(t, n, s, e)| (t, n, s, e, *stale))
+    };
+
+    // Output. EPIPE (reader hung up, e.g. `| head`) is not an error — finish
+    // silently with exit 0 like grep instead of spraying "Broken pipe".
+    let write_result: std::io::Result<()> = (|| {
+        let mut stdout = std::io::stdout().lock();
+        if json_mode {
+            let mut json_results = Vec::new();
+            for m in &matches {
+                let mut entry = serde_json::json!({
+                    "file": m.file,
+                    "line": m.line,
+                    "text": m.text,
+                });
+                if m.is_context {
+                    entry["context"] = serde_json::json!(true);
+                } else if let Some(container) = lookup_container(&m.file, m.line) {
+                    let mut c = serde_json::json!({
                         "type": container.0,
                         "name": container.1,
                         "lines": format!("{}-{}", container.2, container.3),
                     });
+                    if container.4 {
+                        c["stale"] = serde_json::json!(true);
+                    }
+                    entry["container"] = c;
+                }
+                json_results.push(entry);
+            }
+            let serialized = serde_json::to_string(&json_results)
+                .unwrap_or_else(|_| "[]".to_string());
+            writeln!(stdout, "{}", serialized)?;
+        } else {
+            // grep formatting: matches `file:line`, context lines `file-line`,
+            // `--` between non-contiguous groups when context is shown.
+            let mut prev: Option<(String, u64)> = None;
+            for m in &matches {
+                if context_requested {
+                    if let Some((ref pf, pl)) = prev {
+                        if pf != &m.file || m.line > pl + 1 {
+                            writeln!(stdout, "--")?;
+                        }
+                    }
+                    prev = Some((m.file.clone(), m.line));
+                }
+                let sep = if m.is_context { '-' } else { ':' };
+                write!(stdout, "{}{}{}  {}", m.file, sep, m.line, m.text)?;
+                if !m.text.ends_with('\n') {
+                    writeln!(stdout)?;
+                }
+                if !m.is_context {
+                    if let Some((node_type, name, start, end, stale)) =
+                        lookup_container(&m.file, m.line)
+                    {
+                        let marker = if stale { " [stale]" } else { "" };
+                        writeln!(stdout, "  → {} {} (lines {}-{}){}", node_type, name, start, end, marker)?;
+                    }
                 }
             }
-            json_results.push(entry);
         }
-        writeln!(stdout, "{}", serde_json::to_string(&json_results)?)?;
-        return Ok(());
+        Ok(())
+    })();
+    match write_result {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => grep_exit(0),
+        other => other?,
     }
 
-    // Text output — cache nodes per file to avoid redundant DB queries
-    let mut node_cache: std::collections::HashMap<&str, Vec<queries::NodeResult>> =
-        std::collections::HashMap::new();
-    for m in &matches {
-        write!(stdout, "{}:{}  {}", m.file, m.line, m.text)?;
-        if !m.text.ends_with('\n') {
-            writeln!(stdout)?;
-        }
-        if let Some(ref ctx) = ctx {
-            let nodes = node_cache.entry(&m.file).or_insert_with(|| {
-                queries::get_nodes_by_file_path(ctx.db.conn(), &m.file).unwrap_or_default()
-            });
-            if let Some((node_type, name, start, end)) = find_containing_node_in(nodes, m.line) {
-                writeln!(stdout, "  → {} {} (lines {}-{})", node_type, name, start, end)?;
-            }
-        }
+    if !capped_files.is_empty() {
+        eprintln!(
+            "[code-graph] truncated: {} file(s) hit the per-file cap of {} matches: {}. Use --max-count 0 for all matches.",
+            capped_files.len(),
+            max_count,
+            capped_files.join(", ")
+        );
     }
-
+    if stale_count > 0 {
+        eprintln!(
+            "[code-graph] {} file(s) changed since last index; annotations marked [stale] — run: code-graph-mcp incremental-index",
+            stale_count
+        );
+    }
     if ctx.is_none() {
         eprintln!("[code-graph] No index found. Run: code-graph-mcp incremental-index");
         eprintln!("[code-graph] Showing plain grep results (no AST context).");
@@ -1438,9 +1748,22 @@ struct GrepMatch {
     file: String,
     line: u64,
     text: String,
+    /// true for -A/-B/-C context lines (rg JSON `type: "context"` records)
+    is_context: bool,
 }
 
-/// Parse ripgrep JSON output into structured matches.
+/// Make an rg-reported path relative to the project root.
+fn relativize_path<'a>(path_str: &'a str, root_str: &str) -> &'a str {
+    let root_prefix = root_str.trim_end_matches('/');
+    path_str
+        .strip_prefix(root_prefix)
+        .or_else(|| path_str.strip_prefix(root_str))
+        .unwrap_or(path_str)
+        .trim_start_matches('/')
+}
+
+/// Parse ripgrep JSON output into structured matches (and context lines when
+/// -A/-B/-C were passed — rg interleaves `context` records in print order).
 fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
     let root_str = project_root.to_string_lossy().into_owned();
     let mut matches = Vec::new();
@@ -1451,9 +1774,11 @@ fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
-        if v["type"].as_str() != Some("match") {
-            continue;
-        }
+        let is_context = match v["type"].as_str() {
+            Some("match") => false,
+            Some("context") => true,
+            _ => continue,
+        };
         let data = &v["data"];
         let Some(path_str) = data["path"]["text"].as_str() else {
             continue;
@@ -1463,31 +1788,14 @@ fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
         };
         let text = data["lines"]["text"].as_str().unwrap_or("").to_string();
 
-        // Make path relative to project root
-        let root_prefix = root_str.trim_end_matches('/');
-        let relative_path = path_str
-            .strip_prefix(root_prefix)
-            .or_else(|| path_str.strip_prefix(&root_str))
-            .unwrap_or(path_str)
-            .trim_start_matches('/');
-
         matches.push(GrepMatch {
-            file: relative_path.to_string(),
+            file: relativize_path(path_str, &root_str).to_string(),
             line: line_number,
             text,
+            is_context,
         });
     }
     matches
-}
-
-/// Find the innermost AST node containing the given line (with DB lookup).
-fn find_containing_node(
-    ctx: &CliContext,
-    file_path: &str,
-    line: u64,
-) -> Option<(String, String, i64, i64)> {
-    let nodes = queries::get_nodes_by_file_path(ctx.db.conn(), file_path).ok()?;
-    find_containing_node_in(&nodes, line)
 }
 
 /// Find the innermost AST node containing the given line (from pre-loaded nodes).

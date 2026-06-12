@@ -42,6 +42,9 @@ type: reference
 > ToolSearch 加载），而 Bash 永远在线——真实编程夜（2026-06-12）观测到的全部
 > 转化都是 CLI 调用。结构化查询的最快路径是 Bash 直呼
 > `code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`。
+> `grep` 是 drop-in 替代：`-F` 字面 / `-i` / `-w` / `-l` / `-A/-B/-C N` 上下文 /
+> 多路径 / `--max-count 0`，退出码兼容 grep（0/1/2），召回达 git-grep 级
+> （tracked-but-gitignored 也能搜到），每条命中标注所属 fn/class。
 >
 > v0.10.0 起：tools/list 默认只暴露 7 个核心工具；下表"进阶 5"中的工具
 > 已从 tools/list 隐藏以节省 session 启动 tokens。**Claude Code 里请走 CLI

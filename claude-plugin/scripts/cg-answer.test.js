@@ -21,6 +21,9 @@ if (pattern === 'HangForever') { setTimeout(() => {}, 60000); }
 else if (pattern === 'ExplodePlease') { process.exit(3); }
 else if (pattern === 'NothingHere') {
   process.stdout.write('[code-graph] No matches for: NothingHere\\n');
+} else if (pattern === 'NothingHereExit1') {
+  // v0.50 grep-parity binary: no match → empty stdout + exit 1
+  process.exit(1);
 } else {
   process.stdout.write(
     'src/storage/db.rs:42  fn ' + pattern + '() {\\n' +
@@ -81,7 +84,13 @@ test('runGrepAnswer: CLI "[code-graph] No matches" → status no-hits', () => {
   assert.equal(r.status, 'no-hits');
 });
 
-test('runGrepAnswer: nonzero exit → unavailable', () => {
+test('runGrepAnswer: exit 1 (v0.50 grep-parity no-match) → status no-hits', () => {
+  const r = runGrepAnswer({ cwd: stubDir, pattern: 'NothingHereExit1', binary: stubBinary() });
+  assert.equal(r.status, 'no-hits',
+    'grep-parity exit 1 means no match, not a failed binary');
+});
+
+test('runGrepAnswer: exit >1 → unavailable', () => {
   const r = runGrepAnswer({ cwd: stubDir, pattern: 'ExplodePlease', binary: stubBinary() });
   assert.equal(r.status, 'unavailable');
 });

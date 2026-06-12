@@ -70,6 +70,84 @@ mod inner {
             Ok(cache.join("code-graph").join("models"))
         }
 
+        /// blake3 of the pinned model.safetensors content
+        /// (sentence-transformers/all-MiniLM-L6-v2 @ HF revision c9745ed1d9f2,
+        /// sha256 53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db).
+        /// MUST be bumped in lockstep with HF_REVISION in
+        /// .github/workflows/release.yml ("Package model files" step) — a
+        /// mismatched constant makes every client reject the released tarball.
+        pub const MODEL_CONTENT_BLAKE3: &'static str =
+            "8087e9bf97c265f8435ed268733ecf3791825ad24850fd5d84d89e32ee3a589a";
+
+        /// Marker file recording which model content the cache dir holds.
+        const MODEL_ID_MARKER: &'static str = ".model-id";
+
+        fn hash_file_blake3(path: &std::path::Path) -> Result<String> {
+            use std::io::Read as IoRead;
+            let mut hasher = blake3::Hasher::new();
+            let mut f = std::fs::File::open(path)?;
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 { break; }
+                hasher.update(&buf[..n]);
+            }
+            Ok(hasher.finalize().to_hex().to_string())
+        }
+
+        /// Verify that `dir/model.safetensors` matches `expected` (blake3 hex).
+        /// On success writes the `.model-id` marker so later checks are O(1);
+        /// on mismatch removes the bad weights so a half-poisoned cache can't
+        /// be loaded later, and returns an error.
+        pub fn verify_model_dir(dir: &std::path::Path, expected: &str) -> Result<()> {
+            let weights = dir.join("model.safetensors");
+            let actual = Self::hash_file_blake3(&weights)?;
+            if actual != expected {
+                let _ = std::fs::remove_file(&weights);
+                let _ = std::fs::remove_file(dir.join(Self::MODEL_ID_MARKER));
+                anyhow::bail!(
+                    "model.safetensors content mismatch (blake3 {} != expected {}) — rejected",
+                    actual, expected
+                );
+            }
+            std::fs::write(dir.join(Self::MODEL_ID_MARKER), expected)?;
+            Ok(())
+        }
+
+        /// Version/identity-aware cache check (testable core; `expected` is the
+        /// blake3 the running binary requires). True iff the cached weights are
+        /// present AND match. A marker hit short-circuits; a missing marker
+        /// (pre-v0.50 install) triggers a one-time hash, writing the marker on
+        /// match. Unreadable file → treat as current (never churn-redownload on
+        /// a flaky FS; load() will surface the real error).
+        pub fn cached_model_matches(dir: &std::path::Path, expected: &str) -> bool {
+            let weights = dir.join("model.safetensors");
+            if !weights.exists() {
+                return false;
+            }
+            let marker = dir.join(Self::MODEL_ID_MARKER);
+            if let Ok(id) = std::fs::read_to_string(&marker) {
+                return id.trim() == expected;
+            }
+            match Self::hash_file_blake3(&weights) {
+                Ok(h) if h == expected => {
+                    let _ = std::fs::write(&marker, expected);
+                    true
+                }
+                Ok(_) => false,
+                Err(_) => true,
+            }
+        }
+
+        /// Is the cached model the one THIS binary expects? Existence alone is
+        /// not enough: the existence-only check left the model permanently
+        /// pinned to whatever was downloaded first (same fault class as the
+        /// native-binary pin fixed in v0.45.x) and accepted any content that
+        /// happened to sit in the cache dir.
+        pub fn cached_model_is_current(dir: &std::path::Path) -> bool {
+            Self::cached_model_matches(dir, Self::MODEL_CONTENT_BLAKE3)
+        }
+
         /// URL for model download, based on current binary version.
         pub fn model_download_url() -> String {
             let version = env!("CARGO_PKG_VERSION");
@@ -121,11 +199,18 @@ mod inner {
                 entry.unpack_in(dest_dir)?;
             }
 
+            // Content verification against the compiled-in pin. The release
+            // also publishes models.tar.gz.sha256, but that asset only
+            // self-validates the bundle — a swapped GitHub release asset would
+            // come with a matching .sha256. The binary pinning the expected
+            // weights hash is the only check the attacker can't ship alongside.
+            Self::verify_model_dir(dest_dir, Self::MODEL_CONTENT_BLAKE3)?;
+
             // Write version marker (blake3 hash of tarball for cache invalidation)
             let hash = blake3::hash(&body);
             std::fs::write(dest_dir.join(".version"), hash.to_hex().as_str())?;
 
-            tracing::info!("[model] Model extracted to {:?} ({} bytes)", dest_dir, body.len());
+            tracing::info!("[model] Model extracted and verified at {:?} ({} bytes)", dest_dir, body.len());
             Ok(())
         }
 
@@ -465,5 +550,81 @@ mod tests {
             "URL should contain package version: {}", url);
         assert!(url.contains("models.tar.gz"),
             "URL should point to models.tar.gz: {}", url);
+    }
+
+    // ── cached_model_matches / verify_model_dir (model-pin guard) ──────────
+
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_cached_model_matches_is_identity_aware_not_existence_only() {
+        use inner::EmbeddingModel as M;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let content = b"fake-weights";
+        let expected = blake3::hash(content).to_hex().to_string();
+
+        // Missing weights → not current.
+        assert!(!M::cached_model_matches(dir, &expected));
+
+        // Pre-v0.50 cache (no marker): matching content → current, marker written.
+        std::fs::write(dir.join("model.safetensors"), content).unwrap();
+        assert!(M::cached_model_matches(dir, &expected));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".model-id")).unwrap().trim(),
+            expected,
+            "one-time hash must persist the marker"
+        );
+
+        // Marker present and matching → current (O(1) path).
+        assert!(M::cached_model_matches(dir, &expected));
+
+        // Binary now expects different weights (new pinned model) → stale.
+        let other = blake3::hash(b"new-model").to_hex().to_string();
+        assert!(!M::cached_model_matches(dir, &other),
+            "stale cached model must be reported as not current");
+    }
+
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_model_content_pin_matches_local_weights() {
+        // A typo in MODEL_CONTENT_BLAKE3 would make every client reject the
+        // released models.tar.gz forever. When the repo's models/ dir holds
+        // the pinned weights (dev machines; CI release runners don't), assert
+        // the constant matches the real file. Skips silently otherwise.
+        let local = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("models").join("model.safetensors");
+        if !local.exists() {
+            return;
+        }
+        let dir = local.parent().unwrap();
+        assert!(
+            inner::EmbeddingModel::cached_model_matches(
+                dir, inner::EmbeddingModel::MODEL_CONTENT_BLAKE3),
+            "MODEL_CONTENT_BLAKE3 does not match models/model.safetensors — \
+             constant typo or local models/ dir drifted from the pinned HF revision"
+        );
+    }
+
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_verify_model_dir_rejects_and_removes_mismatched_weights() {
+        use inner::EmbeddingModel as M;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("model.safetensors"), b"tampered").unwrap();
+
+        let expected = blake3::hash(b"genuine").to_hex().to_string();
+        let result = M::verify_model_dir(dir, &expected);
+        assert!(result.is_err(), "mismatched weights must be rejected");
+        assert!(!dir.join("model.safetensors").exists(),
+            "rejected weights must be removed so a poisoned cache can't load later");
+
+        // Matching content verifies and writes the marker.
+        std::fs::write(dir.join("model.safetensors"), b"genuine").unwrap();
+        M::verify_model_dir(dir, &expected).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".model-id")).unwrap().trim(),
+            expected
+        );
     }
 }

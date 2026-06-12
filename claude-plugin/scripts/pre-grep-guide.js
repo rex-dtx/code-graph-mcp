@@ -242,6 +242,44 @@ function extractSedReadTargets(cmd) {
   return out;
 }
 
+// v0.50 — a compound command (`grep …; sed -n 1,60p f` / `grep … && wc`) is
+// denied WHOLE, but the answer covers only the grep. The 2026-06-13 mem-project
+// deny swallowed a `; sed` read while the copy said "use these results directly
+// instead of re-running" — the tail's intent was silently dropped. Extract the
+// first top-level `;`/`&&` tail (quote-aware) so the deny can flag it for
+// re-issue. `||` tails are skipped: the answer delivered hits, so the on-failure
+// branch would not have run anyway. Pipes/redirects are the same pipeline.
+function extractUnansweredTail(cmd) {
+  if (!cmd || typeof cmd !== 'string' || cmd.length > 2000) return null;
+  let quote = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === ';' || (c === '&' && cmd[i + 1] === '&')) {
+      const tail = cmd.slice(i + (c === ';' ? 1 : 2)).trim();
+      return tail || null;
+    }
+  }
+  return null;
+}
+
+// Shared deny-copy footer for the unanswered compound tail. Budget-conscious:
+// two lines, verbatim command so the model can re-issue without thinking.
+// Wording is path-neutral — it must stay true for BOTH the answered deny
+// ("grep half answered, tail wasn't") and the static fallback (nothing was).
+function appendUnansweredTailNote(lines, tail) {
+  if (!tail) return;
+  const shown = tail.length > 300 ? tail.slice(0, 300) + '…' : tail;
+  lines.push(
+    'NOTE: the rest of this compound command (after the grep) did NOT run — re-issue it separately:',
+    `$ ${shown}`,
+  );
+}
+
 // v0.47.0 — pull the first source-tree path token out of the denied command so
 // the inline answer can scope its search the same way the raw grep would have.
 function extractSearchPath(cmd) {
@@ -282,7 +320,7 @@ function buildHint() {
   // Terse, no banner spam. Single message budget ~600 bytes.
   return [
     '[code-graph] Raw `grep`/`rg` on indexed source — consider AST-aware equivalents:',
-    '  • code-graph-mcp grep "<pat>" <path>          # grep + containing fn/module per hit',
+    '  • code-graph-mcp grep "<pat>" [paths...]      # grep + containing fn/module per hit (-F literal, -i, -w, -l, -C N)',
     '  • code-graph-mcp ast-search "<pat>" --type fn # filter by type/returns/params',
     '  • code-graph-mcp callgraph SYMBOL             # callers + callees, repo-wide',
     '  • code-graph-mcp show SYMBOL                  # one symbol: signature + source',
@@ -290,20 +328,22 @@ function buildHint() {
   ].join('\n');
 }
 
-function buildBlockReason() {
+function buildBlockReason(unansweredTail) {
   // Shown to Claude via PreToolUse `decision: block` reason. Must give a
   // concrete alternate command Claude can re-issue without further thinking.
   // v0.49 — NO escape-hatch line anywhere in deny copy: the daagu 2026-06-12
   // night proved even the "THIS command only" scoping reads as a teachable
   // permanent prefix (adopted in 8s, reused 11×, incl. on the exact identifier
   // searches this hook targets). The env opt-out stays documented in README.
-  return [
+  const lines = [
     '[code-graph] Raw `grep -rn` on indexed source — denied by code-graph hook.',
     'Use the AST-aware equivalent (returns containing fn/module per hit, repo-wide):',
-    '  code-graph-mcp grep "<pattern>" <path>          # FTS + AST context per hit',
+    '  code-graph-mcp grep "<pattern>" [paths...]      # AST context per hit; -F literal, -i, -w, -l, -C N, --max-count 0',
     '  code-graph-mcp ast-search "<pattern>" --type fn # filter by node type',
     '  code-graph-mcp callgraph SYMBOL                 # callers + callees',
-  ].join('\n');
+  ];
+  appendUnansweredTailNote(lines, unansweredTail);
+  return lines.join('\n');
 }
 
 // v0.47.0 — deny WITH the answer inline. Hint-only had ~0% transfer and a bare
@@ -313,7 +353,7 @@ function buildBlockReason() {
 // advertising the bypass taught it a permanent prefix within 5 seconds (daagu
 // 2026-06-11: one deny → 14 bypassed greps). The static deny keeps a scoped
 // escape because there we give no answer.
-function buildBlockReasonWithAnswer(pattern, searchPath, answer) {
+function buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail) {
   const cmdShown = `code-graph-mcp grep "${pattern}"${searchPath ? ` ${searchPath}` : ''}`;
   const lines = [
     '[code-graph] Raw `grep` on indexed source — denied; the AST-aware equivalent already ran for you:',
@@ -326,6 +366,7 @@ function buildBlockReasonWithAnswer(pattern, searchPath, answer) {
   lines.push(
     'Each hit shows its containing fn/module — use these results directly instead of re-running the search.',
   );
+  appendUnansweredTailNote(lines, unansweredTail);
   return lines.join('\n');
 }
 
@@ -333,7 +374,7 @@ function buildBlockReasonWithAnswer(pattern, searchPath, answer) {
 // context flags (-A/-B/-C = "show me the body"); the answer IS the bodies,
 // fetched via `code-graph-mcp show`. answer.text already carries per-symbol
 // `$ code-graph-mcp show <sym>` headers.
-function buildShowDenyReason(answer) {
+function buildShowDenyReason(answer, unansweredTail) {
   const lines = [
     '[code-graph] Raw grep for symbol definitions — denied; here are the definitions from the AST index:',
     answer.text,
@@ -342,6 +383,7 @@ function buildShowDenyReason(answer) {
     lines.push('(truncated — re-run the `code-graph-mcp show <symbol>` command above for full source)');
   }
   lines.push('Use these directly instead of re-running the search.');
+  appendUnansweredTailNote(lines, unansweredTail);
   return lines.join('\n');
 }
 
@@ -364,7 +406,7 @@ function translateBreToRg(cmd, pattern) {
 // ripgrep) mean 0 hits is NOT proof of absence, so denying here could mislead.
 // Let the raw grep through with an honest one-liner.
 function buildNoHitsFyi(pattern) {
-  return `[code-graph] FYI: \`code-graph-mcp grep "${pattern}"\` found no matches — raw grep proceeding.`;
+  return `[code-graph] FYI: \`code-graph-mcp grep "${pattern}"\` found no matches — raw grep proceeding. (Regex-metachar patterns: \`code-graph-mcp grep -F\` searches literally.)`;
 }
 
 // --- Main execution (only when run directly) ---
@@ -483,20 +525,26 @@ function runMain() {
     // is the documented modern path. Exit 0 — this is a routing decision, not
     // a hook failure (exit 2 would mark the tool call as "hook errored").
     const answered = answer.status === 'hits';
+    // v0.50 — flag the unanswered `;`/`&&` tail. Extracted from rawCmd: its
+    // paths are valid in the model's shell cwd, where the re-issue will run.
+    const unansweredTail = extractUnansweredTail(rawCmd);
     recordRecommendation(root, {
       hook: 'grep', action: 'deny', answered,
       // mode segments which answer type converts (show=bodies, grep=hits).
       ...(answered ? { mode: answeredMode } : {}),
+      // tail segments compound-command denies — lets the funnel compare
+      // re-issue behavior for denies that carried a tail note.
+      ...(unansweredTail ? { tail: true } : {}),
     });
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         permissionDecision: 'deny',
         permissionDecisionReason: !answered
-          ? buildBlockReason()
+          ? buildBlockReason(unansweredTail)
           : answeredMode === 'show'
-            ? buildShowDenyReason(answer)
-            : buildBlockReasonWithAnswer(pattern, searchPath, answer),
+            ? buildShowDenyReason(answer, unansweredTail)
+            : buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail),
       },
     }) + '\n');
     return;
@@ -518,6 +566,7 @@ module.exports = {
   translateBreToRg,      // v0.49 — BRE→rust-regex dialect bridge
   buildShowDenyReason,   // v0.49 — show-mode deny copy
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
+  extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix

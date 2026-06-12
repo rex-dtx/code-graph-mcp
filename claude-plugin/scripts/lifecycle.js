@@ -75,6 +75,48 @@ function hasInstalledPluginRecord() {
   return !!(installed && installed.plugins && Array.isArray(installed.plugins[PLUGIN_ID]) && installed.plugins[PLUGIN_ID].length > 0);
 }
 
+/** The installPath Claude Code currently considers active (installed_plugins.json), or null. */
+function activeInstallPath() {
+  const installed = readJson(installedPluginsPath());
+  const recs = installed && installed.plugins && installed.plugins[PLUGIN_ID];
+  if (!Array.isArray(recs) || !recs[0] || typeof recs[0].installPath !== 'string') return null;
+  return recs[0].installPath;
+}
+
+/**
+ * Stale-relic detection: is THIS script running from an old plugin-cache
+ * version dir while installed_plugins.json points at a different (active)
+ * install that exists on disk?
+ *
+ * Why: a still-running Claude Code process keeps firing SessionStart from the
+ * install path it loaded at startup. After auto-update installs vN+1 and
+ * re-anchors manifest + settings.json, the next SessionStart in that old
+ * process runs the vN scripts, whose syncLifecycleConfig sees
+ * `manifest.version !== currentVersion` and — direction-blind — calls
+ * update(), dragging manifest and every settings.json hook path back to the
+ * vN dir. The two versions then ping-pong (observed live 2026-06-12: manifest
+ * 0.49.0 → rewritten 0.48.0 fifteen minutes after a successful update).
+ *
+ * The authority is installed_plugins.json, not version direction: a deliberate
+ * downgrade via /plugin lands installPath == the old dir, so the old scripts
+ * keep full self-heal rights. Dev checkouts and npm installs are exempt
+ * (pluginRoot not under the plugins cache).
+ */
+function isStaleRelicContext({
+  pluginRoot = PLUGIN_ROOT,
+  cacheRoot = pluginsCacheDir(),
+  activePath = activeInstallPath(),
+  existsSync = fs.existsSync,
+} = {}) {
+  if (!activePath) return false;
+  const root = path.resolve(pluginRoot);
+  const cache = path.resolve(cacheRoot);
+  if (root !== cache && !root.startsWith(cache + path.sep)) return false;
+  const active = path.resolve(activePath);
+  if (active === root) return false;
+  return existsSync(path.join(active, 'scripts', 'lifecycle.js'));
+}
+
 function isOurComposite(settings) {
   return settings.statusLine &&
     settings.statusLine.command &&
@@ -377,6 +419,50 @@ function registerHooksToSettings(settings) {
   return before !== JSON.stringify(settings.hooks);
 }
 
+// Inventory of (event, matcher) tuples we expect to find in settings.json after
+// install. Consumed by doctor (report + fix) and session-init (self-heal):
+// `missing` = entry absent; `stale` = present but the registered command no
+// longer matches what we'd write now (points at an old plugin-cache version
+// dir / moved path). A stale path can run pre-recordRecommendation hook code,
+// so the hook fires but the conversion metric stays dark — invisible to a
+// present/absent check. This is the 0.45.1-registered-while-0.45.4-active
+// case the RCA surfaced.
+function surveyHookCoverage(settings) {
+  const desired = buildSettingsHookEntries();
+  const expected = [];
+  const desiredCmd = {}; // key -> command string we would write now
+  for (const [event, entries] of Object.entries(desired)) {
+    for (const e of entries) {
+      const key = `${event}:${e.matcher || '*'}`;
+      expected.push(key);
+      desiredCmd[key] = e.hooks && e.hooks[0] && e.hooks[0].command;
+    }
+  }
+
+  const present = new Set();
+  const presentCmd = {}; // key -> command currently registered
+  if (settings && settings.hooks) {
+    for (const [event, entries] of Object.entries(settings.hooks)) {
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        if (isOurHookEntry(entry)) {
+          const key = `${event}:${entry.matcher || '*'}`;
+          present.add(key);
+          if (entry.hooks && entry.hooks[0] && entry.hooks[0].command) {
+            presentCmd[key] = entry.hooks[0].command;
+          }
+        }
+      }
+    }
+  }
+
+  const missing = expected.filter(k => !present.has(k));
+  const stale = expected.filter(k =>
+    present.has(k) && desiredCmd[k] && presentCmd[k] && presentCmd[k] !== desiredCmd[k]
+  );
+  return { expected, present: [...present], missing, stale };
+}
+
 // --- Install (idempotent) ---
 
 function install() {
@@ -673,6 +759,8 @@ module.exports = {
   getPluginVersion, cleanupOldCacheVersions,
   removeHooksFromSettings, isOurHookEntry,
   registerHooksToSettings, buildSettingsHookEntries,                  // v0.32.0
+  surveyHookCoverage, compositeCommand,                                // v0.49.1 — version-aware self-heal
+  activeInstallPath, isStaleRelicContext,                              // v0.49.1 — stale-relic downgrade guard
   SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests
   PLUGIN_ROOT,                                                         // v0.32.1 — for tests / consumers
   registerStatuslineProvider, unregisterStatuslineProvider,

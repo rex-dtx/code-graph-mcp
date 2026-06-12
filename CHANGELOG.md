@@ -1,5 +1,94 @@
 # Changelog
 
+## v0.50.0 — grep parity (BREAKING: exit codes) + auto-update chain audit
+
+**Migration note (breaking)**: `code-graph-mcp grep` now uses grep-compatible exit
+codes — **0 = matched, 1 = no match, 2 = error/usage** (previously: 0 on no-match,
+1 on most errors). Scripts that treated any nonzero exit as failure must distinguish
+1 (no match) from 2 (trouble). Revert path: pin the previous version
+(`npm i @sdsrs/code-graph@0.49.0` / `cargo install code-graph-mcp --version 0.49.0`).
+The bundled hook consumer (`cg-answer.js`) is updated in the same release and accepts
+both old and new shapes.
+
+### Auto-update chain audit (plugin shell / marketplace clone / binary / model)
+
+- **fix(plugin)**: stale-relic downgrade war — a still-running Claude Code process
+  fires SessionStart from the plugin-cache dir it loaded at startup; after
+  auto-update installed vN+1, the vN scripts' `syncLifecycleConfig` saw
+  `manifest.version !== currentVersion` and (direction-blind) called `update()`,
+  dragging the install manifest and all six settings.json hook/statusline paths
+  back to vN — upgrade↔downgrade ping-pong until the next auto-update re-ran
+  (observed live 2026-06-12→13: manifest 0.49.0 → 0.48.0 fifteen minutes after a
+  successful update; settings re-downgraded again after doctor re-registered).
+  `syncLifecycleConfig` now defers to `installed_plugins.json` as the authority:
+  a script running from a cache dir that is NOT the active installPath returns
+  `deferred-to-active-install` and touches nothing. Deliberate downgrades via
+  /plugin keep self-heal rights (installPath then IS the old dir); dev checkouts
+  and npm installs are exempt. (`isStaleRelicContext` in lifecycle.js +
+  install-e2e §1.11.) A relic SessionStart also skips the auto-adopt template
+  refresh (it would "refresh" MEMORY.md back to the OLD shipped table), and
+  doctor's settings-writing repairs (`hooks-invalid` / `missing-hooks-in-settings`)
+  get the same guard with a redirect to the active copy (`relicRepairGuard`).
+- **fix(plugin)**: marketplace clone staleness — auto-update wrote the plugin
+  cache + installed_plugins.json but never touched
+  `~/.claude/plugins/marketplaces/code-graph-mcp`, so its marketplace.json stayed
+  at whatever version the last manual /plugin command saw (observed: 0.48.0 four
+  days after 0.49.0 shipped), making the /plugin UI lie and letting Claude Code
+  reinstall old plugin files from it. After a successful shell update, auto-update
+  now fast-forwards the clone (`git pull --ff-only`, silent no-op on dirty/
+  diverged/missing-git). State gains `marketplaceRefreshed`.
+- **fix(embedding)**: model cache was existence-only and unverified — the
+  embedding model (`models.tar.gz` → `~/.cache/code-graph/models/`) downloaded
+  once and was never version-checked (same fault class as the v0.45.x native-
+  binary pin) nor integrity-checked (the published `.sha256` only self-validates
+  the bundle). The binary now pins the expected `model.safetensors` content
+  (`MODEL_CONTENT_BLAKE3`); downloads verify-or-reject (mismatched weights are
+  deleted, not loaded), the cache check is identity-aware (`.model-id` marker,
+  one-time hash migration for pre-existing caches), and a future model change
+  re-downloads automatically instead of pinning forever. Offline/stale caches
+  still load (graceful degradation unchanged).
+- **ci(release)**: the "Package model files" step now `sha256sum -c` pins all
+  three HF files against known-good hashes of the pinned revision, so a
+  compromised HF response or a revision bump without updating the client-side
+  `MODEL_CONTENT_BLAKE3` fails the release instead of shipping mismatched weights.
+
+- **fix**: leading-dash patterns work — `grep "--no-default-features"` no longer
+  parses as a flag (clap `allow_hyphen_values` + `--` separator before the rg pattern).
+- **fix**: per-file truncation is surfaced — files hitting the match cap are listed on
+  stderr; new `--max-count N` flag controls the cap (`0` = unlimited, default 100).
+- **fix**: repo-wide searches now include tracked-but-gitignored files (`git ls-files
+  -ci` supplement) — `git grep` semantics; previously a `docs/` ignore rule silently
+  hid git-tracked docs. Untracked ignored files stay skipped.
+- **fix**: `... | head` no longer prints `Error: Broken pipe (os error 32)` — EPIPE
+  ends output silently with exit 0, like grep.
+- **feat**: `-i/--ignore-case`, `-w/--word-regexp`, `-F/--fixed-strings` (literal
+  search — regex-hostile patterns like `res.json(` work with `-F`), multiple path
+  arguments.
+- **feat**: `-l/--files-with-matches` (bare paths; `--json` → array of strings) and
+  `-A/-B/-C N` context lines (grep-style `:` match / `-` context separators with
+  `--` between groups; AST annotation stays on match lines only; `--json` context
+  entries carry `"context": true`).
+- **perf**: `--json` mode reuses the per-file AST-node cache (was one DB query per
+  match).
+- **fix(plugin)**: grep denies on compound commands (`grep …; sed -n 1,60p f` /
+  `grep … && wc`) now flag the unanswered `;`/`&&` tail with a verbatim re-issue
+  line — on all three deny paths (grep-answer, show-answer, and the static
+  fallback). Previously the whole command was blocked but the deny copy ("use
+  these results directly instead of re-running") silently swallowed the tail's
+  intent (2026-06-13 mem-project deny dropped a `sed` read of the file's first
+  60 lines). `||` tails stay unflagged: with hits delivered, the on-failure
+  branch would not have run anyway. Quote-aware — separators inside pattern
+  quotes don't trigger. Deny records in `recommendations.jsonl` gain `tail: true`
+  when a note was carried, so the funnel can segment re-issue behavior
+  (`jq 'select(.tail)'` until `stats` breaks it out).
+- **feat**: query-time freshness for AST annotations — before annotating, each
+  matched file is hash-compared and lazily re-indexed when dirty (parity with the
+  MCP tools' `ensure_file_indexed`), bounded by a sync budget
+  (`CODE_GRAPH_GREP_SYNC_BUDGET`, default 8 files) and a 250ms SQLite busy
+  timeout; beyond budget or under write contention annotations carry `[stale]`
+  (JSON: `"stale": true`) with a stderr hint. Cost: +6.7ms on a repo-wide search
+  (29.6→36.3ms avg).
+
 ## v0.49.0 — feat: answer-delivery upgrade — every guidance surface delivers results, and the funnel finally sees failures
 
 First valid funnel reading (daagu, 6 sessions / ~3.5h real coding, 2026-06-12: 53 hook

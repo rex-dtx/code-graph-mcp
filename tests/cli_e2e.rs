@@ -68,11 +68,17 @@ export class Logger {
 
 /// Run a CLI command and return (stdout, stderr, exit_code).
 fn run_cli(project: &TempDir, args: &[&str]) -> (String, String, i32) {
-    let output = Command::new(binary_path())
-        .current_dir(project.path())
-        .args(args)
-        .output()
-        .expect("failed to run binary");
+    run_cli_env(project, args, &[])
+}
+
+/// Like `run_cli` but with extra environment variables.
+fn run_cli_env(project: &TempDir, args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32) {
+    let mut cmd = Command::new(binary_path());
+    cmd.current_dir(project.path()).args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to run binary");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -286,19 +292,21 @@ fn test_cli_grep() {
 fn test_cli_grep_no_matches() {
     if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
+    // grep-parity: no match exits 1 (was 0 pre-v0.50) so scripts can branch
+    // on match presence like with real grep.
     let (_, stderr, code) = run_cli(&project, &["grep", "xyznonexistent"]);
-    assert_eq!(code, 0);
+    assert_eq!(code, 1, "no match must exit 1 (grep parity)");
     assert!(stderr.contains("No matches"), "should show no matches message");
 }
 
 #[test]
-fn test_cli_grep_invalid_regex_exits_nonzero() {
+fn test_cli_grep_invalid_regex_exits_two() {
     if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
-    // Unescaped `(` is an invalid regex — ripgrep exits 2. The CLI must surface
-    // a non-zero exit (not silently succeed like a no-match).
+    // Unescaped `(` is an invalid regex — ripgrep exits 2. grep-parity: error
+    // paths exit 2 (grep's "trouble" code), distinct from no-match (1).
     let (_, stderr, code) = run_cli(&project, &["grep", "res.json("]);
-    assert_ne!(code, 0, "invalid regex must exit non-zero, not silently succeed");
+    assert_eq!(code, 2, "invalid regex must exit 2 (grep parity), got stderr: {stderr}");
     assert!(stderr.contains("ripgrep error") || stderr.to_lowercase().contains("regex"),
         "should surface the ripgrep error, got: {stderr}");
 }
@@ -337,8 +345,321 @@ fn test_cli_grep_empty_pattern_errors() {
     // erroring with the Usage hint, not run ripgrep against an empty regex.
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["grep", ""]);
-    assert_eq!(code, 1, "empty pattern should exit 1 with Usage; stderr={stderr:?}");
+    assert_eq!(code, 2, "empty pattern is a usage error: exit 2 (grep parity); stderr={stderr:?}");
     assert!(stderr.contains("Usage:"), "should show usage on empty pattern; got: {stderr:?}");
+}
+
+#[test]
+fn test_cli_grep_leading_dash_pattern() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    std::fs::write(project.path().join("BUILD.md"),
+        "Use cargo build --no-default-features for the small binary.\n").unwrap();
+    // A pattern starting with `-` must be searchable without clap or rg
+    // swallowing it as a flag (rg invocation needs the `--` separator).
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "--no-default-features"]);
+    assert_eq!(code, 0, "leading-dash pattern must work; stderr={stderr}");
+    assert!(stdout.contains("BUILD.md"), "should find the hit, got: {stdout}");
+    // The clap-suggested `--` escape form must work too.
+    let (stdout2, _, code2) = run_cli(&project, &["grep", "--", "--no-default-features"]);
+    assert_eq!(code2, 0);
+    assert!(stdout2.contains("BUILD.md"));
+}
+
+#[test]
+fn test_cli_grep_fixed_strings_literal() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // -F treats the pattern literally — `res.json(` stops being a regex error.
+    let (stdout, _, code) = run_cli(&project, &["grep", "-F", "res.json(", "src/api.ts"]);
+    assert_eq!(code, 0, "-F literal search must succeed on regex-hostile pattern");
+    assert!(stdout.contains("res.json("), "should find literal hits, got: {stdout}");
+}
+
+#[test]
+fn test_cli_grep_ignore_case() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    let (_, _, code_sensitive) = run_cli(&project, &["grep", "VALIDATETOKEN"]);
+    assert_eq!(code_sensitive, 1, "case-sensitive by default (grep parity)");
+    let (stdout, _, code) = run_cli(&project, &["grep", "-i", "VALIDATETOKEN"]);
+    assert_eq!(code, 0, "-i must match case-insensitively");
+    assert!(stdout.contains("validateToken"));
+}
+
+#[test]
+fn test_cli_grep_word_regexp() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // `validate` appears only inside `validateToken` — -w must not match it.
+    let (_, _, code) = run_cli(&project, &["grep", "-w", "validate"]);
+    assert_eq!(code, 1, "-w must not match partial words");
+    let (stdout, _, code2) = run_cli(&project, &["grep", "-w", "validateToken"]);
+    assert_eq!(code2, 0);
+    assert!(stdout.contains("validateToken"));
+}
+
+#[test]
+fn test_cli_grep_multi_path() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    let (stdout, _, code) =
+        run_cli(&project, &["grep", "validateToken", "src/auth.ts", "src/api.ts"]);
+    assert_eq!(code, 0, "multiple path arguments must be accepted (grep parity)");
+    assert!(stdout.contains("src/auth.ts"), "hit from first path, got: {stdout}");
+    assert!(stdout.contains("src/api.ts"), "hit from second path, got: {stdout}");
+}
+
+#[test]
+fn test_cli_grep_max_count_truncation_note() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    let many = "needle\n".repeat(5);
+    std::fs::write(project.path().join("many.txt"), &many).unwrap();
+    // Cap hit → must say so on stderr instead of silently truncating.
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "needle", "many.txt", "--max-count", "2"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.matches("needle").count(), 2, "cap applies, got: {stdout}");
+    assert!(stderr.contains("--max-count") || stderr.contains("truncat"),
+        "truncation must be surfaced on stderr, got: {stderr:?}");
+    // --max-count 0 lifts the cap entirely.
+    let (stdout_all, stderr_all, code_all) =
+        run_cli(&project, &["grep", "needle", "many.txt", "--max-count", "0"]);
+    assert_eq!(code_all, 0);
+    assert_eq!(stdout_all.matches("needle").count(), 5, "0 = unlimited, got: {stdout_all}");
+    assert!(!stderr_all.contains("truncat"), "no cap → no truncation note");
+}
+
+#[test]
+fn test_cli_grep_files_with_matches() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // -l: file names only, no line numbers, no AST arrows (grep parity).
+    let (stdout, _, code) = run_cli(&project, &["grep", "-l", "validateToken"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("src/auth.ts") && stdout.contains("src/api.ts"),
+        "both matching files listed, got: {stdout}");
+    assert!(!stdout.contains(':'), "-l output must be bare file paths, got: {stdout}");
+    assert!(!stdout.contains('→'), "-l output must have no AST arrows");
+    // no match → exit 1, like grep.
+    let (_, _, code2) = run_cli(&project, &["grep", "-l", "zzz_nothing"]);
+    assert_eq!(code2, 1);
+}
+
+#[test]
+fn test_cli_grep_files_with_matches_json() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["grep", "-l", "validateToken", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = v.as_array().expect("-l --json must be a JSON array");
+    assert!(arr.iter().all(|e| e.is_string()), "-l --json entries are path strings");
+    assert!(arr.iter().any(|e| e.as_str() == Some("src/auth.ts")), "got: {stdout}");
+    // empty contract preserved
+    let (stdout2, _, code2) = run_cli(&project, &["grep", "-l", "zzz_nothing", "--json"]);
+    assert_eq!(code2, 1);
+    assert_eq!(stdout2.trim(), "[]");
+}
+
+#[test]
+fn test_cli_grep_context_lines() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    std::fs::write(project.path().join("ctx.txt"),
+        "line1\nline2\nNEEDLE_A\nline4\nline5\nline6\nline7\nNEEDLE_B\nline9\n").unwrap();
+    let (stdout, _, code) = run_cli(&project, &["grep", "-C", "1", "NEEDLE_", "ctx.txt"]);
+    assert_eq!(code, 0);
+    // grep-style: matches use `:`, context lines use `-`, gaps separated by `--`.
+    assert!(stdout.contains("ctx.txt:3  NEEDLE_A"), "match line with colon, got: {stdout}");
+    assert!(stdout.contains("ctx.txt-2  line2"), "before-context with dash, got: {stdout}");
+    assert!(stdout.contains("ctx.txt-4  line4"), "after-context with dash, got: {stdout}");
+    assert!(stdout.contains("\n--\n"), "non-contiguous groups separated by --, got: {stdout}");
+    assert!(!stdout.contains("line6"), "-C 1 must not pull distant lines, got: {stdout}");
+}
+
+#[test]
+fn test_cli_grep_after_before_context() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    std::fs::write(project.path().join("ab.txt"), "before\nNEEDLE\nafter\n").unwrap();
+    let (stdout, _, code) = run_cli(&project, &["grep", "-A", "1", "NEEDLE", "ab.txt"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("ab.txt-3  after") && !stdout.contains("before"),
+        "-A 1 shows only the after line, got: {stdout}");
+    let (stdout2, _, code2) = run_cli(&project, &["grep", "-B", "1", "NEEDLE", "ab.txt"]);
+    assert_eq!(code2, 0);
+    assert!(stdout2.contains("ab.txt-1  before") && !stdout2.contains("after"),
+        "-B 1 shows only the before line, got: {stdout2}");
+}
+
+#[test]
+fn test_cli_grep_context_ast_arrow_only_on_matches() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // validateToken sits inside a fn in the indexed fixture; context lines
+    // around it must not each get their own AST arrow (annotation spam).
+    let (stdout, _, code) = run_cli(&project, &["grep", "-C", "1", "decoded !== null", "src/auth.ts"]);
+    assert_eq!(code, 0);
+    let arrows = stdout.matches('→').count();
+    assert_eq!(arrows, 1, "exactly one arrow (the match line), got: {stdout}");
+}
+
+/// Extract the start line from the first AST annotation `(lines N-M)`.
+fn first_annotation_start(stdout: &str) -> Option<u64> {
+    let idx = stdout.find("(lines ")?;
+    let rest = &stdout[idx + "(lines ".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+#[test]
+fn test_cli_grep_annotation_resyncs_after_edit() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    let (out1, _, code1) = run_cli(&project, &["grep", "decoded !== null", "src/auth.ts"]);
+    assert_eq!(code1, 0);
+    let start1 = first_annotation_start(&out1).expect("baseline annotation present");
+
+    // Shift every fn down by 5 lines; without query-time freshness the
+    // annotation would keep the pre-edit boundaries (the stale-arrow bug).
+    let p = project.path().join("src/auth.ts");
+    let content = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, format!("// pad\n// pad\n// pad\n// pad\n// pad\n{content}")).unwrap();
+
+    let (out2, _, code2) = run_cli(&project, &["grep", "decoded !== null", "src/auth.ts"]);
+    assert_eq!(code2, 0);
+    let start2 = first_annotation_start(&out2).expect("post-edit annotation present");
+    assert_eq!(start2, start1 + 5,
+        "annotation must use post-edit fn boundaries (lazy resync), got: {out2}");
+    assert!(!out2.contains("[stale]"), "synced annotation must not carry a stale marker");
+}
+
+#[test]
+fn test_cli_grep_stale_marker_when_sync_budget_exhausted() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // Dirty the file, then forbid syncing (budget 0): the annotation must
+    // still appear but carry an honest [stale] marker + a stderr hint.
+    let p = project.path().join("src/auth.ts");
+    let content = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, format!("// pad\n{content}")).unwrap();
+
+    let (stdout, stderr, code) = run_cli_env(&project,
+        &["grep", "decoded !== null", "src/auth.ts"],
+        &[("CODE_GRAPH_GREP_SYNC_BUDGET", "0")]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("[stale]"), "dirty + no budget → stale marker, got: {stdout}");
+    assert!(stderr.contains("incremental-index"),
+        "stderr must point at the fix, got: {stderr:?}");
+
+    // JSON shape: container carries "stale": true.
+    let (json_out, _, _) = run_cli_env(&project,
+        &["grep", "decoded !== null", "src/auth.ts", "--json"],
+        &[("CODE_GRAPH_GREP_SYNC_BUDGET", "0")]);
+    let v: serde_json::Value = serde_json::from_str(json_out.trim()).unwrap();
+    let entry = &v.as_array().unwrap()[0];
+    assert_eq!(entry["container"]["stale"], serde_json::json!(true),
+        "JSON container must flag staleness, got: {json_out}");
+}
+
+fn has_git() -> bool {
+    Command::new("git").arg("--version").output().is_ok()
+}
+
+#[test]
+fn test_cli_grep_tracked_but_gitignored() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_git() { eprintln!("skipping: git not installed"); return; }
+    let project = setup_indexed_project();
+    let root = project.path();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("docs/notes.md"), "tracked_needle lives here\n").unwrap();
+    std::fs::write(root.join("docs/scratch.md"), "scratch_needle lives here\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "docs/\n.code-graph/\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "-f", "docs/notes.md"]);
+
+    // git-grep parity: a tracked file stays searchable even when its directory
+    // is gitignored (rg alone skips it — the audited blind spot).
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "tracked_needle"]);
+    assert_eq!(code, 0, "tracked-but-gitignored file must be found; stderr={stderr}");
+    assert!(stdout.contains("docs/notes.md"), "got: {stdout}");
+
+    // Untracked + ignored stays invisible (matches git grep semantics).
+    let (_, _, code2) = run_cli(&project, &["grep", "scratch_needle"]);
+    assert_eq!(code2, 1, "untracked ignored file must stay skipped");
+}
+
+#[test]
+fn test_cli_grep_gitignore_negation_divergence() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_git() { eprintln!("skipping: git not installed"); return; }
+    let project = setup_indexed_project();
+    let root = project.path();
+    // daagu-shape divergence: a bare dir-name pattern (`keep/`, matches at any
+    // depth) with a specific-path whitelist (`!sub/keep/`). git evaluates the
+    // negation and treats sub/keep/a.txt as NOT ignored (plain `git add`
+    // works), but rg 14.x prunes the directory during the walk before the
+    // negation applies, so the file never gets searched — the tracked\walked
+    // supplement must restore it (feedback_srcpath_abs_path_blindspot,
+    // previously unfixed).
+    std::fs::create_dir_all(root.join("sub/keep")).unwrap();
+    std::fs::write(root.join("sub/keep/a.txt"), "negation_needle here\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "keep/\n!sub/keep/\n.code-graph/\n").unwrap();
+    // A tracked hidden file is the third blind-spot class (rg skips hidden).
+    std::fs::write(root.join(".hidden-config.md"), "hidden_needle here\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["add", "sub/keep/a.txt", ".hidden-config.md"]);
+
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "negation_needle"]);
+    assert_eq!(code, 0, "whitelisted-but-pruned tracked file must be found; stderr={stderr}");
+    assert!(stdout.contains("sub/keep/a.txt"), "got: {stdout}");
+
+    let (stdout2, _, code2) = run_cli(&project, &["grep", "hidden_needle"]);
+    assert_eq!(code2, 0, "tracked hidden file must be found");
+    assert!(stdout2.contains(".hidden-config.md"), "got: {stdout2}");
+
+    // Path-scoped: supplement must honor the path restriction.
+    let (_, _, code3) = run_cli(&project, &["grep", "negation_needle", "src/"]);
+    assert_eq!(code3, 1, "supplement must not leak outside the requested path scope");
+}
+
+#[test]
+fn test_cli_grep_sigpipe_graceful() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    use std::io::Read;
+    let project = setup_indexed_project();
+    // >64 KiB of matches so the writer outlives the pipe buffer after the
+    // reader hangs up — forces EPIPE mid-stream.
+    let many = "needle line that is long enough to fill the pipe buffer quickly\n".repeat(3000);
+    std::fs::write(project.path().join("many.txt"), &many).unwrap();
+    let mut child = Command::new(binary_path())
+        .current_dir(project.path())
+        .args(["grep", "needle", "many.txt", "--max-count", "0"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read a token amount, then hang up while the writer still has data.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = [0u8; 512];
+    let _ = stdout.read(&mut buf).unwrap();
+    drop(stdout);
+    let status = child.wait().unwrap();
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert!(!err.contains("Broken pipe"),
+        "EPIPE must be handled silently like grep, got stderr: {err:?}");
+    assert_eq!(status.code(), Some(0), "early reader hangup is not an error");
 }
 
 // ============================================================
@@ -1713,7 +2034,7 @@ fn test_cli_json_empty_grep() {
     if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
     let (stdout, stderr, code) = run_cli(&project, &["grep", "xyznonexistent", "--json"]);
-    assert_eq!(code, 0);
+    assert_eq!(code, 1, "no match exits 1 (grep parity) while keeping the JSON contract");
     assert_eq!(stdout.trim(), "[]", "JSON grep with no results should output []");
     assert!(stderr.contains("No matches"), "stderr should still show hint");
 }

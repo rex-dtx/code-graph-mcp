@@ -6,7 +6,7 @@ const fs = require('fs');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
   cleanupDisabledStatusline, isPluginInactive, readJson, CACHE_DIR,
-  settingsPath,
+  settingsPath, isStaleRelicContext,
 } = require('./lifecycle');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const { maybeAutoAdopt, isAdopted } = require('./adopt');
@@ -55,6 +55,15 @@ function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
 }
 
 function syncLifecycleConfig() {
+  // v0.49.1: stale-relic guard. A still-running Claude Code process fires
+  // SessionStart from the plugin-cache dir it loaded at startup; after
+  // auto-update installs a newer version, those old scripts would see
+  // `manifest.version !== currentVersion` below and — direction-blind —
+  // call update(), dragging manifest + every settings.json hook path back
+  // to the old dir (upgrade↔downgrade ping-pong, observed live 2026-06-12).
+  // installed_plugins.json is the authority on which install may self-heal.
+  if (isStaleRelicContext()) return 'deferred-to-active-install';
+
   const manifest = readManifest();
   const currentVersion = getPluginVersion();
 
@@ -81,6 +90,14 @@ function syncLifecycleConfig() {
     install();
     return 'self-healed-bad-path';
   }
+  // v0.49.1: also self-heal when the composite path exists but is not the one
+  // we'd write now (old plugin-cache version dir that still exists on disk —
+  // invisible to the existence check above; same fault class as the binary pin).
+  const { compositeCommand } = require('./lifecycle');
+  if (settings.statusLine.command !== compositeCommand()) {
+    install();
+    return 'self-healed-stale-statusline';
+  }
   // Self-heal if any hook command points to a non-existent script (path pollution)
   if (settings.hooks) {
     for (const entries of Object.values(settings.hooks)) {
@@ -101,18 +118,20 @@ function syncLifecycleConfig() {
   // (e.g. user manually edited settings.json, or settings.json got rewritten
   // by another tool that didn't preserve our entries). Without this, the
   // user silently loses PreToolUse/PostToolUse hooks until next plugin update.
-  const { isOurHookEntry, buildSettingsHookEntries } = require('./lifecycle');
-  const desired = buildSettingsHookEntries();
-  for (const [event, desiredEntries] of Object.entries(desired)) {
-    const presentMatchers = new Set(
-      (settings.hooks?.[event] || []).filter(isOurHookEntry).map(e => e.matcher || '*')
-    );
-    for (const e of desiredEntries) {
-      if (!presentMatchers.has(e.matcher || '*')) {
-        install();
-        return 'self-healed-missing-settings-hook';
-      }
-    }
+  // v0.49.1: upgraded from matcher-presence to surveyHookCoverage so a
+  // present-but-stale command path (old plugin-cache version dir that still
+  // exists) also heals. Previously only doctor checked staleness, so if the
+  // auto-update re-register step failed silently, users kept running old hook
+  // code indefinitely — the settings.json sibling of the binary-pin bug.
+  const { surveyHookCoverage } = require('./lifecycle');
+  const cov = surveyHookCoverage(settings);
+  if (cov.missing.length > 0) {
+    install();
+    return 'self-healed-missing-settings-hook';
+  }
+  if (cov.stale.length > 0) {
+    install();
+    return 'self-healed-stale-settings-hook';
   }
   return 'noop';
 }
@@ -298,6 +317,11 @@ function runSessionInit() {
   }
 
   const lifecycle = syncLifecycleConfig();
+  // v0.49.1: a stale relic (see isStaleRelicContext) must not write ANY
+  // versioned state — that includes the adoption template: maybeAutoAdopt's
+  // drift-refresh would "refresh" MEMORY.md back to the relic's OLD shipped
+  // template, the adoption-surface twin of the settings.json downgrade war.
+  const isRelic = lifecycle === 'deferred-to-active-install';
 
   // Verify binary availability — catch issues early with actionable diagnostics
   const binaryCheck = verifyBinary();
@@ -308,7 +332,7 @@ function runSessionInit() {
   // v0.9.0 C' 上下文感知默认：插件模式下首次 SessionStart 自动 adopt。
   // v0.11.0: 已 adopt 的项目如果 shipped template 漂移也会触发一次刷新。
   // 两种情况都发一次 stderr 提示，让用户知道发生了什么 + 如何回退。
-  const autoAdopt = maybeAutoAdopt({ scriptPath: __dirname });
+  const autoAdopt = isRelic ? { attempted: false, result: null } : maybeAutoAdopt({ scriptPath: __dirname });
   if (autoAdopt.attempted && autoAdopt.result && autoAdopt.result.ok) {
     if (autoAdopt.reason === 'refreshed') {
       process.stderr.write(

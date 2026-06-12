@@ -248,3 +248,95 @@ test('fetchLatestRelease parses JSON without relying on global fetch', async () 
   assert.equal(latest.version, '2.0.0');
   assert.equal(latest.tarballUrl, 'https://example.com/release.tgz');
 });
+// ── refreshMarketplaceClone (v0.49.1 marketplace-staleness fix) ────────────
+
+const { execFileSync: execGit } = require('child_process');
+const { refreshMarketplaceClone, downloadAndInstall } = require('./auto-update');
+
+function git(cwd, ...args) {
+  return execGit('git', ['-C', cwd, '-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+    { stdio: 'pipe', encoding: 'utf8' });
+}
+
+test('refreshMarketplaceClone fast-forwards a stale clone', (t) => {
+  const root = mkDir(t, 'code-graph-mp-');
+  const remote = path.join(root, 'remote');
+  const clone = path.join(root, 'clone');
+
+  fs.mkdirSync(remote);
+  git(remote, 'init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(remote, 'marketplace.json'), '{"version":"0.48.0"}');
+  git(remote, 'add', '.');
+  git(remote, 'commit', '-q', '-m', 'v0.48.0');
+  execGit('git', ['clone', '-q', remote, clone], { stdio: 'pipe' });
+
+  // Remote advances (a release bumped marketplace.json) — clone is now stale.
+  fs.writeFileSync(path.join(remote, 'marketplace.json'), '{"version":"0.49.0"}');
+  git(remote, 'commit', '-q', '-am', 'v0.49.0');
+
+  assert.equal(refreshMarketplaceClone({ dir: clone }), true);
+  assert.match(fs.readFileSync(path.join(clone, 'marketplace.json'), 'utf8'), /0\.49\.0/);
+});
+
+test('refreshMarketplaceClone is a safe no-op on non-git dirs and pull failures', (t) => {
+  const root = mkDir(t, 'code-graph-mp-');
+  // Not a git repo → false, no throw.
+  assert.equal(refreshMarketplaceClone({ dir: root }), false);
+  // Missing dir → false, no throw.
+  assert.equal(refreshMarketplaceClone({ dir: path.join(root, 'nope') }), false);
+  // exec throws (diverged / dirty clone) → false, no throw.
+  const fakeGitDir = path.join(root, 'repo');
+  fs.mkdirSync(path.join(fakeGitDir, '.git'), { recursive: true });
+  assert.equal(refreshMarketplaceClone({
+    dir: fakeGitDir,
+    exec: () => { throw new Error('not a fast-forward'); },
+  }), false);
+});
+
+test('downloadAndInstall wires the marketplace refresh + binary download (orchestration glue)', async (t) => {
+  // In-process with all side-effectful deps injected would still write the
+  // manifest into the REAL ~/.cache (CACHE_DIR is bound at module load), so
+  // run in a subprocess with a sandboxed HOME — same pattern as install-e2e.
+  const sandboxHome = mkDir(t, 'code-graph-dai-');
+  const script = `
+    const fs = require('fs');
+    const path = require('path');
+    const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    const latest = { version: '9.9.9', tarballUrl: 'https://example/tar', binaryUrl: null };
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push(cmd);
+      if (cmd === 'tar') {
+        // Simulate extraction: produce claude-plugin/ with a matching version.
+        const tmpDir = args[args.indexOf('-C') + 1];
+        const mDir = path.join(tmpDir, 'claude-plugin', '.claude-plugin');
+        fs.mkdirSync(mDir, { recursive: true });
+        fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '9.9.9' }));
+      }
+    };
+    (async () => {
+      let refreshed = 0;
+      let binDownloads = 0;
+      const result = await downloadAndInstall(latest, {
+        exec,
+        refreshMarketplace: () => { refreshed++; return true; },
+        downloadBin: async () => { binDownloads++; return true; },
+      });
+      console.log(JSON.stringify({ result, refreshed, binDownloads, calls }));
+    })();
+  `;
+  const out = execGit(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: sandboxHome },
+    encoding: 'utf8',
+  });
+  const { result, refreshed, binDownloads } = JSON.parse(out.trim().split('\n').pop());
+  assert.equal(result.pluginUpdated, true, 'plugin files must install from the extracted tarball');
+  assert.equal(refreshed, 1, 'marketplace refresh must run exactly once after a plugin update');
+  assert.equal(result.marketplaceRefreshed, true);
+  assert.equal(binDownloads, 1, 'binary download must run');
+  assert.equal(result.binaryUpdated, true);
+  // Plugin landed in the sandboxed cache, not the real one.
+  const dst = path.join(sandboxHome, '.claude', 'plugins', 'cache',
+    'code-graph-mcp', 'code-graph-mcp', '9.9.9', '.claude-plugin', 'plugin.json');
+  assert.equal(fs.existsSync(dst), true, 'plugin copied into sandbox plugins cache');
+});

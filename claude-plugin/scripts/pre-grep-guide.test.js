@@ -9,6 +9,7 @@ const {
   translateBreToRg,
   buildShowDenyReason,
   extractSedReadTargets,
+  extractUnansweredTail,
   extractPatterns,
   extractSearchPath,
   normalizeCommandPaths,
@@ -741,6 +742,78 @@ test('buildBlockReasonWithAnswer: truncated flag adds marker', () => {
   assert.match(reason, /truncated/);
 });
 
+// ── v0.50 compound-command tail: deny answers the grep, NOT the rest ─
+
+test('extractUnansweredTail: `; sed` tail after piped grep (2026-06-13 real deny shape)', () => {
+  assert.equal(
+    extractUnansweredTail(
+      'grep -n "mem_update\\|registerTool" tests/server.test.mjs | head -20; sed -n \'1,60p\' tests/server.test.mjs'),
+    "sed -n '1,60p' tests/server.test.mjs");
+});
+
+test('extractUnansweredTail: && tail is unanswered (would have run on grep success)', () => {
+  assert.equal(
+    extractUnansweredTail('grep -rn "fts5_search" src/ && wc -l src/storage/db.rs'),
+    'wc -l src/storage/db.rs');
+});
+
+test('extractUnansweredTail: quoted separators are pattern text, not a tail', () => {
+  assert.equal(extractUnansweredTail('grep -rn "a;b" src/'), null);
+  assert.equal(extractUnansweredTail("grep -rn 'a && b' src/"), null);
+});
+
+test('extractUnansweredTail: pipes and redirects are the same pipeline, not a tail', () => {
+  assert.equal(extractUnansweredTail('grep -rn "Foo" src/ 2>&1 | head -10'), null);
+});
+
+test('extractUnansweredTail: || branch would NOT have run on hits — no tail', () => {
+  assert.equal(extractUnansweredTail('grep -rn "Foo" src/ || echo none'), null);
+});
+
+test('extractUnansweredTail: trailing separator with nothing after → no tail', () => {
+  assert.equal(extractUnansweredTail('grep -rn "Foo" src/;'), null);
+});
+
+test('buildBlockReasonWithAnswer: compound tail → note says the rest did NOT run', () => {
+  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/', {
+    status: 'hits', text: 'hit', truncated: false,
+  }, "sed -n '1,60p' tests/server.test.mjs");
+  assert.match(reason, /did NOT run/);
+  assert.match(reason, /sed -n '1,60p' tests\/server\.test\.mjs/);
+});
+
+test('buildBlockReasonWithAnswer: no tail → no compound note', () => {
+  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/', {
+    status: 'hits', text: 'hit', truncated: false,
+  });
+  assert.doesNotMatch(reason, /did NOT run/);
+});
+
+test('buildShowDenyReason: compound tail → note says the rest did NOT run', () => {
+  const reason = buildShowDenyReason(
+    { status: 'hits', text: 'fn body', truncated: false },
+    'cargo test -q');
+  assert.match(reason, /did NOT run/);
+  assert.match(reason, /cargo test -q/);
+});
+
+test('buildShowDenyReason: no tail → no compound note', () => {
+  const reason = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false });
+  assert.doesNotMatch(reason, /did NOT run/);
+});
+
+test('buildBlockReason: compound tail → static deny also flags the unanswered tail', () => {
+  const reason = buildBlockReason("sed -n '1,60p' tests/server.test.mjs");
+  assert.match(reason, /did NOT run/);
+  assert.match(reason, /sed -n '1,60p' tests\/server\.test\.mjs/);
+});
+
+test('buildBlockReason: no tail → unchanged static deny', () => {
+  const reason = buildBlockReason();
+  assert.match(reason, /denied by code-graph hook/);
+  assert.doesNotMatch(reason, /did NOT run/);
+});
+
 test('buildNoHitsFyi: names the pattern and says raw grep proceeds', () => {
   const fyi = buildNoHitsFyi('GhostSymbol');
   assert.match(fyi, /GhostSymbol/);
@@ -898,6 +971,75 @@ test('e2e: CODE_GRAPH_NO_ANSWER_IN_DENY=1 → static deny even when stub would h
     const out = JSON.parse(res.stdout);
     assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
     assert.doesNotMatch(out.hookSpecificOutput.permissionDecisionReason, /src\/foo\.rs:7/);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: compound `grep …; sed` → deny answers grep AND flags the unanswered sed tail', () => {
+  const uniq = `StubTail${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
+  const cmd = `grep -n "${uniq}" src/foo.rs | head -20; sed -n '100,160p' src/foo.rs`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'src', 'foo.rs'), 'fn x() {}\n');
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    assert.match(reason, /src\/foo\.rs:7/);            // grep half answered
+    assert.match(reason, /did NOT run/);               // tail flagged honestly
+    assert.match(reason, /sed -n '100,160p' src\/foo\.rs/); // verbatim re-issue line
+    // funnel: the deny record marks that a tail note was carried
+    const recs = fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const rec = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(rec.action, 'deny');
+    assert.equal(rec.tail, true);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: compound cmd + answer failure → STATIC deny still flags tail + records tail:true', () => {
+  const uniq = `StubTailBoom${Date.now()}`;
+  const fixture = e2eFixture(`process.exit(3);`);
+  const cmd = `grep -n "${uniq}" src/foo.rs && cargo test -q`;
+  try {
+    fsE2e.mkdirSync(pathE2e.join(fixture.dir, 'src'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'src', 'foo.rs'), 'fn x() {}\n');
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    const reason = out.hookSpecificOutput.permissionDecisionReason;
+    assert.match(reason, /denied by code-graph hook/);  // static fallback path
+    assert.match(reason, /did NOT run/);
+    assert.match(reason, /cargo test -q/);
+    const rec = JSON.parse(fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
+    assert.equal(rec.answered, false);
+    assert.equal(rec.tail, true);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: simple (non-compound) denied grep → no tail field in the deny record', () => {
+  const uniq = `StubNoTail${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
+  const cmd = `grep -rn "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture);
+    const out = JSON.parse(res.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    const rec = JSON.parse(fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
+    assert.equal(rec.action, 'deny');
+    assert.equal('tail' in rec, false);
   } finally {
     cleanupFixture(fixture, cmd);
   }

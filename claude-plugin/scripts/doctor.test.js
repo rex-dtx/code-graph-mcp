@@ -80,3 +80,16 @@ test('surveyHookCoverage flags missing entries when settings empty', () => {
   assert.ok(cov.missing.length === cov.expected.length, 'all expected entries missing');
   assert.equal(cov.stale.length, 0, 'nothing present to be stale');
 });
+
+// ── relicRepairGuard (v0.50.0 — doctor twin of the session-init relic guard) ──
+
+test('relicRepairGuard blocks settings repair from a relic copy and redirects', () => {
+  const { relicRepairGuard } = require('./doctor');
+  const lines = [];
+  // Relic context → guard fires, prints the redirect, returns true (skip install).
+  assert.equal(relicRepairGuard({ relic: true, log: (s) => lines.push(s) }), true);
+  assert.ok(lines.some(l => l.includes('not the active install')),
+    `guard must explain why repair is skipped, got: ${lines.join(' | ')}`);
+  // Active (or dev/npm) context → repair proceeds.
+  assert.equal(relicRepairGuard({ relic: false, log: () => {} }), false);
+});

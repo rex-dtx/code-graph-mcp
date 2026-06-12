@@ -6,6 +6,7 @@ const https = require('https');
 const path = require('path');
 const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
+const { claudeHome } = require('./claude-config');
 const { clearCache: clearBinaryCache } = require('./find-binary');
 const { readBinaryVersion, isDevMode } = require('./version-utils');
 const { cgTmpDir } = require('./tmp-dir');
@@ -277,9 +278,41 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion) {
   }
 }
 
+// ── Marketplace clone refresh ──────────────────────────────
+
+function marketplaceCloneDir() {
+  return path.join(claudeHome(), 'plugins', 'marketplaces', MARKETPLACE_NAME);
+}
+
+/**
+ * Fast-forward the Claude Code marketplace clone after a plugin update.
+ *
+ * Auto-update writes the plugin cache + installed_plugins.json directly and
+ * never touched the marketplace clone, so its marketplace.json stayed pinned
+ * at the version present when the user last ran a /plugin command (observed
+ * live: clone at 0.48.0 four days after 0.49.0 shipped). A stale clone makes
+ * the /plugin UI report the old version and lets Claude Code re-install the
+ * old plugin files from it. --ff-only + silent failure: a dirty or diverged
+ * clone is Claude Code's property — never force anything there.
+ */
+function refreshMarketplaceClone({ dir = marketplaceCloneDir(), exec = execFileSync, timeoutMs = 15000 } = {}) {
+  try {
+    if (!fs.existsSync(path.join(dir, '.git'))) return false;
+    if (!commandExists('git')) return false;
+    exec('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], { timeout: timeoutMs, stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Download & Install ─────────────────────────────────────
 
-async function downloadAndInstall(latest) {
+async function downloadAndInstall(latest, {
+  exec = execFileSync,
+  downloadBin = downloadBinary,
+  refreshMarketplace = refreshMarketplaceClone,
+} = {}) {
   // Pre-flight: check required CLI tools before attempting any download
   const missingTools = ['curl', 'tar'].filter(cmd => !commandExists(cmd));
   if (missingTools.length > 0) {
@@ -290,19 +323,20 @@ async function downloadAndInstall(latest) {
   const tmpDir = path.join(cgTmpDir(), `update-${Date.now()}`);
   let pluginUpdated = false;
   let binaryUpdated = false;
+  let marketplaceRefreshed = false;
 
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
 
     // ── Step 1: Download and install plugin files from tarball ──
     const tarballPath = path.join(tmpDir, 'release.tar.gz');
-    execFileSync('curl', [
+    exec('curl', [
       '-sL', '-o', tarballPath,
       '-H', 'Accept: application/vnd.github+json',
       latest.tarballUrl,
     ], { timeout: 30000, stdio: 'pipe' });
 
-    execFileSync('tar', [
+    exec('tar', [
       'xzf', tarballPath, '-C', tmpDir, '--strip-components=1',
     ], { timeout: 15000, stdio: 'pipe' });
 
@@ -344,22 +378,28 @@ async function downloadAndInstall(latest) {
       try {
         const newLifecycle = path.join(pluginDst, 'scripts', 'lifecycle.js');
         if (fs.existsSync(newLifecycle)) {
-          execFileSync(process.execPath, [newLifecycle, 'update'], {
+          exec(process.execPath, [newLifecycle, 'update'], {
             timeout: 5000, stdio: 'pipe',
           });
         }
       } catch { /* not fatal — syncLifecycleConfig will self-heal on next session */ }
     }
 
+    // ── Step 1.5: Fast-forward the marketplace clone so /plugin UI and any
+    //    Claude-Code-side reinstall see the version we just installed.
+    if (pluginUpdated) {
+      marketplaceRefreshed = refreshMarketplace();
+    }
+
     // ── Step 2: Download platform binary directly from GitHub release ──
-    if (await downloadBinary(latest)) {
+    if (await downloadBin(latest)) {
       binaryUpdated = true;
     }
 
-    return { pluginUpdated, binaryUpdated };
+    return { pluginUpdated, binaryUpdated, marketplaceRefreshed };
   } catch (e) {
     console.error(`[code-graph] Plugin download/extract failed: ${e.message}`);
-    return { pluginUpdated: false, binaryUpdated: false };
+    return { pluginUpdated: false, binaryUpdated: false, marketplaceRefreshed };
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ok */ }
   }
@@ -431,6 +471,7 @@ async function checkForUpdate({ installMissing = false } = {}) {
         lastUpdate: success ? new Date().toISOString() : state.lastUpdate,
         rateLimited: false,
         binaryUpdated: result.binaryUpdated,
+        marketplaceRefreshed: result.marketplaceRefreshed,
       };
       saveState(newState);
 
@@ -474,6 +515,7 @@ module.exports = {
   requestJson, parseLatestRelease, fetchLatestRelease,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
   selfHealStaleBinary,
+  downloadAndInstall, refreshMarketplaceClone, marketplaceCloneDir,
 };
 
 // CLI: node auto-update.js [check|status] [--silent] [--install-missing]

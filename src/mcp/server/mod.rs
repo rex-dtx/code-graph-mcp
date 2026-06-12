@@ -880,8 +880,15 @@ impl McpServer {
                 }
             };
 
+            // Version/identity-aware, not existence-only: a cached model that
+            // doesn't match the weights this binary expects (older release, or
+            // tampered cache) re-downloads instead of staying pinned forever —
+            // same fault class as the native-binary pin fixed in v0.45.x.
+            if EmbeddingModel::cached_model_is_current(&cache_dir) {
+                return; // Already downloaded and matching
+            }
             if cache_dir.join("model.safetensors").exists() {
-                return; // Already downloaded
+                tracing::info!("[model-dl] Cached model does not match this binary's pinned weights — re-downloading");
             }
 
             let url = EmbeddingModel::model_download_url();
@@ -1305,7 +1312,7 @@ impl McpServer {
             const NOISY: &str = concat!(
                 "Code Graph MCP \u{2014} project indexed. Fastest path is the CLI via Bash (no tool loading): ",
                 "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; \"impact of X?\" or before editing a fn \u{2192} `code-graph-mcp impact X`; ",
-                "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; symbol search with AST context \u{2192} `code-graph-mcp grep \"pat\" [path]`.\n",
+                "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; text search with AST context \u{2192} `code-graph-mcp grep \"pat\" [paths]` (-F literal, -i, -w, -l, -C N; grep-compatible exits).\n",
                 "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, semantic_code_search for concept search without an exact symbol.\n",
                 "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
                 "Still Grep for exact strings/regex; still Read files you will edit.\n",

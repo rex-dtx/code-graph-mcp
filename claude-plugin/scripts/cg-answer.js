@@ -114,7 +114,16 @@ function runGrepAnswer(opts = {}) {
       // The CLI skips its recommendations.jsonl `use` record when this is set.
       env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
     });
-    if (res.error || res.signal || res.status !== 0) {
+    if (res.error || res.signal) {
+      return { status: 'unavailable' };
+    }
+    // v0.50 grep-parity exit codes: 0 = matched, 1 = no match, 2 = error.
+    // Older binaries exit 0 on no-match with the NO_MATCH_PREFIX on stderr
+    // (stdout empty) — both shapes resolve to 'no-hits' below.
+    if (res.status === 1) {
+      return { status: 'no-hits' };
+    }
+    if (res.status !== 0) {
       return { status: 'unavailable' };
     }
     const out = (res.stdout || '').trim();
