@@ -18,12 +18,15 @@
 //      2026-06-11 replay: 38/40 head-greps dark to this)
 //   6. Same command-hash not hinted within last 60s (per-command cooldown)
 //
-// BLOCK fires when shouldHint AND (shouldBlock):
-//   7. No precision flag in the command (-l / -A / -B / -C / --include / --exclude)
-//   8. Pattern looks identifier-like (CamelCase ≥4ch, or snake_case with _, or
-//      a declaration anchor like `fn X` / `class X` / `def X`)
-//   9. Pattern is not a bare marker word (TODO/FIXME/XXX/HACK/WARN/ERROR/NOTE)
+// BLOCK fires when shouldHint AND (classifyBlock, v0.49 intent-aware):
+//   7. Pattern looks identifier-like (CamelCase ≥4ch, or snake_case with _, or
+//      a declaration anchor like `fn X` / `class X` / `def X`), quoted
+//   8. Pattern is not a bare marker word (TODO/FIXME/XXX/HACK/WARN/ERROR/NOTE)
+//   9. No unanswerable-intent flag (-L / -v / --exclude*) — those stay hint
 //  10. CODE_GRAPH_NO_BLOCK_GREP != "1" (block escape, independent of QUIET_HOOKS)
+//  Mode: context flags (-A/-B/-C) + declaration anchors → 'show' (deny carries
+//  the symbol BODIES via `cg show`); context flags without named decls → hint;
+//  everything else (incl. -l / --include) → 'grep' (deny carries the hits).
 //
 // A `CODE_GRAPH_NO_BLOCK_GREP=1`-prefixed grep that would otherwise hint is
 // recorded as `action:'bypass'` and allowed silently (v0.48) — previously the
@@ -39,7 +42,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
-const { runGrepAnswer, sanitizeSearchPath } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, sanitizeSearchPath } = require('./cg-answer');
 
 // --- Pure logic (testable) ---
 
@@ -83,17 +86,21 @@ function shouldHint(cmd) {
   return true;
 }
 
-// v0.32.0 block tier — strictly narrower than shouldHint. The disqualifying
-// flags (-l, -A, -B, -C, --include, --exclude) mean the user is already doing
-// precise filtering and a blanket "use cg" suggestion would be wrong. The
-// identifier-like check restricts blocks to "I'm looking for a symbol" — the
-// exact use case cg replaces. Marker-only patterns (TODO/FIXME) are legit raw
-// text scans with no cg equivalent.
-// Match any short-flag cluster containing l/L/A/B/C (e.g. `-l`, `-rl`, `-rln`,
-// `-A`, `-rA3`). Combined flag clusters are common in real-world usage and the
-// "precision intent" applies as soon as ANY of these letters appears.
-const BLOCK_DISQUALIFYING_FLAGS =
-  /(?:^|\s)-[a-zA-Z]*[lLABC][a-zA-Z]*(?:\s|=|\d|$)|--(?:files-with-matches|files-without-match|include|exclude|exclude-dir|after-context|before-context|context)\b/;
+// v0.49 intent-aware block tiers. The v0.32 rationale ("precision flags mean
+// the user is filtering — a blanket *suggestion* would be wrong") was written
+// for the suggestion era; in the answer era the deny CARRIES the result, so a
+// flag only disqualifies when the answer cannot honor its intent. 2026-06-12
+// daagu replay: 22/128 head-greps were `rg "def X|class Y" -A 25` — function-
+// body reads the old rule exempted to (ignored) hints; `cg show` answers them.
+//
+// Context flags (-A/-B/-C): intent = read surrounding code. Answerable via
+// `show` only when the pattern names declarations; bare-identifier + context
+// stays hint (a grep-style answer can't honor ±N lines).
+const CONTEXT_FLAG =
+  /(?:^|\s)-[a-zA-Z]*[ABC][a-zA-Z]*(?:\s|=|\d|$)|--(?:after-context|before-context|context)\b/;
+// Intents the cg answer cannot honor: inverted file lists, exclusion scoping.
+const UNANSWERABLE_FLAGS =
+  /(?:^|\s)-[a-zA-Z]*[Lv][a-zA-Z]*(?:\s|=|\d|$)|--(?:files-without-match|invert-match|exclude|exclude-dir)\b/;
 // v0.32.1: drop the `type` declaration keyword (too common in English prose
 // like "# type checking") and anchor declaration anchors to pattern start
 // (otherwise `"some type X"` matches). CamelCase and snake_case still match
@@ -120,13 +127,41 @@ function extractPatterns(cmd) {
   return matches.map(m => m[1] !== undefined ? m[1] : m[2]);
 }
 
-function shouldBlock(cmd) {
-  if (!shouldHint(cmd)) return false;             // narrower than hint
-  if (BLOCK_DISQUALIFYING_FLAGS.test(cmd)) return false;
-  if (MARKER_ONLY.test(cmd)) return false;        // bare TODO/FIXME — no cg equivalent
+// Declaration anchors inside a pattern (`def cascade_failure|class TaskState`)
+// name the exact symbols the model wants to READ — extract them for `show`.
+const DECL_SYMBOL = /(?:fn|def|class|function|struct|impl|trait)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+
+function extractDeclSymbols(patterns) {
+  const out = [];
+  for (const p of patterns) {
+    for (const m of p.matchAll(DECL_SYMBOL)) {
+      if (!out.includes(m[1])) out.push(m[1]);
+    }
+  }
+  return out;
+}
+
+/// Block-tier classification (strictly narrower than shouldHint):
+///   {mode:'show', symbols} — declaration anchors + context flags → deliver bodies
+///   {mode:'grep'}          — symbol search (incl. -l / --include) → deliver hits
+///   null                   — hint tier (marker scans, unquoted, unanswerable flags)
+function classifyBlock(cmd) {
+  if (!shouldHint(cmd)) return null;              // narrower than hint
+  if (UNANSWERABLE_FLAGS.test(cmd)) return null;  // intent the answer can't honor
+  if (MARKER_ONLY.test(cmd)) return null;         // bare TODO/FIXME — no cg equivalent
   const patterns = extractPatterns(cmd);
-  if (patterns.length === 0) return false;        // unquoted pattern — conservative, hint
-  return patterns.some(p => IDENTIFIER_LIKE.test(p));
+  if (patterns.length === 0) return null;         // unquoted pattern — conservative, hint
+  if (!patterns.some(p => IDENTIFIER_LIKE.test(p))) return null;
+  if (CONTEXT_FLAG.test(cmd)) {
+    const symbols = extractDeclSymbols(patterns);
+    if (symbols.length === 0) return null;        // context read without named decls
+    return { mode: 'show', symbols: symbols.slice(0, 3) };
+  }
+  return { mode: 'grep' };
+}
+
+function shouldBlock(cmd) {
+  return classifyBlock(cmd) !== null;
 }
 
 // v0.47.1 — CC harness steers Bash toward ABSOLUTE paths (cd in compound
@@ -257,14 +292,16 @@ function buildHint() {
 function buildBlockReason() {
   // Shown to Claude via PreToolUse `decision: block` reason. Must give a
   // concrete alternate command Claude can re-issue without further thinking.
+  // v0.49 — NO escape-hatch line anywhere in deny copy: the daagu 2026-06-12
+  // night proved even the "THIS command only" scoping reads as a teachable
+  // permanent prefix (adopted in 8s, reused 11×, incl. on the exact identifier
+  // searches this hook targets). The env opt-out stays documented in README.
   return [
     '[code-graph] Raw `grep -rn` on indexed source — denied by code-graph hook.',
     'Use the AST-aware equivalent (returns containing fn/module per hit, repo-wide):',
     '  code-graph-mcp grep "<pattern>" <path>          # FTS + AST context per hit',
     '  code-graph-mcp ast-search "<pattern>" --type fn # filter by node type',
     '  code-graph-mcp callgraph SYMBOL                 # callers + callees',
-    'If this specific search truly needs raw-text regex (log/comment scan), prepend',
-    '`CODE_GRAPH_NO_BLOCK_GREP=1` to THIS command only — a per-command escape, not a default prefix.',
   ].join('\n');
 }
 
@@ -289,6 +326,37 @@ function buildBlockReasonWithAnswer(pattern, searchPath, answer) {
     'Each hit shows its containing fn/module — use these results directly instead of re-running the search.',
   );
   return lines.join('\n');
+}
+
+// v0.49 — show-mode deny: the model grepped for symbol DEFINITIONS with
+// context flags (-A/-B/-C = "show me the body"); the answer IS the bodies,
+// fetched via `code-graph-mcp show`. answer.text already carries per-symbol
+// `$ code-graph-mcp show <sym>` headers.
+function buildShowDenyReason(answer) {
+  const lines = [
+    '[code-graph] Raw grep for symbol definitions — denied; here are the definitions from the AST index:',
+    answer.text,
+  ];
+  if (answer.truncated) {
+    lines.push('(truncated — re-run the `code-graph-mcp show <symbol>` command above for full source)');
+  }
+  lines.push('Use these directly instead of re-running the search.');
+  return lines.join('\n');
+}
+
+// v0.49 — plain `grep` speaks BRE: alternation/grouping arrive escaped
+// (`a\|b`, `\(x\)`) and 0-hit against cg grep's rust-regex dialect, wasting
+// the answer on the ALLOW fallthrough (2026-06-12: both answered:false denies
+// were dialect/path-shape misses). Unescape for plain grep only — rg/ag and
+// grep -E/-P are already extended.
+function translateBreToRg(cmd, pattern) {
+  if (typeof pattern !== 'string' || !pattern) return pattern;
+  const verb = (cmd.match(GREP_HEAD) || [])[1];
+  if (verb !== 'grep') return pattern;
+  if (/(?:^|\s)-[a-zA-Z]*[EP][a-zA-Z]*(?:\s|=|\d|$)|--(?:extended-regexp|perl-regexp)\b/.test(cmd)) {
+    return pattern;
+  }
+  return pattern.replace(/\\([|(){}+?])/g, '$1');
 }
 
 // v0.47.0 — cg grep found nothing. Regex-dialect differences (BRE `\|` vs
@@ -358,18 +426,30 @@ function runMain() {
 
   markCooldown(rawCmd);
 
-  if (!isBlockDisabled() && shouldBlock(cmd)) {
+  const block = isBlockDisabled() ? null : classifyBlock(cmd);
+  if (block) {
     // v0.47.0 — run the AST-aware equivalent inside the hook and embed the
     // results in the deny reason ("answer in the deny"). Degrades to the
     // v0.46 static deny on any failure; downgrades to allow+FYI on 0 hits
     // (regex-dialect differences mean 0 hits ≠ proof of absence).
+    // v0.49 — intent-aware: declaration+context greps get `show` bodies,
+    // falling back to the grep answer, then the static deny.
     let answer = { status: 'unavailable' };
-    const pattern = pickBlockPattern(cmd);
+    const pattern = translateBreToRg(cmd, pickBlockPattern(cmd));
     // v0.48 — glob-truncated once, shared by the run and the deny message
     // (a literal `dir/*.py` argv made rg exit 1 → answered:false static deny).
     const searchPath = sanitizeSearchPath(extractSearchPath(cmd));
-    if (!isAnswerDisabled() && pattern) {
-      answer = runGrepAnswer({ cwd: root, pattern, searchPath });
+    let answeredMode = block.mode;
+    if (!isAnswerDisabled()) {
+      if (block.mode === 'show') {
+        answer = runShowAnswer({ cwd: root, symbols: block.symbols });
+        if (answer.status !== 'hits' && pattern) {
+          answeredMode = 'grep';
+          answer = runGrepAnswer({ cwd: root, pattern, searchPath });
+        }
+      } else if (pattern) {
+        answer = runGrepAnswer({ cwd: root, pattern, searchPath });
+      }
     }
 
     if (answer.status === 'no-hits') {
@@ -383,16 +463,21 @@ function runMain() {
     // ignored by Claude Code — the grep ran anyway. The hookSpecificOutput form
     // is the documented modern path. Exit 0 — this is a routing decision, not
     // a hook failure (exit 2 would mark the tool call as "hook errored").
+    const answered = answer.status === 'hits';
     recordRecommendation(root, {
-      hook: 'grep', action: 'deny', answered: answer.status === 'hits',
+      hook: 'grep', action: 'deny', answered,
+      // mode segments which answer type converts (show=bodies, grep=hits).
+      ...(answered ? { mode: answeredMode } : {}),
     });
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         permissionDecision: 'deny',
-        permissionDecisionReason: answer.status === 'hits'
-          ? buildBlockReasonWithAnswer(pattern, searchPath, answer)
-          : buildBlockReason(),
+        permissionDecisionReason: !answered
+          ? buildBlockReason()
+          : answeredMode === 'show'
+            ? buildShowDenyReason(answer)
+            : buildBlockReasonWithAnswer(pattern, searchPath, answer),
       },
     }) + '\n');
     return;
@@ -409,6 +494,10 @@ if (require.main === module) {
 module.exports = {
   shouldHint,
   shouldBlock,
+  classifyBlock,         // v0.49 — intent-aware block tiers
+  extractDeclSymbols,    // v0.49 — show-mode symbol extraction
+  translateBreToRg,      // v0.49 — BRE→rust-regex dialect bridge
+  buildShowDenyReason,   // v0.49 — show-mode deny copy
   extractPatterns,    // v0.32.1 — exposed for tests
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix

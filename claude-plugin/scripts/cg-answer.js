@@ -128,4 +128,52 @@ function runGrepAnswer(opts = {}) {
   }
 }
 
-module.exports = { runGrepAnswer, truncateAtLine, sanitizeSearchPath };
+/**
+ * v0.49 — Run `code-graph-mcp show <symbol>` for up to 3 declaration symbols
+ * and concatenate the bodies. Powers the show-mode deny (declaration-anchor +
+ * context-flag greps: the model wants to READ the functions, so hand it the
+ * functions). Same bounded/best-effort posture as runGrepAnswer; symbols that
+ * fail to resolve are skipped, all-fail → no-hits (caller falls back to grep).
+ */
+function runShowAnswer(opts = {}) {
+  const {
+    cwd,
+    symbols,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    maxBytes = DEFAULT_MAX_BYTES,
+  } = opts;
+  try {
+    if (!Array.isArray(symbols) || symbols.length === 0) {
+      return { status: 'unavailable' };
+    }
+    let binary = opts.binary;
+    if (binary === undefined) {
+      binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
+    }
+    if (!binary) return { status: 'unavailable' };
+
+    const parts = [];
+    for (const sym of symbols.slice(0, 3)) {
+      if (typeof sym !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(sym)) continue;
+      const res = spawnSync(binary, ['show', sym], {
+        cwd,
+        timeout: timeoutMs,
+        encoding: 'utf8',
+        maxBuffer: 4 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
+      });
+      if (res.error || res.signal || res.status !== 0) continue;
+      const out = (res.stdout || '').trim();
+      if (!out || out.startsWith(NO_MATCH_PREFIX)) continue;
+      parts.push(`$ code-graph-mcp show ${sym}\n${out}`);
+    }
+    if (parts.length === 0) return { status: 'no-hits' };
+    const { text, truncated } = truncateAtLine(parts.join('\n\n'), maxBytes);
+    return { status: 'hits', text, truncated };
+  } catch {
+    return { status: 'unavailable' };
+  }
+}
+
+module.exports = { runGrepAnswer, runShowAnswer, truncateAtLine, sanitizeSearchPath };

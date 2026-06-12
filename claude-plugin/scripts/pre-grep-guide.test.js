@@ -4,6 +4,10 @@ const assert = require('node:assert/strict');
 const {
   shouldHint,
   shouldBlock,
+  classifyBlock,
+  extractDeclSymbols,
+  translateBreToRg,
+  buildShowDenyReason,
   extractPatterns,
   extractSearchPath,
   normalizeCommandPaths,
@@ -317,28 +321,79 @@ test('shouldBlock: rg with CamelCase on lib/', () => {
 
 // ── shouldBlock: should NOT block (downgrade to hint) — precision flags ─
 
-test('shouldBlock: grep -l (files-with-matches) → hint only', () => {
-  assert.equal(shouldBlock('grep -rl "EmbeddingModel" src/'), false);
+test('shouldBlock: grep -l (files-with-matches) → deny, grep answer covers file lists (v0.49)', () => {
+  assert.equal(shouldBlock('grep -rl "EmbeddingModel" src/'), true);
+  assert.deepEqual(classifyBlock('grep -rl "EmbeddingModel" src/'), { mode: 'grep' });
 });
 
-test('shouldBlock: --include=*.rs → user already filtering, hint only', () => {
-  assert.equal(shouldBlock('grep -rn --include="*.rs" "EmbeddingModel" src/'), false);
+test('shouldBlock: --include=*.rs → deny, path-scoped grep answer covers it (v0.49)', () => {
+  assert.equal(shouldBlock('grep -rn --include="*.rs" "EmbeddingModel" src/'), true);
 });
 
-test('shouldBlock: --exclude-dir=tests → hint only', () => {
+test('shouldBlock: --exclude=tests → hint only (answer cannot honor exclusion)', () => {
   assert.equal(shouldBlock('grep -rn --exclude=tests "EmbeddingModel" src/'), false);
 });
 
-test('shouldBlock: -A 3 context flag → hint only', () => {
+test('shouldBlock: -L / -v inverted intents → hint only', () => {
+  assert.equal(shouldBlock('grep -rL "EmbeddingModel" src/'), false);
+  assert.equal(shouldBlock('grep -rnv "EmbeddingModel" src/'), false);
+});
+
+test('shouldBlock: -A 3 with bare identifier → hint only (cannot honor ±N lines)', () => {
   assert.equal(shouldBlock('grep -rn -A 3 "EmbeddingModel" src/'), false);
 });
 
-test('shouldBlock: -B 2 context flag → hint only', () => {
+test('shouldBlock: -B 2 with bare identifier → hint only', () => {
   assert.equal(shouldBlock('grep -rn -B 2 "EmbeddingModel" src/'), false);
 });
 
-test('shouldBlock: -C 5 context flag → hint only', () => {
+test('shouldBlock: -C 5 with bare identifier → hint only', () => {
   assert.equal(shouldBlock('grep -rn -C 5 "EmbeddingModel" src/'), false);
+});
+
+// ── translateBreToRg (v0.49) — BRE→rust-regex dialect bridge ─────────
+
+test('translateBreToRg: plain grep BRE alternation unescaped', () => {
+  assert.equal(
+    translateBreToRg('grep -rn "UnifiedPickerEngine\\|engine.run" src/', 'UnifiedPickerEngine\\|engine.run'),
+    'UnifiedPickerEngine|engine.run');
+});
+
+test('translateBreToRg: rg patterns untouched (already extended)', () => {
+  assert.equal(translateBreToRg('rg "a\\|b" src/', 'a\\|b'), 'a\\|b');
+});
+
+test('translateBreToRg: grep -E untouched', () => {
+  assert.equal(translateBreToRg('grep -rnE "a\\|b" src/', 'a\\|b'), 'a\\|b');
+});
+
+test('translateBreToRg: unescapes groups/braces/quantifiers for plain grep', () => {
+  assert.equal(translateBreToRg('grep "fn \\(x\\)\\+" src/', 'fn \\(x\\)\\+'), 'fn (x)+');
+});
+
+// ── classifyBlock: show mode (v0.49) — the daagu 22/128 function-body reads ──
+
+test('classifyBlock: declaration anchor + -A → show mode with symbols', () => {
+  assert.deepEqual(
+    classifyBlock('rg -n "def cascade_failure|def reset_task" -A 25 backend/app/'),
+    { mode: 'show', symbols: ['cascade_failure', 'reset_task'] });
+});
+
+test('classifyBlock: multi-decl alternation caps at 3 symbols', () => {
+  const c = classifyBlock('rg -n "def a_one|def b_two|class CThree|fn d_four" -A 10 src/');
+  assert.equal(c.mode, 'show');
+  assert.deepEqual(c.symbols, ['a_one', 'b_two', 'CThree']);
+});
+
+test('classifyBlock: declaration anchor WITHOUT context flag → plain grep deny', () => {
+  assert.deepEqual(classifyBlock('grep -rn "def fetch_user" backend/app/services/'),
+    { mode: 'grep' });
+});
+
+test('extractDeclSymbols: dedupes and spans fn/def/class/struct anchors', () => {
+  assert.deepEqual(
+    extractDeclSymbols(['fn alpha_one', 'struct BetaTwo', 'fn alpha_one']),
+    ['alpha_one', 'BetaTwo']);
 });
 
 // ── shouldBlock: should NOT block — marker-only patterns ────────────
@@ -402,8 +457,8 @@ test('buildBlockReason: lists cg grep + ast-search + callgraph', () => {
   assert.match(out, /code-graph-mcp callgraph/);
 });
 
-test('buildBlockReason: documents the escape hatch env var', () => {
-  assert.match(buildBlockReason(), /CODE_GRAPH_NO_BLOCK_GREP=1/);
+test('buildBlockReason: NEVER documents the escape hatch (v0.49 — the "THIS command only" scoping was adopted as a permanent prefix in 8s on 2026-06-12)', () => {
+  assert.doesNotMatch(buildBlockReason(), /CODE_GRAPH_NO_BLOCK_GREP/);
 });
 
 test('buildBlockReason: under 700-byte budget (single CC message)', () => {
@@ -583,11 +638,11 @@ test('replay: real abs-path symbol grep → BLOCK after normalization', () => {
   assert.equal(shouldBlock(norm), true);
 });
 
-test('replay: real abs-path -rln grep → HINT only after normalization (precision flag)', () => {
+test('replay: real abs-path -rln grep → DENY after normalization (v0.49: file lists answerable)', () => {
   const cmd = `grep -rln "load_active_config_standalone" ${DAAGU}/backend/tests/ | head -5`;
   const norm = normalizeCommandPaths(cmd, DAAGU);
   assert.equal(shouldHint(norm), true);
-  assert.equal(shouldBlock(norm), false);                     // -l cluster disqualifies block
+  assert.deepEqual(classifyBlock(norm), { mode: 'grep' });    // grep answer lists files per hit
 });
 
 test('replay: abs-path config-only grep stays silent after normalization', () => {
@@ -669,13 +724,6 @@ test('buildBlockReasonWithAnswer: NEVER advertises the bypass (v0.48 — one den
     status: 'hits', text: 'hit', truncated: false,
   });
   assert.doesNotMatch(reason, /CODE_GRAPH_NO_BLOCK_GREP/);
-});
-
-test('buildBlockReason: scopes the escape to THIS command only', () => {
-  const reason = buildBlockReason();
-  assert.match(reason, /CODE_GRAPH_NO_BLOCK_GREP=1/);
-  assert.match(reason, /THIS command only/);
-  assert.match(reason, /not a default/);
 });
 
 test('buildBlockReasonWithAnswer: no searchPath → command has no path arg', () => {

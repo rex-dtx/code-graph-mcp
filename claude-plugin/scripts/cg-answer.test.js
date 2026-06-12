@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { runGrepAnswer, truncateAtLine } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, truncateAtLine } = require('./cg-answer');
 
 // Stub "binary": a node script that reacts to its first real arg so one stub
 // covers hits / no-hits / error / timeout cases.
@@ -172,4 +172,35 @@ test('runGrepAnswer: glob searchPath is truncated before spawn (defensive layer)
   });
   assert.equal(r.status, 'hits');
   assert.match(r.text, /args=\["grep","fts5_search","src\/storage"\]/);
+});
+
+// ── runShowAnswer (v0.49) — show-mode deny bodies ────────────────────
+
+test('runShowAnswer: concatenates per-symbol show output with $ headers', () => {
+  const r = runShowAnswer({ cwd: stubDir, symbols: ['alpha_one', 'beta_two'], binary: stubBinary() });
+  assert.equal(r.status, 'hits');
+  assert.match(r.text, /\$ code-graph-mcp show alpha_one/);
+  assert.match(r.text, /\$ code-graph-mcp show beta_two/);
+});
+
+test('runShowAnswer: skips non-identifier symbols, all-skipped → unavailable-safe no-hits', () => {
+  const r = runShowAnswer({ cwd: stubDir, symbols: ['$(rm -rf)', 'a|b'], binary: stubBinary() });
+  assert.equal(r.status, 'no-hits');
+});
+
+test('runShowAnswer: caps at 3 symbols', () => {
+  const r = runShowAnswer({
+    cwd: stubDir, symbols: ['s_one', 's_two', 's_three', 's_four'], binary: stubBinary(),
+  });
+  assert.equal(r.status, 'hits');
+  assert.doesNotMatch(r.text, /show s_four/);
+});
+
+test('runShowAnswer: empty symbol list → unavailable', () => {
+  assert.equal(runShowAnswer({ cwd: stubDir, symbols: [], binary: stubBinary() }).status, 'unavailable');
+});
+
+test('runShowAnswer: failing binary → no-hits (caller falls back to grep answer)', () => {
+  const r = runShowAnswer({ cwd: stubDir, symbols: ['ExplodePlease'], binary: stubBinary() });
+  assert.equal(r.status, 'no-hits');
 });
