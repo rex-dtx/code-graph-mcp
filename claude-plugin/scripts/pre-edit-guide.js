@@ -11,10 +11,14 @@ const fs = require('fs');
 const path = require('path');
 const { findBinary } = require('./find-binary');
 const { cgTmpDir } = require('./tmp-dir');
+const { resolveProjectRoot } = require('./project-root');
+const { recordRecommendation } = require('./recommendation-log');
 
-const cwd = process.cwd();
-const dbPath = path.join(cwd, '.code-graph', 'index.db');
-if (!fs.existsSync(dbPath)) process.exit(0);
+// v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
+// gate kept this hook dark for entire sessions after `cd backend/` — daagu
+// 2026-06-12: 115 edits, zero impact injections.
+const cwd = resolveProjectRoot(process.cwd());
+if (cwd === null) process.exit(0);
 
 // Resolve binary the same way the other hooks do — bare PATH lookup misses
 // npm-global installs on systems where the global bin dir isn't on PATH for
@@ -22,10 +26,15 @@ if (!fs.existsSync(dbPath)) process.exit(0);
 const binary = findBinary();
 if (!binary) process.exit(0);
 
+// Hook-internal CLI runs are deliveries, not model-initiated conversions —
+// the marker keeps them out of the recommendations.jsonl `use` funnel leg.
+const internalEnv = { ...process.env, CODE_GRAPH_INTERNAL: '1' };
+
 // --- Parse tool input ---
 let input;
 try {
-  input = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
+  // fd 0, not '/dev/stdin': the path form fails ENXIO on socketpair stdin.
+  input = JSON.parse(fs.readFileSync(0, 'utf8'));
 } catch { process.exit(0); }
 
 const oldStr = (input.tool_input && input.tool_input.old_string) || '';
@@ -72,6 +81,7 @@ if (!symbol || symbol.length < 3) {
         try {
           const raw = execFileSync(binary, ['grep', candidate, filePath, '--json'], {
             cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+            env: internalEnv,
           });
           const grepResult = JSON.parse(raw);
           // Pick this candidate if it has few matches (precise location)
@@ -122,11 +132,14 @@ let jsonResult;
 try {
   const args = ['impact', symbol, '--json'];
   if (relFile && !relFile.startsWith('..')) args.push('--file', relFile);
-  const raw = execFileSync('code-graph-mcp', args, {
+  // v0.49 — use the resolved binary (bare 'code-graph-mcp' was PATH-dependent,
+  // diverging from the findBinary() result the rest of the hook trusts).
+  const raw = execFileSync(binary, args, {
     cwd,
     timeout: 2500,
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: internalEnv,
   });
   jsonResult = JSON.parse(raw);
 } catch {
@@ -153,6 +166,9 @@ if (directCallers < 1) process.exit(0);
 
 // Mark cooldown
 try { fs.writeFileSync(cooldownFile, ''); } catch { /* ok */ }
+
+// Funnel visibility (v0.49): an injected impact summary is a delivered answer.
+recordRecommendation(cwd, { hook: 'edit', action: 'hint', answered: true });
 
 // --- Inject compact impact summary ---
 const routeCount = jsonResult.affected_routes || 0;
