@@ -45,8 +45,8 @@ const INDEX_LINE =
   '- [code-graph-mcp](plugin_code_graph_mcp.md) ' +
   '[impact-analysis, callgraph, find-references, module-overview, semantic-search, ast-search, dead-code, find-similar-code, dependency-graph, trace-http-chain] — ' +
   '改 X 影响面/谁调用 X/X 被谁用/看 X 源码/Y 模块长啥样/概念查询 优先于 Grep；字面匹配走 Grep。' +
-  '核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map）' +
-  '+ 进阶 5（impact_analysis/trace_http_chain/dependency_graph/find_similar_code/find_dead_code），决策表见全文';
+  'Bash 直呼 CLI 最快（零加载）：`code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`；' +
+  'MCP 核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map），决策表见全文';
 
 // memdir L1 升格 (per sdscc 重构方案 §5.0): the INDEX_LINE that lands in
 // MEMORY.md is what Claude sees first on every keyword match. Tailoring it
@@ -234,9 +234,12 @@ function detectProjectType(cwd = process.cwd(), env = process.env) {
 // most for THIS project.
 function buildIndexLine(projectType = 'generic') {
   const prefix = '- [code-graph-mcp](plugin_code_graph_mcp.md) ';
+  // v0.49 — CLI form leads: in Claude Code the MCP tools are deferred (need a
+  // ToolSearch load before first call) while Bash is always live; the only
+  // conversions observed in real coding nights were CLI invocations.
   const coreSuffix =
-    '核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map）' +
-    '+ 进阶 5（impact_analysis/trace_http_chain/dependency_graph/find_similar_code/find_dead_code），决策表见全文';
+    'Bash 直呼 CLI 最快（零加载）：`code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`；' +
+    'MCP 核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map），决策表见全文';
   switch (projectType) {
     case 'web-rs':
     case 'web-node':

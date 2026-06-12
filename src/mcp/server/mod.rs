@@ -1297,18 +1297,19 @@ impl McpServer {
         let instructions = if quiet {
             "code-graph-mcp ready. See MEMORY.md \u{2192} plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`."
         } else {
-            // v0.18.4: trimmed from ~700B to ~330B after the hidden-5 fold.
-            // The "CLI-only" caveat is gone — impact/similar/deps/dead/route
-            // are now reachable as flags on the core 7 (get_ast_node /
-            // module_overview / get_call_graph). What remains: the boundary
-            // signal (Grep/Read still applies), the CLI escape hatch, and the
-            // pointer to the full decision table.
+            // v0.49: CLI form leads. In Claude Code the MCP tools are deferred
+            // (a ToolSearch load must precede the first call) while Bash is
+            // always live — the only conversions observed on real coding
+            // nights (2026-06-12) were CLI invocations seconds after a deny.
+            // Trigger phrases keep the literal questions first (routing memo).
             const NOISY: &str = concat!(
-                "Code Graph MCP \u{2014} project indexed. 7 tools cover structure / calls / refs / concept search; impact, similar, deps, dead, and route are folded into flags on get_ast_node, module_overview, and get_call_graph.\n",
+                "Code Graph MCP \u{2014} project indexed. Fastest path is the CLI via Bash (no tool loading): ",
+                "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; \"impact of X?\" or before editing a fn \u{2192} `code-graph-mcp impact X`; ",
+                "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; symbol search with AST context \u{2192} `code-graph-mcp grep \"pat\" [path]`.\n",
+                "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, semantic_code_search for concept search without an exact symbol.\n",
                 "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
-                "Triggers: \"who calls X?\" \u{2192} get_call_graph; \"impact of X?\" or before editing a fn \u{2192} get_ast_node include_impact=true; concept search without an exact symbol \u{2192} semantic_code_search.\n",
                 "Still Grep for exact strings/regex; still Read files you will edit.\n",
-                "CLI escape hatch: `code-graph-mcp <impact|similar|deps|dead-code|trace>`. Diagnostics: `code-graph-mcp health-check`.\n",
+                "Diagnostics: `code-graph-mcp health-check`.\n",
                 "Full decision table: MEMORY.md \u{2192} plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
             );
             // Compile-time guard: calibrated from observed Claude Code truncation

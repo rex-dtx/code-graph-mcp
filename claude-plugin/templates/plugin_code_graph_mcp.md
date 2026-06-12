@@ -38,6 +38,11 @@ type: reference
 
 ## 何时调用 MCP/CLI（替代多步 Grep/Read）
 
+> **v0.49 起 CLI 优先**：Claude Code 里 MCP 工具是 deferred（首次调用前要
+> ToolSearch 加载），而 Bash 永远在线——真实编程夜（2026-06-12）观测到的全部
+> 转化都是 CLI 调用。结构化查询的最快路径是 Bash 直呼
+> `code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`。
+>
 > v0.10.0 起：tools/list 默认只暴露 7 个核心工具；下表"进阶 5"中的工具
 > 已从 tools/list 隐藏以节省 session 启动 tokens。**Claude Code 里请走 CLI
 > 子命令**（MCP schema 不在 list，Claude Code 的 ToolSearch 不会加载，直接

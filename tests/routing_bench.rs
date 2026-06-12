@@ -77,7 +77,7 @@ const SYSTEM_PROMPT: &str = "You are a code-search assistant. For the user's que
 /// Mirror of `claude-plugin/scripts/adopt.js` `INDEX_LINE`. Used by
 /// context-rich bench mode to inject MEMORY.md hook into system prompt.
 /// Drift-checked at test time via `index_line_drift_check`.
-const INDEX_LINE_MIRROR: &str = "- [code-graph-mcp](plugin_code_graph_mcp.md) [impact-analysis, callgraph, find-references, module-overview, semantic-search, ast-search, dead-code, find-similar-code, dependency-graph, trace-http-chain] — 改 X 影响面/谁调用 X/X 被谁用/看 X 源码/Y 模块长啥样/概念查询 优先于 Grep；字面匹配走 Grep。核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map）+ 进阶 5（impact_analysis/trace_http_chain/dependency_graph/find_similar_code/find_dead_code），决策表见全文";
+const INDEX_LINE_MIRROR: &str = "- [code-graph-mcp](plugin_code_graph_mcp.md) [impact-analysis, callgraph, find-references, module-overview, semantic-search, ast-search, dead-code, find-similar-code, dependency-graph, trace-http-chain] — 改 X 影响面/谁调用 X/X 被谁用/看 X 源码/Y 模块长啥样/概念查询 优先于 Grep；字面匹配走 Grep。Bash 直呼 CLI 最快（零加载）：`code-graph-mcp callgraph X / show X / overview <dir> / grep \"pat\" / impact X`；MCP 核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map），决策表见全文";
 
 /// (natural-language query, expected tool name).
 /// 20 queries × 7 tools — 3 per tool except `find_references` with 2.
