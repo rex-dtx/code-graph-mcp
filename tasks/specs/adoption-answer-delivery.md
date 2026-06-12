@@ -1,6 +1,6 @@
 ---
-status: approved
-revision: 1
+status: implemented
+revision: 2
 ---
 # Adoption: answer-delivery upgrade (P0–P4)
 
@@ -56,3 +56,10 @@ subsequent night of real coding produces a trustworthy deny→use funnel.
 
 # Change log
 - r1 (2026-06-13): initial, from the 2026-06-12 daagu night analysis.
+- r2 (2026-06-13): implemented as v0.49.0 (commits 6ec909f / 0353db2 / b22e5ae /
+  1609ce9 / b704160 / d70db9b). Deviation: P3's new post-edit hook + file-impact
+  CLI replaced by modernizing the existing pre-edit-guide.js (reuse-first — the
+  edit→impact surface already existed, dark for the same subdir-cwd reasons).
+  P1b replay result: deny-class 20 → 35 of 128 (estimate was ~40; bare-identifier
+  + context-flag commands stay hint by design). P2c sed-range lands in
+  pre-grep-guide (Bash hook) feeding the shared fanout state.
