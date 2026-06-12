@@ -4526,7 +4526,7 @@ mod tests {
         assert_eq!(s.deny_answered, 1);
         assert_eq!(s.deny_unanswered, 2, "answered:false and missing field are both static");
         assert_eq!(s.by_action.get("bypass").copied(), Some(1));
-        assert!(s.by_hook.get("cli").is_none(), "cli use lines stay out of by_hook");
+        assert!(!s.by_hook.contains_key("cli"), "cli use lines stay out of by_hook");
     }
 
     #[test]

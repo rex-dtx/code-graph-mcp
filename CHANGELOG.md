@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.49.0 — feat: answer-delivery upgrade — every guidance surface delivers results, and the funnel finally sees failures
+
+First valid funnel reading (daagu, 6 sessions / ~3.5h real coding, 2026-06-12: 53 hook
+events, 0 MCP calls, 3 post-deny CLI conversions) showed which levers work: delivered
+answers satisfy in place (5/5), advice converts ~0 (0/40 hints), and the only conversions
+were CLI invocations seconds after a deny. This release rebuilds around that evidence.
+
+**What changes for users** (migration: nothing to do; opt-outs below):
+
+- **Deny tier broadened, intent-aware** (`pre-grep-guide.js`): declaration-anchor greps
+  with context flags (`rg "def X|class Y" -A 25`) are denied WITH the symbol bodies via
+  `code-graph-mcp show`; `-l` / `--include` symbol greps are denied with the grep answer.
+  `-L` / `-v` / `--exclude*` (intents the answer can't honor) stay hint. Replay on the
+  daagu night: deny-class coverage 20 → 35 of 128 head-greps, hint 28 → 13.
+- **Deny copy never mentions the escape env again** — the v0.48 "THIS command only"
+  scoping was adopted as a permanent prefix within 8 seconds and reused 11× that night.
+  `CODE_GRAPH_NO_BLOCK_GREP=1` still works; it is documented here, not taught in-band.
+- **BRE→rust-regex bridge**: plain-grep patterns (`a\|b`) are unescaped before the
+  answer runs — both `answered:false` denies that night were dialect/path-shape misses.
+- **Read-fanout hint now DELIVERS the module overview** (`pre-read-guide.js`): on the
+  5th same-dir read the hint embeds `code-graph-mcp overview <dir>` output. The read
+  hook also gets the v0.48 subdir-cwd fix it missed (it had recorded ZERO events in
+  daagu history) plus fd-0 stdin. `sed -n X,Yp` source reads now count toward fanout.
+- **Edit→impact injection un-darkened** (`pre-edit-guide.js`): same subdir-cwd + stdin
+  fixes (daagu: 115 edits, zero impact injections); impact CLI call uses the resolved
+  binary; injections are recorded to the funnel.
+- **Funnel instrument fixes (Rust)**: 0-tool-call sessions with in-window hook traffic
+  now flush a usage record — previously the deny→use denominator could only contain
+  converted sessions, making 0% conversion structurally unobservable. Model-initiated
+  CLI queries record `{hook:"cli",action:"use"}` (hook-internal runs carry
+  `CODE_GRAPH_INTERNAL=1` and are excluded). `stats` segments denies answered/static,
+  reports CLI uses, and funnel conversion is any-use (mcp OR cli) with separable legs.
+- **Guidance surfaces lead with the CLI** (MCP `instructions`, adopt index line,
+  decision-table template): in Claude Code the MCP tools are deferred behind ToolSearch
+  while Bash is always live. Adopted projects realign at next SessionStart.
+
+**Opt-out / revert**: `CODE_GRAPH_QUIET_HOOKS=1` silences hooks; `CODE_GRAPH_NO_BLOCK_GREP=1`
+downgrades block→hint per command (still measured); `CODE_GRAPH_NO_ANSWER_IN_DENY=1`
+restores advice-only denies AND advice-only read hints; or pin `@sdsrs/code-graph@0.48.0`.
+usage.jsonl / recommendations.jsonl shapes are additive — no schema bump, no index rebuild.
+
 ## v0.48.0 — fix: grep guard survives `cd` into subdirs; deny stops teaching its own bypass
 
 Field reading of the v0.46 deny→use funnel on a real consumer project (daagu, 4 sessions /
