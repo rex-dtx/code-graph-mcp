@@ -189,6 +189,50 @@ fn test_cli_affected_changed_test_file_is_self_included() {
 }
 
 #[test]
+fn test_cli_affected_dot_input_no_pollution() {
+    // F2: `affected .` normalizes to "" → must pollute neither changed nor not_indexed.
+    let project = setup_affected_project();
+    let (stdout, _, code) = run_cli(&project, &["affected", ".", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert_eq!(v["changed"].as_array().unwrap().len(), 0, "`.` must not be a changed file");
+    assert_eq!(v["not_indexed"].as_array().unwrap().len(), 0, "`.` must not be reported not_indexed");
+}
+
+#[test]
+fn test_cli_affected_nonexistent_test_path_not_in_tests() {
+    // F3: a nonexistent test-path input goes to not_indexed only, never the tests set.
+    let project = setup_affected_project();
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/ghost.test.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    let tests: Vec<String> = v["tests"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    let ni: Vec<String> = v["not_indexed"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    assert!(ni.contains(&"src/ghost.test.ts".to_string()), "nonexistent input → not_indexed; got {ni:?}");
+    assert!(!tests.contains(&"src/ghost.test.ts".to_string()),
+        "nonexistent test must NOT be in the re-run set; got {tests:?}");
+}
+
+#[test]
+fn test_cli_affected_blast_radius_disjoint_from_changed() {
+    // F4: a changed file must never appear in affected_files. api.ts imports auth.ts;
+    // changing BOTH must not list api.ts (a changed file) as 'affected'.
+    let project = setup_affected_project();
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/auth.ts", "src/api.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    let affected: Vec<String> = v["affected_files"].as_array().unwrap()
+        .iter().map(|x| x["path"].as_str().unwrap().to_string()).collect();
+    let changed: Vec<String> = v["changed"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    for c in &changed {
+        assert!(!affected.contains(c), "changed file {c} must not be in affected_files; affected={affected:?}");
+    }
+}
+
+#[test]
 fn test_cli_health_check_resolution_block() {
     let project = setup_indexed_project(); // TS fixture: api.ts → auth.ts validateToken
     let (stdout, _, code) = run_cli(&project, &["health-check", "--json"]);

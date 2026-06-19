@@ -348,24 +348,8 @@ impl McpServer {
         // due to name-based resolution matching common names like `update`, `read`, etc.)
         // Also drop the synthetic `<external>` bucket — it's a container for unresolved
         // imports, not a real file dependency.
-        let root_lang = crate::utils::config::detect_language(file_path);
-        let is_compatible_lang = |dep_path: &str| -> bool {
-            if dep_path == "<external>" { return false; }
-            let dep_lang = crate::utils::config::detect_language(dep_path);
-            match (root_lang, dep_lang) {
-                (None, _) | (_, None) => true, // unknown language → keep
-                (Some(a), Some(b)) if a == b => true,
-                // JS/TS family can cross-reference
-                (Some(a), Some(b)) if matches!((a, b),
-                    ("javascript" | "typescript" | "tsx", "javascript" | "typescript" | "tsx")
-                ) => true,
-                // C/C++ family can cross-reference
-                (Some(a), Some(b)) if matches!((a, b),
-                    ("c" | "cpp", "c" | "cpp")
-                ) => true,
-                _ => false,
-            }
-        };
+        let is_compatible_lang =
+            |dep_path: &str| crate::utils::config::is_compatible_lang(file_path, dep_path);
 
         let outgoing: Vec<serde_json::Value> = deps.iter()
             .filter(|d| d.direction == "outgoing")

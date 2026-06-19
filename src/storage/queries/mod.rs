@@ -29,7 +29,7 @@ pub use files::{
     delete_files_by_paths, get_all_file_hashes, get_file_language, get_file_path,
     get_index_status, upsert_file, FileRecord, IndexStatus,
 };
-pub use imports::{get_import_tree, file_is_indexed, FileDependency};
+pub use imports::{get_import_tree, file_is_indexed, get_reverse_dependents, FileDependency};
 pub use nodes::{
     delete_nodes_by_file, get_all_node_names_with_ids, get_dirty_node_ids,
     get_first_node_id_by_name, get_inbound_calls_for_pending, get_inbound_cross_file_edges,

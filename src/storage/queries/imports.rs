@@ -138,6 +138,61 @@ pub fn file_is_indexed(conn: &Connection, file_path: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Reverse transitive dependents of `file_path` over EVERY "A depends on B" relation
+/// (imports ∪ calls ∪ references ∪ implements ∪ inherits), file-level, cycle-guarded.
+/// Returns (dependent_file_path, min_depth). Unlike [`get_import_tree`] (imports ∪ calls
+/// only — correct for a *dependency graph* view), `affected` needs the full relation
+/// set so a test that only `references`/`implements`/`inherits` a changed symbol is not
+/// silently dropped from the "tests to re-run" set. No `symbol_count` subquery — callers
+/// here only need the file set and depth.
+pub fn get_reverse_dependents(
+    conn: &Connection,
+    file_path: &str,
+    max_depth: i32,
+) -> Result<Vec<(String, i32)>> {
+    use crate::domain::{REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS, REL_REFERENCES};
+    let max_depth = max_depth.clamp(1, 10);
+    // Relation IN-list built from trusted constants (no user input → no injection).
+    let in_list = [REL_IMPORTS, REL_CALLS, REL_REFERENCES, REL_IMPLEMENTS, REL_INHERITS]
+        .iter()
+        .map(|r| format!("'{r}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH RECURSIVE dep_tree(file_id, file_path, depth, visited_ids) AS (
+            SELECT f0.id, f0.path, 0, CAST(f0.id AS TEXT)
+            FROM files f0 WHERE f0.path = ?1
+
+            UNION ALL
+
+            SELECT DISTINCT f1.id, f1.path, dt.depth + 1,
+                   dt.visited_ids || '|' || CAST(f1.id AS TEXT)
+            FROM dep_tree dt
+            JOIN nodes n2 ON n2.file_id = dt.file_id
+            JOIN edges e ON e.target_id = n2.id AND e.relation IN ({in_list})
+            JOIN nodes n1 ON n1.id = e.source_id
+            JOIN files f1 ON f1.id = n1.file_id
+            WHERE dt.depth < ?2
+              AND f1.path != ?1
+              AND ('|' || dt.visited_ids || '|') NOT LIKE '%|' || CAST(f1.id AS TEXT) || '|%'
+        )
+        SELECT dt.file_path, MIN(dt.depth) AS min_depth
+        FROM dep_tree dt
+        WHERE dt.depth > 0
+        GROUP BY dt.file_path
+        ORDER BY min_depth, dt.file_path"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![file_path, max_depth], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +237,26 @@ mod tests {
         ).unwrap();
         assert!(file_is_indexed(conn, "src/a.rs").unwrap());
         assert!(!file_is_indexed(conn, "src/missing.rs").unwrap());
+    }
+
+    #[test]
+    fn reverse_dependents_includes_non_import_relations() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('a.ts','h1',0,'typescript',0)", []).unwrap();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('b.ts','h2',0,'typescript',0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (1,'function','a',1,2,'')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (2,'function','b',1,2,'')", []).unwrap();
+        // a (file 1) references b (file 2) via a 'references' edge — NOT imports/calls.
+        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'references')", []).unwrap();
+
+        // get_import_tree walks only imports∪calls → must MISS the references-only dep.
+        let imp = get_import_tree(conn, "b.ts", "incoming", 5).unwrap();
+        assert!(imp.iter().all(|d| d.file_path != "a.ts"),
+            "import_tree (imports∪calls) should not see a references-only dependent");
+        // get_reverse_dependents walks all dependency relations → must INCLUDE a.ts.
+        let rev = get_reverse_dependents(conn, "b.ts", 5).unwrap();
+        assert!(rev.iter().any(|(p, _)| p == "a.ts"),
+            "reverse_dependents must include the references dependent; got {rev:?}");
     }
 }

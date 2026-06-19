@@ -2709,52 +2709,80 @@ pub struct AffectedArgs {
 /// Reverse-impact: given changed files, list the test files that transitively
 /// depend on them (primary) plus the full affected-file set (secondary).
 pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::io::Read;
 
     let depth = args.depth.clamp(1, 10);
 
-    // 1. Gather raw paths: positional + optional stdin.
+    // 1. Gather raw paths: positional + optional stdin. read_to_end + lossy UTF-8 so a
+    //    non-UTF-8 path (legal on Linux) cannot break the --json envelope (F6).
     let mut raw: Vec<String> = args.files.clone();
     if args.stdin {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        raw.extend(buf.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()));
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        raw.extend(
+            String::from_utf8_lossy(&buf)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty()),
+        );
     }
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    // 2. Normalize + dedup. Outside-root / unresolvable paths are reported, not fatal
-    //    (a git diff may list deleted or moved files).
+    // 2. Classify each raw input. `changed` holds normalized, INDEXED paths only;
+    //    `not_indexed` reports the user's RAW input (one consistent form, F7). Inputs
+    //    that normalize to "" (e.g. `.` / project root) are skipped — not a file (F2).
     let mut changed: Vec<String> = Vec::new();
     let mut not_indexed: Vec<String> = Vec::new();
+    let mut seen_changed: HashSet<String> = HashSet::new();
     for r in &raw {
-        match normalize_user_path(project_root, r) {
-            Ok(p) if !changed.contains(&p) => changed.push(p),
-            Ok(_) => {}
-            Err(_) if !not_indexed.contains(r) => not_indexed.push(r.clone()),
-            Err(_) => {}
-        }
-    }
-
-    // 3. Union incoming (reverse) dependents across all indexed changed files.
-    //    get_import_tree("incoming") already walks REL_IMPORTS ∪ REL_CALLS, cycle-guarded.
-    let mut affected: BTreeMap<String, i32> = BTreeMap::new();
-    for f in &changed {
-        if !queries::file_is_indexed(conn, f)? {
-            if !not_indexed.contains(f) { not_indexed.push(f.clone()); }
+        let norm = match normalize_user_path(project_root, r) {
+            Ok(p) => p,
+            Err(_) => {
+                if !not_indexed.contains(r) { not_indexed.push(r.clone()); }
+                continue;
+            }
+        };
+        if norm.is_empty() {
             continue;
         }
-        for dep in queries::get_import_tree(conn, f, "incoming", depth)? {
-            affected.entry(dep.file_path)
-                .and_modify(|d| if dep.depth < *d { *d = dep.depth })
-                .or_insert(dep.depth);
+        if !queries::file_is_indexed(conn, &norm)? {
+            if !not_indexed.contains(r) { not_indexed.push(r.clone()); }
+            continue;
+        }
+        if seen_changed.insert(norm.clone()) {
+            changed.push(norm);
         }
     }
 
-    // 4. Primary: test files among dependents ∪ changed files that are themselves tests.
-    let mut tests: Vec<String> = affected.keys()
+    // 3. Union reverse dependents across all changed files over EVERY dependency
+    //    relation (imports∪calls∪references∪implements∪inherits, F1), keeping only
+    //    language-compatible dependents (F10) and excluding the changed files
+    //    themselves from the blast radius (F4).
+    let changed_set: HashSet<&str> = changed.iter().map(|s| s.as_str()).collect();
+    let mut affected: BTreeMap<String, i32> = BTreeMap::new();
+    for f in &changed {
+        for (dep_path, dep_depth) in queries::get_reverse_dependents(conn, f, depth)? {
+            if !crate::utils::config::is_compatible_lang(f, &dep_path) {
+                continue;
+            }
+            if changed_set.contains(dep_path.as_str()) {
+                continue;
+            }
+            affected
+                .entry(dep_path)
+                .and_modify(|d| if dep_depth < *d { *d = dep_depth })
+                .or_insert(dep_depth);
+        }
+    }
+
+    // 4. Primary output: test files among the dependents ∪ changed files that are
+    //    themselves tests. `changed` is indexed-only, so a nonexistent test path can no
+    //    longer land in both `tests` and `not_indexed` (F3).
+    let mut tests: Vec<String> = affected
+        .keys()
         .filter(|p| crate::domain::is_test_path(p))
         .cloned()
         .collect();
@@ -3711,22 +3739,8 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
 
     // Filter out cross-language false edges (name-based resolution artifacts)
     // and the synthetic `<external>` bucket (unresolved imports, not a real file).
-    let root_lang = crate::utils::config::detect_language(file_path);
-    let is_compatible_lang = |dep_path: &str| -> bool {
-        if dep_path == "<external>" { return false; }
-        let dep_lang = crate::utils::config::detect_language(dep_path);
-        match (root_lang, dep_lang) {
-            (None, _) | (_, None) => true,
-            (Some(a), Some(b)) if a == b => true,
-            (Some(a), Some(b)) if matches!((a, b),
-                ("javascript" | "typescript" | "tsx", "javascript" | "typescript" | "tsx")
-            ) => true,
-            (Some(a), Some(b)) if matches!((a, b),
-                ("c" | "cpp", "c" | "cpp")
-            ) => true,
-            _ => false,
-        }
-    };
+    let is_compatible_lang =
+        |dep_path: &str| crate::utils::config::is_compatible_lang(file_path, dep_path);
 
     let outgoing: Vec<&_> = deps.iter().filter(|d| d.direction == "outgoing" && is_compatible_lang(&d.file_path)).collect();
     let incoming: Vec<&_> = deps.iter().filter(|d| d.direction == "incoming" && is_compatible_lang(&d.file_path)).collect();
