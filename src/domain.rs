@@ -168,7 +168,14 @@ pub const NON_FUNCTION_IMPACT_WARNING: &str = "Impact analysis tracks function c
 pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
     name.starts_with("test_")
         || name.ends_with("Test") || name.ends_with("Tests")
-        || file_path.starts_with("tests/") || file_path.starts_with("test/")
+        || is_test_path(file_path)
+}
+
+/// File-level test classifier (path heuristics only). Single source of truth for
+/// "is this path a test file" — `is_test_symbol` and the `affected` command both
+/// use it, so the path rules never drift into a second copy.
+pub fn is_test_path(file_path: &str) -> bool {
+    file_path.starts_with("tests/") || file_path.starts_with("test/")
         || file_path.starts_with("benches/") || file_path.starts_with("bench/")
         || file_path.contains("__tests__/")
         || file_path.ends_with("/tests.rs")
@@ -408,6 +415,21 @@ mod tests {
         // Guard against false positives: substring must be the final segment.
         assert!(!is_test_symbol("fts5_search", "src/contests.rs"));
         assert!(!is_test_symbol("normal_fn", "src/tests_helpers.rs"));
+    }
+
+    #[test]
+    fn is_test_path_classifies_by_path_only() {
+        // Path-based positives (no symbol name needed).
+        assert!(is_test_path("tests/foo.rs"));
+        assert!(is_test_path("src/auth.test.ts"));
+        assert!(is_test_path("pkg/handler_test.go"));
+        assert!(is_test_path("a/__tests__/x.js"));
+        // Negatives.
+        assert!(!is_test_path("src/auth.ts"));
+        assert!(!is_test_path("src/main.rs"));
+        // is_test_symbol still honors the name heuristic on a non-test path.
+        assert!(is_test_symbol("test_login", "src/auth.rs"));
+        assert!(!is_test_symbol("login", "src/auth.rs"));
     }
 
     #[test]
