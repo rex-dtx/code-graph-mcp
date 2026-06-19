@@ -71,7 +71,7 @@ Repo-wide AST + FTS + vector index. Prefer code-graph MCP over multi-round Grep/
 | Concept search without exact symbol (e.g. "code that handles retries") | `semantic_code_search query="..."` | guesswork-driven Grep |
 | HTTP route → handler chain | `get_call_graph route_path="GET /api/x"` | manual route table + Read |
 
-Still use Grep for exact strings/regex (especially in non-code files: JSON, lockfiles, logs). Still use Read for files you're about to edit. CLI escape hatch: `code-graph-mcp <map|overview|show|callgraph|impact|refs|dead-code|trace|grep|health-check>` — same data, Bash-friendly output. `code-graph-mcp grep` is a drop-in grep: `-F` literal / `-i` / `-w` / `-l` / `-A/-B/-C N` context / multi-path / `--max-count 0`, grep-compatible exit codes (0/1/2), git-grep-grade recall (finds tracked-but-gitignored files like this CLAUDE.md), each hit annotated with its containing fn/class. Full decision table: `MEMORY.md → plugin_code_graph_mcp.md`.
+Still use Grep for exact strings/regex (especially in non-code files: JSON, lockfiles, logs). Still use Read for files you're about to edit. CLI escape hatch: `code-graph-mcp <map|tour|overview|show|callgraph|impact|refs|dead-code|trace|grep|health-check>` — same data, Bash-friendly output. (`tour [PATH]` = dependency-ordered reading order: where to start reading a repo/subtree; CLI-only.) `code-graph-mcp grep` is a drop-in grep: `-F` literal / `-i` / `-w` / `-l` / `-A/-B/-C N` context / multi-path / `--max-count 0`, grep-compatible exit codes (0/1/2), git-grep-grade recall (finds tracked-but-gitignored files like this CLAUDE.md), each hit annotated with its containing fn/class. Full decision table: `MEMORY.md → plugin_code_graph_mcp.md`.
 
 ## Autonomy
 

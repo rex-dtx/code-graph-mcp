@@ -2436,3 +2436,94 @@ fn test_cli_callgraph_json_includes_parent_id() {
         "every non-root row must carry parent_id; with_parent={with_parent} depth>0={depth_gt_zero}"
     );
 }
+
+// --- tour subcommand ---
+
+/// Three modules in distinct directories with a clean dependency chain:
+/// `src/api` → `src/store` → `src/core`. Exercises cross-module ordering
+/// (single-dir fixtures collapse to one module).
+fn setup_tour_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let mk = |dir: &str, file: &str, body: &str| {
+        let d = project.path().join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(file), body).unwrap();
+    };
+    // NB: export *functions*, not `const`s — top-level const exports are not
+    // extracted as symbol nodes, so importing them produces no REL_IMPORTS edge
+    // and the cross-module dependency (the whole point here) would silently vanish.
+    mk("src/core", "util.ts",
+        "export function clampLen(x: string): number { return x.length; }\n");
+    mk("src/store", "store.ts",
+        "import { clampLen } from '../core/util';\nexport function saveItem(x: string): boolean { return clampLen(x) < 10; }\n");
+    mk("src/api", "handlers.ts",
+        "import { saveItem } from '../store/store';\nexport function handleSave(x: string): boolean { return saveItem(x); }\n");
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+fn tour_paths(v: &serde_json::Value) -> Vec<String> {
+    v["reading_order"].as_array().unwrap().iter()
+        .map(|e| e["path"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn test_cli_tour_orders_prerequisites_first() {
+    // api → store → core, so the reading order must be core, then store, then api.
+    let project = setup_tour_project();
+    let (stdout, _, code) = run_cli(&project, &["tour", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json envelope");
+    let paths = tour_paths(&v);
+    let pos = |p: &str| paths.iter().position(|x| x == p)
+        .unwrap_or_else(|| panic!("module {p} missing from {paths:?}"));
+    assert!(pos("src/core") < pos("src/store"), "core before store; got {paths:?}");
+    assert!(pos("src/store") < pos("src/api"), "store before api; got {paths:?}");
+}
+
+#[test]
+fn test_cli_tour_json_shape() {
+    let project = setup_tour_project();
+    let (stdout, _, code) = run_cli(&project, &["tour", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json envelope");
+    let arr = v["reading_order"].as_array().expect("reading_order is an array");
+    assert!(!arr.is_empty());
+    let core = arr.iter().find(|e| e["path"] == "src/core").unwrap();
+    assert_eq!(core["role"], "foundational", "core imports nothing in-scope");
+    assert_eq!(core["depended_on_by"], 1, "store imports core");
+    assert!(core["depends_on"].as_array().unwrap().is_empty());
+    assert!(core["in_cycle"].is_boolean());
+    assert!(core["key_symbols"].is_array());
+    // The dependent module records its in-scope import.
+    let store = arr.iter().find(|e| e["path"] == "src/store").unwrap();
+    let store_deps: Vec<&str> = store["depends_on"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(store_deps, ["src/core"], "store imports core");
+}
+
+#[test]
+fn test_cli_tour_path_scope() {
+    // Scoping to a subtree filters out modules outside it.
+    let project = setup_tour_project();
+    let (stdout, _, code) = run_cli(&project, &["tour", "src/store", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    let paths = tour_paths(&v);
+    assert_eq!(paths, ["src/store"], "only the scoped module remains; got {paths:?}");
+}
+
+#[test]
+fn test_cli_json_empty_tour() {
+    // cli_json_empty contract: a scope matching no modules still yields the
+    // same-shape object envelope on stdout (not a bare bail to stderr).
+    let project = setup_tour_project();
+    let (stdout, _, code) = run_cli(&project, &["tour", "zznonexistent/", "--json"]);
+    assert_eq!(code, 0, "empty tour exits 0 (structural overview, not a lookup)");
+    assert_eq!(stdout.trim(), r#"{"reading_order":[]}"#,
+        "empty result must be the same-shape envelope");
+}

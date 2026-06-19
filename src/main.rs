@@ -119,6 +119,11 @@ fn main() -> Result<()> {
             let map_args = code_graph_mcp::cli::MapArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_map(&project_root, map_args)
         }
+        Some("tour") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            let tour_args = code_graph_mcp::cli::TourArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_tour(&project_root, tour_args)
+        }
         Some("overview" | "module_overview") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let overview_args = code_graph_mcp::cli::OverviewArgs::parse_from(args.iter().skip(1));
