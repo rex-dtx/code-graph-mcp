@@ -754,6 +754,7 @@ pub fn canonical_query_cmd(sub: &str) -> Option<&'static str> {
         "ast-search" | "ast_search" => "ast-search",
         "callgraph" | "get_call_graph" => "callgraph",
         "impact" | "impact_analysis" => "impact",
+        "affected" => "affected",
         "map" | "project_map" => "map",
         "overview" | "module_overview" => "overview",
         "show" | "get_ast_node" => "show",
@@ -2669,6 +2670,116 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// --- affected subcommand ---
+
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp affected",
+          about = "Changed files → test files to re-run (+ full blast radius)")]
+pub struct AffectedArgs {
+    /// Changed file paths (relative to project root, or absolute under it)
+    pub files: Vec<String>,
+    /// Also read newline-separated paths from stdin (e.g. `git diff --name-only | …`)
+    #[arg(long)]
+    pub stdin: bool,
+    /// Max reverse-dependency traversal depth (default: 10; clamped 1..=10)
+    #[arg(long, default_value_t = 10)]
+    pub depth: i32,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Reverse-impact: given changed files, list the test files that transitively
+/// depend on them (primary) plus the full affected-file set (secondary).
+pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+
+    let depth = args.depth.clamp(1, 10);
+
+    // 1. Gather raw paths: positional + optional stdin.
+    let mut raw: Vec<String> = args.files.clone();
+    if args.stdin {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        raw.extend(buf.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()));
+    }
+
+    let ctx = CliContext::open(project_root)?;
+    let conn = ctx.db.conn();
+
+    // 2. Normalize + dedup. Outside-root / unresolvable paths are reported, not fatal
+    //    (a git diff may list deleted or moved files).
+    let mut changed: Vec<String> = Vec::new();
+    let mut not_indexed: Vec<String> = Vec::new();
+    for r in &raw {
+        match normalize_user_path(project_root, r) {
+            Ok(p) if !changed.contains(&p) => changed.push(p),
+            Ok(_) => {}
+            Err(_) if !not_indexed.contains(r) => not_indexed.push(r.clone()),
+            Err(_) => {}
+        }
+    }
+
+    // 3. Union incoming (reverse) dependents across all indexed changed files.
+    //    get_import_tree("incoming") already walks REL_IMPORTS ∪ REL_CALLS, cycle-guarded.
+    let mut affected: BTreeMap<String, i32> = BTreeMap::new();
+    for f in &changed {
+        if !queries::file_is_indexed(conn, f)? {
+            if !not_indexed.contains(f) { not_indexed.push(f.clone()); }
+            continue;
+        }
+        for dep in queries::get_import_tree(conn, f, "incoming", depth)? {
+            affected.entry(dep.file_path)
+                .and_modify(|d| if dep.depth < *d { *d = dep.depth })
+                .or_insert(dep.depth);
+        }
+    }
+
+    // 4. Primary: test files among dependents ∪ changed files that are themselves tests.
+    let mut tests: Vec<String> = affected.keys()
+        .filter(|p| crate::domain::is_test_path(p))
+        .cloned()
+        .collect();
+    for f in &changed {
+        if crate::domain::is_test_path(f) && !tests.contains(f) {
+            tests.push(f.clone());
+        }
+    }
+    tests.sort();
+
+    // 5. Emit (same-shape JSON on every path — empty included).
+    let mut stdout = std::io::stdout().lock();
+    if args.json {
+        let affected_files: Vec<_> = affected.iter().map(|(p, d)| serde_json::json!({
+            "path": p, "depth": d, "is_test": crate::domain::is_test_path(p),
+        })).collect();
+        let result = serde_json::json!({
+            "changed": changed,
+            "tests": tests,
+            "affected_files": affected_files,
+            "not_indexed": not_indexed,
+        });
+        writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "Affected by {} changed file(s) — {} test file(s) to re-run:",
+        changed.len(), tests.len())?;
+    for t in &tests {
+        writeln!(stdout, "  {}", t)?;
+    }
+    writeln!(stdout, "Full blast radius: {} file(s) (depth <= {})", affected.len(), depth)?;
+    for (p, d) in &affected {
+        writeln!(stdout, "  {} (depth {})", p, d)?;
+    }
+    if !not_indexed.is_empty() {
+        writeln!(stdout, "{} input file(s) not in index: {}",
+            not_indexed.len(), not_indexed.join(", "))?;
+    }
     Ok(())
 }
 

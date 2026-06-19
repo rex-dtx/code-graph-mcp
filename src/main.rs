@@ -154,6 +154,11 @@ fn main() -> Result<()> {
             let dead_code_args = code_graph_mcp::cli::DeadCodeArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_dead_code(&project_root, dead_code_args)
         }
+        Some("affected") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            let affected_args = code_graph_mcp::cli::AffectedArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_affected(&project_root, affected_args)
+        }
         Some("benchmark") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let bench_args = code_graph_mcp::cli::BenchmarkArgs::parse_from(args.iter().skip(1));
@@ -216,6 +221,7 @@ fn print_help() {
     println!("    ast-search [query]  Structured search with --type/--returns/--params filters");
     println!("    callgraph <symbol>  Show call graph (callers/callees)");
     println!("    impact <symbol>     Impact analysis (callers, routes, risk level)");
+    println!("    affected [files...] Changed files → test files to re-run (--stdin, --depth, --json)");
     println!("    show <symbol>       Show symbol details (code, type, signature)");
     println!("    map                 Project architecture map (modules, deps, entry points)");
     println!("    overview <path>     Module overview (symbols grouped by file and type)");

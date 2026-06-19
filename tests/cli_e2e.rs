@@ -86,6 +86,61 @@ fn run_cli_env(project: &TempDir, args: &[&str], envs: &[(&str, &str)]) -> (Stri
     (stdout, stderr, code)
 }
 
+/// Temp project where src/api.ts and src/auth.test.ts both depend on src/auth.ts.
+/// auth.test.ts is co-located so the proven `./auth` import resolves, and `.test.ts`
+/// makes it a test file via is_test_path.
+fn setup_affected_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    std::fs::write(src.join("auth.ts"), r#"
+export function validateToken(token: string): boolean {
+    return token.length > 0;
+}
+"#).unwrap();
+
+    std::fs::write(src.join("api.ts"), r#"
+import { validateToken } from './auth';
+export function handleLogin(token: string): boolean {
+    return validateToken(token);
+}
+"#).unwrap();
+
+    std::fs::write(src.join("auth.test.ts"), r#"
+import { validateToken } from './auth';
+export function testValidate(): void {
+    validateToken('x');
+}
+"#).unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+#[test]
+fn test_cli_affected_json_core() {
+    let project = setup_affected_project();
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/auth.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid json: {e}; raw: {stdout}"));
+
+    let tests: Vec<String> = v["tests"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    assert!(tests.contains(&"src/auth.test.ts".to_string()),
+        "auth.test.ts must be a test to re-run; got {tests:?}");
+
+    let affected: Vec<String> = v["affected_files"].as_array().unwrap()
+        .iter().map(|x| x["path"].as_str().unwrap().to_string()).collect();
+    assert!(affected.contains(&"src/api.ts".to_string()),
+        "api.ts depends on auth.ts and must be in blast radius; got {affected:?}");
+    assert_eq!(v["not_indexed"].as_array().unwrap().len(), 0);
+}
+
 // ============================================================
 // clap migration (audit #4) — cross-command --help hygiene
 // ============================================================
