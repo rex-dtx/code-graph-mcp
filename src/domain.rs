@@ -183,6 +183,7 @@ pub fn is_test_path(file_path: &str) -> bool {
         || file_path.ends_with(".test.ts") || file_path.ends_with(".test.js")
         || file_path.ends_with(".test.tsx") || file_path.ends_with(".test.jsx")
         || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
+        || file_path.ends_with(".spec.tsx") || file_path.ends_with(".spec.jsx")
 }
 
 // -- SQL counterparts of is_test_symbol --
@@ -422,6 +423,8 @@ mod tests {
         // Path-based positives (no symbol name needed).
         assert!(is_test_path("tests/foo.rs"));
         assert!(is_test_path("src/auth.test.ts"));
+        assert!(is_test_path("src/Button.spec.tsx"));
+        assert!(is_test_path("src/Button.spec.jsx"));
         assert!(is_test_path("pkg/handler_test.go"));
         assert!(is_test_path("a/__tests__/x.js"));
         // Negatives.
