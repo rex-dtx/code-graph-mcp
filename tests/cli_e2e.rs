@@ -141,6 +141,53 @@ fn test_cli_affected_json_core() {
     assert_eq!(v["not_indexed"].as_array().unwrap().len(), 0);
 }
 
+#[test]
+fn test_cli_affected_not_indexed_json_envelope() {
+    // json-empty contract: unknown input still yields a valid same-shape envelope.
+    let project = setup_affected_project();
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/ghost.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert_eq!(v["tests"].as_array().unwrap().len(), 0);
+    assert_eq!(v["affected_files"].as_array().unwrap().len(), 0);
+    let ni: Vec<String> = v["not_indexed"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    assert_eq!(ni, vec!["src/ghost.ts".to_string()]);
+}
+
+#[test]
+fn test_cli_affected_stdin_matches_positional() {
+    let project = setup_affected_project();
+    // Pipe the path via stdin instead of positional.
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+    let mut child = Command::new(binary_path())
+        .current_dir(project.path())
+        .args(["affected", "--stdin", "--json"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"src/auth.ts\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    let tests: Vec<String> = v["tests"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    assert!(tests.contains(&"src/auth.test.ts".to_string()), "got {tests:?}");
+}
+
+#[test]
+fn test_cli_affected_changed_test_file_is_self_included() {
+    // Changing a test file → that test file is in the re-run set.
+    let project = setup_affected_project();
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/auth.test.ts", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    let tests: Vec<String> = v["tests"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    assert!(tests.contains(&"src/auth.test.ts".to_string()),
+        "a changed test file must re-run itself; got {tests:?}");
+}
+
 // ============================================================
 // clap migration (audit #4) — cross-command --help hygiene
 // ============================================================
