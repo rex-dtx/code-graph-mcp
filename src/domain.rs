@@ -171,9 +171,12 @@ pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
         || is_test_path(file_path)
 }
 
-/// File-level test classifier (path heuristics only). Single source of truth for
-/// "is this path a test file" — `is_test_symbol` and the `affected` command both
-/// use it, so the path rules never drift into a second copy.
+/// File-level test classifier (path heuristics only) shared by `is_test_symbol` and
+/// the `affected` command. NOT the only test-path matcher: the SQL counterparts
+/// (`PROD_SOURCE_FILTER_AND` / `TEST_SOURCE_FILTER_OR` below) and the local closure in
+/// `indexer::pipeline::resolve::refine_ambiguous_targets` use their own, intentionally
+/// divergent patterns. See the "Five sites must agree" note below and
+/// feedback_test_classifier_dual_sources.md before changing any one of them.
 pub fn is_test_path(file_path: &str) -> bool {
     file_path.starts_with("tests/") || file_path.starts_with("test/")
         || file_path.starts_with("benches/") || file_path.starts_with("bench/")

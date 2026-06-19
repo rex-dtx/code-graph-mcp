@@ -74,6 +74,10 @@ pub(super) fn refine_ambiguous_targets(
         return candidates.to_vec();
     }
 
+    // NOTE: deliberately divergent local copy — biases ambiguous-target resolution by
+    // substring (.test. / .spec. / _test. / mid-path /tests/), broader than the
+    // suffix/prefix rules in `domain::is_test_path`. Kept separate on purpose; see the
+    // "Five sites must agree" note in domain.rs (feedback_test_classifier_dual_sources.md).
     let is_test_path = |p: &str| {
         p.contains(".test.") || p.contains("_test.")
             || p.starts_with("tests/") || p.contains("/tests/")

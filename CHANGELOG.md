@@ -21,8 +21,9 @@ read existing edge data; no extraction change). Adopted from a competitive scan 
 ### Graph resolution-coverage metric
 
 - **feat(health)**: `health-check --json` gains a `resolution` block —
-  `pending_unresolved_calls` + per-language edge counts (calls/imports/references),
-  a pure aggregate over existing edges via a single `GROUP BY`. The text output gains
+  `pending_unresolved_calls` + per-language edge counts grouped by relation (calls,
+  imports, references, implements, inherits, …), a pure aggregate over existing edges
+  via a single `GROUP BY`. The text output gains
   a `Resolution:` summary line. Makes silent edge-resolution regressions observable
   instead of human-discovered after shipping.
 
