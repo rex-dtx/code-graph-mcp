@@ -188,6 +188,22 @@ fn test_cli_affected_changed_test_file_is_self_included() {
         "a changed test file must re-run itself; got {tests:?}");
 }
 
+#[test]
+fn test_cli_health_check_resolution_block() {
+    let project = setup_indexed_project(); // TS fixture: api.ts → auth.ts validateToken
+    let (stdout, _, code) = run_cli(&project, &["health-check", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    let res = &v["resolution"];
+    assert!(res.is_object(), "resolution block must be present; got {v}");
+    assert!(res["pending_unresolved_calls"].is_number());
+    // Key-agnostic: ≥1 resolved call edge across all languages (handleLogin→validateToken).
+    let total_calls: i64 = res["edges_by_language"].as_object().unwrap().values()
+        .filter_map(|rels| rels["calls"].as_i64())
+        .sum();
+    assert!(total_calls >= 1, "expected ≥1 resolved call edge across languages; got {res}");
+}
+
 // ============================================================
 // clap migration (audit #4) — cross-command --help hygiene
 // ============================================================

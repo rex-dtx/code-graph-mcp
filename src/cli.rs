@@ -679,6 +679,10 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
         "commit_drift": commit_drift,
     });
 
+    // Graph-resolution coverage (pending backlog + per-language edge counts).
+    // .ok() so a stats failure never breaks the existing health-check contract.
+    let resolution = queries::resolution_stats(conn).ok();
+
     match format {
         "json" => {
             let mut json = serde_json::json!({
@@ -697,6 +701,9 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "snapshot": snapshot_block,
                 "conversion_metric": recommendation_metric_state(project_root),
             });
+            if let Some(ref r) = resolution {
+                json["resolution"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
+            }
             if let Some(ts) = status.last_indexed_at {
                 json["last_indexed_at"] = serde_json::json!(ts);
             }
@@ -729,6 +736,13 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                     "empty" => "active, no recommendations recorded yet",
                     _ => "DARK (no recommendations.jsonl — PreToolUse hooks not recording here)",
                 });
+                if let Some(ref r) = resolution {
+                    let summary: Vec<String> = r.edges_by_language.iter()
+                        .map(|(lang, rels)| format!("{} {}", lang, rels.values().sum::<i64>()))
+                        .collect();
+                    println!("Resolution: {} pending; edges by lang: {}",
+                        r.pending_unresolved_calls, summary.join(", "));
+                }
             } else if !schema_ok {
                 eprintln!(
                     "UNHEALTHY: schema version mismatch (got {}, expected {})",

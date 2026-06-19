@@ -23,7 +23,7 @@ pub use edges::{
     get_edge_sources_with_files, get_edge_target_names, get_edge_target_names_batch,
     get_edge_targets_with_files, get_edges_batch, get_edges_from, get_incoming_references,
     insert_edge, insert_edge_cached, insert_pending_unresolved_call, list_pending_unresolved_calls,
-    EdgeInfo, EdgeRecord, IncomingReference, PendingCallRow,
+    resolution_stats, EdgeInfo, EdgeRecord, IncomingReference, PendingCallRow, ResolutionStats,
 };
 pub use files::{
     delete_files_by_paths, get_all_file_hashes, get_file_language, get_file_path,

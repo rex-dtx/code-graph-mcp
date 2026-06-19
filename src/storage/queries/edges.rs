@@ -298,6 +298,43 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
     Ok(result)
 }
 
+/// Graph-resolution coverage snapshot: how many calls are still unresolved, and how
+/// many edges of each relation each language produced. A per-language edge count that
+/// drops between INDEX_VERSIONs flags a silent edge-resolution regression.
+#[derive(Debug, serde::Serialize)]
+pub struct ResolutionStats {
+    pub pending_unresolved_calls: i64,
+    /// language -> relation -> count
+    pub edges_by_language:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>>,
+}
+
+/// Aggregate resolved edges per (language, relation) plus the pending-call backlog.
+/// Pure read over existing `edges`/`nodes`/`files` rows — no extraction, no schema change.
+pub fn resolution_stats(conn: &Connection) -> Result<ResolutionStats> {
+    use std::collections::BTreeMap;
+
+    let pending = count_pending_unresolved_calls(conn)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(f.language, 'unknown') AS lang, e.relation, COUNT(*) AS cnt
+         FROM edges e
+         JOIN nodes n ON n.id = e.source_id
+         JOIN files f ON f.id = n.file_id
+         GROUP BY lang, e.relation",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+    })?;
+
+    let mut by_lang: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+    for row in rows {
+        let (lang, rel, cnt) = row?;
+        by_lang.entry(lang).or_default().insert(rel, cnt);
+    }
+    Ok(ResolutionStats { pending_unresolved_calls: pending, edges_by_language: by_lang })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +373,27 @@ mod tests {
         delete_files_by_paths(db.conn(), &["t.ts".into()]).unwrap();
         let edges_after = get_edges_from(db.conn(), n1).unwrap();
         assert_eq!(edges_after.len(), 0);
+    }
+
+    #[test]
+    fn resolution_stats_counts_edges_by_language() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "a.rs".into(), blake3_hash: "h".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+        let n1 = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "f".into(),
+            qualified_name: None, start_line: 1, end_line: 2,
+            code_content: "".into(), signature: None, doc_comment: None,
+            context_string: None, name_tokens: None, return_type: None,
+            param_types: None, is_test: false,
+        }).unwrap();
+        insert_edge(conn, n1, n1, "calls", None).unwrap();
+
+        let stats = resolution_stats(conn).unwrap();
+        assert_eq!(stats.pending_unresolved_calls, 0);
+        assert_eq!(stats.edges_by_language["rust"]["calls"], 1);
     }
 }
