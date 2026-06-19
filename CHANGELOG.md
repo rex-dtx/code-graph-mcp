@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.51.1 — `affected` correctness fixes (post-release code review)
+
+Fix-forward for defects found by a max-effort code review of v0.51.0's `affected`
+command. No breaking changes; no `INDEX_VERSION` bump.
+
+### `affected` correctness
+
+- **fix(cli)**: the reverse-dependency closure now walks **all** dependency relations
+  (imports ∪ calls ∪ references ∪ implements ∪ inherits) via a new
+  `get_reverse_dependents`, not just imports ∪ calls. Test files that only `reference`
+  (or implement/inherit) a changed symbol were silently dropped from the "tests to
+  re-run" set — e.g. `affected src/domain.rs` went from 11 → 15 test files.
+- **fix(cli)**: apply the cross-language compatibility filter (now shared by `affected`,
+  `deps`, and the dependency-graph tool) so bare-name resolution false positives in a
+  different language no longer leak into the blast radius.
+- **fix(cli)**: `affected_files` is disjoint from `changed`; inputs normalizing to `""`
+  (`.`/root) are skipped; a nonexistent test-path input is reported in `not_indexed`
+  only (never both `not_indexed` and `tests`); `not_indexed` reports the raw input
+  consistently; `--stdin` reads bytes lossily so a non-UTF-8 path can't break `--json`.
+- **fix(domain)**: `is_test_path` now matches `.spec.tsx`/`.spec.jsx`.
+
+### Honesty / consistency
+
+- **fix(health)**: the text `health-check` prints the `Resolution:` line even on an
+  unhealthy index, matching the unconditional `--json` block.
+- **docs**: corrected the `is_test_path` "single source of truth" overclaim (the SQL
+  filters and a `resolve.rs` closure are intentionally divergent copies) and the
+  resolution-block relation list (it counts every relation, not just calls/imports/references).
+
+### Known backlog (not in this release)
+
+- `resolution_stats` runs a `GROUP BY` over edges on every `health-check` (perf on huge repos).
+- a negative `--depth` clamps to 1 + exits 0 (consistent with `impact`'s flag form,
+  inconsistent with the positional-numeric exit-2 audit convention).
+
 ## v0.51.0 — `affected` command (changed files → impacted tests) + resolution-coverage metric
 
 Additive minor release. No breaking changes. No `INDEX_VERSION` bump (both features
