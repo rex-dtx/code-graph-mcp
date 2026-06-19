@@ -289,6 +289,8 @@ fn test_cli_health_check() {
     assert_eq!(code, 0);
     assert!(stdout.starts_with("OK:"), "expected OK, got: {}", stdout);
     assert!(stdout.contains("nodes"), "should mention nodes");
+    // F12: text health-check surfaces the Resolution line (mirrors the --json block).
+    assert!(stdout.contains("Resolution:"), "text health-check must show Resolution line: {}", stdout);
 }
 
 #[test]

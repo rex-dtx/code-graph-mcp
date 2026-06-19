@@ -724,6 +724,17 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
             }
         }
         _ => {
+            // Print resolution coverage regardless of healthy, mirroring the JSON arm
+            // which attaches the block unconditionally (F12). Healthy keeps `OK:` first.
+            let print_resolution = || {
+                if let Some(ref r) = resolution {
+                    let summary: Vec<String> = r.edges_by_language.iter()
+                        .map(|(lang, rels)| format!("{} {}", lang, rels.values().sum::<i64>()))
+                        .collect();
+                    println!("Resolution: {} pending; edges by lang: {}",
+                        r.pending_unresolved_calls, summary.join(", "));
+                }
+            };
             if healthy {
                 let age_info = age_str.map(|a| format!(" (updated {})", a)).unwrap_or_default();
                 println!(
@@ -736,21 +747,17 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                     "empty" => "active, no recommendations recorded yet",
                     _ => "DARK (no recommendations.jsonl — PreToolUse hooks not recording here)",
                 });
-                if let Some(ref r) = resolution {
-                    let summary: Vec<String> = r.edges_by_language.iter()
-                        .map(|(lang, rels)| format!("{} {}", lang, rels.values().sum::<i64>()))
-                        .collect();
-                    println!("Resolution: {} pending; edges by lang: {}",
-                        r.pending_unresolved_calls, summary.join(", "));
-                }
+                print_resolution();
             } else if !schema_ok {
                 eprintln!(
                     "UNHEALTHY: schema version mismatch (got {}, expected {})",
                     status.schema_version, expected_schema
                 );
+                print_resolution();
                 std::process::exit(1);
             } else {
                 eprintln!("UNHEALTHY: index is empty");
+                print_resolution();
                 std::process::exit(1);
             }
         }
