@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.52.0 — `tour`: dependency-ordered reading order
+
+New CLI command that answers "where do I start reading this repo?" deterministically.
+Read-only over the existing index — no `INDEX_VERSION` bump, no breaking changes.
+
+### New: `code-graph-mcp tour [PATH] [--json]`
+
+- Lists modules in dependency order — prerequisites before the modules that build on
+  them — via a Kahn topological sort over the project-map import edges. Each module is
+  annotated with a role (`entry` / `foundational` / `core` / `mid`), its depended-on-by
+  count, its in-scope imports, and key symbols. Optional `PATH` scopes the tour to a
+  subtree; `--json` emits a `{"reading_order": [...]}` envelope.
+- **Cycle-tolerant**: import cycles are broken deterministically (smallest unresolved
+  in-degree, then lexical order) and flagged, so the output is stable for a fixed index.
+- **CLI-only by design** — the model reaches it via Bash; no new MCP tool, keeping the
+  LLM-visible instructions budget and tool-routing surface unchanged.
+- Reuses the existing project-map graph (`get_project_map`); the ordering core lives in
+  `src/graph/reading_order.rs` (pure, unit-tested).
+
 ## v0.51.1 — `affected` correctness fixes (post-release code review)
 
 Fix-forward for defects found by a max-effort code review of v0.51.0's `affected`
