@@ -127,6 +127,17 @@ pub fn get_import_tree(
     Ok(results)
 }
 
+/// True when `file_path` has a row in the `files` table (i.e. it is indexed).
+/// Lets `affected` distinguish "no dependents" from "never indexed".
+pub fn file_is_indexed(conn: &Connection, file_path: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE path = ?1",
+        rusqlite::params![file_path],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +170,17 @@ mod tests {
         let tree_in = get_import_tree(conn, "src/b.ts", "incoming", 2).unwrap();
         let a_dep = tree_in.iter().find(|d| d.file_path == "src/a.ts").unwrap();
         assert_eq!(a_dep.symbol_count, 2, "incoming symbol_count should match");
+    }
+
+    #[test]
+    fn file_is_indexed_detects_presence() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/a.rs', 'h', 0, 'rust', 0)",
+            [],
+        ).unwrap();
+        assert!(file_is_indexed(conn, "src/a.rs").unwrap());
+        assert!(!file_is_indexed(conn, "src/missing.rs").unwrap());
     }
 }
