@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.51.0 — `affected` command (changed files → impacted tests) + resolution-coverage metric
+
+Additive minor release. No breaking changes. No `INDEX_VERSION` bump (both features
+read existing edge data; no extraction change). Adopted from a competitive scan of
+[colbymchenry/codegraph](https://github.com/colbymchenry/codegraph).
+
+### `affected` — reverse-impact test selection
+
+- **feat(cli)**: new `code-graph-mcp affected [files...]`. Given changed files
+  (positional or `--stdin` from `git diff --name-only`), it walks the reverse
+  import ∪ call closure and reports the **test files to re-run** (primary) plus the
+  full affected-file blast radius with depths (secondary). Flags: `--stdin`,
+  `--depth N` (default 10), `--json`. Reuses the existing `get_import_tree(incoming)`
+  traversal, inheriting its cycle-guarding and import-only-dependent coverage. Inputs
+  go through `normalize_user_path`; unindexed inputs are reported in `not_indexed`
+  (the `--json` envelope is same-shape on every path). Registered as an adoption-funnel
+  conversion. Example: `git diff --name-only | code-graph-mcp affected --stdin`.
+
+### Graph resolution-coverage metric
+
+- **feat(health)**: `health-check --json` gains a `resolution` block —
+  `pending_unresolved_calls` + per-language edge counts (calls/imports/references),
+  a pure aggregate over existing edges via a single `GROUP BY`. The text output gains
+  a `Resolution:` summary line. Makes silent edge-resolution regressions observable
+  instead of human-discovered after shipping.
+
+### Internal
+
+- **refactor(domain)**: extracted `is_test_path` (file-level test predicate) from
+  `is_test_symbol`, which now delegates — single source of truth, behavior preserved.
+- **test(coverage)**: new `tests/edge_coverage.rs` — multi-language (TS/Python/Rust)
+  per-language edge-count baseline + a file-scoped method→sibling-method resolution
+  invariant (guards the `method_call_edge_drops` class fixed at `INDEX_VERSION` 16).
+
 ## v0.50.0 — grep parity (BREAKING: exit codes) + auto-update chain audit
 
 **Migration note (breaking)**: `code-graph-mcp grep` now uses grep-compatible exit
