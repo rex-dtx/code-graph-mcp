@@ -15,7 +15,7 @@ import sqlite3
 import sys
 
 # node id namespacing: ids are per-DB, so prefix with a DB index to keep them globally unique.
-def _rows(db_path: str, db_idx: int, min_doc_len: int):
+def _rows(db_path: str, db_idx: int):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.execute(
@@ -36,7 +36,7 @@ def build(dbs: list[str], min_doc_len: int):
     # Map (db_idx, name)/(db_idx, qualified_name) -> global id, for resolving real-query hint_symbol.
     name_index: dict[tuple[int, str], int] = {}
     for db_idx, db_path in enumerate(dbs):
-        for _, row in _rows(db_path, db_idx, min_doc_len):
+        for _, row in _rows(db_path, db_idx):
             gid = db_idx * 10_000_000 + int(row["id"])  # global id namespacing
             if row["name"]:
                 name_index.setdefault((db_idx, row["name"]), gid)
@@ -50,7 +50,7 @@ def build(dbs: list[str], min_doc_len: int):
                 # Exclude docs that just restate the symbol name (trivial match).
                 queries.append({
                     "query_id": f"doc:{gid}",
-                    "query": " ".join(doc.split())[:300],
+                    "query": " ".join(doc.split()[:75]),
                     "gold_node_ids": [gid],
                     "source": "bootstrap",
                     "language": row["language"],
