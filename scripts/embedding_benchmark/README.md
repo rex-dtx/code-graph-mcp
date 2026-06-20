@@ -71,7 +71,8 @@ By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limi
 
 5. **TS n=58 caveat** — numbers directionally consistent with rust's strong performance on context_string but insufficient for statistical significance. Add more TS-heavy repos to the `--db` list before drawing hard conclusions about TS.
 
-## Go/no-go gate (spec §0.4)
+## Go/no-go gate
 
-The decision lives in `docs/superpowers/specs/2026-06-21-tier1-static-embeddings-design.md`.  
-Best config: **minilm / context_string** (NDCG@10 = 0.8655, recall@10 = 0.9306).
+**Decision: NO-GO** — `potion-code-16M` does not replace `all-MiniLM-L6-v2`. potion's best config (context_string) trails minilm overall (0.7898 vs 0.8655, −7.6pp) and on rust (−5.7pp, beyond the 0.02 regression threshold); it only ties on TS (n=58, directional). Phase 2 (Rust static inference + 384→256 migration) is not authorized. Full rationale: `docs/superpowers/specs/2026-06-21-tier1-static-embeddings-decision.md`.
+
+Best config measured: **minilm / context_string** (NDCG@10 = 0.8655, recall@10 = 0.9306) — the current production embedding remains the strongest, so no change is made.
