@@ -63,9 +63,9 @@ By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limi
 
 1. **context_string dominates code_content for both backends** — the gap is large (minilm: 0.8655 vs 0.4394; potion: 0.7898 vs 0.3804). The spec §0.4 field choice is answered: use `context_string`.
 
-2. **minilm beats potion overall** (0.8655 vs 0.7898, −8.7pp). The gap is consistent across rust (0.9355 vs 0.8782) and javascript (0.6890 vs 0.5312).
+2. **minilm beats potion overall** (0.8655 vs 0.7898, −7.6pp). The gap is consistent across rust (0.9355 vs 0.8782) and javascript (0.6890 vs 0.5312).
 
-3. **Rust (untrained) > TS (untrained) > JS (trained on minilm training corpora)** — the rust gap over JS is large for both backends on context_string (minilm: 0.9355 vs 0.6890; potion: 0.8782 vs 0.5312). TS lands between rust and JS despite n=58 being a small sample.
+3. **Rust > TS > JS by NDCG@10 (despite JS's heavy presence in web-crawl pre-training)** — the rust gap over JS is large for both backends on context_string (minilm: 0.9355 vs 0.6890; potion: 0.8782 vs 0.5312). TS lands between rust and JS despite n=58 being a small sample. (None of the three is fine-tuned for this task; the surprise is that JS, the most pre-training-abundant language, ranks lowest.)
 
 4. **JS underperforms despite likely being in minilm's training data** — JavaScript is extremely well-represented in web-crawl pre-training yet scores substantially lower than rust. This suggests the JS query+context construction or the mixed-type JS corpus (loose scripts + generated code) is harder to rank, not a data-domain coverage issue.
 
