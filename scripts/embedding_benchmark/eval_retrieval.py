@@ -48,22 +48,21 @@ class Backend:
 
 
 def load_candidates(dbs: list[str], field: str):
-    """Return (global_ids, texts, languages) for all non-test symbols across the DBs."""
-    ids, texts, langs = [], [], []
+    """Return (global_ids, texts) for all non-test symbols across the DBs."""
+    ids, texts = [], []
     for db_idx, db_path in enumerate(dbs):
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            f"""SELECT n.id, n.{field} AS text, f.language
+            f"""SELECT n.id, n.{field} AS text
                 FROM nodes n JOIN files f ON n.file_id = f.id
                 WHERE n.is_test = 0 AND f.language IS NOT NULL"""
         )
         for r in cur:
             ids.append(db_idx * 10_000_000 + int(r["id"]))
             texts.append((r["text"] or "")[:2000])  # cap to keep runtime bounded
-            langs.append(r["language"])
         conn.close()
-    return ids, texts, langs
+    return ids, texts
 
 
 def main():
@@ -75,9 +74,7 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    ids, texts, langs = load_candidates(args.db, args.field)
-    id_to_pos = {nid: i for i, nid in enumerate(ids)}
-    id_to_lang = {nid: lg for nid, lg in zip(ids, langs)}
+    ids, texts = load_candidates(args.db, args.field)
 
     backend = Backend(args.backend)
     print(f"[eval] encoding {len(texts)} candidates with {args.backend}/{args.field}...")
@@ -127,7 +124,9 @@ def main():
         "overall": agg(overall),
         "by_language": {lg: agg(rows) for lg, rows in sorted(per_lang.items())},
     }
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(args.out, "w") as fh:
         json.dump(result, fh, indent=2)
     print(json.dumps(result, indent=2))
