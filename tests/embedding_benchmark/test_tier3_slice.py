@@ -57,3 +57,25 @@ def test_limit_per_db_caps_output(tmp_path):
     _make_db(db)
     out = build([db], limit_per_db=1)
     assert len(out) == 1
+
+
+def test_unique_count_is_among_code_types_only(tmp_path):
+    db = str(tmp_path / "index.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, language TEXT);
+        CREATE TABLE nodes (id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT,
+                            qualified_name TEXT, type TEXT, is_test INTEGER);
+        INSERT INTO files VALUES (1, 'a.rs', 'rust');
+        -- same name 'shared' as a function (code type) AND a module (non-code type)
+        INSERT INTO nodes VALUES (20, 1, 'shared', NULL, 'function', 0);
+        INSERT INTO nodes VALUES (21, 1, 'shared', NULL, 'module',   0);
+        """
+    )
+    conn.commit()
+    conn.close()
+    out = build([db], limit_per_db=250)
+    shared = [q for q in out if q["query"] == "shared"]
+    assert len(shared) == 1                      # the function is emitted; module never counts
+    assert shared[0]["gold_node_ids"] == [20]    # gold is the function node, not the module

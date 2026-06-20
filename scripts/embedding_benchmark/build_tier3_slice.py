@@ -69,11 +69,13 @@ def main():
 
     queries = build(args.db, args.limit_per_db)
 
-    out = sys.stdout if args.out == "-" else open(args.out, "w")
-    for q in queries:
-        out.write(json.dumps(q, ensure_ascii=False) + "\n")
-    if out is not sys.stdout:
-        out.close()
+    if args.out == "-":
+        for q in queries:
+            sys.stdout.write(json.dumps(q, ensure_ascii=False) + "\n")
+    else:
+        with open(args.out, "w") as f:
+            for q in queries:
+                f.write(json.dumps(q, ensure_ascii=False) + "\n")
 
     by_lang: dict[str, int] = {}
     for q in queries:
