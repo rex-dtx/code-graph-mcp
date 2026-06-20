@@ -2568,3 +2568,50 @@ fn test_cli_json_empty_cycles() {
     assert_eq!(code, 0, "no circular imports is success, not an error");
     assert_eq!(stdout.trim(), "[]", "empty cycles must emit [] per the JSON-empty contract");
 }
+
+#[test]
+fn test_cli_surprising_detects_cross_module_call() {
+    // doWork (src/) calls helper (lib/) → a cross-module call edge: surprising.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    let lib = project.path().join("lib");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("b.ts"), "export function helper(): number { return 42; }\n").unwrap();
+    std::fs::write(src.join("a.ts"), r#"
+import { helper } from '../lib/b';
+export function doWork(): number { return helper(); }
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&project, &["surprising", "--json"]);
+    assert_eq!(code, 0, "surprising exits 0; stdout={stdout} stderr={stderr}");
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("surprising --json must emit valid JSON");
+    let arr = v.as_array().expect("surprising --json is an array");
+    assert!(
+        arr.iter().any(|c| c["source"].as_str() == Some("doWork")
+            && c["target"].as_str() == Some("helper")),
+        "should surface the cross-module doWork → helper call; got {stdout}"
+    );
+}
+
+#[test]
+fn test_cli_json_empty_surprising() {
+    // A single file with no cross-file calls → no surprising connections.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("solo.ts"), "export function alone(): number { return 1; }\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["surprising", "--json"]);
+    assert_eq!(code, 0, "no surprising connections is success, not an error");
+    assert_eq!(stdout.trim(), "[]", "empty must emit [] per the JSON-empty contract");
+}
