@@ -138,8 +138,24 @@ Note: NL overall NDCG@10 = 0.6698, which is below the vector-only baseline of 0.
 
 ### Phase B go/no-go
 
-**Decision: PROCEED**
+**Decision: NO-GO** — the Tier 3 ranking changes (single-identifier weighting + definition-node boost) have a measured ceiling of **+1.6pp** on exact-symbol recall@1 (**+0.0pp** for JavaScript), because the recall@1 miss is overwhelmingly a *retrieval* failure, not a *ranking* one.
 
-`by_query_class.exact_symbol.recall@1 = 0.836` — materially below the 0.97 threshold. Defining nodes do NOT already rank #1 in ~16.4% of exact-symbol queries. The existing `name_boost` + acronym handling + exact-name exemption does not fully cover this case. Headroom of ~13pp on recall@1 exists; Phase B (single-identifier weighting + definition-node boost changes in `search.rs`) is authorized to proceed.
+The `recall@1 = 0.836` "miss" of 16.4% is NOT re-rankable headroom (the original `0.836 < 0.97 → PROCEED, ~13pp` reading was wrong — it assumed every rank-1 miss is re-rankable). A gold-rank distribution — the tier3 slice re-run at `--top-k 100` (pool-depth probe, fetch_count = top_k×4 = 400) — splits it cleanly:
 
-TypeScript is the weakest language at recall@1 = 0.7789, suggesting the ranking gap is largest there and Phase B has the most to gain on TS exact-symbol queries.
+| band | overall | rust | typescript | javascript |
+|------|---------|------|------------|------------|
+| rank 1 | 0.838 | 0.874 | 0.779 | 0.870 |
+| rank 2–10 (re-rankable) | 0.016 | 0.030 | 0.005 | 0.000 |
+| **rank 11–100** | **0.000** | 0.000 | 0.000 | 0.000 |
+| absent from top-100 (retrieval miss) | 0.146 | 0.096 | 0.216 | 0.130 |
+
+The defining node is either in the top-10 or absent from the top-100 entirely — the rank 11–100 band is empty (`recall@100 == recall@10 == 0.854`). Therefore:
+
+- **Definition boost** can only promote the rank-2–10 golds → ceiling **+1.6pp** overall (rust +3.0pp, ts +0.5pp, **js +0.0pp**). Marginal-to-negligible, and on the wrong side of "worth a `search.rs` change."
+- **Adaptive query weighting** reshuffles only candidates already in the fused pool; the empty rank 11–100 band shows the missing golds are not fused-but-low, they are *unretrieved* — re-weighting cannot surface them.
+
+**Outcome:** Phase B (the Tier 3 `search.rs` ranking changes) is NOT authorized — same data-driven discipline as the potion NO-GO. `eval_ranking.py` + `build_tier3_slice.py` are kept as a permanent end-to-end retrieval-quality gate.
+
+**Separate future threads (NOT Phase B):**
+1. The **14.6% exact-symbol retrieval miss** — defining nodes never fetched into the FTS/vector pool. A retrieval/indexing question (bare-identifier tokenization, generic-name ambiguity like `run`/`get`, or index coverage), possibly a larger lever than re-ranking. Part is likely benchmark noise (over-generic unique names no ranking should chase).
+2. **NL overall NDCG@10 = 0.6698 vs vector-only 0.8655.** Caveat: the NL query set was built for the vector-only eval (query = a symbol's doc-comment; the gold's `context_string` contains that doc), so it structurally favors pure-embedding cosine — not a clean "pipeline is worse" claim. Needs an isolated look before reading it as an RRF-tuning regression.
