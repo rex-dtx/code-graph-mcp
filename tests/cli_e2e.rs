@@ -2615,3 +2615,39 @@ fn test_cli_json_empty_surprising() {
     assert_eq!(code, 0, "no surprising connections is success, not an error");
     assert_eq!(stdout.trim(), "[]", "empty must emit [] per the JSON-empty contract");
 }
+
+#[test]
+fn test_cli_report_aggregates_all_sections() {
+    // a.ts <-> b.ts mutually import + call → both an import cycle and a surprising edge.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.ts"), r#"
+import { fromB } from './b';
+export function fromA(): number { return fromB(); }
+"#).unwrap();
+    std::fs::write(src.join("b.ts"), r#"
+import { fromA } from './a';
+export function fromB(): number { return fromA(); }
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&project, &["report", "--json"]);
+    assert_eq!(code, 0, "report exits 0; stdout={stdout} stderr={stderr}");
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("report --json must emit a valid JSON object");
+
+    // Object envelope with a populated summary and every section present as an array.
+    let summary = v.get("summary").expect("report has a summary");
+    assert!(summary["files"].as_i64().unwrap() >= 2, "summary counts files");
+    assert!(summary["confidence"].is_object(), "summary has a confidence breakdown");
+    for key in ["hot_functions", "chokepoints", "import_cycles", "surprising_connections", "dead_code"] {
+        assert!(v.get(key).map(|x| x.is_array()).unwrap_or(false), "section `{key}` is present as an array");
+    }
+    // The mutual import is a real cycle, so that section must be non-empty.
+    assert!(!v["import_cycles"].as_array().unwrap().is_empty(),
+        "should report the a.ts <-> b.ts import cycle; got {stdout}");
+}

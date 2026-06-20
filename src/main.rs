@@ -179,6 +179,11 @@ fn main() -> Result<()> {
             let surprising_args = code_graph_mcp::cli::SurprisingArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_surprising(&project_root, surprising_args)
         }
+        Some("report") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            let report_args = code_graph_mcp::cli::ReportArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_report(&project_root, report_args)
+        }
         Some("benchmark") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let bench_args = code_graph_mcp::cli::BenchmarkArgs::parse_from(args.iter().skip(1));
@@ -253,6 +258,7 @@ fn print_help() {
     println!("    centrality          Rank architectural chokepoints (betweenness over the call graph)");
     println!("    cycles              Detect circular import dependencies (file-level)");
     println!("    surprising          Surface unexpected cross-module couplings (uncertain edges)");
+    println!("    report              Consolidated code-health report (summary + all analyses)");
     println!("    incremental-index   Run incremental index update");
     println!("    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)");
     println!("    reindex [--from-snapshot]");
@@ -419,7 +425,7 @@ const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
     "dead-code", "incremental-index", "rebuild-index", "reindex", "health-check", "doctor",
-    "centrality", "cycles", "surprising", "benchmark", "stats", "adopt", "unadopt", "snapshot",
+    "centrality", "cycles", "surprising", "report", "benchmark", "stats", "adopt", "unadopt", "snapshot",
     // MCP tool names accepted as aliases (see dispatch above). Listed here so
     // typo-suggester picks the closer alias for inputs like "project_mapp".
     "project_map", "module_overview", "get_ast_node", "find_references",
