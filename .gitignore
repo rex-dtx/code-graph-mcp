@@ -40,3 +40,6 @@ node_modules/
 
 # Local test harnesses and throwaway experiments
 tmp/
+
+# Embedding benchmark venv
+scripts/embedding_benchmark/.venv/
