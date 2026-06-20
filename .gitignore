@@ -43,3 +43,9 @@ tmp/
 
 # Embedding benchmark venv
 scripts/embedding_benchmark/.venv/
+
+# Embedding benchmark generated artifacts (inputs/outputs, not source)
+scripts/embedding_benchmark/query_set.jsonl
+scripts/embedding_benchmark/results/*.json
+scripts/embedding_benchmark/__pycache__/
+tests/embedding_benchmark/__pycache__/
