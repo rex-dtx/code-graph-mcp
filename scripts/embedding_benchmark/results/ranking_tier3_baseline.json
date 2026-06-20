@@ -1,0 +1,50 @@
+{
+  "harness": "eval_ranking",
+  "top_k": 20,
+  "overall": {
+    "ndcg@10": 0.8453,
+    "recall@1": 0.836,
+    "recall@10": 0.854,
+    "mrr": 0.8424,
+    "n": 500
+  },
+  "by_language": {
+    "javascript": {
+      "ndcg@10": 0.8701,
+      "recall@1": 0.8701,
+      "recall@10": 0.8701,
+      "mrr": 0.8701,
+      "n": 77
+    },
+    "python": {
+      "ndcg@10": 1.0,
+      "recall@1": 1.0,
+      "recall@10": 1.0,
+      "mrr": 1.0,
+      "n": 3
+    },
+    "rust": {
+      "ndcg@10": 0.8869,
+      "recall@1": 0.8696,
+      "recall@10": 0.9043,
+      "mrr": 0.8813,
+      "n": 230
+    },
+    "typescript": {
+      "ndcg@10": 0.7823,
+      "recall@1": 0.7789,
+      "recall@10": 0.7842,
+      "mrr": 0.7816,
+      "n": 190
+    }
+  },
+  "by_query_class": {
+    "exact_symbol": {
+      "ndcg@10": 0.8453,
+      "recall@1": 0.836,
+      "recall@10": 0.854,
+      "mrr": 0.8424,
+      "n": 500
+    }
+  }
+}

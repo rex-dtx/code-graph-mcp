@@ -1,0 +1,57 @@
+{
+  "harness": "eval_ranking",
+  "top_k": 20,
+  "overall": {
+    "ndcg@10": 0.6698,
+    "recall@1": 0.5448,
+    "recall@10": 0.787,
+    "mrr": 0.632,
+    "n": 648
+  },
+  "by_language": {
+    "javascript": {
+      "ndcg@10": 0.504,
+      "recall@1": 0.4062,
+      "recall@10": 0.6,
+      "mrr": 0.4737,
+      "n": 160
+    },
+    "python": {
+      "ndcg@10": 0.5,
+      "recall@1": 0.0,
+      "recall@10": 1.0,
+      "mrr": 0.3333,
+      "n": 1
+    },
+    "rust": {
+      "ndcg@10": 0.7453,
+      "recall@1": 0.6084,
+      "recall@10": 0.8695,
+      "mrr": 0.705,
+      "n": 429
+    },
+    "typescript": {
+      "ndcg@10": 0.5714,
+      "recall@1": 0.4655,
+      "recall@10": 0.6897,
+      "mrr": 0.5339,
+      "n": 58
+    }
+  },
+  "by_query_class": {
+    "bootstrap": {
+      "ndcg@10": 0.6702,
+      "recall@1": 0.5474,
+      "recall@10": 0.7854,
+      "mrr": 0.6331,
+      "n": 643
+    },
+    "real": {
+      "ndcg@10": 0.6102,
+      "recall@1": 0.2,
+      "recall@10": 1.0,
+      "mrr": 0.4867,
+      "n": 5
+    }
+  }
+}

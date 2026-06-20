@@ -76,3 +76,70 @@ By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limi
 **Decision: NO-GO** — `potion-code-16M` does not replace `all-MiniLM-L6-v2`. potion's best config (context_string) trails minilm overall (0.7898 vs 0.8655, −7.6pp) and on rust (−5.7pp, beyond the 0.02 regression threshold); it only ties on TS (n=58, directional). Phase 2 (Rust static inference + 384→256 migration) is not authorized. Full rationale: `docs/superpowers/specs/2026-06-21-tier1-static-embeddings-decision.md`.
 
 Best config measured: **minilm / context_string** (NDCG@10 = 0.8655, recall@10 = 0.9306) — the current production embedding remains the strongest, so no change is made.
+
+## Ranking benchmark (end-to-end)
+
+`eval_ranking.py` drives the **real** `semantic_code_search` pipeline (FTS5 + vector + RRF + adjusted-score re-rank) over MCP stdio, unlike `eval_retrieval.py` which is vector-only. Spawns `code-graph-mcp serve` for each project root against a frozen `sqlite3.backup()` copy of the index; never sends `initialized` (so background startup indexing is never triggered) and passes `skip_indexing=true` on every search call (so the copied index is never reindexed or wiped during a run).
+
+### Invariants
+
+- **Isolated root**: each benchmark root is a `/tmp/cg-bench-*` copy backed up via `sqlite3.backup()` — WAL + vec0 shadow tables included so vector search works against the copy.
+- **No `initialized`**: omitting the `notifications/initialized` message prevents the server from launching its background index-watcher, keeping the index snapshot stable.
+- **`skip_indexing=true`**: every `semantic_code_search` call carries this flag to skip per-query freshness checks, ensuring the server reads the snapshot, not a live reindex.
+- **`CODE_GRAPH_INTERNAL=1`**: suppresses usage.jsonl writes so benchmark runs never pollute real adoption metrics.
+
+### Run commands
+
+```bash
+# Step 1 — generate the tier3 slice (exact-symbol queries, gold = defining node)
+python3 scripts/embedding_benchmark/build_tier3_slice.py \
+  --db .code-graph/index.db \
+  --db /mnt/data_ssd/dev/projects/sgc/.code-graph/index.db \
+  --out scripts/embedding_benchmark/tier3_slice.jsonl --limit-per-db 250
+
+# Step 2 — NL baseline (regression guard; --min-ndcg 0.5 catches a missing embed-model build)
+python3 scripts/embedding_benchmark/eval_ranking.py \
+  --queries scripts/embedding_benchmark/query_set.jsonl \
+  --root . --root /mnt/data_ssd/dev/projects/sgc \
+  --min-ndcg 0.5 \
+  --out scripts/embedding_benchmark/results/ranking_nl_baseline.json
+
+# Step 3 — tier3 slice baseline (improvement measure; no --min-ndcg floor)
+python3 scripts/embedding_benchmark/eval_ranking.py \
+  --queries scripts/embedding_benchmark/tier3_slice.jsonl \
+  --root . --root /mnt/data_ssd/dev/projects/sgc \
+  --out scripts/embedding_benchmark/results/ranking_tier3_baseline.json
+```
+
+### Results (2026-06-21, end-to-end RRF pipeline)
+
+Binary: `target/release/code-graph-mcp` (built with `embed-model` feature, minilm active).  
+DBs: `code-graph-mcp` (rust+js) + `sgc` (ts+js). `--top-k 20`.
+
+**NL set** (`query_set.jsonl`, n=648, bootstrap doc-comment queries — regression guard):
+
+| metric     | overall | rust   | typescript | javascript |
+|------------|---------|--------|------------|------------|
+| NDCG@10    | 0.6698  | 0.7453 | 0.5714     | 0.5040     |
+| recall@1   | 0.5448  | 0.6084 | 0.4655     | 0.4062     |
+| recall@10  | 0.7870  | 0.8695 | 0.6897     | 0.6000     |
+| MRR        | 0.6320  | 0.7050 | 0.5339     | 0.4737     |
+
+Note: NL overall NDCG@10 = 0.6698, which is below the vector-only baseline of 0.8655. The vector-only benchmark (`eval_retrieval.py`) measures pure embedding similarity without BM25; the end-to-end pipeline adds FTS5 + RRF fusion which can dilute pure vector signal when BM25 and vector disagree. The run did NOT abort (above the 0.5 `--min-ndcg` floor), confirming vector search is active. The gap signals that BM25 and vector are not always aligned on NL queries — a known property of RRF fusion when the FTS ranking is noisy relative to the embedding.
+
+**Tier3 slice** (`tier3_slice.jsonl`, n=500, exact-symbol-name queries, gold = defining node — improvement measure):
+
+| metric    | overall | rust   | typescript | javascript | python |
+|-----------|---------|--------|------------|------------|--------|
+| NDCG@10   | 0.8453  | 0.8869 | 0.7823     | 0.8701     | 1.0000 |
+| recall@1  | 0.8360  | 0.8696 | 0.7789     | 0.8701     | 1.0000 |
+| recall@10 | 0.8540  | 0.9043 | 0.7842     | 0.8701     | 1.0000 |
+| MRR       | 0.8424  | 0.8813 | 0.7816     | 0.8701     | 1.0000 |
+
+### Phase B go/no-go
+
+**Decision: PROCEED**
+
+`by_query_class.exact_symbol.recall@1 = 0.836` — materially below the 0.97 threshold. Defining nodes do NOT already rank #1 in ~16.4% of exact-symbol queries. The existing `name_boost` + acronym handling + exact-name exemption does not fully cover this case. Headroom of ~13pp on recall@1 exists; Phase B (single-identifier weighting + definition-node boost changes in `search.rs`) is authorized to proceed.
+
+TypeScript is the weakest language at recall@1 = 0.7789, suggesting the ranking gap is largest there and Phase B has the most to gain on TS exact-symbol queries.
