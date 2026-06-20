@@ -1,0 +1,4 @@
+# scripts/embedding_benchmark/requirements.txt
+numpy>=1.24
+sentence-transformers>=2.2.2
+model2vec>=0.3.0

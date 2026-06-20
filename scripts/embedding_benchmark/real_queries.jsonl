@@ -1,0 +1,5 @@
+{"query_id": "real:1", "query": "split a camelCase or snake_case identifier into separate words", "gold_node_ids": [], "source": "real", "language": "rust", "hint_symbol": "split_identifier"}
+{"query_id": "real:2", "query": "fuse two ranked result lists with reciprocal rank fusion", "gold_node_ids": [], "source": "real", "language": "rust", "hint_symbol": "weighted_rrf_fusion"}
+{"query_id": "real:3", "query": "detect circular import dependencies between files", "gold_node_ids": [], "source": "real", "language": "rust", "hint_symbol": "cmd_cycles"}
+{"query_id": "real:4", "query": "download and extract the embedding model tarball", "gold_node_ids": [], "source": "real", "language": "rust", "hint_symbol": "download_model_to"}
+{"query_id": "real:5", "query": "rebuild the vector table when the embedding dimension changes", "gold_node_ids": [], "source": "real", "language": "rust", "hint_symbol": "vec0_dim_from_sqlite_master"}
