@@ -47,7 +47,7 @@ done
 ## Results (2026-06-21, query_set n=648, candidates=5879)
 
 DBs: `code-graph-mcp` (rust+js) + `sgc` (ts+js).  
-By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limited statistical power; treat TS numbers as directional), python=1 (excluded from analysis).
+By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limited statistical power; treat TS numbers as directional), python=1 (n=1; included in the overall mean but too small to interpret — negligible weight, ~0.0001 effect).
 
 | backend | field          | NDCG@10 (overall) | rust   | typescript | javascript | recall@1 | recall@10 |
 |---------|----------------|-------------------|--------|------------|------------|----------|-----------|
@@ -67,7 +67,7 @@ By-language query counts: rust=429, javascript=160, typescript=58 (n=58 — limi
 
 3. **Rust > TS > JS by NDCG@10 (despite JS's heavy presence in web-crawl pre-training)** — the rust gap over JS is large for both backends on context_string (minilm: 0.9355 vs 0.6890; potion: 0.8782 vs 0.5312). TS lands between rust and JS despite n=58 being a small sample. (None of the three is fine-tuned for this task; the surprise is that JS, the most pre-training-abundant language, ranks lowest.)
 
-4. **JS underperforms despite likely being in minilm's training data** — JavaScript is extremely well-represented in web-crawl pre-training yet scores substantially lower than rust. This suggests the JS query+context construction or the mixed-type JS corpus (loose scripts + generated code) is harder to rank, not a data-domain coverage issue.
+4. **JS underperforms despite likely being in minilm's training data** — JavaScript is extremely well-represented in web-crawl pre-training yet scores substantially lower than rust. This suggests the JS query+context construction or the mixed-type JS corpus (loose scripts + generated code) is harder to rank, not a data-domain coverage issue. **Caveat:** some bootstrap queries (notably JS) are section-header doc-comments mislabeled to a neighboring symbol (a banner comment naming a sibling), which the `name not in doc` filter cannot catch — so the absolute JS numbers carry label noise and likely understate true quality. This is symmetric across both backends (identical query set), so it does not affect the minilm-vs-potion comparison, only the absolute per-language reading.
 
 5. **TS n=58 caveat** — numbers directionally consistent with rust's strong performance on context_string but insufficient for statistical significance. Add more TS-heavy repos to the `--db` list before drawing hard conclusions about TS.
 
