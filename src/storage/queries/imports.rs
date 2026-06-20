@@ -193,6 +193,35 @@ pub fn get_reverse_dependents(
     Ok(out)
 }
 
+/// All distinct cross-file `imports` edges as `(source_file, target_file)` pairs
+/// (source imports target), for whole-graph circular-dependency detection.
+///
+/// Excludes self-file edges and the synthetic `<external>` pseudo-file (unresolved
+/// external/builtin imports, mirroring `project_map`). `calls` is intentionally
+/// excluded: a call cycle is mutual recursion, not a circular *import*.
+pub fn all_file_import_edges(conn: &Connection) -> Result<Vec<(String, String)>> {
+    use crate::domain::REL_IMPORTS;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT sf.path, tf.path \
+         FROM edges e \
+         JOIN nodes ns ON ns.id = e.source_id \
+         JOIN files sf ON sf.id = ns.file_id \
+         JOIN nodes nt ON nt.id = e.target_id \
+         JOIN files tf ON tf.id = nt.file_id \
+         WHERE e.relation = ?1 \
+           AND sf.id != tf.id \
+           AND sf.path != '<external>' AND tf.path != '<external>'",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![REL_IMPORTS], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +287,49 @@ mod tests {
         let rev = get_reverse_dependents(conn, "b.ts", 5).unwrap();
         assert!(rev.iter().any(|(p, _)| p == "a.ts"),
             "reverse_dependents must include the references dependent; got {rev:?}");
+    }
+
+    #[test]
+    fn all_file_import_edges_returns_cross_file_imports_only() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('a.ts','h1',0,'typescript',0)", []).unwrap();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('b.ts','h2',0,'typescript',0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (1,'function','fa',1,2,'')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (2,'function','fb',1,2,'')", []).unwrap();
+        // a imports b AND b imports a → a file-level cycle.
+        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'imports')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (2,1,'imports')", []).unwrap();
+        // A 'calls' edge must NOT appear — cycles are imports-only (call cycles = recursion).
+        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'calls')", []).unwrap();
+
+        let mut edges = all_file_import_edges(conn).unwrap();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![
+                ("a.ts".to_string(), "b.ts".to_string()),
+                ("b.ts".to_string(), "a.ts".to_string()),
+            ],
+            "exactly the two cross-file import edges; the calls edge is excluded"
+        );
+    }
+
+    #[test]
+    fn all_file_import_edges_excludes_self_file_and_external() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('a.ts','h1',0,'typescript',0)", []).unwrap();
+        // Synthetic <external> bucket for unresolved imports (mirrors project_map).
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('<external>','h2',0,'typescript',0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (1,'function','f1',1,2,'')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (1,'function','f2',3,4,'')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (2,'function','ext',1,2,'')", []).unwrap();
+        // Intra-file import (same file) and an import of the <external> bucket — both excluded.
+        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'imports')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,3,'imports')", []).unwrap();
+
+        let edges = all_file_import_edges(conn).unwrap();
+        assert!(edges.is_empty(), "self-file and <external> imports must be excluded; got {edges:?}");
     }
 }

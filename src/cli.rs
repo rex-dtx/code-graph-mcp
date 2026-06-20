@@ -4651,6 +4651,68 @@ pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
     Ok(())
 }
 
+/// CLI arguments for the `cycles` subcommand.
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp cycles",
+          about = "Detect circular import dependencies (file-level)")]
+pub struct CyclesArgs {
+    /// Maximum number of cycles to report (default: 50)
+    #[arg(long, default_value_t = 50)]
+    pub limit: u32,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Detect circular import dependencies — strongly-connected components of the
+/// file-level `imports` graph. Each cycle is a set of files that transitively
+/// import each other, shown with a representative shortest loop `a → b → … → a`.
+/// Reported over imports only: a `calls` cycle is mutual recursion, not a
+/// circular import. Most actionable for JS/TS/Python/Go; Rust intra-crate module
+/// cycles are frequently benign. CLI-only; not exposed as an MCP tool.
+pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
+    let CyclesArgs { limit, json: json_mode } = args;
+
+    let ctx = CliContext::open(project_root)?;
+    let conn = ctx.db.conn();
+
+    let edges = crate::storage::queries::all_file_import_edges(conn)?;
+    let mut cycles = crate::graph::cycles::find_cycles(&edges);
+    cycles.truncate(limit as usize);
+
+    let mut stdout = std::io::stdout().lock();
+
+    if json_mode {
+        // Empty → `[]` (array-shaped success), per the CLI JSON-empty contract.
+        let items: Vec<serde_json::Value> = cycles.iter().map(|c| {
+            serde_json::json!({
+                "files": c.files,
+                "size": c.size,
+                "cycle": c.path,
+            })
+        }).collect();
+        writeln!(stdout, "{}", serde_json::to_string(&items)?)?;
+        return Ok(());
+    }
+
+    if cycles.is_empty() {
+        eprintln!("[code-graph] No circular import dependencies found.");
+        return Ok(());
+    }
+
+    writeln!(stdout, "Circular import dependencies ({} found):", cycles.len())?;
+    writeln!(stdout, "(files that transitively import each other — a → b → … → a)\n")?;
+    for c in &cycles {
+        writeln!(stdout, "  {}-file cycle: {}", c.size, c.path.join(" → "))?;
+        // When the SCC has more files than the representative loop visits, list them all.
+        if c.size + 1 > c.path.len() {
+            writeln!(stdout, "    files: {}", c.files.join(", "))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// CLI arguments for the `benchmark` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
 #[command(name = "code-graph-mcp benchmark",

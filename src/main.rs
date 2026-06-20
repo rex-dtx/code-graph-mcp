@@ -169,6 +169,11 @@ fn main() -> Result<()> {
             let centrality_args = code_graph_mcp::cli::CentralityArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_centrality(&project_root, centrality_args)
         }
+        Some("cycles") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            let cycles_args = code_graph_mcp::cli::CyclesArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::cli::cmd_cycles(&project_root, cycles_args)
+        }
         Some("benchmark") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             let bench_args = code_graph_mcp::cli::BenchmarkArgs::parse_from(args.iter().skip(1));
@@ -241,6 +246,7 @@ fn print_help() {
     println!("    refs <symbol>       Find all references to a symbol (callers, importers, etc.)");
     println!("    dead-code [path]    Find unused code (orphans and exported-unused symbols)");
     println!("    centrality          Rank architectural chokepoints (betweenness over the call graph)");
+    println!("    cycles              Detect circular import dependencies (file-level)");
     println!("    incremental-index   Run incremental index update");
     println!("    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)");
     println!("    reindex [--from-snapshot]");
@@ -407,7 +413,7 @@ const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
     "dead-code", "incremental-index", "rebuild-index", "reindex", "health-check", "doctor",
-    "centrality", "benchmark", "stats", "adopt", "unadopt", "snapshot",
+    "centrality", "cycles", "benchmark", "stats", "adopt", "unadopt", "snapshot",
     // MCP tool names accepted as aliases (see dispatch above). Listed here so
     // typo-suggester picks the closer alias for inputs like "project_mapp".
     "project_map", "module_overview", "get_ast_node", "find_references",
