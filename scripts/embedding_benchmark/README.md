@@ -149,7 +149,7 @@ The `recall@1 = 0.836` "miss" of 16.4% is NOT re-rankable headroom (the original
 | **rank 11–100** | **0.000** | 0.000 | 0.000 | 0.000 |
 | absent from top-100 (retrieval miss) | 0.146 | 0.096 | 0.216 | 0.130 |
 
-The defining node is either in the top-10 or absent from the top-100 entirely — the rank 11–100 band is empty (`recall@100 == recall@10 == 0.854`). Therefore:
+The defining node is either in the top-10 or absent from the top-100 entirely — the rank 11–100 band is empty (`recall@100 == recall@10 == 0.854`). (Rank-1 here is 0.838 from this `--top-k 100` pool-depth probe; the `--top-k 20` baseline JSON above reports recall@1 = 0.836 — the 0.2pp delta is pool-depth re-ranking of a single query, not an inconsistency. Raw probe output: `results/tier3_rank_distribution.txt`.) Therefore:
 
 - **Definition boost** can only promote the rank-2–10 golds → ceiling **+1.6pp** overall (rust +3.0pp, ts +0.5pp, **js +0.0pp**). Marginal-to-negligible, and on the wrong side of "worth a `search.rs` change."
 - **Adaptive query weighting** reshuffles only candidates already in the fused pool; the empty rank 11–100 band shows the missing golds are not fused-but-low, they are *unretrieved* — re-weighting cannot surface them.

@@ -1,0 +1,17 @@
+# tier3 gold-rank distribution — Phase B NO-GO evidence (2026-06-21)
+# cmd: python3 scripts/embedding_benchmark/tier3_rank_distribution.py \
+#        --queries scripts/embedding_benchmark/tier3_slice.jsonl \
+#        --root . --root /mnt/data_ssd/dev/projects/sgc --top-k 100
+# re-rankable band (rank 2-10) = definition-boost ceiling; empty rank 11-100 => the
+# 14.6% miss is retrieval (unfetched), not ranking. Hence Phase B NO-GO.
+
+OVERALL     n= 500 | rank1=0.838  rank2-10=0.016  rank11-100=0.000  absent=0.146
+            -> re-rankable(rank2-100, definition-boost ceiling)=0.016  retrieval-miss(absent)=0.146
+javascript  n=  77 | rank1=0.870  rank2-10=0.000  rank11-100=0.000  absent=0.130
+            -> re-rankable(rank2-100, definition-boost ceiling)=0.000  retrieval-miss(absent)=0.130
+python      n=   3 | rank1=1.000  rank2-10=0.000  rank11-100=0.000  absent=0.000
+            -> re-rankable(rank2-100, definition-boost ceiling)=0.000  retrieval-miss(absent)=0.000
+rust        n= 230 | rank1=0.874  rank2-10=0.030  rank11-100=0.000  absent=0.096
+            -> re-rankable(rank2-100, definition-boost ceiling)=0.030  retrieval-miss(absent)=0.096
+typescript  n= 190 | rank1=0.779  rank2-10=0.005  rank11-100=0.000  absent=0.216
+            -> re-rankable(rank2-100, definition-boost ceiling)=0.005  retrieval-miss(absent)=0.216
