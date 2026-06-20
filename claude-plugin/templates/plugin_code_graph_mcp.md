@@ -82,6 +82,9 @@ hidden 5 加载 schema —— 实操中走新 flag。CLI 子命令保持原样�
 | "相似/重复函数"（需 embedding） | `code-graph-mcp similar X` | `get_ast_node symbol_name=X include_similar=true` |
 | "未使用的代码" | `code-graph-mcp dead-code [path]` | `module_overview path=<path> include_dead=true` |
 | "架构咽喉/桥节点是谁？" | `code-graph-mcp centrality` | —（CLI-only；betweenness 中心性，补 `map` 的 caller_count 度中心性） |
+| "循环导入依赖（哪些文件互相 import）？" | `code-graph-mcp cycles` | —（CLI-only；文件级 import 环 = SCC；JS/TS/Py/Go 是坏味，Rust 内部环常良性） |
+| "可疑/意外的跨模块耦合？" | `code-graph-mcp surprising` | —（CLI-only；跨文件 calls/refs 按 低置信(ambiguous>inferred)+跨模块+sole-bridge 打分） |
+| "代码健康总览（想要一份报告）？" | `code-graph-mcp report` | —（CLI-only；汇总 summary+置信度 / hot / chokepoints / cycles / surprising / dead-code） |
 
 **dead-code 的 `ignore_paths`**：CLI 默认豁免 `["claude-plugin/", "benches/"]`
 （macro/shell 入口点）；`--no-ignore` 关闭。MCP 端也接同名参数。
@@ -117,6 +120,9 @@ code-graph-mcp show SYMBOL                # 节点详情
 code-graph-mcp refs SYMBOL --relation calls  # 引用筛选
 code-graph-mcp refs SYMBOL --min-confidence extracted  # 只看精确边（滤跨文件裸名 inferred/ambiguous）
 code-graph-mcp centrality                 # 架构咽喉（betweenness 桥节点；补 map 的 caller_count）
+code-graph-mcp cycles                     # 循环导入依赖（文件级 import 环 / SCC）
+code-graph-mcp surprising                 # 可疑跨模块耦合（低置信 + 跨模块 + sole-bridge 打分）
+code-graph-mcp report                     # 代码健康总览（汇总 hot/chokepoints/cycles/surprising/dead-code）
 code-graph-mcp dead-code [path]           # 未使用代码（默认豁免 claude-plugin/）
 code-graph-mcp dead-code --ignore tmp/ --ignore scripts/bin/  # 自定义豁免前缀
 code-graph-mcp dead-code --no-ignore      # 关掉默认豁免，看完整列表

@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.55.0 — code-health commands (cycles / surprising / report) + routing
+
+Three new CLI-only analysis commands, with routing-template wiring so Claude Code
+auto-routes to them. All read-time over the existing graph; no `INDEX_VERSION` /
+schema change.
+
+- **feat(cli) `cycles`**: detect circular import dependencies — strongly-connected
+  components of the file-level `imports` graph, with a representative shortest loop.
+  Imports-only (a `calls` cycle is recursion, not a smell). Most actionable for
+  JS/TS/Python/Go; Rust intra-crate module cycles are often benign.
+- **feat(cli) `surprising`**: surface unexpected cross-module couplings — cross-file
+  `calls`/`references` ranked by resolution confidence (ambiguous > inferred >
+  extracted, reusing v0.54 `edges.confidence`) + crosses-modules + sole-bridge.
+- **feat(cli) `report`**: consolidated code-health overview — summary (counts +
+  edge-confidence breakdown) + hot functions + betweenness chokepoints + import
+  cycles + surprising connections + dead code. `--json` emits an object envelope.
+- **docs(adoption)**: the shipped routing template
+  (`claude-plugin/templates/plugin_code_graph_mcp.md`) lists all three in its CLI
+  decision table + cheat-sheet (CLI-only, like `centrality`). Adopted project
+  copies refresh from the template on next SessionStart.
+
 ## v0.54.2 — routing template: centrality + refs --min-confidence
 
 - **docs(adoption)**: the shipped routing template (`claude-plugin/templates/plugin_code_graph_mcp.md`)
