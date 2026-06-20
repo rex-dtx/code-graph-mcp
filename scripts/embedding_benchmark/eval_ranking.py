@@ -69,10 +69,12 @@ def prepare_isolated_root(real_root: str, workdir: str) -> str:
     os.makedirs(dst_dir, exist_ok=True)
     src = sqlite3.connect(src_db)
     dst = sqlite3.connect(os.path.join(dst_dir, "index.db"))
-    with dst:
-        src.backup(dst)
-    src.close()
-    dst.close()
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
     with open(os.path.join(workdir, "Cargo.toml"), "w") as f:
         f.write('[package]\nname = "bench-fixture"\nversion = "0.0.0"\nedition = "2021"\n')
     os.makedirs(os.path.join(workdir, ".git"), exist_ok=True)
@@ -181,7 +183,9 @@ def main():
         by_db.setdefault(decode_db_idx(gold[0]), []).append(q)
 
     overall, per_lang, per_class = [], {}, {}
-    tmp = tempfile.mkdtemp(prefix="cg-bench-")
+    # Force /tmp, not $TMPDIR: under Claude Code $TMPDIR is ~/.claude/tmp/, and a
+    # benchmark crash (SIGKILL) would otherwise leak cg-bench-* into that tree.
+    tmp = tempfile.mkdtemp(prefix="cg-bench-", dir="/tmp")
     try:
         for db_idx in sorted(by_db):
             if db_idx >= len(args.root):
