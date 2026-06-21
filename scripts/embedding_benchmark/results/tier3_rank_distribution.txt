@@ -1,3 +1,9 @@
+# SUPERSEDED (2026-06-21) by results/diag_retrieval_drop_postfix.txt.
+# The absent=0.146 below is a BENCHMARK ARTIFACT (pre-fix binary + ~19% test-path
+# symbols selected as gold that the binary correctly excludes via is_test_symbol).
+# It is NOT a retrieval miss. Post-fix (00160d4), test-aware: absent=0.008. See README
+# "Phase B go/no-go" CORRECTION + feedback_test_classifier_dual_sources.
+#
 # tier3 gold-rank distribution — Phase B NO-GO evidence (2026-06-21)
 # cmd: python3 scripts/embedding_benchmark/tier3_rank_distribution.py \
 #        --queries scripts/embedding_benchmark/tier3_slice.jsonl \

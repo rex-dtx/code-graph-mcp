@@ -1,0 +1,22 @@
+# Post-fix (00160d4) exact-symbol retrieval diagnostic — supersedes tier3_rank_distribution.txt
+# binary: HEAD + --features embed-model (vector active); frozen snapshots; test-aware probe
+# cmd: diag_retrieval_drop.py --root <repo> --root <sgc> --top-k 100 --cap 500
+
+
+=== exact-symbol retrieval-drop diagnostic (real binary, top_k=100) ===
+OVERALL     n=1000 | rank1=0.987  rank2-10=0.005  rank11-100=0.000  absent=0.008
+            absent breakdown: guard_killed=0.001 fts_has_gold=0.000 fts_no_gold=0.007  (of absent: guard=12% has_gold=0% no_gold=88%)
+bash        n=   1 | rank1=1.000  rank2-10=0.000  rank11-100=0.000  absent=0.000
+            absent breakdown: guard_killed=0.000 fts_has_gold=0.000 fts_no_gold=0.000  (of absent: guard=0% has_gold=0% no_gold=0%)
+javascript  n= 423 | rank1=0.974  rank2-10=0.007  rank11-100=0.000  absent=0.019
+            absent breakdown: guard_killed=0.002 fts_has_gold=0.000 fts_no_gold=0.017  (of absent: guard=12% has_gold=0% no_gold=88%)
+python      n=  18 | rank1=1.000  rank2-10=0.000  rank11-100=0.000  absent=0.000
+            absent breakdown: guard_killed=0.000 fts_has_gold=0.000 fts_no_gold=0.000  (of absent: guard=0% has_gold=0% no_gold=0%)
+rust        n= 362 | rank1=1.000  rank2-10=0.000  rank11-100=0.000  absent=0.000
+            absent breakdown: guard_killed=0.000 fts_has_gold=0.000 fts_no_gold=0.000  (of absent: guard=0% has_gold=0% no_gold=0%)
+typescript  n= 196 | rank1=0.990  rank2-10=0.010  rank11-100=0.000  absent=0.000
+            absent breakdown: guard_killed=0.000 fts_has_gold=0.000 fts_no_gold=0.000  (of absent: guard=0% has_gold=0% no_gold=0%)
+
+--- absent samples (q -> class | FTS terms | multitoken) ---
+  $D                               [javascript] fts_no_gold   mode=empty_terms  multitoken=0 terms=[]
+  Schema$1                         [javascript] fts_no_gold   mode=or_fallback  multitoken=0 terms=['Schema1']

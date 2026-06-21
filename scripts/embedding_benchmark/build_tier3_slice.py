@@ -23,6 +23,26 @@ CODE_TYPES = {
 }
 
 
+def is_test_path(p: str) -> bool:
+    """Port of src/domain.rs is_test_path."""
+    return (p.startswith(("tests/", "test/", "benches/", "bench/")) or "__tests__/" in p
+            or p.endswith(("/tests.rs", "_test.go", "_test.rs", ".test.ts", ".test.js",
+                           ".test.tsx", ".test.jsx", ".spec.ts", ".spec.js",
+                           ".spec.tsx", ".spec.jsx")))
+
+
+def is_test_symbol(name: str, path: str) -> bool:
+    """Port of src/domain.rs is_test_symbol. The binary's candidate loop excludes
+    these from semantic_code_search (search.rs:201), so selecting them as gold makes
+    the tool's CORRECT exclusion register as a retrieval 'miss'. The `is_test = 0`
+    column filter alone is INSUFFICIENT — it misses path/name test symbols whose
+    is_test column is 0 (e.g. build_oracle in tests/routing_bench.rs). This dual-
+    classifier gap inflated the now-retracted 'tier3 14.6% retrieval miss'
+    (see feedback_test_classifier_dual_sources; README Phase B correction)."""
+    return (name.startswith("test_") or name.endswith(("Test", "Tests"))
+            or is_test_path(path))
+
+
 def build(dbs: list[str], limit_per_db: int = 250) -> list[dict]:
     queries: list[dict] = []
     for db_idx, db_path in enumerate(dbs):
@@ -30,7 +50,7 @@ def build(dbs: list[str], limit_per_db: int = 250) -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT n.id, n.name, n.type, f.language
+            SELECT n.id, n.name, n.type, f.language, f.path
             FROM nodes n JOIN files f ON n.file_id = f.id
             WHERE n.is_test = 0 AND f.language IS NOT NULL
             """
@@ -43,6 +63,7 @@ def build(dbs: list[str], limit_per_db: int = 250) -> list[dict]:
             and r["name"]
             and len(r["name"]) >= 3
             and r["name"].replace("_", "").isalnum()  # identifier-ish; drops operators/paths
+            and not is_test_symbol(r["name"], r["path"])  # match the binary's exclusion
         ]
         name_counts = Counter(r["name"] for r in cand)
         uniq = [r for r in cand if name_counts[r["name"]] == 1]

@@ -79,3 +79,31 @@ def test_unique_count_is_among_code_types_only(tmp_path):
     shared = [q for q in out if q["query"] == "shared"]
     assert len(shared) == 1                      # the function is emitted; module never counts
     assert shared[0]["gold_node_ids"] == [20]    # gold is the function node, not the module
+
+
+def test_build_excludes_path_based_test_symbols(tmp_path):
+    """Regression: a symbol with is_test=0 but in a test PATH (tests/, *.test.ts, ...)
+    must be excluded — the binary's candidate loop drops it via is_test_symbol(name,path),
+    so selecting it as gold registers the tool's correct exclusion as a phantom retrieval
+    miss. This dual-classifier gap (is_test column vs path/name) inflated the retracted
+    'tier3 14.6% retrieval miss'."""
+    db = str(tmp_path / "index.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, language TEXT);
+        CREATE TABLE nodes (id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT,
+                            qualified_name TEXT, type TEXT, is_test INTEGER);
+        INSERT INTO files VALUES (1, 'src/lib.rs', 'rust'),
+                                 (2, 'tests/routing_bench.rs', 'rust'),
+                                 (3, 'src/x.test.ts', 'typescript');
+        INSERT INTO nodes VALUES (30, 1, 'real_fn',      NULL, 'function', 0);  -- kept
+        INSERT INTO nodes VALUES (31, 2, 'build_oracle', NULL, 'function', 0);  -- test PATH, is_test=0
+        INSERT INTO nodes VALUES (32, 3, 'makeFixture',  NULL, 'function', 0);  -- *.test.ts
+        INSERT INTO nodes VALUES (33, 1, 'fooTests',     NULL, 'class',    0);  -- *Tests name
+        """
+    )
+    conn.commit()
+    conn.close()
+    out = build([db], limit_per_db=250)
+    assert {q["query"] for q in out} == {"real_fn"}  # all three test symbols excluded
