@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.57.0 — inline route handlers; SIGBUS/flake fixes; CLI/MCP classification unified
+
+### Added
+- **Inline route handlers are materialized as nodes** — Express/Fastify/Koa inline
+  arrow / function-expression handlers become function nodes named `"METHOD path"`,
+  so trace / impact / overview / map give correct per-route results instead of
+  collapsing onto the file `<module>` node (INDEX_VERSION 17→18; existing
+  `.code-graph` indexes auto-rebuild on next open).
+- **Search-decay outcome metrics** — observe logging + a re-search-rate proxy.
+- **answer-in-deny observability** — the grep/read deny hooks report a distinct
+  `no-binary` status, and `doctor` reports when a missing binary has disabled
+  answer-in-deny.
+
+### Changed
+- **MCP `impact_analysis` output values corrected** — callers are now deduplicated
+  by (name, file, depth) and routes counted from production callers only, so
+  test-only endpoints no longer inflate `affected_routes` / `risk_level`. The tool
+  schema is unchanged; numeric values may change for affected symbols.
+- CLI `search` / `similar` now filter `<external>` stubs, matching the MCP surface.
+
+### Fixed
+- **`snapshot_integration` SIGBUS in concurrent install** — `try_install` no longer
+  re-opens the shared `index.db` to write meta after the atomic rename; a
+  concurrent installer's rename could replace the open WAL database and corrupt the
+  `-shm` index (SIGBUS in `walIndexAppend`). Meta is now written to the per-thread
+  partial and checkpointed before the rename.
+- **SQLite mmap disabled (`mmap_size=0`)** — removes the documented
+  mmap-on-truncation SIGBUS hazard (VACUUM/checkpoint shrinking a mapped DB); the
+  page cache keeps reads fast at index sizes.
+- **`ensure_indexed` spurious-wakeup** — the startup-indexing grace wait now loops
+  on an `Instant` deadline, so a spurious condvar wakeup can't make it fall through
+  and start indexing instead of staying non-blocking.
+- **`CODE_GRAPH_QUIET_HOOKS=1`** now also silences the fresh-install restart notice
+  (it leaked on a checkout with no install manifest).
+- Audit remediation: `grep -n` parity, binary checksum on download, CLI tracing;
+  honest `stats` metric naming.
+
+### Internal
+- CI runs the full Node test suite (serially, to avoid a find-binary cache race).
+- Migration parity test also diffs column defaults; CLI/MCP dead-code + impact
+  classification unified into shared helpers (`domain::is_dead_code_exported`,
+  `graph::impact::classify_impact`).
+
 ## v0.56.2 — fix: code-explorer sub-agent referenced a folded MCP tool
 
 The shipped `code-explorer` sub-agent (`claude-plugin/agents/code-explorer.md`)
