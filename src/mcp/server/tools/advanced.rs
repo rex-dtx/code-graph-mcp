@@ -199,52 +199,31 @@ impl McpServer {
             }
         }
 
-        // Exclude root node (depth 0) — it's the queried symbol itself, not a caller
+        // Exclude the root node (depth 0) — the queried symbol itself, not a caller.
         let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
 
-        // Separate production callers from test callers
-        let is_test = |c: &&queries::CallerWithRouteInfo| {
-            is_test_symbol(&c.name, &c.file_path)
-        };
-        let prod_callers: Vec<_> = callers.iter().filter(|c| !is_test(c)).collect();
-        let test_callers: Vec<_> = callers.iter().filter(|c| is_test(c)).collect();
+        // Fetch the target's nodes once: needed for the function-like check (a
+        // non-function with zero callers gets UNKNOWN risk) and reused below for
+        // value references.
+        let nodes = queries::get_nodes_by_name(self.db.conn(), &resolved_name)?;
+        let is_function_like = nodes
+            .iter()
+            .any(|n| crate::domain::is_function_node_type(n.node_type.as_str()));
 
-        let affected_files: std::collections::HashSet<&str> = prod_callers.iter()
-            .map(|c| c.file_path.as_str()).collect();
-        let affected_routes: Vec<serde_json::Value> = callers.iter()
-            .filter_map(|c| {
-                c.route_info.as_ref().and_then(|meta| serde_json::from_str(meta).ok())
-            }).collect();
-
-        let direct: Vec<_> = prod_callers.iter().filter(|c| c.depth == 1).collect();
-        let transitive: Vec<_> = prod_callers.iter().filter(|c| c.depth > 1).collect();
-
-        // Non-function symbols (constant/struct/enum/trait/...) have usages beyond
-        // the call graph (imports, field access, type annotations). With zero
-        // callers, risk must be UNKNOWN rather than the default LOW.
-        let type_warning = if prod_callers.is_empty() {
-            let nodes = queries::get_nodes_by_name(self.db.conn(), &resolved_name)?;
-            let is_function_like = nodes.iter()
-                .any(|n| crate::domain::is_function_node_type(n.node_type.as_str()));
-            if !is_function_like {
-                Some(crate::domain::NON_FUNCTION_IMPACT_WARNING)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Risk based on production callers, not test callers. When the target is a
-        // type with no call-graph callers, flag it UNKNOWN instead of LOW — the
-        // warning above already explains why, but risk_level is the field LLMs act on.
-        let risk_level: &'static str = if type_warning.is_some() {
-            "UNKNOWN"
-        } else {
-            crate::domain::compute_risk_level(
-                prod_callers.len(), affected_routes.len(), change_type == "remove"
-            )
-        };
+        // Partition prod/test callers, count routes/files, and assess risk via the
+        // surface-shared classifier — the CLI `impact` subcommand runs the identical
+        // rule (crate::graph::impact). Single source for the (name,file,depth) dedup
+        // and the prod-only route policy: this path previously counted routes
+        // reachable through test callers into the risk input and did not dedup.
+        let impact = crate::graph::impact::classify_impact(&callers, change_type, is_function_like);
+        let direct: Vec<_> = impact.prod_callers.iter().filter(|c| c.depth == 1).collect();
+        let transitive: Vec<_> = impact.prod_callers.iter().filter(|c| c.depth > 1).collect();
+        let affected_routes: Vec<serde_json::Value> = impact
+            .route_callers
+            .iter()
+            .filter_map(|c| c.route_info.as_ref().and_then(|meta| serde_json::from_str(meta).ok()))
+            .collect();
+        let risk_level = impact.risk_level;
 
         // Value references: callers that mention this symbol as a VALUE (callback /
         // fn pointer / type-position) rather than calling it — coupling the call
@@ -252,7 +231,6 @@ impl McpServer {
         // caller counts so `direct_callers` stays pure control-flow. Prod sources,
         // deduped by referencing symbol.
         let value_references = {
-            let nodes = queries::get_nodes_by_name(self.db.conn(), &resolved_name)?;
             let mut seen = std::collections::HashSet::new();
             for n in &nodes {
                 let refs = queries::get_incoming_references(
@@ -278,14 +256,14 @@ impl McpServer {
                 "name": c.name, "file": c.file_path, "depth": c.depth
             })).collect::<Vec<_>>(),
             "affected_routes": affected_routes,
-            "affected_files": affected_files.len(),
+            "affected_files": impact.affected_files,
             "value_references": value_references,
             "risk_level": risk_level,
-            "tests_affected": test_callers.len(),
+            "tests_affected": impact.test_count,
             "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}] ({} tests affected)",
-                &resolved_name, affected_routes.len(), prod_callers.len(), affected_files.len(), risk_level, test_callers.len())
+                &resolved_name, affected_routes.len(), impact.prod_callers.len(), impact.affected_files, risk_level, impact.test_count)
         });
-        if let Some(warning) = type_warning {
+        if let Some(warning) = impact.type_warning {
             result["warning"] = json!(warning);
         }
         Ok(result)
@@ -573,11 +551,8 @@ impl McpServer {
         let mut exported_items: Vec<serde_json::Value> = Vec::new();
 
         for r in &results {
-            let is_exported = r.has_export_edge
-                || r.code_content.starts_with("pub ")
-                || r.code_content.starts_with("pub(")
-                || (r.file_path.ends_with(".go")
-                    && r.name.chars().next().is_some_and(|c| c.is_uppercase()));
+            let is_exported = crate::domain::is_dead_code_exported(
+                r.has_export_edge, &r.code_content, &r.file_path, &r.name);
             let lines = r.end_line - r.start_line + 1;
             let mut item = json!({
                 "name": r.name,

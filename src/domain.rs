@@ -286,6 +286,29 @@ pub fn is_skippable_result(node_type: &str, node_name: &str, file_path: &str) ->
         || is_test_symbol(node_name, file_path)
 }
 
+/// Classify a dead-code candidate as exported-but-unused (`true`) vs a true
+/// orphan (`false`). Exported = visible outside its module (public/`pub`, or an
+/// uppercase Go identifier, or an explicit export edge), so even without tracked
+/// callers removal is a wider decision than for an orphan.
+///
+/// Single source for the orphan/exported split otherwise reimplemented at three
+/// sites (`cmd_dead_code` text path, `cmd_dead_code` JSON path, and
+/// `tool_find_dead_code`). The CLI JSON path had drifted — it omitted the Go
+/// export leg the text + MCP paths apply, so exported Go symbols were misfiled as
+/// orphans in `--json` output only.
+pub fn is_dead_code_exported(
+    has_export_edge: bool,
+    code_content: &str,
+    file_path: &str,
+    name: &str,
+) -> bool {
+    has_export_edge
+        || code_content.starts_with("pub ")
+        || code_content.starts_with("pub(")
+        || (file_path.ends_with(".go")
+            && name.chars().next().is_some_and(|c| c.is_uppercase()))
+}
+
 /// File-level test classifier (path heuristics only) shared by `is_test_symbol` and
 /// the `affected` command. NOT the only test-path matcher: the SQL counterparts
 /// (`PROD_SOURCE_FILTER_AND` / `TEST_SOURCE_FILTER_OR` below) and the local closure in
@@ -530,6 +553,23 @@ mod tests {
         // Real production symbols and real (named) modules are kept.
         assert!(!is_skippable_result("function", "realFn", "src/a.rs"));
         assert!(!is_skippable_result("module", "my_mod", "src/a.rs"));
+    }
+
+    #[test]
+    fn test_is_dead_code_exported_covers_all_legs() {
+        // Explicit export edge.
+        assert!(is_dead_code_exported(true, "fn hidden() {}", "src/a.rs", "hidden"));
+        // Rust `pub` / `pub(crate)` visibility from the code content.
+        assert!(is_dead_code_exported(false, "pub fn f() {}", "src/a.rs", "f"));
+        assert!(is_dead_code_exported(false, "pub(crate) fn f() {}", "src/a.rs", "f"));
+        // Go: an uppercase identifier in a .go file is exported. This is the leg the
+        // CLI JSON path used to drop — guard it on every surface now.
+        assert!(is_dead_code_exported(false, "func Handler() {}", "pkg/h.go", "Handler"));
+        // Go lowercase = unexported → orphan; non-Go uppercase is not Go-export.
+        assert!(!is_dead_code_exported(false, "func handler() {}", "pkg/h.go", "handler"));
+        assert!(!is_dead_code_exported(false, "fn Helper() {}", "src/a.rs", "Helper"));
+        // Plain private function with no callers = orphan.
+        assert!(!is_dead_code_exported(false, "fn helper() {}", "src/a.rs", "helper"));
     }
 
     /// Rust convention: `mod tests;` resolves to `<module>/tests.rs`. Functions

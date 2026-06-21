@@ -2702,46 +2702,18 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
 
     let callers = queries::get_callers_with_route_info(conn, symbol, file_filter, depth)?;
 
-    // Exclude root node (depth 0) — it's the queried symbol itself
-    let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
-
-    // Separate production callers from test callers, deduplicate by (name, file, depth)
-    let mut seen = std::collections::HashSet::new();
-    let prod_callers: Vec<_> = callers.iter()
-        .filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path))
-        .filter(|c| seen.insert((&c.name, &c.file_path, c.depth)))
-        .collect();
-    let test_count = callers.iter()
-        .filter(|c| crate::domain::is_test_symbol(&c.name, &c.file_path))
-        .count();
-
-    // Count unique files and routes from production callers only
-    let files: std::collections::HashSet<&str> = prod_callers.iter().map(|c| c.file_path.as_str()).collect();
-    let routes: Vec<&&queries::CallerWithRouteInfo> = prod_callers.iter().filter(|c| c.route_info.is_some()).collect();
+    // Partition prod/test callers (deduped by name,file,depth), count routes/files,
+    // and assess risk via the surface-shared classifier — the MCP impact tool runs
+    // the identical rule. crate::graph::impact owns the prod-only route policy (a
+    // test-only endpoint is not a production blast radius) and the dedup.
+    let is_function_like = symbol_nodes
+        .iter()
+        .any(|n| crate::domain::is_function_node_type(n.node_type.as_str()));
+    let impact = crate::graph::impact::classify_impact(&callers, change_type, is_function_like);
+    let prod_callers = &impact.prod_callers;
+    let routes = &impact.route_callers;
     let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
-
-    // Call-graph-based impact only tracks function call chains. For non-function
-    // symbols (constant/struct/class/enum/interface/type_alias/trait/module) with
-    // zero callers the real usage (imports, field access, instantiation, type
-    // annotations) is broader than the call graph. Flag risk_level=UNKNOWN so
-    // downstream consumers (LLMs) don't act on a misleading LOW.
-    let type_warning: Option<&'static str> = if prod_callers.is_empty() {
-        let is_function_like = symbol_nodes.iter()
-            .any(|n| crate::domain::is_function_node_type(n.node_type.as_str()));
-        if !is_function_like {
-            Some(crate::domain::NON_FUNCTION_IMPACT_WARNING)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let risk: &'static str = if type_warning.is_some() {
-        "UNKNOWN"
-    } else {
-        crate::domain::compute_risk_level(prod_callers.len(), routes.len(), change_type == "remove")
-    };
+    let risk = impact.risk_level;
 
     let mut stdout = std::io::stdout().lock();
 
@@ -2751,8 +2723,8 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             "risk": risk,
             "direct_callers": direct_callers,
             "total_callers": prod_callers.len(),
-            "tests_affected": test_count,
-            "affected_files": files.len(),
+            "tests_affected": impact.test_count,
+            "affected_files": impact.affected_files,
             "affected_routes": routes.len(),
             "callers": prod_callers.iter().map(|c| serde_json::json!({
                 "name": c.name,
@@ -2762,7 +2734,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 "route": c.route_info,
             })).collect::<Vec<_>>(),
         });
-        if let Some(warning) = type_warning {
+        if let Some(warning) = impact.type_warning {
             result["warning"] = serde_json::json!(warning);
         }
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
@@ -2770,7 +2742,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     }
 
     writeln!(stdout, "Impact: {} — Risk: {}", symbol, risk)?;
-    if let Some(warning) = type_warning {
+    if let Some(warning) = impact.type_warning {
         writeln!(stdout, "  (warning: {})", warning)?;
     }
     writeln!(
@@ -2778,14 +2750,14 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         "  {} direct callers, {} total, {} files, {} routes ({} tests affected)",
         direct_callers,
         prod_callers.len(),
-        files.len(),
+        impact.affected_files,
         routes.len(),
-        test_count
+        impact.test_count
     )?;
 
     if !routes.is_empty() {
         writeln!(stdout, "Routes:")?;
-        for r in &routes {
+        for r in routes {
             let route_str = r.route_info.as_deref().unwrap_or("?");
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(route_str) {
                 let method = v["method"].as_str().unwrap_or("?");
@@ -2799,7 +2771,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
 
     if !prod_callers.is_empty() {
         writeln!(stdout, "Callers:")?;
-        for c in &prod_callers {
+        for c in prod_callers {
             let indent = "  ".repeat(c.depth as usize);
             writeln!(stdout, "{}{}  ({}) {}", indent, c.name, c.node_type, c.file_path)?;
         }
@@ -4625,11 +4597,8 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     let mut exported_unused: Vec<&queries::DeadCodeResult> = Vec::new();
 
     for r in &results {
-        let is_exported = r.has_export_edge
-            || r.code_content.starts_with("pub ")
-            || r.code_content.starts_with("pub(")
-            || (r.file_path.ends_with(".go")
-                && r.name.chars().next().is_some_and(|c| c.is_uppercase()));
+        let is_exported = crate::domain::is_dead_code_exported(
+            r.has_export_edge, &r.code_content, &r.file_path, &r.name);
         if is_exported {
             exported_unused.push(r);
         } else {
@@ -4641,9 +4610,10 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
 
     if json_mode {
         let items: Vec<serde_json::Value> = results.iter().map(|r| {
-            let is_exported = r.has_export_edge
-                || r.code_content.starts_with("pub ")
-                || r.code_content.starts_with("pub(");
+            // Same classifier as the text path + MCP — the JSON path previously
+            // omitted the Go export leg, misfiling exported Go symbols as orphans.
+            let is_exported = crate::domain::is_dead_code_exported(
+                r.has_export_edge, &r.code_content, &r.file_path, &r.name);
             let mut obj = serde_json::json!({
                 "name": r.name,
                 "type": r.node_type,
