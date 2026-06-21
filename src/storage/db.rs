@@ -140,7 +140,18 @@ impl Database {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;
-            PRAGMA mmap_size = 268435456;
+            -- mmap DISABLED (was 256MB). SQLite memory-mapped reads raise SIGBUS if
+            -- the mapped DB file is truncated underneath the mapping
+            -- (https://www.sqlite.org/mmap.html §5). We DO truncate the main file —
+            -- the post-version-sweep VACUUM below, plus sqlite's own checkpoints —
+            -- and a long-lived reader (the MCP server) can hold the mapping while
+            -- the watcher writes. Under the embed build's memory pressure the kernel
+            -- reclaims the mapped pages, so the next read re-faults from the now
+            -- shorter file and SIGBUSes: this is the snapshot_integration CI flake
+            -- (with-embed only; an x86 SIGBUS can ONLY be an mmap-beyond-EOF fault,
+            -- which pins it to this mapping). The OS page cache keeps plain pread
+            -- fast at these index sizes, so disabling mmap costs ~nothing.
+            PRAGMA mmap_size = 0;
             PRAGMA temp_store = MEMORY;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
@@ -839,6 +850,20 @@ mod tests {
     // pre-commit + CI test gate fails the build instead of a user's first open.
     // Set comparison by column name (NOT ordered): ALTER ADD COLUMN always
     // appends, so column order legitimately differs between the two paths.
+    #[test]
+    fn open_disables_mmap_to_avoid_sigbus_on_truncation() {
+        // Regression guard for the snapshot_integration with-embed SIGBUS: sqlite
+        // mmap raises SIGBUS when the mapped DB file is truncated (VACUUM/checkpoint)
+        // while a reader holds the mapping. Keep mmap off — see the open() pragmas.
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(&tmp.path().join("index.db")).unwrap();
+        let mmap: i64 = db
+            .conn()
+            .pragma_query_value(None, "mmap_size", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mmap, 0, "mmap must stay disabled to avoid the truncation SIGBUS");
+    }
+
     #[test]
     fn fresh_schema_matches_fully_migrated_schema() {
         use std::collections::BTreeMap;
