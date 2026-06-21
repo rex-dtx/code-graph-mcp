@@ -105,7 +105,7 @@ if (process.env.CODE_GRAPH_FORCE_PLUGIN_MCP !== '1' && isNonProjectCwd(process.c
   return;
 }
 
-const { findBinary, clearCache } = require('./find-binary');
+const { findBinary, clearCache, unsupportedPlatformHint } = require('./find-binary');
 
 let binary = findBinary();
 
@@ -169,6 +169,14 @@ if (!binary) {
   const installedViaMarketplace = fs.existsSync(
     path.join(__dirname, '..', '.claude-plugin', 'plugin.json')
   );
+  const platformHint = unsupportedPlatformHint();
+  if (platformHint) {
+    // Unsupported platform (Alpine/musl or native Windows-on-ARM): the per-platform
+    // npm package does not exist, so the generic "npm install @sdsrs/code-graph-<plat>-<arch>"
+    // suggestion below would point at a nonexistent package. Show the source/emulation hint.
+    process.stderr.write('[code-graph] Binary not found.\n' + platformHint + '\n');
+    process.exit(1);
+  }
   process.stderr.write('[code-graph] Binary not found. Install manually:\n');
   if (installedViaMarketplace) {
     process.stderr.write(
@@ -217,6 +225,10 @@ child.on('error', (err) => {
       `  xattr -d com.apple.quarantine "${binary}"\n`
     );
   }
+  // A glibc binary installed on musl (older npm ignores the `libc` field) is present
+  // but execs into a loader error — surface the actionable platform hint.
+  const platformHint = unsupportedPlatformHint();
+  if (platformHint) process.stderr.write(platformHint + '\n');
   process.exit(1);
 });
 

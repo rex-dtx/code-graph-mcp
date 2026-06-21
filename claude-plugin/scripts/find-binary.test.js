@@ -6,7 +6,8 @@ const os = require('os');
 const path = require('path');
 
 const { globalNodeModulesCandidates, findPlatformBinary, BINARY_NAME,
-        compareVersions, getPackageVersion, isCachedBinaryFresh } = require('./find-binary');
+        compareVersions, getPackageVersion, isCachedBinaryFresh,
+        unsupportedPlatformHint } = require('./find-binary');
 
 function mkDir(t, prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -218,4 +219,28 @@ test('isCachedBinaryFresh: file basename mismatch → not fresh', (t) => {
   fs.writeFileSync(wrongName, '#!/bin/sh\necho wrong\n');
   if (process.platform !== 'win32') fs.chmodSync(wrongName, 0o755);
   assert.equal(isCachedBinaryFresh(wrongName, '0.25.0'), false);
+});
+
+// ── unsupportedPlatformHint (actionable message for tails with no prebuilt binary) ──
+
+test('unsupportedPlatformHint flags Alpine/musl with a source/glibc-image hint', () => {
+  const hint = unsupportedPlatformHint('linux', 'x64', 'musl');
+  assert.ok(hint, 'musl should produce a hint');
+  assert.match(hint, /musl|Alpine/);
+  assert.match(hint, /cargo install/);
+});
+
+test('unsupportedPlatformHint flags native Windows-on-ARM with emulation/source hint', () => {
+  const hint = unsupportedPlatformHint('win32', 'arm64', 'glibc');
+  assert.ok(hint, 'win32-arm64 should produce a hint');
+  assert.match(hint, /Windows on ARM|arm64/);
+  assert.match(hint, /x64|cargo install/);
+});
+
+test('unsupportedPlatformHint returns null for supported platforms', () => {
+  assert.equal(unsupportedPlatformHint('linux', 'x64', 'glibc'), null);
+  assert.equal(unsupportedPlatformHint('linux', 'arm64', 'glibc'), null);
+  assert.equal(unsupportedPlatformHint('darwin', 'arm64', 'glibc'), null);
+  assert.equal(unsupportedPlatformHint('darwin', 'x64', 'glibc'), null);
+  assert.equal(unsupportedPlatformHint('win32', 'x64', 'glibc'), null);
 });

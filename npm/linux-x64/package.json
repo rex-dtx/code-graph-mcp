@@ -13,6 +13,9 @@
   "cpu": [
     "x64"
   ],
+  "libc": [
+    "glibc"
+  ],
   "files": [
     "code-graph-mcp"
   ],

@@ -12,6 +12,45 @@ const CACHE_FILE = path.join(os.homedir(), '.cache', 'code-graph', 'binary-path'
 const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
 const PLATFORM_PKG = `@sdsrs/code-graph-${PLATFORM}-${ARCH}`;
 
+/**
+ * libc flavor of the current Linux runtime: 'glibc' or 'musl'. musl (Alpine) has
+ * no `glibcVersionRuntime` in the Node process-report header. Best-effort; returns
+ * 'glibc' off Linux or when detection is unavailable.
+ */
+function detectLibc() {
+  if (PLATFORM !== 'linux') return 'glibc';
+  try {
+    const header = process.report.getReport().header;
+    if (header && header.glibcVersionRuntime) return 'glibc';
+    return 'musl';
+  } catch {
+    try { if (fs.existsSync('/etc/alpine-release')) return 'musl'; } catch { /* ignore */ }
+    return 'glibc';
+  }
+}
+
+/**
+ * Actionable install hint for a platform that has NO published prebuilt binary
+ * (Alpine/musl, or native Windows-on-ARM), or null when the platform is supported
+ * (generic messaging applies). Pure in (platform, arch, libc) so it is unit-testable
+ * without running on each OS. Prevents the misleading "npm install
+ * @sdsrs/code-graph-<plat>-<arch>" suggestion for a package that does not exist.
+ */
+function unsupportedPlatformHint(platform = PLATFORM, arch = ARCH, libc = null) {
+  const lc = libc || (platform === 'linux' ? detectLibc() : 'glibc');
+  if (platform === 'linux' && lc === 'musl') {
+    return 'Detected Alpine/musl libc, which has no prebuilt binary. Install from source:\n'
+      + '  cargo install code-graph-mcp --features embed-model\n'
+      + 'or use a glibc-based image (e.g. node:20-slim / debian, not node:20-alpine).';
+  }
+  if (platform === 'win32' && arch === 'arm64') {
+    return 'Detected Windows on ARM (arm64), which has no native build. Either use an x64 '
+      + 'build of Node.js (the published x64 binary runs under Windows ARM emulation), '
+      + 'or install from source:\n  cargo install code-graph-mcp --features embed-model';
+  }
+  return null;
+}
+
 /** Read the npm pkg version from this script's package.json (claude-plugin/../package.json). */
 function getPackageVersion() {
   try { return require('../../package.json').version; }
@@ -263,6 +302,7 @@ module.exports = {
   findBinary, findBinaryUncached, clearCache,
   globalNodeModulesCandidates, findPlatformBinary,
   getPackageVersion, compareVersions, isCachedBinaryFresh,
+  detectLibc, unsupportedPlatformHint,
   CACHE_FILE, BINARY_NAME, PLATFORM_PKG,
 };
 
