@@ -538,6 +538,11 @@ function runMain() {
       hook: 'grep', action: 'deny', answered,
       // mode segments which answer type converts (show=bodies, grep=hits).
       ...(answered ? { mode: answeredMode } : {}),
+      // reason segments WHY an unanswered deny fell back to the static copy:
+      // 'no-binary' (flagship answer-in-deny dark — binary missing) vs
+      // 'unavailable' (binary ran but failed/timed out). Without this the two
+      // are indistinguishable in the funnel ("broken" looks like "no hits").
+      ...(answered ? {} : { reason: answer.status }),
       // tail segments compound-command denies — lets the funnel compare
       // re-issue behavior for denies that carried a tail note.
       ...(unansweredTail ? { tail: true } : {}),

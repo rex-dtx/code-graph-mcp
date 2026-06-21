@@ -885,6 +885,9 @@ test('e2e: denied grep with stub hits → deny JSON embeds the answer + records 
     const rec = JSON.parse(recs.trim().split('\n').pop());
     assert.equal(rec.action, 'deny');
     assert.equal(rec.answered, true);
+    // An answered deny carries no failure reason — the field is reserved for
+    // the not-answered fallback so 'no-binary' vs 'unavailable' stays legible.
+    assert.equal(rec.reason, undefined);
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -926,6 +929,9 @@ test('e2e: stub fails → static deny (v0.46 fallback) + records answered:false'
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
     assert.equal(rec.action, 'deny');
     assert.equal(rec.answered, false);
+    // A binary that ran but failed (exit 3) is a runtime 'unavailable' — the
+    // funnel must NOT confuse this with a missing-binary ('no-binary') deny.
+    assert.equal(rec.reason, 'unavailable');
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1040,6 +1046,59 @@ test('e2e: simple (non-compound) denied grep → no tail field in the deny recor
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
     assert.equal(rec.action, 'deny');
     assert.equal('tail' in rec, false);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: missing binary → static deny records reason:no-binary (flagship-dark, distinct from no-hits & unavailable)', () => {
+  // The whole point of the `reason` field: a deny that fell back because the
+  // binary could not be found ('no-binary') must be distinguishable in the log
+  // from one where the binary ran but had nothing useful. We can't make
+  // findBinary() return null in-repo (dev target/release is always there), so
+  // run the child with a `--require` shim that forces it null — and DON'T set
+  // _CG_ANSWER_BINARY (it would short-circuit before findBinary()).
+  const uniq = `StubGone${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('unused\\n');`);
+  const shim = pathE2e.join(fixture.dir, 'no-binary-shim.js');
+  fsE2e.writeFileSync(shim, `
+const Module = require('module');
+const orig = Module.prototype.require;
+Module.prototype.require = function (id) {
+  const m = orig.apply(this, arguments);
+  if (id === './find-binary') {
+    return new Proxy(m, { get(t, p) { return p === 'findBinary' ? () => null : t[p]; } });
+  }
+  return m;
+};
+`);
+  const cmd = `grep -rn "${uniq}" src/`;
+  try {
+    const res = spawnHook(process.execPath, [pathE2e.join(__dirname, 'pre-grep-guide.js')], {
+      cwd: fixture.dir,
+      input: JSON.stringify({ tool_input: { command: cmd } }),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        // _CG_ANSWER_BINARY intentionally UNSET so the shimmed findBinary() runs.
+        _CG_ANSWER_BINARY: '',
+        NODE_OPTIONS: `--require ${shim}`,
+        CODE_GRAPH_QUIET_HOOKS: '0',
+        CODE_GRAPH_NO_BLOCK_GREP: '0',
+        CODE_GRAPH_NO_ANSWER_IN_DENY: '0',
+      },
+    });
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    // Still a deny, still the static fallback copy (no embedded answer).
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(out.hookSpecificOutput.permissionDecisionReason, /denied by code-graph hook/);
+    const rec = JSON.parse(fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
+    assert.equal(rec.action, 'deny');
+    assert.equal(rec.answered, false);
+    assert.equal(rec.reason, 'no-binary',
+      'a missing-binary deny must be distinguishable from an unavailable (runtime-fail) deny');
   } finally {
     cleanupFixture(fixture, cmd);
   }

@@ -61,6 +61,11 @@ function runDiagnostics() {
     results.push({ name: 'Schema', status: 'skip', detail: 'binary not found' });
     results.push({ name: 'Index', status: 'skip', detail: 'binary not found' });
     results.push({ name: 'Embeddings', status: 'skip', detail: 'binary not found' });
+    // The deny hooks run `code-graph-mcp grep/show/overview` inside the hook to
+    // answer in-place (the flagship conversion lever). A missing binary silently
+    // disables that — denies fall back to bare advice — so call it out here.
+    results.push({ name: 'Answer-in-deny', status: 'skip',
+      detail: 'disabled — binary not found, deny hooks fall back to static advice' });
   } else {
     let execOk = true;
     try {

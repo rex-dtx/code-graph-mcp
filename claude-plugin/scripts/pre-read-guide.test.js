@@ -291,6 +291,41 @@ test('trackReadAndMaybeHint: fires on 5th read with stubbed overview answer', ()
   }
 });
 
+test('trackReadAndMaybeHint: missing binary → hint records reason:no-binary (delivered-overview dark, sibling of pre-grep)', () => {
+  // Sibling-hook parity: when the binary can't be found the read-fanout hint
+  // falls back to bare advice. That must be distinguishable in the funnel from a
+  // runtime failure, exactly like pre-grep's deny. Force findBinary() null
+  // in-process and unset _CG_ANSWER_BINARY so the resolution actually runs.
+  const findBinaryMod = require('./find-binary');
+  const realFindBinary = findBinaryMod.findBinary;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-nobin-'));
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  const oldEnv = process.env._CG_ANSWER_BINARY;
+  delete process.env._CG_ANSWER_BINARY;
+  findBinaryMod.findBinary = () => null;
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    let fired = false;
+    for (let i = 0; i < 5; i++) {
+      fired = trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs');
+    }
+    assert.equal(fired, true, '5th same-dir read must still fire the hint');
+    const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const last = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(last.action, 'hint');
+    assert.equal(last.answered, false);
+    assert.equal(last.reason, 'no-binary',
+      'a dark delivered-overview hint must be distinguishable from a runtime failure');
+  } finally {
+    process.stdout.write = origWrite;
+    findBinaryMod.findBinary = realFindBinary;
+    if (oldEnv === undefined) delete process.env._CG_ANSWER_BINARY;
+    else process.env._CG_ANSWER_BINARY = oldEnv;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('trackReadAndMaybeHint: non-fanout source read records an observe event', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-observe-'));
   fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });

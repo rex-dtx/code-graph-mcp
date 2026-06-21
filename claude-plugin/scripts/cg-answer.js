@@ -79,7 +79,12 @@ function sanitizeSearchPath(searchPath) {
  * @param {number} [opts.maxBytes]
  * @returns {{status: 'hits', text: string, truncated: boolean}
  *         | {status: 'no-hits'}
+ *         | {status: 'no-binary'}
  *         | {status: 'unavailable'}}
+ *   `no-binary` (binary not installed / not locatable) is kept distinct from
+ *   `unavailable` (runtime failure) so the deny funnel can tell "flagship
+ *   answer-in-deny is dark because the binary is missing" apart from "binary
+ *   ran, query just had no hits". Both still fall back to the static deny.
  */
 function runGrepAnswer(opts = {}) {
   const {
@@ -97,7 +102,7 @@ function runGrepAnswer(opts = {}) {
     if (binary === undefined) {
       binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
     }
-    if (!binary) return { status: 'unavailable' };
+    if (!binary) return { status: 'no-binary' };
 
     // Defensive re-sanitize: callers should pass a clean path, but a glob
     // reaching argv is a guaranteed nonzero exit (see sanitizeSearchPath).
@@ -143,6 +148,12 @@ function runGrepAnswer(opts = {}) {
  * context-flag greps: the model wants to READ the functions, so hand it the
  * functions). Same bounded/best-effort posture as runGrepAnswer; symbols that
  * fail to resolve are skipped, all-fail → no-hits (caller falls back to grep).
+ * @returns {{status: 'hits', text: string, truncated: boolean}
+ *         | {status: 'no-hits'}
+ *         | {status: 'no-binary'}
+ *         | {status: 'unavailable'}}
+ *   `no-binary` distinguishes a missing/unlocatable binary from a runtime
+ *   `unavailable`, so the deny funnel can see a dark flagship answer-in-deny.
  */
 function runShowAnswer(opts = {}) {
   const {
@@ -159,7 +170,7 @@ function runShowAnswer(opts = {}) {
     if (binary === undefined) {
       binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
     }
-    if (!binary) return { status: 'unavailable' };
+    if (!binary) return { status: 'no-binary' };
 
     const parts = [];
     for (const sym of symbols.slice(0, 3)) {
@@ -189,6 +200,12 @@ function runShowAnswer(opts = {}) {
  * v0.49 — Run `code-graph-mcp overview <dir>` for the read-fanout hint, so the
  * hint DELIVERS the module map instead of advising a tool call (hints measured
  * 0/40 transfer on 2026-06-12; delivered answers satisfied 5/5 in place).
+ * @returns {{status: 'hits', text: string, truncated: boolean}
+ *         | {status: 'no-hits'}
+ *         | {status: 'no-binary'}
+ *         | {status: 'unavailable'}}
+ *   `no-binary` distinguishes a missing/unlocatable binary from a runtime
+ *   `unavailable`, so the read-fanout funnel can see a dark delivered hint.
  */
 function runOverviewAnswer(opts = {}) {
   const {
@@ -205,7 +222,7 @@ function runOverviewAnswer(opts = {}) {
     if (binary === undefined) {
       binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
     }
-    if (!binary) return { status: 'unavailable' };
+    if (!binary) return { status: 'no-binary' };
     const res = spawnSync(binary, ['overview', dir], {
       cwd,
       timeout: timeoutMs,

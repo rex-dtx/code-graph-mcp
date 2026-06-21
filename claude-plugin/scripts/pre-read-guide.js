@@ -177,7 +177,14 @@ function trackReadAndMaybeHint(root, rel, now = Date.now()) {
     answer = runOverviewAnswer({ cwd: root, dir });
   }
   const answered = answer.status === 'hits';
-  recordRecommendation(root, { hook: 'read', action: 'hint', answered });
+  recordRecommendation(root, {
+    hook: 'read', action: 'hint', answered,
+    // reason segments WHY an unanswered hint fell back to the bare advice:
+    // 'no-binary' (delivered overview dark — binary missing) vs 'unavailable'
+    // (binary ran but failed/timed out) vs 'no-hits'. Mirrors pre-grep-guide
+    // so the read-fanout funnel can tell a dark flagship apart from no result.
+    ...(answered ? {} : { reason: answer.status }),
+  });
   process.stdout.write((answered ? buildHintWithAnswer(dir, answer) : buildHint(dir)) + '\n');
   return true;
 }

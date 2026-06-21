@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { runGrepAnswer, runShowAnswer, truncateAtLine } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, runOverviewAnswer, truncateAtLine } = require('./cg-answer');
 
 // Stub "binary": a node script that reacts to its first real arg so one stub
 // covers hits / no-hits / error / timeout cases.
@@ -95,12 +95,15 @@ test('runGrepAnswer: exit >1 → unavailable', () => {
   assert.equal(r.status, 'unavailable');
 });
 
-test('runGrepAnswer: missing binary → unavailable', () => {
+test('runGrepAnswer: missing binary → no-binary (distinct from runtime unavailable)', () => {
   const r = runGrepAnswer({ cwd: stubDir, pattern: 'fts5_search', binary: null });
-  assert.equal(r.status, 'unavailable');
+  assert.equal(r.status, 'no-binary',
+    'a null binary is the flagship-dark case and must be distinguishable from a runtime failure');
 });
 
-test('runGrepAnswer: nonexistent binary path → unavailable', () => {
+test('runGrepAnswer: nonexistent binary path → unavailable (spawn failure, not no-binary)', () => {
+  // A non-null path that fails to spawn is a runtime failure, NOT a missing
+  // binary — `no-binary` is reserved for findBinary() returning falsy.
   const r = runGrepAnswer({
     cwd: stubDir, pattern: 'fts5_search', binary: path.join(stubDir, 'nope-bin'),
   });
@@ -212,4 +215,39 @@ test('runShowAnswer: empty symbol list → unavailable', () => {
 test('runShowAnswer: failing binary → no-hits (caller falls back to grep answer)', () => {
   const r = runShowAnswer({ cwd: stubDir, symbols: ['ExplodePlease'], binary: stubBinary() });
   assert.equal(r.status, 'no-hits');
+});
+
+test('runShowAnswer: missing binary → no-binary (distinct from runtime no-hits/unavailable)', () => {
+  const r = runShowAnswer({ cwd: stubDir, symbols: ['alpha_one'], binary: null });
+  assert.equal(r.status, 'no-binary');
+});
+
+// ── runOverviewAnswer (v0.49) — read-fanout delivered module map ──────
+
+test('runOverviewAnswer: hits → status hits with stdout text', () => {
+  const r = runOverviewAnswer({ cwd: stubDir, dir: 'src/storage', binary: stubBinary() });
+  assert.equal(r.status, 'hits');
+  assert.match(r.text, /args=\["overview","src\/storage"\]/);
+});
+
+test('runOverviewAnswer: CLI "No matches" → no-hits', () => {
+  const r = runOverviewAnswer({ cwd: stubDir, dir: 'NothingHere', binary: stubBinary() });
+  assert.equal(r.status, 'no-hits');
+});
+
+test('runOverviewAnswer: failing binary → unavailable', () => {
+  const r = runOverviewAnswer({ cwd: stubDir, dir: 'ExplodePlease', binary: stubBinary() });
+  assert.equal(r.status, 'unavailable');
+});
+
+test('runOverviewAnswer: missing binary → no-binary (distinct from runtime unavailable)', () => {
+  const r = runOverviewAnswer({ cwd: stubDir, dir: 'src/storage', binary: null });
+  assert.equal(r.status, 'no-binary');
+});
+
+test('runOverviewAnswer: empty/oversized dir → unavailable (never spawns)', () => {
+  assert.equal(runOverviewAnswer({ cwd: stubDir, dir: '', binary: stubBinary() }).status, 'unavailable');
+  assert.equal(
+    runOverviewAnswer({ cwd: stubDir, dir: 'a'.repeat(301), binary: stubBinary() }).status,
+    'unavailable');
 });
