@@ -185,6 +185,9 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
     let id: u64 = pid.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(seq);
     let zst_partial = cg_dir.join(format!(".snapshot-{id:016x}.db.zst.partial"));
     let db_partial  = cg_dir.join(format!(".snapshot-{id:016x}.db.partial"));
+    // WAL sidecars SQLite creates next to db_partial; cleaned on every exit path.
+    let wal_partial = cg_dir.join(format!(".snapshot-{id:016x}.db.partial-wal"));
+    let shm_partial = cg_dir.join(format!(".snapshot-{id:016x}.db.partial-shm"));
 
     let install_inner = || -> Result<String> {
         download(url, &zst_partial)?;
@@ -193,23 +196,39 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
         decompress_with_cap(&zst_partial, &db_partial, MAX_DECOMPRESSED_BYTES)?;
         validate(&db_partial, root)?;
 
-        // POSIX rename(2) atomically replaces the destination — pre-deleting
-        // would open a TOCTOU window where a concurrent reader sees no file.
+        // Write consumer-side meta (source_url + fetched_at) into our UNIQUE
+        // partial, NOT the shared final index.db. The previous order — rename into
+        // place, THEN open index.db and WAL-write meta — raced a concurrent
+        // installer's rename: thread B replacing index.db reinitialised the shared
+        // `index.db-shm` WAL-index under thread A's open connection, so A's next
+        // frame write SIGBUSed in walIndexAppend (the
+        // snapshot_install_concurrent_serialized_via_filesystem flake). Writing meta
+        // to our own partial means no thread ever WAL-writes the shared file; the
+        // atomic rename below is the sole operation on index.db.
+        let commit = {
+            let db = Database::open(&db_partial)?;
+            let conn = db.conn();
+            super::meta::write_meta(conn, super::meta::META_SNAPSHOT_SOURCE_URL, url)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            super::meta::write_meta(conn, super::meta::META_SNAPSHOT_FETCHED_AT, &now.to_string())?;
+            let commit = super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SOURCE_COMMIT)?
+                .unwrap_or_default();
+            // Fold the WAL into the main file so the rename moves a complete DB and
+            // leaves no orphaned -wal still carrying the meta we just wrote.
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            commit
+        }; // connection dropped here → -wal/-shm released before the rename
+
+        // POSIX rename(2) atomically replaces the destination — pre-deleting would
+        // open a TOCTOU window where a concurrent reader sees no file. The partial
+        // is now a complete, closed DB; the last concurrent rename wins cleanly.
         let final_db = cg_dir.join("index.db");
         std::fs::rename(&db_partial, &final_db)?;
-
-        // Write consumer-side meta (source_url + fetched_at)
-        let db = Database::open(&final_db)?;
-        let conn = db.conn();
-        super::meta::write_meta(conn, super::meta::META_SNAPSHOT_SOURCE_URL, url)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        super::meta::write_meta(conn, super::meta::META_SNAPSHOT_FETCHED_AT, &now.to_string())?;
-
-        let commit = super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SOURCE_COMMIT)?
-            .unwrap_or_default();
+        let _ = std::fs::remove_file(&wal_partial);
+        let _ = std::fs::remove_file(&shm_partial);
         Ok(commit)
     };
 
@@ -226,6 +245,8 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
             // source_url/fetched_at meta is still a usable index.
             let _ = std::fs::remove_file(&zst_partial);
             let _ = std::fs::remove_file(&db_partial);
+            let _ = std::fs::remove_file(&wal_partial);
+            let _ = std::fs::remove_file(&shm_partial);
             Err(e)
         }
     }
