@@ -772,6 +772,80 @@ mod tests {
         assert_eq!(name, "hello");
     }
 
+    // P2-8 migration gate: a fresh DB (create_tables_sql) and a v1 DB upgraded
+    // through every migrate_vN must end with identical files/nodes/edges column
+    // schemas. Catches a FORGOTTEN migration — adding a column to
+    // create_tables_sql without a guarded-ALTER migrate_vN (+ SCHEMA_VERSION
+    // bump) makes fresh installs work while existing users crash with
+    // "no such column" on upgrade (the v0.54 edges.confidence class) — and
+    // catches create_tables vs migrate_vN column-definition drift (the confidence
+    // column lives in two hand-maintained places). Runs in `cargo test`, so the
+    // pre-commit + CI test gate fails the build instead of a user's first open.
+    // Set comparison by column name (NOT ordered): ALTER ADD COLUMN always
+    // appends, so column order legitimately differs between the two paths.
+    #[test]
+    fn fresh_schema_matches_fully_migrated_schema() {
+        use std::collections::BTreeMap;
+        // column name -> (declared type, notnull, pk)
+        fn columns(conn: &Connection, table: &str) -> BTreeMap<String, (String, bool, bool)> {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+            let rows = stmt.query_map([], |r| Ok((
+                r.get::<_, String>(1)?,
+                (r.get::<_, String>(2)?, r.get::<_, i64>(3)? != 0, r.get::<_, i64>(5)? != 0),
+            ))).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        }
+
+        // Fresh DB at the current schema.
+        let fresh_tmp = TempDir::new().unwrap();
+        let fresh = Database::open(&fresh_tmp.path().join("index.db")).unwrap();
+
+        // A v1 DB → Database::open runs every migration up to SCHEMA_VERSION.
+        let mig_tmp = TempDir::new().unwrap();
+        let mig_path = mig_tmp.path().join("index.db");
+        {
+            register_sqlite_vec();
+            let conn = Connection::open(&mig_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            // Frozen v1 schema (the shape the v1->v2 test builds).
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                    blake3_hash TEXT NOT NULL, last_modified INTEGER NOT NULL,
+                    language TEXT, indexed_at INTEGER NOT NULL
+                );
+                CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    type TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT,
+                    start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                    code_content TEXT NOT NULL, signature TEXT, doc_comment TEXT, context_string TEXT
+                );
+                CREATE TABLE edges (
+                    id INTEGER PRIMARY KEY,
+                    source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    relation TEXT NOT NULL, metadata TEXT, UNIQUE(source_id, target_id, relation)
+                );
+                CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    name, qualified_name, code_content, context_string, doc_comment,
+                    content='nodes', content_rowid='id'
+                );"
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let migrated = Database::open(&mig_path).unwrap();
+
+        for table in ["files", "nodes", "edges"] {
+            assert_eq!(
+                columns(fresh.conn(), table), columns(migrated.conn(), table),
+                "table `{table}`: fresh create_tables_sql schema diverges from the \
+                 v1->vN migration result — a migrate_vN / SCHEMA_VERSION bump is \
+                 missing, or a column definition drifted between create_tables_sql \
+                 and its migrate_vN",
+            );
+        }
+    }
+
     #[test]
     fn test_corrupt_db_auto_recovery() {
         let tmp = TempDir::new().unwrap();
