@@ -77,13 +77,46 @@ jobs:
         # (surveyHookCoverage moved to lifecycle.js); vetted locally — doctor
         # is fixture-only; sync-versions stubs builds via SYNC_VERSIONS_SKIP_BUILD
         # except one test that expects `cargo build` to fail (cargo ships on
-        # ubuntu-latest runners). scripts/install-e2e.test.js stays OUT of CI:
-        # several tests need target/release/code-graph-mcp — its gate is
-        # pre-commit, which runs it whenever claude-plugin/ or scripts/ JS is
-        # staged (it went stale for 3 months when neither gate ran it).
+        # ubuntu-latest runners).
         # pr-impact-comment.test.js added in v0.53.0; vetted locally — node-only,
         # stub binary via _CG_REVIEW_BINARY shim, tmpdir fixtures, no cargo build.
-        run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js claude-plugin/scripts/hooks.test.js claude-plugin/scripts/pre-edit-guide.test.js claude-plugin/scripts/pre-grep-guide.test.js claude-plugin/scripts/cg-answer.test.js claude-plugin/scripts/doctor.test.js claude-plugin/scripts/pr-impact-comment.test.js scripts/release-smoke.test.js scripts/sync-versions.test.js
+        #
+        # v0.56.2 batch (close the CI/pre-commit coverage gap — most Node tests
+        # ran only via the pre-commit hook, invisible to a CI-only contributor).
+        # All vetted by READING each test (a local pass is a weak signal because
+        # the dev box has target/release/code-graph-mcp, which CI does not):
+        #   adopt              — pure logic + mkdtemp sandboxes (memoryDir slug,
+        #                        sentinel heal, detectProjectType); no binary/net.
+        #   claude-config      — pure CLAUDE_CONFIG_DIR env-var resolution.
+        #   find-binary        — fixtures + process.execpath/shell-script fake
+        #                        binaries; the one "no platform pkg" test self-
+        #                        skips if a real global install is present, and
+        #                        asserts null on a clean runner. `npm root -g`
+        #                        is local (no network); npm ships with node.
+        #   incremental-index  — shouldRun() env logic + a node-only default-OFF
+        #                        spawn; two binary-spawn tests do `if (!findBinary())
+        #                        return` and skip on CI (no target/release binary).
+        #   pre-read-guide     — fanout state machine + tmpdir; answer stub via
+        #                        _CG_ANSWER_BINARY, never the real binary.
+        #   project-detect     — isProjectRoot/isNonProjectCwd over tmpdir markers.
+        #   recommendation-log — JSONL append/rotate in a tmpdir .code-graph/.
+        #   tmp-dir            — cgTmpDir() path + mkdir under os.tmpdir().
+        #   user-prompt-context— intent/symbol regex + one CODE_GRAPH_QUIET_HOOKS=1
+        #                        node-only spawn; reads committed skills/*.md.
+        #   version-utils      — readBinaryVersion/isDevMode/getNewestMtime over
+        #                        shell-script fakes + tmpdir; no real binary.
+        #
+        # Still OUT of CI (need a built binary, network, or local install state):
+        #   scripts/install-e2e.test.js — several tests need target/release/
+        #     code-graph-mcp; gate is pre-commit, which runs it whenever
+        #     claude-plugin/ or scripts/ JS is staged (it went stale for 3 months
+        #     when neither gate ran it).
+        #   mcp-launcher.test.js — its dedup-stub test depends on the repo-root
+        #     .mcp.json, which is gitignored (a dev-only file registering
+        #     code-graph-dev for local metrics) and so absent on a CI checkout;
+        #     without it the launcher falls through to findBinary()→null and the
+        #     60s npm-install + 90s GitHub-download fallbacks, hanging the test.
+        run: node --test claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js claude-plugin/scripts/hooks.test.js claude-plugin/scripts/pre-edit-guide.test.js claude-plugin/scripts/pre-grep-guide.test.js claude-plugin/scripts/cg-answer.test.js claude-plugin/scripts/doctor.test.js claude-plugin/scripts/pr-impact-comment.test.js claude-plugin/scripts/adopt.test.js claude-plugin/scripts/claude-config.test.js claude-plugin/scripts/find-binary.test.js claude-plugin/scripts/incremental-index.test.js claude-plugin/scripts/pre-read-guide.test.js claude-plugin/scripts/project-detect.test.js claude-plugin/scripts/recommendation-log.test.js claude-plugin/scripts/tmp-dir.test.js claude-plugin/scripts/user-prompt-context.test.js claude-plugin/scripts/version-utils.test.js scripts/release-smoke.test.js scripts/sync-versions.test.js
 
   # Supply-chain CVE scan over Cargo.lock (376 transitive deps including the
   # Candle ML stack). cargo-audit reads RustSec advisories and exits non-zero
