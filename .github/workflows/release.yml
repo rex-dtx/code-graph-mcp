@@ -178,6 +178,13 @@ jobs:
             cp artifacts/binary-$pkg/code-graph-mcp release-assets/code-graph-mcp-$pkg
           done
           cp artifacts/binary-win32-x64/code-graph-mcp.exe release-assets/code-graph-mcp-win32-x64.exe
+          # Per-binary sha256 sidecar (mirrors models.tar.gz.sha256 below).
+          # auto-update.js fetches <asset>.sha256 and verifies the downloaded
+          # binary BEFORE chmod/exec; same-origin, so it guards transit/CDN
+          # corruption + truncation, not a full release-asset swap.
+          for asset in code-graph-mcp-linux-x64 code-graph-mcp-linux-arm64 code-graph-mcp-darwin-x64 code-graph-mcp-darwin-arm64 code-graph-mcp-win32-x64.exe; do
+            sha256sum "release-assets/$asset" | cut -d' ' -f1 > "release-assets/$asset.sha256"
+          done
 
       - name: Package model files
         # Pinned to a specific HuggingFace commit (cso #2) instead of the

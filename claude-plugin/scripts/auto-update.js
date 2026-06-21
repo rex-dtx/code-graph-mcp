@@ -3,6 +3,7 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
+const crypto = require('crypto');
 const path = require('path');
 const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
@@ -240,17 +241,58 @@ async function downloadBinary(latest) {
       latest.binaryUrl,
     ], { timeout: 60000, stdio: 'pipe' });
 
-    return promoteVerifiedBinary(binaryTmp, binaryDst, latest.version);
+    // Best-effort fetch of the integrity sidecar (<asset>.sha256). curl -f makes
+    // a 404 (an older release with no sidecar) fail → expectedSha stays null →
+    // promoteVerifiedBinary takes the TOFU path. Same-origin, so this guards
+    // corruption in transit, not a release-asset swap (version-exec is the
+    // backstop there).
+    let expectedSha = null;
+    const shaTmp = binaryTmp + '.sha256';
+    try {
+      execFileSync('curl', ['-sfL', '-o', shaTmp, latest.binaryUrl + '.sha256'],
+        { timeout: 30000, stdio: 'pipe' });
+      expectedSha = (fs.readFileSync(shaTmp, 'utf8').trim().split(/\s+/)[0]) || null;
+    } catch { /* no sidecar → TOFU */ } finally {
+      try { if (fs.existsSync(shaTmp)) fs.unlinkSync(shaTmp); } catch { /* ok */ }
+    }
+
+    return promoteVerifiedBinary(binaryTmp, binaryDst, latest.version, expectedSha);
   } catch (e) {
     console.error(`[code-graph] Binary download failed: ${e.message}`);
     return false;
   }
 }
 
-function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion) {
+/**
+ * Hex sha256 of a file's contents (lowercase).
+ * @param {string} filePath
+ * @returns {string}
+ */
+function sha256File(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSha256) {
   try {
     const stat = fs.statSync(binaryTmp);
     if (stat.size <= 1_000_000) return false;
+
+    // Integrity gate BEFORE the file is made executable or run, so a corrupted
+    // or tampered download is never exec'd. The published <asset>.sha256 sidecar
+    // is same-origin, so this defends transit/CDN corruption + truncation, not a
+    // full release compromise (an attacker swapping the binary swaps the sidecar
+    // too — the version-exec check below is the backstop there). No sidecar
+    // (older release) → warn + proceed (TOFU), preserving the size + version
+    // gates. Mirrors the snapshot checksum convention (src/snapshot/install.rs).
+    if (expectedSha256) {
+      const actualSha = sha256File(binaryTmp);
+      if (actualSha.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+        console.error(`[code-graph] Binary checksum mismatch (sha256): expected ${expectedSha256}, got ${actualSha} — refusing to install.`);
+        return false;
+      }
+    } else {
+      console.error('[code-graph] No binary checksum sidecar found — content not verified (size + version checks still apply).');
+    }
 
     // chmod BEFORE reading the version. readBinaryVersion executes the binary
     // (`--version`), which requires the exec bit; `curl -o` writes the tmp file

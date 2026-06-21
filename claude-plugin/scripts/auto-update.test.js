@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 
 const {
   commandExists,
@@ -90,6 +91,41 @@ test('promoteVerifiedBinary promotes a non-executable (0644) download — curl -
   assert.equal(fs.existsSync(dst), true);
   assert.equal(fs.statSync(dst).mode & 0o111, 0o111, 'promoted binary is executable');
   assert.equal(readBinaryVersion(dst), '1.2.3');
+});
+
+test('promoteVerifiedBinary accepts a binary matching the expected sha256', (t) => {
+  const dir = mkDir(t, 'code-graph-bin-');
+  const tmp = path.join(dir, 'code-graph-mcp.tmp');
+  const dst = path.join(dir, 'code-graph-mcp');
+  writeFakeBinary(tmp, '1.2.3');
+  const sha = crypto.createHash('sha256').update(fs.readFileSync(tmp)).digest('hex');
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', sha), true);
+  assert.equal(fs.existsSync(dst), true);
+});
+
+test('promoteVerifiedBinary rejects a binary whose sha256 mismatches the sidecar', (t) => {
+  // Tampered/corrupted download: the checksum gate runs BEFORE chmod+exec, so a
+  // mismatched binary is refused and never made executable. Platform-independent
+  // (no exec needed to reject).
+  const dir = mkDir(t, 'code-graph-bin-');
+  const tmp = path.join(dir, 'code-graph-mcp.tmp');
+  const dst = path.join(dir, 'code-graph-mcp');
+  writeFakeBinary(tmp, '1.2.3');
+  const wrongSha = 'deadbeef'.repeat(8); // 64 hex chars, deliberately wrong
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', wrongSha), false);
+  assert.equal(fs.existsSync(dst), false, 'tampered binary must not be promoted');
+  assert.equal(fs.existsSync(tmp), false, 'tmp cleaned up on rejection');
+});
+
+test('promoteVerifiedBinary proceeds without a sidecar (TOFU back-compat)', (t) => {
+  // Older releases ship no <asset>.sha256; a null expected hash must not block
+  // install (the size + version-exec gates still apply).
+  const dir = mkDir(t, 'code-graph-bin-');
+  const tmp = path.join(dir, 'code-graph-mcp.tmp');
+  const dst = path.join(dir, 'code-graph-mcp');
+  writeFakeBinary(tmp, '1.2.3');
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', null), true);
+  assert.equal(fs.existsSync(dst), true);
 });
 
 test('cachedBinaryNeedsUpdate is version-aware, not existence-only', (t) => {

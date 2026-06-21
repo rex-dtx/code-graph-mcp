@@ -549,6 +549,27 @@ fn test_cli_grep_leading_dash_pattern() {
 }
 
 #[test]
+fn test_cli_grep_noop_muscle_memory_flags() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // "drop-in grep" parity: -n/-r/-R/-H are accepted no-ops (line numbers,
+    // recursion, and filenames are already the default output here), NOT
+    // swallowed as the pattern by allow_hyphen_values. Pre-fix, `grep -n "pat"`
+    // bound `-n` as the pattern and pushed "pat" into the path list → rg errored
+    // with "No such file or directory: pat" at exit 2 — silently training the
+    // model to abandon the tool the whole project exists to steer it toward.
+    for flag in ["-n", "--line-number", "-r", "-R", "--recursive", "-H", "--with-filename"] {
+        let (stdout, stderr, code) = run_cli(&project, &["grep", flag, "validateToken"]);
+        assert_eq!(code, 0, "grep {flag} <pat> must bind the pattern, not swallow the flag; stderr={stderr}");
+        assert!(stdout.contains("validateToken"), "grep {flag}: should find matches, got: {stdout}");
+    }
+    // -n combined with an explicit path (the most common real invocation).
+    let (stdout, _, code) = run_cli(&project, &["grep", "-n", "validateToken", "src/auth.ts"]);
+    assert_eq!(code, 0, "grep -n <pat> <path> must work");
+    assert!(stdout.contains("validateToken"));
+}
+
+#[test]
 fn test_cli_grep_fixed_strings_literal() {
     if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
@@ -1888,6 +1909,43 @@ fn test_cli_incremental_index() {
     let (_, stderr, code) = run_cli(&project, &["incremental-index"]);
     assert_eq!(code, 0);
     assert!(stderr.contains("Incremental index:"), "should show index stats");
+}
+
+// Regression guard for feedback_tracing_invisible_in_cli: CLI subcommands now
+// install a stderr tracing subscriber (previously only `serve` did), so indexer
+// warn!/info! is visible. The "[incremental]" line is a tracing::info! (distinct
+// from the always-printed "Incremental index:" eprintln), so it surfaces only
+// when a subscriber is installed AND the level allows it.
+#[test]
+fn test_cli_incremental_index_tracing_subscriber_installed() {
+    // RUST_LOG=info → the tracing-only "[incremental]" summary reaches stderr.
+    let project = setup_indexed_project();
+    std::fs::write(
+        project.path().join("src/auth.ts"),
+        "export function validateToken(t: string): boolean { return t.length > 0; }\nexport function freshlyAdded() { return 42; }\n",
+    ).unwrap();
+    let (_, stderr, code) = run_cli_env(&project, &["incremental-index"], &[("RUST_LOG", "info")]);
+    assert_eq!(code, 0, "incremental-index should succeed; stderr={stderr}");
+    assert!(stderr.contains("[incremental]"),
+        "RUST_LOG=info must surface the indexer's tracing output on the CLI path \
+         (proves the subscriber is installed); got stderr: {stderr:?}");
+
+    // Negative control: at "warn" level the info-level "[incremental]" line is
+    // filtered out, while the non-tracing "Incremental index:" eprintln still
+    // prints — proving the assertion above is level-gated by the subscriber, not
+    // an always-present string. RUST_LOG is set explicitly (not left to ambient
+    // env) so the control is deterministic on a shell/CI that exports RUST_LOG.
+    let project2 = setup_indexed_project();
+    std::fs::write(
+        project2.path().join("src/auth.ts"),
+        "export function validateToken(t: string): boolean { return t.length > 0; }\nexport function freshlyAdded2() { return 7; }\n",
+    ).unwrap();
+    let (_, stderr2, code2) = run_cli_env(&project2, &["incremental-index"], &[("RUST_LOG", "warn")]);
+    assert_eq!(code2, 0);
+    assert!(!stderr2.contains("[incremental]"),
+        "at default warn level the info [incremental] line must be filtered out; got: {stderr2:?}");
+    assert!(stderr2.contains("Incremental index:"),
+        "the non-tracing eprintln summary still prints at warn level; got: {stderr2:?}");
 }
 
 // clap-migrated (audit #4) contract lock. Flag parsing flipped to clap while the

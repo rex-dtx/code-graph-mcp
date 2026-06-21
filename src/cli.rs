@@ -1360,6 +1360,15 @@ pub struct GrepArgs {
     /// Max matches per file; 0 = unlimited
     #[arg(long, default_value_t = 100)]
     pub max_count: u64,
+    /// Accepted for grep parity; line numbers are always printed (no-op).
+    #[arg(short = 'n', long = "line-number")]
+    pub line_number: bool,
+    /// Accepted for grep parity; the search is always recursive (no-op).
+    #[arg(short = 'r', long = "recursive", visible_short_alias = 'R')]
+    pub recursive: bool,
+    /// Accepted for grep parity; filenames are always shown (no-op).
+    #[arg(short = 'H', long = "with-filename")]
+    pub with_filename: bool,
 }
 
 /// AST-context grep: ripgrep + AST context from index.
@@ -1432,6 +1441,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         pattern, paths, json: json_mode,
         ignore_case, word_regexp, fixed_strings, max_count,
         files_with_matches, context, after_context, before_context,
+        // -n/-r/-R/-H: accepted for grep muscle-memory parity, all no-ops here
+        // (line numbers, recursion, and filenames are already the default).
+        line_number: _, recursive: _, with_filename: _,
     } = args;
     let context_requested = context.is_some() || after_context.is_some() || before_context.is_some();
     // clap accepts an empty-string positional (e.g. an unset shell var expanding

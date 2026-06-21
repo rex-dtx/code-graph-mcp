@@ -29,6 +29,17 @@ fn main() -> Result<()> {
         }
     }
 
+    // CLI subcommands (everything except serve) get a stderr tracing subscriber
+    // too, so warn!/error! from the indexer is visible — RUST_LOG overrides the
+    // "warn" default (feedback_tracing_invisible_in_cli). serve installs its own
+    // ("info") inside run_serve; help/version need no logging.
+    if !matches!(
+        subcommand,
+        Some("serve") | None | Some("--help" | "-h" | "help") | Some("--version" | "-V")
+    ) {
+        init_tracing("warn");
+    }
+
     match subcommand {
         Some("serve") | None => run_serve(),
         Some("--help" | "-h" | "help") => {
@@ -305,14 +316,24 @@ fn print_help() {
     println!("    -V, --version       Show version");
 }
 
-fn run_serve() -> Result<()> {
-    tracing_subscriber::fmt()
+/// Install a global stderr tracing subscriber (idempotent via `try_init`).
+/// `RUST_LOG` overrides `default_level`. CLI subcommands call this with "warn"
+/// so indexer warnings (parse-skip counts, FTS5-only fallback, embedding
+/// dim-mismatch wipe) are visible — previously only `run_serve` installed a
+/// subscriber, so every tracing event on a CLI path was silently dropped
+/// (feedback_tracing_invisible_in_cli). serve keeps the "info" default.
+fn init_tracing(default_level: &str) {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .with_writer(io::stderr)
-        .init();
+        .try_init();
+}
+
+fn run_serve() -> Result<()> {
+    init_tracing("info");
 
     // P0.1 — non-project cwd guard (Rust counterpart to mcp-launcher.js's
     // isNonProjectCwd gate). When the binary is invoked directly — bypassing the
