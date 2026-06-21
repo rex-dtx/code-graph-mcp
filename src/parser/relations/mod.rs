@@ -152,24 +152,32 @@ fn walk_for_relations(
                 })
         }
         "arrow_function" => {
-            // `const foo = () => {}` → scope name is the binding.
-            // Other anonymous arrows (e.g. `test(() => {...})` callbacks,
-            // `.map(x => x)` inline lambdas) inherit the parent scope so
-            // calls inside them attribute to the enclosing named function
-            // or fall through to `<module>` at file top level. Returning
-            // `Some("<anonymous>")` here used to emit unresolvable edges
-            // (no node is named "<anonymous>"), silently dropping test
-            // callback calls and causing false-positive orphans.
-            node.parent()
-                .filter(|p| p.kind() == "variable_declarator")
-                .and_then(|p| p.child_by_field_name("name"))
-                .map(|n| {
-                    let name = node_text(&n, source).to_string();
-                    match current_class {
-                        Some(cls) => format!("{}.{}", cls, name),
-                        None => name,
-                    }
-                })
+            // Inline HTTP route handler → its synthetic node name "METHOD path",
+            // so calls inside the handler attribute to the materialized handler
+            // node (treesitter.rs) instead of the file <module>. Otherwise:
+            // `const foo = () => {}` → scope name is the binding; other anonymous
+            // arrows (`test(() => {...})` callbacks, `.map(x => x)` lambdas)
+            // inherit the parent scope. (Returning `Some("<anonymous>")` would
+            // emit unresolvable edges — no node is named that — silently dropping
+            // callback calls and causing false-positive orphans.)
+            super::route_handler_name(&node, source).or_else(|| {
+                node.parent()
+                    .filter(|p| p.kind() == "variable_declarator")
+                    .and_then(|p| p.child_by_field_name("name"))
+                    .map(|n| {
+                        let name = node_text(&n, source).to_string();
+                        match current_class {
+                            Some(cls) => format!("{}.{}", cls, name),
+                            None => name,
+                        }
+                    })
+            })
+        }
+        "function_expression" => {
+            // Only materialized inline route handlers get a scope here; other
+            // function expressions keep inheriting the parent scope (no node is
+            // created for them, so a synthetic scope would dangle).
+            super::route_handler_name(&node, source)
         }
         // Dart: function_body is a sibling of either method_signature
         // (in class_body) or function_signature (top-level declaration).

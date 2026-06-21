@@ -19,35 +19,13 @@ pub(super) fn extract_route_pattern(node: &tree_sitter::Node, source: &str, lang
 }
 
 fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
-    let function = node.child_by_field_name("function")?;
-    if function.kind() != "member_expression" { return None; }
-
-    let object = function.child_by_field_name("object")?;
-    let property = function.child_by_field_name("property")?;
-
-    let obj_name = node_text(&object, source);
-    let method_name = node_text(&property, source);
-
-    // Check if this looks like an HTTP route registration
-    if !matches!(obj_name, "app" | "router" | "server") { return None; }
-    let http_method = match method_name {
-        "get" => "GET",
-        "post" => "POST",
-        "put" => "PUT",
-        "delete" => "DELETE",
-        "patch" => "PATCH",
-        "use" => "USE",
-        _ => return None,
-    };
+    // Recognize the route call + method/path via the shared helper — single
+    // source of truth for the receiver objects + method map, kept in sync with
+    // the handler-node materializer (crate::parser::route_handler_name).
+    let (http_method, path) = crate::parser::express_route_method_path(node, source)?;
 
     let args = node.child_by_field_name("arguments")?;
-    // First argument is the path (string)
-    let first_arg = args.named_child(0)?;
-    let path = node_text(&first_arg, source)
-        .trim_matches(|c| c == '\'' || c == '"')
-        .to_string();
-
-    // Last named argument is the handler
+    // Last named argument is the handler.
     let handler_count = args.named_child_count();
     if handler_count < 2 { return None; }
     let handler_arg = args.named_child(handler_count - 1)?;
@@ -64,8 +42,12 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
             source_language: String::new(),
         })
     } else if matches!(handler_arg.kind(), "arrow_function" | "function_expression" | "function") {
-        // Inline handler: router.post('/path', async (req, res) => { ... })
-        // Link to the <module> node so find_http_route can locate the file and handler lines
+        // Inline handler: router.post('/path', async (req, res) => { ... }).
+        // Point the edge at the synthetic handler node (materialized in
+        // treesitter.rs) so trace/impact/overview resolve to the handler instead
+        // of collapsing every route onto the file <module>. Keep the line
+        // metadata for find_http_route. If the path isn't a concrete route the
+        // name builder returns None and we fall back to the legacy <module>.
         let handler_start = handler_arg.start_position().row + 1;
         let handler_end = handler_arg.end_position().row + 1;
         let metadata = serde_json::json!({
@@ -75,9 +57,11 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
             "handler_start_line": handler_start,
             "handler_end_line": handler_end,
         }).to_string();
+        let name = crate::parser::synthetic_route_handler_name(http_method, &path)
+            .unwrap_or_else(|| "<module>".into());
         Some(ParsedRelation {
-            source_name: "<module>".into(),
-            target_name: "<module>".into(),
+            source_name: name.clone(),
+            target_name: name,
             relation: REL_ROUTES_TO.into(),
             metadata: Some(metadata),
             source_language: String::new(),

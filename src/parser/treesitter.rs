@@ -157,6 +157,11 @@ fn extract_nodes(
             if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
+            } else if let Some(name) = super::route_handler_name(&node, source) {
+                // Anonymous `function (req, res) { ... }` used as an inline route
+                // handler (no name field → extract_function_node returns None):
+                // materialize it like the arrow / function_expression case below.
+                results.push(make_simple_node("function", name, &node, source, node_is_test));
             }
         }
         // Python async functions
@@ -545,6 +550,19 @@ fn extract_nodes(
             }
         }
 
+        // Inline HTTP route handlers (Express/Fastify/Koa:
+        // `app.get('/x', (req, res) => { ... })`) are anonymous arrows /
+        // function expressions with no `name` field, so they matched no node arm
+        // and their calls collapsed onto the file <module>. Materialize them as
+        // function nodes named "METHOD path" so trace/impact/overview resolve
+        // per-route; relations::walk_for_relations scopes the handler's calls to
+        // the same synthetic name. (INDEX_VERSION bumped in domain.rs.)
+        "arrow_function" | "function_expression" => {
+            if let Some(name) = super::route_handler_name(&node, source) {
+                results.push(make_simple_node("function", name, &node, source, node_is_test));
+            }
+            // fall through to extract_children below so nested fns still extract
+        }
         _ => {}
     }
 

@@ -275,6 +275,52 @@ router.get('/api/users/:id', authMiddleware, async (req, res) => {
 }
 
 #[test]
+fn test_inline_route_handler_scopes_calls_and_materializes_node() {
+    let code = r#"
+app.get('/users', async (req, res) => {
+    const u = fetchUser(req.params.id);
+    res.json(u);
+});
+"#;
+    let relations = extract_relations(code, "typescript").unwrap();
+    // routes_to edge now targets the synthetic handler node, not <module>.
+    let route = relations.iter().find(|r| r.relation == REL_ROUTES_TO).expect("route edge");
+    assert_eq!(route.source_name, "GET /users", "route edge source = synthetic handler name");
+    assert_eq!(route.target_name, "GET /users");
+    assert!(route.metadata.as_deref().unwrap_or("").contains("\"inline\":true"));
+    // The call inside the handler attributes to the handler, not the file <module>.
+    let call = relations.iter()
+        .find(|r| r.relation == crate::domain::REL_CALLS && r.target_name == "fetchUser")
+        .expect("fetchUser call edge");
+    assert_eq!(call.source_name, "GET /users",
+        "inline-handler call must scope to the synthetic handler node, got source={}", call.source_name);
+    // Node materialization: extract_nodes produces a function node named "GET /users".
+    let tree = crate::parser::treesitter::parse_tree(code, "typescript").unwrap();
+    let nodes = crate::parser::treesitter::extract_nodes_from_tree(&tree, code, "typescript");
+    assert!(nodes.iter().any(|n| n.name == "GET /users" && n.node_type == "function"),
+        "inline handler must be materialized as a function node; got: {:?}",
+        nodes.iter().map(|n| (n.name.clone(), n.node_type.clone())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_fastify_inline_route_handler_scopes_calls() {
+    let code = r#"
+fastify.post('/login', async (req, reply) => {
+    const ok = checkAuth(req.body);
+    reply.send({ ok });
+});
+"#;
+    let relations = extract_relations(code, "javascript").unwrap();
+    let route = relations.iter().find(|r| r.relation == REL_ROUTES_TO).expect("fastify route edge");
+    assert_eq!(route.source_name, "POST /login", "fastify route recognized + synthetic name");
+    let call = relations.iter()
+        .find(|r| r.relation == crate::domain::REL_CALLS && r.target_name == "checkAuth")
+        .expect("checkAuth call edge");
+    assert_eq!(call.source_name, "POST /login",
+        "fastify inline handler must scope its calls, got source={}", call.source_name);
+}
+
+#[test]
 fn test_extract_python_flask_routes() {
     let code = r#"
 @app.route('/api/users', methods=['GET'])
