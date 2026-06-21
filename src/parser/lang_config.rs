@@ -194,4 +194,29 @@ mod tests {
         assert_eq!(config.name, "unknown");
         assert!(!config.has_test_attributes);
     }
+
+    /// P2-7 guard for feedback_lang_config_default_name: every detectable
+    /// language (utils::config::SUPPORTED_LANGUAGES) must resolve a tree-sitter
+    /// grammar AND a round-tripping lang_config name. A forgotten `for_language`
+    /// arm falls to "unknown", which silently makes `config.name == "X"` guards
+    /// in treesitter never fire — the language then extracts nothing. This turns
+    /// that silent partial-add into a build failure.
+    #[test]
+    fn every_supported_language_has_consistent_config() {
+        for &lang in crate::utils::config::SUPPORTED_LANGUAGES {
+            assert!(
+                crate::parser::languages::get_language(lang).is_some(),
+                "no tree-sitter grammar for supported language {lang:?} \
+                 (parser::languages::get_language)",
+            );
+            let config = LanguageConfig::for_language(lang);
+            assert_eq!(
+                config.name, lang,
+                "lang_config::for_language({lang:?}).name must round-trip, got {:?} — a \
+                 forgotten static_name arm makes `config.name == {lang:?}` guards silently \
+                 never fire (feedback_lang_config_default_name)",
+                config.name,
+            );
+        }
+    }
 }

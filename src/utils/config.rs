@@ -1,3 +1,17 @@
+/// Languages a file can be detected as — the output set of `detect_language`.
+/// Canonical list: when adding a language, add it here AND to `detect_language`.
+/// The `every_supported_language_has_consistent_config` test (parser::lang_config)
+/// asserts each entry resolves a tree-sitter grammar (parser::languages::
+/// get_language) and a round-tripping lang_config static_name, so a forgotten
+/// lang_config arm — which silently makes `config.name == "X"` guards never fire
+/// (feedback_lang_config_default_name) — fails the build instead of an indexed
+/// repo silently extracting nothing for that language.
+pub const SUPPORTED_LANGUAGES: &[&str] = &[
+    "rust", "typescript", "tsx", "javascript", "go", "python", "java",
+    "c", "cpp", "html", "css", "csharp", "kotlin", "ruby", "php", "swift",
+    "dart", "markdown", "bash", "json",
+];
+
 pub fn detect_language(path: &str) -> Option<&'static str> {
     let p = std::path::Path::new(path);
     // file_stem() returns None for paths without a filename component;
