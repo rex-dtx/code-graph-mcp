@@ -274,6 +274,18 @@ pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
         || is_test_path(file_path)
 }
 
+/// True for a search/similarity candidate that every result surface skips as
+/// non-real output: a file-level `<module>` placeholder, an `<external>` stub,
+/// or a test symbol. Single source for the triad otherwise reimplemented in
+/// `cmd_search`/`tool_semantic_search` and `cmd_similar`/`tool_find_similar_code`
+/// across the CLI and MCP surfaces (a recurring drift site — the CLI search/
+/// similar paths historically omitted the `<external>` leg the MCP path applied).
+pub fn is_skippable_result(node_type: &str, node_name: &str, file_path: &str) -> bool {
+    (node_type == "module" && node_name == "<module>")
+        || file_path == "<external>"
+        || is_test_symbol(node_name, file_path)
+}
+
 /// File-level test classifier (path heuristics only) shared by `is_test_symbol` and
 /// the `affected` command. NOT the only test-path matcher: the SQL counterparts
 /// (`PROD_SOURCE_FILTER_AND` / `TEST_SOURCE_FILTER_OR` below) and the local closure in
@@ -505,6 +517,19 @@ mod tests {
         // Production code in src/ is unaffected
         assert!(!is_test_symbol("fts5_search", "src/storage/queries/search.rs"));
         assert!(!is_test_symbol("conn", "src/storage/db.rs"));
+    }
+
+    #[test]
+    fn test_is_skippable_result_covers_the_triad() {
+        // <module> placeholder, <external> stub, and test symbols are skipped on
+        // every search/similarity surface.
+        assert!(is_skippable_result("module", "<module>", "src/a.rs"));
+        assert!(is_skippable_result("function", "anything", "<external>"));
+        assert!(is_skippable_result("function", "test_foo", "src/a.rs"));
+        assert!(is_skippable_result("function", "foo", "tests/a.rs"));
+        // Real production symbols and real (named) modules are kept.
+        assert!(!is_skippable_result("function", "realFn", "src/a.rs"));
+        assert!(!is_skippable_result("module", "my_mod", "src/a.rs"));
     }
 
     /// Rust convention: `mod tests;` resolves to `<module>/tests.rs`. Functions

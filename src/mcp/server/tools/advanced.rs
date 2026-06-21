@@ -467,13 +467,7 @@ impl McpServer {
         let similar: Vec<serde_json::Value> = candidates.iter()
             .filter_map(|(id, distance)| {
                 let nf = node_map.get(id)?;
-                if nf.node.node_type == "module" && nf.node.name == "<module>" {
-                    return None;
-                }
-                if nf.file_path == "<external>" {
-                    return None;
-                }
-                if is_test_symbol(&nf.node.name, &nf.file_path) {
+                if crate::domain::is_skippable_result(&nf.node.node_type, &nf.node.name, &nf.file_path) {
                     return None;
                 }
                 let similarity = 1.0 / (1.0 + distance);

@@ -201,9 +201,7 @@ impl McpServer {
         for r in &fused {
             if let Some(nwf) = nwf_map.remove(&r.node_id) {
                 let node = &nwf.node;
-                if node.node_type == "module" && node.name == "<module>" { continue; }
-                if nwf.file_path == "<external>" { continue; }
-                if is_test_symbol(&node.name, &nwf.file_path) { continue; }
+                if crate::domain::is_skippable_result(&node.node_type, &node.name, &nwf.file_path) { continue; }
                 if let Some(nt) = node_type_filter {
                     let normalized = normalize_type_filter_mcp(nt);
                     if !normalized.iter().any(|t| t == &node.node_type) { dropped_by_filter += 1; continue; }

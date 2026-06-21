@@ -2009,11 +2009,11 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     let mut filtered_nodes: Vec<&queries::NodeResult> = Vec::new();
     let mut dropped_by_filter = 0usize;
     for n in &fts_result.nodes {
-        // Skip <module> nodes and test symbols (consistent with MCP semantic_code_search)
-        if n.node_type == "module" && n.name == "<module>" { continue; }
-        if let Some(nwf) = nwf_map.get(&n.id) {
-            if crate::domain::is_test_symbol(&n.name, &nwf.file_path) { continue; }
-        }
+        // Skip <module>/<external> placeholders and test symbols, consistent with
+        // MCP semantic_code_search (domain::is_skippable_result = the shared triad;
+        // the CLI path previously omitted the <external> leg the MCP path applied).
+        let fp = nwf_map.get(&n.id).map(|nwf| nwf.file_path.as_str()).unwrap_or("");
+        if crate::domain::is_skippable_result(&n.node_type, &n.name, fp) { continue; }
         if let Some(lang) = language_filter {
             let lang_ok = nwf_map.get(&n.id)
                 .and_then(|nwf| nwf.language.as_deref())
@@ -4124,9 +4124,8 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     for (id, distance) in &raw_results {
         if *id == node_id || *distance > max_distance { continue; }
         let Some(node) = queries::get_node_by_id(conn, *id)? else { continue; };
-        if node.node_type == "module" && node.name == "<module>" { continue; }
         let fp = queries::get_file_path(conn, node.file_id)?.unwrap_or_default();
-        if crate::domain::is_test_symbol(&node.name, &fp) { continue; }
+        if crate::domain::is_skippable_result(&node.node_type, &node.name, &fp) { continue; }
         similar.push((node, fp, *distance));
         if similar.len() >= top_k as usize { break; }
     }
