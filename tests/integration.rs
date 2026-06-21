@@ -409,6 +409,58 @@ export function handleRequest(req: Request, res: Response) {
     assert_eq!(result["risk_level"], "LOW", "leaf function should be LOW risk");
 }
 
+/// E2E: an inline (arrow) Express route handler is materialized as a function node
+/// (bfa3723) and that node flows through impact analysis — a function the handler
+/// calls reports the handler ("GET /widgets") as a route-carrying caller. bfa3723
+/// only manually verified trace/overview; impact/map share the graph but were not
+/// separately e2e'd, so this pins impact + the route survival end to end.
+#[test]
+fn test_e2e_impact_on_inline_route_handler() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("server.ts"), r#"
+function logAccess(msg: string) {
+    return msg;
+}
+
+app.get('/widgets', (req: Request, res: Response) => {
+    logAccess('widgets hit');
+    res.json([]);
+});
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    // Trigger indexing.
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "logAccess"}));
+    let _ = server.handle_message(&search).unwrap();
+
+    // Impact on the function the inline handler calls: the materialized handler
+    // node ("GET /widgets") must appear as a caller, carrying its route metadata.
+    let msg = tool_call_json("impact_analysis", serde_json::json!({
+        "symbol_name": "logAccess",
+        "change_type": "signature",
+        "depth": 3
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let direct = result["direct_callers"].as_array().unwrap();
+    let direct_names: Vec<&str> = direct.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(
+        direct_names.iter().any(|n| n.contains("/widgets")),
+        "the inline handler must materialize as a caller of logAccess; got {:?}",
+        direct_names
+    );
+    let routes = result["affected_routes"].as_array().unwrap();
+    assert!(
+        !routes.is_empty(),
+        "the materialized handler carries a route, so affected_routes must be non-empty; got {:?}",
+        result["affected_routes"]
+    );
+}
+
 #[test]
 fn test_e2e_module_overview() {
     let project = TempDir::new().unwrap();
