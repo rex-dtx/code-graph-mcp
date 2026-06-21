@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.56.1 — fix: chained statusline dropped when the previous command used a leading `~`
+
+The composite statusline runs each provider via `execFileSync` (no shell), so a
+`_previous` command captured verbatim with a leading `~` (e.g.
+`~/.claude/utils/statusline.sh`) threw `ENOENT` and was silently swallowed — the
+user's original statusline vanished, leaving only the `code-graph` line. No
+`INDEX_VERSION` / schema change.
+
+- **fix(statusline): expand a leading `~` before exec** (#24). `runProvider` now
+  expands `~`/`~/` to the home directory on every command word, mirroring the shell
+  tilde expansion Claude Code applies when it runs `statusLine.command` directly.
+  The `_previous` command is still stored verbatim (correct for the shell-based
+  restore to `settings.json` on uninstall); expansion happens only at exec time, so
+  users already affected are fixed on upgrade without re-running install. A regression
+  test spawns the composite with a `~`-prefixed provider and asserts it renders.
+
 ## v0.56.0 — vector-availability visibility + model/release hardening + platform hints
 
 Install-integrity pass: make a silent FTS5-only degradation visible, harden the
