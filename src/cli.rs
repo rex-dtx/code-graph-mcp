@@ -1920,13 +1920,13 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    // Over-fetch unconditionally so post-fetch filtering can still return `limit`
-    // results. The filter below ALWAYS drops <module> and test symbols (not only
-    // when a language/node-type filter is set), so fetching exactly `limit` rows
-    // under-returns whenever any of the top rows are test/module — and the gap
-    // grows with `limit`. Mirrors MCP semantic_code_search ((top_k*4).max(20))
-    // and ast_search (limit*4), which over-fetch for the same reason.
-    let fetch_limit = (limit * 4).max(20);
+    // Over-fetch so post-fetch filtering can still return `limit` results. The filter
+    // below ALWAYS drops <module>/test symbols, and a language/node-type filter can drop
+    // far more — a selective filter over a minority language/type silently under-returns.
+    // Widen the pool when a filter is active (shared policy with MCP semantic_code_search
+    // via search_fetch_count); the unfiltered value stays (limit*4).max(20).
+    let filtered = language_filter.is_some() || node_type_filter.is_some();
+    let fetch_limit = crate::domain::search_fetch_count(limit, filtered);
     let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
     if fts_result.nodes.is_empty() {
         if json_mode {
@@ -1962,36 +1962,49 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
         .map(normalize_type_filter)
         .unwrap_or_default();
 
-    // Filter by language, node_type, and skip test/module nodes (align with MCP behavior)
-    let filtered_nodes: Vec<&queries::NodeResult> = fts_result.nodes.iter()
-        .filter(|n| {
-            // Skip <module> nodes and test symbols (consistent with MCP semantic_code_search)
-            if n.node_type == "module" && n.name == "<module>" { return false; }
-            if let Some(nwf) = nwf_map.get(&n.id) {
-                if crate::domain::is_test_symbol(&n.name, &nwf.file_path) { return false; }
-            }
-            if let Some(lang) = language_filter {
-                let lang_ok = nwf_map.get(&n.id)
-                    .and_then(|nwf| nwf.language.as_deref())
-                    .map(|l| l.eq_ignore_ascii_case(lang))
-                    .unwrap_or(false);
-                if !lang_ok { return false; }
-            }
-            if !normalized_node_types.is_empty()
-                && !normalized_node_types.iter().any(|t| n.node_type == *t)
-            {
-                return false;
-            }
-            true
-        })
-        .take(limit as usize)
-        .collect();
+    // Filter by language, node_type, and skip test/module nodes (align with MCP behavior).
+    // Count language/node_type drops separately so an over-selective filter that empties
+    // the result set can say so (vs a generic "no results"), mirroring MCP's filter hint.
+    let mut filtered_nodes: Vec<&queries::NodeResult> = Vec::new();
+    let mut dropped_by_filter = 0usize;
+    for n in &fts_result.nodes {
+        // Skip <module> nodes and test symbols (consistent with MCP semantic_code_search)
+        if n.node_type == "module" && n.name == "<module>" { continue; }
+        if let Some(nwf) = nwf_map.get(&n.id) {
+            if crate::domain::is_test_symbol(&n.name, &nwf.file_path) { continue; }
+        }
+        if let Some(lang) = language_filter {
+            let lang_ok = nwf_map.get(&n.id)
+                .and_then(|nwf| nwf.language.as_deref())
+                .map(|l| l.eq_ignore_ascii_case(lang))
+                .unwrap_or(false);
+            if !lang_ok { dropped_by_filter += 1; continue; }
+        }
+        if !normalized_node_types.is_empty()
+            && !normalized_node_types.iter().any(|t| n.node_type == *t)
+        {
+            dropped_by_filter += 1;
+            continue;
+        }
+        filtered_nodes.push(n);
+        if filtered_nodes.len() >= limit as usize { break; }
+    }
 
     if filtered_nodes.is_empty() {
         if json_mode {
             println!("[]");
         }
-        eprintln!("[code-graph] No results for: {} (language: {})", query, language_filter.unwrap_or("any"));
+        if filtered && dropped_by_filter > 0 {
+            // Matches existed but the language/node_type filter removed them all — the
+            // index has hits, just not of this language/type. (CLI stdout stays `[]`.)
+            eprintln!(
+                "[code-graph] No results for: {} — {} candidate(s) matched the query but were removed by the active filter (language: {}{}). Broaden or clear the filter.",
+                query, dropped_by_filter, language_filter.unwrap_or("any"),
+                node_type_filter.map(|t| format!(", node-type: {t}")).unwrap_or_default()
+            );
+        } else {
+            eprintln!("[code-graph] No results for: {} (language: {})", query, language_filter.unwrap_or("any"));
+        }
         return Ok(());
     }
 
@@ -4059,7 +4072,11 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         bytemuck::cast_slice(&bytes).to_vec()
     };
 
-    let raw_results = queries::vector_search(conn, &embedding, top_k + 1)?;
+    // Over-fetch so self-exclusion + max_distance + test/module post-filters don't
+    // silently starve top_k (vec0 KNN can't pre-filter on joined node columns). Parity
+    // with the MCP twin tool_find_similar_code; the old `top_k + 1` fell short on any drop.
+    let fetch_count = crate::domain::similar_fetch_count(top_k);
+    let raw_results = queries::vector_search(conn, &embedding, fetch_count)?;
 
     // Collect filtered results
     let mut similar: Vec<(queries::NodeResult, String, f64)> = Vec::new();
@@ -4071,6 +4088,18 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         if crate::domain::is_test_symbol(&node.name, &fp) { continue; }
         similar.push((node, fp, *distance));
         if similar.len() >= top_k as usize { break; }
+    }
+
+    // Observability: post-filters (max_distance + test/module) can shrink results below
+    // top_k even with over-fetch. Surface to stderr; stdout JSON stays a bare array.
+    let cutoff_dropped = raw_results.iter()
+        .filter(|(id, dist)| *id != node_id && *dist > max_distance)
+        .count();
+    if (similar.len() as i64) < top_k && cutoff_dropped > 0 {
+        eprintln!(
+            "[code-graph] {} result(s) within max_distance={} (< top_k={}); {} nearer candidate(s) exceeded the cutoff. Raise --max-distance to widen.",
+            similar.len(), max_distance, top_k, cutoff_dropped
+        );
     }
 
     let mut stdout = std::io::stdout().lock();

@@ -56,9 +56,16 @@ impl McpServer {
             self.ensure_indexed()?;
         }
 
-        // FTS5 search (fetch extra to allow for filtering)
-        // Use a floor of 20 so small top_k values still have enough candidates after filtering
-        let fetch_count = (top_k * 4).max(20);
+        // vec0 KNN can't pre-filter on joined `nodes` columns, so language/node_type
+        // filtering happens after the fetch (Phase 1 below). Widen the candidate pool
+        // when a filter is active so a selective filter can't silently starve top_k.
+        // The unfiltered fetch is byte-identical to the historical (top_k*4).max(20),
+        // so the retrieval benchmark (which passes no filter) is unaffected.
+        let filtered = language_filter.is_some() || node_type_filter.is_some();
+        let fetch_count = crate::domain::search_fetch_count(top_k, filtered);
+        // FTS sparsity ratio uses the base (unfiltered) pool size so a widened filtered
+        // fetch doesn't spuriously depress match_confidence for filtered queries.
+        let conf_fetch = crate::domain::search_fetch_count(top_k, false);
         let fts_result = queries::fts5_search(self.db.conn(), query, fetch_count)?;
         let fts_or_fallback = fts_result.or_fallback;
 
@@ -139,7 +146,7 @@ impl McpServer {
                 // signal, not a weak one. Only apply when we have enough FTS breadth to
                 // judge "sparse vs. broad".
                 if fts_search.len() >= crate::domain::CONF_SPARSITY_MIN_FTS {
-                    let fts_ratio = fts_search.len() as f64 / fetch_count as f64;
+                    let fts_ratio = fts_search.len() as f64 / conf_fetch as f64;
                     if fts_ratio < crate::domain::CONF_SPARSITY_R1 { c *= crate::domain::CONF_SPARSITY_P1; }
                     else if fts_ratio < crate::domain::CONF_SPARSITY_R2 { c *= crate::domain::CONF_SPARSITY_P2; }
                     else if fts_ratio < crate::domain::CONF_SPARSITY_R3 { c *= crate::domain::CONF_SPARSITY_P3; }
@@ -180,6 +187,9 @@ impl McpServer {
             .map(|t| t.to_lowercase())
             .collect();
         let mut candidates: Vec<Candidate> = Vec::new();
+        // Count candidates that matched the query but were removed by the active
+        // language/node_type filter — drives the filter-aware empty-result hint below.
+        let mut dropped_by_filter = 0usize;
         for r in &fused {
             if let Some(nwf) = nwf_map.remove(&r.node_id) {
                 let node = &nwf.node;
@@ -188,9 +198,11 @@ impl McpServer {
                 if is_test_symbol(&node.name, &nwf.file_path) { continue; }
                 if let Some(nt) = node_type_filter {
                     let normalized = normalize_type_filter_mcp(nt);
-                    if !normalized.iter().any(|t| t == &node.node_type) { continue; }
+                    if !normalized.iter().any(|t| t == &node.node_type) { dropped_by_filter += 1; continue; }
                 }
-                if let Some(lang) = language_filter { if nwf.language.as_deref() != Some(lang) { continue; } }
+                if let Some(lang) = language_filter {
+                    if nwf.language.as_deref() != Some(lang) { dropped_by_filter += 1; continue; }
+                }
 
                 let base_score = if max_rrf > 0.0 {
                     (r.score / max_rrf * query_quality * match_confidence * 100.0).round() / 100.0
@@ -383,6 +395,19 @@ impl McpServer {
         } // end estimated_tokens check
 
         if results.is_empty() {
+            // Filter-aware: if a language/node_type filter removed candidates that DID
+            // match the query, say so — the index has matches, just not of this
+            // language/type. (vec0 can't pre-filter, so this is a post-fetch drop.)
+            if filtered && dropped_by_filter > 0 {
+                return Ok(json!({
+                    "results": [],
+                    "message": "No matching symbols after filtering.",
+                    "hint": format!(
+                        "{} candidate(s) matched the query but were removed by the active language/node_type filter. Broaden or clear the filter, or raise top_k.",
+                        dropped_by_filter
+                    )
+                }));
+            }
             let has_code_syntax = query.contains('(') || query.contains(')') || query.contains("->") || query.contains("::") || query.contains('<');
             let has_non_ascii = !query.is_ascii();
             let hint = if has_code_syntax {

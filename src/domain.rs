@@ -113,6 +113,45 @@ pub const SIZE_DAMPEN_COEFF: f64 = 0.4;
 /// Doc penalty: demote markdown headings for code-intent queries (unless lang=markdown).
 pub const DOC_PENALTY_MARKDOWN: f64 = 0.4;
 
+// -- Retrieval over-fetch (post-KNN filtering compensation) --
+// vec0 KNN (`embedding MATCH … LIMIT k`) cannot pre-filter on joined `nodes`
+// columns, so every filter — always-on test/module/external skip plus optional
+// language/node_type — is applied in Rust AFTER the top-k fetch. A fetch sized to
+// top_k lets a selective filter silently starve the result set (return < top_k, or
+// nothing, while matches sit just past the cutoff). We over-fetch to compensate;
+// when an optional language/node_type filter is active the survivors can be a small
+// minority of the nearest neighbours, so the pool is widened further.
+/// Base over-fetch multiplier for semantic_code_search with no language/node_type filter.
+pub const SEARCH_BASE_OVERFETCH: i64 = 4;
+/// Floor so a small top_k still has candidates after the always-on test/module skip.
+pub const SEARCH_FETCH_FLOOR: i64 = 20;
+/// Wider over-fetch when a selective language/node_type filter is active.
+pub const SEARCH_FILTER_OVERFETCH: i64 = 16;
+/// Floor for the filtered case.
+pub const SEARCH_FILTER_FETCH_FLOOR: i64 = 100;
+/// `similar` / find_similar_code over-fetch: self-exclusion + max_distance + test/module
+/// skip are all post-fetch, so fetch a multiple of top_k rather than top_k+1.
+pub const SIMILAR_OVERFETCH: i64 = 3;
+
+/// Candidate-pool size for semantic_code_search. `filtered` = a language or node_type
+/// filter is active (widens the pool so the post-KNN filter cannot starve top_k). The
+/// unfiltered value is byte-identical to the historical `(top_k*4).max(20)`, so the
+/// retrieval benchmark — which passes no filter — is unchanged by the filtered branch.
+pub fn search_fetch_count(top_k: i64, filtered: bool) -> i64 {
+    if filtered {
+        (top_k * SEARCH_FILTER_OVERFETCH).max(SEARCH_FILTER_FETCH_FLOOR)
+    } else {
+        (top_k * SEARCH_BASE_OVERFETCH).max(SEARCH_FETCH_FLOOR)
+    }
+}
+
+/// Candidate-pool size for `similar` / find_similar_code. Over-fetches so the
+/// post-fetch filters (self-exclusion, max_distance, test/module skip) do not starve
+/// top_k — the old `top_k + 1` fell short on any single drop.
+pub fn similar_fetch_count(top_k: i64) -> i64 {
+    (top_k * SIMILAR_OVERFETCH).max(top_k + 1)
+}
+
 // -- Token estimation --
 /// Approximate **bytes** per token for code content (1 token ≈ 3 bytes UTF-8).
 ///
@@ -495,5 +534,35 @@ mod tests {
     #[test]
     fn test_rel_references_constant() {
         assert_eq!(crate::domain::REL_REFERENCES, "references");
+    }
+
+    #[test]
+    fn test_search_fetch_count_unfiltered_matches_historical() {
+        // Unfiltered MUST stay byte-identical to the old inline `(top_k*4).max(20)`
+        // so the retrieval benchmark (which passes no language/node_type filter)
+        // is unchanged. Any drift here is a metric regression, not a refactor.
+        assert_eq!(search_fetch_count(20, false), 80);
+        assert_eq!(search_fetch_count(100, false), 400);
+        assert_eq!(search_fetch_count(1, false), 20); // floor
+        assert_eq!(search_fetch_count(3, false), 20); // floor
+    }
+
+    #[test]
+    fn test_search_fetch_count_filtered_widens_pool() {
+        // A selective language/node_type filter is applied AFTER the KNN fetch, so the
+        // pool must be wider than the unfiltered case or the filter starves top_k.
+        assert!(search_fetch_count(20, true) > search_fetch_count(20, false));
+        assert_eq!(search_fetch_count(20, true), 320);
+        assert_eq!(search_fetch_count(1, true), 100); // floor
+    }
+
+    #[test]
+    fn test_similar_fetch_count_overfetches() {
+        // `similar` post-filters self + max_distance + test/module; the old `top_k + 1`
+        // fell short on any single drop. Must be a multiple of top_k (MCP-twin parity).
+        assert_eq!(similar_fetch_count(10), 30);
+        assert_eq!(similar_fetch_count(5), 15);
+        assert_eq!(similar_fetch_count(1), 3); // max(3, 2)
+        assert!(similar_fetch_count(10) > 10 + 1);
     }
 }

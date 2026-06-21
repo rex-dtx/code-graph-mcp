@@ -443,8 +443,9 @@ impl McpServer {
 
         // Search for similar vectors. Fetch extra so max_distance filtering
         // doesn't silently starve `top_k` — we need enough candidates to know
-        // whether the cutoff actually dropped results.
-        let fetch_count = (top_k * 3).max(top_k + 1);
+        // whether the cutoff actually dropped results. Shared over-fetch policy with
+        // the CLI `similar` twin (single source of truth, avoids CLI↔MCP drift).
+        let fetch_count = crate::domain::similar_fetch_count(top_k);
         let results = queries::vector_search(self.db.conn(), &embedding, fetch_count)?;
 
         // Split raw (self excluded) from cutoff-filtered candidates so we can

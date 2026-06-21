@@ -384,6 +384,24 @@ fn test_cli_search_language_filter() {
 }
 
 #[test]
+fn test_cli_search_filter_removed_all_explains_why() {
+    // Regression: an over-selective language filter that removes EVERY query match must
+    // explain on stderr that candidates matched but were filtered out — not a bare
+    // "no results" — while stdout keeps the `[]` JSON contract. Guards the post-fetch
+    // under-fetch fix: vec0/FTS can't pre-filter on joined language, so the drop happens
+    // after fetch and is invisible without this signal (CLI↔MCP parity).
+    let project = setup_indexed_project(); // TS fixture: validateToken in api.ts/auth.ts
+    let (stdout, stderr, code) =
+        run_cli(&project, &["search", "validateToken", "--language", "python", "--json"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]", "stdout JSON contract must stay []; got: {stdout:?}");
+    assert!(
+        stderr.contains("removed by the active filter"),
+        "stderr must explain the filter emptied the results; got: {stderr:?}"
+    );
+}
+
+#[test]
 fn test_cli_search_compact() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["search", "validate", "--compact"]);
