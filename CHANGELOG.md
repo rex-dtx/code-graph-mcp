@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.56.0 — vector-availability visibility + model/release hardening + platform hints
+
+Install-integrity pass: make a silent FTS5-only degradation visible, harden the
+model download + release gate, and turn unsupported-platform install failures into
+actionable hints. No `INDEX_VERSION` / schema change.
+
+- **feat(search): surface vector availability.** `semantic_code_search` now reports
+  `search_mode`/`vector_available` when the embedding model isn't loaded (the hybrid
+  path stays a bare array — unchanged). `health-check` text gains a `Search:` line,
+  and `doctor` warns on a vector-inactive index instead of reporting it green.
+- **feat(indexer): retry model download.** The background model download retries 3×
+  with backoff, so a transient first-session failure no longer strands the whole
+  session on FTS5-only.
+- **ci(release): vector-integrity gate.** Post-publish smoke now installs the
+  published model and asserts it loads + embeds (`search_mode=hybrid`) — a
+  missing/corrupt/unloadable model release fails the gate instead of shipping green.
+- **feat(plugin): unsupported-platform hints + libc metadata.** Alpine/musl and
+  native Windows-on-ARM get an actionable install hint (build-from-source /
+  x64-emulation) instead of a misleading suggestion to install a nonexistent
+  platform package. The `linux-x64`/`linux-arm64` npm packages declare
+  `"libc": ["glibc"]` so npm cleanly skips them on musl.
+- **fix(bench): tier3 slice excludes test symbols** (internal) — the "14.6% retrieval
+  miss" was a benchmark artifact (test-classifier mismatch), not a pipeline issue.
+
 ## v0.55.0 — code-health commands (cycles / surprising / report) + routing
 
 Three new CLI-only analysis commands, with routing-template wiring so Claude Code
