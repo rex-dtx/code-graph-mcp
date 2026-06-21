@@ -18,6 +18,33 @@ const path = require('path');
 
 const REC_FILE = 'recommendations.jsonl';
 
+// Bounded growth: recommendations.jsonl is append-only and written per-event
+// from BOTH here and the Rust CLI (cli::record_cli_use). Keep these constants in
+// sync with the Rust side (mcp::metrics::JSONL_ROTATE_MAX_BYTES / KEEP_BYTES).
+const ROTATE_MAX_BYTES = 1048576; // 1 MB
+const ROTATE_KEEP_BYTES = 524288; // 512 KB
+
+/**
+ * Best-effort size-based rotation: if `file` exceeds ROTATE_MAX_BYTES, rewrite
+ * it keeping ~the last ROTATE_KEEP_BYTES, trimmed *forward* to the next line
+ * boundary so no partial line survives. Swallows every error — telemetry
+ * rotation must never break or delay a tool call. Mirror of the Rust
+ * `mcp::metrics::rotate_jsonl_if_over`.
+ * @param {string} file  absolute path to the JSONL file
+ */
+function rotateIfNeeded(file) {
+  try {
+    if (fs.statSync(file).size <= ROTATE_MAX_BYTES) return;
+    const buf = fs.readFileSync(file);
+    const start = Math.max(0, buf.length - ROTATE_KEEP_BYTES);
+    const nl = buf.indexOf(0x0a, start); // first newline at/after start
+    const trimStart = nl >= 0 ? nl + 1 : start;
+    fs.writeFileSync(file, buf.subarray(trimStart));
+  } catch {
+    /* missing file or IO error → skip; the append below still runs */
+  }
+}
+
 /**
  * Append one recommendation event to <cwd>/.code-graph/recommendations.jsonl.
  * @param {string} cwd        project root (the hook's process.cwd())
@@ -30,8 +57,10 @@ function recordRecommendation(cwd, event = {}) {
     // Append-only: do NOT create .code-graph. Its absence means "not an indexed
     // project" — recording there would pollute non-project cwds.
     if (!fs.existsSync(dir)) return false;
+    const file = path.join(dir, REC_FILE);
+    rotateIfNeeded(file); // rotate-before-append so the file never exceeds ~max + one line
     const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
-    fs.appendFileSync(path.join(dir, REC_FILE), line);
+    fs.appendFileSync(file, line);
     return true;
   } catch {
     return false;

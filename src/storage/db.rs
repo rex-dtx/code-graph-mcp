@@ -243,6 +243,17 @@ If you see this repeatedly, another code-graph server of a different version is 
             conn.execute_batch(
                 "BEGIN; DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; COMMIT;"
             )?;
+            // Reclaim the pages freed by the sweep so a version bump that shrinks
+            // the index (fewer nodes under the new INDEX_VERSION, or a shrunk
+            // codebase) doesn't carry the old high-water-mark of free pages into
+            // the rebuild. Benefit is bounded — the immediate rebuild reuses free
+            // pages when the new index is >= the old size — so this is hygiene on
+            // the rare version-mismatch open, not a hot path. Best-effort: another
+            // code-graph binary sharing this DB can make VACUUM fail with
+            // "database is locked", which must never block opening the DB.
+            if let Err(e) = conn.execute_batch("VACUUM;") {
+                tracing::warn!("[index] post-sweep VACUUM skipped: {}", e);
+            }
         }
         conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION)?;
 
@@ -387,6 +398,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, crate::domain::EMBEDDING_DIM.to_string());
+    }
+
+    #[test]
+    fn test_index_version_sweep_vacuums_freed_pages() {
+        // A version-mismatch open wipes edges/nodes/files; the post-sweep VACUUM
+        // must reclaim the freed pages AND must not error on a DB carrying the
+        // vec0 virtual table. Without the VACUUM, freelist_count stays > 0.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        {
+            let db = Database::open_with_vec(&db_path).unwrap();
+            // ~1.2MB of file rows so the sweep frees a meaningful page count.
+            let pad = "h".repeat(2048);
+            let tx = db.conn().unchecked_transaction().unwrap();
+            for i in 0..600 {
+                tx.execute(
+                    "INSERT INTO files (path, blake3_hash, last_modified, indexed_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![format!("f/{i}.rs"), pad, 0_i64, 0_i64],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            // Stamp an older index generation so the next open triggers the sweep.
+            db.conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1)
+                .unwrap();
+        }
+
+        // Reopen → INDEX_VERSION mismatch → sweep DELETE + VACUUM.
+        let db = Database::open_with_vec(&db_path).unwrap();
+        let files: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files, 0, "version-mismatch sweep must clear files");
+        let freelist: i64 = db
+            .conn()
+            .pragma_query_value(None, "freelist_count", |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            freelist, 0,
+            "post-sweep VACUUM must reclaim freed pages (freelist_count)"
+        );
     }
 
     #[test]

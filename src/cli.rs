@@ -824,10 +824,19 @@ pub fn record_cli_use(project_root: &Path, cmd: &str) {
         "action": "use",
         "cmd": cmd,
     });
+    let rec_path = dir.join("recommendations.jsonl");
+    // Bounded growth: recommendations.jsonl is append-only and (unlike
+    // usage.jsonl) written per-event from both here and the JS PreToolUse hooks,
+    // so rotate before appending. Same policy/constants as usage.jsonl.
+    crate::mcp::metrics::rotate_jsonl_if_over(
+        &rec_path,
+        crate::mcp::metrics::JSONL_ROTATE_MAX_BYTES,
+        crate::mcp::metrics::JSONL_ROTATE_KEEP_BYTES,
+    );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("recommendations.jsonl"))
+        .open(&rec_path)
     {
         use std::io::Write as _;
         let _ = writeln!(f, "{}", line);
@@ -5263,6 +5272,40 @@ mod tests {
         std::fs::create_dir_all(&idx_dir).unwrap();
         std::fs::write(idx_dir.join("index.db"), b"").unwrap();
         assert_eq!(resolve_project_root_from(cwd), cwd);
+    }
+
+    #[test]
+    fn test_record_cli_use_rotates_recommendations_jsonl() {
+        // record_cli_use is the sole reader of CODE_GRAPH_INTERNAL and no other
+        // test mutates it, so toggling it here is race-free.
+        std::env::remove_var("CODE_GRAPH_INTERNAL");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cg = root.join(CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&cg).unwrap();
+        let rec = cg.join("recommendations.jsonl");
+        // Pre-fill > 1MB of prior recommendation lines.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&rec).unwrap();
+            let pad = "x".repeat(1024);
+            for i in 0..1200 {
+                writeln!(f, "{{\"old\":{i},\"pad\":\"{pad}\"}}").unwrap();
+            }
+        }
+        assert!(std::fs::metadata(&rec).unwrap().len() > 1_048_576);
+
+        record_cli_use(root, "callgraph");
+
+        let size = std::fs::metadata(&rec).unwrap().len();
+        assert!(size < 600_000, "recommendations.jsonl should be rotated, got {size} bytes");
+        // The freshly recorded use line is last + valid; first surviving line is whole JSON.
+        let content = std::fs::read_to_string(&rec).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(content.trim().lines().last().unwrap()).unwrap();
+        assert_eq!(last["action"], "use");
+        assert_eq!(last["cmd"], "callgraph");
+        serde_json::from_str::<serde_json::Value>(content.lines().next().unwrap()).unwrap();
     }
 
     #[test]

@@ -3,6 +3,15 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+/// Size threshold above which append-only telemetry JSONL files are rotated.
+/// Shared by usage.jsonl (`SessionMetrics::flush`) and recommendations.jsonl
+/// (`cli::record_cli_use`). MUST stay in sync with the JS PreToolUse writer
+/// `claude-plugin/scripts/recommendation-log.js` — recommendations.jsonl is
+/// written from both Rust and JS, so both sides must rotate identically.
+pub(crate) const JSONL_ROTATE_MAX_BYTES: u64 = 1_048_576; // 1 MB
+/// Bytes retained (file tail) when a telemetry JSONL file is rotated.
+pub(crate) const JSONL_ROTATE_KEEP_BYTES: usize = 524_288; // 512 KB
+
 /// Canonical error categories for tool invocations. Written to usage.jsonl
 /// under `tools.<name>.err_kinds` so post-hoc analysis can separate real bugs
 /// from startup-grace retries, user typos, and ambiguous-symbol guards without
@@ -288,26 +297,9 @@ impl SessionMetrics {
             }
         }
 
-        // Size-based rotation: if file > 1MB, keep last 512KB
-        const MAX_SIZE: u64 = 1_048_576; // 1MB
-        const KEEP_SIZE: usize = 524_288; // 512KB
-        if let Ok(meta) = std::fs::metadata(usage_path) {
-            if meta.len() > MAX_SIZE {
-                if let Ok(content) = std::fs::read(usage_path) {
-                    let start = content.len().saturating_sub(KEEP_SIZE);
-                    // Find the first newline after start to avoid partial lines
-                    let trim_start = content[start..]
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map(|pos| start + pos + 1)
-                        .unwrap_or(start);
-                    if let Err(e) = std::fs::write(usage_path, &content[trim_start..]) {
-                        tracing::warn!("Failed to rotate usage file: {}", e);
-                        return;
-                    }
-                }
-            }
-        }
+        // Bounded growth: rotate before appending so the file never exceeds
+        // ~max + one line. recommendations.jsonl shares this exact policy.
+        rotate_jsonl_if_over(usage_path, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
 
         // Append the line
         match std::fs::OpenOptions::new()
@@ -408,6 +400,31 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+/// Best-effort size-based rotation for append-only telemetry JSONL files. If
+/// `path` is larger than `max_bytes`, rewrite it keeping ~the last `keep_bytes`,
+/// trimmed *forward* to the next line boundary so no partial line survives. All
+/// errors are logged and swallowed — telemetry rotation must never break or
+/// delay the caller. Mirrored in `claude-plugin/scripts/recommendation-log.js`
+/// (recommendations.jsonl is also written by the JS PreToolUse hooks).
+pub(crate) fn rotate_jsonl_if_over(path: &Path, max_bytes: u64, keep_bytes: usize) {
+    let Ok(meta) = std::fs::metadata(path) else { return }; // missing → nothing to do
+    if meta.len() <= max_bytes {
+        return; // under threshold → leave it
+    }
+    let Ok(content) = std::fs::read(path) else { return };
+    let start = content.len().saturating_sub(keep_bytes);
+    // Advance to the first newline at/after `start` so the kept region begins on
+    // a whole line (drop the partial line `start` may have landed inside).
+    let trim_start = content[start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|pos| start + pos + 1)
+        .unwrap_or(start);
+    if let Err(e) = std::fs::write(path, &content[trim_start..]) {
+        tracing::warn!("Failed to rotate {}: {}", path.display(), e);
+    }
 }
 
 #[cfg(test)]
@@ -638,6 +655,39 @@ not json
         let last_line = content.trim().lines().last().unwrap();
         let record: serde_json::Value = serde_json::from_str(last_line).unwrap();
         assert_eq!(record["v"], "0.5.26");
+    }
+
+    #[test]
+    fn test_rotate_jsonl_if_over_trims_to_line_boundary_and_noops_when_small() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rec.jsonl");
+        // ~2MB of distinct whole lines so we can assert the boundary is clean.
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let pad = "z".repeat(1000);
+            for i in 0..2000 {
+                writeln!(f, "{i:08}|{pad}").unwrap();
+            }
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > JSONL_ROTATE_MAX_BYTES);
+
+        rotate_jsonl_if_over(&path, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
+
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after <= JSONL_ROTATE_KEEP_BYTES as u64,
+            "kept tail must be <= keep_bytes, got {after}"
+        );
+        // No partial first line: it begins with the 8-digit counter + '|'.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let first = content.lines().next().unwrap();
+        assert_eq!(&first[8..9], "|", "first surviving line must start on a whole-line boundary: {first:.16}");
+
+        // Under threshold → untouched.
+        let small = dir.path().join("small.jsonl");
+        std::fs::write(&small, "a\nb\n").unwrap();
+        rotate_jsonl_if_over(&small, JSONL_ROTATE_MAX_BYTES, JSONL_ROTATE_KEEP_BYTES);
+        assert_eq!(std::fs::read_to_string(&small).unwrap(), "a\nb\n");
     }
 
     #[test]

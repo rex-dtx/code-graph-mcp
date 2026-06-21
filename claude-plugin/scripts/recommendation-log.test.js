@@ -42,3 +42,25 @@ test('recordRecommendation appends across calls (one line each)', (t) => {
   const hooks = lines.map((l) => JSON.parse(l).hook);
   assert.deepEqual(hooks, ['grep', 'read', 'grep']);
 });
+
+test('recordRecommendation rotates the file when it exceeds the size cap', (t) => {
+  const cwd = tmpProject(t, true);
+  const file = path.join(cwd, '.code-graph', REC_FILE);
+  // Pre-fill > 1MB of prior events.
+  const filler = 'y'.repeat(1024);
+  let blob = '';
+  for (let i = 0; i < 1200; i++) blob += `{"old":${i},"pad":"${filler}"}\n`;
+  fs.writeFileSync(file, blob);
+  assert.ok(fs.statSync(file).size > 1048576, 'precondition: file over 1MB');
+
+  // One more recorded event must trigger rotation (rotate-before-append).
+  assert.equal(recordRecommendation(cwd, { hook: 'grep', action: 'deny' }), true);
+
+  const size = fs.statSync(file).size;
+  assert.ok(size < 600000, `rotated file should be well under 1MB, got ${size}`);
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n');
+  // The just-recorded line is last and intact; the first surviving line is whole JSON.
+  const last = JSON.parse(lines[lines.length - 1]);
+  assert.equal(last.action, 'deny');
+  assert.doesNotThrow(() => JSON.parse(lines[0]), 'first surviving line must be a whole JSON line');
+});
