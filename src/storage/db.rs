@@ -842,12 +842,17 @@ mod tests {
     #[test]
     fn fresh_schema_matches_fully_migrated_schema() {
         use std::collections::BTreeMap;
-        // column name -> (declared type, notnull, pk)
-        fn columns(conn: &Connection, table: &str) -> BTreeMap<String, (String, bool, bool)> {
+        // column name -> (declared type, notnull, pk, default expr). The default
+        // (PRAGMA table_info col 4) is compared too: a `DEFAULT` drift between
+        // create_tables_sql and a migrate_vN ALTER — e.g. edges.confidence declared
+        // `DEFAULT 'extracted'` in one site but a different literal in the other —
+        // is invisible to a name/type/notnull/pk diff. feedback_schema_column_migration_seam.
+        fn columns(conn: &Connection, table: &str) -> BTreeMap<String, (String, bool, bool, Option<String>)> {
             let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
             let rows = stmt.query_map([], |r| Ok((
                 r.get::<_, String>(1)?,
-                (r.get::<_, String>(2)?, r.get::<_, i64>(3)? != 0, r.get::<_, i64>(5)? != 0),
+                (r.get::<_, String>(2)?, r.get::<_, i64>(3)? != 0, r.get::<_, i64>(5)? != 0,
+                 r.get::<_, Option<String>>(4)?),
             ))).unwrap();
             rows.map(|r| r.unwrap()).collect()
         }
