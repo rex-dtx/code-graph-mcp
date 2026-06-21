@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.56.2 — fix: code-explorer sub-agent referenced a folded MCP tool
+
+The shipped `code-explorer` sub-agent (`claude-plugin/agents/code-explorer.md`)
+listed `mcp__code-graph__trace_http_chain` in its tool frontmatter and body, but
+that tool was folded into `get_call_graph route_path` back in v0.18.4 and no longer
+dispatches — so the agent carried a dead tool and was missing four exploration tools
+it should have had. Plugin-shell-only fix; no `INDEX_VERSION` / schema change, no
+binary change.
+
+- **fix(plugin): drop stale `trace_http_chain` ref from code-explorer agent.** The
+  agent now lists exactly the 7 live MCP tools (adds `project_map` / `module_overview`
+  / `ast_search` / `find_references`, which its module-architecture remit needs), and
+  the body strategy uses `get_call_graph route_path='GET /api/x'` for HTTP flow. Guarded
+  by `tests/integration.rs::test_code_explorer_agent_references_only_live_tools`, which
+  asserts every `mcp__code-graph__<name>` the agent lists is a live tool in the registry.
+
 ## v0.56.1 — fix: chained statusline dropped when the previous command used a leading `~`
 
 The composite statusline runs each provider via `execFileSync` (no shell), so a
