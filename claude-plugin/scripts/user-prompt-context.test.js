@@ -558,6 +558,33 @@ test('CODE_GRAPH_QUIET_HOOKS=1 short-circuits silently on stdout, stderr, exit 0
   assert.equal(proc.status, 0, 'quiet must exit 0');
 });
 
+test('CODE_GRAPH_QUIET_HOOKS=1 silences even the fresh-install (no-manifest) notice', () => {
+  // Regression: the mid-session install notice printed BEFORE the quiet check,
+  // so on a fresh checkout (no ~/.cache/code-graph manifest) it leaked to stdout
+  // despite the escape hatch. CI hit this; the dev box has a manifest and masked
+  // it. Force the no-manifest path with a throwaway HOME so it reproduces locally.
+  const { spawnSync } = require('node:child_process');
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upc-nohome-'));
+  try {
+    const script = path.join(__dirname, 'user-prompt-context.js');
+    const proc = spawnSync(process.execPath, [script], {
+      input: JSON.stringify({ message: 'impact of refactoring parse_code function' }),
+      // HOME (POSIX) + USERPROFILE (Windows) → os.homedir() points at an empty
+      // dir, so MANIFEST_PATH is absent and runMain() enters the install branch.
+      env: { ...process.env, HOME: home, USERPROFILE: home, CODE_GRAPH_QUIET_HOOKS: '1' },
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    assert.equal(proc.stdout, '', 'quiet must silence the no-manifest install notice on stdout');
+    assert.equal(proc.stderr, '', 'quiet must be silent on stderr');
+    assert.equal(proc.status, 0, 'quiet must exit 0');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ── Phase E: hasSymptom + symptom-hint fallback ──────────────
 
 const { hasSymptom, SYMPTOM_PATTERNS } = require('./user-prompt-context');

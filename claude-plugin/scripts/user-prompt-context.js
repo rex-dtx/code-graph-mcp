@@ -379,6 +379,13 @@ function determineQueryType(intents, symbols, filePaths, isCoolingDownFn, messag
 // db presence) live INSIDE this guard so `require()` from tests doesn't
 // terminate the test process on module load.
 function runMain() {
+  // Escape hatch first: CODE_GRAPH_QUIET_HOOKS=1 must silence EVERYTHING,
+  // including the mid-session install notice below. On a fresh install (no
+  // manifest) that notice otherwise leaks to stdout even under quiet — and any
+  // stdout/stderr leak lands in Claude's display. (The dev box has a manifest,
+  // so this only surfaced once user-prompt-context.test.js ran in CI.)
+  if (computeQuietHooks()) return;
+
   // Mid-session install: lifecycle.js install() hasn't run yet (no manifest).
   // MCP server only starts at session startup — tell the user to restart.
   if (!fs.existsSync(MANIFEST_PATH)) {
@@ -397,8 +404,6 @@ function runMain() {
     );
     return;
   }
-
-  if (computeQuietHooks()) return;
 
   // --- Read user message ---
   let message;
