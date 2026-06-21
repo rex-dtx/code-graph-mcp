@@ -186,6 +186,9 @@ impl McpServer {
         let query_terms_lower: Vec<String> = meaningful_tokens.iter()
             .map(|t| t.to_lowercase())
             .collect();
+        // Verbatim identifier query (e.g. "run_serve") — used for exact-name rerank
+        // dominance below and the confidence exemption further down (single source).
+        let query_trimmed = query.trim().to_lowercase();
         let mut candidates: Vec<Candidate> = Vec::new();
         // Count candidates that matched the query but were removed by the active
         // language/node_type filter — drives the filter-aware empty-result hint below.
@@ -210,6 +213,14 @@ impl McpServer {
 
                 // Name match boost: symbols whose name contains query terms are more likely relevant
                 let name_lower = node.name.to_lowercase();
+                // Exact symbol-name match dominates the rerank: RRF already ranks an
+                // exact match (tier3 recall@10 0.984 RRF-only), but base×name_boost×size
+                // could bury it under vector noise + size dampening (→ 0.806). Same
+                // semantics as `has_exact_name_match` (confidence exemption) below.
+                let is_exact_name = name_lower == query_trimmed
+                    || node.qualified_name.as_deref()
+                        .map(|q| q.to_lowercase() == query_trimmed)
+                        .unwrap_or(false);
                 let name_match_count = query_terms_lower.iter()
                     .filter(|t| name_lower.contains(t.as_str()))
                     .count();
@@ -235,7 +246,8 @@ impl McpServer {
                     1.0
                 };
 
-                let adjusted = (base_score * name_boost * size_factor * doc_penalty * 100.0).round() / 100.0;
+                let adjusted = crate::search::fusion::final_adjusted_score(
+                    base_score, name_boost, size_factor, doc_penalty, is_exact_name);
                 candidates.push(Candidate { node, file_path: &nwf.file_path, adjusted_score: adjusted });
             }
         }
@@ -369,7 +381,6 @@ impl McpServer {
             // Exact-identifier exemption: when the query is a single identifier that
             // appears verbatim as a candidate symbol name, the retrieval is precise
             // regardless of the FTS breadth heuristics — skip the warning.
-            let query_trimmed = query.trim().to_lowercase();
             let has_exact_name_match = candidates.iter().take(5).any(|c| {
                 c.node.name.to_lowercase() == query_trimmed
                     || c.node.qualified_name.as_deref()

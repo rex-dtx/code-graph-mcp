@@ -107,6 +107,14 @@ pub const CONF_WARNING_THRESHOLD: f64 = 0.5;
 /// Name-match boost: +per-match, capped, for symbols whose name contains query terms.
 pub const NAME_BOOST_PER_MATCH: f64 = 0.3;
 pub const NAME_BOOST_CAP: f64 = 2.0;
+/// Exact symbol-name match dominance. When the query is verbatim a node's
+/// name/qualified_name, its definition must rank first: RRF already places it
+/// (tier3 exact-symbol recall@10 was 0.984 RRF-only) but the `base × name_boost ×
+/// size × doc` rerank buried exact matches under vector noise + size dampening,
+/// dropping recall@10 to 0.806. This additive bonus dominates any non-exact
+/// `adjusted` (which lies in [0, base×CAP] ⊂ [0,2]); exact matches then order
+/// among themselves by `base_score`.
+pub const EXACT_NAME_MATCH_BONUS: f64 = 100.0;
 /// Size dampening: counter BM25/vector bias toward very large nodes (> threshold lines).
 pub const SIZE_DAMPEN_LINES: f64 = 100.0;
 pub const SIZE_DAMPEN_COEFF: f64 = 0.4;

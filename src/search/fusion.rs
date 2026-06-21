@@ -77,6 +77,31 @@ pub fn weighted_rrf_fusion(
     results
 }
 
+/// Phase-2 re-rank score for one candidate.
+///
+/// Non-exact path is byte-identical to the historical inline formula
+/// `(base * name_boost * size_factor * doc_penalty * 100).round() / 100`, so
+/// natural-language ranking is unchanged. An exact symbol-name match
+/// (query verbatim == node name/qualified_name) instead scores
+/// `base + EXACT_NAME_MATCH_BONUS`, which dominates any non-exact adjusted score
+/// (bounded by `base * NAME_BOOST_CAP` ⊂ [0, 2]). Rationale: RRF already ranks
+/// exact symbol matches (tier3 recall@10 0.984 RRF-only), but the multiplicative
+/// rerank buried them under vector noise + size dampening (recall@10 → 0.806).
+/// Exact matches order among themselves by `base_score` (i.e. by RRF rank).
+pub fn final_adjusted_score(
+    base_score: f64,
+    name_boost: f64,
+    size_factor: f64,
+    doc_penalty: f64,
+    is_exact_name: bool,
+) -> f64 {
+    if is_exact_name {
+        base_score + crate::domain::EXACT_NAME_MATCH_BONUS
+    } else {
+        (base_score * name_boost * size_factor * doc_penalty * 100.0).round() / 100.0
+    }
+}
+
 #[cfg(test)]
 pub fn rrf_fusion(
     fts_results: &[SearchResult],
@@ -90,6 +115,35 @@ pub fn rrf_fusion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_exact_name_dominates_any_non_exact() {
+        // Worst-case exact (tiny base, heavy size dampening) must still outrank the
+        // best-case non-exact (max base, max name_boost). This is the tier3 fix:
+        // an exact symbol match can never be buried by the multiplicative rerank.
+        let exact = final_adjusted_score(0.01, 1.0, 0.1, 1.0, true);
+        let best_non_exact =
+            final_adjusted_score(1.0, crate::domain::NAME_BOOST_CAP, 1.0, 1.0, false);
+        assert!(exact > best_non_exact, "exact {exact} must beat non-exact {best_non_exact}");
+    }
+
+    #[test]
+    fn test_non_exact_byte_identical_to_legacy_formula() {
+        // Non-exact path MUST equal the old inline formula exactly — guards against
+        // any NL-ranking regression from this change.
+        let got = final_adjusted_score(0.46, 1.3, 0.8, 1.0, false);
+        let legacy = (0.46_f64 * 1.3 * 0.8 * 1.0 * 100.0).round() / 100.0;
+        assert_eq!(got, legacy);
+    }
+
+    #[test]
+    fn test_exact_matches_order_by_base() {
+        // Among exact matches, higher base (better RRF rank) wins.
+        assert!(
+            final_adjusted_score(0.5, 1.0, 1.0, 1.0, true)
+                > final_adjusted_score(0.2, 1.0, 1.0, 1.0, true)
+        );
+    }
 
     #[test]
     fn test_rrf_fusion_basic() {
