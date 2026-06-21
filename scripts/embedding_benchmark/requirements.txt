@@ -2,3 +2,7 @@
 numpy>=1.24
 sentence-transformers>=2.2.2
 model2vec>=0.3.0
+# Only for the --backend coderank / jina cells (custom_code models loaded with
+# trust_remote_code=True). nomic-ai/CodeRankEmbed needs einops; jina v5 needs peft.
+einops>=0.8
+peft>=0.10

@@ -18,6 +18,8 @@ from metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 MINILM_ID = "sentence-transformers/all-MiniLM-L6-v2"
 MINILM_REV = "c9745ed1d9f2"  # must match src/embedding/model.rs:75
 POTION_ID = "minishlab/potion-code-16M"
+CODERANK_ID = "nomic-ai/CodeRankEmbed"            # MIT, 137M, 768-d, asymmetric (query/document prompts)
+JINA_ID = "jinaai/jina-embeddings-v5-text-nano"   # CC-BY-NC-4.0 (non-commercial!), 210M base, asymmetric (task='retrieval')
 
 
 def l2(mat: np.ndarray) -> np.ndarray:
@@ -27,24 +29,42 @@ def l2(mat: np.ndarray) -> np.ndarray:
 
 
 class Backend:
+    """encode(texts, is_query): asymmetric backends (coderank, jina) prefix queries
+    and documents differently — the standard retrieval gain for those models.
+    Symmetric backends (minilm, potion) ignore is_query, so their output stays
+    byte-identical to the committed baseline (no re-run needed to trust it)."""
+
     def __init__(self, name: str):
         self.name = name
         if name == "minilm":
             from sentence_transformers import SentenceTransformer
             self.model = SentenceTransformer(MINILM_ID, revision=MINILM_REV)
-            self._encode = lambda texts: np.asarray(
+            self._encode = lambda texts, is_query: np.asarray(
                 self.model.encode(texts, batch_size=64, show_progress_bar=False), dtype=np.float32)
         elif name == "potion":
             from model2vec import StaticModel
             self.model = StaticModel.from_pretrained(POTION_ID)
-            self._encode = lambda texts: np.asarray(self.model.encode(texts), dtype=np.float32)
+            self._encode = lambda texts, is_query: np.asarray(self.model.encode(texts), dtype=np.float32)
+        elif name == "coderank":
+            from sentence_transformers import SentenceTransformer
+            self.model = SentenceTransformer(CODERANK_ID, trust_remote_code=True, device="cuda")
+            self._encode = lambda texts, is_query: np.asarray(
+                self.model.encode(texts, batch_size=64, show_progress_bar=False,
+                                  prompt_name=("query" if is_query else "document")), dtype=np.float32)
+        elif name == "jina":
+            from sentence_transformers import SentenceTransformer
+            self.model = SentenceTransformer(JINA_ID, trust_remote_code=True, device="cuda")
+            self._encode = lambda texts, is_query: np.asarray(
+                self.model.encode(texts, batch_size=64, show_progress_bar=False,
+                                  task="retrieval", prompt_name=("query" if is_query else "document")),
+                dtype=np.float32)
         else:
             raise SystemExit(f"unknown backend {name!r}")
 
-    def encode(self, texts: list[str]) -> np.ndarray:
+    def encode(self, texts: list[str], is_query: bool = False) -> np.ndarray:
         if not texts:
             return np.zeros((0, 1), dtype=np.float32)
-        return l2(self._encode(texts))  # explicit L2 — matches the Rust l2_normalize path
+        return l2(self._encode(texts, is_query))  # explicit L2 — matches the Rust l2_normalize path
 
 
 def load_candidates(dbs: list[str], field: str):
@@ -67,7 +87,7 @@ def load_candidates(dbs: list[str], field: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["minilm", "potion"], required=True)
+    ap.add_argument("--backend", choices=["minilm", "potion", "coderank", "jina"], required=True)
     ap.add_argument("--field", choices=["context_string", "code_content"], required=True)
     ap.add_argument("--db", action="append", required=True)
     ap.add_argument("--queries", default="query_set.jsonl")
@@ -78,7 +98,7 @@ def main():
 
     backend = Backend(args.backend)
     print(f"[eval] encoding {len(texts)} candidates with {args.backend}/{args.field}...")
-    cand = backend.encode(texts)  # (N, dim), L2-normalized
+    cand = backend.encode(texts, is_query=False)  # (N, dim), L2-normalized
 
     queries = []
     with open(args.queries) as fh:
@@ -88,7 +108,7 @@ def main():
                 queries.append(json.loads(line))
 
     q_texts = [q["query"] for q in queries]
-    q_emb = backend.encode(q_texts)  # (Q, dim), L2-normalized
+    q_emb = backend.encode(q_texts, is_query=True)  # (Q, dim), L2-normalized
 
     # Per-query: cosine == dot product on normalized vectors. Rank candidates, score.
     per_lang: dict[str, list[dict]] = {}
