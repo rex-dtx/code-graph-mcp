@@ -7,22 +7,28 @@
  */
 const { execFileSync } = require('child_process');
 const path = require('path');
+const os = require('os');
 const lifecycle = require('./lifecycle');
 const { readRegistry } = lifecycle;
 const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
 const SEPARATOR = ' \x1b[2m|\x1b[0m ';
 
-const disabledCleanup = cleanupDisabledStatusline();
-if (disabledCleanup.cleaned) process.exit(0);
+function main() {
+  const disabledCleanup = cleanupDisabledStatusline();
+  if (disabledCleanup.cleaned) process.exit(0);
 
-// Collect stdin (Claude Code pipes JSON context)
-let stdinData = '';
-let ran = false;
-const stdinTimeout = setTimeout(() => { if (!ran) { ran = true; run(''); } }, 2000);
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => { stdinData += chunk; });
-process.stdin.on('end', () => { clearTimeout(stdinTimeout); if (!ran) { ran = true; run(stdinData); } });
+  // Collect stdin (Claude Code pipes JSON context)
+  let stdinData = '';
+  let ran = false;
+  const stdinTimeout = setTimeout(() => { if (!ran) { ran = true; run(''); } }, 2000);
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => { stdinData += chunk; });
+  process.stdin.on('end', () => { clearTimeout(stdinTimeout); if (!ran) { ran = true; run(stdinData); } });
+}
+
+// Only run the statusline when invoked as a CLI; `require()` (tests) just imports helpers.
+if (require.main === module) main();
 
 function run(stdin) {
   const registry = readRegistry();
@@ -58,7 +64,14 @@ function runProvider(command, needsStdin, stdin) {
     const parts = parseCommand(command);
     if (!parts) return null;
 
-    const out = execFileSync(parts[0], parts.slice(1), {
+    // Claude Code runs statusLine.command through a shell, so a leading `~`
+    // (e.g. `~/.claude/utils/statusline.sh`) is expanded natively. execFileSync
+    // does NOT use a shell, so we must expand `~/` ourselves on every word —
+    // otherwise a `_previous` command captured verbatim throws ENOENT and gets
+    // swallowed below, silently dropping the user's original statusline.
+    const argv = parts.map(expandTilde);
+
+    const out = execFileSync(argv[0], argv.slice(1), {
       timeout: 3000,
       stdio: ['pipe', 'pipe', 'pipe'],
       input: needsStdin ? stdin : '',
@@ -81,9 +94,19 @@ function parseCommand(cmd) {
   return parts.length > 0 ? parts : null;
 }
 
+// Expand a leading `~` / `~/` to the home directory, mirroring shell tilde
+// expansion (which Claude Code applies when it runs statusLine.command, but
+// execFileSync does not). Only a bare `~` or a `~/`-prefixed word is expanded;
+// `~user` and mid-string `~` are left untouched (we don't resolve other users).
+function expandTilde(p) {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
 function codeGraphCommand() {
   // Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
   return `node "${path.join(__dirname, 'statusline.js')}"`;
 }
 
-module.exports = { run };
+module.exports = { run, runProvider, parseCommand, expandTilde };

@@ -141,3 +141,39 @@ test('lifecycle install writes to CLAUDE_CONFIG_DIR instead of ~/.claude when se
     'default ~/.claude/settings.json must not be written when override is set');
 });
 
+test('composite expands a leading ~ in a _previous command instead of dropping it (issue #24)', (t) => {
+  // A user whose prior statusline used a leading ~ (valid in settings.json, which
+  // Claude Code runs through a shell). install() captures it verbatim as _previous.
+  // The composite runs providers via execFileSync (no shell), so without tilde
+  // expansion the command throws ENOENT and is silently swallowed — the user's
+  // original statusline vanishes.
+  const homeDir = mkHome(t);
+  const prevScript = path.join(homeDir, '.claude', 'utils', 'statusline.sh');
+  fs.mkdirSync(path.dirname(prevScript), { recursive: true });
+  fs.writeFileSync(prevScript, '#!/bin/sh\necho "PREV-STATUSLINE-OK"\n');
+  fs.chmodSync(prevScript, 0o755);
+
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  writeJson(registryPath, [
+    { id: '_previous', command: '~/.claude/utils/statusline.sh', needsStdin: true },
+  ]);
+
+  const out = runScript(homeDir, compositeCli, [], { input: '{}' });
+  assert.match(out, /PREV-STATUSLINE-OK/,
+    'a _previous command using a leading ~ must be tilde-expanded, not silently dropped');
+});
+
+test('expandTilde mirrors shell tilde expansion (only a leading ~ / ~/)', () => {
+  const composite = require('./statusline-composite');
+  const home = os.homedir();
+  assert.equal(composite.expandTilde('~'), home);
+  assert.equal(composite.expandTilde('~/.claude/utils/statusline.sh'),
+    path.join(home, '.claude', 'utils', 'statusline.sh'));
+  assert.equal(composite.expandTilde('/abs/path/script.sh'), '/abs/path/script.sh');
+  assert.equal(composite.expandTilde('node'), 'node');
+  assert.equal(composite.expandTilde('~user/script.sh'), '~user/script.sh',
+    'other-user home dirs are not resolved');
+  assert.equal(composite.expandTilde('a~/b'), 'a~/b',
+    'only a leading ~ expands, not a mid-string ~');
+});
+
