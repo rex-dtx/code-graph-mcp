@@ -2150,3 +2150,39 @@ fn handler() {}
     assert!(impact["value_references"].as_u64().unwrap_or(0) >= 1,
         "impact_analysis(handler) should report value_references >= 1; got {}", impact);
 }
+
+#[test]
+fn test_code_explorer_agent_references_only_live_tools() {
+    // Guard: the shipped code-explorer sub-agent
+    // (claude-plugin/agents/code-explorer.md) lists MCP tools in its frontmatter.
+    // Every mcp__code-graph__<name> it references must be a live public tool in
+    // the registry — catches stale references to folded/removed tools (e.g.
+    // trace_http_chain, which became get_call_graph route_path in v0.18.4).
+    let agent_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("claude-plugin/agents/code-explorer.md");
+    let Ok(agent_md) = fs::read_to_string(&agent_path) else {
+        // Plugin dir absent (e.g. minimal package build) — nothing to check.
+        eprintln!("skip: {} not found", agent_path.display());
+        return;
+    };
+
+    let registry = code_graph_mcp::mcp::tools::ToolRegistry::new();
+    let live: Vec<&str> = registry.list_tools().iter().map(|t| t.name.as_str()).collect();
+
+    const PREFIX: &str = "mcp__code-graph__";
+    let mut referenced = 0;
+    for (idx, _) in agent_md.match_indices(PREFIX) {
+        let name: String = agent_md[idx + PREFIX.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        assert!(
+            live.contains(&name.as_str()),
+            "code-explorer.md references non-live MCP tool '{}' (live tools: {:?})",
+            name, live
+        );
+        referenced += 1;
+    }
+    assert!(referenced >= 1,
+        "expected code-explorer.md to reference at least one mcp__code-graph__ tool");
+}
