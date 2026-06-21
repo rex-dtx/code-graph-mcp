@@ -305,3 +305,43 @@ jobs:
           # Windows can't resolve. `node -e require('/tmp/...')` fails there
           # because `/tmp/` doesn't exist in the Win32 filesystem view.
           node -e "const m = JSON.parse(require('fs').readFileSync('map.json','utf8')); if (!m || typeof m !== 'object') { console.error('map.json is not a valid JSON object'); process.exit(1); } console.log('map OK:', Object.keys(m).slice(0, 5));"
+
+      - name: Verify embedding model loads & embeds (vector integrity gate)
+        # The prior smoke proved the binary runs + indexes (FTS/AST) but NEVER that
+        # the embedding model downloads/loads — so a release with a missing/corrupt/
+        # unloadable models.tar.gz shipped green while every user silently degraded to
+        # FTS5-only (no vector). This pulls the PUBLISHED model, checksum-verifies it,
+        # points the binary at it, and asserts it actually loads + embeds
+        # (search_mode=hybrid). Linux-only: the model is platform-independent, so one
+        # load+embed is enough to catch a broken model release. Boundary: validates the
+        # published tarball loads & produces vectors; the blake3 content pin is enforced
+        # at build (model packaging step) and at runtime in the normal cache path.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -eu
+          work=$(mktemp -d); cd "$work"
+          base="https://github.com/sdsrss/code-graph-mcp/releases/download/v${VERSION}"
+          curl -fL --retry 3 -o models.tar.gz "$base/models.tar.gz"
+          curl -fL --retry 3 -o models.tar.gz.sha256 "$base/models.tar.gz.sha256"
+          echo "$(cat models.tar.gz.sha256)  models.tar.gz" | sha256sum -c -
+          mkdir -p models && tar xzf models.tar.gz -C models
+          test -s models/model.safetensors
+          export CODE_GRAPH_MODEL_DIR="$work/models"
+          proj=$(mktemp -d); cd "$proj"
+          git init -q; git config user.email ci@example.com; git config user.name CI
+          mkdir -p src
+          printf 'fn alpha() {}\nfn beta() { alpha(); }\nfn main() { beta(); }\n' > src/main.rs
+          git add . && git commit -q -m init
+          code-graph-mcp incremental-index   # loads model from CODE_GRAPH_MODEL_DIR + embeds
+          code-graph-mcp health-check --json > hc.json
+          node -e '
+            const h = JSON.parse(require("fs").readFileSync("hc.json","utf8"));
+            console.log("health-check:", JSON.stringify({search_mode:h.search_mode, embedding_progress:h.embedding_progress, model_available:h.model_available}));
+            const [done,total] = (h.embedding_progress||"0/0").split("/").map(Number);
+            if (h.search_mode !== "hybrid" || !(done>0)) {
+              console.error("::error::vector INACTIVE after installing the published model (search_mode="+h.search_mode+", embedded="+done+"/"+total+") — a broken model release; users would be silently FTS5-only");
+              process.exit(1);
+            }
+            console.log("OK: vector active — embedded "+done+"/"+total);
+          '

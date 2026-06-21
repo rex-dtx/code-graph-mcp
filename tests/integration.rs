@@ -9,6 +9,15 @@ use code_graph_mcp::storage::queries::*;
 
 use common::{parse_tool_result, tool_call_json};
 
+/// `semantic_code_search` returns a bare array on the hybrid path, or a
+/// `{results, vector_available, ...}` object when the embedding model is not loaded
+/// (the case in CI / `--no-default-features`). Extract the results from either shape.
+fn search_hits(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v.as_array().cloned()
+        .or_else(|| v.get("results").and_then(|r| r.as_array()).cloned())
+        .unwrap_or_default()
+}
+
 #[test]
 fn test_e2e_index_and_search() {
     let project = TempDir::new().unwrap();
@@ -46,7 +55,7 @@ export function handleLogin(req: Request, res: Response) {
     let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "validateToken", "top_k": 3}));
     let resp = server.handle_message(&search).unwrap();
     let results = parse_tool_result(&resp);
-    let results_arr = results.as_array().unwrap();
+    let results_arr = search_hits(&results);
     assert!(!results_arr.is_empty(), "search should find results");
     let names: Vec<&str> = results_arr.iter()
         .filter_map(|r| r["name"].as_str())
@@ -153,7 +162,7 @@ fn test_e2e_incremental_reindex() {
     let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "original"}));
     let resp = server.handle_message(&search).unwrap();
     let result = parse_tool_result(&resp);
-    assert!(!result.as_array().unwrap().is_empty());
+    assert!(!search_hits(&result).is_empty());
 
     // Modify file
     fs::write(project.path().join("app.ts"), "function modified() {}").unwrap();
@@ -166,7 +175,8 @@ fn test_e2e_incremental_reindex() {
     let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "modified"}));
     let resp = server.handle_message(&search).unwrap();
     let result = parse_tool_result(&resp);
-    let names: Vec<&str> = result.as_array().unwrap().iter()
+    let hits = search_hits(&result);
+    let names: Vec<&str> = hits.iter()
         .filter_map(|r| r["name"].as_str())
         .collect();
     assert!(names.contains(&"modified"), "should find modified function, got: {:?}", names);
@@ -250,7 +260,9 @@ function greet(name: string): string {
     let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "greet"}));
     let resp = server.handle_message(&search).unwrap();
     let result = parse_tool_result(&resp);
-    assert!(result.is_array());
+    // hybrid → bare array; FTS5-only (no model in CI) → {results, vector_available}
+    assert!(result.is_array() || result.get("results").is_some(),
+        "search should return results (array or FTS5-only object), got: {}", result);
 
     // 9. ping
     let msg = r#"{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}"#;
@@ -1063,8 +1075,9 @@ fn test_skip_indexing_flag() {
     let msg = tool_call_json("semantic_code_search", serde_json::json!({"query": "hello"}));
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    // semantic_code_search returns a raw array
-    assert!(!result.as_array().unwrap().is_empty(), "should find hello after indexing");
+    // semantic_code_search returns a raw array on the hybrid path, or a
+    // {results, vector_available} object when FTS5-only (no model in CI).
+    assert!(!search_hits(&result).is_empty(), "should find hello after indexing");
 
     // Second call with skip_indexing — should still work (index already built)
     let msg2 = tool_call_json("semantic_code_search", serde_json::json!({
@@ -1073,7 +1086,7 @@ fn test_skip_indexing_flag() {
     }));
     let resp2 = server.handle_message(&msg2).unwrap();
     let result2 = parse_tool_result(&resp2);
-    assert!(!result2.as_array().unwrap().is_empty(), "should find hello with skip_indexing when already indexed");
+    assert!(!search_hits(&result2).is_empty(), "should find hello with skip_indexing when already indexed");
 
     // Third call: skip_indexing on a fresh server with no prior indexing should return empty results (not error)
     let project2 = TempDir::new().unwrap();
@@ -1431,7 +1444,7 @@ fn test_unicode_identifiers_index_and_search() {
     );
     let resp = server.handle_message(&search).unwrap();
     let results = parse_tool_result(&resp);
-    let results_arr = results.as_array().unwrap();
+    let results_arr = search_hits(&results);
     let names: Vec<&str> = results_arr.iter()
         .filter_map(|r| r["name"].as_str())
         .collect();
@@ -1474,7 +1487,7 @@ fn test_cjk_identifiers_index_and_search() {
     );
     let resp = server.handle_message(&search).unwrap();
     let results = parse_tool_result(&resp);
-    let results_arr = results.as_array().unwrap();
+    let results_arr = search_hits(&results);
     // Verify the CJK name is preserved in the result
     let names: Vec<&str> = results_arr.iter()
         .filter_map(|r| r["name"].as_str())

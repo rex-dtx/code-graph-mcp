@@ -93,3 +93,32 @@ test('relicRepairGuard blocks settings repair from a relic copy and redirects', 
   // Active (or dev/npm) context → repair proceeds.
   assert.equal(relicRepairGuard({ relic: false, log: () => {} }), false);
 });
+
+// ── classifyEmbeddings (vector-availability — warns on silent FTS5-only) ──
+
+test('classifyEmbeddings WARNS when embed-capable but nothing embedded (vector inactive)', () => {
+  const { classifyEmbeddings } = require('./doctor');
+  // The exact silent-FTS5 gap: model_available compile-flag true, real embeddable
+  // nodes exist, but 0 embedded (model never downloaded/loaded).
+  const r = classifyEmbeddings({ model_available: true, embedding_progress: '0/2745',
+    embedding_status: 'pending', search_mode: 'fts_only' });
+  assert.equal(r.status, 'warn', 'must not false-green a vector-inactive index');
+  assert.match(r.detail, /FTS5-only|vector INACTIVE/);
+});
+
+test('classifyEmbeddings WARNS when binary lacks embed-model feature', () => {
+  const { classifyEmbeddings } = require('./doctor');
+  const r = classifyEmbeddings({ model_available: false, embedding_progress: '0/0' });
+  assert.equal(r.status, 'warn');
+  assert.match(r.detail, /without embed-model/);
+});
+
+test('classifyEmbeddings OK for hybrid (partial + complete) and no-embeddable', () => {
+  const { classifyEmbeddings } = require('./doctor');
+  assert.equal(classifyEmbeddings({ model_available: true, embedding_progress: '900/2745' }).status, 'ok');
+  assert.equal(classifyEmbeddings({ model_available: true, embedding_progress: '2745/2745' }).status, 'ok');
+  // total === 0 is a non-code index, genuinely nothing to embed → ok, not a false warn.
+  const none = classifyEmbeddings({ model_available: true, embedding_progress: '0/0' });
+  assert.equal(none.status, 'ok');
+  assert.match(none.detail, /no embeddable nodes/);
+});

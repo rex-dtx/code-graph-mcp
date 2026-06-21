@@ -892,9 +892,30 @@ impl McpServer {
             }
 
             let url = EmbeddingModel::model_download_url();
-            match EmbeddingModel::download_model_to(&url, &cache_dir) {
-                Ok(()) => tracing::info!("[model-dl] Model downloaded successfully"),
-                Err(e) => tracing::warn!("[model-dl] Download failed (FTS5-only mode): {}", e),
+            // Bounded retry with backoff. A single transient failure (flaky net, slow
+            // mirror, brief 5xx) otherwise leaves the user silently FTS5-only for the
+            // ENTIRE session until a manual restart. Retry a few times before giving
+            // up; a later server start still re-attempts (cached_model_is_current).
+            const MAX_ATTEMPTS: u32 = 3;
+            let mut downloaded = false;
+            for attempt in 1..=MAX_ATTEMPTS {
+                match EmbeddingModel::download_model_to(&url, &cache_dir) {
+                    Ok(()) => {
+                        tracing::info!("[model-dl] Model downloaded successfully (attempt {}/{})", attempt, MAX_ATTEMPTS);
+                        downloaded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("[model-dl] Download attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, e);
+                        if attempt < MAX_ATTEMPTS {
+                            // Exponential backoff: 4s, then 8s (background thread — sleeping is fine).
+                            std::thread::sleep(std::time::Duration::from_secs(4u64 * (1u64 << (attempt - 1))));
+                        }
+                    }
+                }
+            }
+            if !downloaded {
+                tracing::warn!("[model-dl] All {} download attempts failed — staying in FTS5-only mode; will retry on next server start.", MAX_ATTEMPTS);
             }
         });
     }
@@ -1690,6 +1711,16 @@ mod tests {
         assert_eq!(result["schema_version"], crate::storage::schema::SCHEMA_VERSION);
     }
 
+    /// Extract the results array from a `semantic_code_search` response: a bare
+    /// array on the hybrid path, or a `{results, vector_available, ...}` object on
+    /// the FTS5-only path (these unit tests run with no embedding model loaded).
+    fn search_results(v: &serde_json::Value) -> Vec<serde_json::Value> {
+        v.as_array()
+            .cloned()
+            .or_else(|| v.get("results").and_then(|r| r.as_array()).cloned())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn test_semantic_search_tool() {
         let project_dir = TempDir::new().unwrap();
@@ -1713,8 +1744,11 @@ function handleLogin(req: Request) {
         let req = tool_call_json("semantic_code_search", json!({"query": "validateToken", "top_k": 3}));
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
-        assert!(result.is_array());
-        let results = result.as_array().unwrap();
+        // No embedding model in unit tests → FTS5-only object path; assert the
+        // degradation signal is surfaced, then read results shape-agnostically.
+        assert_eq!(result["vector_available"], serde_json::json!(false),
+            "no-model test env must report vector_available=false, got: {}", result);
+        let results = search_results(&result);
         assert!(!results.is_empty(), "search should return results");
         let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
         assert!(names.contains(&"validateToken"),
@@ -2044,8 +2078,8 @@ function handleLogin(req: Request) {
         }));
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
-        let results = result.as_array().unwrap();
-        for r in results {
+        let results = search_results(&result);
+        for r in &results {
             assert!(r["file_path"].as_str().unwrap().ends_with(".ts"),
                 "language filter should only return typescript files, got: {}", r["file_path"]);
         }
@@ -2068,8 +2102,8 @@ function standalone() { return 1; }
         }));
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
-        let results = result.as_array().unwrap();
-        for r in results {
+        let results = search_results(&result);
+        for r in &results {
             assert_eq!(r["type"].as_str().unwrap(), "class",
                 "node_type filter should only return classes");
         }
@@ -2151,8 +2185,10 @@ app.post('/api/login', handleLogin);
         }));
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
-        // Should succeed (array or compressed mode) — not crash or OOM
-        assert!(result.is_array() || result["mode"].as_str() == Some("compressed"),
+        // Should succeed (bare array, FTS5-only object, or compressed mode) — not crash/OOM
+        assert!(result.is_array()
+                || result.get("results").is_some()
+                || result["mode"].as_str() == Some("compressed"),
             "search with huge top_k should return valid results, got: {}", result);
     }
 

@@ -14,6 +14,38 @@ const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 // ── Diagnostics ───────────────────────────────────────────
 
 /**
+ * Classify embedding/vector availability from a `health-check --json` payload.
+ * Pure (no I/O) so it is unit-testable. Surfaces a silent FTS5-only degradation
+ * that the prior embedding_progress-only check false-greened as "no embeddable
+ * nodes": when the binary is embed-capable and the index HAS embeddable nodes but
+ * none are embedded, the vector channel is inactive and semantic search runs
+ * FTS5-only — that is a 'warn', not 'ok'.
+ * @returns {{name:string, status:'ok'|'warn', detail:string}}
+ */
+function classifyEmbeddings(hc) {
+  const ep = (hc && hc.embedding_progress) || '0/0';
+  const [done, total] = ep.split('/').map(Number);
+  if (hc && hc.model_available === false) {
+    return { name: 'Embeddings', status: 'warn',
+      detail: 'binary built without embed-model — semantic search is FTS5-only; reinstall via npm/plugin for the hybrid binary' };
+  }
+  if (!total) {
+    return { name: 'Embeddings', status: 'ok', detail: 'no embeddable nodes' };
+  }
+  if (!done) {
+    const why = (hc && hc.embedding_status === 'pending')
+      ? 'model not downloaded/loaded yet — auto-downloads in background on first search; retry shortly or restart the MCP server'
+      : `embedding_status=${(hc && hc.embedding_status) || 'unknown'}`;
+    return { name: 'Embeddings', status: 'warn',
+      detail: `vector INACTIVE — ${total} embeddable nodes, 0 embedded; semantic search is FTS5-only (${why})` };
+  }
+  if (done < total) {
+    return { name: 'Embeddings', status: 'ok', detail: `hybrid — ${Math.round((done / total) * 100)}% embedded (${done}/${total})` };
+  }
+  return { name: 'Embeddings', status: 'ok', detail: `hybrid — embeddings complete (${done}/${total})` };
+}
+
+/**
  * Run all diagnostic checks. Returns an array of:
  *   { name: string, status: 'ok'|'warn'|'error'|'skip', detail: string, fixId?: string }
  */
@@ -119,17 +151,9 @@ function runDiagnostics() {
             });
           }
 
-          // Embeddings
-          const ep = hc.embedding_progress || '0/0';
-          const [done, total] = ep.split('/').map(Number);
-          if (total > 0 && done < total) {
-            const pct = Math.round((done / total) * 100);
-            results.push({ name: 'Embeddings', status: 'ok', detail: `${pct}% (${done}/${total})` });
-          } else if (total === 0) {
-            results.push({ name: 'Embeddings', status: 'ok', detail: 'no embeddable nodes' });
-          } else {
-            results.push({ name: 'Embeddings', status: 'ok', detail: `100% (${done}/${total})` });
-          }
+          // Embeddings / vector availability — pure classifier; warns on FTS5-only
+          // degradation (model missing/not loaded) instead of false-greening it.
+          results.push(classifyEmbeddings(hc));
         }
       } catch (e) {
         const rawStderr = e.stderr ? e.stderr.toString() : '';
@@ -453,7 +477,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, surveyHookCoverage, relicRepairGuard };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, surveyHookCoverage, relicRepairGuard, classifyEmbeddings };
 
 if (require.main === module) {
   const args = process.argv.slice(2);

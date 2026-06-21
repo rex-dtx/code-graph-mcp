@@ -101,6 +101,11 @@ impl McpServer {
             } else {
                 vec![]
             };
+        // Whether the vector channel was actually available for this query (model
+        // loaded AND sqlite-vec enabled). When false, every result is FTS5-only with
+        // reduced semantic recall — surfaced in the output below so the caller is not
+        // silently degraded (the model auto-downloads in the background on first use).
+        let vector_available = model_guard.is_some() && self.db.vec_enabled();
         drop(model_guard);
 
         // Track search source IDs for confidence scoring
@@ -391,6 +396,8 @@ impl McpServer {
                 "mode": mode,
                 "message": "Results exceeded token limit. Use get_ast_node(node_id) to expand individual symbols.",
                 "match_confidence": (match_confidence * 100.0).round() / 100.0,
+                "search_mode": if vector_available { "hybrid" } else { "fts_only" },
+                "vector_available": vector_available,
                 "results": compact
             });
             if match_confidence < crate::domain::CONF_WARNING_THRESHOLD && !has_exact_name_match {
@@ -431,10 +438,24 @@ impl McpServer {
             return Ok(json!({
                 "results": [],
                 "message": "No matching symbols found.",
-                "hint": hint
+                "hint": hint,
+                "search_mode": if vector_available { "hybrid" } else { "fts_only" },
+                "vector_available": vector_available
             }));
         }
 
-        Ok(json!(results))
+        // Hybrid path stays a bare array (unchanged contract). When the vector channel
+        // was unavailable, wrap in an object carrying the degradation signal so the
+        // caller knows recall is FTS5-only rather than silently trusting it.
+        if vector_available {
+            Ok(json!(results))
+        } else {
+            Ok(json!({
+                "results": results,
+                "search_mode": "fts_only",
+                "vector_available": false,
+                "note": "Embedding model not loaded — results are FTS5-only (reduced semantic recall). The model auto-downloads in the background on first use; retry shortly, or run `code-graph-mcp doctor` to check status."
+            }))
+        }
     }
 }

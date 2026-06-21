@@ -185,7 +185,10 @@ function handleLogin(req: Request) {
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
     let results: serde_json::Value = serde_json::from_str(text).unwrap();
-    let arr = results.as_array().unwrap();
+    // hybrid → bare array; FTS5-only (no embedding model in CI) → {results, vector_available}
+    let arr = results.as_array().cloned()
+        .or_else(|| results.get("results").and_then(|r| r.as_array()).cloned())
+        .expect("search should return an array or a results object");
     assert!(!arr.is_empty(), "search should return results");
 
     // get_ast_node

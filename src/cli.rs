@@ -747,6 +747,19 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                     "empty" => "active, no recommendations recorded yet",
                     _ => "DARK (no recommendations.jsonl — PreToolUse hooks not recording here)",
                 });
+                // Vector/embedding status — make a silent FTS5-only degradation visible
+                // (the prior gap: text health-check never surfaced search_mode, so a user
+                // whose model download failed had no way to see vector was inactive).
+                println!("Search: {} — {}% embedded ({})",
+                    if search_mode == "hybrid" { "hybrid (FTS5 + vector)" } else { "FTS5-only (vector inactive)" },
+                    coverage_pct,
+                    match embedding_status {
+                        "unavailable" => "binary built without embed-model feature",
+                        "pending" => "model not loaded yet; auto-downloads in background on first search — retry shortly, then re-check",
+                        "partial" => "embedding in progress",
+                        "complete" => "embeddings complete",
+                        other => other,
+                    });
                 print_resolution();
             } else if !schema_ok {
                 eprintln!(
