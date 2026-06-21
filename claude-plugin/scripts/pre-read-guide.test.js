@@ -291,6 +291,23 @@ test('trackReadAndMaybeHint: fires on 5th read with stubbed overview answer', ()
   }
 });
 
+test('trackReadAndMaybeHint: non-fanout source read records an observe event', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-observe-'));
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  try {
+    // A single subdir source read is below the fanout threshold → no hint, but
+    // it must still record an `observe` event for the search-decay metric.
+    const fired = trackReadAndMaybeHint(root, 'src/storage/db.rs');
+    assert.equal(fired, false, 'single read must not fire the fanout hint');
+    const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const last = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(last.hook, 'read');
+    assert.equal(last.action, 'observe');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('trackReadAndMaybeHint: top-level and outside-root paths never fire', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-skip-'));
   try {

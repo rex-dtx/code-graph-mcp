@@ -1044,20 +1044,47 @@ pub struct RecommendationSummary {
     /// ask the model to convert. Pre-v0.47 denies lack the field → unanswered.
     pub deny_answered: u64,
     pub deny_unanswered: u64,
+    /// Outcome proxy ("search-decay"): silent grep/read allows recorded by the
+    /// PreToolUse hooks (action:"observe"), so the model's raw fan-out is visible
+    /// alongside the deny/hint events.
+    pub observe: u64,
+    /// Of `deny_answered` (cg delivered a grep answer in-place), how many were
+    /// IMMEDIATELY followed by another grep/read event — i.e. the inline answer
+    /// did not end the hunt. Lower is better. Computed in append (chronological)
+    /// order; a single-user-sequential approximation (truly concurrent sessions
+    /// interleave in the shared file).
+    pub researched_after_answer: u64,
 }
 
 /// Parse and aggregate `recommendations.jsonl` content. Pure: no IO, no panics —
 /// malformed lines are skipped silently (telemetry, not a contract surface).
 pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
     let mut s = RecommendationSummary::default();
+    // Outcome-proxy state: `armed` means the previous tool event was an answered
+    // deny (cg satisfied the grep in-place); the next grep/read event of ANY
+    // action is a re-search — the inline answer wasn't enough. Lines are appended
+    // chronologically so a single forward pass suffices.
+    let mut armed = false;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else { continue; };
         let action = v.get("action").and_then(|x| x.as_str());
-        if action == Some("use") {
-            s.cli_uses += 1;
-            continue;
+        let hook = v.get("hook").and_then(|x| x.as_str());
+
+        // Re-search detection runs on every tool event, before action bucketing.
+        let is_search_event = matches!(hook, Some("grep") | Some("read"))
+            && matches!(action, Some("deny") | Some("hint") | Some("bypass") | Some("observe"));
+        if armed {
+            if is_search_event { s.researched_after_answer += 1; }
+            armed = false; // only the IMMEDIATELY-next tool event counts
+        }
+
+        // observe / use are not recommendation events: count separately, like cli use.
+        match action {
+            Some("use") => { s.cli_uses += 1; continue; }
+            Some("observe") => { s.observe += 1; continue; }
+            _ => {}
         }
         s.total += 1;
         if let Some(a) = action {
@@ -1065,12 +1092,13 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
             if a == "deny" {
                 if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
                     s.deny_answered += 1;
+                    armed = true; // watch the next event for a re-search
                 } else {
                     s.deny_unanswered += 1;
                 }
             }
         }
-        if let Some(h) = v.get("hook").and_then(|x| x.as_str()) {
+        if let Some(h) = hook {
             *s.by_hook.entry(h.to_string()).or_insert(0) += 1;
         }
     }
@@ -1214,6 +1242,15 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 "cli_uses": recs.cli_uses,
                 "deny_answered": recs.deny_answered,
                 "deny_unanswered": recs.deny_unanswered,
+                // Outcome proxy: observe = silent grep/read allows recorded by the
+                // hooks; re_search_rate = fraction of answered denies immediately
+                // followed by another grep/read (lower = the inline answer sufficed;
+                // null until there is an answered deny to divide by).
+                "observe": recs.observe,
+                "researched_after_answer": recs.researched_after_answer,
+                "re_search_rate": if recs.deny_answered > 0 {
+                    serde_json::json!((recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() / 100.0)
+                } else { serde_json::Value::Null },
                 // tool_calls / recommendations: two independent populations, so
                 // this is an activity/volume ratio, NOT a recommend→use rate. The
                 // real conversion is funnel.deny_conversion / hint_conversion.
@@ -1308,6 +1345,18 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             }
             if recs.cli_uses > 0 {
                 println!("CLI uses: {} model-initiated code-graph-mcp queries", recs.cli_uses);
+            }
+            // Outcome proxy ("search-decay"): of the answered denies (cg delivered
+            // the grep result in-place), how often did the model immediately keep
+            // searching? Lower = the inline answer was enough. observe = the silent
+            // grep/read allows that make the fan-out visible.
+            if recs.deny_answered > 0 {
+                let pct = (recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
+                println!("Re-search after cg answer: {}/{} answered denies → kept searching = {pct}% (lower = inline answer sufficed)",
+                    recs.researched_after_answer, recs.deny_answered);
+            }
+            if recs.observe > 0 {
+                println!("Tool observes: {} silent grep/read allows recorded (fan-out timeline)", recs.observe);
             }
             // Volume ratio (NOT a conversion rate): cg tool calls and hook
             // recommendations are independent populations, so this only signals
@@ -5263,6 +5312,35 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_aggregate_recommendations_research_after_answer_and_observe() {
+        // Append order = chronological. Each answered deny "arms"; the next
+        // grep/read event is a re-search (inline answer didn't end the hunt).
+        //   t1 answered deny → t2 grep observe  = re-search
+        //   t3 answered deny → t4 cli use       = conversion, NOT re-search
+        //   t5 answered deny → t6 read observe  = re-search (read after answer)
+        //   t7 UNanswered deny → t8 grep observe = not armed (only answered denies)
+        let content = "\
+{\"ts\":\"t1\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"t2\",\"hook\":\"grep\",\"action\":\"observe\"}
+{\"ts\":\"t3\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"t4\",\"hook\":\"cli\",\"action\":\"use\",\"cmd\":\"grep\"}
+{\"ts\":\"t5\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"t6\",\"hook\":\"read\",\"action\":\"observe\"}
+{\"ts\":\"t7\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":false}
+{\"ts\":\"t8\",\"hook\":\"grep\",\"action\":\"observe\"}
+";
+        let s = aggregate_recommendations_jsonl(content);
+        assert_eq!(s.deny_answered, 3, "t1,t3,t5 answered");
+        assert_eq!(s.deny_unanswered, 1, "t7 unanswered");
+        assert_eq!(s.researched_after_answer, 2,
+            "t1→t2 (re-grep) and t5→t6 (read) count; t3→t4 (cli use) is a conversion, not re-search");
+        assert_eq!(s.observe, 3, "t2,t6,t8 observes");
+        assert_eq!(s.cli_uses, 1, "t4");
+        assert_eq!(s.by_action.get("observe"), None, "observe is not a recommendation action");
+        assert_eq!(s.total, 4, "4 denies counted; observe + cli use excluded from total");
+    }
 
     #[test]
     fn resolve_project_root_prefers_existing_index_at_cwd() {

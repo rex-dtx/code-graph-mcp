@@ -483,7 +483,13 @@ function runMain() {
     return;
   }
 
-  if (isOnCooldown(rawCmd)) return;
+  if (isOnCooldown(rawCmd)) {
+    // Outcome proxy: a source grep re-issued within the cooldown window runs
+    // silently (no deny/hint). Record it so `stats` sees the model's grep
+    // fan-out — especially a re-grep right after cg answered the same query.
+    recordRecommendation(root, { hook: 'grep', action: 'observe' });
+    return;
+  }
 
   markCooldown(rawCmd);
 

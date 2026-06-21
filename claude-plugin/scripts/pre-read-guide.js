@@ -164,7 +164,13 @@ function trackReadAndMaybeHint(root, rel, now = Date.now()) {
     fired = true;
   }
   saveState(root, state);
-  if (!fired) return false;
+  if (!fired) {
+    // Outcome proxy: a source read that didn't trip the fanout hint still ran.
+    // Record it (best-effort) so `stats` can measure the model's read fan-out —
+    // e.g. a read right after cg answered a grep in-place (search-decay).
+    recordRecommendation(root, { hook: 'read', action: 'observe' });
+    return false;
+  }
 
   let answer = { status: 'unavailable' };
   if (!isAnswerDisabled()) {
