@@ -5,6 +5,22 @@
 // -- Data directory --
 pub const CODE_GRAPH_DIR: &str = ".code-graph";
 
+// -- MCP tool surface --
+/// Tools surfaced in `tools/list` (the live surface MCP clients see). Single
+/// source of truth so `stats` can flag legacy/folded tool names recorded in
+/// usage.jsonl (e.g. `read_snippet`, `trace_http_chain` from older sessions)
+/// instead of commingling them with the live set. The registry's `list_tools()`
+/// is asserted to match this exactly (mcp::tools tests), so they cannot drift.
+pub const LIVE_MCP_TOOLS: &[&str] = &[
+    "semantic_code_search",
+    "get_call_graph",
+    "get_ast_node",
+    "project_map",
+    "module_overview",
+    "ast_search",
+    "find_references",
+];
+
 // -- Relation types --
 pub const REL_CALLS: &str = "calls";
 pub const REL_INHERITS: &str = "inherits";

@@ -1298,6 +1298,57 @@ fn test_cli_stats_recommendations_empty_distinct_from_absent() {
         "an empty recommendations.jsonl is 'empty', distinct from 'absent'; got: {jstdout:?}");
 }
 
+// P1-6: the misleading "Conversion (proxy)" headline (tool_calls / recs = two
+// independent populations) is renamed to an honest volume label, and folded/
+// hidden tool names from older sessions are flagged so the table doesn't
+// commingle them with the live tools/list surface (domain::LIVE_MCP_TOOLS).
+#[test]
+fn test_cli_stats_marks_legacy_tool_names_and_volume_label() {
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    // One session mixing a live tool (get_call_graph) with a folded one
+    // (read_snippet, merged into get_ast_node) + a recommendation so the volume
+    // line prints.
+    std::fs::write(
+        cg.join("usage.jsonl"),
+        "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":2,\"ms\":5,\"err\":0,\"max_ms\":5},\"read_snippet\":{\"n\":3,\"ms\":4,\"err\":0,\"max_ms\":4}}}\n",
+    ).unwrap();
+    std::fs::write(cg.join("recommendations.jsonl"), "{\"hook\":\"pre-grep-guide\",\"action\":\"deny\"}\n").unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["stats"]);
+    assert_eq!(code, 0, "stats should run; stdout={stdout}");
+    assert!(stdout.contains("read_snippet †"),
+        "folded tool name must be flagged legacy; got: {stdout}");
+    assert!(stdout.contains("† not in the current tools/list surface"),
+        "legacy footnote must be present; got: {stdout}");
+    assert!(!stdout.contains("get_call_graph †"),
+        "a live tool must NOT be flagged legacy; got: {stdout}");
+    assert!(stdout.contains("Tool-call volume:") && stdout.contains("not conversion"),
+        "the volume ratio must not be labeled 'Conversion'; got: {stdout}");
+    assert!(!stdout.contains("Conversion (proxy)"),
+        "the old misleading 'Conversion (proxy)' label must be gone; got: {stdout}");
+}
+
+#[test]
+fn test_cli_stats_json_renames_conversion_and_lists_live_tools() {
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::write(
+        cg.join("usage.jsonl"),
+        "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}}}\n",
+    ).unwrap();
+    std::fs::write(cg.join("recommendations.jsonl"), "{\"hook\":\"pre-grep-guide\",\"action\":\"deny\"}\n").unwrap();
+    let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
+    assert_eq!(jcode, 0);
+    let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
+    assert!(v["recommendations"]["conversion_ratio"].is_null(),
+        "the misleading conversion_ratio field must be renamed; got: {jstdout}");
+    assert!(v["recommendations"]["tool_calls_per_rec"].is_number(),
+        "tool_calls_per_rec must replace it; got: {jstdout}");
+    assert!(v["live_tools"].as_array().is_some_and(|a| a.iter().any(|t| t == "get_call_graph")),
+        "live_tools must surface the current tools/list set; got: {jstdout}");
+}
+
 // Deny→use funnel: stats must print the per-session attribution line when usage
 // records carry the window-joined `recs` field.
 #[test]

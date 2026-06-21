@@ -1179,6 +1179,7 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             "first_ts": summary.first_ts,
             "last_ts": summary.last_ts,
             "total_tool_calls": summary.total_tool_calls(),
+            "live_tools": crate::domain::LIVE_MCP_TOOLS,
             "tools": tools_json,
             "search": {
                 "queries": summary.search_queries,
@@ -1204,7 +1205,10 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 "cli_uses": recs.cli_uses,
                 "deny_answered": recs.deny_answered,
                 "deny_unanswered": recs.deny_unanswered,
-                "conversion_ratio": if recs.total > 0 {
+                // tool_calls / recommendations: two independent populations, so
+                // this is an activity/volume ratio, NOT a recommend→use rate. The
+                // real conversion is funnel.deny_conversion / hint_conversion.
+                "tool_calls_per_rec": if recs.total > 0 {
                     (summary.total_tool_calls() as f64 / recs.total as f64 * 100.0).round() / 100.0
                 } else { 0.0 },
                 // Per-session deny→use / hint→use funnel (window-joined attribution).
@@ -1248,9 +1252,19 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         } else {
             println!("{:<28} {:>6} {:>10} {:>6} {:>8}", "Tool", "n", "avg_ms", "err", "max_ms");
             println!("{}", "-".repeat(62));
+            let mut any_legacy = false;
             for (name, agg) in &sorted {
                 let avg = agg.total_ms.checked_div(agg.n).unwrap_or(0);
-                println!("{:<28} {:>6} {:>10} {:>6} {:>8}", name, agg.n, avg, agg.err, agg.max_ms);
+                // Mark tool names no longer in the live tools/list surface (folded
+                // or hidden, recorded by older sessions) so the table doesn't
+                // commingle historical names with the current live set.
+                let legacy = !crate::domain::LIVE_MCP_TOOLS.contains(&name.as_str());
+                if legacy { any_legacy = true; }
+                let label = if legacy { format!("{name} †") } else { name.to_string() };
+                println!("{:<28} {:>6} {:>10} {:>6} {:>8}", label, agg.n, avg, agg.err, agg.max_ms);
+            }
+            if any_legacy {
+                println!("  † not in the current tools/list surface (folded/hidden; from older sessions)");
             }
         }
 
@@ -1286,9 +1300,11 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             if recs.cli_uses > 0 {
                 println!("CLI uses: {} model-initiated code-graph-mcp queries", recs.cli_uses);
             }
-            // Field conversion signal the synthetic routing_bench oracle can't see:
-            // cg tool calls vs hook recommendations. ≪1 = recommendations ignored.
-            println!("Conversion (proxy): {} cg tool calls / {} recommendations = {ratio:.2}",
+            // Volume ratio (NOT a conversion rate): cg tool calls and hook
+            // recommendations are independent populations, so this only signals
+            // activity level. The real recommend→use conversion is the Deny→use /
+            // Hint→use funnel printed below.
+            println!("Tool-call volume: {} cg calls / {} recommendations = {ratio:.2} (activity ratio, not conversion)",
                 summary.total_tool_calls(), recs.total);
         } else if rec_exists {
             // File present but empty: hooks are wired and recording, just no

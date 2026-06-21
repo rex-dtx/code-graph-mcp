@@ -190,6 +190,14 @@ mod tests {
         assert!(!names.contains(&"dependency_graph"));
         assert!(!names.contains(&"find_similar_code"));
         assert!(!names.contains(&"find_dead_code"));
+
+        // Drift guard: the tools/list surface must equal domain::LIVE_MCP_TOOLS.
+        // `cli::cmd_stats` uses that const to flag legacy/folded tool names in
+        // usage.jsonl, so the two cannot be allowed to drift apart.
+        let live: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        let expected: std::collections::BTreeSet<&str> =
+            crate::domain::LIVE_MCP_TOOLS.iter().copied().collect();
+        assert_eq!(live, expected, "tools/list must equal domain::LIVE_MCP_TOOLS");
     }
 
     #[test]
