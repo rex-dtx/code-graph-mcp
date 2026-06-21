@@ -1,0 +1,23 @@
+[package]
+name = "nomic-bert-candle-poc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Empty [workspace] table: makes this PoC a self-contained workspace root so it
+# is never absorbed by (or made to depend on) the parent crate's build/CI.
+[workspace]
+
+[[bin]]
+name = "poc"
+path = "src/main.rs"
+
+[dependencies]
+candle-core = "0.9"
+candle-nn = "0.9"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 2
