@@ -1054,20 +1054,28 @@ impl McpServer {
         if self.indexing.startup_indexing.load(Ordering::Acquire) {
             let (lock, cvar) = &*self.indexing.startup_indexing_done;
             let mut done = lock_or_recover(lock, "startup_indexing_done");
-            let grace = std::time::Duration::from_secs(2);
-            if !*done {
-                let (guard, wait_result) = cvar.wait_timeout(done, grace).unwrap_or_else(|e| {
+            // Wait at most this grace for background indexing, then return Err so the
+            // stdio loop stays responsive (vs blocking up to 300s). Loop against an
+            // Instant deadline rather than trusting a single wait_timeout: a spurious
+            // condvar wakeup — or wait_result.timed_out() being unreliable under load,
+            // as on slow Windows CI — must NOT fall through and let us start indexing.
+            // It re-waits the remaining grace and only bails once the deadline has
+            // truly passed with indexing still unfinished.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !*done {
+                let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+                    Some(r) if !r.is_zero() => r,
+                    _ => anyhow::bail!(
+                        "Indexing in progress — results will be available shortly. \
+                         Please retry your request in a few seconds or run `code-graph-mcp health-check` for details."
+                    ),
+                };
+                let (guard, _) = cvar.wait_timeout(done, remaining).unwrap_or_else(|e| {
                     tracing::warn!("Recovering poisoned condvar (startup_indexing_done)");
                     let guard = e.into_inner();
                     (guard.0, guard.1)
                 });
                 done = guard;
-                if wait_result.timed_out() && !*done {
-                    anyhow::bail!(
-                        "Indexing in progress — results will be available shortly. \
-                         Please retry your request in a few seconds or run `code-graph-mcp health-check` for details."
-                    );
-                }
             }
         }
         // Consume result whether we waited or it completed before this call
@@ -2486,6 +2494,42 @@ app.post('/api/login', handleLogin);
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("ndexing in progress") || err_msg.contains("retry"),
             "error message should mention indexing in progress or retry, got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_ensure_indexed_non_blocking_survives_spurious_wakeups() {
+        // Regression for the windows-with-embed flake: ensure_indexed's condvar wait
+        // checked wait_result.timed_out() exactly once, so a SPURIOUS wakeup (the
+        // condvar returning before the grace deadline without `done` being set —
+        // common on a loaded runner) made it fall through and return Ok instead of
+        // staying non-blocking. Inject spurious wakeups deterministically by
+        // notifying the condvar without ever setting done=true: the wait MUST loop
+        // until the real deadline and still return Err.
+        let project_dir = TempDir::new().unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.indexing.startup_indexing.store(true, Ordering::SeqCst);
+        *server.indexing.startup_indexing_done.0.lock().unwrap() = false;
+
+        let dvar = std::sync::Arc::clone(&server.indexing.startup_indexing_done);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = std::sync::Arc::clone(&stop);
+        let notifier = std::thread::spawn(move || {
+            while !stop_c.load(Ordering::Relaxed) {
+                dvar.1.notify_all(); // wake the waiter WITHOUT setting done — spurious
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let result = server.ensure_indexed();
+        let elapsed = start.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        notifier.join().unwrap();
+
+        assert!(elapsed.as_secs() < 5,
+            "must stay non-blocking even under spurious wakeups, took {}s", elapsed.as_secs());
+        assert!(result.is_err(),
+            "ensure_indexed must return Err under spurious wakeups while indexing is unfinished");
     }
 
     #[test]
