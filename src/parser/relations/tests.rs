@@ -122,6 +122,39 @@ run_app "$@"
 }
 
 #[test]
+fn test_extract_python_top_level_call_attributes_to_module() {
+    // A function invoked only at module top level must produce a
+    // `<module> calls main_entry` edge, else dead-code flags the entry point.
+    // (Same fix as bash, INDEX_VERSION 26→27.)
+    let code = "def main_entry():\n    return helper()\n\ndef helper():\n    return 1\n\nmain_entry()\n";
+    let relations = extract_relations(code, "python").unwrap();
+    let module_calls: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.source_name == "<module>")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(module_calls.contains(&"main_entry"),
+        "top-level main_entry() must attribute to <module>, got: {:?}", module_calls);
+    // The call INSIDE main_entry still attributes to main_entry, not <module>.
+    assert!(!module_calls.contains(&"helper"),
+        "`helper` is inside main_entry's body, must attribute to main_entry not <module>");
+}
+
+#[test]
+fn test_extract_ruby_top_level_call_attributes_to_module() {
+    // Ruby method calls need parens/a receiver to parse as `call` nodes (bare
+    // `entry` parses as an identifier — a separate, pre-existing gap). A
+    // top-level `entry()` must attribute to <module> so the entry isn't dead.
+    let code = "def entry\n  1\nend\n\nentry()\n";
+    let relations = extract_relations(code, "ruby").unwrap();
+    let module_calls: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.source_name == "<module>")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(module_calls.contains(&"entry"),
+        "top-level entry() must attribute to <module>, got: {:?}", module_calls);
+}
+
+#[test]
 fn test_extract_c_include_imports() {
     let code = "#include \"local/utils.h\"\n#include <stdio.h>\n#include \"helpers.hpp\"\n\nint main() { return 0; }\n";
     let relations = extract_relations(code, "c").unwrap();

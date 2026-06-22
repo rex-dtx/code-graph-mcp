@@ -530,16 +530,22 @@ fn walk_for_relations(
         // module_overview / impact_analysis / find_dead_code all rely on this
         // edge. Routes and `from X import Y` already extracted via other arms.
         "call" if config.name == "python" => {
-            if let Some(scope) = active_scope {
-                if let Some(callee) = helpers::extract_callee_name(&node, source) {
-                    results.push(ParsedRelation {
-                        source_name: scope.to_string(),
-                        target_name: callee,
-                        relation: REL_CALLS.into(),
-                        metadata: None,
-                        source_language: String::new(),
-                    });
-                }
+            // Top-level (module / class-body) calls attribute to `<module>`
+            // rather than being dropped — a function invoked only at import time
+            // (`app.run()`, a bare `main_entry()`) would otherwise have no
+            // incoming edge and be reported dead. Undefined callees (print,
+            // os.path.join, …) drop at Phase-2 same-language resolution, so this
+            // only adds edges to defined same-project functions. Mirrors the
+            // bash/js `<module>` fallback.
+            let scope = active_scope.unwrap_or("<module>");
+            if let Some(callee) = helpers::extract_callee_name(&node, source) {
+                results.push(ParsedRelation {
+                    source_name: scope.to_string(),
+                    target_name: callee,
+                    relation: REL_CALLS.into(),
+                    metadata: None,
+                    source_language: String::new(),
+                });
             }
         }
 
@@ -563,8 +569,12 @@ fn walk_for_relations(
                             }
                         }
                     }
-                } else if let Some(scope) = active_scope {
-                    // Regular method call
+                } else {
+                    // Regular method call. Top-level calls attribute to
+                    // `<module>` (same rationale as the python/bash arms) so a
+                    // top-level entry call isn't dropped; undefined callees drop
+                    // at Phase-2 same-language resolution.
+                    let scope = active_scope.unwrap_or("<module>");
                     results.push(ParsedRelation {
                         source_name: scope.to_string(),
                         target_name: method_name.to_string(),
