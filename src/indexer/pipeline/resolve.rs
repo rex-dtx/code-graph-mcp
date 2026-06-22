@@ -244,6 +244,87 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
     Ok(edges_added)
 }
 
+/// Positively resolve bare-name `calls` edges to the node an explicit import in
+/// the caller's file binds them to. Runs once after all call edges exist (post
+/// Phase-2 + pending sweep), immediately before
+/// `prune_import_contradicted_call_edges`.
+///
+/// Motivation: `refine_ambiguous_targets` resolves a bare call to the
+/// path-closest same-name node, which can be the WRONG file when the caller
+/// explicitly `from X import name`s a farther one. The prune then deletes that
+/// wrong edge — but the language's scoping rules say the call resolves to the
+/// IMPORTED node, and path-proximity never produced that edge, so the call was
+/// left with no edge at all (`feedback_bare_name_call_qualifier`,
+/// `feedback_edge_resolution_same_language`). This inserts the import-bound edge
+/// so bind + prune together repoint the call: insert correct, drop wrong.
+///
+/// Conservative by construction (mirrors the prune's guards):
+/// - only bare-name call edges (NULL/empty metadata) are eligible — qualified
+///   calls (`cache.save()`, `crate::x::foo()`) carry their own resolution;
+/// - the import must bind the name to exactly ONE internal node in the caller's
+///   file (ambiguous suffix-imports / `<external>` targets are skipped — never
+///   creates an edge into the external sentinel);
+/// - a file-local definition of the name shadows the import — skip, the
+///   same-file tier already resolved it;
+/// - idempotent: `insert_edge_cached` is INSERT OR IGNORE, so a call that
+///   already resolved to the imported node is a no-op (e.g. JS, whose import
+///   edges resolve by proximity, agrees with the call and gains nothing here).
+///
+/// Returns the number of edges inserted.
+pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
+    use crate::domain::{REL_CALLS, REL_IMPORTS};
+
+    // Collect (caller_fn_id, imported_target_id) pairs to bind. A bare call
+    // whose name is bound by a unique internal import in the caller's file —
+    // and is NOT shadowed by a same-file definition of that name — resolves to
+    // the imported node.
+    let pairs: Vec<(i64, i64)> = {
+        let mut stmt = db.conn().prepare(
+            "SELECT DISTINCT c.source_id, it.import_target_id
+             FROM (
+                 SELECT e.source_id AS source_id, tn.name AS call_name,
+                        sn.file_id AS caller_file
+                 FROM edges e
+                 JOIN nodes sn ON sn.id = e.source_id
+                 JOIN nodes tn ON tn.id = e.target_id
+                 WHERE e.relation = ?1
+                   AND (e.metadata IS NULL OR e.metadata = '')
+             ) c
+             JOIN (
+                 SELECT mn.file_id AS import_file, itn.name AS import_name,
+                        MIN(itn.id) AS import_target_id
+                 FROM edges ie
+                 JOIN nodes mn  ON mn.id  = ie.source_id
+                 JOIN nodes itn ON itn.id = ie.target_id
+                 JOIN files itf ON itf.id = itn.file_id
+                 WHERE ie.relation = ?2
+                   AND itf.path <> '<external>'
+                 GROUP BY mn.file_id, itn.name
+                 HAVING COUNT(DISTINCT itn.id) = 1
+             ) it
+               ON it.import_file = c.caller_file
+              AND it.import_name = c.call_name
+             WHERE c.source_id <> it.import_target_id
+               AND NOT EXISTS (
+                   SELECT 1 FROM nodes ln
+                   WHERE ln.file_id = c.caller_file AND ln.name = c.call_name
+               )",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![REL_CALLS, REL_IMPORTS], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        rows.filter_map(std::result::Result::ok).collect()
+    };
+
+    let mut inserted = 0usize;
+    for (src, tgt) in pairs {
+        if insert_edge_cached(db.conn(), src, tgt, REL_CALLS, None)? {
+            inserted += 1;
+        }
+    }
+    Ok(inserted)
+}
+
 /// Remove bare-name `calls` edges that an explicit import in the caller's file
 /// contradicts. Runs once after all call edges exist (post Phase-2 + pending
 /// sweep).

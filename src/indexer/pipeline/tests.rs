@@ -251,6 +251,74 @@ function readJson(p) { return 2; }
 }
 
 #[test]
+fn test_import_binding_resolves_call_over_path_proximity() {
+    // Import-aware call resolution: when a bare call's name matches same-name
+    // defs in multiple files, an explicit `from X import name` in the caller's
+    // file must bind the call to the IMPORTED definition — even when a
+    // different same-name def is closer by path. Without import-awareness,
+    // refine_ambiguous_targets picks the path-closest (wrong) target, which
+    // prune_import_contradicted_call_edges then deletes, leaving the call with
+    // NO edge at all (correct import-bound edge never positively created).
+    // Python is used here because its import edges already resolve
+    // module-path-aware (resolve_python_module_targets), isolating the
+    // call-resolution gap; JS module-specifier resolution is a separate cycle.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("app/core")).unwrap();
+    fs::create_dir_all(project_dir.path().join("app/util")).unwrap();
+
+    // Path-closest same-name def — the WRONG target for the call below.
+    fs::write(project_dir.path().join("app/core/helper.py"), r#"
+def process():
+    return 1
+"#).unwrap();
+
+    // Imported same-name def — the RIGHT target, farther by path prefix.
+    fs::write(project_dir.path().join("app/util/helper.py"), r#"
+def process():
+    return 2
+"#).unwrap();
+
+    // Caller sits next to app/core/helper.py but explicitly imports the util one.
+    fs::write(project_dir.path().join("app/core/caller.py"), r#"
+from app.util.helper import process
+
+def run():
+    return process()
+"#).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let caller = crate::storage::queries::get_nodes_with_files_by_name(
+        db.conn(), "run",
+    ).unwrap();
+    let caller = caller.iter()
+        .find(|n| n.file_path == "app/core/caller.py")
+        .expect("run should be indexed");
+
+    let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
+    let call_target_paths: Vec<String> = edges.iter()
+        .filter(|e| e.relation == REL_CALLS)
+        .filter_map(|e| db.conn().query_row(
+            "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
+            [e.target_id], |row| row.get(0),
+        ).ok())
+        .collect();
+
+    assert!(
+        call_target_paths.iter().any(|p| p == "app/util/helper.py"),
+        "run() must resolve to the IMPORTED process (app/util/helper.py); got {:?}",
+        call_target_paths
+    );
+    assert!(
+        !call_target_paths.iter().any(|p| p == "app/core/helper.py"),
+        "run() must NOT resolve to the path-closest non-imported process (app/core/helper.py); got {:?}",
+        call_target_paths
+    );
+}
+
+#[test]
 fn test_js_module_level_test_callback_calls_resolve() {
     // Regression: helpers defined in a JS test file that are called only
     // from inside `test(() => {...})` / `describe(() => {...})` callbacks

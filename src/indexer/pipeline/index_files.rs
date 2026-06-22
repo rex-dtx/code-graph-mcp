@@ -47,7 +47,7 @@ use super::{IndexResult, IndexStats, ProgressFn};
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
-use super::resolve::{classify_edge_confidence, prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
+use super::resolve::{bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
 
 /// Batch size for streaming indexing. Each batch processes Phase 1+2
 /// then drops heavyweight data (ASTs, source strings) before the next batch.
@@ -1011,6 +1011,22 @@ pub(super) fn index_files(
         tracing::info!(
             "[index] Phase 2c: resolved {} pending unresolved calls",
             pending_resolved
+        );
+    }
+
+    // Phase 2d-bind: positively resolve bare-name calls to the node an explicit
+    // import in the caller's file binds them to. `refine_ambiguous_targets`
+    // picks the path-closest same-name node, which can be the wrong file when
+    // the caller `from X import name`s a farther one; that wrong edge is dropped
+    // by the prune below, so without this bind the call would be left with no
+    // edge at all. Insert the import-bound edge first, then let the prune remove
+    // the contradicted proximity edge — together they repoint the call.
+    let bound = bind_calls_to_imported_targets(db)?;
+    total_edges_created += bound;
+    if bound > 0 {
+        tracing::info!(
+            "[index] Phase 2d-bind: bound {} bare call(s) to their imported target",
+            bound
         );
     }
 
