@@ -94,6 +94,13 @@ pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, langu
     let mut relations = Vec::new();
     let config = LanguageConfig::for_language(language);
     walk_for_relations(tree.root_node(), source, language, &config, None, None, None, &mut relations, 0);
+    // Ruby bare (parens-less) method calls are `identifier` nodes structurally
+    // identical to local-variable reads (the `"call"` arm above only fires on
+    // parenthesized / receiver calls). Resolve them with Ruby's own rule in a
+    // dedicated scope-aware pass.
+    if config.name == "ruby" {
+        ruby_bare_calls::extract(tree.root_node(), source, "<module>", &mut relations);
+    }
     // Stamp source_language on every relation. walk_for_relations constructs
     // ParsedRelation with source_language: String::new(), and we fill it in
     // here so every call site inside walk doesn't need to propagate language.
@@ -101,6 +108,152 @@ pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, langu
         r.source_language = language.to_string();
     }
     relations
+}
+
+/// Ruby bare (parens-less) method-call extraction.
+///
+/// tree-sitter-ruby parses a bare name (`helper`, no receiver/parens) as an
+/// `identifier`, structurally indistinguishable from a local-variable read
+/// (`result` after `result = …`). Ruby itself disambiguates by scope: a bare
+/// name is a local variable iff it was BOUND (assigned / parameter) in the
+/// enclosing method scope, otherwise it is a method call. This pass replicates
+/// that rule, biased to false-negatives (the safe direction for an LLM-facing
+/// tool, matching the dead-code philosophy):
+///
+/// - only STATEMENT-position bare identifiers emit a call (not RHS / args /
+///   conditions — those add ambiguity for little dead-code value);
+/// - a name bound ANYWHERE in its scope is treated as a local for ALL its bare
+///   uses (no order tracking) — so a real local never invents an edge;
+/// - undefined callees additionally drop at Phase-2 same-language resolution.
+///
+/// Parenthesized / receiver calls are already handled by the `"call"` arm.
+mod ruby_bare_calls {
+    use super::{node_text, ParsedRelation};
+    use crate::domain::REL_CALLS;
+    use std::collections::HashSet;
+    use tree_sitter::Node;
+
+    /// Process one scope rooted at `scope_root` (the `program` for top level, or
+    /// a `method`/`singleton_method` node). Nested methods recurse as fresh scopes.
+    pub(super) fn extract<'a>(
+        scope_root: Node,
+        source: &'a str,
+        scope_name: &str,
+        out: &mut Vec<ParsedRelation>,
+    ) {
+        let is_method = matches!(scope_root.kind(), "method" | "singleton_method");
+        // Method parameters are locals.
+        let mut bound: HashSet<&'a str> = HashSet::new();
+        if is_method {
+            if let Some(params) = scope_root.child_by_field_name("parameters") {
+                collect_idents(params, source, &mut bound);
+            }
+        }
+        let body = if is_method {
+            scope_root.child_by_field_name("body")
+        } else {
+            Some(scope_root)
+        };
+        let Some(body) = body else { return };
+        collect_locals(body, source, &mut bound);
+        emit(body, source, scope_name, &bound, out);
+    }
+
+    /// Collect names bound as locals in this scope's `body` (assignment targets,
+    /// block params, `for` vars, rescue vars). Stops at nested method bodies —
+    /// those are separate scopes.
+    fn collect_locals<'a>(node: Node, source: &'a str, set: &mut HashSet<&'a str>) {
+        let mut c = node.walk();
+        for child in node.named_children(&mut c) {
+            match child.kind() {
+                "method" | "singleton_method" => {} // nested scope — skip
+                "assignment" | "operator_assignment" => {
+                    if let Some(left) = child.child_by_field_name("left") {
+                        collect_idents(left, source, set);
+                    }
+                    if let Some(right) = child.child_by_field_name("right") {
+                        collect_locals(right, source, set);
+                    }
+                }
+                "block_parameters" => collect_idents(child, source, set),
+                "exception_variable" => collect_idents(child, source, set),
+                "for" => {
+                    if let Some(p) = child.child_by_field_name("pattern") {
+                        collect_idents(p, source, set);
+                    }
+                    collect_locals(child, source, set);
+                }
+                _ => collect_locals(child, source, set),
+            }
+        }
+    }
+
+    /// Insert every `identifier` in `node`'s subtree (used for assignment LHS and
+    /// parameter lists). Over-collecting a default-value call name as "bound" only
+    /// suppresses one of its own bare-call edges — a safe false-negative.
+    fn collect_idents<'a>(node: Node, source: &'a str, set: &mut HashSet<&'a str>) {
+        if node.kind() == "identifier" {
+            set.insert(node_text(&node, source));
+            return;
+        }
+        let mut c = node.walk();
+        for child in node.named_children(&mut c) {
+            collect_idents(child, source, set);
+        }
+    }
+
+    /// Walk `node`, emitting a `calls` edge for each statement-position bare
+    /// identifier that is callable and not a bound local. Recurses into nested
+    /// methods as fresh scopes.
+    fn emit<'a>(
+        node: Node,
+        source: &'a str,
+        scope_name: &str,
+        bound: &HashSet<&'a str>,
+        out: &mut Vec<ParsedRelation>,
+    ) {
+        let stmt_position = matches!(
+            node.kind(),
+            "body_statement" | "then" | "else" | "ensure" | "program" | "do" | "begin"
+        );
+        let mut c = node.walk();
+        for child in node.named_children(&mut c) {
+            match child.kind() {
+                "method" | "singleton_method" => {
+                    let name = child
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, source))
+                        .unwrap_or("<module>");
+                    extract(child, source, name, out);
+                }
+                "identifier" if stmt_position => {
+                    let name = node_text(&child, source);
+                    if is_callable(name) && !bound.contains(name) {
+                        out.push(ParsedRelation {
+                            source_name: scope_name.to_string(),
+                            target_name: name.to_string(),
+                            relation: REL_CALLS.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
+                    }
+                }
+                _ => emit(child, source, scope_name, bound, out),
+            }
+        }
+    }
+
+    /// A bare name is a candidate method call when it looks like a Ruby method
+    /// name: lowercase/underscore first char (Constants/Classes are uppercase and
+    /// never bare method calls), and not a literal keyword that surfaces as an
+    /// identifier in some grammar positions.
+    fn is_callable(name: &str) -> bool {
+        let Some(first) = name.chars().next() else { return false };
+        if !(first == '_' || first.is_ascii_lowercase()) {
+            return false;
+        }
+        !matches!(name, "self" | "nil" | "true" | "false" | "super" | "__method__")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1384,9 +1384,10 @@ fn test_extract_php_imports() {
 
 #[test]
 fn test_extract_ruby_calls() {
-    // Bare names (`fetch`, `store`) in Ruby are statically ambiguous
-    // (local var read vs. method call) — tree-sitter-ruby parses them
-    // as `identifier`, not `call`. Use parens to force the call shape.
+    // Parens force the `call` shape (handled by the `"call"` arm). Bare
+    // statement-position names are ALSO extracted now (the ruby_bare_calls
+    // pass — see test_extract_ruby_bare_calls_statement_position); bare names
+    // in RHS/argument positions stay ambiguous and are intentionally skipped.
     let code = "def process\n  fetch()\n  store()\nend\n";
     let relations = extract_relations(code, "ruby").unwrap();
     let calls: Vec<&str> = relations.iter()
@@ -1397,6 +1398,57 @@ fn test_extract_ruby_calls() {
         "Ruby: missing fetch call, got: {:?}", calls);
     assert!(calls.contains(&"store"),
         "Ruby: missing store call, got: {:?}", calls);
+}
+
+#[test]
+fn test_extract_ruby_bare_calls_statement_position() {
+    // Parens-less calls in statement position now produce edges via the
+    // dedicated ruby_bare_calls pass (INDEX_VERSION 27→28). `setup`/`helper`
+    // are method calls; `x` (assigned) is a local and must NOT produce an edge.
+    let code = "def entry\n  setup\n  helper\n  x = 5\n  x\nend\n\ndef setup\n  1\nend\n\ndef helper\n  2\nend\n";
+    let relations = extract_relations(code, "ruby").unwrap();
+    let calls: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.source_name == "entry")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(calls.contains(&"setup"), "bare `setup` call must be captured, got: {:?}", calls);
+    assert!(calls.contains(&"helper"), "bare `helper` call must be captured, got: {:?}", calls);
+    assert!(!calls.contains(&"x"), "local var `x` must NOT be a call, got: {:?}", calls);
+}
+
+#[test]
+fn test_ruby_bare_calls_exclude_locals_params_blockparams() {
+    // Flood-avoidance safety net (the whole reason bare-call extraction was
+    // historically deferred): a local var whose name MATCHES a method name, a
+    // method param, multiple-assignment targets, and a block param must NEVER
+    // produce a bare-call edge — Ruby's own assigned-vs-call disambiguation.
+    let code = "def config\n  9\nend\n\ndef process(data)\n  config = load()\n  config\n  data\n  a, b = pair()\n  a\n  b\n  items.each do |item|\n    item\n  end\n  go\nend\n\ndef go\n  1\nend\n";
+    let relations = extract_relations(code, "ruby").unwrap();
+    let bare: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(bare.contains(&"go"), "bare `go` call must be captured, got: {:?}", bare);
+    for local in ["config", "data", "a", "b", "item"] {
+        assert!(!bare.contains(&local),
+            "`{local}` is a local/param/block-param and must NOT be a bare call, got: {:?}", bare);
+    }
+}
+
+#[test]
+fn test_ruby_bare_call_nested_method_is_own_scope() {
+    // A local in the OUTER method must not suppress a same-named bare call in a
+    // NESTED method (nested defs are separate scopes with their own locals).
+    let code = "def outer\n  helper = 1\n  helper\n  def inner\n    helper\n  end\nend\n\ndef helper\n  2\nend\n";
+    let relations = extract_relations(code, "ruby").unwrap();
+    // outer: `helper` is a local (assigned) → no edge.
+    assert!(!relations.iter().any(|r|
+        r.relation == REL_CALLS && r.source_name == "outer" && r.target_name == "helper"),
+        "outer's `helper` is a local var, must not be a call");
+    // inner: `helper` is NOT bound in inner → a call.
+    assert!(relations.iter().any(|r|
+        r.relation == REL_CALLS && r.source_name == "inner" && r.target_name == "helper"),
+        "inner's `helper` (unbound in inner's scope) must be a call");
 }
 
 #[test]
