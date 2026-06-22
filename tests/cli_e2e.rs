@@ -2231,6 +2231,37 @@ fn test_cli_rebuild_index_with_confirm_rebuilds() {
     assert!(std::fs::metadata(&db_path).unwrap().len() > 0, "recreated index.db must be non-empty");
 }
 
+// The atomic rebuild builds into `index.db.rebuild-<pid>` then renames it over
+// index.db (so concurrent readers never see the empty mid-rebuild window). After
+// a successful rebuild no temp file may survive, a stale temp from a
+// previously-killed rebuild must be cleaned, and the index stays queryable.
+#[test]
+fn test_cli_rebuild_index_atomic_leaves_no_temp() {
+    let project = setup_indexed_project();
+    let cg_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    let db_path = cg_dir.join("index.db");
+    assert!(db_path.exists());
+
+    // Plant a stale temp file as if a prior rebuild was killed mid-flight.
+    std::fs::write(cg_dir.join("index.db.rebuild-99999"), b"garbage").unwrap();
+
+    let (_, stderr, code) = run_cli(&project, &["rebuild-index", "--confirm"]);
+    assert_eq!(code, 0, "rebuild-index --confirm failed: {}", stderr);
+    assert!(db_path.exists() && std::fs::metadata(&db_path).unwrap().len() > 0,
+        "index.db must be a non-empty rebuilt file");
+
+    let leftovers: Vec<String> = std::fs::read_dir(&cg_dir).unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("index.db.rebuild-"))
+        .collect();
+    assert!(leftovers.is_empty(), "rebuild left temp files behind: {:?}", leftovers);
+
+    // Index still answers after the atomic swap.
+    let (_, _, hc_code) = run_cli(&project, &["health-check"]);
+    assert_eq!(hc_code, 0, "health-check must succeed after atomic rebuild");
+}
+
 // clap-migrated (audit #4) contract lock. The --confirm gate stays an exit-1
 // anyhow bail (not a clap-required arg — see test_cli_rebuild_index_requires_confirm
 // above), while clap now owns help + unknown-flag rejection (exit 2).

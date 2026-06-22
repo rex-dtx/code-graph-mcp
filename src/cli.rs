@@ -408,92 +408,119 @@ pub struct IncrementalIndexArgs {
 /// Run incremental index update.
 /// If `quiet` is true, suppress non-error output.
 /// Auto-creates the database and runs a full index if no index exists.
+/// Map SQLITE_BUSY ("database is locked", error code 5) to an actionable hint —
+/// surfaces when two indexers / an MCP server race on the same index.db. Shared
+/// by the full / incremental / embed paths.
+fn wrap_index_busy<T>(r: Result<T>) -> Result<T> {
+    r.map_err(|e| {
+        let msg = format!("{:#}", e);
+        if msg.contains("database is locked") || msg.contains("Error code 5") {
+            anyhow::anyhow!(
+                "Another `code-graph-mcp` process is writing to .code-graph/index.db \
+                 (an indexer or MCP server). Wait for it to finish, then retry. \
+                 Original error: {}",
+                e
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// Embed any nodes still missing vectors (synchronous, unlike the server's
+/// background thread). No-op without the `embed-model` feature or when the model
+/// can't load. Shared by the full / incremental / rebuild paths so embedding
+/// behaviour can't drift between them.
+fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
+    if !db.vec_enabled() {
+        return Ok(());
+    }
+    use crate::embedding::model::EmbeddingModel;
+    use crate::indexer::pipeline::embed_and_store_batch;
+    if let Some(model) = EmbeddingModel::load()? {
+        let mut total = 0usize;
+        loop {
+            let chunk = wrap_index_busy(queries::get_unembedded_nodes(db.conn(), 64))?;
+            if chunk.is_empty() { break; }
+            wrap_index_busy(embed_and_store_batch(db, &model, &chunk))?;
+            total += chunk.len();
+        }
+        if total > 0 && !quiet {
+            let (embedded, embeddable) = queries::count_nodes_with_vectors(db.conn())?;
+            eprintln!("Embedded {} nodes ({}/{})", total, embedded, embeddable);
+        }
+    }
+    Ok(())
+}
+
+/// Build a fresh FULL index into an explicit `db_path` and embed it. The DB is
+/// opened and dropped within this call, so on return the WAL is checkpointed and
+/// `db_path` is self-contained — which lets `rebuild-index` build into a temp
+/// file and atomically rename it over `index.db`.
+fn build_full_index_at(db_path: &Path, project_root: &Path, quiet: bool) -> Result<()> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        cleanup_legacy_db_files(parent);
+    }
+    // Open with vec support so embeddings can be stored.
+    let db = Database::open_with_vec(db_path)?;
+    use crate::indexer::pipeline::run_full_index;
+    let result = wrap_index_busy(run_full_index(&db, project_root, None, None))?;
+    if !quiet {
+        eprintln!(
+            "Full index: {} files, {} nodes, {} edges",
+            result.files_indexed, result.nodes_created, result.edges_created
+        );
+    }
+    embed_missing_nodes(&db, quiet)?;
+    Ok(())
+}
+
 pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
-    let is_new = !db_path.exists();
 
-    if is_new {
-        // Ensure .code-graph/ directory exists
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    // No existing DB → full index. Delegate to build_full_index_at so the
+    // full-index + embed path is shared with rebuild-index (no drift).
+    if !db_path.exists() {
         if !quiet {
             eprintln!("No index found, creating full index...");
         }
+        return build_full_index_at(&db_path, project_root, quiet);
     }
+
     cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
 
     // Open with vec support so embeddings can be stored
     let db = Database::open_with_vec(&db_path)?;
 
-    // Wrap rusqlite SQLITE_BUSY ("database is locked", error code 5) — surfaces
-    // when two indexers race on the same .code-graph/index.db. Without this, the
-    // user sees a cryptic "Error code 5: database is locked" with no remediation.
-    fn wrap_busy<T>(r: Result<T>) -> Result<T> {
-        r.map_err(|e| {
-            let msg = format!("{:#}", e);
-            if msg.contains("database is locked") || msg.contains("Error code 5") {
-                anyhow::anyhow!(
-                    "Another `code-graph-mcp` process is writing to .code-graph/index.db \
-                     (an indexer or MCP server). Wait for it to finish, then retry. \
-                     Original error: {}",
-                    e
-                )
-            } else {
-                e
-            }
-        })
-    }
-
-    if is_new {
-        // Full index for new databases
-        use crate::indexer::pipeline::run_full_index;
-        let result = wrap_busy(run_full_index(&db, project_root, None, None))?;
-        if !quiet {
+    // Incremental index for the existing database.
+    use crate::indexer::pipeline::run_incremental_index;
+    let stats = wrap_index_busy(run_incremental_index(&db, project_root, None, None))?;
+    if !quiet {
+        if stats.files_deleted > 0 {
             eprintln!(
-                "Full index: {} files, {} nodes, {} edges",
-                result.files_indexed, result.nodes_created, result.edges_created
+                "Incremental index: {} files updated, {} files removed, {} nodes created",
+                stats.files_indexed, stats.files_deleted, stats.nodes_created
+            );
+        } else {
+            eprintln!(
+                "Incremental index: {} files updated, {} nodes created",
+                stats.files_indexed, stats.nodes_created
             );
         }
-    } else {
-        // Incremental index for existing databases
-        use crate::indexer::pipeline::run_incremental_index;
-        let stats = wrap_busy(run_incremental_index(&db, project_root, None, None))?;
-        if !quiet {
-            if stats.files_deleted > 0 {
-                eprintln!(
-                    "Incremental index: {} files updated, {} files removed, {} nodes created",
-                    stats.files_indexed, stats.files_deleted, stats.nodes_created
-                );
-            } else {
-                eprintln!(
-                    "Incremental index: {} files updated, {} nodes created",
-                    stats.files_indexed, stats.nodes_created
-                );
-            }
-        }
     }
 
-    // Embed any nodes missing vectors (runs synchronously, unlike server background thread)
-    if db.vec_enabled() {
-        use crate::embedding::model::EmbeddingModel;
-        use crate::indexer::pipeline::embed_and_store_batch;
-        if let Some(model) = EmbeddingModel::load()? {
-            let mut total = 0usize;
-            loop {
-                let chunk = wrap_busy(queries::get_unembedded_nodes(db.conn(), 64))?;
-                if chunk.is_empty() { break; }
-                wrap_busy(embed_and_store_batch(&db, &model, &chunk))?;
-                total += chunk.len();
-            }
-            if total > 0 && !quiet {
-                let (embedded, embeddable) = queries::count_nodes_with_vectors(db.conn())?;
-                eprintln!("Embedded {} nodes ({}/{})", total, embedded, embeddable);
-            }
-        }
-    }
-
+    embed_missing_nodes(&db, quiet)?;
     Ok(())
+}
+
+/// SQLite sidecar path: `<db>-wal` / `<db>-shm`. Appends the literal suffix to
+/// the FULL filename (not an extension swap) — required for temp db names like
+/// `index.db.rebuild-<pid>`, whose WAL is `index.db.rebuild-<pid>-wal`.
+fn db_sidecar(db_path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = db_path.as_os_str().to_os_string();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
 }
 
 /// Drop the existing index.db (plus WAL/SHM) and trigger a full rebuild via
@@ -535,14 +562,58 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     }
     let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
     let db_path = code_graph_dir.join("index.db");
-    if db_path.exists() {
-        std::fs::remove_file(&db_path)?;
+
+    // Atomic rebuild: build the fresh index into a temp file in the SAME dir,
+    // then rename it over index.db in one syscall. Concurrent readers (a second
+    // CLI invocation, or the MCP server reopening) therefore always see a
+    // COMPLETE index — the old one until the rename, the new one after — instead
+    // of the empty/partial window the old "remove index.db then rebuild in place"
+    // left open for the entire (multi-second on large repos) rebuild.
+    let temp_path = code_graph_dir.join(format!("index.db.rebuild-{}", std::process::id()));
+    let temp_files = [
+        temp_path.clone(),
+        db_sidecar(&temp_path, "-wal"),
+        db_sidecar(&temp_path, "-shm"),
+    ];
+    let remove_all = |paths: &[std::path::PathBuf]| {
+        for p in paths {
+            if p.exists() { let _ = std::fs::remove_file(p); }
+        }
+    };
+    // Clear leftover temp files from previously-killed rebuilds (ANY pid). The
+    // `index.db.rebuild-<pid>` prefix also matches their `-wal`/`-shm` sidecars.
+    // A concurrent rebuild's in-progress temp could be swept too — that only
+    // makes the other run's final rename fail (an error, never corruption);
+    // concurrent rebuild-index runs were never supported.
+    if let Ok(entries) = std::fs::read_dir(&code_graph_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("index.db.rebuild-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
-    let wal = db_path.with_extension("db-wal");
-    let shm = db_path.with_extension("db-shm");
-    if wal.exists() { std::fs::remove_file(&wal)?; }
-    if shm.exists() { std::fs::remove_file(&shm)?; }
-    cmd_incremental_index(project_root, quiet)
+
+    // Build into the temp file. On failure, drop the temp and keep the existing
+    // index.db intact — the rename below is the only mutation of the live index,
+    // so a failed rebuild no longer leaves the user with NO index (the old
+    // remove-first path did).
+    if let Err(e) = build_full_index_at(&temp_path, project_root, quiet) {
+        remove_all(&temp_files);
+        return Err(e);
+    }
+    // The temp DB closed cleanly inside build_full_index_at (WAL checkpointed);
+    // remove any residual temp -wal/-shm so the renamed file is self-contained.
+    remove_all(&temp_files[1..]);
+
+    // Drop the OLD index's -wal/-shm BEFORE the rename: afterwards a stale
+    // index.db-wal would be (wrongly) replayed by SQLite onto the NEW index.db.
+    // The old WAL is discardable here — we're replacing the whole index. A reader
+    // in the sub-millisecond gap sees the old index.db (a valid, complete file).
+    remove_all(&[db_sidecar(&db_path, "-wal"), db_sidecar(&db_path, "-shm")]);
+
+    // Atomic swap (temp and index.db share .code-graph/ → POSIX rename is atomic).
+    std::fs::rename(&temp_path, &db_path)?;
+    Ok(())
 }
 
 // Internal notes — `//` (not `///`) so clap leaves them out of `--help`: --json and
@@ -5843,6 +5914,22 @@ mod tests {
         let root = tmp.path();
         let abs = root.join("src/parser");
         assert_eq!(normalize_user_path(root, abs.to_str().unwrap()).unwrap(), "src/parser");
+    }
+
+    #[test]
+    fn test_db_sidecar_appends_suffix_to_full_filename() {
+        // SQLite names the WAL `<dbfile>-wal` — a literal suffix, NOT an extension
+        // swap. For `index.db` both happen to agree, but for the rebuild temp
+        // `index.db.rebuild-<pid>` only the literal append is correct.
+        let canonical = std::path::Path::new("/p/.code-graph/index.db");
+        assert_eq!(db_sidecar(canonical, "-wal"),
+            std::path::PathBuf::from("/p/.code-graph/index.db-wal"));
+        assert_eq!(db_sidecar(canonical, "-shm"),
+            std::path::PathBuf::from("/p/.code-graph/index.db-shm"));
+        let temp = std::path::Path::new("/p/.code-graph/index.db.rebuild-1234");
+        assert_eq!(db_sidecar(temp, "-wal"),
+            std::path::PathBuf::from("/p/.code-graph/index.db.rebuild-1234-wal"),
+            "WAL of a multi-dot temp db must append -wal, not swap the extension");
     }
 
     #[test]
