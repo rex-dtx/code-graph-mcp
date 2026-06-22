@@ -304,12 +304,69 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Verify the downloaded compressed artifact against its `<url>.blake3` sidecar.
-/// Hard-fails on mismatch. When no sidecar is published (a pre-checksum release),
-/// warns loudly and continues — integrity could not be established, but the
-/// download still went over authenticated HTTPS (`gh api` / origin remote). New
-/// releases that ship the `.blake3` sidecar get full verification.
+/// Out-of-band integrity pin for the snapshot artifact, read from
+/// `CODE_GRAPH_SNAPSHOT_PIN` (a blake3 hex digest). Like the url-trust signal, it
+/// lives in the *environment* — deliberately NOT in `.code-graph.toml` — so a
+/// committed/PR-injected config file cannot set it. See [`verify_checksum_impl`]
+/// for why this matters.
+fn snapshot_pin() -> Option<String> {
+    std::env::var("CODE_GRAPH_SNAPSHOT_PIN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// blake3 of the (cap-bounded) artifact as lower-hex.
+fn hash_artifact(artifact: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(artifact).context("open artifact for checksum")?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).context("hash artifact")?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Verify the downloaded compressed artifact's integrity. Env-reads the
+/// out-of-band pin and delegates to [`verify_checksum_impl`].
 fn verify_checksum(url: &str, artifact: &Path) -> Result<()> {
+    verify_checksum_impl(url, artifact, snapshot_pin())
+}
+
+/// Two integrity tiers, strongest first:
+///
+/// 1. **Out-of-band pin** (`pin`, from `CODE_GRAPH_SNAPSHOT_PIN`): when set it is
+///    the SOLE authority — the artifact must blake3-match it, no network sidecar
+///    is consulted, and it applies even to `file://` sources. This is what closes
+///    the residual `CODE_GRAPH_SNAPSHOT_TRUST_URL` gap: once a url override is
+///    trusted, the attacker controls both the artifact AND its `<url>.blake3`
+///    sidecar, so a sidecar-derived checksum is circular. A pin lives in the
+///    developer's environment (a committed/PR file can't set it), so it holds
+///    independent of the url host.
+/// 2. **`<url>.blake3` sidecar** (when no pin): hard-fail on mismatch. When no
+///    sidecar is published (a pre-checksum release), warn loudly and continue —
+///    integrity could not be established, but the download still went over
+///    authenticated HTTPS (`gh api` / origin remote).
+fn verify_checksum_impl(url: &str, artifact: &Path, pin: Option<String>) -> Result<()> {
+    if let Some(pin) = pin {
+        let pin = pin.trim();
+        // blake3 hex is 64 chars; reject anything else loudly rather than failing
+        // with a confusing "mismatch" when a user pastes the wrong value.
+        if pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "CODE_GRAPH_SNAPSHOT_PIN must be a 64-char blake3 hex digest \
+                 (got {} chars) — refusing to install",
+                pin.len()
+            );
+        }
+        let actual = hash_artifact(artifact)?;
+        if !actual.eq_ignore_ascii_case(pin) {
+            anyhow::bail!(
+                "snapshot checksum mismatch (blake3): CODE_GRAPH_SNAPSHOT_PIN expected \
+                 {pin}, got {actual} — refusing to install"
+            );
+        }
+        tracing::debug!("snapshot checksum verified against CODE_GRAPH_SNAPSHOT_PIN (blake3 {actual})");
+        return Ok(());
+    }
+
     // file:// is test/config-controlled; no network sidecar to fetch.
     if url.starts_with("file://") {
         return Ok(());
@@ -333,10 +390,7 @@ fn verify_checksum(url: &str, artifact: &Path) -> Result<()> {
         return Ok(());
     }
     // Stream-hash the artifact (it is capped at MAX_COMPRESSED_BYTES).
-    let mut file = std::fs::File::open(artifact).context("open artifact for checksum")?;
-    let mut hasher = blake3::Hasher::new();
-    std::io::copy(&mut file, &mut hasher).context("hash artifact")?;
-    let actual = hasher.finalize().to_hex().to_string();
+    let actual = hash_artifact(artifact)?;
     if !actual.eq_ignore_ascii_case(&expected) {
         anyhow::bail!(
             "snapshot checksum mismatch (blake3): expected {expected}, got {actual} — refusing to install"
@@ -497,6 +551,82 @@ mod tests {
                 "must not persist content fetched over a downgraded redirect"
             );
         }
+    }
+
+    // An out-of-band CODE_GRAPH_SNAPSHOT_PIN matching the artifact accepts it
+    // WITHOUT touching the network — the url here is attacker-shaped, so a non-Ok
+    // result (a sidecar fetch to attacker.invalid) would prove the pin did not
+    // short-circuit. Ok proves the pin is the sole, url-independent authority.
+    #[test]
+    fn verify_checksum_pin_match_accepts_without_network() {
+        let tmp = TempDir::new().unwrap();
+        let artifact = tmp.path().join("snap.db.zst");
+        let bytes = b"the genuine snapshot bytes";
+        std::fs::write(&artifact, bytes).unwrap();
+        let pin = blake3::hash(bytes).to_hex().to_string();
+        let r = verify_checksum_impl("https://attacker.invalid/snap.db.zst", &artifact, Some(pin));
+        assert!(r.is_ok(), "a correct pin must accept the artifact: {r:?}");
+    }
+
+    // Closes the residual CODE_GRAPH_SNAPSHOT_TRUST_URL gap: once a url override is
+    // trusted, the attacker serves BOTH a malicious artifact and a `.blake3`
+    // sidecar matching it, so the sidecar-only check would pass. With a pin set to
+    // the genuine hash, the attacker's different artifact is rejected — the pin
+    // never consults the attacker-controlled sidecar.
+    #[test]
+    fn verify_checksum_pin_defeats_attacker_matched_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let genuine_pin = blake3::hash(b"genuine snapshot").to_hex().to_string();
+        let evil = tmp.path().join("evil.db.zst");
+        std::fs::write(&evil, b"malicious snapshot").unwrap();
+        let err = verify_checksum_impl(
+            "https://attacker.invalid/evil.db.zst",
+            &evil,
+            Some(genuine_pin),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("mismatch"),
+            "a pinned hash must reject an attacker artifact even with a matching sidecar: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_checksum_pin_mismatch_names_the_env_var() {
+        let tmp = TempDir::new().unwrap();
+        let artifact = tmp.path().join("snap.db.zst");
+        std::fs::write(&artifact, b"genuine").unwrap();
+        let err = verify_checksum_impl("https://x.invalid/x.db.zst", &artifact, Some("0".repeat(64)))
+            .unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("mismatch") && chain.contains("CODE_GRAPH_SNAPSHOT_PIN"),
+            "expected a pin-mismatch error naming the env var, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn verify_checksum_pin_rejects_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let artifact = tmp.path().join("snap.db.zst");
+        std::fs::write(&artifact, b"x").unwrap();
+        // Too short + non-hex → loud rejection, not a confusing "mismatch".
+        let err = verify_checksum_impl("https://x.invalid/x.db.zst", &artifact, Some("nothex".into()))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("CODE_GRAPH_SNAPSHOT_PIN"),
+            "a malformed pin must name the env var: {err:?}"
+        );
+    }
+
+    // No pin: behavior is unchanged — a file:// source still installs without a
+    // network sidecar (the existing TOFU path the production tests rely on).
+    #[test]
+    fn verify_checksum_no_pin_file_url_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let artifact = tmp.path().join("snap.db.zst");
+        std::fs::write(&artifact, b"whatever").unwrap();
+        assert!(verify_checksum_impl("file:///x.db.zst", &artifact, None).is_ok());
     }
 
     #[test]

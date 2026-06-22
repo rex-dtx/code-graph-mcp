@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Security
+- **`CODE_GRAPH_SNAPSHOT_PIN` — out-of-band snapshot integrity pin.** Set it to a
+  snapshot artifact's blake3 hex digest and the auto-installer verifies the
+  download against it instead of the `<url>.blake3` sidecar. Because the pin lives
+  in the environment (not in the repo's `.code-graph.toml`), it holds even when
+  `CODE_GRAPH_SNAPSHOT_TRUST_URL=1` trusts a custom url — closing the residual gap
+  where an attacker who controls the url also controls its sidecar. When set it is
+  the sole integrity authority (no network sidecar fetch) and applies to `file://`
+  sources too. Unset → behavior is unchanged.
+
 ## v0.57.0 — inline route handlers; SIGBUS/flake fixes; CLI/MCP classification unified
 
 ### Added
