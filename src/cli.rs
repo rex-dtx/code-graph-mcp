@@ -1161,11 +1161,12 @@ pub struct RecommendationSummary {
     /// for the honest signal.
     pub researched_after_answer: u64,
     /// Subset of `researched_after_answer`: the follow-up search was ITSELF
-    /// answered by cg (an answered deny / delivered hint), so the model drilled
-    /// deeper and cg kept up — each step replaced another raw grep with an answer.
-    /// A win, not a miss. Upper bound: a verbatim re-grep of the SAME pattern also
-    /// lands here (pattern-level dedup is a future refinement — the hook does not
-    /// yet record the pattern).
+    /// answered by cg (an answered deny / delivered hint) AND searched a DIFFERENT
+    /// pattern, so the model drilled deeper and cg kept up — each step replaced
+    /// another raw grep with an answer. A win, not a miss. A verbatim re-grep of
+    /// the SAME pattern is excluded (scored as fall-through) when the hook recorded
+    /// the pattern; pre-fix events without a pattern field still land here (the old
+    /// upper-bound behavior, back-compatible).
     pub sustained_after_answer: u64,
     /// Subset of `researched_after_answer`: the follow-up was a search cg could
     /// NOT satisfy (static deny / advisory-only hint / bypass). THIS is the honest
@@ -1184,6 +1185,11 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
     // action is a re-search — the inline answer wasn't enough. Lines are appended
     // chronologically so a single forward pass suffices.
     let mut armed = false;
+    // Pattern of the armed answered deny (when the hook recorded one). A follow-up
+    // search carrying the SAME pattern is a verbatim re-grep = the inline answer was
+    // ignored/insufficient (a real fall-through), NOT a deeper drill-down. Absent on
+    // pre-fix events → falls back to the answered/observe split (back-compatible).
+    let mut armed_pattern: Option<String> = None;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
@@ -1197,12 +1203,20 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
         if armed {
             if is_search_event {
                 s.researched_after_answer += 1;
-                // Split the follow-up honestly: observe = a silent file read
-                // acting on the delivered answer (not a search cg failed);
-                // answered:true = cg ALSO answered the next step (sustained
-                // drill-down, a win); anything else (static deny / advisory hint /
-                // bypass) = cg fell through — the real insufficiency.
-                if action == Some("observe") {
+                let follow_pattern = v.get("pattern").and_then(|x| x.as_str());
+                // Split the follow-up honestly. Same-pattern takes precedence: a
+                // verbatim re-grep of the SAME denied pattern (re-deny after the
+                // cooldown, or a grep observe within it) means the inline answer
+                // didn't end the hunt for THAT query → fall-through, NOT a win and
+                // NOT "acting on the answer". Otherwise: observe = a file read
+                // acting on the delivered answer; answered:true = cg ALSO answered
+                // the next (deeper) step (sustained drill-down, a win); anything
+                // else (static deny / advisory hint / bypass) = cg fell through.
+                // The is_some() guard keeps absent==absent (pre-fix events) OUT of
+                // the same-pattern branch.
+                if armed_pattern.is_some() && armed_pattern.as_deref() == follow_pattern {
+                    s.fallthrough_after_answer += 1;
+                } else if action == Some("observe") {
                     // acting on the answer — neither sustained nor fall-through
                 } else if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
                     s.sustained_after_answer += 1;
@@ -1211,6 +1225,7 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                 }
             }
             armed = false; // only the IMMEDIATELY-next tool event counts
+            armed_pattern = None;
         }
 
         // observe / use are not recommendation events: count separately, like cli use.
@@ -1227,6 +1242,9 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                 if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
                     s.deny_answered += 1;
                     armed = true; // watch the next event for a re-search
+                    // Remember the pattern (if recorded) so a verbatim re-grep of it
+                    // is scored as fall-through, not sustained.
+                    armed_pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
                 } else {
                     s.deny_unanswered += 1;
                 }
@@ -1495,14 +1513,16 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             // grep/read allows that make the fan-out visible.
             if recs.deny_answered > 0 {
                 // Honest fan-out signal. The follow-up after an answered deny is
-                // one of: cg ALSO answered it (sustained drill-down — a win), a
-                // file read acting on the answer (observe), or a search cg couldn't
-                // satisfy (fall-through). Only fall-through means the inline answer
-                // was insufficient. The raw "kept searching" count lumps all three
+                // one of: cg ALSO answered a DIFFERENT next step (sustained drill-down
+                // — a win), a file read acting on the answer (observe), or the inline
+                // answer didn't end the hunt — a verbatim re-grep of the same pattern
+                // or a search cg couldn't satisfy (fall-through). Only fall-through
+                // means the inline answer was insufficient. The raw "kept searching"
+                // count lumps all three
                 // and reads alarmingly high even when cg wins every step, so lead
                 // with fall-through and show the raw count correctly framed.
                 let ft_pct = (recs.fallthrough_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
-                println!("Fall-through after cg answer: {}/{} answered denies → next search cg couldn't satisfy = {ft_pct}% (the real 'answer insufficient' rate; lower is better)",
+                println!("Fall-through after cg answer: {}/{} answered denies → inline answer didn't end the hunt (verbatim re-grep or a search cg couldn't satisfy) = {ft_pct}% (the real 'answer insufficient' rate; lower is better)",
                     recs.fallthrough_after_answer, recs.deny_answered);
                 if recs.sustained_after_answer > 0 {
                     println!("  ↳ drill-down sustained: {} follow-up search(es) cg also answered — cg kept up, not a miss",
@@ -5625,6 +5645,47 @@ mod tests {
         assert_eq!(s.fallthrough_after_answer, 2, "L4→L5 (static) and L6→L7 (advisory hint): cg couldn't satisfy");
         assert_eq!(s.observe, 1, "L9");
         assert_eq!(s.cli_uses, 2, "L3,L11");
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_same_pattern_regrep_is_fallthrough() {
+        // Pattern fingerprint tightens `sustained` (the documented upper bound):
+        // a verbatim re-grep of the SAME denied pattern after cg answered means
+        // the inline answer was ignored/insufficient → fall-through, NOT a
+        // drill-down win (and NOT "acting on the answer" even when it lands as a
+        // grep observe within the cooldown window). A DIFFERENT pattern is genuine
+        // drill-down → sustained. A follow-up WITHOUT a pattern (read observe, or
+        // any pre-fix event) keeps the old behavior — back-compatible.
+        //   A1 answered deny pattern=foo → arm(foo)
+        //   A2 answered deny pattern=foo → SAME (re-deny after cooldown) → fall-through; re-arm(foo)
+        //   A3 cli use                   → disarm
+        //   A4 answered deny pattern=bar → arm(bar)
+        //   A5 grep observe pattern=bar  → SAME (re-grep within cooldown) → fall-through
+        //   A6 answered deny pattern=baz → arm(baz)
+        //   A7 answered deny pattern=qux → DIFFERENT → sustained; re-arm(qux)
+        //   A8 cli use                   → disarm
+        //   A9 answered deny pattern=zap → arm(zap)
+        //   A10 read observe (no pattern)→ neither (acting on the answer)
+        let content = "\
+{\"ts\":\"A1\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"foo\"}
+{\"ts\":\"A2\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"foo\"}
+{\"ts\":\"A3\",\"hook\":\"cli\",\"action\":\"use\",\"cmd\":\"grep\"}
+{\"ts\":\"A4\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"bar\"}
+{\"ts\":\"A5\",\"hook\":\"grep\",\"action\":\"observe\",\"pattern\":\"bar\"}
+{\"ts\":\"A6\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"baz\"}
+{\"ts\":\"A7\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"qux\"}
+{\"ts\":\"A8\",\"hook\":\"cli\",\"action\":\"use\",\"cmd\":\"grep\"}
+{\"ts\":\"A9\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"zap\"}
+{\"ts\":\"A10\",\"hook\":\"read\",\"action\":\"observe\"}
+";
+        let s = aggregate_recommendations_jsonl(content);
+        assert_eq!(s.deny_answered, 6, "A1,A2,A4,A6,A7,A9 answered");
+        assert_eq!(s.researched_after_answer, 4, "A2,A5,A7,A10 follow answered denies; A3/A8 use disarm");
+        assert_eq!(s.fallthrough_after_answer, 2,
+            "A1→A2 (same-pattern re-deny) and A4→A5 (same-pattern re-grep observe): answer ignored");
+        assert_eq!(s.sustained_after_answer, 1, "A6→A7: different pattern = genuine drill-down cg also answered");
+        assert_eq!(s.observe, 2, "A5,A10");
+        assert_eq!(s.cli_uses, 2, "A3,A8");
     }
 
     #[test]

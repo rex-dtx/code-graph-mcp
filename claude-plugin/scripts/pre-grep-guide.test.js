@@ -909,6 +909,45 @@ test('e2e: denied grep with stub hits → deny JSON embeds the answer + records 
   }
 });
 
+test('e2e: denied grep records the denied pattern (fingerprint for verbatim re-grep detection)', () => {
+  // The Rust funnel (aggregate_recommendations_jsonl) scores a follow-up search
+  // carrying the SAME pattern as the armed answered deny as fall-through, not a
+  // sustained drill-down. That needs the pattern on the deny event.
+  const uniq = `StubPat${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
+  const cmd = `grep -rn "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    const rec = JSON.parse(fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim().split('\n').pop());
+    assert.equal(rec.action, 'deny');
+    assert.equal(rec.pattern, uniq, 'deny event carries the denied pattern as a fingerprint');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: re-grep within cooldown → observe carries the same pattern (answer-ignored fingerprint)', () => {
+  // First grep denies + marks the cooldown; the verbatim re-grep within the
+  // window runs silently as an observe. It must carry the same pattern so the
+  // funnel can tell "ignored the inline answer" from "drilled into something new".
+  const uniq = `StubCool${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  hit\\n');`);
+  const cmd = `grep -rn "${uniq}" src/`;
+  try {
+    runHook(cmd, fixture);              // 1st → deny + markCooldown
+    const res2 = runHook(cmd, fixture); // 2nd within window → observe
+    assert.equal(res2.status, 0);
+    const last = JSON.parse(fsE2e.readFileSync(
+      pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim().split('\n').pop());
+    assert.equal(last.action, 'observe');
+    assert.equal(last.pattern, uniq, 'cooldown observe carries the re-grepped pattern');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
 test('e2e: stub reports no matches → grep allowed with FYI + records fallthrough', () => {
   const uniq = `StubMiss${Date.now()}`;
   const fixture = e2eFixture(

@@ -484,6 +484,13 @@ function runMain() {
   if (relPrefix) cmd = rebaseRelativePaths(cmd, relPrefix, root);
   if (!shouldHint(cmd)) return;
 
+  // v0.64 — fingerprint the grep's pattern once, shared by the emit points below.
+  // The funnel (aggregate_recommendations_jsonl) uses it to tell a verbatim re-grep
+  // of an answered deny (inline answer ignored → fall-through) from a deeper
+  // drill-down. undefined when there's no identifier-like pattern (unquoted / prose
+  // grep) → omitted from the event, so the funnel stays back-compatible.
+  const grepPattern = translateBreToRg(cmd, pickBlockPattern(cmd));
+
   // v0.48 — deliberate escape: record it (funnel visibility) and stay silent.
   // Before GREP_HEAD accepted bare KEY=VALUE prefixes these were invisible.
   if (commandHasBypass(rawCmd)) {
@@ -495,7 +502,7 @@ function runMain() {
     // Outcome proxy: a source grep re-issued within the cooldown window runs
     // silently (no deny/hint). Record it so `stats` sees the model's grep
     // fan-out — especially a re-grep right after cg answered the same query.
-    recordRecommendation(root, { hook: 'grep', action: 'observe' });
+    recordRecommendation(root, { hook: 'grep', action: 'observe', ...(grepPattern ? { pattern: grepPattern } : {}) });
     return;
   }
 
@@ -510,7 +517,7 @@ function runMain() {
     // v0.49 — intent-aware: declaration+context greps get `show` bodies,
     // falling back to the grep answer, then the static deny.
     let answer = { status: 'unavailable' };
-    const pattern = translateBreToRg(cmd, pickBlockPattern(cmd));
+    const pattern = grepPattern; // computed once above; reused for the answer + deny fingerprint
     // v0.48 — glob-truncated once, shared by the run and the deny message
     // (a literal `dir/*.py` argv made rg exit 1 → answered:false static deny).
     const searchPath = sanitizeSearchPath(extractSearchPath(cmd));
@@ -544,6 +551,9 @@ function runMain() {
     const unansweredTail = extractUnansweredTail(rawCmd);
     recordRecommendation(root, {
       hook: 'grep', action: 'deny', answered,
+      // pattern fingerprints the denied search so the funnel can score a verbatim
+      // re-grep of it (the inline answer was ignored) as fall-through, not a win.
+      ...(pattern ? { pattern } : {}),
       // mode segments which answer type converts (show=bodies, grep=hits).
       ...(answered ? { mode: answeredMode } : {}),
       // reason segments WHY an unanswered deny fell back to the static copy:

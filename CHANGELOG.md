@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.65.0 — Pattern-fingerprint tightens the fall-through metric (a verbatim re-grep no longer counts as a win)
+
+### Fixed
+- **`code-graph-mcp stats` no longer scores a verbatim re-grep of an answered query as "drill-down
+  sustained".** v0.64.0 split the follow-up after an answered deny into sustained (cg answered the
+  next step too — a win) vs fall-through (cg couldn't satisfy it). But it had no way to tell a
+  *deeper* search from the model re-running the *same* grep it was just answered, so a verbatim
+  re-grep (the inline answer was ignored) landed in sustained and inflated the win count. The hook
+  now records the denied search pattern, and the funnel scores a same-pattern follow-up as
+  fall-through ("the inline answer didn't end the hunt for that query"), not sustained. The stats
+  line is reworded to "inline answer didn't end the hunt (verbatim re-grep or a search cg couldn't
+  satisfy)".
+
+### Added
+- **The two PreToolUse grep emit points (`deny` and the cooldown `observe`) now record a `pattern`
+  field in `recommendations.jsonl`** — the post-translation search term. Omitted when the grep has
+  no identifier-like pattern, so events without a pattern keep the v0.64.0 sustained/observe split
+  (back-compatible).
+
+### Internal
+- `aggregate_recommendations_jsonl` tracks the armed answered-deny's pattern; a same-pattern
+  follow-up takes precedence over the observe/answered split and scores as fall-through. The
+  `is_some()` guard keeps absent-pattern events (all pre-v0.65 data) on the old behavior, so the
+  fall-through rate on existing data is unchanged until new pattern-tagged events accrue. No
+  index/schema bump (the telemetry field is additive; `stats` is output-only).
+
 ## v0.64.0 — Honest "fall-through" adoption metric (the re-search rate was over-counting)
 
 ### Fixed
