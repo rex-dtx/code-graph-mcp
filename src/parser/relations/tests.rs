@@ -2,6 +2,34 @@ use super::*;
 use crate::domain::{REL_ROUTES_TO, REL_EXPORTS, REL_REFERENCES};
 
 #[test]
+fn test_extract_php_include_imports() {
+    // PHP file includes (require / require_once / include / include_once) must
+    // produce REL_IMPORTS edges to the bare file stem (directory + `.php`
+    // stripped), mirroring C `#include` and JS `require`. Pre-fix these were
+    // silently dropped — PHP files got symbols/calls/`use` imports but no
+    // file-include dependency edges, so deps/cycles/affected/project_map
+    // under-reported PHP cross-file dependencies. INDEX_VERSION 23→24.
+    let code = "<?php\n\
+        require_once 'lib.php';\n\
+        require 'src/User.php';\n\
+        include 'helpers.php';\n\
+        include_once __DIR__ . '/config.php';\n\
+        use App\\Models\\Account;\n\
+        function handle($r) { return process($r); }\n";
+    let rels = extract_relations(code, "php").unwrap();
+    let imports: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_IMPORTS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(imports.contains(&"lib"), "require_once 'lib.php' → import 'lib'; got: {:?}", imports);
+    assert!(imports.contains(&"User"), "require 'src/User.php' → 'User' (dir stripped); got: {:?}", imports);
+    assert!(imports.contains(&"helpers"), "include 'helpers.php' → 'helpers'; got: {:?}", imports);
+    assert!(imports.contains(&"config"), "include_once __DIR__.'/config.php' → 'config'; got: {:?}", imports);
+    // The existing `use` namespace import (last segment) must still work.
+    assert!(imports.contains(&"Account"), "use App\\Models\\Account → 'Account'; got: {:?}", imports);
+}
+
+#[test]
 fn test_extract_bash_call_relations() {
     let code = r#"#!/usr/bin/env bash
 

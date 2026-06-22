@@ -81,7 +81,7 @@ pub fn normalize_confidence(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 23; // v23: per-occurrence inline route handler node names (METHOD path#Lstart) — duplicate same-route handlers in one file no longer fan out calls/routes_to edges
+pub const INDEX_VERSION: i32 = 24; // v24: PHP file-include imports (require/require_once/include/include_once → REL_IMPORTS edge to the bare file stem) — PHP deps/cycles/affected/project_map previously missed cross-file include dependencies
 
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;

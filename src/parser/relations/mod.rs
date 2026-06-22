@@ -646,6 +646,41 @@ fn walk_for_relations(
             }
         }
 
+        // PHP file includes: require / require_once / include / include_once
+        // 'path/File.php' → IMPORTS to the bare file stem. Mirrors the C/C++
+        // `#include` and JS `require` shape: strip the directory and the `.php`
+        // extension so Phase 2 can resolve the import to a concrete file node.
+        // Without this arm, PHP files got symbols + calls + `use` imports but no
+        // file-include edges, so deps/cycles/affected/project_map under-reported
+        // PHP cross-file dependencies (the AST node is a dedicated
+        // `*_expression`, never a function_call_expression, so no double-count).
+        "require_expression" | "require_once_expression"
+        | "include_expression" | "include_once_expression"
+            if config.name == "php" =>
+        {
+            if let Some(raw) = extract_string_from_subtree(&node, source) {
+                let stem = {
+                    let bare = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_str());
+                    bare.strip_suffix(".php").unwrap_or(bare).to_string()
+                };
+                if !stem.is_empty() {
+                    // Stamp the raw include path so Phase 2 can resolve it to the
+                    // concrete indexed file (require_once 'lib.php' → lib.php's
+                    // <module> node), mirroring the JS `js_module` specifier.
+                    // target_name stays the bare stem for the name-based fallback
+                    // when the path doesn't resolve to an indexed file.
+                    let metadata = Some(serde_json::json!({ "php_include": &raw }).to_string());
+                    results.push(ParsedRelation {
+                        source_name: "<module>".into(),
+                        target_name: stem,
+                        relation: REL_IMPORTS.into(),
+                        metadata,
+                        source_language: String::new(),
+                    });
+                }
+            }
+        }
+
         // PHP: use App\Models\User;
         // namespace_use_declaration -> namespace_use_clause -> qualified_name -> name (last segment)
         "namespace_use_declaration" if config.name == "php" => {

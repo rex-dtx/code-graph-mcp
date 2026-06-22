@@ -4,6 +4,10 @@
 //! can bind the import edge to the right definition instead of a path-proximity
 //! guess (the Python analog is `python_modules::resolve_python_module_targets`).
 //!
+//! Also hosts `resolve_php_include_path` — PHP `require`/`include 'lib.php'`
+//! is the same shape (a directory-relative file path), so it reuses the same
+//! normalization to bind the include edge to the included file's `<module>`.
+//!
 //! Only RELATIVE specifiers (`./`, `../`) are resolved here. Bare specifiers
 //! (`react`, `lodash`) and tsconfig path aliases are left to the existing
 //! name-based handling / `<external>` sentinels — resolving them needs
@@ -84,6 +88,47 @@ pub(super) fn resolve_js_module_targets(
     if targets.is_empty() { None } else { Some(targets) }
 }
 
+/// Resolve a PHP `require`/`include` path to the indexed file it refers to.
+/// PHP includes are resolved against the including file's directory (the common
+/// `require_once 'lib.php'`, `require 'sub/User.php'`, and
+/// `require __DIR__ . '/config.php'` forms — the last yields a leading-`/`
+/// path that is still importer-relative). Returns the normalized repo-relative
+/// path present in `file_set`, trying the path as-given then `<path>.php`. None
+/// for paths that don't resolve to an indexed file (caller leaves the edge
+/// unresolved → `<external>`), biasing toward false-negatives over wrong binds.
+pub(super) fn resolve_php_include_path(
+    include_path: &str,
+    importer_rel_path: &str,
+    file_set: &HashSet<String>,
+) -> Option<String> {
+    // Strip a leading `./` or `/` (the latter from `__DIR__ . '/x.php'`) so the
+    // join stays repo-relative. Absolute filesystem includes can't be resolved
+    // against the index, so a bare `/etc/...` simply won't match file_set.
+    let rel = include_path.trim_start_matches("./").trim_start_matches('/');
+    if rel.is_empty() {
+        return None;
+    }
+    let importer_dir = match importer_rel_path.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    };
+    let joined = if importer_dir.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{}/{}", importer_dir, rel)
+    };
+    let base = normalize_rel_path(&joined)?;
+    if file_set.contains(&base) {
+        return Some(base);
+    }
+    // Extensionless include (`require 'lib'`) → probe `.php`.
+    let with_ext = format!("{}.php", base);
+    if file_set.contains(&with_ext) {
+        return Some(with_ext);
+    }
+    None
+}
+
 /// Normalize a repo-relative path, collapsing `.` and `..` segments. Returns
 /// None if it escapes the repo root (a leading `..` with nothing to pop), which
 /// cannot correspond to an indexed file.
@@ -155,5 +200,47 @@ mod tests {
             resolve_js_specifier_path("../util/helper", "src/core/caller.ts", &files),
             Some("src/util/helper.ts".to_string())
         );
+    }
+
+    #[test]
+    fn php_include_resolves_same_dir() {
+        let files = fs(&["src/app.php", "src/lib.php"]);
+        // require_once 'lib.php' from src/app.php → src/lib.php
+        assert_eq!(
+            resolve_php_include_path("lib.php", "src/app.php", &files),
+            Some("src/lib.php".to_string())
+        );
+    }
+
+    #[test]
+    fn php_include_resolves_subdir_and_dir_constant() {
+        let files = fs(&["app.php", "models/User.php", "config.php"]);
+        // require 'models/User.php' from app.php → models/User.php
+        assert_eq!(
+            resolve_php_include_path("models/User.php", "app.php", &files),
+            Some("models/User.php".to_string())
+        );
+        // require __DIR__ . '/config.php' → extract_string yields '/config.php';
+        // the leading slash is stripped and resolved against the importer dir.
+        assert_eq!(
+            resolve_php_include_path("/config.php", "app.php", &files),
+            Some("config.php".to_string())
+        );
+    }
+
+    #[test]
+    fn php_include_extensionless_probes_php() {
+        let files = fs(&["src/app.php", "src/lib.php"]);
+        assert_eq!(
+            resolve_php_include_path("lib", "src/app.php", &files),
+            Some("src/lib.php".to_string())
+        );
+    }
+
+    #[test]
+    fn php_include_unindexed_is_none() {
+        // Vendored/third-party include not in the index → unresolved (→ <external>).
+        let files = fs(&["src/app.php"]);
+        assert_eq!(resolve_php_include_path("vendor/autoload.php", "src/app.php", &files), None);
     }
 }
