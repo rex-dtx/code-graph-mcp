@@ -59,9 +59,11 @@ pub(crate) fn synthetic_route_handler_name(method: &str, path: &str) -> Option<S
 
 /// If `node` is the inline arrow / function-expression handler of an HTTP route
 /// registration (the LAST argument of an `app|router|server|fastify.METHOD(path,
-/// ...)` call), return the synthetic handler node name "METHOD path". Used by the
-/// node extractor (Phase 1) and the relations walker (Phase 2) so the handler
-/// node, its scoped calls, and the routes_to edge all share one name.
+/// ...)` call), return the per-occurrence handler node name "METHOD path#Lstart"
+/// (the start-line suffix disambiguates multiple inline handlers for the SAME
+/// route in one file). Used by the node extractor (Phase 1) and the relations
+/// walker (Phase 2) so the handler node, its scoped calls, and the routes_to edge
+/// all share one name.
 pub(crate) fn route_handler_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
     if !matches!(node.kind(), "arrow_function" | "function_expression" | "function") {
         return None;
@@ -77,5 +79,14 @@ pub(crate) fn route_handler_name(node: &tree_sitter::Node, source: &str) -> Opti
     }
     let call = args.parent().filter(|p| p.kind() == "call_expression")?;
     let (method, path) = express_route_method_path(&call, source)?;
-    synthetic_route_handler_name(method, &path)
+    let base = synthetic_route_handler_name(method, &path)?;
+    // Append the handler's start line to disambiguate multiple inline handlers
+    // for the SAME method+path in one file (valid: conditional / overloaded
+    // registration). Without it every same-route handler collapses onto one
+    // synthetic name, so name-based edge resolution cross-links their scoped calls
+    // and fans routes_to into a cartesian product (src{N}×tgt{N}). The line keeps
+    // node identity, the handler's calls, and the routes_to edge 1:1.
+    // find_routes_by_path matches on the metadata `$.path` (storage/queries/
+    // routes.rs), not the node name, so trace / route lookup is unaffected.
+    Some(format!("{}#L{}", base, node.start_position().row + 1))
 }

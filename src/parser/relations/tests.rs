@@ -285,20 +285,24 @@ app.get('/users', async (req, res) => {
     let relations = extract_relations(code, "typescript").unwrap();
     // routes_to edge now targets the synthetic handler node, not <module>.
     let route = relations.iter().find(|r| r.relation == REL_ROUTES_TO).expect("route edge");
-    assert_eq!(route.source_name, "GET /users", "route edge source = synthetic handler name");
-    assert_eq!(route.target_name, "GET /users");
+    // Synthetic handler name now carries a per-occurrence `#Lstart` suffix so
+    // duplicate same-route handlers stay distinct; assert the base + that all four
+    // derivation points (route source/target, scoped call, materialized node) agree.
+    assert!(route.source_name.starts_with("GET /users#L"),
+        "route edge source = synthetic handler name, got {}", route.source_name);
+    assert_eq!(route.target_name, route.source_name, "routes_to is a self-edge on the handler node");
     assert!(route.metadata.as_deref().unwrap_or("").contains("\"inline\":true"));
     // The call inside the handler attributes to the handler, not the file <module>.
     let call = relations.iter()
         .find(|r| r.relation == crate::domain::REL_CALLS && r.target_name == "fetchUser")
         .expect("fetchUser call edge");
-    assert_eq!(call.source_name, "GET /users",
-        "inline-handler call must scope to the synthetic handler node, got source={}", call.source_name);
-    // Node materialization: extract_nodes produces a function node named "GET /users".
+    assert_eq!(call.source_name, route.source_name,
+        "inline-handler call must scope to the SAME synthetic handler node as the route edge, got source={}", call.source_name);
+    // Node materialization: extract_nodes produces a function node with the same name.
     let tree = crate::parser::treesitter::parse_tree(code, "typescript").unwrap();
     let nodes = crate::parser::treesitter::extract_nodes_from_tree(&tree, code, "typescript");
-    assert!(nodes.iter().any(|n| n.name == "GET /users" && n.node_type == "function"),
-        "inline handler must be materialized as a function node; got: {:?}",
+    assert!(nodes.iter().any(|n| n.name == route.source_name && n.node_type == "function"),
+        "inline handler must be materialized as a function node matching the edge name; got: {:?}",
         nodes.iter().map(|n| (n.name.clone(), n.node_type.clone())).collect::<Vec<_>>());
 }
 
@@ -312,12 +316,13 @@ fastify.post('/login', async (req, reply) => {
 "#;
     let relations = extract_relations(code, "javascript").unwrap();
     let route = relations.iter().find(|r| r.relation == REL_ROUTES_TO).expect("fastify route edge");
-    assert_eq!(route.source_name, "POST /login", "fastify route recognized + synthetic name");
+    assert!(route.source_name.starts_with("POST /login#L"),
+        "fastify route recognized + synthetic name, got {}", route.source_name);
     let call = relations.iter()
         .find(|r| r.relation == crate::domain::REL_CALLS && r.target_name == "checkAuth")
         .expect("checkAuth call edge");
-    assert_eq!(call.source_name, "POST /login",
-        "fastify inline handler must scope its calls, got source={}", call.source_name);
+    assert_eq!(call.source_name, route.source_name,
+        "fastify inline handler must scope its calls to the same handler node, got source={}", call.source_name);
 }
 
 #[test]

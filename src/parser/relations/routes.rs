@@ -57,7 +57,12 @@ fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<Parse
             "handler_start_line": handler_start,
             "handler_end_line": handler_end,
         }).to_string();
-        let name = crate::parser::synthetic_route_handler_name(http_method, &path)
+        // Reuse route_handler_name (not synthetic_route_handler_name) so the
+        // routes_to endpoint name is byte-identical to the materialized handler
+        // node + its scoped calls — same node → same "METHOD path#Lstart",
+        // including the per-occurrence line suffix that keeps duplicate same-route
+        // handlers 1:1. Falls back to <module> when the path isn't concrete.
+        let name = crate::parser::route_handler_name(&handler_arg, source)
             .unwrap_or_else(|| "<module>".into());
         Some(ParsedRelation {
             source_name: name.clone(),

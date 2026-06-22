@@ -81,7 +81,7 @@ pub fn normalize_confidence(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 22; // v22: JS member calls on require-namespace bindings (m.foo()) resolved to module
+pub const INDEX_VERSION: i32 = 23; // v23: per-occurrence inline route handler node names (METHOD path#Lstart) — duplicate same-route handlers in one file no longer fan out calls/routes_to edges
 
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;

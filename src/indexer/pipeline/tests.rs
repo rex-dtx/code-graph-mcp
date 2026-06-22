@@ -45,6 +45,54 @@ function handleLogin(req: Request) {
 }
 
 #[test]
+fn test_duplicate_inline_route_handlers_resolve_per_occurrence() {
+    // Two inline handlers for the SAME method+path in one file (valid:
+    // conditional / overloaded registration). Before the per-occurrence line
+    // suffix in route_handler_name both materialized under one synthetic name
+    // "GET /dup", so name-based edge resolution cross-linked their calls
+    // (handler-1's logA AND logB attributed to both) and fanned routes_to into a
+    // cartesian product (src{N}×tgt{N}). Each handler must resolve 1:1.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    fs::write(project_dir.path().join("routes.js"), r#"
+const express = require('express');
+const app = express();
+function logA() { console.log('a'); }
+function logB() { console.log('b'); }
+app.get('/dup', (req, res) => { logA(); res.send('1'); });
+app.get('/dup', (req, res) => { logB(); res.send('2'); });
+app.get('/unique', (req, res) => { logA(); });
+"#).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    let conn = db.conn();
+
+    // Two distinct handler nodes for the same /dup route (per-occurrence identity).
+    let dup_nodes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE name LIKE 'GET /dup%'", [], |r| r.get(0)).unwrap();
+    assert_eq!(dup_nodes, 2, "each /dup registration is its own handler node");
+
+    // routes_to: exactly one self-edge per registration (3), NOT a cartesian fan-out.
+    let routes_to: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edges WHERE relation = 'routes_to'", [], |r| r.get(0)).unwrap();
+    assert_eq!(routes_to, 3, "one routes_to per registration; no same-name cartesian fan-out");
+
+    // calls must not cross-link: exactly one /dup handler calls logA (the first),
+    // exactly one calls logB (the second) — 1 each, not 2 each.
+    let dup_to = |callee: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edges e \
+             JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id \
+             WHERE e.relation = 'calls' AND s.name LIKE 'GET /dup%' AND t.name = ?1",
+            [callee], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(dup_to("logA"), 1, "only the first /dup handler calls logA (no cross-link)");
+    assert_eq!(dup_to("logB"), 1, "only the second /dup handler calls logB (no cross-link)");
+}
+
+#[test]
 fn test_cross_language_bare_name_call_resolution() {
     // Regression: Rust method call `hasher.update(...)` was resolving to
     // JS `function update()` via global bare-name lookup, producing phantom
