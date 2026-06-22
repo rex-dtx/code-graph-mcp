@@ -424,6 +424,22 @@ fn walk_for_relations(
                                                 }
                                             }
                                         }
+                                    } else if name_node.kind() == "identifier" {
+                                        // Namespace require: `const helper = require('./x')`.
+                                        // Emit a binding marker (var → specifier) so Phase 2
+                                        // resolves `helper.foo()` member calls to the required
+                                        // module file. Marker only — the variable itself is not
+                                        // a symbol, so Phase 2 must consume it without a name edge.
+                                        let var = node_text(&name_node, source).to_string();
+                                        if !var.is_empty() {
+                                            results.push(ParsedRelation {
+                                                source_name: "<module>".into(),
+                                                target_name: var,
+                                                relation: REL_IMPORTS.into(),
+                                                metadata: Some(serde_json::json!({ "q": "ns_require", "js_module": &path }).to_string()),
+                                                source_language: String::new(),
+                                            });
+                                        }
                                     }
                                 }
                             }

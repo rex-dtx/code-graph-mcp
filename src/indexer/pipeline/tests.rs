@@ -473,6 +473,60 @@ function run() { return process(); }
 }
 
 #[test]
+fn test_commonjs_namespace_require_binds_member_call() {
+    // Cycle 4: `const helper = require('../util/helper'); helper.process()` must
+    // resolve the member call to the required module's export, not the
+    // path-closest same-name def. JS discards the receiver today (extract_callee
+    // returns Bare for non-Rust), so `helper.process()` resolves "process" by
+    // proximity. Capturing the receiver + tracking the require-namespace binding
+    // lets it bind to the required file.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src/core")).unwrap();
+    fs::create_dir_all(project_dir.path().join("src/util")).unwrap();
+
+    fs::write(project_dir.path().join("src/core/helper.js"),
+        "function process() { return 1; }\nmodule.exports = { process };\n").unwrap();
+    fs::write(project_dir.path().join("src/util/helper.js"),
+        "function process() { return 2; }\nmodule.exports = { process };\n").unwrap();
+    fs::write(project_dir.path().join("src/core/caller.js"), r#"
+const helper = require('../util/helper');
+
+function run() { return helper.process(); }
+"#).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let caller = crate::storage::queries::get_nodes_with_files_by_name(
+        db.conn(), "run",
+    ).unwrap();
+    let caller = caller.iter()
+        .find(|n| n.file_path == "src/core/caller.js")
+        .expect("run should be indexed");
+
+    let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
+    let call_target_paths: Vec<String> = edges.iter()
+        .filter(|e| e.relation == REL_CALLS)
+        .filter_map(|e| db.conn().query_row(
+            "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
+            [e.target_id], |row| row.get(0),
+        ).ok())
+        .collect();
+
+    assert!(
+        call_target_paths.iter().any(|p| p == "src/util/helper.js"),
+        "helper.process() must resolve to the required module (src/util/helper.js); got {:?}",
+        call_target_paths
+    );
+    assert!(
+        !call_target_paths.iter().any(|p| p == "src/core/helper.js"),
+        "helper.process() must NOT resolve to the path-closest non-required process (src/core/helper.js); got {:?}",
+        call_target_paths
+    );
+}
+
+#[test]
 fn test_js_module_level_test_callback_calls_resolve() {
     // Regression: helpers defined in a JS test file that are called only
     // from inside `test(() => {...})` / `describe(() => {...})` callbacks

@@ -101,6 +101,31 @@ pub(crate) fn extract_callee(
 ) -> Option<(String, CalleeQualifier)> {
     let _ = current_rust_impl; // used in Task 8+
     if language != "rust" {
+        // JS-family: capture a SIMPLE-identifier receiver (`m.foo()`) so the
+        // indexer can bind the call to a require-namespaced module
+        // (`const m = require('./x')`). Every other shape — `this.x()`,
+        // `a.b.x()`, `chain().x()`, bare `foo()` — keeps the Bare qualifier so
+        // its resolution path is unchanged (only `identifier.method()` is newly
+        // routed through the receiver-aware branch, which falls back to the
+        // identical default resolution when the receiver is not a namespace).
+        if matches!(language, "javascript" | "typescript" | "tsx") {
+            if let Some(function) = node.child_by_field_name("function") {
+                if function.kind() == "member_expression" {
+                    if let (Some(obj), Some(prop)) = (
+                        function.child_by_field_name("object"),
+                        function.child_by_field_name("property"),
+                    ) {
+                        if obj.kind() == "identifier" {
+                            let name = node_text(&prop, source).to_string();
+                            if !name.is_empty() {
+                                let recv = node_text(&obj, source).to_string();
+                                return Some((name, CalleeQualifier::Receiver(recv)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare));
     }
 

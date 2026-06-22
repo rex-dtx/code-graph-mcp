@@ -47,7 +47,7 @@ use super::{IndexResult, IndexStats, ProgressFn};
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
-use super::js_modules::resolve_js_module_targets;
+use super::js_modules::{resolve_js_module_targets, resolve_js_specifier_path};
 use super::resolve::{bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
 
 /// Batch size for streaming indexing. Each batch processes Phase 1+2
@@ -411,6 +411,26 @@ pub(super) fn index_files(
             let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
             let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
 
+            // Pre-scan this file's require-namespace bindings
+            // (`const m = require('./x')`, stamped `{"q":"ns_require",...}`) →
+            // resolved file path, so `m.foo()` member calls (CalleeMeta::Receiver)
+            // bind to the required module in the call-resolution pass below.
+            let mut ns_module_map: HashMap<String, String> = HashMap::new();
+            for rel in &relations {
+                if rel.relation != REL_IMPORTS { continue; }
+                if let Some(meta_str) = rel.metadata.as_deref() {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                        if meta.get("q").and_then(|v| v.as_str()) == Some("ns_require") {
+                            if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
+                                if let Some(file) = resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths) {
+                                    ns_module_map.insert(rel.target_name.clone(), file);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             for rel in &relations {
                 // Contract: extract_relations_from_tree stamps every relation with
                 // source_language equal to the language argument. The
@@ -441,6 +461,20 @@ pub(super) fn index_files(
                     })
                     .map(|i| pf.node_ids[i])
                     .collect::<Vec<_>>();
+
+                // Namespace-require markers (`const m = require('./x')`) were
+                // consumed by the pre-scan above into ns_module_map; the variable
+                // is not a symbol, so skip it here (a default name resolution would
+                // mint a spurious `<external>/<var>` node).
+                if rel.relation == REL_IMPORTS {
+                    if let Some(meta_str) = rel.metadata.as_deref() {
+                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                            if meta.get("q").and_then(|v| v.as_str()) == Some("ns_require") {
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 // Try Python module-constrained resolution for import edges
                 if rel.relation == REL_IMPORTS {
@@ -554,6 +588,38 @@ pub(super) fn index_files(
                 if rel.relation == REL_CALLS {
                     use super::resolve::{method_candidates, parse_callee_metadata, path_filter_candidates, self_filter_candidates, CalleeMeta};
                     match parse_callee_metadata(rel.metadata.as_deref()) {
+                        Some(CalleeMeta::Receiver(recv))
+                            if matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx") =>
+                        {
+                            // Cycle 4: `m.foo()` where `const m = require('./x')` —
+                            // bind the method to the required module file. Only JS
+                            // produces a Receiver here (extract_callee captures a
+                            // simple-identifier receiver for the JS family). When recv
+                            // is NOT a require-namespace binding (`arr.map()`,
+                            // `res.send()`) or the method isn't in that file, fall
+                            // through to the default resolution below — identical to
+                            // the pre-Cycle-4 Bare path — by NOT continuing.
+                            if let Some(module_file) = ns_module_map.get(&recv) {
+                                let targets: Vec<i64> = name_to_ids.get(&rel.target_name)
+                                    .map(|ids| ids.iter().copied()
+                                        .filter(|id| node_id_to_path.get(id)
+                                            .map(|p| p == module_file).unwrap_or(false))
+                                        .collect())
+                                    .unwrap_or_default();
+                                if !targets.is_empty() {
+                                    for &src_id in &source_ids {
+                                        for &tgt_id in &targets {
+                                            if src_id != tgt_id
+                                                && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                total_edges_created += 1;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            // Not a namespace binding → fall through to default.
+                        }
                         Some(CalleeMeta::Chain) | Some(CalleeMeta::Receiver(_)) => {
                             // Receiver type is not statically inferable (`obj.method()`
                             // where `obj`'s type is unknown). The blanket drop here

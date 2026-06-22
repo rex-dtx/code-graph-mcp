@@ -1516,16 +1516,26 @@ fn test_rust_callee_self_type_within_impl() {
 }
 
 #[test]
-fn test_non_rust_callee_metadata_unchanged() {
+fn test_js_simple_receiver_call_emits_recv_metadata() {
+    // JS simple-identifier member calls (`foo.bar()`) carry a Receiver qualifier
+    // so the indexer can bind them to a require-namespace module
+    // (`const foo = require('./x')`); see Cycle 4. Bare calls (`baz()`) keep
+    // metadata=None — the guard the previous test_non_rust_callee_metadata_
+    // unchanged enforced, preserved here for the non-receiver shapes.
     let code = "function caller() { foo.bar(); baz(); }";
     let relations = extract_relations(code, "javascript").unwrap();
-    for r in relations.iter().filter(|r| r.relation == REL_CALLS) {
-        assert_eq!(
-            r.metadata, None,
-            "non-Rust REL_CALLS relations must keep metadata=None (regression guard for {})",
-            r.target_name
-        );
-    }
+    let bar = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "bar")
+        .expect("missing call bar");
+    assert_eq!(
+        bar.metadata.as_deref(),
+        Some(r#"{"q":"recv","v":"foo"}"#),
+        "foo.bar() must emit a Receiver qualifier for require-namespace resolution"
+    );
+    let baz = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "baz")
+        .expect("missing call baz");
+    assert_eq!(baz.metadata, None, "bare baz() must keep metadata=None");
 }
 
 #[test]
