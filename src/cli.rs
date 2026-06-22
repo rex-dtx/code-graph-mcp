@@ -3679,6 +3679,9 @@ pub struct TraceArgs {
     /// Hide downstream middleware/calls (shown by default)
     #[arg(long)]
     pub no_middleware: bool,
+    /// Include test symbols in the call chain (hidden by default, matching the MCP trace tool)
+    #[arg(long)]
+    pub include_tests: bool,
     /// JSON output
     #[arg(long)]
     pub json: bool,
@@ -3697,6 +3700,10 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     let depth: i32 = args.depth.clamp(1, 20);
     let json_mode = args.json;
     let include_middleware = !args.no_middleware;
+    // Hide test symbols from the recursive call chain by default, matching the MCP
+    // trace_http_chain tool (server/tools/advanced.rs). The one-hop downstream list
+    // stays unfiltered on both surfaces. --include-tests opts the chain back in.
+    let include_tests = args.include_tests;
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -3749,6 +3756,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
             )?;
             let chain_nodes: Vec<serde_json::Value> = chain.nodes.iter()
                 .filter(|n| n.depth > 0)
+                .filter(|n| include_tests || !crate::domain::is_test_symbol(&n.name, &n.file_path))
                 .map(|n| serde_json::json!({
                     "name": n.name, "file_path": n.file_path, "depth": n.depth,
                 }))
@@ -3806,6 +3814,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         )?;
         for n in &chain.nodes {
             if n.depth == 0 { continue; }
+            if !include_tests && crate::domain::is_test_symbol(&n.name, &n.file_path) { continue; }
             let indent = "  ".repeat(n.depth as usize);
             writeln!(stdout, "{}→ {} ({})", indent, n.name, n.file_path)?;
         }

@@ -1914,6 +1914,45 @@ fn test_cli_trace_no_routes() {
     assert!(stderr.contains("No routes matching"), "should report no routes found");
 }
 
+#[test]
+fn test_cli_trace_filters_test_symbols_by_default() {
+    // Parity with the MCP trace_http_chain tool, which filters is_test_symbol out of
+    // the call chain (server/tools/advanced.rs). The CLI trace chain used to show test
+    // callees; it now hides them by default and exposes --include-tests to opt back in.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("server.ts"), r#"
+const app = express();
+function realWork() { return 1; }
+function test_helper() { return 2; }
+app.get('/widgets', (req, res) => {
+    realWork();
+    test_helper();
+    res.json([]);
+});
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // --no-middleware isolates the recursive call chain (the surface MCP filters);
+    // the one-hop "downstream" list stays unfiltered on BOTH surfaces, so excluding
+    // it here keeps the assertion focused on the chain parity.
+    // Default: the test-named callee is hidden from the chain; the prod one shows.
+    let (out, _, code) = run_cli(&project, &["trace", "GET /widgets", "--no-middleware"]);
+    assert_eq!(code, 0, "trace should resolve the route; got code {code}");
+    assert!(out.contains("realWork"), "prod callee must appear; got:\n{out}");
+    assert!(!out.contains("test_helper"), "test callee must be hidden by default; got:\n{out}");
+
+    // --include-tests shows both.
+    let (out2, _, code2) = run_cli(&project, &["trace", "GET /widgets", "--no-middleware", "--include-tests"]);
+    assert_eq!(code2, 0);
+    assert!(out2.contains("realWork") && out2.contains("test_helper"),
+        "--include-tests must show test callees; got:\n{out2}");
+}
+
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection.
 #[test]
 fn test_cli_trace_help_exits_zero() {
