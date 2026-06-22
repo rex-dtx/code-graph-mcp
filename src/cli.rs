@@ -2715,6 +2715,23 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
     let risk = impact.risk_level;
 
+    // Value references (REL_REFERENCES): callbacks / fn-pointers / type-position
+    // couplings the call graph misses. Prod sources, deduped by referencing symbol.
+    // Mirrors the MCP impact tool (server/tools/advanced.rs) so both surfaces report
+    // the same signal — CLI/MCP parity. NEVER folded into the caller counts above.
+    let value_references = {
+        use std::collections::HashSet;
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for n in &symbol_nodes {
+            for r in queries::get_incoming_references(conn, n.id, Some(crate::domain::REL_REFERENCES))? {
+                if !crate::domain::is_test_symbol(&r.name, &r.file_path) {
+                    seen.insert((r.name, r.file_path));
+                }
+            }
+        }
+        seen.len()
+    };
+
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
@@ -2726,6 +2743,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             "tests_affected": impact.test_count,
             "affected_files": impact.affected_files,
             "affected_routes": routes.len(),
+            "value_references": value_references,
             "callers": prod_callers.iter().map(|c| serde_json::json!({
                 "name": c.name,
                 "type": c.node_type,
@@ -2754,6 +2772,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         routes.len(),
         impact.test_count
     )?;
+    if value_references > 0 {
+        writeln!(
+            stdout,
+            "  {} value reference(s) — callbacks / fn-pointers / type positions (not call-graph callers)",
+            value_references
+        )?;
+    }
 
     if !routes.is_empty() {
         writeln!(stdout, "Routes:")?;

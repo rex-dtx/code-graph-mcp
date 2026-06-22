@@ -990,6 +990,8 @@ fn test_cli_impact_json() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert!(v["risk"].is_string());
     assert!(v["symbol"].is_string());
+    // value_references mirrors the MCP impact tool (CLI/MCP parity) — must be present.
+    assert!(v["value_references"].is_number(), "CLI impact json must expose value_references like MCP");
 }
 
 // clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection;
