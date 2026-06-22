@@ -94,6 +94,11 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
     };
 
     let conn = rusqlite::Connection::open(&staging_db)?;
+    // Uniformity: pin mmap=0 on every connection-open path (matches db.rs open()/
+    // open_readonly). Not a live hazard here — a short-lived, single-process producer
+    // connection, not a long-lived reader during a concurrent VACUUM — but keeps a
+    // future nonzero SQLITE_DEFAULT_MMAP_SIZE from silently re-enabling mmap anywhere.
+    conn.execute_batch("PRAGMA mmap_size = 0;")?;
     let target_str = vacuum_target.to_string_lossy().replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{target_str}';"))
         .with_context(|| format!("VACUUM INTO '{}'", vacuum_target.display()))?;
