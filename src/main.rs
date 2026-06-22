@@ -212,10 +212,50 @@ fn main() -> Result<()> {
             code_graph_mcp::cli::cmd_stats(&project_root, stats_args)
         }
         Some("doctor") => {
-            run_node_script("doctor.js", &args.iter().filter(|a| a.as_str() == "--check-only").cloned().collect::<Vec<_>>())
+            // doctor/adopt/unadopt are JS-dispatched and bypass clap, so `--help`
+            // would otherwise RUN them — and doctor's default repairs rewrite
+            // ~/.claude/settings.json (adopt rewrites MEMORY.md). `--help`/`-h`
+            // must be side-effect-free, so intercept it before run_node_script.
+            if wants_subcommand_help(&args) {
+                print!(
+                    "code-graph-mcp doctor \u{2014} diagnose and repair environment issues\n\n\
+                     USAGE:\n    code-graph-mcp doctor [--check-only]\n\n\
+                     By default doctor repairs detected issues (re-registers hooks in\n\
+                     ~/.claude/settings.json, fixes stale binary/model paths). Pass\n\
+                     --check-only to report issues without changing anything.\n"
+                );
+                Ok(())
+            } else {
+                run_node_script("doctor.js", &args.iter().filter(|a| a.as_str() == "--check-only").cloned().collect::<Vec<_>>())
+            }
         }
-        Some("adopt") => run_node_script("adopt.js", &[]),
-        Some("unadopt") => run_node_script("adopt.js", &["unadopt".to_string()]),
+        Some("adopt") => {
+            if wants_subcommand_help(&args) {
+                print!(
+                    "code-graph-mcp adopt \u{2014} install the code-graph memory file + MEMORY.md sentinel\n\n\
+                     USAGE:\n    code-graph-mcp adopt\n\n\
+                     Writes plugin_code_graph_mcp.md and a sentinel block into this\n\
+                     project's ~/.claude memory so Claude Code auto-loads the decision\n\
+                     table. Run `code-graph-mcp unadopt` to remove it.\n"
+                );
+                Ok(())
+            } else {
+                run_node_script("adopt.js", &[])
+            }
+        }
+        Some("unadopt") => {
+            if wants_subcommand_help(&args) {
+                print!(
+                    "code-graph-mcp unadopt \u{2014} remove the code-graph memory file + sentinel\n\n\
+                     USAGE:\n    code-graph-mcp unadopt\n\n\
+                     Reverses `code-graph-mcp adopt`: deletes the memory file and the\n\
+                     MEMORY.md sentinel block. User content outside the sentinel is kept.\n"
+                );
+                Ok(())
+            } else {
+                run_node_script("adopt.js", &["unadopt".to_string()])
+            }
+        }
         Some("snapshot") => {
             // clap-migrated (audit #4): nested #[command(subcommand)] replaces the
             // hand-rolled args[2]/args[3] dispatch. clap owns the no-subcommand and
@@ -244,6 +284,14 @@ fn main() -> Result<()> {
 
 fn print_version() {
     println!("code-graph-mcp {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// True if a JS-dispatched subcommand was invoked with `--help`/`-h`. Skips
+/// argv[0] (binary) and argv[1] (subcommand name) so only the subcommand's own
+/// flags are inspected. Lets doctor/adopt/unadopt honor `--help` without running
+/// their side effects (settings.json / MEMORY.md rewrites).
+fn wants_subcommand_help(args: &[String]) -> bool {
+    args.iter().skip(2).any(|a| a == "--help" || a == "-h")
 }
 
 fn print_help() {

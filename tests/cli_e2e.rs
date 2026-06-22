@@ -278,6 +278,31 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     }
 }
 
+// JS-dispatched subcommands (doctor/adopt/unadopt) bypass clap, so before the
+// `--help` interception in main.rs, `doctor --help` RAN doctor — rewriting
+// ~/.claude/settings.json — instead of printing usage. `--help`/`-h` must be
+// side-effect-free. Asserts each prints usage and exits 0, and that doctor's
+// help neither runs the diagnostic (no `🔍` run header) nor hides --check-only.
+#[test]
+fn test_cli_js_subcommands_help_is_side_effect_free() {
+    let project = TempDir::new().unwrap();
+    for cmd in ["doctor", "adopt", "unadopt"] {
+        for help_flag in ["--help", "-h"] {
+            let (stdout, _, code) = run_cli(&project, &[cmd, help_flag]);
+            assert_eq!(code, 0, "{cmd} {help_flag} should exit 0; got {code}\n{stdout}");
+            assert!(stdout.contains("USAGE"),
+                "{cmd} {help_flag} should print usage, not run the command; got:\n{stdout}");
+            // The doctor diagnostic run prints a `🔍` header; help must not.
+            assert!(!stdout.contains('\u{1f50d}'),
+                "{cmd} {help_flag} ran the command instead of showing help; got:\n{stdout}");
+        }
+    }
+    // doctor help must advertise the diagnose-only escape hatch.
+    let (stdout, _, _) = run_cli(&project, &["doctor", "--help"]);
+    assert!(stdout.contains("--check-only"),
+        "doctor --help must document --check-only; got:\n{stdout}");
+}
+
 // ============================================================
 // health-check
 // ============================================================
