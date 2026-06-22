@@ -60,6 +60,12 @@ impl Database {
         conn.execute_batch("
             PRAGMA query_only = ON;
             PRAGMA busy_timeout = 5000;
+            -- Keep mmap disabled here too (mirrors open_impl_inner). This is the
+            -- secondary / flock-denied reader: it holds a mapping while the primary
+            -- VACUUMs or checkpoints, the exact truncation-under-mmap SIGBUS hazard.
+            -- SQLite's bundled compile default is already 0, so this enforces the
+            -- invariant in code instead of relying on the build flag staying unset.
+            PRAGMA mmap_size = 0;
         ")?;
         // Detect vec tables via sqlite_master so consumers know if vector
         // search is available without needing a separate probe.
@@ -862,6 +868,24 @@ mod tests {
             .pragma_query_value(None, "mmap_size", |r| r.get(0))
             .unwrap();
         assert_eq!(mmap, 0, "mmap must stay disabled to avoid the truncation SIGBUS");
+    }
+
+    #[test]
+    fn open_readonly_also_disables_mmap() {
+        // The secondary / flock-denied reader (open_readonly) holds a mapping while
+        // the primary VACUUMs/checkpoints — the same truncation-SIGBUS hazard as
+        // open(). Pin mmap=0 on this path too so the invariant is enforced in code,
+        // not left to SQLite's compile default.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("index.db");
+        // Materialize a real DB the read-only handle can attach to.
+        Database::open(&path).unwrap();
+        let ro = Database::open_readonly(&path).unwrap();
+        let mmap: i64 = ro
+            .conn()
+            .pragma_query_value(None, "mmap_size", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mmap, 0, "read-only secondary must also keep mmap disabled");
     }
 
     #[test]
