@@ -1042,7 +1042,17 @@ fn walk_for_relations(
                             }
                         }
                     }
-                } else if let Some(scope) = active_scope {
+                } else {
+                    // Top-level bash commands ARE the script's imperative
+                    // execution flow (unlike declarative-top-level langs like
+                    // Rust/Go), so attribute them to `<module>` instead of
+                    // dropping them — an entry-point function invoked only at
+                    // top level (`run_app "$@"`) would otherwise look dead.
+                    // External commands (cd, grep, …) with no same-language
+                    // function_definition drop at Phase-2 resolution, so this
+                    // doesn't pollute the callgraph. (Mirrors the JS/TS/TSX
+                    // top-level `<module>` fallback in the call_expression arm.)
+                    let scope = active_scope.unwrap_or("<module>");
                     // Strip path prefix: ./foo, /usr/bin/foo, path/to/foo → foo
                     let short = raw.rsplit('/').next().unwrap_or(raw);
                     // Reject variable expansions ($VAR, ${VAR}), substitutions

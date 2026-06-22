@@ -96,6 +96,32 @@ run_pipeline() {
 }
 
 #[test]
+fn test_extract_bash_top_level_call_attributes_to_module() {
+    // Top-level commands are bash's imperative execution flow. An entry-point
+    // function invoked only at the script top level must emit a
+    // `<module> calls run_app` edge, or dead-code would flag the entry point.
+    // (INDEX_VERSION 25→26.)
+    let code = r#"#!/usr/bin/env bash
+run_app() {
+    echo hi
+}
+cd /tmp
+run_app "$@"
+"#;
+    let relations = extract_relations(code, "bash").unwrap();
+    let module_calls: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.source_name == "<module>")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(module_calls.contains(&"run_app"),
+        "top-level `run_app` invocation must attribute to <module>, got: {:?}", module_calls);
+    // A call INSIDE a function still attributes to that function, not <module>.
+    assert!(!relations.iter().any(|r|
+        r.relation == REL_CALLS && r.source_name == "<module>" && r.target_name == "echo"),
+        "`echo` is inside run_app's body, must attribute to run_app not <module>");
+}
+
+#[test]
 fn test_extract_c_include_imports() {
     let code = "#include \"local/utils.h\"\n#include <stdio.h>\n#include \"helpers.hpp\"\n\nint main() { return 0; }\n";
     let relations = extract_relations(code, "c").unwrap();
