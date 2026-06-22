@@ -1127,50 +1127,55 @@ pub(super) fn index_files(
         );
     }
 
-    // Phase 2d-bind: positively resolve bare-name calls to the node an explicit
-    // import in the caller's file binds them to. `refine_ambiguous_targets`
-    // picks the path-closest same-name node, which can be the wrong file when
-    // the caller `from X import name`s a farther one; that wrong edge is dropped
-    // by the prune below, so without this bind the call would be left with no
-    // edge at all. Insert the import-bound edge first, then let the prune remove
-    // the contradicted proximity edge — together they repoint the call.
-    let bound = bind_calls_to_imported_targets(db)?;
-    total_edges_created += bound;
-    if bound > 0 {
-        tracing::info!(
-            "[index] Phase 2d-bind: bound {} bare call(s) to their imported target",
-            bound
-        );
-    }
-
-    // Phase 2d: drop bare-name call edges contradicted by an explicit import in
-    // the caller's file. `refine_ambiguous_targets` keeps every tied same-name
-    // candidate when it has no disambiguating info; an import edge IS that info,
-    // so a bare `save()` in a file that does `from db import save` must bind to
-    // db.save only — the fanned-out edge to a sibling `save` elsewhere is a false
-    // caller. Removes those false positives without touching the correct edge.
-    let contradicted = prune_import_contradicted_call_edges(db)?;
-    if contradicted > 0 {
-        total_edges_created = total_edges_created.saturating_sub(contradicted);
-        tracing::info!(
-            "[index] Phase 2d: pruned {} import-contradicted call edges",
-            contradicted
-        );
-    }
-
-    // Phase 2e: classify edge confidence. One set-based pass that downgrades
-    // cross-file by-name `calls`/`references` edges to inferred/ambiguous; every
-    // precise edge keeps the column default `extracted`. Purely additive metadata
-    // — no edge added or removed. Runs after 2c/2d so the final edge set is classified.
-    //
-    // Gate (L2): the UPDATE is a full-graph GROUP-BY over nodes + join over edges.
-    // When this pass indexed nothing and deleted nothing, no node/edge changed, so
-    // the duplicate-counts are identical and reclassification is a guaranteed no-op
-    // — skip it to keep no-change invocations (e.g. query-time freshness checks
-    // where the file hash matched) off the full scan. When anything DID change it
-    // must still run globally: adding/removing a duplicate-named node in one file
-    // flips the ambiguity of cross-file edges in OTHER unchanged files.
+    // Phases 2d-bind, 2d-prune, and 2e are full-graph set-based passes (a JOIN over
+    // all edges, a DELETE with correlated subqueries, and a GROUP-BY over all nodes).
+    // Their result is a guaranteed no-op when this invocation indexed AND deleted
+    // nothing: the edge set is unchanged, so the import-bind finds nothing new to
+    // bind, the import-contradiction prune finds nothing to drop, and the confidence
+    // reclassification recomputes identical counts. Gate the whole block on a real
+    // change so no-diff incremental ticks (e.g. a file-watcher flush whose diff is
+    // empty) don't pay for three full-graph scans on the hot path. When anything DID
+    // change it must run GLOBALLY, not just over the changed files — adding/removing
+    // a duplicate-named node in ONE file flips bind/prune eligibility and the
+    // ambiguity of cross-file edges in OTHER, unchanged files. (Phase 2c above stays
+    // unconditional: it early-returns on an empty pending table, so it is already
+    // cheap on a no-op pass.)
     if !all_indexed.is_empty() || !delete_paths.is_empty() {
+        // Phase 2d-bind: positively resolve bare-name calls to the node an explicit
+        // import in the caller's file binds them to. `refine_ambiguous_targets`
+        // picks the path-closest same-name node, which can be the wrong file when
+        // the caller `from X import name`s a farther one; that wrong edge is dropped
+        // by the prune below, so without this bind the call would be left with no
+        // edge at all. Insert the import-bound edge first, then let the prune remove
+        // the contradicted proximity edge — together they repoint the call.
+        let bound = bind_calls_to_imported_targets(db)?;
+        total_edges_created += bound;
+        if bound > 0 {
+            tracing::info!(
+                "[index] Phase 2d-bind: bound {} bare call(s) to their imported target",
+                bound
+            );
+        }
+
+        // Phase 2d: drop bare-name call edges contradicted by an explicit import in
+        // the caller's file. `refine_ambiguous_targets` keeps every tied same-name
+        // candidate when it has no disambiguating info; an import edge IS that info,
+        // so a bare `save()` in a file that does `from db import save` must bind to
+        // db.save only — the fanned-out edge to a sibling `save` elsewhere is a false
+        // caller. Removes those false positives without touching the correct edge.
+        let contradicted = prune_import_contradicted_call_edges(db)?;
+        if contradicted > 0 {
+            total_edges_created = total_edges_created.saturating_sub(contradicted);
+            tracing::info!(
+                "[index] Phase 2d: pruned {} import-contradicted call edges",
+                contradicted
+            );
+        }
+
+        // Phase 2e: classify edge confidence. Downgrades cross-file by-name
+        // `calls`/`references` edges to inferred/ambiguous; every precise edge keeps
+        // the column default `extracted`. Purely additive metadata — no edge
+        // added or removed.
         let downgraded = classify_edge_confidence(db)?;
         if downgraded > 0 {
             tracing::info!(
