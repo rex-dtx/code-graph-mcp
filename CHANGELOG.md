@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.62.0 — dead-code false-positive sweep, atomic rebuild, path-traversal fix, script-language call recall
+
+### Fixed
+- **`dead-code` no longer reports implicitly-invoked methods as dead.** Constructors
+  and magic/dunder methods are dispatched by the language runtime and never carry an
+  incoming call edge, so every one was flagged as an orphan — the most damaging false
+  positive (it invites deleting a live constructor). Excluded per each language's
+  convention across nine language families: Python `__init__`/`__str__`/… (`__x__`),
+  PHP `__construct`/`__toString` (`__x`), JS/TS `constructor`, Ruby `initialize`,
+  Java/C#/Dart constructors (a function sharing the class name), and C++ constructors
+  plus destructors (`~Class`). Normal-name methods (`toString`, `to_s`) stay as candidates.
+- **`dead-code` no longer reports Markdown headings (`h1`–`h6`) as dead.** Headings are
+  document structure, never callable, so every README heading was flagged. HTML/CSS/JSON
+  contribute only an (already-excluded) `<module>` node; their content stays grep-searchable.
+- **Security: relative paths that escape the project root are rejected.** `normalize_user_path`
+  validated absolute paths but passed relative paths through unchanged, so `deps ../../secret.js`
+  read a file *outside* the project root (the barrel-scan `join`s the raw path) and leaked that
+  file's import/re-export lines. Relative `..` escapes are now rejected, consistent with the
+  existing absolute-path check, across `overview` / `dead-code` / `deps` and every `--file` flag.
+- **`rebuild-index` is now atomic.** It removed `index.db` and rebuilt in place, so for the
+  whole (multi-second on large repos) rebuild a concurrent reader opening a fresh connection saw
+  an empty/partial index and got false "no results". It now builds into a temp file and
+  atomically renames it over `index.db` — readers always see a complete index. A failed rebuild
+  also no longer destroys the existing index.
+- **`--help` / `-h` is side-effect-free for `doctor`, `adopt`, and `unadopt`.** These
+  subcommands bypass clap, so `--help` *ran* them instead of printing usage — `doctor --help`
+  rewrote `~/.claude/settings.json` and `adopt --help` rewrote `MEMORY.md`. Fixed for both the
+  native binary and the npm/npx wrapper, and the previously-undocumented `doctor --check-only`
+  diagnose-only mode is now shown in the usage.
+
+### Added
+- **Top-level (entry-point) calls are tracked for bash, Python, and Ruby.** A function invoked
+  only at script/module top level (`run_app "$@"`, a bare `main_entry()`) was dropped — only
+  JS/TS attributed top-level calls — so it had no incoming edge and `dead-code` reported the
+  entry point as dead. External commands / undefined callees still drop at Phase-2 resolution,
+  so only calls to defined functions add edges.
+- **Ruby bare (parens-less) method calls are now extracted.** `helper` (no parens/receiver)
+  parses identically to a local-variable read, so idiomatic Ruby produced no call edges. A
+  scope-aware pass replicates Ruby's own rule — a bare statement-position name is a method call
+  unless it is bound as a local (assignment / parameter / block param / `for` / `rescue`) in the
+  enclosing scope — biased to false-negatives so a local never invents a spurious caller.
+
+### Internal
+- `INDEX_VERSION` 25 → 28 (bash/Python/Ruby top-level call attribution; Ruby bare calls).
+  Existing `.code-graph/` indexes rebuild automatically on first open after upgrade.
+
 ## v0.61.0 — grep flag parity, PHP include deps, Flask route methods
 
 ### Fixed
