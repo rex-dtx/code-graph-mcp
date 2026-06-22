@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.59.0 — import-aware call resolution (calls bind to the imported definition, not a path-proximity guess)
+
+### Improved
+- **Call edges now resolve to the symbol the caller actually imports**, instead
+  of guessing the path-closest same-name definition. When several files define
+  the same name, an explicit import/require disambiguates the call — cutting
+  false callers/impact inflation and dead-code false positives. Four resolution
+  paths now consult the import binding:
+  - **bare calls bound by an in-file import** (`from x import foo; foo()`)
+    resolve to that import's target — insert the correct edge, drop the
+    contradicted proximity edge (any language whose imports already resolve);
+  - **JS/TS ES imports** (`import { foo } from './rel'`) resolve via the module
+    specifier (relative-path resolution + `.ts/.tsx/.js/.jsx/.mjs/.cjs` /
+    `/index.*` probing) rather than name proximity;
+  - **destructured CommonJS require** (`const { foo } = require('./rel')`)
+    resolves each name to the required file's export;
+  - **namespace-require member calls** (`const m = require('./rel'); m.foo()`)
+    resolve to the required module's export.
+  Bare / external / unresolved specifiers fall through to the previous
+  name-based behavior. Index format bumped (18 → 22); existing `.code-graph/`
+  indexes rebuild automatically on first use.
+
+### Fixed
+- **Plugin: atomic writes in `adopt`/`unadopt`** so a concurrent session can't
+  observe or clobber a half-written shared `MEMORY.md`.
+
 ## v0.58.0 — snapshot integrity pin (CODE_GRAPH_SNAPSHOT_PIN); freshness path-traversal guard
 
 ### Security
