@@ -38,6 +38,12 @@ pub fn find_dead_code(
         // Anonymous consts (`const _: () = assert!(...)`) are compile-time checks,
         // never callable; same pattern for anonymous `let _ = ...` bindings.
         "n.name != '_'".to_string(),
+        // Markdown headings (h1..h6, ATX + setext) are document structure, not
+        // callable code — they never carry incoming edges by nature, so reporting
+        // them as dead code is a guaranteed false positive (every README heading
+        // would be flagged). HTML/CSS/JSON contribute only a `<module>` node,
+        // already excluded above.
+        "n.type NOT IN ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')".to_string(),
         // Implicitly-invoked methods (constructors, magic/dunder methods) are
         // dispatched by the language runtime, never called by explicit name, so
         // they carry no incoming `calls` edge even when the class is fully used.
@@ -817,5 +823,51 @@ mod tests {
             "C++ destructor '~Beta' must NOT be reported dead; got: {names:?}");
         assert!(names.contains(&"compute_unused"),
             "a genuinely-dead regular method must still be reported; got: {names:?}");
+    }
+
+    /// Regression: markdown headings (h1..h6) are document structure, never
+    /// callable code, so they never carry incoming edges — reporting them dead
+    /// would flag every README heading. They must be excluded; a real dead
+    /// function in a source file must still be reported.
+    #[test]
+    fn test_find_dead_code_excludes_markdown_headings() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let md = upsert_file(conn, &FileRecord {
+            path: "README.md".into(), blake3_hash: "hmd".into(), last_modified: 1,
+            language: Some("markdown".into()),
+        }).unwrap();
+        for (i, level) in (1..=6).enumerate() {
+            insert_node(conn, &NodeRecord {
+                file_id: md, node_type: format!("h{level}"), name: format!("Heading {level}"),
+                qualified_name: None, start_line: (i as i64) * 3 + 1, end_line: (i as i64) * 3 + 3,
+                code_content: format!("{} Heading {}", "#".repeat(level), level),
+                signature: None, doc_comment: None, context_string: None,
+                name_tokens: None, return_type: None, param_types: None, is_test: false,
+            }).unwrap();
+        }
+
+        // A genuinely-dead function in a real source file — must still be reported.
+        let src = upsert_file(conn, &FileRecord {
+            path: "src/x.py".into(), blake3_hash: "hpy".into(), last_modified: 1,
+            language: Some("python".into()),
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: src, node_type: "function".into(), name: "dead_fn".into(),
+            qualified_name: None, start_line: 1, end_line: 4,
+            code_content: "def dead_fn():\n    a = 1\n    return a".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let names: Vec<String> = find_dead_code(conn, None, None, false, 1, 100)
+            .unwrap().into_iter().map(|r| r.name).collect();
+        for level in 1..=6 {
+            assert!(!names.contains(&format!("Heading {level}")),
+                "markdown h{level} heading must NOT be reported dead; got: {names:?}");
+        }
+        assert!(names.contains(&"dead_fn".to_string()),
+            "a genuinely-dead function must still be reported; got: {names:?}");
     }
 }
