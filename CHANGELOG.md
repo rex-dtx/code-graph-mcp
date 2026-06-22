@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.61.0 — grep flag parity, PHP include deps, Flask route methods
+
+### Fixed
+- **`grep` accepts grep/ripgrep's attached and bundled context flags** (`-A2`,
+  `-C2`, `-nA2`, `-niB3`). The `pattern` positional's `allow_hyphen_values`
+  previously bound an attached short value like `-A2` as the search pattern and
+  pushed the real pattern into the path list → a cryptic `rg: No such file`
+  exit 2 on one of grep's most common forms. Separated `-A 2`, literal
+  `--no-default-features` patterns, and unknown-flag errors are unchanged.
+- **File counts exclude the synthetic `<external>` pseudo-file.** `health-check`,
+  `report`, and the MCP `get_index_status` tool/resource counted the
+  unresolved-import bucket as a real file, inflating the reported count by 1
+  whenever a project has external imports (e.g. "5 files" for 4 source files).
+- **Flask `@app.route('/x', methods=['GET'])` routes carry the declared HTTP
+  method.** The verb was read only from the decorator name, so every Flask route
+  was recorded as "ANY" and `trace 'GET /x'` (exact-method filter) matched
+  nothing. The `methods=` kwarg is now parsed (first verb when several are
+  listed; no `methods=` stays "ANY").
+
+### Added
+- **PHP `require` / `require_once` / `include` / `include_once` file imports are
+  extracted and resolved.** PHP was the only supported language whose
+  file-include dependencies produced no edge — `deps` / `cycles` / `affected` /
+  `project_map` now see PHP cross-file includes. The include path resolves
+  against the importing file's directory to the included file's module node;
+  unindexed/vendored paths fall through to `<external>`.
+
+### Internal
+- `INDEX_VERSION` 23 → 25 (PHP file-include imports; Flask route method
+  metadata). Existing `.code-graph/` indexes rebuild automatically on first open
+  after upgrade.
+
 ## v0.60.0 — accurate duplicate-route handling + CLI/MCP parity
 
 ### Fixed
