@@ -12,6 +12,24 @@ process.env._FIND_BINARY_ROOT = path.resolve(__dirname, "..");
 // Lets `code-graph-mcp adopt` / `unadopt` work uniformly across plugin / npm / npx.
 const sub = process.argv[2];
 if (sub === "adopt" || sub === "unadopt") {
+  // `--help`/`-h` must be side-effect-free: adopt() writes the memory file +
+  // MEMORY.md sentinel, unadopt() removes them. The Rust binary guards this for
+  // direct invocation, but npm/npx routes through this wrapper, which intercepts
+  // adopt/unadopt *before* the binary — so the guard must be repeated here, or
+  // `code-graph-mcp adopt --help` rewrites MEMORY.md (the common new-user path).
+  if (process.argv.slice(3).some((a) => a === "--help" || a === "-h")) {
+    process.stdout.write(sub === "adopt"
+      ? "code-graph-mcp adopt — install the code-graph memory file + MEMORY.md sentinel\n\n" +
+        "USAGE:\n    code-graph-mcp adopt\n\n" +
+        "Writes plugin_code_graph_mcp.md and a sentinel block into this project's\n" +
+        "~/.claude memory so Claude Code auto-loads the decision table. Run\n" +
+        "`code-graph-mcp unadopt` to remove it.\n"
+      : "code-graph-mcp unadopt — remove the code-graph memory file + sentinel\n\n" +
+        "USAGE:\n    code-graph-mcp unadopt\n\n" +
+        "Reverses `code-graph-mcp adopt`: deletes the memory file and the MEMORY.md\n" +
+        "sentinel block. User content outside the sentinel is kept.\n");
+    process.exit(0);
+  }
   const { adopt, unadopt, formatResult } = require("../claude-plugin/scripts/adopt");
   const result = sub === "unadopt" ? unadopt() : adopt();
   process.stdout.write(formatResult(sub, result) + "\n");

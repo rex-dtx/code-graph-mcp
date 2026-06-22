@@ -461,6 +461,30 @@ test('§2.1 bin/cli.js exists and is executable entry point', () => {
   assert.match(content, /spawn/, 'Must spawn binary as child process');
 });
 
+test('§2.1b bin/cli.js: adopt/unadopt --help is side-effect-free', () => {
+  // The npm/npx wrapper intercepts adopt/unadopt BEFORE the binary. `--help`/`-h`
+  // must print usage WITHOUT running adopt() (writes the memory file + MEMORY.md
+  // sentinel) / unadopt() — the common new-user path is `... adopt --help`. The
+  // Rust binary guards this separately for direct invocation.
+  for (const sub of ['adopt', 'unadopt']) {
+    for (const flag of ['--help', '-h']) {
+      const home = mkHome();
+      const cwd = path.join(home, 'proj');
+      fs.mkdirSync(cwd, { recursive: true });
+      fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}'); // project marker
+      const out = execFileSync(process.execPath, [BIN_CLI, sub, flag], {
+        cwd, env: { ...process.env, HOME: home }, stdio: ['pipe', 'pipe', 'pipe'],
+      }).toString();
+      assert.match(out, /USAGE/, `${sub} ${flag} must print usage`);
+      // adopt/unadopt run-markers must be absent (proves the command didn't run).
+      assert.doesNotMatch(out, /Adopted|Indexed|Removed/, `${sub} ${flag} ran the command`);
+      // And no memory must be written under the sandbox HOME.
+      assert.ok(!fs.existsSync(path.join(home, '.claude', 'projects')),
+        `${sub} ${flag} wrote memory (side effect)`);
+    }
+  }
+});
+
 test('§2.2 find-binary.js resolves dev binary in source repo', () => {
   const result = execFileSync(process.execPath, [FIND_BINARY], {
     env: { ...process.env, _FIND_BINARY_ROOT: ROOT },
