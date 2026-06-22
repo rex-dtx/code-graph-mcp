@@ -319,6 +319,107 @@ def run():
 }
 
 #[test]
+fn test_js_named_import_resolves_via_module_specifier() {
+    // Cycle 2: JS/TS import edges must resolve via the module specifier
+    // (`from '../util/helper'`), not by path-proximity name matching. Two files
+    // define `process`; the caller imports the farther one explicitly. The
+    // import edge must bind to the specifier-resolved file, not the path-closest
+    // same-name node (which is what refine_ambiguous_targets picks today).
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src/core")).unwrap();
+    fs::create_dir_all(project_dir.path().join("src/util")).unwrap();
+
+    fs::write(project_dir.path().join("src/core/helper.ts"),
+        "export function process() { return 1; }\n").unwrap();
+    fs::write(project_dir.path().join("src/util/helper.ts"),
+        "export function process() { return 2; }\n").unwrap();
+    fs::write(project_dir.path().join("src/core/caller.ts"), r#"
+import { process } from '../util/helper';
+
+export function run() { return process(); }
+"#).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let import_target_paths: Vec<String> = db.conn().prepare(
+        "SELECT tf.path FROM edges e
+         JOIN nodes sn ON sn.id = e.source_id
+         JOIN files sf ON sf.id = sn.file_id
+         JOIN nodes tn ON tn.id = e.target_id
+         JOIN files tf ON tf.id = tn.file_id
+         WHERE e.relation = 'imports' AND sf.path = 'src/core/caller.ts'
+           AND tn.name = 'process'"
+    ).unwrap()
+     .query_map([], |r| r.get::<_, String>(0)).unwrap()
+     .filter_map(Result::ok)
+     .collect();
+
+    assert!(
+        import_target_paths.iter().any(|p| p == "src/util/helper.ts"),
+        "import must resolve via specifier to src/util/helper.ts; got {:?}",
+        import_target_paths
+    );
+    assert!(
+        !import_target_paths.iter().any(|p| p == "src/core/helper.ts"),
+        "import must NOT bind to the path-closest src/core/helper.ts; got {:?}",
+        import_target_paths
+    );
+}
+
+#[test]
+fn test_js_import_binds_call_over_path_proximity() {
+    // Cycle 2 end-to-end (TS analog of test_import_binding_resolves_call_over_path_proximity):
+    // once JS imports resolve via specifier, the Cycle-1 bind repoints the bare
+    // call to the imported target instead of the path-closest same-name def.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src/core")).unwrap();
+    fs::create_dir_all(project_dir.path().join("src/util")).unwrap();
+
+    fs::write(project_dir.path().join("src/core/helper.ts"),
+        "export function process() { return 1; }\n").unwrap();
+    fs::write(project_dir.path().join("src/util/helper.ts"),
+        "export function process() { return 2; }\n").unwrap();
+    fs::write(project_dir.path().join("src/core/caller.ts"), r#"
+import { process } from '../util/helper';
+
+export function run() { return process(); }
+"#).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let caller = crate::storage::queries::get_nodes_with_files_by_name(
+        db.conn(), "run",
+    ).unwrap();
+    let caller = caller.iter()
+        .find(|n| n.file_path == "src/core/caller.ts")
+        .expect("run should be indexed");
+
+    let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
+    let call_target_paths: Vec<String> = edges.iter()
+        .filter(|e| e.relation == REL_CALLS)
+        .filter_map(|e| db.conn().query_row(
+            "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
+            [e.target_id], |row| row.get(0),
+        ).ok())
+        .collect();
+
+    assert!(
+        call_target_paths.iter().any(|p| p == "src/util/helper.ts"),
+        "run() must resolve to the IMPORTED process (src/util/helper.ts); got {:?}",
+        call_target_paths
+    );
+    assert!(
+        !call_target_paths.iter().any(|p| p == "src/core/helper.ts"),
+        "run() must NOT resolve to the path-closest non-imported process (src/core/helper.ts); got {:?}",
+        call_target_paths
+    );
+}
+
+#[test]
 fn test_js_module_level_test_callback_calls_resolve() {
     // Regression: helpers defined in a JS test file that are called only
     // from inside `test(() => {...})` / `describe(() => {...})` callbacks

@@ -47,6 +47,7 @@ use super::{IndexResult, IndexStats, ProgressFn};
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
+use super::js_modules::resolve_js_module_targets;
 use super::resolve::{bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
 
 /// Batch size for streaming indexing. Each batch processes Phase 1+2
@@ -164,6 +165,19 @@ pub(super) fn index_files(
         }
     }
     let python_module_map = build_python_module_map(&all_python_paths);
+
+    // All indexed file paths (this run's `files` plus everything already in the
+    // DB), used to resolve JS/TS relative import specifiers to a concrete file.
+    // Includes pseudo-files like `<external>`; the resolver only matches real
+    // relative paths so they never collide.
+    let mut all_file_paths: HashSet<String> = files.iter().cloned().collect();
+    {
+        let mut stmt = db.conn().prepare("SELECT path FROM files")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            all_file_paths.insert(row?);
+        }
+    }
 
     // Pre-load global name->[(id, path, language)] map once before the batch loop.
     // This avoids a full table scan per batch in Phase 2 relation resolution.
@@ -461,6 +475,39 @@ pub(super) fn index_files(
                                     }
                                     continue; // No point in default resolution for external imports
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Try JS/TS relative-specifier resolution for import edges. The
+                // parser stamps `{"js_module":"<specifier>"}` (imports.rs);
+                // resolve the specifier against the importer's path + extension
+                // probing to a concrete file so the import binds there instead
+                // of a path-proximity same-name guess. Combined with Phase
+                // 2d-bind, this also repoints the matching bare calls. Bare/
+                // external/unindexed specifiers return None → fall through to
+                // default name-based / `<external>` resolution (unchanged).
+                if rel.relation == REL_IMPORTS {
+                    if let Some(ref meta_str) = rel.metadata {
+                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                            if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str()) {
+                                if let Some(targets) = resolve_js_module_targets(
+                                    js_module, &pf.rel_path, &rel.target_name,
+                                    &all_file_paths, &name_to_ids, &node_id_to_path,
+                                ) {
+                                    for &src_id in &source_ids {
+                                        for &tgt_id in &targets {
+                                            if src_id != tgt_id
+                                                && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                total_edges_created += 1;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                // Unresolved (bare pkg / re-export / unindexed) —
+                                // fall through to default resolution below.
                             }
                         }
                     }

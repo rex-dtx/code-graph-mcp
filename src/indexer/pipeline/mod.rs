@@ -20,6 +20,7 @@ use crate::storage::queries::{
 mod embed;
 mod context;
 mod python_modules;
+mod js_modules;
 mod resolve;
 mod index_files;
 

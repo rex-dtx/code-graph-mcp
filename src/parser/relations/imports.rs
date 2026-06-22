@@ -10,13 +10,25 @@ use super::helpers::MAX_SUBTREE_DEPTH;
 use crate::domain::REL_IMPORTS;
 
 pub(super) fn extract_import_names(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
+    // Capture the ES module specifier (`from '../util/helper'`) so the indexer
+    // can resolve a relative import to a concrete file (mirrors Python's
+    // python_module metadata). The `source` field is the string literal; strip
+    // its quotes. Absent (no `from` clause) → no metadata, default resolution.
+    // The specifier is stamped on every binding this statement introduces.
+    let js_module = node.child_by_field_name("source")
+        .map(|s| node_text(&s, source))
+        .map(|raw| raw.trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string())
+        .filter(|s| !s.is_empty());
+    let metadata: Option<String> = js_module.as_ref()
+        .map(|m| serde_json::json!({ "js_module": m }).to_string());
+
     // Walk children looking for import specifiers or identifiers
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
             match child.kind() {
                 "import_clause" | "import_specifier" | "dotted_name" => {
                     // For named imports: import { Foo, Bar } from '...'
-                    extract_import_specifiers(&child, source, results);
+                    extract_import_specifiers(&child, source, results, metadata.as_deref());
                 }
                 "identifier" | "namespace_import" => {
                     let name = node_text(&child, source).to_string();
@@ -25,24 +37,24 @@ pub(super) fn extract_import_names(node: &tree_sitter::Node, source: &str, resul
                             source_name: "<module>".into(),
                             target_name: name,
                             relation: REL_IMPORTS.into(),
-                            metadata: None,
+                            metadata: metadata.clone(),
                             source_language: String::new(),
                         });
                     }
                 }
                 _ => {
-                    extract_import_names_recursive(&child, source, results);
+                    extract_import_names_recursive(&child, source, results, metadata.as_deref());
                 }
             }
         }
     }
 }
 
-fn extract_import_specifiers(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
-    extract_import_specifiers_inner(node, source, results, 0);
+fn extract_import_specifiers(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, metadata: Option<&str>) {
+    extract_import_specifiers_inner(node, source, results, metadata, 0);
 }
 
-fn extract_import_specifiers_inner(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, depth: usize) {
+fn extract_import_specifiers_inner(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, metadata: Option<&str>, depth: usize) {
     if depth > MAX_SUBTREE_DEPTH { return; }
     if node.kind() == "import_specifier" {
         if let Some(name_node) = node.child_by_field_name("name") {
@@ -51,7 +63,7 @@ fn extract_import_specifiers_inner(node: &tree_sitter::Node, source: &str, resul
                 source_name: "<module>".into(),
                 target_name: name,
                 relation: REL_IMPORTS.into(),
-                metadata: None,
+                metadata: metadata.map(str::to_string),
                 source_language: String::new(),
             });
         }
@@ -59,16 +71,16 @@ fn extract_import_specifiers_inner(node: &tree_sitter::Node, source: &str, resul
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            extract_import_specifiers_inner(&child, source, results, depth + 1);
+            extract_import_specifiers_inner(&child, source, results, metadata, depth + 1);
         }
     }
 }
 
-fn extract_import_names_recursive(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>) {
-    extract_import_names_recursive_inner(node, source, results, 0);
+fn extract_import_names_recursive(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, metadata: Option<&str>) {
+    extract_import_names_recursive_inner(node, source, results, metadata, 0);
 }
 
-fn extract_import_names_recursive_inner(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, depth: usize) {
+fn extract_import_names_recursive_inner(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, metadata: Option<&str>, depth: usize) {
     if depth > MAX_SUBTREE_DEPTH { return; }
     if node.kind() == "import_specifier" || node.kind() == "identifier" {
         let name = if node.kind() == "import_specifier" {
@@ -83,7 +95,7 @@ fn extract_import_names_recursive_inner(node: &tree_sitter::Node, source: &str, 
                 source_name: "<module>".into(),
                 target_name: name,
                 relation: REL_IMPORTS.into(),
-                metadata: None,
+                metadata: metadata.map(str::to_string),
                 source_language: String::new(),
             });
         }
@@ -91,7 +103,7 @@ fn extract_import_names_recursive_inner(node: &tree_sitter::Node, source: &str, 
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            extract_import_names_recursive_inner(&child, source, results, depth + 1);
+            extract_import_names_recursive_inner(&child, source, results, metadata, depth + 1);
         }
     }
 }
