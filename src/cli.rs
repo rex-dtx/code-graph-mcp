@@ -182,13 +182,18 @@ impl CliContext {
 /// - `"./foo"` → `"foo"`
 /// - absolute path under `project_root` → relative portion (lexical first, canonical fallback for symlinks)
 /// - absolute path outside `project_root` → error
-/// - relative path → unchanged
+/// - relative path that escapes the root via `..` → error
+/// - other relative path → unchanged
 ///
 /// Why: indexed `file_path` columns in SQLite are project-relative. When users
 /// paste an absolute path from an IDE (very common), the CLI used to silently
 /// return empty/wrong results (`overview` "No symbols found", `dead-code` exit-0
 /// "No dead code found", `deps` bogus barrel-scan fallback). All three are
 /// indistinguishable from real "no results" → user trusts the wrong answer.
+/// A relative `..` escape is worse than wrong: the index holds only in-root
+/// paths, so the path can only match the disk — `deps`' barrel-scan reads
+/// `project_root.join(raw)`, turning `deps ../../secret.js` into a path-traversal
+/// file read that leaks the file's import/re-export lines. Reject the escape.
 fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
     if raw == "." {
         return Ok(String::new());
@@ -198,6 +203,27 @@ fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
     }
     let p = Path::new(raw);
     if !p.is_absolute() {
+        // Resolve `..`/`.` lexically (no filesystem touch — the target may be
+        // gitignored or already deleted) and reject any prefix that climbs above
+        // the root. `depth` is the component count relative to the root; it going
+        // negative at any point means the path escaped.
+        let mut depth: i32 = 0;
+        for comp in p.components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    depth -= 1;
+                    if depth < 0 {
+                        anyhow::bail!(
+                            "path '{}' escapes the project root '{}' \u{2014} use a path inside the project",
+                            raw, project_root.display()
+                        );
+                    }
+                }
+                std::path::Component::Normal(_) => depth += 1,
+                // CurDir (`.`) and any RootDir/Prefix don't climb above the root.
+                _ => {}
+            }
+        }
         return Ok(raw.to_string());
     }
     if let Ok(rel) = p.strip_prefix(project_root) {
@@ -5817,6 +5843,26 @@ mod tests {
         let root = tmp.path();
         let abs = root.join("src/parser");
         assert_eq!(normalize_user_path(root, abs.to_str().unwrap()).unwrap(), "src/parser");
+    }
+
+    #[test]
+    fn test_normalize_user_path_rejects_relative_dotdot_escape() {
+        // A relative path climbing above the root must error, not pass through:
+        // the index holds only in-root paths, so an escaping path can only match
+        // the disk. `deps`' barrel-scan reads `project_root.join(raw)`, so this is
+        // a path-traversal file read (leaks import/re-export lines), not just a
+        // wrong query.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for escape in ["../secret.js", "../../etc/passwd", "a/../../b", ".."] {
+            let err = normalize_user_path(root, escape).unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("escapes the project root"),
+                "{escape:?} should be rejected as an escape; got: {msg}");
+        }
+        // Non-escaping `..` (stays at or below the root) is still allowed through.
+        assert_eq!(normalize_user_path(root, "a/../b").unwrap(), "a/../b");
+        assert_eq!(normalize_user_path(root, "src/sub/../mod.rs").unwrap(), "src/sub/../mod.rs");
     }
 
     #[test]
