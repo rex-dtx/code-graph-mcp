@@ -90,6 +90,21 @@ test('adopt preserves existing MEMORY.md content and appends', () => {
   } finally { sb.cleanup(); }
 });
 
+test('adopt + unadopt write atomically — no .tmp residue in the memory dir', () => {
+  // The memory dir is shared with claude-mem-lite, which reads MEMORY.md on
+  // every keyword match; a non-atomic write crashing mid-flight would corrupt
+  // it. adopt/unadopt now go through writeFileAtomic (tmp + rename). Proof the
+  // rename completed cleanly across all three write sites (detail file + adopt
+  // index + unadopt prune): no leftover `*.tmp.<pid>` entries.
+  const sb = makeSandbox();
+  try {
+    adopt({ cwd: sb.cwd, home: sb.home });
+    unadopt({ cwd: sb.cwd, home: sb.home });
+    const residue = fs.readdirSync(sb.dir).filter((f) => f.includes('.tmp.'));
+    assert.deepStrictEqual(residue, [], `no atomic-write tmp residue; found: ${residue}`);
+  } finally { sb.cleanup(); }
+});
+
 test('adopt refuses a non-project cwd even when the memory dir already exists (regression: /tmp adoption)', () => {
   // Bug: the isProjectRoot guard was nested inside `if (!fs.existsSync(dir))`,
   // so when Claude Code had already created ~/.claude/projects/<slug>/memory

@@ -24,6 +24,15 @@ function readAdoptedBy(filePath) {
     return m ? m[1] : null;
   } catch { return null; }
 }
+// Atomic write (tmp in same dir → rename) so a crash mid-write can't leave a
+// half-written MEMORY.md / detail file — the dir is shared with claude-mem-lite,
+// which reads MEMORY.md on every keyword match. Mirrors lifecycle.js
+// writeJsonAtomic / auto-update.js binary promote; accepts a string or Buffer.
+function writeFileAtomic(filePath, data) {
+  const tmp = filePath + '.tmp.' + process.pid;
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, filePath);
+}
 // One-liner per MEMORY.md spec ("each entry should be one line"). All routing
 // triggers from prior multi-line block preserved verbatim — collapsing to single
 // line is a structural fix, not a signal change. Decision table lives in the
@@ -354,7 +363,7 @@ function adopt({ cwd, home, templatePath } = {}) {
   // ADOPTED_BY_RE strip below).
   const tplBody = fs.readFileSync(tpl);
   const marker = Buffer.from(`<!-- adopted-by: ${effectiveCwd} -->\n`);
-  fs.writeFileSync(target, Buffer.concat([marker, tplBody]));
+  writeFileAtomic(target, Buffer.concat([marker, tplBody]));
 
   const indexPath = path.join(dir, 'MEMORY.md');
   const index = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '# Memory Index\n';
@@ -372,7 +381,7 @@ function adopt({ cwd, home, templatePath } = {}) {
   const cleaned = stripSentinelBlock(index);
   const healed = cleaned !== index;
   const base = cleaned.endsWith('\n') ? cleaned : cleaned + '\n';
-  fs.writeFileSync(indexPath, base + desiredBlock + '\n');
+  writeFileAtomic(indexPath, base + desiredBlock + '\n');
   return { ok: true, target, indexPath, indexed: true, healed, collisionWith };
 }
 
@@ -479,7 +488,7 @@ function unadopt({ cwd, home } = {}) {
     const before = fs.readFileSync(indexPath, 'utf8');
     const after = stripSentinelBlock(before);
     if (after !== before) {
-      fs.writeFileSync(indexPath, after);
+      writeFileAtomic(indexPath, after);
       indexPruned = true;
     }
   }
