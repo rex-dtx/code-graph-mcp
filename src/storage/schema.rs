@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS edges (
     target_id   INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     relation    TEXT NOT NULL,
     metadata    TEXT,
-    -- Resolution confidence (v17+): extracted | inferred | ambiguous. Assigned
+    -- Resolution confidence (added by migrate_v8_to_v9, SCHEMA_VERSION 9):
+    -- extracted | inferred | ambiguous. Assigned
     -- by classify_edge_confidence after Phase 2 + the pending sweep. Defaults to
     -- 'extracted' so the ~10 precise insert sites need no change; only cross-file
     -- by-name calls/references get downgraded. See domain::CONF_* .

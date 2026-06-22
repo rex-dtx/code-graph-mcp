@@ -391,8 +391,8 @@ fn walk_for_relations(
                             // Destructured require: `const { foo, bar } = require('./x')`.
                             // Emit a per-name import stamped with the full specifier so
                             // js_modules resolution binds each name to the required file's
-                            // export (and Phase 2d-bind then repoints the matching calls) —
-                            // the CommonJS analog of ES named imports. The last-segment
+                            // export (and Phase 2d-bind repoints calls made under the EXPORT
+                            // name) — the CommonJS analog of ES named imports. The last-segment
                             // module import above is kept for module-level dep tracking.
                             if let Some(decl) = node.parent().filter(|p| p.kind() == "variable_declarator") {
                                 if let Some(name_node) = decl.child_by_field_name("name") {
@@ -403,6 +403,11 @@ fn walk_for_relations(
                                                 // Shorthand `{ foo }` → the binding name; renamed
                                                 // `{ foo: f }` (pair_pattern) → the KEY (export name),
                                                 // since that is what the required file exports.
+                                                // The import edge is correct either way, but Phase
+                                                // 2d-bind keys on the export name: a shorthand call
+                                                // (`foo()`, local == export) is repointed; a renamed
+                                                // local call (`f()`) is NOT (known long-tail limit —
+                                                // see feedback_import_aware_call_resolution).
                                                 let imported = match binding.kind() {
                                                     "shorthand_property_identifier_pattern" => {
                                                         Some(node_text(&binding, source).to_string())
