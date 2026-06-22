@@ -268,14 +268,24 @@ jobs:
         shell: bash
         run: |
           set -eu
+          # `npm install -g` EXITS 0 even when a platform optionalDependency
+          # (@sdsrs/code-graph-<os>-<arch>) has not propagated to the registry yet —
+          # npm silently skips an unresolvable optional dep ("added 1 package"
+          # instead of 2). So the npm exit code is NOT a reliable signal: the binary
+          # can be missing after a "successful" install (v0.66.0 ubuntu smoke). Gate
+          # the retry on the binary actually RESOLVING to the expected version, not on
+          # npm's exit code, so the backoff actually covers optional-dep propagation.
+          expected="code-graph-mcp ${VERSION}"
           for attempt in 1 2 3 4 5; do
             echo "Install attempt $attempt of 5..."
-            if npm install -g "@sdsrs/code-graph@${VERSION}"; then
-              echo "Install succeeded on attempt $attempt"
+            npm install -g "@sdsrs/code-graph@${VERSION}" || true
+            if actual=$(code-graph-mcp --version 2>/dev/null) && [ "$actual" = "$expected" ]; then
+              echo "Install + binary resolved on attempt $attempt: $actual"
               break
             fi
+            echo "Binary not resolvable yet (got '${actual:-<none>}', want '$expected') — platform package likely still propagating."
             if [ "$attempt" = "5" ]; then
-              echo "::error::npm install failed after 5 attempts for version ${VERSION}"
+              echo "::error::@sdsrs/code-graph@${VERSION} did not yield a working binary after 5 attempts (platform optional-dep never resolved)"
               exit 1
             fi
             sleep $((attempt * 15))
