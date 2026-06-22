@@ -294,6 +294,40 @@ fn test_cli_health_check() {
 }
 
 #[test]
+fn test_cli_health_check_files_excludes_external_pseudo_file() {
+    // Regression: the user-facing `files` count must report real source files
+    // only, not the synthetic `<external>` pseudo-file (the unresolved-import
+    // bucket). a.js imports a builtin (`crypto`) so `<external>` is created; with
+    // 2 real files the count must be 2, not 3. The fix is in the shared
+    // get_index_status, so `report` and the MCP get_index_status tool inherit it.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.js"),
+        "const crypto = require('crypto');\nfunction fa() { return crypto.randomUUID(); }\nmodule.exports = { fa };\n").unwrap();
+    std::fs::write(src.join("b.js"),
+        "const { fa } = require('./a');\nfunction fb() { return fa(); }\nmodule.exports = { fb };\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    {
+        let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+        code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+        // Self-check: the fixture must actually create the <external> pseudo-file,
+        // else this test would pass even with the bug present.
+        let total: i64 = db.conn().query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        let real: i64 = db.conn()
+            .query_row("SELECT COUNT(*) FROM files WHERE path != '<external>'", [], |r| r.get(0)).unwrap();
+        assert_eq!(real, 2, "fixture has 2 real source files");
+        assert_eq!(total, 3, "fixture must create the <external> pseudo-file to exercise the bug; total={total}");
+    }
+    let (stdout, _, code) = run_cli(&project, &["health-check", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    assert_eq!(v["files"].as_i64().unwrap(), 2,
+        "health-check `files` must exclude the <external> pseudo-file; got: {stdout}");
+}
+
+#[test]
 fn test_cli_health_check_json() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["health-check", "--json"]);
@@ -567,6 +601,50 @@ fn test_cli_grep_noop_muscle_memory_flags() {
     let (stdout, _, code) = run_cli(&project, &["grep", "-n", "validateToken", "src/auth.ts"]);
     assert_eq!(code, 0, "grep -n <pat> <path> must work");
     assert!(stdout.contains("validateToken"));
+}
+
+#[test]
+fn test_cli_grep_attached_context_forms() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // Drop-in grep parity: the attached numeric context forms `-A2`/`-B1`/`-C2`
+    // (real grep and ripgrep both accept them) must parse as context, NOT get
+    // bound as the search pattern by the pattern positional's allow_hyphen_values.
+    // Pre-fix, `grep -A2 pat path` set pattern="-A2" and pushed "pat" into the
+    // path list → rg "No such file or directory: pat", exit 2 — a cryptic failure
+    // on one of grep's most common invocations.
+    let (stdout, stderr, code) =
+        run_cli(&project, &["grep", "-A2", "validateToken", "src/auth.ts"]);
+    assert_eq!(code, 0, "attached -A2 must parse as after-context; stderr={stderr}");
+    assert!(stdout.contains("validateToken"), "should find the match, got: {stdout}");
+    // After-context lines render with a `-` line separator (rg/grep style).
+    assert!(stdout.contains("src/auth.ts-"),
+        "after-context lines should appear for -A2, got: {stdout}");
+    // -C2 and -B1 attached forms likewise bind the pattern, not the flag.
+    let (_, se_c, code_c) = run_cli(&project, &["grep", "-C2", "validateToken", "src/auth.ts"]);
+    assert_eq!(code_c, 0, "attached -C2 must work; stderr={se_c}");
+    let (_, se_b, code_b) = run_cli(&project, &["grep", "-B1", "validateToken", "src/auth.ts"]);
+    assert_eq!(code_b, 0, "attached -B1 must work; stderr={se_b}");
+    // Bundled boolean short(s) + trailing attached context. grep and ripgrep both
+    // accept `-nA2`; the value flag is always last in a bundle. `-n` is advertised
+    // here as a no-op parity flag, so `grep -nA2 pat` is a high-probability
+    // muscle-memory form that must not regress to the cryptic rg path error.
+    let (so_n, se_n, code_n) =
+        run_cli(&project, &["grep", "-nA2", "validateToken", "src/auth.ts"]);
+    assert_eq!(code_n, 0, "bundled -nA2 must parse as -n + after-context; stderr={se_n}");
+    assert!(so_n.contains("validateToken"), "should find the match, got: {so_n}");
+    assert!(so_n.contains("src/auth.ts-"), "after-context lines should appear for -nA2, got: {so_n}");
+    // -niA2: the bundled -i must still take effect (case-insensitive match).
+    let (so_ni, se_ni, code_ni) =
+        run_cli(&project, &["grep", "-niA2", "VALIDATETOKEN", "src/auth.ts"]);
+    assert_eq!(code_ni, 0, "bundled -niA2 (with -i) must work; stderr={se_ni}");
+    assert!(so_ni.contains("validateToken"), "-niA2 should match case-insensitively, got: {so_ni}");
+    // The `--` escape still lets a literal "-A2" be searched as a pattern
+    // (normalization must stop at the `--` separator).
+    std::fs::write(project.path().join("DASH.md"), "the -A2 flag here\n").unwrap();
+    let (stdout_lit, _, code_lit) = run_cli(&project, &["grep", "--", "-A2"]);
+    assert_eq!(code_lit, 0, "literal -A2 via -- must still search as a pattern");
+    assert!(stdout_lit.contains("DASH.md"), "should find literal -A2, got: {stdout_lit}");
 }
 
 #[test]

@@ -19,7 +19,14 @@ pub struct IndexStatus {
 }
 
 pub fn get_index_status(conn: &Connection, is_watching: bool) -> Result<IndexStatus> {
-    let files_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+    // Exclude the synthetic `<external>` pseudo-file (the unresolved-import
+    // bucket) so the user-facing file count reflects real source files only —
+    // matching what the indexer reports ("Full index: N files") and project_map's
+    // `f.path != '<external>'` filter. This count feeds CLI health-check/report
+    // and the MCP get_index_status tool + resource. The `has_data` gates that
+    // read files_count stay correct: a real index always has ≥1 real file.
+    let files_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE path != '<external>'", [], |r| r.get(0))?;
     let nodes_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
     let edges_count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
     let last_indexed_at: Option<i64> = conn.query_row(

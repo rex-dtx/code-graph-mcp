@@ -97,7 +97,10 @@ fn main() -> Result<()> {
         }
         Some("grep") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let grep_args = code_graph_mcp::cli::GrepArgs::parse_from(args.iter().skip(1));
+            // parse_grep_args normalizes attached context forms (`-A2` → `-A 2`)
+            // before clap, so grep's attached numeric syntax works despite the
+            // pattern positional's allow_hyphen_values (see normalize_grep_argv).
+            let grep_args = code_graph_mcp::cli::parse_grep_args(&args);
             code_graph_mcp::cli::cmd_grep(&project_root, grep_args)
         }
         // MCP tool names (e.g. `semantic_code_search`) accepted as aliases for

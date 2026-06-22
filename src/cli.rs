@@ -1445,6 +1445,82 @@ pub struct GrepArgs {
     pub with_filename: bool,
 }
 
+/// Split attached short-option context forms (`-A2` → `-A`, `2`; bundled
+/// `-nA2` → `-nA`, `2`) so the `grep` subcommand accepts grep/ripgrep's attached
+/// numeric syntax.
+///
+/// The `pattern` positional carries `allow_hyphen_values` so a flag-shaped
+/// search term (e.g. `--no-default-features`) is searchable without a `--`
+/// escape. The side effect: clap binds an attached short value like `-A2` —
+/// which is not an *exact* registered token — to the positional as the pattern
+/// instead of parsing `-A` with value `2`, leaving the real pattern to be
+/// misrouted into the path list (rg then errors "No such file"). Splitting the
+/// digits into a separate token makes `-A`/`-B`/`-C` exact tokens again (and a
+/// bundle like `-nA2` becomes `-nA 2`, which clap parses as `-n -A=2`).
+///
+/// Stops at the first `--` so an intentional literal `-A2` *pattern* after the
+/// separator (`grep -- -A2`) is preserved verbatim.
+pub fn normalize_grep_argv(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut after_sep = false;
+    for a in args {
+        if after_sep || a == "--" {
+            after_sep = after_sep || a == "--";
+            out.push(a);
+            continue;
+        }
+        if let Some((cluster, digits)) = split_attached_context(&a) {
+            out.push(cluster);
+            out.push(digits);
+            continue;
+        }
+        out.push(a);
+    }
+    out
+}
+
+/// If `tok` is a single-dash short-flag cluster ending in an attached context
+/// value — `-A2`, `-C10`, or a bundle like `-nA2`/`-niB3` (leading boolean
+/// shorts, then `-A`/`-B`/`-C`, then digits) — return `(cluster_without_digits,
+/// digits)`. Returns `None` otherwise (incl. `--long`, bare `-A`, `-m2`, `-A2x`,
+/// and `-A2B3` where a value flag is not last in the bundle).
+///
+/// grep and ripgrep both accept these attached forms, and the value flag is only
+/// ever last in a bundle (`-nA2` valid; `-A2n`/`-An2` rejected by real grep), so
+/// we peel a trailing `[ABC][0-9]+` run that sits after a run of ASCII-letter
+/// shorts. clap then bundle-parses the cluster (`-nA` → `-n -A`) and the bare
+/// `-A`/`-B`/`-C` takes the now-separate digit token as its value.
+fn split_attached_context(tok: &str) -> Option<(String, String)> {
+    let b = tok.as_bytes();
+    // single dash, not `--`, at least `-X0` (a flag char + ≥1 digit).
+    if b.len() < 3 || b[0] != b'-' || b[1] == b'-' {
+        return None;
+    }
+    // Start of the trailing ASCII-digit run (one past the last non-digit byte).
+    let digit_start = b.iter().rposition(|&c| !c.is_ascii_digit())? + 1;
+    if digit_start == b.len() {
+        return None; // no trailing digits (e.g. `-A2x`, `-nr`)
+    }
+    // The byte immediately before the digits must be a value-taking context flag,
+    // and everything between `-` and the digits must be ASCII letters (the
+    // leading boolean shorts + that context flag). Rejects `-A2B3`, `-m2`, `-2`.
+    if !matches!(b[digit_start - 1], b'A' | b'B' | b'C')
+        || !b[1..digit_start].iter().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some((tok[..digit_start].to_string(), tok[digit_start..].to_string()))
+}
+
+/// Parse `grep` arguments from the full process argv (including argv\[0]),
+/// applying [`normalize_grep_argv`] first. Mirrors the other subcommands'
+/// `skip(1)`; clap consumes the leading `grep` token as the binary-name slot.
+pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
+    GrepArgs::parse_from(normalize_grep_argv(
+        argv.iter().skip(1).cloned().collect(),
+    ))
+}
+
 /// AST-context grep: ripgrep + AST context from index.
 ///
 /// Output format:
@@ -5773,5 +5849,32 @@ mod tests {
             assert_eq!(res, "src/parser");
             let _ = std::fs::remove_file(&link_root);
         }
+    }
+
+    #[test]
+    fn test_normalize_grep_argv_attached_context() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Attached numeric context forms split into flag + value.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-A2", "pat"])), s(&["grep", "-A", "2", "pat"]));
+        assert_eq!(normalize_grep_argv(s(&["grep", "-B1", "pat"])), s(&["grep", "-B", "1", "pat"]));
+        assert_eq!(normalize_grep_argv(s(&["grep", "-C10", "pat"])), s(&["grep", "-C", "10", "pat"]));
+        // Bundled boolean short(s) + trailing attached context: peel the digits,
+        // keep the cluster so clap parses `-nA 2` as `-n -A=2`.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-nA2", "pat"])), s(&["grep", "-nA", "2", "pat"]));
+        assert_eq!(normalize_grep_argv(s(&["grep", "-niB3", "pat"])), s(&["grep", "-niB", "3", "pat"]));
+        // Value flag not last in the bundle (`-A2B3`) → digit in the middle → left alone.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-A2B3"])), s(&["grep", "-A2B3"]));
+        // Bare `-A` (clap takes the next token as its value) is untouched.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-A", "2", "pat"])), s(&["grep", "-A", "2", "pat"]));
+        // Non-context single-dash flags and `--long` patterns are untouched.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-n", "pat"])), s(&["grep", "-n", "pat"]));
+        assert_eq!(normalize_grep_argv(s(&["grep", "--no-default-features"])),
+                   s(&["grep", "--no-default-features"]));
+        // Digit-suffix on a non-context flag (`-m2`) is left alone.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-m2", "pat"])), s(&["grep", "-m2", "pat"]));
+        // Non-digit tail (`-A2x`) is not a valid attached form → left alone.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-A2x"])), s(&["grep", "-A2x"]));
+        // `--` stops normalization so a literal `-A2` pattern survives.
+        assert_eq!(normalize_grep_argv(s(&["grep", "--", "-A2"])), s(&["grep", "--", "-A2"]));
     }
 }
