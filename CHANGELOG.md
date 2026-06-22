@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.66.0 — Fall-through metric excludes inconclusive follow-ups; recovers the failed v0.65.0 release
+
+> **Note:** v0.65.0's Release workflow failed at the Publish step (a transient crates.io error during
+> an unnecessary in-CI rebuild), so v0.65.0 was tagged but never published — v0.64.0 remained the
+> latest release. v0.66.0 contains all v0.65.0 changes plus the fixes below and publishes cleanly.
+> No user action needed; auto-update moves you straight from v0.64.0 to v0.66.0.
+
+### Fixed
+- **The Release Publish job no longer rebuilds the binary.** The `Update versions` step ran
+  `sync-versions.js`, whose local "rebuild release binary" convenience ran `cargo build --release`
+  inside CI — pointless (the 5 platform binaries are already built by the matrix jobs) and fragile:
+  a transient `download of float8 failed` crates.io error failed the entire publish *after* every
+  binary had built. The step now sets `SYNC_VERSIONS_SKIP_BUILD=1`; downstream steps use the
+  pre-built artifacts + npm packages, never `target/release/`.
+- **`code-graph-mcp stats` no longer counts inconclusive follow-ups as fall-through.** A follow-up
+  search after an answered deny that itself found nothing (`no-hits` — cg ran the next grep and got
+  0 hits) or could not run (`unavailable` — cg CLI down) carries no signal about whether the inline
+  answer was sufficient, yet was scored as "answer insufficient". Such follow-ups now go to a
+  separate `followup_inconclusive` bucket, excluded from the fall-through rate (same over-count
+  class as the v0.64.0 drill-down/observe fix). A verbatim same-pattern re-grep still scores as
+  fall-through.
+
+### Added
+- **Opt-in `.code-graph/.no-metrics` sentinel.** A development/dogfood checkout that runs the tool's
+  own CLI/hooks for functionality testing or simulations can drop this file under `.code-graph/` to
+  stop `record_cli_use` (Rust) and `recordRecommendation` (JS) from appending self-generated
+  `use`/hook events to its own `recommendations.jsonl` (which otherwise read back as genuine
+  adoption). Does not affect `usage.jsonl` (MCP tool metrics still flow). Delete the file to re-enable.
+
+### Internal
+- `aggregate_recommendations_jsonl` adds the `followup_inconclusive` counter (no-hits / unavailable
+  follow-ups); `stats` text + `--json` surface it so the components of `researched_after_answer`
+  stay legible. No index/schema bump (telemetry + output only).
+
 ## v0.65.0 — Pattern-fingerprint tightens the fall-through metric (a verbatim re-grep no longer counts as a win)
 
 ### Fixed

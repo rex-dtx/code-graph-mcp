@@ -6,7 +6,7 @@ use std::process::Command;
 
 use clap::{Parser, Subcommand};
 
-use crate::domain::CODE_GRAPH_DIR;
+use crate::domain::{CODE_GRAPH_DIR, NO_METRICS_SENTINEL};
 use crate::storage::db::Database;
 use crate::storage::queries;
 
@@ -915,6 +915,17 @@ pub fn record_cli_use(project_root: &Path, cmd: &str) {
     if !dir.is_dir() {
         return;
     }
+    // Opt-in per-project metrics silence. A `.code-graph/.no-metrics` sentinel marks
+    // a development/dogfood checkout where the tool's OWN CLI is run for functionality
+    // testing, sims, or ad-hoc dev — those runs would otherwise append `use` events
+    // to the project's own recommendations.jsonl and read back as genuine consumer
+    // adoption (the 2026-06-23 self-pollution: 184 burst rows from in-repo CLI runs).
+    // Guards ONLY this recommendations-log write; MCP usage.jsonl (flush_metrics) is
+    // untouched, so a dev repo's real MCP tool metrics still flow. Mirrored in JS
+    // recommendation-log.js. Reversible: delete the file to re-enable.
+    if dir.join(NO_METRICS_SENTINEL).exists() {
+        return;
+    }
     let line = serde_json::json!({
         "ts": crate::mcp::metrics::iso8601_now(),
         "hook": "cli",
@@ -1174,6 +1185,17 @@ pub struct RecommendationSummary {
     /// signal — the actual fan-out leak. `observe` (a file read acting on the
     /// delivered answer) is excluded from both subsets: it is not a search cg failed.
     pub fallthrough_after_answer: u64,
+    /// Subset of `researched_after_answer` EXCLUDED from both sustained AND
+    /// fall-through: the follow-up search is itself a NULL signal about the prior
+    /// answer's sufficiency. Two shapes: `fallthrough:"no-hits"` (cg ran the next
+    /// grep and found nothing — necessarily a DIFFERENT query, since a verbatim
+    /// re-grep of the answered pattern would re-hit the prior answer's lines, so
+    /// 0 hits ⇒ a new search, not "the answer was wrong") and `reason:"unavailable"`
+    /// (cg CLI couldn't run — infra, orthogonal to answer quality). Counting either
+    /// as fall-through over-states "answer insufficient" — the same over-count class
+    /// as lumping in drill-down/observe (v0.64). Tracked so the named subsets of
+    /// `researched_after_answer` stay legible.
+    pub followup_inconclusive: u64,
 }
 
 /// Parse and aggregate `recommendations.jsonl` content. Pure: no IO, no panics —
@@ -1214,8 +1236,21 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                 // else (static deny / advisory hint / bypass) = cg fell through.
                 // The is_some() guard keeps absent==absent (pre-fix events) OUT of
                 // the same-pattern branch.
+                let follow_inconclusive = v.get("fallthrough").and_then(|x| x.as_str())
+                    == Some("no-hits")
+                    || v.get("reason").and_then(|x| x.as_str()) == Some("unavailable");
                 if armed_pattern.is_some() && armed_pattern.as_deref() == follow_pattern {
                     s.fallthrough_after_answer += 1;
+                } else if follow_inconclusive {
+                    // The follow-up is a NULL signal about the prior answer: `no-hits`
+                    // = cg ran the next grep and found nothing (a verbatim re-grep of
+                    // the answered pattern would have re-hit it, so 0 hits ⇒ a NEW
+                    // query, not "the answer was wrong"); `unavailable` = cg CLI
+                    // couldn't run (infra). Neither means the inline answer was
+                    // insufficient → exclude from fall-through (same over-count class
+                    // as the observe/drill-down split). Ordered after the same-pattern
+                    // check so a verbatim re-grep still scores as fall-through.
+                    s.followup_inconclusive += 1;
                 } else if action == Some("observe") {
                     // acting on the answer — neither sustained nor fall-through
                 } else if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
@@ -1409,6 +1444,7 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 } else { serde_json::Value::Null },
                 "sustained_after_answer": recs.sustained_after_answer,
                 "fallthrough_after_answer": recs.fallthrough_after_answer,
+                "followup_inconclusive": recs.followup_inconclusive,
                 "fallthrough_rate": if recs.deny_answered > 0 {
                     serde_json::json!((recs.fallthrough_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() / 100.0)
                 } else { serde_json::Value::Null },
@@ -1527,6 +1563,10 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 if recs.sustained_after_answer > 0 {
                     println!("  ↳ drill-down sustained: {} follow-up search(es) cg also answered — cg kept up, not a miss",
                         recs.sustained_after_answer);
+                }
+                if recs.followup_inconclusive > 0 {
+                    println!("  ↳ inconclusive (excluded): {} follow-up(s) where cg found nothing (no-hits = a new query) or was unavailable — says nothing about the prior answer",
+                        recs.followup_inconclusive);
                 }
                 let raw_pct = (recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
                 println!("  ↳ any follow-up (raw): {}/{} = {raw_pct}% — incl. drill-down + file-reads; NOT a failure rate",
@@ -5689,6 +5729,38 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_recommendations_inconclusive_followup_excluded_from_fallthrough() {
+        // Consumer-data over-count fix: a follow-up after an answered deny that is
+        // itself a NULL signal about the prior answer must NOT count as fall-through.
+        // Two shapes — `no-hits` (cg ran the next grep, found nothing → a NEW query,
+        // since a verbatim re-grep of the answered pattern would re-hit it) and
+        // `unavailable` (cg CLI couldn't run → infra). Same honesty principle as the
+        // v0.64 drill-down/observe exclusion. Same-pattern still wins (verbatim
+        // re-grep = answer ignored = real fall-through, even if it now finds nothing).
+        //   N1 answered deny → N2 grep hint fallthrough=no-hits          = inconclusive
+        //   N3 answered deny → N4 grep deny answered:false reason=unavail = inconclusive
+        //   N5 answered deny → N6 grep static deny (answered:false)       = fall-through (cg couldn't)
+        //   N7 answered deny pattern=foo → N8 same-pattern deny no-hits   = fall-through (pattern wins)
+        let content = "\
+{\"ts\":\"N1\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"N2\",\"hook\":\"grep\",\"action\":\"hint\",\"fallthrough\":\"no-hits\"}
+{\"ts\":\"N3\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"N4\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":false,\"reason\":\"unavailable\"}
+{\"ts\":\"N5\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"N6\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":false}
+{\"ts\":\"N7\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"foo\"}
+{\"ts\":\"N8\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":false,\"pattern\":\"foo\",\"fallthrough\":\"no-hits\"}
+";
+        let s = aggregate_recommendations_jsonl(content);
+        assert_eq!(s.deny_answered, 4, "N1,N3,N5,N7 answered");
+        assert_eq!(s.researched_after_answer, 4, "N2,N4,N6,N8 all follow answered denies");
+        assert_eq!(s.followup_inconclusive, 2, "N2 (no-hits) + N4 (unavailable): null signal, excluded");
+        assert_eq!(s.fallthrough_after_answer, 2,
+            "N6 (static deny cg couldn't satisfy) + N8 (same-pattern re-grep wins over no-hits)");
+        assert_eq!(s.sustained_after_answer, 0, "no follow-up was itself answered by cg");
+    }
+
+    #[test]
     fn test_aggregate_recommendations_counts_live_impact_separately() {
         // v0.63 — SessionStart live-context injections are a separate counter,
         // like observe/use: NOT in total/by_action, and they don't trip the
@@ -5751,6 +5823,32 @@ mod tests {
         assert_eq!(last["action"], "use");
         assert_eq!(last["cmd"], "callgraph");
         serde_json::from_str::<serde_json::Value>(content.lines().next().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_record_cli_use_skips_when_no_metrics_sentinel_present() {
+        // A `.code-graph/.no-metrics` sentinel silences the recommendations-log
+        // writer so a dev/dogfood checkout's own CLI runs (functionality testing,
+        // sims, ad-hoc dev) don't self-pollute its adoption metrics with `use`
+        // events that read back as genuine consumer traffic. Safe to toggle
+        // CODE_GRAPH_INTERNAL (no test SETS it to "1"; parallel removes are idempotent).
+        std::env::remove_var("CODE_GRAPH_INTERNAL");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cg = root.join(CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&cg).unwrap();
+        let rec = cg.join("recommendations.jsonl");
+
+        // No sentinel → the use event is recorded.
+        record_cli_use(root, "grep");
+        let after_first = std::fs::read_to_string(&rec).unwrap();
+        assert_eq!(after_first.lines().count(), 1, "use event recorded when no sentinel present");
+
+        // Sentinel present → record_cli_use is a no-op; the file is byte-unchanged.
+        std::fs::write(cg.join(crate::domain::NO_METRICS_SENTINEL), b"").unwrap();
+        record_cli_use(root, "callgraph");
+        let after_second = std::fs::read_to_string(&rec).unwrap();
+        assert_eq!(after_second, after_first, "sentinel must suppress the second use event");
     }
 
     #[test]

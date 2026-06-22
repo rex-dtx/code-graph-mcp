@@ -5,6 +5,15 @@
 // -- Data directory --
 pub const CODE_GRAPH_DIR: &str = ".code-graph";
 
+/// Opt-in per-project metrics-silence sentinel (a file under `.code-graph/`). When
+/// present, the recommendations.jsonl writers — `cli::record_cli_use` (Rust) and
+/// `recommendation-log.js` (JS hooks) — skip recording, so a development/dogfood
+/// checkout's own CLI/hook runs (manual functionality testing, sims, ad-hoc dev)
+/// don't pollute the project's adoption metrics with self-generated events. Does
+/// NOT silence MCP usage.jsonl (flush_metrics), so real dev MCP tool metrics still
+/// flow. Kept in sync with the literal in claude-plugin/scripts/recommendation-log.js.
+pub const NO_METRICS_SENTINEL: &str = ".no-metrics";
+
 // -- MCP tool surface --
 /// Tools surfaced in `tools/list` (the live surface MCP clients see). Single
 /// source of truth so `stats` can flag legacy/folded tool names recorded in

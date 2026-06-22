@@ -125,7 +125,16 @@ jobs:
           cp artifacts/binary-win32-x64/code-graph-mcp.exe npm/win32-x64/
 
       - name: Update versions
+        # SYNC_VERSIONS_SKIP_BUILD: the Publish job already has the 5 pre-built
+        # platform binaries (matrix artifacts); sync-versions.js's local
+        # "rebuild release binary" convenience is pointless here and made the
+        # release fragile — a transient crates.io blip (v0.65.0: `download of
+        # float8 failed`) failed the whole publish at the rebuild, after all
+        # binaries were built. Downstream steps use artifacts/ + npm/, never
+        # target/release/, so skipping the rebuild is safe.
         run: node scripts/sync-versions.js $VERSION
+        env:
+          SYNC_VERSIONS_SKIP_BUILD: '1'
 
       - name: Release smoke test
         run: node --test scripts/release-smoke.test.js

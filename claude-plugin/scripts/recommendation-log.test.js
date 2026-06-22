@@ -32,6 +32,19 @@ test('recordRecommendation is a no-op (no dir created) when .code-graph absent',
   assert.equal(fs.existsSync(path.join(cwd, '.code-graph')), false);
 });
 
+test('recordRecommendation is a no-op when .code-graph/.no-metrics sentinel present', (t) => {
+  const cwd = tmpProject(t, true);
+  // Without the sentinel it records normally...
+  assert.equal(recordRecommendation(cwd, { hook: 'grep', action: 'deny' }), true);
+  const before = fs.readFileSync(path.join(cwd, '.code-graph', REC_FILE), 'utf8');
+  // ...then the project marks itself metrics-silent (a dev/dogfood checkout)...
+  fs.writeFileSync(path.join(cwd, '.code-graph', '.no-metrics'), '');
+  // ...and subsequent recordings are suppressed, leaving the file byte-unchanged.
+  assert.equal(recordRecommendation(cwd, { hook: 'grep', action: 'hint' }), false);
+  const after = fs.readFileSync(path.join(cwd, '.code-graph', REC_FILE), 'utf8');
+  assert.equal(after, before, 'sentinel must suppress further recordings');
+});
+
 test('recordRecommendation appends across calls (one line each)', (t) => {
   const cwd = tmpProject(t, true);
   recordRecommendation(cwd, { hook: 'grep', action: 'hint' });

@@ -17,6 +17,9 @@ const fs = require('fs');
 const path = require('path');
 
 const REC_FILE = 'recommendations.jsonl';
+// Opt-in per-project metrics-silence sentinel (under .code-graph/). Mirror of the
+// Rust `domain::NO_METRICS_SENTINEL` — keep the literal in sync.
+const NO_METRICS_FILE = '.no-metrics';
 
 // Bounded growth: recommendations.jsonl is append-only and written per-event
 // from BOTH here and the Rust CLI (cli::record_cli_use). Keep these constants in
@@ -57,6 +60,11 @@ function recordRecommendation(cwd, event = {}) {
     // Append-only: do NOT create .code-graph. Its absence means "not an indexed
     // project" — recording there would pollute non-project cwds.
     if (!fs.existsSync(dir)) return false;
+    // Opt-in metrics silence for dev/dogfood checkouts: when the project marks
+    // itself with `.code-graph/.no-metrics`, the tool's own hook/CLI runs (sims,
+    // functionality testing) must not self-pollute its adoption metrics. Mirrors
+    // the Rust cli::record_cli_use guard. Reversible: delete the file to re-enable.
+    if (fs.existsSync(path.join(dir, NO_METRICS_FILE))) return false;
     const file = path.join(dir, REC_FILE);
     rotateIfNeeded(file); // rotate-before-append so the file never exceeds ~max + one line
     const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
