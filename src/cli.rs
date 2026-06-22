@@ -1145,6 +1145,11 @@ pub struct RecommendationSummary {
     /// PreToolUse hooks (action:"observe"), so the model's raw fan-out is visible
     /// alongside the deny/hint events.
     pub observe: u64,
+    /// SessionStart "live context" injections (action:"live_impact", hook:"session"):
+    /// the recent-change blast radius pushed at session start (v0.63). A separate
+    /// counter — like observe/use it is NOT a tool-call recommendation, so it stays
+    /// out of `total`/`by_action`. Surfaced in stats so the feature isn't dark.
+    pub live_impact: u64,
     /// Of `deny_answered` (cg delivered a grep answer in-place), how many were
     /// IMMEDIATELY followed by another grep/read event — i.e. the inline answer
     /// did not end the hunt. Lower is better. Computed in append (chronological)
@@ -1181,6 +1186,7 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
         match action {
             Some("use") => { s.cli_uses += 1; continue; }
             Some("observe") => { s.observe += 1; continue; }
+            Some("live_impact") => { s.live_impact += 1; continue; }
             _ => {}
         }
         s.total += 1;
@@ -1344,6 +1350,7 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 // followed by another grep/read (lower = the inline answer sufficed;
                 // null until there is an answered deny to divide by).
                 "observe": recs.observe,
+                "live_impact": recs.live_impact,
                 "researched_after_answer": recs.researched_after_answer,
                 "re_search_rate": if recs.deny_answered > 0 {
                     serde_json::json!((recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() / 100.0)
@@ -1472,6 +1479,12 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             // printing nothing — silence reads as "feature absent".
             println!("Conversion metric: DARK — no recommendations.jsonl. PreToolUse hooks are not");
             println!("  recording here, so recommend→use conversion cannot be measured in this project.");
+        }
+        // v0.63 — SessionStart live-context injections. Printed outside the
+        // total>0 branch (it's a separate counter): a session whose only event was
+        // the SessionStart injection still surfaces it instead of reading dark.
+        if recs.live_impact > 0 {
+            println!("Live-context: {} recent-change blast-radius injection(s) at SessionStart", recs.live_impact);
         }
         // Per-session funnel: of sessions that saw a deny/hint, how many also called
         // a cg query tool. This is the deny→use attribution the aggregate ratio can't give.
@@ -5517,6 +5530,27 @@ mod tests {
         assert_eq!(s.cli_uses, 1, "t4");
         assert_eq!(s.by_action.get("observe"), None, "observe is not a recommendation action");
         assert_eq!(s.total, 4, "4 denies counted; observe + cli use excluded from total");
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_counts_live_impact_separately() {
+        // v0.63 — SessionStart live-context injections are a separate counter,
+        // like observe/use: NOT in total/by_action, and they don't trip the
+        // re-search arming (hook:"session" is not a grep/read search event).
+        let content = "\
+{\"ts\":\"t1\",\"hook\":\"session\",\"action\":\"live_impact\",\"blast\":72,\"direct\":41,\"wip\":true}
+{\"ts\":\"t2\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"t3\",\"hook\":\"session\",\"action\":\"live_impact\",\"blast\":3,\"direct\":1,\"wip\":false}
+{\"ts\":\"t4\",\"hook\":\"grep\",\"action\":\"hint\"}
+";
+        let s = aggregate_recommendations_jsonl(content);
+        assert_eq!(s.live_impact, 2, "t1,t3 live_impact");
+        assert_eq!(s.total, 2, "only the deny + hint are recommendation events");
+        assert_eq!(s.by_action.get("live_impact"), None, "live_impact is not a recommendation action");
+        assert_eq!(s.by_hook.get("session"), None, "session hook is not a recommendation hook");
+        // t2 answered deny arms; t3 is live_impact (not a search event) → it must
+        // NOT count as a re-search and must disarm.
+        assert_eq!(s.researched_after_answer, 0, "live_impact after an answered deny is not a re-search");
     }
 
     #[test]

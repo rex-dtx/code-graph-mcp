@@ -150,6 +150,23 @@ test('fn-extract: short strings return null', () => {
 // ── Pattern consistency check ───────────────────────────
 // Verify fnPatterns in this test match what's in pre-edit-guide.js
 
+// ── Salience forcing (v0.63) ────────────────────────────
+// pre-edit-guide.js top-level-exits on require (reads stdin / checks db), so we
+// assert on the source text — same convention as pattern-sync below.
+
+test('salience: impact summary forces a per-caller verdict before the edit', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const source = fs.readFileSync(path.join(__dirname, 'pre-edit-guide.js'), 'utf8');
+  // mem lifts cite-recall to ~94% by making the model ACT on the injection; the
+  // impact summary must do the same rather than be passively skimmed. Wording
+  // references "each caller of X()" not "above" (finding #5) so it stays coherent
+  // when only the caller COUNT is shown (callers[] empty but directCallers>=1).
+  assert.match(source, /Before this edit: confirm each caller of/);
+  assert.match(source, /still holds with your change, or note why it is unaffected/);
+  assert.doesNotMatch(source, /caller\(s\) above you will update/); // old wording removed
+});
+
 test('pattern-sync: fnPatterns count matches source', () => {
   const fs = require('node:fs');
   const path = require('node:path');

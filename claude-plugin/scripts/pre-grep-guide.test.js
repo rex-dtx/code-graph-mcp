@@ -728,6 +728,22 @@ test('buildBlockReasonWithAnswer: NEVER advertises the bypass (v0.48 — one den
   assert.doesNotMatch(reason, /CODE_GRAPH_NO_BLOCK_GREP/);
 });
 
+test('buildBlockReasonWithAnswer: no salience restatement — answer is already in context (v0.63 removed)', () => {
+  // A forced "name the hit you will act on" line was trialed and removed: the
+  // answer is delivered, so restatement is performative friction. Keep the deny
+  // copy to delivery + the plain "use directly" nudge only.
+  const reason = buildBlockReasonWithAnswer('fts5_search', 'src/storage/', {
+    status: 'hits', text: 'hit', truncated: false,
+  });
+  assert.doesNotMatch(reason, /name the hit you will act on/i);
+  assert.match(reason, /use these results directly/i);
+});
+
+test('buildShowDenyReason: no salience restatement (v0.63 removed)', () => {
+  const reason = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false });
+  assert.doesNotMatch(reason, /name which definition above you will change/i);
+});
+
 test('buildBlockReasonWithAnswer: no searchPath → command has no path arg', () => {
   const reason = buildBlockReasonWithAnswer('fts5_search', undefined, {
     status: 'hits', text: 'hit', truncated: false,

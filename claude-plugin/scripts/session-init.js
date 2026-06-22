@@ -40,6 +40,132 @@ function shouldInjectMap({ available, quietHooks, adopted } = {}) {
   return !!(available && !quietHooks && adopted);
 }
 
+// v0.63 — SessionStart "live context": the recent-change blast radius from the
+// AST index. UNLIKE injectProjectMap (default-OFF because the static module map
+// duplicates MEMORY.md + the on-demand project_map tool), this is git-delta-
+// derived — it changes every session and MEMORY.md cannot carry it, so it earns
+// being ON by default for adopted projects. It is the graph-unique, actionable
+// counterpart to mem's SessionStart dashboard (which pushes recent activity to
+// create engagement). Selectivity is automatic: a session with no recently
+// changed *source* files (a deps-only or release commit, a clean checkout off a
+// non-code commit) injects nothing — zero standing-context cost when idle.
+//
+// Gating differs from the static map on purpose: it respects only the hard
+// kill-switch (CODE_GRAPH_QUIET_HOOKS=1) and a dedicated opt-out, NOT the
+// default-quiet flag that suppresses the duplicative map.
+function shouldInjectRecentImpact({ available, adopted, env = {} } = {}) {
+  if (!available || !adopted) return false;
+  if (env.CODE_GRAPH_QUIET_HOOKS === '1') return false;
+  if (env.CODE_GRAPH_NO_RECENT_IMPACT === '1') return false;
+  return true;
+}
+
+// Pure: given whether there are uncommitted (WIP) source changes and the
+// SessionStart `source`, decide if the recent-impact injection is worth its
+// standing-context cost. Marginal-information argument, not measured:
+//   - WIP present → active work; the blast radius of what you're editing is the
+//     highest-value case → always show.
+//   - clean tree → we fall back to the LAST COMMIT. On a cold `startup` that's
+//     low value (you just made it, or you're starting on something unrelated),
+//     and the project's own evidence is that SessionStart dumps tend to go
+//     unreferenced ([[project_cross_project_interference]]) → suppress. On a
+//     resume (`clear`/`compact`/`resume`) the same last-commit reminder helps
+//     re-establish context → show.
+// Unknown source (direct calls / tests) defaults to showing — only an explicit
+// cold `startup` with no WIP is suppressed.
+function recentImpactWorthShowing({ isWip, source } = {}) {
+  if (isWip) return true;
+  return source !== 'startup';
+}
+
+// Source-file extensions the indexer extracts symbols from (AST-bearing). Config
+// /lockfile/doc changes have no graph blast radius, so they're filtered out
+// before the `affected` call — keeps the "Changed:" line free of Cargo.lock noise
+// and avoids spending the CLI call on a commit that only bumped versions.
+const RECENT_SRC_EXT =
+  /\.(rs|ts|tsx|js|jsx|mjs|cjs|py|go|java|rb|php|swift|kt|kts|dart|c|h|cc|cpp|hpp|cs|sh|bash)$/i;
+
+// Pure: filter file paths to indexed source files, capped. Accepts EITHER a raw
+// `git diff --name-only` blob (string, split on newline) OR an already-parsed
+// path array (from parseGitStatusPaths) — the array form is essential: passing
+// the parser's array output to a string-only signature silently returned [] and
+// broke WIP detection (caught by the composing test). Cap guards message length
+// and the affected call's argv on a sweeping refactor.
+function filterSourceFiles(input, cap = 25) {
+  const lines = Array.isArray(input)
+    ? input
+    : (typeof input === 'string' ? input.split('\n') : []);
+  return lines
+    .map(s => s.trim())
+    .filter(Boolean)
+    .filter(f => RECENT_SRC_EXT.test(f))
+    .slice(0, cap);
+}
+
+// Pure: extract file paths from `git status --porcelain` output. One call covers
+// tracked changes (staged + unstaged) AND untracked files — the diff-only path
+// MISSED untracked new source files you're actively editing (finding #3). Format
+// is `XY␣PATH`, or `XY␣ORIG -> PATH` for renames (take the new path). Git quotes
+// paths with special chars; best-effort unquote.
+function parseGitStatusPaths(statusOutput) {
+  if (!statusOutput || typeof statusOutput !== 'string') return [];
+  const paths = [];
+  for (const line of statusOutput.split('\n')) {
+    if (line.length < 4) continue;        // need 2 status chars + space + ≥1 path char
+    let rest = line.slice(3);             // skip the XY status columns + separator space
+    const arrow = rest.indexOf(' -> ');   // rename/copy → the path after the arrow is current
+    if (arrow >= 0) rest = rest.slice(arrow + 4);
+    rest = rest.trim();
+    if (rest.startsWith('"') && rest.endsWith('"')) rest = rest.slice(1, -1);
+    if (rest) paths.push(rest);
+  }
+  return paths;
+}
+
+// Above ~15 direct dependents the per-name list is noise, not signal:
+// information scales INVERSELY with blast size. A high-fanout node (a constants
+// module, a shared util) "touches everything", so its actionable content
+// collapses to "this is high-risk — run the full suite"; the arbitrary first-N
+// dependent names add nothing. Below the threshold the specific dependents ARE
+// the signal (edit one fn → these 3 callers). So scale detail to actionability.
+const FANOUT_LIST_MAX = 15;
+
+// Pure: render the injected text from the parsed `affected --json` payload.
+// Returns null when there's nothing graph-relevant to say (no indexed dependents),
+// so the caller injects nothing rather than an empty banner.
+function formatRecentImpact(changed, affected, dependentCap = 6) {
+  if (!Array.isArray(changed) || changed.length === 0) return null;
+  const all = (affected && Array.isArray(affected.affected_files)) ? affected.affected_files : [];
+  if (all.length === 0) return null;
+  const direct = all.filter(a => a.depth === 1 && !a.is_test).map(a => a.path);
+  const testCount = Array.isArray(affected.tests) ? affected.tests.length : all.filter(a => a.is_test).length;
+
+  const changedShown = changed.slice(0, 8).join(', ') + (changed.length > 8 ? `, +${changed.length - 8}` : '');
+  const lines = [
+    '[code-graph] Recent changes — blast radius from the AST index (graph-only; not in MEMORY.md):',
+    `  Changed: ${changedShown}`,
+  ];
+  if (direct.length > FANOUT_LIST_MAX) {
+    // High fanout: the name list is noise; surface risk + test scope only.
+    lines.push(`  High-fanout change — ${all.length} file(s) impacted (${direct.length} direct); run the full suite (${testCount} test file(s)).`);
+  } else {
+    lines.push(`  Impacts ${all.length} file(s) (${direct.length} direct dependent(s)), ${testCount} test file(s) to re-run.`);
+    if (direct.length > 0) {
+      const shown = direct.slice(0, dependentCap).join(', ');
+      const more = direct.length > dependentCap ? `, +${direct.length - dependentCap} more` : '';
+      lines.push(`  Direct dependents: ${shown}${more}`);
+    }
+  }
+  // Runnable verbatim when ≤4 changed; above that, show 4 + an explicit count
+  // rather than a bare "…" — a pasted "…" command yields a SMALLER blast than the
+  // numbers above (the computation used all changed files, up to the cap) — finding #4.
+  const runCmd = changed.length <= 4
+    ? `code-graph-mcp affected ${changed.join(' ')}`
+    : `code-graph-mcp affected ${changed.slice(0, 4).join(' ')}  (+${changed.length - 4} more changed file(s) — pass all for the full blast)`;
+  lines.push(`  Re-run impacted tests: ${runCmd}`);
+  return lines.join('\n');
+}
+
 function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
   try {
     const child = spawnFn(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check', '--silent'], {
@@ -292,7 +418,7 @@ function consistencyCheck(binary) {
   return issues;
 }
 
-function runSessionInit() {
+function runSessionInit({ source } = {}) {
   if (isPluginInactive()) {
     cleanupDisabledStatusline();
     return { inactive: true, lifecycle: 'noop', autoUpdateLaunched: false };
@@ -358,12 +484,18 @@ function runSessionInit() {
   const mapInjected = shouldInjectMap({ available: binaryCheck.available, quietHooks, adopted })
     ? injectProjectMap()
     : false;
+  // v0.63 — live context: recent-change blast radius. Default-ON for adopted
+  // projects (separate gate from the duplicative static map); self-selecting
+  // (nothing injected when no source files changed recently).
+  const recentImpactInjected = shouldInjectRecentImpact({ available: binaryCheck.available, adopted, env: process.env })
+    ? injectRecentImpact({ source })
+    : false;
   const consistencyIssues = binaryCheck.available
     ? consistencyCheck(binaryCheck.binary)
     : [];
   return {
     inactive: false, lifecycle,
-    autoUpdateLaunched, indexFreshness, mapInjected, binaryCheck, consistencyIssues,
+    autoUpdateLaunched, indexFreshness, mapInjected, recentImpactInjected, binaryCheck, consistencyIssues,
     quietHooks, adopted, autoAdopted: autoAdopt.attempted,
   };
 }
@@ -378,7 +510,15 @@ function injectProjectMap() {
     const dbPath = path.join(cwd, '.code-graph', 'index.db');
     if (!fs.existsSync(dbPath)) return false;
 
-    const output = execSync('code-graph-mcp map --compact', {
+    // findBinary, not bare 'code-graph-mcp' on PATH (finding #8): a stale/global
+    // PATH binary reads a different/older index and returns "(empty project)"
+    // even when the local index is populated — the sibling bug injectRecentImpact
+    // already avoided via findBinary().
+    const { findBinary } = require('./find-binary');
+    const bin = findBinary();
+    if (!bin) return false;
+
+    const output = execFileSync(bin, ['map', '--compact'], {
       cwd,
       timeout: 5000,
       encoding: 'utf8',
@@ -397,18 +537,107 @@ function injectProjectMap() {
   return false;
 }
 
+/**
+ * v0.63 — inject the recent-change blast radius (graph-unique "live" context).
+ * Changed source files = working-tree changes vs HEAD (WIP), else the last commit.
+ * The last-commit fallback is suppressed on a cold `startup` (low marginal value)
+ * via recentImpactWorthShowing. One bounded `affected --json` call; degrades to
+ * silent no-op on any error. Records a `live_impact` event so `stats` can see the
+ * feature fire (else it's a dark metric). Returns true iff something was injected.
+ */
+function injectRecentImpact({ source } = {}) {
+  try {
+    const cwd = process.cwd();
+    const dbPath = path.join(cwd, '.code-graph', 'index.db');
+    if (!fs.existsSync(dbPath)) return false;
+
+    // WIP = ALL working-tree changes (staged + unstaged + UNTRACKED) in one
+    // `git status` call — the old diff-only path missed untracked new source
+    // files you're actively editing (finding #3). Clean tree → fall back to the
+    // last commit. Timeouts tightened (finding #1): worst-case cap sum is now
+    // status(1s) + HEAD~1(1s) + affected(1.5s) = 3.5s, comfortably under the 5s
+    // SessionStart hook budget; the old 2+2+3=7s could get the whole hook killed.
+    const gitOpts = { cwd, timeout: 1000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] };
+    let changed = [];
+    let isWip = false;
+    try {
+      changed = filterSourceFiles(parseGitStatusPaths(
+        execSync('git status --porcelain --untracked-files=all', gitOpts)));
+      isWip = changed.length > 0;
+      // Clean tree → fall back to what the last commit touched.
+      if (!isWip) {
+        changed = filterSourceFiles(execSync('git diff --name-only HEAD~1 HEAD', gitOpts));
+      }
+    } catch {
+      return false; // not a git repo / no commits — nothing to diff
+    }
+    if (changed.length === 0) return false;
+
+    // Marginal-value gate: cold startup + clean tree (last-commit fallback) → skip,
+    // before spending the affected CLI call.
+    if (!recentImpactWorthShowing({ isWip, source })) return false;
+
+    const { findBinary } = require('./find-binary');
+    const bin = findBinary();
+    if (!bin) return false;
+
+    let affected;
+    try {
+      const raw = execFileSync(bin, ['affected', ...changed, '--json'], {
+        cwd, timeout: 1500, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
+      });
+      affected = JSON.parse(raw);
+    } catch {
+      return false;
+    }
+
+    const text = formatRecentImpact(changed, affected);
+    if (!text) return false;
+    process.stdout.write(text + '\n');
+
+    // Instrumentation (step 3a): record that the injection fired so `stats`
+    // surfaces it instead of the feature being dark. Carries the blast/direct
+    // counts + WIP flag for later reference-rate / A-B analysis. Best-effort.
+    try {
+      const all = Array.isArray(affected.affected_files) ? affected.affected_files : [];
+      const direct = all.filter(a => a.depth === 1 && !a.is_test).length;
+      const { recordRecommendation } = require('./recommendation-log');
+      recordRecommendation(cwd, { hook: 'session', action: 'live_impact', blast: all.length, direct, wip: isWip });
+    } catch { /* telemetry must never break the injection */ }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 module.exports = {
   launchBackgroundAutoUpdate,
   syncLifecycleConfig,
   ensureIndexFresh,
   injectProjectMap,
+  injectRecentImpact,
   verifyBinary,
   consistencyCheck,
   runSessionInit,
   computeQuietHooks,
   shouldInjectMap,
+  shouldInjectRecentImpact,
+  recentImpactWorthShowing,
+  filterSourceFiles,
+  parseGitStatusPaths,
+  formatRecentImpact,
 };
 
 if (require.main === module) {
-  runSessionInit();
+  // SessionStart passes {source:"startup"|"clear"|"compact"|"resume"} on stdin.
+  // Best-effort + TTY-guarded: a hook gets piped JSON (EOF closes it), but a
+  // manual `node session-init.js` in a terminal must not block on fd 0.
+  let source;
+  try {
+    if (!process.stdin.isTTY) {
+      source = JSON.parse(fs.readFileSync(0, 'utf8')).source;
+    }
+  } catch { /* no/garbled stdin → treat as unknown source */ }
+  runSessionInit({ source });
 }

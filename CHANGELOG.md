@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.63.0 — SessionStart live blast-radius context, edit-impact salience, project-map binary fix
+
+### Added
+- **SessionStart now injects the recent-change blast radius from the AST index.** On session
+  start / resume, the working-tree changes (staged, unstaged, and untracked) — or, on a clean
+  tree, the last commit — are run through `affected`, and a compact summary (files impacted,
+  direct dependents, tests to re-run) is surfaced as context. Unlike the opt-in static project
+  map, this is git-delta-derived: it changes every session and is not duplicated by `MEMORY.md`,
+  so it is on by default for adopted projects. Self-selecting — a commit that touched no indexed
+  source (a deps/release bump) or a cold start on a clean tree injects nothing. A high-fanout
+  change (a constants/util module that "touches everything") collapses to a risk + test-count
+  line instead of a noisy dependent list. Opt out with `CODE_GRAPH_NO_RECENT_IMPACT=1` (or the
+  existing `CODE_GRAPH_QUIET_HOOKS=1`).
+- **The pre-edit impact hook asks for an explicit per-caller verdict.** When you edit a function
+  with callers, the injected impact summary now ends by asking you to confirm each caller still
+  holds with the change, or note why it is unaffected — so the blast radius is reconciled against
+  the edit rather than skimmed.
+
+### Fixed
+- **The SessionStart project map no longer shows "(empty project)" when the index is populated.**
+  It invoked the binary by bare name on `PATH`, so a stale/global install pointing at a different
+  index returned empty; it now resolves the binary the same way every other hook does.
+
+### Internal
+- New `live_impact` metric: the SessionStart blast-radius injection is recorded to
+  `recommendations.jsonl` and surfaced by `code-graph-mcp stats`, so its effect (and the model's
+  subsequent search fan-out) can be measured rather than assumed.
+
 ## v0.62.0 — dead-code false-positive sweep, atomic rebuild, path-traversal fix, script-language call recall
 
 ### Fixed

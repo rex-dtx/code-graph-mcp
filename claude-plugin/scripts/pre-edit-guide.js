@@ -168,7 +168,9 @@ if (directCallers < 1) process.exit(0);
 try { fs.writeFileSync(cooldownFile, ''); } catch { /* ok */ }
 
 // Funnel visibility (v0.49): an injected impact summary is a delivered answer.
-recordRecommendation(cwd, { hook: 'edit', action: 'hint', answered: true });
+// v0.63 — ack:true marks that this injection carries a salience-forcing directive
+// (the per-caller verdict line below), so a later A/B can segment ack vs non-ack.
+recordRecommendation(cwd, { hook: 'edit', action: 'hint', answered: true, ack: true });
 
 // --- Inject compact impact summary ---
 const routeCount = jsonResult.affected_routes || 0;
@@ -185,5 +187,15 @@ const callers = (jsonResult.callers || []).filter(c => c.depth === 1);
 if (callers.length > 0) {
   summary += '  Callers: ' + callers.map(c => `${c.name} (${c.file})`).join(', ') + '\n';
 }
+
+// Salience forcing (v0.63) — an injected impact summary that the model merely
+// reads is wasted context. mem's PreToolUse edit hook lifts cite-recall to ~94%
+// by making the model ACT on the injection ("apply each lesson or rule it out")
+// rather than passively receive it. Mirror that: force an explicit per-caller
+// verdict so the blast radius is reconciled against the edit, not skimmed.
+// Wording references "each caller of X()" not "above" (finding #5): the name list
+// is only printed when callers[] is populated, but the directCallers>=1 gate can
+// fire with the count alone — the verdict must stay coherent either way.
+summary += `  → Before this edit: confirm each caller of ${symbol}() still holds with your change, or note why it is unaffected.\n`;
 
 process.stdout.write(summary);

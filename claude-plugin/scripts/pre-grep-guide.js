@@ -366,6 +366,12 @@ function buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail)
   lines.push(
     'Each hit shows its containing fn/module — use these results directly instead of re-running the search.',
   );
+  // NOTE (v0.63): a forced-ack salience line was trialed here and removed. The
+  // answer is ALREADY in context, so demanding the model restate which hit it
+  // will use risks performative compliance + friction with no measured gain
+  // (deny-with-answer already satisfies in-place, 5/5 in the daagu replay). The
+  // engagement nudge is kept only where it pays — the pre-edit impact summary,
+  // a true before-you-edit reconciliation moment. Re-add here only behind an A/B.
   appendUnansweredTailNote(lines, unansweredTail);
   return lines.join('\n');
 }
@@ -383,6 +389,8 @@ function buildShowDenyReason(answer, unansweredTail) {
     lines.push('(truncated — re-run the `code-graph-mcp show <symbol>` command above for full source)');
   }
   lines.push('Use these directly instead of re-running the search.');
+  // NOTE (v0.63): forced-ack salience trialed + removed here too — see
+  // buildBlockReasonWithAnswer. The definitions are already delivered.
   appendUnansweredTailNote(lines, unansweredTail);
   return lines.join('\n');
 }
