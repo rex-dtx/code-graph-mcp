@@ -105,6 +105,24 @@ test('adopt + unadopt write atomically — no .tmp residue in the memory dir', (
   } finally { sb.cleanup(); }
 });
 
+test('writeFileAtomic cleans its temp file when rename fails (no orphaned .tmp)', () => {
+  // The success path leaves no residue (above). This pins the FAILURE path: if
+  // renameSync throws (ENOSPC/EACCES/EROFS on the shared memory dir) the temp must
+  // be unlinked, not orphaned. Force every rename to fail and assert no `.tmp.<pid>`
+  // survives the (failed) adopt.
+  const sb = makeSandbox();
+  const realRename = fs.renameSync;
+  try {
+    fs.renameSync = () => { const e = new Error('EROFS: simulated read-only fs'); e.code = 'EROFS'; throw e; };
+    try { adopt({ cwd: sb.cwd, home: sb.home }); } catch { /* expected — rename failed */ }
+    const residue = fs.readdirSync(sb.dir).filter((f) => f.includes('.tmp.'));
+    assert.deepStrictEqual(residue, [], `failed rename must not orphan a temp; found: ${residue}`);
+  } finally {
+    fs.renameSync = realRename;
+    sb.cleanup();
+  }
+});
+
 test('adopt refuses a non-project cwd even when the memory dir already exists (regression: /tmp adoption)', () => {
   // Bug: the isProjectRoot guard was nested inside `if (!fs.existsSync(dir))`,
   // so when Claude Code had already created ~/.claude/projects/<slug>/memory

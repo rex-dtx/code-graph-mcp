@@ -31,7 +31,15 @@ function readAdoptedBy(filePath) {
 function writeFileAtomic(filePath, data) {
   const tmp = filePath + '.tmp.' + process.pid;
   fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, filePath);
+  try {
+    fs.renameSync(tmp, filePath);
+  } catch (e) {
+    // rename can fail (ENOSPC / EACCES / EROFS on the dir). Don't orphan the
+    // temp in the shared memory dir — mirror auto-update.js's binary promote,
+    // which cleans its tmp on failure. Best-effort unlink, then rethrow original.
+    try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+    throw e;
+  }
 }
 // One-liner per MEMORY.md spec ("each entry should be one line"). All routing
 // triggers from prior multi-line block preserved verbatim — collapsing to single
