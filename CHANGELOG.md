@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.60.0 — accurate duplicate-route handling + CLI/MCP parity
+
+### Fixed
+- **Duplicate inline route handlers for the same METHOD+path in one file now
+  resolve to distinct nodes.** Previously two `app.get('/x', …)` registrations in
+  one file collapsed onto a single synthetic `GET /x` node, so name-based edge
+  resolution cross-linked their calls and fanned `routes_to` into a cartesian
+  product — inflating trace/impact/call-graph for those routes. Handler nodes now
+  carry a per-occurrence line suffix (`GET /x#Lstart`) so each resolves 1:1.
+  Route lookup via `trace` is unaffected (it matches the route metadata path, not
+  the node name). Existing `.code-graph/` indexes rebuild automatically on first
+  open after upgrade.
+- **`impact` route count is now consistent** across the CLI and MCP surfaces, and
+  matches the reported risk level even when a route's metadata is malformed.
+
+### Added
+- **`impact` reports `value_references` in the CLI too** (callback / function-
+  pointer / type-position couplings the call graph misses), matching the MCP tool.
+- **`trace --include-tests`**: the call chain now hides test symbols by default
+  (matching the MCP `trace` tool); pass `--include-tests` to show them.
+
+### Internal
+- Indexer skips the cross-file bind/prune/classify passes on no-op incremental
+  updates — no wasted full-graph scans on empty-diff watcher ticks.
+- SQLite memory-mapping is pinned off on every connection-open path (the
+  read-only secondary and the snapshot producer, not just the primary), and
+  adopt/unadopt atomic writes clean up their temp file if a rename fails.
+
 ## v0.59.0 — import-aware call resolution (calls bind to the imported definition, not a path-proximity guess)
 
 ### Improved
