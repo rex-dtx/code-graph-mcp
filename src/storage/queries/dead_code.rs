@@ -38,6 +38,32 @@ pub fn find_dead_code(
         // Anonymous consts (`const _: () = assert!(...)`) are compile-time checks,
         // never callable; same pattern for anonymous `let _ = ...` bindings.
         "n.name != '_'".to_string(),
+        // Implicitly-invoked methods (constructors, magic/dunder methods) are
+        // dispatched by the language runtime, never called by explicit name, so
+        // they carry no incoming `calls` edge even when the class is fully used.
+        // Reporting them dead is a guaranteed false positive — and the most
+        // damaging kind, since it invites deleting a live constructor or lifecycle
+        // hook. Excluded per each language's actual convention:
+        //   Python  __x__       (__init__, __str__, __enter__, __eq__, ...)
+        //   PHP     __x         (PHP reserves the __ prefix for magic methods)
+        //   JS/TS   constructor (invoked by `new`, never by name)
+        //   Ruby    initialize  (invoked by `.new`)
+        //   Java/C#/Dart        constructor is a function sharing the class name
+        //                       (qualified_name `Account.Account`) — detected by
+        //                       a same-file class/struct of the same name.
+        // C/C++ constructors aren't pattern-matchable here — left as a known gap.
+        "NOT (n.type IN ('method', 'function') AND (
+            (f.language = 'python' AND n.name LIKE '\\_\\_%\\_\\_' ESCAPE '\\')
+            OR (f.language = 'php' AND n.name LIKE '\\_\\_%' ESCAPE '\\')
+            OR (f.language IN ('javascript', 'typescript', 'tsx') AND n.name = 'constructor')
+            OR (f.language = 'ruby' AND n.name = 'initialize')
+            OR (f.language IN ('java', 'csharp', 'dart') AND EXISTS (
+                SELECT 1 FROM nodes c
+                WHERE c.file_id = n.file_id
+                  AND c.type IN ('class', 'struct')
+                  AND c.name = n.name
+            ))
+        ))".to_string(),
         "f.path != '<external>'".to_string(),
         "(n.end_line - n.start_line + 1) >= :min_lines".to_string(),
     ];
@@ -632,5 +658,116 @@ mod tests {
              NOT be reported dead; got: {:?}", names);
         assert!(names.contains(&"OrphanConfig"),
             "OrphanConfig is referenced nowhere and must still be reported dead; got: {:?}", names);
+    }
+
+    /// Regression: implicitly-invoked methods (constructors + magic/dunder
+    /// methods) are dispatched by the language runtime, never called by explicit
+    /// name, so they never carry an incoming `calls` edge — even when the class
+    /// is fully used. Reporting them dead is a guaranteed false positive that
+    /// invites deleting a live constructor. They must be excluded per each
+    /// language's convention, while a genuinely-dead regular method is still
+    /// reported (no over-suppression).
+    #[test]
+    fn test_find_dead_code_excludes_implicitly_invoked_methods() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        // One file per language so the same-file instr probe can't rescue
+        // anything — every method below is genuinely edgeless.
+        let cases = [
+            ("src/a.py",  "python",     "method",   "__init__",
+             "def __init__(self, x):\n    self.x = x\n    self.y = x"),
+            ("src/a.py",  "python",     "method",   "__eq__",
+             "def __eq__(self, o):\n    return self.x == o.x\n    # cmp"),
+            ("src/b.php", "php",        "method",   "__construct",
+             "function __construct($v) {\n    $this->v = $v;\n    $this->t = 0;\n}"),
+            ("src/b.php", "php",        "method",   "__toString",
+             "function __toString() {\n    return \"X\";\n    // str\n}"),
+            ("src/c.ts",  "typescript", "method",   "constructor",
+             "constructor(x: number) {\n    this.x = x;\n    this.y = x;\n}"),
+            ("src/d.js",  "javascript", "method",   "constructor",
+             "constructor() {\n    this.a = 1;\n    this.b = 2;\n}"),
+            ("src/e.rb",  "ruby",       "method",   "initialize",
+             "def initialize(name)\n    @name = name\n    @n = 0\nend"),
+        ];
+
+        let mut fid_cache: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+        for (i, (path, lang, ntype, name, code)) in cases.iter().enumerate() {
+            let fid = *fid_cache.entry(path).or_insert_with(|| {
+                upsert_file(conn, &FileRecord {
+                    path: (*path).into(), blake3_hash: format!("h{i}"), last_modified: 1,
+                    language: Some((*lang).into()),
+                }).unwrap()
+            });
+            insert_node(conn, &NodeRecord {
+                file_id: fid, node_type: (*ntype).into(), name: (*name).into(),
+                qualified_name: None, start_line: (i as i64) * 10 + 1, end_line: (i as i64) * 10 + 4,
+                code_content: (*code).into(), signature: None, doc_comment: None,
+                context_string: None, name_tokens: None, return_type: None,
+                param_types: None, is_test: false,
+            }).unwrap();
+        }
+
+        // Java/C#/Dart constructors are `function` nodes that share the enclosing
+        // class name (qualified_name `Account.Account`). Each needs a sibling
+        // `class` node in the same file so the same-file-class probe fires.
+        let class_ctor_cases = [
+            ("src/Account.java", "java",   "Account"),
+            ("src/Repo.cs",      "csharp", "Repo"),
+            ("src/Widget.dart",  "dart",   "Widget"),
+        ];
+        for (i, (path, lang, cls)) in class_ctor_cases.iter().enumerate() {
+            let fid = upsert_file(conn, &FileRecord {
+                path: (*path).into(), blake3_hash: format!("hc{i}"), last_modified: 1,
+                language: Some((*lang).into()),
+            }).unwrap();
+            // The class itself.
+            insert_node(conn, &NodeRecord {
+                file_id: fid, node_type: "class".into(), name: (*cls).into(),
+                qualified_name: Some((*cls).into()), start_line: 1, end_line: 12,
+                code_content: format!("class {cls} {{ }}"), signature: None,
+                doc_comment: None, context_string: None, name_tokens: None,
+                return_type: None, param_types: None, is_test: false,
+            }).unwrap();
+            // The constructor: a `function` sharing the class name, edgeless.
+            insert_node(conn, &NodeRecord {
+                file_id: fid, node_type: "function".into(), name: (*cls).into(),
+                qualified_name: Some(format!("{cls}.{cls}")), start_line: 3, end_line: 6,
+                code_content: format!("{cls}(int x) {{\n    this.x = x;\n    this.y = x;\n}}"),
+                signature: None, doc_comment: None, context_string: None,
+                name_tokens: None, return_type: None, param_types: None, is_test: false,
+            }).unwrap();
+        }
+
+        // A genuinely-dead regular method (Python, 3 lines, no edges) — must
+        // still be reported so the exclusion doesn't over-suppress real findings.
+        let py_fid = *fid_cache.get("src/a.py").unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: py_fid, node_type: "method".into(), name: "compute_unused".into(),
+            qualified_name: None, start_line: 200, end_line: 203,
+            code_content: "def compute_unused(self):\n    a = 1\n    return a".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Capture (name, node_type) so constructor *function* nodes can be told
+        // apart from the same-named `class` node.
+        let results: Vec<(String, String)> = find_dead_code(conn, None, None, false, 1, 100)
+            .unwrap().into_iter().map(|r| (r.name, r.node_type)).collect();
+        let names: Vec<&str> = results.iter().map(|(n, _)| n.as_str()).collect();
+
+        for implicit in ["__init__", "__eq__", "__construct", "__toString", "constructor", "initialize"] {
+            assert!(!names.contains(&implicit),
+                "implicitly-invoked method '{implicit}' must NOT be reported dead; got: {names:?}");
+        }
+        // Java/C#/Dart constructors are `function` nodes named like the class.
+        // The constructor *function* must never be reported (the same-named
+        // `class` node is a separate unused-class concern, out of scope here).
+        for ctor in ["Account", "Repo", "Widget"] {
+            assert!(!results.iter().any(|(n, t)| n == ctor && (t == "function" || t == "method")),
+                "constructor function '{ctor}' must be excluded; got: {results:?}");
+        }
+        assert!(names.contains(&"compute_unused"),
+            "a genuinely-dead regular method must still be reported; got: {names:?}");
     }
 }
