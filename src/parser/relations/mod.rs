@@ -387,6 +387,46 @@ fn walk_for_relations(
                                     source_language: String::new(),
                                 });
                             }
+
+                            // Destructured require: `const { foo, bar } = require('./x')`.
+                            // Emit a per-name import stamped with the full specifier so
+                            // js_modules resolution binds each name to the required file's
+                            // export (and Phase 2d-bind then repoints the matching calls) —
+                            // the CommonJS analog of ES named imports. The last-segment
+                            // module import above is kept for module-level dep tracking.
+                            if let Some(decl) = node.parent().filter(|p| p.kind() == "variable_declarator") {
+                                if let Some(name_node) = decl.child_by_field_name("name") {
+                                    if name_node.kind() == "object_pattern" {
+                                        let metadata = serde_json::json!({ "js_module": &path }).to_string();
+                                        for i in 0..name_node.named_child_count() {
+                                            if let Some(binding) = name_node.named_child(i) {
+                                                // Shorthand `{ foo }` → the binding name; renamed
+                                                // `{ foo: f }` (pair_pattern) → the KEY (export name),
+                                                // since that is what the required file exports.
+                                                let imported = match binding.kind() {
+                                                    "shorthand_property_identifier_pattern" => {
+                                                        Some(node_text(&binding, source).to_string())
+                                                    }
+                                                    "pair_pattern" => binding.child_by_field_name("key")
+                                                        .map(|k| node_text(&k, source).to_string()),
+                                                    _ => None,
+                                                };
+                                                if let Some(name) = imported {
+                                                    if !name.is_empty() {
+                                                        results.push(ParsedRelation {
+                                                            source_name: "<module>".into(),
+                                                            target_name: name,
+                                                            relation: REL_IMPORTS.into(),
+                                                            metadata: Some(metadata.clone()),
+                                                            source_language: String::new(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
