@@ -152,12 +152,16 @@ pub(super) fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Op
     // Extract path from decorator arguments
     let path = extract_string_from_subtree(&dec, source)?;
 
-    let method = if dec_text.contains(".get(") { "GET" }
-        else if dec_text.contains(".post(") { "POST" }
-        else if dec_text.contains(".put(") { "PUT" }
-        else if dec_text.contains(".delete(") { "DELETE" }
-        else if dec_text.contains(".patch(") { "PATCH" }
-        else { "ANY" };
+    let method: String = if dec_text.contains(".get(") { "GET".into() }
+        else if dec_text.contains(".post(") { "POST".into() }
+        else if dec_text.contains(".put(") { "PUT".into() }
+        else if dec_text.contains(".delete(") { "DELETE".into() }
+        else if dec_text.contains(".patch(") { "PATCH".into() }
+        // Flask `@app.route('/x', methods=['GET'])`: the decorator name is the
+        // generic `.route`, so the verb lives in the `methods=` kwarg. Without
+        // this, every Flask route was "ANY" and `trace 'GET /x'` (exact-method
+        // filter) matched nothing. No methods= kwarg → "ANY" (unspecified).
+        else { parse_flask_methods_kwarg(dec_text).unwrap_or_else(|| "ANY".into()) };
 
     let metadata = serde_json::json!({"method": method, "path": path}).to_string();
 
@@ -168,4 +172,23 @@ pub(super) fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Op
         metadata: Some(metadata),
         source_language: String::new(),
     })
+}
+
+/// Extract the first HTTP method from a Flask `methods=['GET', 'POST']` kwarg in
+/// an `@app.route(...)` decorator. Returns None when no `methods=` kwarg is
+/// present (caller falls back to "ANY"). The scan is confined to the bracketed
+/// list literal, so a path segment like `/get-methods` cannot be mistaken for a
+/// verb; the failure mode is always None → "ANY". The single-method metadata
+/// schema stores the first listed method when several are given.
+fn parse_flask_methods_kwarg(dec_text: &str) -> Option<String> {
+    let after_kw = dec_text.split_once("methods").map(|(_, rest)| rest)?;
+    let list_start = after_kw.find('[')?;
+    let list = after_kw[list_start + 1..].split(']').next().unwrap_or("");
+    const METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+    let upper = list.to_uppercase();
+    METHODS
+        .iter()
+        .filter_map(|m| upper.find(m).map(|pos| (pos, *m)))
+        .min_by_key(|&(pos, _)| pos)
+        .map(|(_, m)| m.to_string())
 }

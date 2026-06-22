@@ -30,6 +30,38 @@ fn test_extract_php_include_imports() {
 }
 
 #[test]
+fn test_extract_flask_route_methods_kwarg() {
+    // Flask `@app.route('/x', methods=['POST'])` must derive the HTTP method from
+    // the `methods=` kwarg, not default to "ANY" (which breaks `trace 'POST /x'`
+    // since trace filters routes by exact method). FastAPI `.get()`/`.post()`
+    // decorators already work via the decorator name.
+    let code = "from flask import Flask\n\
+        app = Flask(__name__)\n\
+        @app.route('/users', methods=['GET'])\n\
+        def list_users():\n    return []\n\
+        @app.route('/users/<id>', methods=['DELETE'])\n\
+        def remove_user(id):\n    return None\n\
+        @app.route('/multi', methods=['POST', 'PUT'])\n\
+        def multi():\n    return None\n\
+        @app.route('/noverb')\n\
+        def noverb():\n    return None\n";
+    let rels = extract_relations(code, "python").unwrap();
+    let route_method = |handler: &str| -> Option<String> {
+        rels.iter()
+            .find(|r| r.relation == REL_ROUTES_TO && r.source_name == handler)
+            .and_then(|r| r.metadata.as_ref())
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("method").and_then(|x| x.as_str()).map(String::from))
+    };
+    assert_eq!(route_method("list_users").as_deref(), Some("GET"), "methods=['GET'] → GET");
+    assert_eq!(route_method("remove_user").as_deref(), Some("DELETE"), "methods=['DELETE'] → DELETE");
+    // Multi-method: the single-method metadata schema stores the first listed.
+    assert_eq!(route_method("multi").as_deref(), Some("POST"), "methods=['POST','PUT'] → first (POST)");
+    // No methods= kwarg → "ANY" (unspecified) preserved.
+    assert_eq!(route_method("noverb").as_deref(), Some("ANY"), "no methods= → ANY");
+}
+
+#[test]
 fn test_extract_bash_call_relations() {
     let code = r#"#!/usr/bin/env bash
 
