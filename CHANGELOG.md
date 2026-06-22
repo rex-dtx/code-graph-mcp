@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.58.0 — snapshot integrity pin (CODE_GRAPH_SNAPSHOT_PIN); freshness path-traversal guard
 
 ### Security
 - **`CODE_GRAPH_SNAPSHOT_PIN` — out-of-band snapshot integrity pin.** Set it to a
