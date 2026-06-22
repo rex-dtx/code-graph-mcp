@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 // Regression gate for v0.31.1: hooks.json matchers must be Claude Code's
 // literal/regex form, NOT the expression DSL `tool == "X"`. The earlier
@@ -148,4 +149,82 @@ test('lifecycle.buildSettingsHookEntries: hook commands use absolute paths (no e
       }
     }
   }
+});
+
+// v0.67.0 hook-reliability Layer 1 (static firing invariants):
+// The tests above inspect matcher STRINGS but never the target script file. A
+// renamed/typo'd/moved hook script makes Claude Code unable to run it → the hook
+// is SILENTLY inert (the "dark hook" class — feedback_pretooluse_dark_under_green_health.md).
+// This collects every script CC will actually load — both registration channels —
+// and asserts each exists and parses. Cheapest possible guard against silent dark.
+const PLUGIN_ROOT = path.resolve(__dirname, '..'); // claude-plugin/
+
+function resolveHookScript(cmd) {
+  // command form: node "<path>"  (<path> may contain ${CLAUDE_PLUGIN_ROOT})
+  const m = (cmd || '').match(/"([^"]+\.js)"/);
+  return m ? m[1].replace('${CLAUDE_PLUGIN_ROOT}', PLUGIN_ROOT) : null;
+}
+
+function allRegisteredHookCommands() {
+  const commands = [];
+  // (1) settings.json side — lifecycle.buildSettingsHookEntries (PreToolUse/PostToolUse/UserPromptSubmit)
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  for (const entries of Object.values(buildSettingsHookEntries())) {
+    for (const e of entries) for (const h of e.hooks || []) commands.push(h.command);
+  }
+  // (2) plugin-cache hooks.json side — SessionStart (the only event CC loads from here)
+  for (const entries of Object.values(loadHooks().hooks || {})) {
+    if (!Array.isArray(entries)) continue;
+    for (const e of entries) for (const h of e.hooks || []) commands.push(h.command);
+  }
+  return commands;
+}
+
+test('every registered hook script exists on disk', () => {
+  const commands = allRegisteredHookCommands();
+  // 3 PreToolUse + 1 PostToolUse + 1 UserPromptSubmit + 1 SessionStart = 6
+  assert.ok(commands.length >= 6, `expected >=6 registered hook commands, got ${commands.length}`);
+  for (const cmd of commands) {
+    const p = resolveHookScript(cmd);
+    assert.ok(p, `could not extract a .js path from hook command: ${JSON.stringify(cmd)}`);
+    assert.ok(fs.existsSync(p),
+      `hook script missing on disk: ${p}\n  (from command ${JSON.stringify(cmd)})\n` +
+      `  A renamed/typo'd/moved script makes the hook silently inert — Claude Code cannot run a missing file.`);
+  }
+});
+
+test('every registered hook script parses (node --check)', () => {
+  for (const cmd of allRegisteredHookCommands()) {
+    const p = resolveHookScript(cmd);
+    assert.doesNotThrow(
+      () => execFileSync(process.execPath, ['--check', p], { stdio: 'pipe' }),
+      `hook script has a syntax error (node --check failed): ${p}`);
+  }
+});
+
+// Pin the EXACT matcher surface, not just "covers". The earlier tests assert the
+// set INCLUDES Edit/Bash/Read etc.; this asserts it EQUALS the intended set, so
+// adding/dropping a matcher must update this test — a deliberate decision, never a
+// silent coverage drift. A PreToolUse hook fires only on the literal tool name.
+// Deliberate exclusions (verified 2026-06-23; revisit if either premise changes):
+//   - MultiEdit: NOT a tool in current Claude Code (absent from the tool surface;
+//     the plugin targets recent CC per the v0.32.0 settings.json architecture), so
+//     a matcher for it would be dead config. Re-add only if CC (re)introduces it.
+//   - NotebookEdit: a real tool, but code-graph does NOT parse .ipynb (no jupyter
+//     support in the parser / supported-language set), so both pre-edit-guide
+//     (needs graph symbols) and incremental-index (needs to re-index the file)
+//     would no-op on a notebook. Prerequisite is .ipynb PARSING support (a parser
+//     feature); add the matcher as PART of that work, never before it.
+test('buildSettingsHookEntries: matcher surface is exactly the intended set', () => {
+  const { buildSettingsHookEntries } = require('./lifecycle');
+  const desired = buildSettingsHookEntries();
+  const setOf = (event) => (desired[event] || []).map(e => e.matcher).sort();
+  assert.deepEqual(setOf('PreToolUse'), ['Bash', 'Edit', 'Read'],
+    'PreToolUse matcher set changed — update this gate intentionally (does the new tool need a guide hook?)');
+  assert.deepEqual(setOf('PostToolUse'), ['Write|Edit'],
+    'PostToolUse matcher set changed — incremental-index re-index trigger surface must be deliberate');
+  assert.deepEqual(setOf('UserPromptSubmit'), [''],
+    'UserPromptSubmit matcher set changed unexpectedly');
+  assert.deepEqual(Object.keys(desired).sort(), ['PostToolUse', 'PreToolUse', 'UserPromptSubmit'],
+    'a new top-level hook event is registered into settings.json — confirm it is intended (SessionStart belongs in hooks.json)');
 });

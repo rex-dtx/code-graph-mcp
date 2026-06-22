@@ -260,6 +260,24 @@ function runDiagnostics() {
     }
   } catch { /* probe failed — skip */ }
 
+  // 8. Hook firing (v0.67.0) — coverage (#7) proves the hook is WIRED into
+  //    settings.json; this proves the script actually RUNS. Spawns each
+  //    registered hook with a synthetic CC payload in a throwaway fixture and
+  //    checks it exits 0. Catches the registered-but-inert class (broken
+  //    require-chain / incompatible node / corrupt install) that a string/path
+  //    check cannot see. (It does NOT prove CC dispatches to it — that needs a
+  //    live session; the dispatch canary in session-init.js covers that.)
+  try {
+    const { verifyHooksFire } = require('./lifecycle');
+    const fire = verifyHooksFire();
+    if (fire.ok) {
+      results.push({ name: 'Hook firing', status: 'ok', detail: `${fire.results.length} hooks fire cleanly` });
+    } else {
+      const failed = fire.results.filter(r => !r.ok).map(r => r.label).join(', ') || fire.error || 'unknown';
+      results.push({ name: 'Hook firing', status: 'warn', detail: `did not fire: ${failed}` });
+    }
+  } catch { /* probe failed — skip */ }
+
   return results;
 }
 

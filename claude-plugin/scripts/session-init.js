@@ -493,10 +493,18 @@ function runSessionInit({ source } = {}) {
   const consistencyIssues = binaryCheck.available
     ? consistencyCheck(binaryCheck.binary)
     : [];
+  // v0.67.0 — hook reliability (active-project path only): Layer A pushes a
+  // FAILED firing self-test result (and refreshes it in the background, off the
+  // 5s budget); Layer B is the runtime dispatch-dark canary. Both best-effort.
+  const hookFireWarn = checkHookFiring();
+  if (hookFireWarn) process.stderr.write(hookFireWarn);
+  const hookDarkWarn = detectHookDark();
+  if (hookDarkWarn) process.stderr.write(hookDarkWarn);
   return {
     inactive: false, lifecycle,
     autoUpdateLaunched, indexFreshness, mapInjected, recentImpactInjected, binaryCheck, consistencyIssues,
     quietHooks, adopted, autoAdopted: autoAdopt.attempted,
+    hookFireWarn: !!hookFireWarn, hookDarkWarn: !!hookDarkWarn,
   };
 }
 
@@ -611,6 +619,69 @@ function injectRecentImpact({ source } = {}) {
   }
 }
 
+// ── v0.67.0 hook-reliability surfaces ─────────────────────────────────
+//
+// Layer A (firing): surface the cached `verify-hooks-fire` result. PUSH — the
+// model/user learns of a broken hook without running doctor. Pure interpreter
+// + an I/O wrapper that background-refreshes the cache off the SessionStart budget.
+function hookFireWarning(state) {
+  if (state && state.ok === false && Array.isArray(state.failures) && state.failures.length) {
+    return `[code-graph] Hook firing self-test failed for: ${state.failures.join(', ')}.\n` +
+           `            Registered but did not run on this machine — run: code-graph-mcp doctor\n`;
+  }
+  return null;
+}
+
+function checkHookFiring({ now = Date.now() } = {}) {
+  const STALE_MS = 24 * 60 * 60 * 1000;
+  let warn = null;
+  try {
+    const state = readJson(path.join(CACHE_DIR, 'hook-fire-state.json'));
+    warn = hookFireWarning(state);
+    const fresh = state && state.ts && (now - new Date(state.ts).getTime() < STALE_MS);
+    if (!fresh) {
+      // Background refresh — detached + unref'd + stdio ignore → zero budget impact.
+      // First session after install has no cache → schedules a check; failures
+      // surface from the next start. Re-checks daily (catches post-install drift,
+      // e.g. a node upgrade that breaks a hook).
+      try {
+        const child = spawn(process.execPath, [path.join(__dirname, 'lifecycle.js'), 'verify-hooks-fire'], {
+          detached: true, stdio: 'ignore',
+        });
+        if (child && typeof child.unref === 'function') child.unref();
+      } catch { /* ok */ }
+    }
+  } catch { /* best-effort */ }
+  return warn;
+}
+
+// Layer B (dispatch): verifyHooksFire proves the script RUNS; only a live session
+// proves Claude Code DISPATCHES tool-calls to it. Pure: given recommendations.jsonl
+// text, the grep/read matchers are "dark" when the edit hook has fired repeatedly
+// (dispatch demonstrably works) but grep AND read never have. Relative sibling
+// comparison → low false-positive (full darkness leaves no file → no claim).
+function analyzeHookDark(recText) {
+  let edit = 0, grepOrRead = 0;
+  for (const line of (recText || '').split('\n')) {
+    if (!line) continue;
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    if (ev.hook === 'grep' || ev.hook === 'read') grepOrRead++;
+    else if (ev.hook === 'edit') edit++;
+  }
+  if (edit >= 3 && grepOrRead === 0) {
+    return `[code-graph] The grep/read PreToolUse hooks have recorded nothing in this project,\n` +
+           `            though the edit hook fired ${edit}× — grep/read interception may be dark. Run: code-graph-mcp doctor\n`;
+  }
+  return null;
+}
+
+function detectHookDark() {
+  try {
+    const recPath = path.join(process.cwd(), '.code-graph', 'recommendations.jsonl');
+    return analyzeHookDark(fs.readFileSync(recPath, 'utf8'));
+  } catch { return null; } // no recommendations.jsonl → nothing to conclude
+}
+
 module.exports = {
   launchBackgroundAutoUpdate,
   syncLifecycleConfig,
@@ -627,6 +698,7 @@ module.exports = {
   filterSourceFiles,
   parseGitStatusPaths,
   formatRecentImpact,
+  hookFireWarning, checkHookFiring, analyzeHookDark, detectHookDark, // v0.67.0
 };
 
 if (require.main === module) {

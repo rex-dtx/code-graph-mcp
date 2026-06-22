@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.67.0 — Hook firing self-test: catch a registered-but-inert hook automatically
+
+### Added
+- **Hook firing self-test.** Registration checks prove a hook is *wired* into `settings.json`; they
+  don't prove the script actually *runs*. A new self-test spawns each registered hook the way Claude
+  Code does (a synthetic tool-call payload, in a throwaway fixture) and confirms it executes —
+  catching the "registered but silently inert" class (a broken require-chain, an incompatible Node, a
+  corrupt install) that path/string checks can't see. Surfaced three ways: a `Hook firing` line in
+  `code-graph-mcp doctor`, a `code-graph-mcp verify-hooks-fire` command, and an automatic once-a-day
+  background check at session start that prints a one-line warning (pointing at `doctor`) if any hook
+  failed — so a dark hook surfaces on its own instead of being found weeks later. (It proves the
+  script runs; only a live session proves Claude Code dispatches to it — see the canary below.)
+- **Dispatch canary.** When the edit hook has fired repeatedly in a project but the grep/read hooks
+  have recorded nothing, session start now warns that grep/read interception may be dark (the
+  subdir-cwd class of bug). Conservative sibling comparison → low false-positive.
+- **Static hook-registration gates (CI).** Tests now assert every registered hook script exists on
+  disk and parses (`node --check`), and pin the exact matcher surface, so a rename/typo or an
+  accidental matcher change can't silently disable a hook.
+- **A way to register demand for non–Claude-Code agents.** A new GitHub issue template lets users
+  request first-class support for other agents (Cursor / Codex / Gemini / Cline / …). The MCP server
+  and CLI already work with any MCP-capable client today.
+
+### Fixed
+- **Hook-firing self-test fixture is race-safe.** It uses a unique temp directory rather than a
+  shared one, so a concurrent process clearing the shared temp dir can't pull the fixture out from
+  under an in-flight check.
+
 ## v0.66.0 — Fall-through metric excludes inconclusive follow-ups; recovers the failed v0.65.0 release
 
 > **Note:** v0.65.0's Release workflow failed at the Publish step (a transient crates.io error during

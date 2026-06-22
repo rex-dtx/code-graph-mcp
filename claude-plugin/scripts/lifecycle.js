@@ -463,6 +463,118 @@ function surveyHookCoverage(settings) {
   return { expected, present: [...present], missing, stale };
 }
 
+// --- Firing self-test (v0.67.0) ---
+//
+// surveyHookCoverage proves a hook is WIRED; it does NOT prove the script RUNS.
+// A renamed sibling module, an incompatible node, or a corrupt install leaves a
+// hook registered-but-inert — invisible to every string/path check. verifyHooksFire
+// spawns each registered hook the way Claude Code does (node + a synthetic CC
+// stdin payload) inside a throwaway fixture and asserts it exits 0. This is the
+// "does it really fire" check. What it CANNOT prove is that CC *dispatches* real
+// tool-calls to it (only a live session shows that — see the Layer-B dispatch
+// canary in session-init.js). Best-effort; never throws.
+
+// Representative CC stdin payload that drives each matcher's path. The Bash
+// payload is engaging (a source-tree search → a deny/hint IS emitted); the Edit
+// payload's short old_string short-circuits before any binary spawn; the rest
+// just exercise the require-chain + stdin parse.
+function hookFirePayload(matcher) {
+  switch (matcher) {
+    case 'Bash':
+      return { tool_name: 'Bash', tool_input: { command: 'grep -rn someUniqueSymbol src/' } };
+    case 'Read':
+      return { tool_name: 'Read', tool_input: { file_path: 'src/example.rs' } };
+    case 'Edit':
+    case 'Write|Edit':
+      return { tool_name: 'Edit', tool_input: { file_path: 'src/example.rs', old_string: 'a', new_string: 'b' } };
+    case '': // UserPromptSubmit
+      return { prompt: 'where is the parse function defined' };
+    default:
+      return { tool_name: 'Unknown', tool_input: {} };
+  }
+}
+
+// The hooks CC actually loads from settings.json (PreToolUse/PostToolUse/
+// UserPromptSubmit). SessionStart (hooks.json) runs every session → its own
+// liveness proof → excluded here.
+function defaultHookFireProbes() {
+  const probes = [];
+  for (const [event, entries] of Object.entries(buildSettingsHookEntries())) {
+    for (const e of entries) {
+      const cmd = e.hooks && e.hooks[0] && e.hooks[0].command;
+      const m = (cmd || '').match(/"([^"]+\.js)"/);
+      if (!m) continue;
+      probes.push({ label: `${event}:${e.matcher || '*'}`, script: m[1], payload: hookFirePayload(e.matcher || '') });
+    }
+  }
+  return probes;
+}
+
+function verifyHooksFire({ hooks, env, timeoutMs = 4000, tmpBase } = {}) {
+  const { spawnSync } = require('child_process');
+  const probes = hooks || defaultHookFireProbes();
+
+  // Throwaway fixture carrying the .code-graph/index.db marker so resolveProjectRoot
+  // resolves (otherwise the hooks early-return before exercising anything).
+  // Base is os.tmpdir() directly (a UNIQUE mkdtemp), NOT the shared cgTmpDir()
+  // subdir — a concurrent process clearing `<tmp>/code-graph-mcp` mid-run would
+  // otherwise yank this fixture out from under an in-flight spawn (cwd ENOENT).
+  let fixture = null;
+  try {
+    const base = tmpBase || os.tmpdir();
+    fixture = fs.mkdtempSync(path.join(base, 'cg-hookfire-'));
+    fs.mkdirSync(path.join(fixture, '.code-graph'), { recursive: true });
+    fs.writeFileSync(path.join(fixture, '.code-graph', 'index.db'), '');
+  } catch (e) {
+    return { ok: false, results: [], error: `fixture: ${e && e.message}` };
+  }
+
+  // Force a non-silenced, no-binary-spawn firing config: the smoke tests the
+  // machinery regardless of the user's silence prefs and never invokes the binary
+  // (CODE_GRAPH_NO_ANSWER_IN_DENY keeps cg-answer out of the deny path).
+  // Redirect the hooks' tmp state (per-command grep cooldown, read-fanout state)
+  // into the throwaway fixture via TMPDIR so the smoke neither collides with a
+  // real 60s cooldown (which would suppress the deny → false "didn't fire") nor
+  // pollutes the user's real cooldown/state.
+  const baseEnv = {
+    ...process.env,
+    CODE_GRAPH_QUIET_HOOKS: '0',
+    CODE_GRAPH_NO_ANSWER_IN_DENY: '1',
+    TMPDIR: fixture, TMP: fixture, TEMP: fixture,
+    ...(env || {}),
+  };
+
+  const results = [];
+  for (const h of probes) {
+    let error = null, ok = false, emitted = false, code = null, signal = null;
+    try {
+      const r = spawnSync(process.execPath, [h.script], {
+        input: JSON.stringify(h.payload || {}),
+        cwd: fixture,
+        env: baseEnv,
+        timeout: timeoutMs,
+        encoding: 'utf8',
+      });
+      code = r.status;
+      signal = r.signal;
+      ok = !r.error && r.status === 0;
+      emitted = !!(r.stdout && r.stdout.trim());
+      if (!ok) {
+        error = r.error
+          ? String(r.error.message || r.error)
+          : ((r.stderr || '').trim().slice(0, 200) || `exit ${r.status}`);
+      }
+    } catch (e) {
+      error = String((e && e.message) || e);
+    }
+    results.push({ label: h.label, script: h.script, ok, code, signal, emitted, error });
+  }
+
+  try { fs.rmSync(fixture, { recursive: true, force: true }); } catch { /* ok */ }
+
+  return { ok: results.length > 0 && results.every(r => r.ok), results };
+}
+
 // --- Install (idempotent) ---
 
 function install() {
@@ -760,6 +872,7 @@ module.exports = {
   removeHooksFromSettings, isOurHookEntry,
   registerHooksToSettings, buildSettingsHookEntries,                  // v0.32.0
   surveyHookCoverage, compositeCommand,                                // v0.49.1 — version-aware self-heal
+  verifyHooksFire, defaultHookFireProbes,                              // v0.67.0 — firing self-test
   activeInstallPath, isStaleRelicContext,                              // v0.49.1 — stale-relic downgrade guard
   SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests
   PLUGIN_ROOT,                                                         // v0.32.1 — for tests / consumers
@@ -796,8 +909,20 @@ if (require.main === module) {
     const checkOnly = process.argv.includes('--check-only');
     const { issueCount } = runDoctor({ checkOnly });
     process.exit(issueCount > 0 ? 1 : 0);
+  } else if (cmd === 'verify-hooks-fire') {
+    // v0.67.0 — Layer-A firing self-test. Spawned detached by session-init
+    // (off the SessionStart budget); writes a small state file the next
+    // SessionStart reads to surface failures.
+    const res = verifyHooksFire();
+    const failures = res.results.filter(r => !r.ok).map(r => r.label);
+    try {
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+      writeJsonAtomic(path.join(CACHE_DIR, 'hook-fire-state.json'),
+        { ts: new Date().toISOString(), ok: res.ok, failures });
+    } catch { /* best-effort telemetry */ }
+    console.log(`Hook firing: ${res.ok ? 'OK' : 'FAIL'} (${res.results.length} probed${failures.length ? ', failed: ' + failures.join(', ') : ''})`);
   } else {
-    console.error('Usage: lifecycle.js <install|uninstall|update|health|doctor>');
+    console.error('Usage: lifecycle.js <install|uninstall|update|health|doctor|verify-hooks-fire>');
     process.exit(1);
   }
 }

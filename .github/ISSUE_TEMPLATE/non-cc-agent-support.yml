@@ -1,0 +1,60 @@
+name: Non–Claude-Code agent support
+description: Request code-graph-mcp support for an agent other than Claude Code (Cursor, Codex CLI, Gemini CLI, Cline, …)
+title: "[non-cc-agent] "
+labels: ["non-cc-agent"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for your interest! A quick, honest status so this is worth your time:
+
+        - **The MCP server and CLI already work with any MCP-capable client today.** code-graph-mcp speaks standard MCP, and the CLI (`code-graph-mcp grep | callgraph | impact | overview | show …`) is agent-agnostic. You can register it in any MCP client by hand — no installer required.
+        - **Its highest-value layer is currently Claude-Code-specific.** The big win on Claude Code is the PreToolUse "deny-with-answer" hook that intercepts a grep/read and pushes the graph answer back *inline* (measured: ~84–93% of those answers end the search). That depends on Claude Code's tool-call interception. On an agent without an equivalent, only the (weaker, pull-based) MCP tools port.
+
+        This form **counts demand** for a first-class installer + steering for a specific non-CC agent. We build it only when (a) enough people ask and (b) the target agent has a mechanism the value actually ports to. Every submission is a counted signal — thank you.
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Which agent?
+      options:
+        - Cursor
+        - Codex CLI
+        - Gemini CLI
+        - Cline
+        - Continue.dev
+        - Windsurf
+        - Other (name it in the notes)
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What would you actually use it for?
+      description: The concrete workflow — e.g. "trace call graphs while editing a large Rust repo in Cursor". This helps us judge whether the value ports to your agent.
+    validations:
+      required: true
+  - type: dropdown
+    id: mechanism
+    attributes:
+      label: Does this agent support tool-call interception / hooks / middleware?
+      description: code-graph's main value on Claude Code comes from intercepting grep/read calls and answering inline. If your agent has no equivalent, only the pull-based MCP tools port. "Not sure" is a fine answer.
+      options:
+        - Yes — it has a pre-tool-call hook / middleware
+        - No — MCP tools / config only
+        - Not sure
+    validations:
+      required: true
+  - type: checkboxes
+    id: dogfood
+    attributes:
+      label: Could you help validate it?
+      description: We only ship what we can measure. A pre-release needs at least one user on the target agent.
+      options:
+        - label: I actively use this agent on real projects and could test a pre-release build
+        - label: I could share before/after on whether it reduces my grep/read fan-out
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+    validations:
+      required: false
