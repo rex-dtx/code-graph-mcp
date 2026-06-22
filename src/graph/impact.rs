@@ -25,10 +25,12 @@ pub struct ImpactClassification<'a> {
     pub prod_callers: Vec<&'a CallerWithRouteInfo>,
     /// Count of distinct production-caller files.
     pub affected_files: usize,
-    /// Production callers carrying route metadata (HTTP endpoints). Routes
-    /// reachable only through test callers are excluded — they are not part of the
-    /// production blast radius. The count feeds the risk level; surfaces render the
-    /// `route_info` for display.
+    /// Production callers carrying a PARSEABLE route (HTTP endpoints). Routes
+    /// reachable only through test callers are excluded (not a production blast
+    /// radius), and so are callers whose `route_info` JSON does not parse — so
+    /// `route_callers.len()` is the single count that feeds the risk level AND
+    /// that both surfaces display (the MCP `affected_routes` array, its summary,
+    /// and the CLI count), with no divergence on corrupt/legacy metadata.
     pub route_callers: Vec<&'a CallerWithRouteInfo>,
     /// Count of distinct test/bench callers (`tests_affected` in both surfaces).
     pub test_count: usize,
@@ -82,11 +84,23 @@ pub fn classify_impact<'a>(
         .collect::<HashSet<_>>()
         .len();
 
-    // Prod callers only: a route reachable solely through a test caller is not a
-    // production blast radius (the MCP-path drift this module fixes).
+    // Prod callers carrying a PARSEABLE route. Two filters in one: (1) a route
+    // reachable solely through a test caller is not a production blast radius (the
+    // MCP-path drift this module first fixed); (2) the `route_info` JSON must parse.
+    // Without (2) the count diverged across surfaces: the MCP path fed
+    // route_callers.len() to risk but displayed only the parseable subset
+    // (affected_routes.len()), while the CLI counted the raw set — so a corrupt or
+    // legacy route_info made risk, the MCP count, and the CLI count disagree.
+    // Gating on parseability makes route_callers.len() the single basis for risk
+    // AND both surfaces' displayed counts (a route we cannot render must not
+    // silently inflate the blast radius either).
     let route_callers: Vec<&CallerWithRouteInfo> = prod_callers
         .iter()
-        .filter(|c| c.route_info.is_some())
+        .filter(|c| {
+            c.route_info
+                .as_deref()
+                .is_some_and(|m| serde_json::from_str::<serde_json::Value>(m).is_ok())
+        })
         .copied()
         .collect();
 
@@ -196,6 +210,21 @@ mod tests {
         assert_eq!(c.route_callers.len(), 3);
         // >= 3 routes ⇒ HIGH (compute_risk_level).
         assert_eq!(c.risk_level, "HIGH");
+    }
+
+    #[test]
+    fn corrupt_route_metadata_excluded_so_count_is_consistent() {
+        // A prod caller whose route_info isn't valid JSON must NOT count toward
+        // route_callers — otherwise risk (route_callers.len()) and the count both
+        // surfaces can render (the parseable subset) diverge on corrupt/legacy
+        // metadata. One valid route + one corrupt → exactly one counted route.
+        let callers = vec![
+            caller("good", "src/a.rs", 1, Some(r#"{"method":"GET","path":"/ok"}"#)),
+            caller("bad", "src/b.rs", 1, Some("not json{")),
+        ];
+        let c = classify_impact(&callers, "behavior", true);
+        assert_eq!(c.route_callers.len(), 1, "only the parseable route counts");
+        assert_eq!(c.route_callers[0].name, "good", "the corrupt-metadata route is dropped");
     }
 
     #[test]
