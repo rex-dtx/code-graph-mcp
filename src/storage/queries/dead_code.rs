@@ -48,16 +48,19 @@ pub fn find_dead_code(
         //   PHP     __x         (PHP reserves the __ prefix for magic methods)
         //   JS/TS   constructor (invoked by `new`, never by name)
         //   Ruby    initialize  (invoked by `.new`)
-        //   Java/C#/Dart        constructor is a function sharing the class name
-        //                       (qualified_name `Account.Account`) — detected by
-        //                       a same-file class/struct of the same name.
-        // C/C++ constructors aren't pattern-matchable here — left as a known gap.
+        //   Java/C#/Dart/C++    constructor is a function/method sharing the
+        //                       class name (qualified_name `Account.Account`) —
+        //                       detected by a same-file class/struct of the same
+        //                       name. C++ destructors (`~Class`, invoked at scope
+        //                       exit) match the `~` prefix.
+        // Plain C has no constructors — nothing to exclude.
         "NOT (n.type IN ('method', 'function') AND (
             (f.language = 'python' AND n.name LIKE '\\_\\_%\\_\\_' ESCAPE '\\')
             OR (f.language = 'php' AND n.name LIKE '\\_\\_%' ESCAPE '\\')
             OR (f.language IN ('javascript', 'typescript', 'tsx') AND n.name = 'constructor')
             OR (f.language = 'ruby' AND n.name = 'initialize')
-            OR (f.language IN ('java', 'csharp', 'dart') AND EXISTS (
+            OR (f.language = 'cpp' AND n.name LIKE '~%')
+            OR (f.language IN ('java', 'csharp', 'dart', 'cpp') AND EXISTS (
                 SELECT 1 FROM nodes c
                 WHERE c.file_id = n.file_id
                   AND c.type IN ('class', 'struct')
@@ -739,6 +742,48 @@ mod tests {
             }).unwrap();
         }
 
+        // C++: constructor is a `method` sharing the class name (tested in its
+        // own file with no destructor, so ONLY the same-file-class rule can
+        // exclude it — not a coincidental instr rescue from a `~Class(` substring).
+        let cpp_ctor_fid = upsert_file(conn, &FileRecord {
+            path: "src/Alpha.cpp".into(), blake3_hash: "hcppa".into(), last_modified: 1,
+            language: Some("cpp".into()),
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: cpp_ctor_fid, node_type: "class".into(), name: "Alpha".into(),
+            qualified_name: Some("Alpha".into()), start_line: 1, end_line: 6,
+            code_content: "class Alpha { }".into(), signature: None,
+            doc_comment: None, context_string: None, name_tokens: None,
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: cpp_ctor_fid, node_type: "method".into(), name: "Alpha".into(),
+            qualified_name: Some("Alpha.Alpha".into()), start_line: 2, end_line: 5,
+            code_content: "Alpha(int w) {\n    width = w;\n    height = w;\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // C++ destructor `~Beta` (own file): only the `~` prefix rule can exclude
+        // it — the constructor body `Beta(` does not contain `~Beta`.
+        let cpp_dtor_fid = upsert_file(conn, &FileRecord {
+            path: "src/Beta.cpp".into(), blake3_hash: "hcppb".into(), last_modified: 1,
+            language: Some("cpp".into()),
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: cpp_dtor_fid, node_type: "class".into(), name: "Beta".into(),
+            qualified_name: Some("Beta".into()), start_line: 1, end_line: 6,
+            code_content: "class Beta { }".into(), signature: None,
+            doc_comment: None, context_string: None, name_tokens: None,
+            return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        insert_node(conn, &NodeRecord {
+            file_id: cpp_dtor_fid, node_type: "method".into(), name: "~Beta".into(),
+            qualified_name: Some("Beta.~Beta".into()), start_line: 2, end_line: 5,
+            code_content: "~Beta() {\n    free(buf);\n    log(\"gone\");\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
         // A genuinely-dead regular method (Python, 3 lines, no edges) — must
         // still be reported so the exclusion doesn't over-suppress real findings.
         let py_fid = *fid_cache.get("src/a.py").unwrap();
@@ -760,13 +805,16 @@ mod tests {
             assert!(!names.contains(&implicit),
                 "implicitly-invoked method '{implicit}' must NOT be reported dead; got: {names:?}");
         }
-        // Java/C#/Dart constructors are `function` nodes named like the class.
-        // The constructor *function* must never be reported (the same-named
+        // Java/C#/Dart/C++ constructors are function/method nodes named like the
+        // class. The constructor itself must never be reported (the same-named
         // `class` node is a separate unused-class concern, out of scope here).
-        for ctor in ["Account", "Repo", "Widget"] {
+        for ctor in ["Account", "Repo", "Widget", "Alpha"] {
             assert!(!results.iter().any(|(n, t)| n == ctor && (t == "function" || t == "method")),
                 "constructor function '{ctor}' must be excluded; got: {results:?}");
         }
+        // C++ destructor (`~Class`, invoked at scope exit) must be excluded.
+        assert!(!names.contains(&"~Beta"),
+            "C++ destructor '~Beta' must NOT be reported dead; got: {names:?}");
         assert!(names.contains(&"compute_unused"),
             "a genuinely-dead regular method must still be reported; got: {names:?}");
     }
