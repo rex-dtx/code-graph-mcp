@@ -1151,11 +1151,28 @@ pub struct RecommendationSummary {
     /// out of `total`/`by_action`. Surfaced in stats so the feature isn't dark.
     pub live_impact: u64,
     /// Of `deny_answered` (cg delivered a grep answer in-place), how many were
-    /// IMMEDIATELY followed by another grep/read event — i.e. the inline answer
-    /// did not end the hunt. Lower is better. Computed in append (chronological)
-    /// order; a single-user-sequential approximation (truly concurrent sessions
-    /// interleave in the shared file).
+    /// IMMEDIATELY followed by ANY grep/read event. Computed in append
+    /// (chronological) order; a single-user-sequential approximation (truly
+    /// concurrent sessions interleave in the shared file). NOTE: this raw count
+    /// is NOT a failure rate — it lumps together healthy drill-down that cg also
+    /// answered (`sustained_after_answer`), file-reads acting on the answer
+    /// (observe), and genuine fall-through (`fallthrough_after_answer`). Only the
+    /// last means the inline answer was insufficient. Read `fallthrough_after_answer`
+    /// for the honest signal.
     pub researched_after_answer: u64,
+    /// Subset of `researched_after_answer`: the follow-up search was ITSELF
+    /// answered by cg (an answered deny / delivered hint), so the model drilled
+    /// deeper and cg kept up — each step replaced another raw grep with an answer.
+    /// A win, not a miss. Upper bound: a verbatim re-grep of the SAME pattern also
+    /// lands here (pattern-level dedup is a future refinement — the hook does not
+    /// yet record the pattern).
+    pub sustained_after_answer: u64,
+    /// Subset of `researched_after_answer`: the follow-up was a search cg could
+    /// NOT satisfy (static deny / advisory-only hint / bypass). THIS is the honest
+    /// "the inline answer was insufficient and cg couldn't help the next step"
+    /// signal — the actual fan-out leak. `observe` (a file read acting on the
+    /// delivered answer) is excluded from both subsets: it is not a search cg failed.
+    pub fallthrough_after_answer: u64,
 }
 
 /// Parse and aggregate `recommendations.jsonl` content. Pure: no IO, no panics —
@@ -1178,7 +1195,21 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
         let is_search_event = matches!(hook, Some("grep") | Some("read"))
             && matches!(action, Some("deny") | Some("hint") | Some("bypass") | Some("observe"));
         if armed {
-            if is_search_event { s.researched_after_answer += 1; }
+            if is_search_event {
+                s.researched_after_answer += 1;
+                // Split the follow-up honestly: observe = a silent file read
+                // acting on the delivered answer (not a search cg failed);
+                // answered:true = cg ALSO answered the next step (sustained
+                // drill-down, a win); anything else (static deny / advisory hint /
+                // bypass) = cg fell through — the real insufficiency.
+                if action == Some("observe") {
+                    // acting on the answer — neither sustained nor fall-through
+                } else if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
+                    s.sustained_after_answer += 1;
+                } else {
+                    s.fallthrough_after_answer += 1;
+                }
+            }
             armed = false; // only the IMMEDIATELY-next tool event counts
         }
 
@@ -1346,14 +1377,22 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 "deny_answered": recs.deny_answered,
                 "deny_unanswered": recs.deny_unanswered,
                 // Outcome proxy: observe = silent grep/read allows recorded by the
-                // hooks; re_search_rate = fraction of answered denies immediately
-                // followed by another grep/read (lower = the inline answer sufficed;
-                // null until there is an answered deny to divide by).
+                // hooks. re_search_rate = fraction of answered denies immediately
+                // followed by ANY grep/read — kept for back-compat, but it OVER-counts
+                // insufficiency (it includes drill-down cg also answered + file-reads).
+                // fallthrough_rate is the honest "inline answer insufficient" fraction:
+                // the follow-up was a search cg could NOT satisfy. Both null until an
+                // answered deny exists to divide by.
                 "observe": recs.observe,
                 "live_impact": recs.live_impact,
                 "researched_after_answer": recs.researched_after_answer,
                 "re_search_rate": if recs.deny_answered > 0 {
                     serde_json::json!((recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() / 100.0)
+                } else { serde_json::Value::Null },
+                "sustained_after_answer": recs.sustained_after_answer,
+                "fallthrough_after_answer": recs.fallthrough_after_answer,
+                "fallthrough_rate": if recs.deny_answered > 0 {
+                    serde_json::json!((recs.fallthrough_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() / 100.0)
                 } else { serde_json::Value::Null },
                 // tool_calls / recommendations: two independent populations, so
                 // this is an activity/volume ratio, NOT a recommend→use rate. The
@@ -1455,8 +1494,22 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             // searching? Lower = the inline answer was enough. observe = the silent
             // grep/read allows that make the fan-out visible.
             if recs.deny_answered > 0 {
-                let pct = (recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
-                println!("Re-search after cg answer: {}/{} answered denies → kept searching = {pct}% (lower = inline answer sufficed)",
+                // Honest fan-out signal. The follow-up after an answered deny is
+                // one of: cg ALSO answered it (sustained drill-down — a win), a
+                // file read acting on the answer (observe), or a search cg couldn't
+                // satisfy (fall-through). Only fall-through means the inline answer
+                // was insufficient. The raw "kept searching" count lumps all three
+                // and reads alarmingly high even when cg wins every step, so lead
+                // with fall-through and show the raw count correctly framed.
+                let ft_pct = (recs.fallthrough_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
+                println!("Fall-through after cg answer: {}/{} answered denies → next search cg couldn't satisfy = {ft_pct}% (the real 'answer insufficient' rate; lower is better)",
+                    recs.fallthrough_after_answer, recs.deny_answered);
+                if recs.sustained_after_answer > 0 {
+                    println!("  ↳ drill-down sustained: {} follow-up search(es) cg also answered — cg kept up, not a miss",
+                        recs.sustained_after_answer);
+                }
+                let raw_pct = (recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
+                println!("  ↳ any follow-up (raw): {}/{} = {raw_pct}% — incl. drill-down + file-reads; NOT a failure rate",
                     recs.researched_after_answer, recs.deny_answered);
             }
             if recs.observe > 0 {
@@ -5526,10 +5579,52 @@ mod tests {
         assert_eq!(s.deny_unanswered, 1, "t7 unanswered");
         assert_eq!(s.researched_after_answer, 2,
             "t1→t2 (re-grep) and t5→t6 (read) count; t3→t4 (cli use) is a conversion, not re-search");
+        // Both follow-ups here are observe (a file read acting on the delivered
+        // answer) → neither a sustained drill-down nor a fall-through cg failed.
+        assert_eq!(s.sustained_after_answer, 0, "no follow-up was itself answered by cg");
+        assert_eq!(s.fallthrough_after_answer, 0, "no follow-up was a search cg couldn't satisfy");
         assert_eq!(s.observe, 3, "t2,t6,t8 observes");
         assert_eq!(s.cli_uses, 1, "t4");
         assert_eq!(s.by_action.get("observe"), None, "observe is not a recommendation action");
         assert_eq!(s.total, 4, "4 denies counted; observe + cli use excluded from total");
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_followup_split_sustained_vs_fallthrough() {
+        // The honest split of "follow-up after an answered deny": cg either
+        // answered the next step too (sustained drill-down — a win), the model
+        // read a file (observe — acting on the answer), or fell through to a
+        // search cg couldn't satisfy (the real insufficiency). `use` between pairs
+        // is a clean disarm (conversion, not a search).
+        //   L1 answered deny → L2 answered deny       = sustained (cg kept up); L2 re-arms
+        //   L2 (armed) → L3 cli use                   = conversion → disarm
+        //   L4 answered deny → L5 static deny         = fall-through (cg couldn't); L5 unanswered → no arm
+        //   L6 answered deny → L7 grep hint (advisory) = fall-through (no delivered answer)
+        //   L8 answered deny → L9 read observe        = neither (acting on answer) → disarm
+        //   L10 answered deny → L11 cli use           = conversion → disarm
+        //   L12 answered deny → (end)                 = no follow-up (answer sufficed)
+        let content = "\
+{\"ts\":\"L1\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"L2\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"mode\":\"grep\"}
+{\"ts\":\"L3\",\"hook\":\"cli\",\"action\":\"use\",\"cmd\":\"grep\"}
+{\"ts\":\"L4\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"L5\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":false}
+{\"ts\":\"L6\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"L7\",\"hook\":\"grep\",\"action\":\"hint\"}
+{\"ts\":\"L8\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"L9\",\"hook\":\"read\",\"action\":\"observe\"}
+{\"ts\":\"L10\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+{\"ts\":\"L11\",\"hook\":\"cli\",\"action\":\"use\",\"cmd\":\"grep\"}
+{\"ts\":\"L12\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true}
+";
+        let s = aggregate_recommendations_jsonl(content);
+        assert_eq!(s.deny_answered, 7, "L1,L2,L4,L6,L8,L10,L12 answered");
+        assert_eq!(s.deny_unanswered, 1, "L5 static");
+        assert_eq!(s.researched_after_answer, 4, "L2,L5,L7,L9 are search follow-ups; L3/L11 use disarm");
+        assert_eq!(s.sustained_after_answer, 1, "L1→L2: cg answered the follow-up too");
+        assert_eq!(s.fallthrough_after_answer, 2, "L4→L5 (static) and L6→L7 (advisory hint): cg couldn't satisfy");
+        assert_eq!(s.observe, 1, "L9");
+        assert_eq!(s.cli_uses, 2, "L3,L11");
     }
 
     #[test]

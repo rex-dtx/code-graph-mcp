@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.64.0 — Honest "fall-through" adoption metric (the re-search rate was over-counting)
+
+### Fixed
+- **`code-graph-mcp stats` no longer reports a misleading "re-search after cg answer" rate.**
+  The old metric counted every grep/read that followed an answered deny as "kept searching = the
+  inline answer failed" — but that lumps in healthy drill-down (the model greps the next related
+  symbol and cg answers that one too) and file-reads that act on the delivered answer. On this
+  repo's own data that read 61%, while the rate at which cg answered and then genuinely could not
+  satisfy the next search was 7%. `stats` now leads with **`Fall-through after cg answer`** (the
+  follow-up was a search cg could not satisfy — the only signal that the inline answer was
+  insufficient), reports **drill-down sustained** (follow-ups cg also answered — a win, not a
+  miss) separately, and labels the old raw "any follow-up" count as "NOT a failure rate".
+
+### Added
+- **`stats --json` gains `recommendations.sustained_after_answer`, `.fallthrough_after_answer`, and
+  `.fallthrough_rate`.** `fallthrough_rate` is the honest "inline answer insufficient" fraction;
+  `re_search_rate` is kept for back-compat but over-counts — read `fallthrough_rate`.
+
+### Internal
+- `aggregate_recommendations_jsonl` now splits the follow-up after an answered deny into sustained
+  (cg answered it too) / fall-through (cg couldn't) / observe (a file read acting on the answer,
+  excluded), instead of counting all three as "re-search". No index/schema bump (output-only).
+
 ## v0.63.0 — SessionStart live blast-radius context, edit-impact salience, project-map binary fix
 
 ### Added
