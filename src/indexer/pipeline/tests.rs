@@ -978,3 +978,67 @@ fn test_pending_buffers_on_callee_file_deletion() {
     assert!(edges_post.iter().any(|e| e.relation == REL_CALLS && e.target_id == foo_id_post),
         "edge caller_b → foo must reappear post re-add via pending sweep");
 }
+
+#[test]
+fn test_is_safe_relative_path() {
+    // Safe: ordinary relative paths, `./` prefix, interior `..` that stays in-root.
+    assert!(is_safe_relative_path("src/lib.rs"));
+    assert!(is_safe_relative_path("a.ts"));
+    assert!(is_safe_relative_path("./src/x.rs"));
+    assert!(is_safe_relative_path("a/b/../c.rs")); // net depth stays >= 0
+    assert!(is_safe_relative_path("")); // empty → downstream treats as no-op
+    // Unsafe: absolute root, leading `..`, or a `..` that climbs above the root.
+    assert!(!is_safe_relative_path("/etc/passwd"));
+    assert!(!is_safe_relative_path("../outside.ts"));
+    assert!(!is_safe_relative_path("../../etc/passwd"));
+    assert!(!is_safe_relative_path("a/../../b.rs")); // dips below root mid-path
+    #[cfg(windows)]
+    assert!(!is_safe_relative_path(r"C:\windows\system32"));
+}
+
+/// Defense-in-depth: `ensure_file_indexed` must refuse to touch a file outside
+/// the project root, whether reached by an absolute path or a `..`-escape. The
+/// MCP freshness wrapper (`ensure_file_fresh_opt`) forwards the client's raw
+/// `file_path` without `normalize_user_path`, so this leaf is what stops an
+/// unnormalized path from hashing/indexing arbitrary files into the project DB.
+/// Such a path is a no-op (`Ok(false)`), like other non-indexable inputs.
+#[test]
+fn test_ensure_file_indexed_rejects_out_of_root_path() {
+    let base = TempDir::new().unwrap();
+    let project_root = base.path().join("proj");
+    fs::create_dir_all(&project_root).unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    // A real source file OUTSIDE the project root (in base/), reachable via `..`.
+    fs::write(base.path().join("outside.ts"), "function secret() {}\n").unwrap();
+    // An absolute-path target outside the project entirely.
+    let elsewhere = TempDir::new().unwrap();
+    let abs_outside = elsewhere.path().join("abs_secret.ts");
+    fs::write(&abs_outside, "function absSecret() {}\n").unwrap();
+
+    // Establish the project index with one legitimate in-root file.
+    fs::write(project_root.join("ok.ts"), "function inRoot() {}\n").unwrap();
+    run_full_index(&db, &project_root, None, None).unwrap();
+
+    // `..`-escape: project_root/../outside.ts resolves to base/outside.ts.
+    let did = ensure_file_indexed(&db, &project_root, "../outside.ts", None).unwrap();
+    assert!(!did, "a `..`-escaping path must be a no-op, not a reindex");
+
+    // Absolute path outside the project.
+    let did_abs =
+        ensure_file_indexed(&db, &project_root, abs_outside.to_str().unwrap(), None).unwrap();
+    assert!(!did_abs, "an absolute out-of-root path must be a no-op");
+
+    // Neither external symbol leaked into the project DB.
+    assert!(get_nodes_by_name(db.conn(), "secret").unwrap().is_empty(),
+        "a `..`-escaping file must not be indexed into the project DB");
+    assert!(get_nodes_by_name(db.conn(), "absSecret").unwrap().is_empty(),
+        "an absolute out-of-root file must not be indexed into the project DB");
+
+    // The guard must not over-block: a legitimate in-root edit still reindexes.
+    fs::write(project_root.join("ok.ts"), "function inRootEdited() {}\n").unwrap();
+    let did_ok = ensure_file_indexed(&db, &project_root, "ok.ts", None).unwrap();
+    assert!(did_ok, "an in-root edited file must still reindex");
+    assert_eq!(get_nodes_by_name(db.conn(), "inRootEdited").unwrap().len(), 1);
+}

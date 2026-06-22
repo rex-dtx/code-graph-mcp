@@ -11,6 +11,10 @@
   where an attacker who controls the url also controls its sidecar. When set it is
   the sole integrity authority (no network sidecar fetch) and applies to `file://`
   sources too. Unset → behavior is unchanged.
+- **`ensure_file_indexed` path-traversal guard** — the query-time freshness leaf
+  now refuses an absolute or `..`-escaping `rel_path`, so an MCP `file_path`
+  argument forwarded without normalization can't make the server hash/index a
+  file outside the project root. Legitimate relative paths are unaffected.
 
 ## v0.57.0 — inline route handlers; SIGBUS/flake fixes; CLI/MCP classification unified
 

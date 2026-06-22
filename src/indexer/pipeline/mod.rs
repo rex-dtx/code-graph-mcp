@@ -71,6 +71,31 @@ pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&Embeddi
 ///
 /// Cross-file dirty-edge handling mirrors `run_incremental_index`: collect
 /// dirty node IDs **before** re-indexing (cascade delete strips old edges),
+/// True when `rel_path` is a safe project-relative path: no absolute root and no
+/// leading `..` that climbs above the project. [`ensure_file_indexed`] keys the
+/// files table by this relative path, so anything else is meaningless as a key
+/// *and* a path-traversal risk — the MCP `file_path` args reach the freshness
+/// path (`ensure_file_fresh_opt`) without going through `normalize_user_path`.
+fn is_safe_relative_path(rel_path: &str) -> bool {
+    use std::path::Component;
+    let mut depth: i32 = 0;
+    for comp in Path::new(rel_path).components() {
+        match comp {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            // An absolute root or a Windows prefix (`C:\`) escapes the project.
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
 /// then regenerate context strings + embeddings once the new nodes exist.
 pub fn ensure_file_indexed(
     db: &Database,
@@ -78,6 +103,14 @@ pub fn ensure_file_indexed(
     rel_path: &str,
     model: Option<&EmbeddingModel>,
 ) -> Result<bool> {
+    // Defense-in-depth: rel_path is a project-relative DB key by contract, but a
+    // caller that forwards an unnormalized client path (absolute, or `..` climbing
+    // out of the project) must not make us stat/hash/index a file outside
+    // project_root. Treat such a path as "nothing to refresh" — consistent with
+    // the not-indexable early returns below, not a hard error.
+    if !is_safe_relative_path(rel_path) {
+        return Ok(false);
+    }
     let abs_path = project_root.join(rel_path);
 
     // Missing-file path: drop stale row so future queries don't return phantom nodes.
