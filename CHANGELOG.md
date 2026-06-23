@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.70.0 — Grep-deny: don't deny what the inline answer can't fully cover
+
+### Fixed
+- **Multi-file grep deny → hint.** The deny-with-answer scopes its inline `cg grep` to a single
+  path (the first source-prefixed token), so a grep naming ≥2 files (`grep "X" scripts/setup.sh
+  hook-shared.mjs`) got an answer covering only the first — an incomplete substitute that rationally
+  pushed the model to set `CODE_GRAPH_NO_BLOCK_GREP=1` and bypass the hook for the rest of the session
+  (a 2026-06-23 reach audit found this was the dominant real bypass). Such greps now downgrade to a
+  HINT (which still nudges) instead of an incomplete deny, so the model's complete grep runs.
+  Single-file and directory/recursive greps — which the inline answer fully covers — still deny. The
+  path count is scoped to the grep's own segment, so a path in a compound `… | sed … file` tail is not
+  mistaken for a second grep target. +7 regression tests.
+
 ## v0.69.0 — Grep-deny floor hardening: never deny a non-foldable grep
 
 ### Fixed

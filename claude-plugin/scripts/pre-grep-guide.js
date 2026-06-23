@@ -166,6 +166,12 @@ function classifyBlock(cmd) {
     if (symbols.length === 0) return null;        // context read without named decls
     return { mode: 'show', symbols: symbols.slice(0, 3) };
   }
+  // v0.70 — only DENY when the inline grep answer can cover the SAME scope. It scopes to one
+  // path (extractSearchPath = first src-prefixed token), so a grep naming ≥2 file paths gets a
+  // first-path-only answer (the rest silently dropped) — an incomplete substitute that
+  // rationally teaches CODE_GRAPH_NO_BLOCK_GREP bypass. Downgrade to hint: the model's complete
+  // grep runs and the hint still nudges. (show mode above is symbol-scoped, not path → unaffected.)
+  if (countNamedPaths(cmd, patterns) >= 2) return null;
   return { mode: 'grep' };
 }
 
@@ -301,6 +307,37 @@ function extractSearchPath(cmd) {
     if (SRC_PATH_TOKEN.test(token)) return token;
   }
   return undefined;
+}
+
+// v0.70 — count the explicit file/dir path arguments a grep names (excluding flags and
+// the quoted search pattern). The deny's inline answer scopes to ONE path
+// (extractSearchPath returns only the first source-prefixed token), so a grep naming ≥2
+// paths gets an answer covering only the first — an incomplete substitute that rationally
+// drives CODE_GRAPH_NO_BLOCK_GREP bypass (2026-06-23: the dominant observed bypass was a
+// multi-file named grep whose deny silently dropped the other files). classifyBlock uses
+// this to downgrade those denies to a hint (which still nudges) so the complete grep runs.
+function countNamedPaths(cmd, patterns) {
+  if (!cmd || typeof cmd !== 'string') return 0;
+  const pats = new Set(patterns || []);
+  // Only the grep's OWN path args count. Stop at the first top-level command separator so a
+  // path in a compound tail (`grep X src/a.py | sed … src/b.py`) is NOT mistaken for a second
+  // grep target — that would wrongly downgrade a complete single-file grep to a hint.
+  let seg = cmd.replace(/^\s*(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:grep|rg|ag)\s+/, '');
+  let quote = null;
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i];
+    if (quote) { if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === ';' || c === '|' || c === '&' || c === '>' || c === '<' || c === '\n') { seg = seg.slice(0, i); break; }
+  }
+  let n = 0;
+  for (const raw of seg.split(/\s+/)) {
+    const tok = raw.replace(/^["']|["']$/g, '');
+    if (!tok || tok.startsWith('-')) continue;     // a flag
+    if (pats.has(tok)) continue;                    // the search pattern, not a path
+    if (tok.includes('/') || /\.[A-Za-z0-9]{1,6}$/.test(tok)) n++;  // dir-sep or file extension
+  }
+  return n;
 }
 
 // v0.47.0 — the pattern that justified the block: first identifier-like one.
@@ -607,6 +644,7 @@ module.exports = {
   extractSedReadTargets, // v0.49 — sed-range reads feed the read-fanout state
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests
+  countNamedPaths,    // v0.70 — multi-path deny→hint downgrade
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix
   resolveProjectRoot,    // v0.48 — subdir-cwd dark fix

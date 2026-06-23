@@ -5,6 +5,7 @@ const {
   shouldHint,
   shouldBlock,
   classifyBlock,
+  countNamedPaths,
   extractDeclSymbols,
   translateBreToRg,
   buildShowDenyReason,
@@ -370,6 +371,45 @@ test('shouldBlock: --include=*.rs → deny, path-scoped grep answer covers it (v
 
 test('shouldBlock: --exclude=tests → hint only (answer cannot honor exclusion)', () => {
   assert.equal(shouldBlock('grep -rn --exclude=tests "EmbeddingModel" src/'), false);
+});
+
+// ── B (v0.70): deny only when the inline answer covers the FULL scope ──
+// The deny scopes to ONE path (extractSearchPath = first src-prefixed token). A grep naming
+// ≥2 file paths would get a first-path-only answer (the rest silently dropped) — an incomplete
+// substitute that rationally teaches CODE_GRAPH_NO_BLOCK_GREP bypass. Downgrade those to HINT;
+// single file / directory greps (which the answer fully covers) still deny.
+
+test('B: ≥2 named files downgrade deny→hint (deny would drop all but the first)', () => {
+  const cmd = 'grep -n "CLAUDE_MEM_DIR" scripts/setup.sh hook-shared.mjs';
+  assert.equal(shouldHint(cmd), true);     // still nudges
+  assert.equal(shouldBlock(cmd), false);   // but does NOT deny (answer can't cover hook-shared.mjs)
+  assert.equal(classifyBlock(cmd), null);
+});
+
+test('B: two source files also downgrade (deny would cover only the first)', () => {
+  assert.equal(shouldBlock('grep -rn "set_hook" src/main.rs src/lib.rs'), false);
+  assert.equal(shouldHint('grep -rn "set_hook" src/main.rs src/lib.rs'), true);
+});
+
+test('B: single file still DENIES (inline answer fully covers it)', () => {
+  assert.deepEqual(classifyBlock('grep -n "handleMessage" src/server.mjs'), { mode: 'grep' });
+});
+
+test('B: single directory (recursive) still DENIES (cg grep covers the whole dir)', () => {
+  assert.equal(shouldBlock('grep -rn "EmbeddingModel" src/'), true);
+});
+
+test('B: --include on a single dir still DENIES (one path, fully scoped)', () => {
+  assert.equal(shouldBlock('grep -rn --include="*.rs" "EmbeddingModel" src/'), true);
+});
+
+test('countNamedPaths: counts paths, excludes flags and the quoted pattern', () => {
+  assert.equal(countNamedPaths('grep -n "Foo" src/a.rs src/b.rs', ['Foo']), 2);
+  assert.equal(countNamedPaths('grep -rn "Foo" src/', ['Foo']), 1);
+  // a path-shaped pattern is the pattern, not a second path token
+  assert.equal(countNamedPaths('grep "config.json" src/app.rs', ['config.json']), 1);
+  // a path in a compound tail (sed/pipe target) is NOT a 2nd grep target → stays 1 (deny)
+  assert.equal(countNamedPaths("grep -n \"Foo\" src/foo.rs | head; sed -n '1,5p' src/bar.rs", ['Foo']), 1);
 });
 
 test('shouldBlock: -L / -v inverted intents → hint only', () => {
