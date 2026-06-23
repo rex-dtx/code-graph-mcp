@@ -63,6 +63,71 @@ test('shouldHint: env-prefixed grep on src/', () => {
   assert.equal(shouldHint('env LANG=C grep -rn "Foo" src/'), true);
 });
 
+// ── git grep coverage (v0.71): `git grep` is raw BRE search on the tracked
+//    source tree — same foldable intent as `grep`, but its command HEAD is
+//    `git`, so it leaked past GREP_HEAD until v0.71. cg grep is a superset
+//    (tracked AND gitignored), so folding `git grep` into it is sound. The verb
+//    set is shared across GREP_HEAD / VERB_STRIP / PIPE_INTO_GREP — these lock
+//    each parse site that touches the verb.
+
+test('git grep: shouldHint fires on `git grep` against src/', () => {
+  assert.equal(shouldHint('git grep -n "fts5_search" src/storage/'), true);
+});
+
+test('git grep: shouldHint fires with the `--` pathspec separator', () => {
+  assert.equal(shouldHint('git grep "FooBar" -- src/lib.rs'), true);
+});
+
+test('git grep: identifier search is a deny (block tier, same as grep)', () => {
+  assert.equal(shouldBlock('git grep "FooBar" src/'), true);
+});
+
+test('git grep: context flag + decl anchor → show mode', () => {
+  assert.deepEqual(
+    classifyBlock('git grep "fn handle_message" -A 5 src/'),
+    { mode: 'show', symbols: ['handle_message'] });
+});
+
+test('git grep: multi-file named search downgrades to hint (v0.70 parity)', () => {
+  // inline answer scopes to ONE path; ≥2 named files → hint so the full grep runs.
+  assert.equal(classifyBlock('git grep "FooBar" src/a.rs src/b.rs'), null);
+});
+
+test('git grep: BRE alternation is translated to rust-regex dialect', () => {
+  // git grep speaks BRE like plain grep → an escaped \| must unescape for cg grep.
+  assert.equal(translateBreToRg('git grep "a\\|b" src/', 'a\\|b'), 'a|b');
+});
+
+test('git grep: `| git grep` is an output-filter pipe (no fire)', () => {
+  assert.equal(shouldHint('grep -rn "Foo" src/ | git grep "Bar"'), false);
+});
+
+test('git grep: rebaseRelativePaths rebases the real subdir path, not the `grep` word', () => {
+  // shell sits in backend/; `app` is subdir-relative → rebased. `grep` is the
+  // git subcommand and is existence-gated so it never masquerades as a path.
+  const exists = (p) => p.endsWith('/root/backend/app');
+  const out = rebaseRelativePaths('git grep "Foo" app', 'backend', '/root', exists);
+  assert.match(out, /git grep "Foo" backend\/app/);
+});
+
+// v0.71 — git grep at a scope the working-tree cg answer can't honor (staged
+// index / another revision) must NOT deny: folding it would substitute
+// current-tree hits for a different revision. The hook stays out entirely.
+test('git grep: --cached (staged index) is not denied — cg cannot honor that scope', () => {
+  assert.equal(shouldHint('git grep --cached "FooBar" src/'), false);
+  assert.equal(shouldBlock('git grep --cached "FooBar" src/'), false);
+});
+
+test('git grep: a treeish ref before `--` (another revision) is not denied', () => {
+  assert.equal(shouldHint('git grep "FooBar" HEAD~3 -- src/'), false);
+  assert.equal(shouldBlock('git grep "cascade_failure" main -- src/'), false);
+});
+
+test('git grep: a bare `-- path` (no ref, working-tree scope) STILL denies', () => {
+  // guard: the revision-scope exclusion must not over-catch a plain pathspec sep.
+  assert.equal(shouldBlock('git grep "FooBar" -- src/lib.rs'), true);
+});
+
 // ── Should NOT fire: pipe-grep (output filter, not search) ──────────
 
 test('shouldHint: pipe-grep on cargo test output', () => {
@@ -980,6 +1045,22 @@ test('e2e: denied grep with stub hits → deny JSON embeds the answer + records 
     // An answered deny carries no failure reason — the field is reserved for
     // the not-answered fallback so 'no-binary' vs 'unavailable' stays legible.
     assert.equal(rec.reason, undefined);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: `git grep` identifier on src/ → deny with the embedded answer', () => {
+  const uniq = `GitHit${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('src/foo.rs:9  fn ' + process.argv[3] + '()\\n');`);
+  const cmd = `git grep -n "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(out.hookSpecificOutput.permissionDecisionReason, new RegExp(uniq));
   } finally {
     cleanupFixture(fixture, cmd);
   }

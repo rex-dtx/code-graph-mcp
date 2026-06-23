@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.71.0 — Grep-deny: cover `git grep`
+
+### Fixed
+- **`git grep` now folds to the AST-aware equivalent.** The PreToolUse grep guard caught
+  `grep`/`rg`/`ag` on the indexed source tree but missed `git grep` — its command head is `git`, so it
+  leaked past the matcher and ran as a raw search with no inline answer. `git grep` carries the same
+  foldable intent, and `code-graph-mcp grep` is a superset (it finds tracked AND gitignored files), so
+  `git grep` on source now denies-with-answer exactly like plain grep. A single shared verb fragment
+  drives the command-head, pattern-strip, and pipe-filter matchers so the parse sites stay in sync, and
+  the BRE→rust-regex translation covers `git grep` too (it speaks basic-regex like grep). Output-filter
+  pipes (`… | git grep X`), multi-file named greps (downgrade to hint, v0.70 parity), and the `--`
+  pathspec separator are all handled. Searches whose scope the working-tree answer can't honor —
+  `git grep --cached` (staged index) and treeish-scoped greps (`git grep "X" HEAD~3 -- src/`) — are
+  deliberately left alone (no deny), since folding them would substitute current-tree hits for a
+  different revision. +12 regression tests including an end-to-end deny.
+
 ## v0.70.0 — Grep-deny: don't deny what the inline answer can't fully cover
 
 ### Fixed

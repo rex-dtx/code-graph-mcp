@@ -48,7 +48,15 @@ const { runGrepAnswer, runShowAnswer, sanitizeSearchPath } = require('./cg-answe
 // v0.48: also match bare `KEY=VALUE grep` prefixes (no `env` verb) — the shape
 // the deny message itself teaches (`CODE_GRAPH_NO_BLOCK_GREP=1 grep …`). With
 // the old `env`-only form those commands failed gate 1 and were invisible.
-const GREP_HEAD = /^\s*(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(grep|rg|ag)\b/;
+// v0.71: `git grep` shares the verb set — its head is `git`, so it leaked past
+// the matcher until folded in here. cg grep is a SUPERSET (covers tracked AND
+// gitignored files), so routing `git grep` to it is sound. GREP_VERB is the
+// single source of truth for every parse site that recognizes the search verb.
+const GREP_VERB = 'git\\s+grep|grep|rg|ag';
+const GREP_HEAD = new RegExp(`^\\s*(?:env\\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*(${GREP_VERB})\\b`);
+// Verb + prefix strip (kept in sync with GREP_HEAD via GREP_VERB; non-capturing).
+// Shared by extractPatterns and countNamedPaths so the verb is removed identically.
+const VERB_STRIP = new RegExp(`^\\s*(?:env\\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*(?:${GREP_VERB})\\s+`);
 // Source-tree prefix list. Expanded v0.27+ Phase C: original `src/tests/lib/...`
 // missed real-world backend conventions where the prefix list term is preceded
 // by something else (`backend/app/...` — `app/` doesn't match because `/` isn't
@@ -63,7 +71,7 @@ const SRC_PREFIXES =
 const SRC_PATH = new RegExp(`(?:^|\\s|["'])(${SRC_PREFIXES})/`);
 // Anchored variant for whole-token matching in extractSearchPath.
 const SRC_PATH_TOKEN = new RegExp(`^(?:\\./)?(${SRC_PREFIXES})/`);
-const PIPE_INTO_GREP = /\|\s*(?:grep|rg|ag)\b/;
+const PIPE_INTO_GREP = new RegExp(`\\|\\s*(?:${GREP_VERB})\\b`);
 const CG_INVOKED = /\bcode-graph-mcp\b/;
 // File argument(s) that end in a config/lockfile/data extension. If, after removing
 // ALL of them, no source-tree path remains, the grep is searching config/data not code.
@@ -80,12 +88,41 @@ const CONFIG_TARGET_ONLY = new RegExp(`(?:^|\\s)[^\\s|<>]*\\.(?:${NON_SOURCE_EXT
 // data-file tokens both match; global so every one is peeled before the SRC_PATH re-check.
 const CONFIG_TARGET_STRIP = new RegExp(`(?:^|\\s)[^\\s|<>]*\\.(?:${NON_SOURCE_EXTS})(?=\\s|$)`, 'gi');
 
+// v0.71 — `git grep --cached`/`--staged` searches the STAGED index, and a treeish
+// ref (`git grep "X" HEAD~3 -- src/`, `git grep "X" main -- src/`) searches another
+// commit/branch — a scope the working-tree inline answer (`code-graph-mcp grep`)
+// CANNOT honor. Folding them would substitute current-tree hits for a different
+// revision with no signal. These are NOT the working-tree source searches this hook
+// folds, so it stays out entirely (no hint, no deny) and the real git grep runs.
+// (`--no-index` is working-tree scope → cg covers it → NOT excluded; plain grep/rg/ag
+// have no revision concept.) A bare treeish without `--` (`git grep X main src/`) is
+// genuinely ambiguous with a pathspec → left as the residual minority.
+const GIT_GREP_HEAD = /^\s*(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*git\s+grep\b/;
+const GIT_GREP_STAGED = /(?:^|\s)--(?:cached|staged)(?:\s|$)/;
+
+function isRevisionScopedGitGrep(cmd) {
+  if (typeof cmd !== 'string' || !GIT_GREP_HEAD.test(cmd)) return false;
+  if (GIT_GREP_STAGED.test(cmd)) return true;
+  // treeish before the `--` pathspec separator: git grep [flags] PATTERN <ref>... -- <path>
+  const sep = cmd.indexOf(' -- ');
+  if (sep === -1) return false;
+  const afterVerb = cmd.slice(0, sep).replace(GIT_GREP_HEAD, '').trimStart();
+  let seenPattern = false;
+  for (const tok of afterVerb.split(/\s+/)) {
+    if (!tok || tok.startsWith('-')) continue;          // a flag
+    if (!seenPattern) { seenPattern = true; continue; } // the search pattern
+    return true;                                        // a 2nd non-flag token before `--` = treeish
+  }
+  return false;
+}
+
 function shouldHint(cmd) {
   if (!cmd || typeof cmd !== 'string') return false;
   if (cmd.length > 1000) return false;             // sanity — oversize commands are noise
   if (CG_INVOKED.test(cmd)) return false;          // already using cg
   if (PIPE_INTO_GREP.test(cmd)) return false;      // `cargo test | grep FAILED` is output filter
   if (!GREP_HEAD.test(cmd)) return false;          // not a search command
+  if (isRevisionScopedGitGrep(cmd)) return false;  // v0.71 — git grep --cached/treeish: scope cg can't honor
   if (!SRC_PATH.test(cmd)) return false;           // not against indexed source tree
   // If a config file appears AND no source path remains after stripping it, skip.
   if (CONFIG_TARGET_ONLY.test(cmd)) {
@@ -128,7 +165,7 @@ const MARKER_ONLY =
 function extractPatterns(cmd) {
   if (!cmd || typeof cmd !== 'string') return [];
   // Strip leading verb + env/assignment prefix (kept in sync with GREP_HEAD)
-  const stripped = cmd.replace(/^\s*(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:grep|rg|ag)\s+/, '');
+  const stripped = cmd.replace(VERB_STRIP, '');
   // Collect every quoted argument — first one is the pattern in standard grep
   // usage; subsequent ones (e.g. `-e "second"`) are also patterns or filter
   // expressions and worth screening too.
@@ -322,7 +359,7 @@ function countNamedPaths(cmd, patterns) {
   // Only the grep's OWN path args count. Stop at the first top-level command separator so a
   // path in a compound tail (`grep X src/a.py | sed … src/b.py`) is NOT mistaken for a second
   // grep target — that would wrongly downgrade a complete single-file grep to a hint.
-  let seg = cmd.replace(/^\s*(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:grep|rg|ag)\s+/, '');
+  let seg = cmd.replace(VERB_STRIP, '');
   let quote = null;
   for (let i = 0; i < seg.length; i++) {
     const c = seg[i];
@@ -450,7 +487,8 @@ function buildShowDenyReason(answer, unansweredTail) {
 function translateBreToRg(cmd, pattern) {
   if (typeof pattern !== 'string' || !pattern) return pattern;
   const verb = (cmd.match(GREP_HEAD) || [])[1];
-  if (verb !== 'grep') return pattern;
+  // git grep speaks BRE like plain grep; rg/ag are already extended-regex.
+  if (!verb || !/grep$/.test(verb)) return pattern;
   if (/(?:^|\s)-[a-zA-Z]*[EP][a-zA-Z]*(?:\s|=|\d|$)|--(?:extended-regexp|perl-regexp)\b/.test(cmd)) {
     return pattern;
   }
@@ -645,6 +683,7 @@ module.exports = {
   extractUnansweredTail, // v0.50 — compound-tail honesty in answered denies
   extractPatterns,    // v0.32.1 — exposed for tests
   countNamedPaths,    // v0.70 — multi-path deny→hint downgrade
+  isRevisionScopedGitGrep, // v0.71 — git grep --cached/treeish exclusion
   extractSearchPath,  // v0.47.0 — deny-with-answer
   normalizeCommandPaths, // v0.47.1 — abs-path matcher fix
   resolveProjectRoot,    // v0.48 — subdir-cwd dark fix
