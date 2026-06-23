@@ -374,6 +374,15 @@ function determineQueryType(intents, symbols, filePaths, isCoolingDownFn, messag
   return null;
 }
 
+// Hook-internal CLI runs are PUSH deliveries, not model-initiated conversions.
+// Tagging them CODE_GRAPH_INTERNAL=1 keeps record_cli_use (src/cli.rs) from
+// logging them as `use` events — otherwise this hook's own injected callgraph/
+// overview/search results read back as genuine consumer adoption (2026-06-23 mem
+// audit: 100 phantom "model CLI calls" were this hook crediting its own deliveries).
+function buildRunEnv(base = process.env) {
+  return { ...base, CODE_GRAPH_INTERNAL: '1' };
+}
+
 // --- Main execution (only when run directly) ---
 // All exit-on-condition checks (manifest, computeQuietHooks, message length,
 // db presence) live INSIDE this guard so `require()` from tests doesn't
@@ -454,6 +463,7 @@ function runMain() {
       timeout: 3000,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: buildRunEnv(),
     });
   }
 
@@ -477,4 +487,4 @@ if (require.main === module) {
   runMain();
 }
 
-module.exports = { shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS };
+module.exports = { shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS, buildRunEnv };

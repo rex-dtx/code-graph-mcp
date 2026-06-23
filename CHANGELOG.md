@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.68.0 — Honest adoption metric: hook deliveries no longer counted as model CLI use
+
+### Fixed
+- **Phantom CLI conversions.** Two hooks ran the `code-graph-mcp` CLI to build the context they push,
+  but without the `CODE_GRAPH_INTERNAL=1` marker that tells `record_cli_use` a run is a *delivery*, not
+  a model-initiated query: `user-prompt-context.js` (UserPromptSubmit intent injection —
+  impact/callgraph/overview/search) and `session-init.js` (`map --compact` project-map injection).
+  Their own injections were logged as `cli/use` events, so `stats` read them back as genuine adoption.
+  On a heavy consumer project this showed up as "100 model CLI calls / deny→use 86%" — while
+  cross-checking the session transcript found the model itself invoked the CLI **once**; the rest were
+  the hooks crediting their own deliveries (same-second bursts trailing each grep deny). Both call sites
+  now carry the marker (matching `cg-answer.js` / `pre-edit-guide.js`), so only real model-initiated CLI
+  queries count toward the deny→use / `CLI uses` funnel. Adds a `buildRunEnv` helper + regression tests
+  (`user-prompt-context.test.js`, `session-init.test.js`).
+
 ## v0.67.0 — Hook firing self-test: catch a registered-but-inert hook automatically
 
 ### Added

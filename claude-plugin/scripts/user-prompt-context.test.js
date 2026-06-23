@@ -14,6 +14,7 @@ const {
   INTENT_THRESHOLD,
   determineQueryType,
   computeQuietHooks,
+  buildRunEnv,
 } = require('./user-prompt-context');
 
 // ── shouldSkip ──────────────────────────────────────────
@@ -712,4 +713,31 @@ test('integration: test 又挂了 → symptom-hint', () => {
 test('integration: Why does this not work? → symptom-hint', () => {
   const r = analyze('Why does this not work?');
   assert.equal(r.query && r.query.type, 'symptom-hint');
+});
+
+// ── buildRunEnv: hook-internal delivery marker (anti phantom-conversion) ──
+
+test('buildRunEnv: tags CODE_GRAPH_INTERNAL=1 so deliveries are not logged as model `use`', () => {
+  const env = buildRunEnv({ PATH: '/usr/bin', HOME: '/home/x' });
+  assert.equal(env.CODE_GRAPH_INTERNAL, '1');
+  // preserves the base env (binary still resolves on PATH, cwd inherited, etc.)
+  assert.equal(env.PATH, '/usr/bin');
+  assert.equal(env.HOME, '/home/x');
+});
+
+test('buildRunEnv: defaults to process.env when no base given', () => {
+  const env = buildRunEnv();
+  assert.equal(env.CODE_GRAPH_INTERNAL, '1');
+});
+
+test('run() wires buildRunEnv() into execFileSync (no phantom use-event leak)', () => {
+  // run() lives inside runMain() (the file top-level-executes on require), so assert
+  // the wiring at the source level: every code-graph-mcp invocation this hook makes
+  // must carry the internal marker, else its PUSH injections read back as model
+  // adoption (the 2026-06-23 mem audit: 100 phantom "model CLI calls"). Mirrors the
+  // cg-answer.js / pre-edit-guide.js internal-env guard.
+  const src = fs.readFileSync(path.join(__dirname, 'user-prompt-context.js'), 'utf8');
+  const i = src.indexOf('function run(');
+  assert.ok(i >= 0, 'run() helper present');
+  assert.match(src.slice(i, i + 320), /env:\s*buildRunEnv\(\)/);
 });

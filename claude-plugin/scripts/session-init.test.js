@@ -347,3 +347,15 @@ test('consistencyCheck returns version-mismatch when versions differ', (t) => {
   assert.ok(versionIssue.msg.includes('0.0.1'));
 });
 
+test('injectProjectMap map call carries CODE_GRAPH_INTERNAL (delivery, not a model conversion)', () => {
+  // injectProjectMap runs `code-graph-mcp map --compact` to inject the project map.
+  // That run is a hook-internal delivery — it must carry the internal marker so
+  // record_cli_use (src/cli.rs) does not log it as a phantom model `use` event
+  // (the 2026-06-23 mem audit found this leak class; the sibling affected call was
+  // already guarded). Asserted at source level because injectProjectMap is not exported.
+  const src = fs.readFileSync(path.join(__dirname, 'session-init.js'), 'utf8');
+  const i = src.indexOf("['map', '--compact']");
+  assert.ok(i >= 0, 'map injection present');
+  assert.match(src.slice(i, i + 420), /CODE_GRAPH_INTERNAL:\s*'1'/);
+});
+

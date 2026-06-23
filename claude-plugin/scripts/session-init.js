@@ -531,6 +531,9 @@ function injectProjectMap() {
       timeout: 5000,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      // Hook-internal delivery, not a model conversion — keep record_cli_use from
+      // logging this `map` run as a phantom `use` (mirror injectRecentImpact's affected call).
+      env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
     });
 
     if (output && output.trim()) {
