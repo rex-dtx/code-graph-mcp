@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.72.0 — Edit-time covering-test targeting
+
+### Added
+- **`impact` now surfaces the tests that cover a symbol.** Both impact surfaces — the
+  `impact <symbol> --json` CLI subcommand and the `impact_analysis` MCP tool — now include a
+  `test_callers` array (`{name, file}`) alongside the existing `tests_affected` count: the actual
+  test/bench functions whose execution reaches the symbol, not just how many. Pure query-time over the
+  existing reverse call graph — no re-index, no schema change.
+- **The edit hook turns that into a runnable test command.** When you edit a function, the PreToolUse
+  impact injection (`pre-edit-guide`) now lists the covering tests and — for Rust — a targeted
+  `cargo test <names>` to run exactly the tests that exercise your change, instead of guessing a test
+  name or running the whole suite. A widely-tested symbol (>6 covering tests) collapses to a count plus
+  the suite command; non-Rust projects get the covering-test list without a fabricated command (a wrong
+  command is worse than none). The edit injection is disabled, as before, by `CODE_GRAPH_QUIET_HOOKS=1`.
+
 ## v0.71.0 — Grep-deny: cover `git grep`
 
 ### Fixed

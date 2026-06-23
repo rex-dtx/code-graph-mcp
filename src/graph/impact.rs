@@ -33,7 +33,14 @@ pub struct ImpactClassification<'a> {
     /// and the CLI count), with no divergence on corrupt/legacy metadata.
     pub route_callers: Vec<&'a CallerWithRouteInfo>,
     /// Count of distinct test/bench callers (`tests_affected` in both surfaces).
+    /// Always equals `test_callers.len()` — same dedup, single source.
     pub test_count: usize,
+    /// The distinct test/bench callers themselves — the identities behind
+    /// `test_count`, deduped by `(name, file, depth)` in input order. Surfaces use
+    /// these for edit-time covering-test targeting (which tests exercise the
+    /// symbol → a runnable test command) and MAY cap the rendered list, while
+    /// `test_count` keeps the true total.
+    pub test_callers: Vec<&'a CallerWithRouteInfo>,
     /// Risk level from [`domain::compute_risk_level`], or `"UNKNOWN"` when the
     /// target is a non-function with zero production callers — its real usage
     /// (imports / field access / instantiation / type annotations) is broader than
@@ -66,17 +73,19 @@ pub fn classify_impact<'a>(
     let mut seen_prod: HashSet<(&str, &str, i32)> = HashSet::new();
     let mut seen_test: HashSet<(&str, &str, i32)> = HashSet::new();
     let mut prod_callers: Vec<&CallerWithRouteInfo> = Vec::new();
-    let mut test_count = 0usize;
+    let mut test_callers: Vec<&CallerWithRouteInfo> = Vec::new();
     for c in callers.iter().filter(|c| c.depth > 0) {
         let key = (c.name.as_str(), c.file_path.as_str(), c.depth);
         if domain::is_test_symbol(&c.name, &c.file_path) {
             if seen_test.insert(key) {
-                test_count += 1;
+                test_callers.push(c);
             }
         } else if seen_prod.insert(key) {
             prod_callers.push(c);
         }
     }
+    // Single source: the count is the deduped identity list's length.
+    let test_count = test_callers.len();
 
     let affected_files = prod_callers
         .iter()
@@ -125,6 +134,7 @@ pub fn classify_impact<'a>(
         affected_files,
         route_callers,
         test_count,
+        test_callers,
         risk_level,
         type_warning,
     }
@@ -248,5 +258,42 @@ mod tests {
         let callers = vec![caller("one", "src/a.rs", 1, None)];
         let c = classify_impact(&callers, "remove", true);
         assert_eq!(c.risk_level, "HIGH");
+    }
+
+    #[test]
+    fn captures_test_caller_identities_not_just_count() {
+        // Edit-time covering-test targeting (a PUSH feature) needs the test
+        // callers' identities — name + file — to build a runnable test command,
+        // not just a count. classify_impact must retain them, deduped, with the
+        // list length equal to test_count (single source of truth).
+        let callers = vec![
+            caller("target", "src/a.rs", 0, None), // root — excluded
+            caller("prod_handler", "src/a.rs", 1, None), // prod caller — not a test
+            caller("test_alpha", "tests/a.rs", 1, None), // test caller (direct)
+            caller("test_beta", "tests/b.rs", 2, None), // test caller (transitive)
+            caller("test_alpha", "tests/a.rs", 1, None), // exact dup — counted once
+        ];
+        let c = classify_impact(&callers, "behavior", true);
+        assert_eq!(c.test_count, 2, "two distinct test callers");
+        assert_eq!(
+            c.test_callers.len(),
+            c.test_count,
+            "an identity is retained for every counted test caller"
+        );
+        let names: Vec<&str> = c.test_callers.iter().map(|tc| tc.name.as_str()).collect();
+        assert!(names.contains(&"test_alpha"), "got {names:?}");
+        assert!(names.contains(&"test_beta"), "got {names:?}");
+        assert!(
+            !names.contains(&"prod_handler"),
+            "a prod caller must not appear among test callers"
+        );
+        // The file identity is carried — it's what lets a surface build the
+        // per-language test command (e.g. `cargo test`, `pytest <file>`).
+        let alpha = c
+            .test_callers
+            .iter()
+            .find(|tc| tc.name == "test_alpha")
+            .unwrap();
+        assert_eq!(alpha.file_path, "tests/a.rs");
     }
 }

@@ -3050,6 +3050,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 "depth": c.depth,
                 "route": c.route_info,
             })).collect::<Vec<_>>(),
+            // Covering tests behind `tests_affected` — name + file is enough for a
+            // hook to build a runnable test command (e.g. `cargo test`/`pytest`).
+            // Full list (not capped here); display-side capping is the surface's job.
+            "test_callers": impact.test_callers.iter().map(|c| serde_json::json!({
+                "name": c.name,
+                "file": c.file_path,
+            })).collect::<Vec<_>>(),
         });
         if let Some(warning) = impact.type_warning {
             result["warning"] = serde_json::json!(warning);

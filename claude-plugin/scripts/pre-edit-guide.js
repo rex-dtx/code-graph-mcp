@@ -13,6 +13,7 @@ const { findBinary } = require('./find-binary');
 const { cgTmpDir } = require('./tmp-dir');
 const { resolveProjectRoot } = require('./project-root');
 const { recordRecommendation } = require('./recommendation-log');
+const { formatCoveringTests } = require('./covering-tests');
 
 // v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
 // gate kept this hook dark for entire sessions after `cd backend/` — daagu
@@ -170,7 +171,13 @@ try { fs.writeFileSync(cooldownFile, ''); } catch { /* ok */ }
 // Funnel visibility (v0.49): an injected impact summary is a delivered answer.
 // v0.63 — ack:true marks that this injection carries a salience-forcing directive
 // (the per-caller verdict line below), so a later A/B can segment ack vs non-ack.
-recordRecommendation(cwd, { hook: 'edit', action: 'hint', answered: true, ack: true });
+// test_targets: how many covering tests this injection offered — the forward
+// signal for whether covering-test targeting reduces test-name guessing (read on
+// consumer projects; this dogfood repo's metrics are dark).
+recordRecommendation(cwd, {
+  hook: 'edit', action: 'hint', answered: true, ack: true,
+  test_targets: (jsonResult.test_callers || []).length,
+});
 
 // --- Inject compact impact summary ---
 const routeCount = jsonResult.affected_routes || 0;
@@ -187,6 +194,12 @@ const callers = (jsonResult.callers || []).filter(c => c.depth === 1);
 if (callers.length > 0) {
   summary += '  Callers: ' + callers.map(c => `${c.name} (${c.file})`).join(', ') + '\n';
 }
+
+// Covering tests — turn the bare "(N tests)" count above into an actionable,
+// targeted run command so the fix-test-iterate loop runs exactly the tests that
+// exercise the edited symbol (not the whole suite or a guessed name). Empty/absent
+// test_callers → appends nothing.
+summary += formatCoveringTests(jsonResult.test_callers, editedFile);
 
 // Salience forcing (v0.63) — an injected impact summary that the model merely
 // reads is wasted context. mem's PreToolUse edit hook lifts cite-recall to ~94%

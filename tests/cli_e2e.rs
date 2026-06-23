@@ -142,6 +142,49 @@ fn test_cli_affected_json_core() {
 }
 
 #[test]
+fn test_cli_impact_json_lists_test_callers() {
+    // Edit-time covering-test targeting: `impact --json` must surface the test
+    // callers' identities (name + file), not just the `tests_affected` count, so a
+    // hook can build a runnable test command. setup_affected_project's
+    // src/auth.test.ts::testValidate calls validateToken (a test caller); src/api.ts
+    // calls it from prod.
+    let project = setup_affected_project();
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["impact", "validateToken", "--file", "src/auth.ts", "--json"],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid json: {e}; raw: {stdout}"));
+
+    assert_eq!(
+        v["tests_affected"].as_u64().unwrap(),
+        1,
+        "exactly one test caller (testValidate); raw: {stdout}"
+    );
+    let test_callers = v["test_callers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("test_callers must be a JSON array; raw: {stdout}"));
+    let names: Vec<&str> = test_callers
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"testValidate"),
+        "testValidate must be listed as a covering test; got {names:?}"
+    );
+    let tv = test_callers
+        .iter()
+        .find(|c| c["name"] == "testValidate")
+        .unwrap();
+    assert_eq!(
+        tv["file"].as_str().unwrap(),
+        "src/auth.test.ts",
+        "the test caller carries its file — needed to build the test command"
+    );
+}
+
+#[test]
 fn test_cli_affected_not_indexed_json_envelope() {
     // json-empty contract: unknown input still yields a valid same-shape envelope.
     let project = setup_affected_project();

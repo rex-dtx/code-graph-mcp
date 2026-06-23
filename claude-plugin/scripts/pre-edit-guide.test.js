@@ -176,3 +176,24 @@ test('pattern-sync: fnPatterns count matches source', () => {
   assert.ok(fnPatterns.length === 8, `Expected 8 patterns, got ${fnPatterns.length}`);
   assert.ok(sourcePatternCount >= 7, `Source should have >= 7 language comments, found ${sourcePatternCount}`);
 });
+
+// ── Covering-test targeting (edit-time PUSH) ────────────
+// The pure formatter lives in covering-tests.js (unit-tested in covering-tests.test.js);
+// these guard that the hook actually wires it in and records the forward signal.
+// Source-grep, same convention as the salience/pattern-sync guards (hook exits on require).
+
+test('covering-tests: hook requires and invokes the covering-tests formatter on test_callers', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const source = fs.readFileSync(path.join(__dirname, 'pre-edit-guide.js'), 'utf8');
+  assert.match(source, /require\(['"]\.\/covering-tests['"]\)/);
+  assert.match(source, /formatCoveringTests\(/);
+  assert.match(source, /test_callers/);
+});
+
+test('covering-tests: edit injection records test_targets for the forward funnel', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const source = fs.readFileSync(path.join(__dirname, 'pre-edit-guide.js'), 'utf8');
+  assert.match(source, /test_targets:/);
+});

@@ -73,6 +73,8 @@ jobs:
         # pre-grep-guide.test.js + cg-answer.test.js added in v0.47.0
         # (deny-with-answer); vetted locally — node-only, stub binary via
         # _CG_ANSWER_BINARY, tmpdir fixtures, no cargo build required.
+        # covering-tests.test.js added with edit-time covering-test targeting;
+        # vetted locally — pure node, no binary/cargo.
         # doctor.test.js + scripts/sync-versions.test.js added in v0.49.1
         # (surveyHookCoverage moved to lifecycle.js); vetted locally — doctor
         # is fixture-only; sync-versions stubs builds via SYNC_VERSIONS_SKIP_BUILD
@@ -122,7 +124,7 @@ jobs:
         # env; under default per-file parallelism that cross-process state races and
         # cg-answer's binary-resolution test flakes intermittently. Serial is
         # deterministic and the suite is fast (~15s).
-        run: node --test --test-concurrency=1 claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js claude-plugin/scripts/hooks.test.js claude-plugin/scripts/pre-edit-guide.test.js claude-plugin/scripts/pre-grep-guide.test.js claude-plugin/scripts/cg-answer.test.js claude-plugin/scripts/doctor.test.js claude-plugin/scripts/pr-impact-comment.test.js claude-plugin/scripts/adopt.test.js claude-plugin/scripts/claude-config.test.js claude-plugin/scripts/find-binary.test.js claude-plugin/scripts/incremental-index.test.js claude-plugin/scripts/pre-read-guide.test.js claude-plugin/scripts/project-detect.test.js claude-plugin/scripts/recommendation-log.test.js claude-plugin/scripts/tmp-dir.test.js claude-plugin/scripts/user-prompt-context.test.js claude-plugin/scripts/version-utils.test.js scripts/release-smoke.test.js scripts/sync-versions.test.js
+        run: node --test --test-concurrency=1 claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js claude-plugin/scripts/hooks.test.js claude-plugin/scripts/pre-edit-guide.test.js claude-plugin/scripts/covering-tests.test.js claude-plugin/scripts/pre-grep-guide.test.js claude-plugin/scripts/cg-answer.test.js claude-plugin/scripts/doctor.test.js claude-plugin/scripts/pr-impact-comment.test.js claude-plugin/scripts/adopt.test.js claude-plugin/scripts/claude-config.test.js claude-plugin/scripts/find-binary.test.js claude-plugin/scripts/incremental-index.test.js claude-plugin/scripts/pre-read-guide.test.js claude-plugin/scripts/project-detect.test.js claude-plugin/scripts/recommendation-log.test.js claude-plugin/scripts/tmp-dir.test.js claude-plugin/scripts/user-prompt-context.test.js claude-plugin/scripts/version-utils.test.js scripts/release-smoke.test.js scripts/sync-versions.test.js
 
   # Supply-chain CVE scan over Cargo.lock (376 transitive deps including the
   # Candle ML stack). cargo-audit reads RustSec advisories and exits non-zero

@@ -260,6 +260,12 @@ impl McpServer {
             "value_references": value_references,
             "risk_level": risk_level,
             "tests_affected": impact.test_count,
+            // Covering tests behind `tests_affected` — name + file is enough for an
+            // editor hook to build a runnable test command. Full list (no cap);
+            // mirrors the `impact` CLI subcommand for CLI/MCP parity.
+            "test_callers": impact.test_callers.iter().map(|c| json!({
+                "name": c.name, "file": c.file_path
+            })).collect::<Vec<_>>(),
             "summary": format!("Changing {} affects {} routes, {} functions across {} files [{}] ({} tests affected)",
                 &resolved_name, affected_routes.len(), impact.prod_callers.len(), impact.affected_files, risk_level, impact.test_count)
         });
