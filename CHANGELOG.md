@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.69.0 — Grep-deny floor hardening: never deny a non-foldable grep
+
+### Fixed
+- **Deny-precision floor.** The PreToolUse grep guard could, in edge cases, deny a grep that
+  code-graph has no structural answer for — friction that teaches the model to set
+  `CODE_GRAPH_NO_BLOCK_GREP=1` and bypass the hook entirely. Two gaps closed: (a) the non-source
+  extension skip-list now covers `.ini/.conf/.xml/.log/.csv` (so `grep "FooBar" src/fixtures/app.log`
+  is no longer a deny), and (b) the config-target strip is now global, so a multi-file config grep
+  (`grep "X" src/a.json src/b.json`) peels off ALL the data files before the source-path re-check
+  instead of only the first (the second's `src/` prefix used to false-match and fire). Precision-only —
+  a mixed target that includes a real source file still fires. A 2026-06-23 reach audit found grep
+  foldability (~24%) ≈ interception (24%), so not denying the non-foldable ~75% is the lever, not reach
+  expansion; +6 regression tests lock pipe / external-dir / data-ext / multi-config / mixed.
+
 ## v0.68.0 — Honest adoption metric: hook deliveries no longer counted as model CLI use
 
 ### Fixed

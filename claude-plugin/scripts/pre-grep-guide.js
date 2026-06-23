@@ -65,10 +65,20 @@ const SRC_PATH = new RegExp(`(?:^|\\s|["'])(${SRC_PREFIXES})/`);
 const SRC_PATH_TOKEN = new RegExp(`^(?:\\./)?(${SRC_PREFIXES})/`);
 const PIPE_INTO_GREP = /\|\s*(?:grep|rg|ag)\b/;
 const CG_INVOKED = /\bcode-graph-mcp\b/;
-// A file argument that ends in a config/lockfile extension AND no source-tree
-// path appears elsewhere → grep is searching config, not code.
-const CONFIG_TARGET_ONLY =
-  /(?:^|\s)[^\s|<>]*\.(toml|md|json|yml|yaml|lock|txt|cfg|env|gitignore|properties)(?:\s|$)/i;
+// File argument(s) that end in a config/lockfile/data extension. If, after removing
+// ALL of them, no source-tree path remains, the grep is searching config/data not code.
+// v0.69 floor-hardening: (a) extended the extension list (ini/conf/xml/log/csv) and
+// (b) made the strip GLOBAL so multiple data files (`grep X src/a.json src/b.json`) all
+// peel off — previously only the first did, leaving the 2nd's `src/`-prefixed path to
+// false-match SRC_PATH and fire. cg has no structural answer for these, so a deny is
+// friction-without-value that teaches CODE_GRAPH_NO_BLOCK_GREP bypass (2026-06-23 reach
+// audit: the unreached ~75% of greps are genuinely non-foldable — keep precision).
+const NON_SOURCE_EXTS =
+  'toml|md|json|yml|yaml|lock|txt|cfg|env|gitignore|properties|ini|conf|xml|log|csv';
+const CONFIG_TARGET_ONLY = new RegExp(`(?:^|\\s)[^\\s|<>]*\\.(?:${NON_SOURCE_EXTS})(?:\\s|$)`, 'i');
+// Global + trailing-lookahead variant for the strip: lookahead (not consume) so adjacent
+// data-file tokens both match; global so every one is peeled before the SRC_PATH re-check.
+const CONFIG_TARGET_STRIP = new RegExp(`(?:^|\\s)[^\\s|<>]*\\.(?:${NON_SOURCE_EXTS})(?=\\s|$)`, 'gi');
 
 function shouldHint(cmd) {
   if (!cmd || typeof cmd !== 'string') return false;
@@ -79,7 +89,7 @@ function shouldHint(cmd) {
   if (!SRC_PATH.test(cmd)) return false;           // not against indexed source tree
   // If a config file appears AND no source path remains after stripping it, skip.
   if (CONFIG_TARGET_ONLY.test(cmd)) {
-    const stripped = cmd.replace(CONFIG_TARGET_ONLY, ' ');
+    const stripped = cmd.replace(CONFIG_TARGET_STRIP, ' ');
     if (!SRC_PATH.test(stripped)) return false;
   }
   return true;

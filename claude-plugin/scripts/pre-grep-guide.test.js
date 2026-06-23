@@ -108,6 +108,42 @@ test('shouldHint: grep on a markdown changelog', () => {
   assert.equal(shouldHint('grep "v0.24" CHANGELOG.md'), false);
 });
 
+// ── Floor (v0.69 hardening): non-foldable greps must NEVER deny/hint ──
+// cg has no structural answer for these → a deny is friction-without-value that teaches
+// CODE_GRAPH_NO_BLOCK_GREP bypass. 2026-06-23 reach audit: foldability (~24%) ≈
+// interception (24%), so the floor (precision) is the lever — not reach expansion.
+
+test('floor: grep on an external / non-indexed dir (/tmp clone) never fires', () => {
+  assert.equal(shouldHint('grep -rn "FooBar" /tmp/openwolf-analysis'), false);
+  assert.equal(shouldBlock('grep -rn "FooBar" /tmp/openwolf-analysis'), false);
+});
+
+test('floor: external path with an embedded src/ segment never fires', () => {
+  // SRC_PATH only matches a prefix at ^|\s|quote — `/tmp/clone/src/` is not a project path.
+  assert.equal(shouldHint('grep -rn "FooBar" /tmp/clone/src/'), false);
+});
+
+test('floor: a non-source data file (.log) under src/ never fires', () => {
+  assert.equal(shouldHint('grep "ErrorHandler" src/fixtures/app.log'), false);
+  assert.equal(shouldBlock('grep "ErrorHandler" src/fixtures/app.log'), false);
+});
+
+test('floor: ini/conf/xml/csv data files under src/ never fire', () => {
+  assert.equal(shouldHint('grep "FooBar" src/config.ini'), false);
+  assert.equal(shouldHint('grep "FooBar" src/app.conf'), false);
+  assert.equal(shouldHint('grep "FooBar" src/data.xml'), false);
+  assert.equal(shouldHint('grep "FooBar" src/rows.csv'), false);
+});
+
+test('floor: multiple config files under a src prefix all peel off → skip', () => {
+  // global strip (v0.69): pre-fix only the first .json peeled, the 2nd false-matched SRC_PATH.
+  assert.equal(shouldHint('grep "FooBar" src/a.json src/b.json'), false);
+});
+
+test('floor: mixed target (data file + real source file) STILL fires (no foldable miss)', () => {
+  assert.equal(shouldHint('grep -rn "FooBar" src/app.log src/handler.rs'), true);
+});
+
 // ── Should NOT fire: not search tools ───────────────────────────────
 
 test('shouldHint: ls src/', () => {
