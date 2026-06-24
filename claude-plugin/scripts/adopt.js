@@ -1,29 +1,33 @@
 #!/usr/bin/env node
 'use strict';
-// adopt / unadopt — writes plugin_code_graph_mcp.md into this project's
-// Claude Code auto-memory dir (~/.claude/projects/<slug>/memory/, also
-// read/written by claude-mem-lite) and maintains a sentinel-bracketed index
-// entry in MEMORY.md. Idempotent. Used by invited-memory pattern with
-// CODE_GRAPH_QUIET_HOOKS=1.
+// adopt / unadopt — installs the code-graph steering into this project:
+//   <cwd>/CLAUDE.md            — a concise, sentinel-bracketed managed block
+//                                (always-loaded; the router/decision summary)
+//   <cwd>/.claude/plugin_code_graph_mcp.md — the full decision table
+//                                (on-demand; NOT auto-loaded each session)
+// Idempotent. Replaces the pre-v0.74 "adopt into the auto-memory dir" scheme,
+// which wrote into ~/.claude/projects/<slug>/memory/ (MEMORY.md sentinel +
+// detail file) — equal weight to CLAUDE.md but polluting claude-mem-lite's
+// index. migrateLegacyMemoryDir() cleans those legacy artifacts on upgrade.
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { PROJECT_MARKERS, isProjectRoot, isNonProjectCwd } = require('./project-detect');
 
-const SENTINEL_BEGIN = '<!-- code-graph-mcp:begin v1 -->';
+// Managed-block sentinels. Bumped to v2 when the steering target moved from the
+// auto-memory dir's MEMORY.md (v1) to the project's CLAUDE.md (v2). The strip
+// regex matches ANY version so migration can remove the legacy v1 MEMORY.md block.
+const SENTINEL_VERSION = 'v2';
+const SENTINEL_BEGIN = `<!-- code-graph-mcp:begin ${SENTINEL_VERSION} -->`;
 const SENTINEL_END = '<!-- code-graph-mcp:end -->';
-// Collision-detection marker. Slug encoding `[^a-zA-Z0-9-]→'-'` is lossy,
-// so two cwds (e.g. /foo/bar and /foo bar) can resolve to the same memory
-// dir. Adopt records its absolute cwd as the file's first-line HTML comment;
-// re-adopt from a different cwd surfaces a warning.
-const ADOPTED_BY_RE = /^<!-- adopted-by: (.+?) -->\r?\n?/;
-function readAdoptedBy(filePath) {
-  try {
-    const first = fs.readFileSync(filePath, 'utf8').split('\n', 1)[0];
-    const m = first.match(/^<!-- adopted-by: (.+?) -->/);
-    return m ? m[1] : null;
-  } catch { return null; }
-}
+const SENTINEL_BEGIN_SRC = '<!-- code-graph-mcp:begin[^>]*-->';
+// Marker on the first line of the installed .claude/plugin_code_graph_mcp.md so
+// unadopt/needsRefresh can distinguish our generated copy from a user's own file
+// of the same name (and so needsRefresh strips it before the bytewise compare).
+const MANAGED_BY = '<!-- managed-by: code-graph-mcp -->';
+// Legacy first-line marker on the old memory-dir detail file; migration deletes
+// only files carrying it (never a user file that happens to share the name).
+const LEGACY_ADOPTED_BY = '<!-- adopted-by:';
 // Atomic write (tmp in same dir → rename) so a crash mid-write can't leave a
 // half-written MEMORY.md / detail file — the dir is shared with claude-mem-lite,
 // which reads MEMORY.md on every keyword match. Mirrors lifecycle.js
@@ -41,40 +45,68 @@ function writeFileAtomic(filePath, data) {
     throw e;
   }
 }
-// One-liner per MEMORY.md spec ("each entry should be one line"). All routing
-// triggers from prior multi-line block preserved verbatim — collapsing to single
-// line is a structural fix, not a signal change. Decision table lives in the
-// linked plugin_code_graph_mcp.md; this line is the router. Tag syntax
-// `[tag1, tag2]` per spec for explicit keyword matching.
-//
-// Generic default — used when no project-type markers detected (e.g. /tmp,
-// scratch dirs, mixed repos). Per-type variants live in `buildIndexLine` and
-// are computed per-cwd at adopt + needsRefresh time. Adopted-project receives
-// the typed variant; everyone else falls back to this canonical line.
-// Tags MUST be ≥4 chars and topic-specific (per claudemd §11-EXT Tag-specificity).
-// Generic single-word English tags (impact / refs / overview / semantic / deps /
-// trace / route / similar) substring-match release-notes / commit-message prose
-// via the §11 read-the-file hook regex (word-boundary + 0–2 declension chars),
-// producing false-positive denies. Each tag below aligns with its MCP tool name
-// (impact_analysis / find_references / module_overview / …) so hyphenated literals
-// never collide with natural prose.
-const INDEX_LINE =
-  '- [code-graph-mcp](plugin_code_graph_mcp.md) ' +
-  '[impact-analysis, callgraph, find-references, module-overview, semantic-search, ast-search, dead-code, find-similar-code, dependency-graph, trace-http-chain] — ' +
-  '改 X 影响面/谁调用 X/X 被谁用/看 X 源码/Y 模块长啥样/概念查询 优先于 Grep；字面匹配走 Grep。' +
-  'Bash 直呼 CLI 最快（零加载）：`code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`；' +
-  'MCP 核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map），决策表见全文';
+// The managed block written into <cwd>/CLAUDE.md. Concise + always-loaded: a
+// scannable trigger table that primes the right tool, ending with a pointer to
+// the full table at .claude/plugin_code_graph_mcp.md (opened on demand, never
+// auto-loaded). Project-type tailoring swaps a couple of rows (web → HTTP-route
+// tracing; frontend → reference audits) — body of the detail doc is unchanged.
+const BLOCK_HEADING = '## Code Graph (repo-wide AST index)';
 
-// memdir L1 升格 (per sdscc 重构方案 §5.0): the INDEX_LINE that lands in
-// MEMORY.md is what Claude sees first on every keyword match. Tailoring it
-// per project type primes the right tools and demotes the irrelevant ones —
-// e.g. a Rust CLI never benefits from `trace_http_chain` priming, and a React
-// frontend cares more about `find_references` for rename audits than `impact`.
-//
-// Detection is cheap substring-on-marker (no AST, no graph): the cost is one
-// fs.readFileSync per cwd. Failure mode is silent fall-back to 'generic' —
-// false-negatives are strictly safer than false-positives that promote the
-// wrong tool.
+function buildTriggerRows(projectType = 'generic') {
+  const base = [
+    ['Who calls X / what X calls', '`code-graph-mcp callgraph X`'],
+    ['Impact before editing a fn', '`code-graph-mcp impact X`'],
+    ['Unfamiliar dir / module', '`code-graph-mcp overview <dir>`'],
+    ['Symbol source / signature', '`code-graph-mcp show X`'],
+    ['Concept search (no exact name)', '`code-graph-mcp search "…"` (vector: MCP `semantic_code_search`)'],
+    ['grep + AST context', '`code-graph-mcp grep "pat" [paths]`'],
+  ];
+  switch (projectType) {
+    case 'web-rs':
+    case 'web-node':
+    case 'web-py':
+    case 'web-go':
+      // HTTP route → handler chain matters; insert after the impact row.
+      return [base[0], base[1],
+        ['HTTP route → handler chain', '`code-graph-mcp trace "GET /api/x"`'],
+        ...base.slice(2)];
+    case 'frontend':
+      // Rename/refactor audits dominate; surface find-references explicitly.
+      return [base[0],
+        ['Rename / refactor audit (refs)', '`code-graph-mcp refs X`'],
+        ...base.slice(1)];
+    default:
+      return base;
+  }
+}
+
+// Build the full sentinel-wrapped managed block for a project type. Deterministic
+// (same type → byte-identical) so needsRefresh can bytewise-detect drift.
+function buildBlock(projectType = 'generic') {
+  const rows = buildTriggerRows(projectType);
+  const table = ['| Intent | Command |', '|--------|---------|']
+    .concat(rows.map(([intent, cmd]) => `| ${intent} | ${cmd} |`))
+    .join('\n');
+  const body = [
+    BLOCK_HEADING,
+    '',
+    'AST + FTS + vector index of the whole repo — prefer over multi-round Grep/Read for',
+    'structural queries (LSP only sees open files; this sees everything). Fastest path = Bash CLI:',
+    '',
+    table,
+    '',
+    "Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.",
+    'Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`',
+  ].join('\n');
+  return `${SENTINEL_BEGIN}\n${body}\n${SENTINEL_END}`;
+}
+
+// Project-type detection tailors the CLAUDE.md block's trigger rows (buildBlock):
+// a Rust CLI never benefits from HTTP-route tracing, a React frontend cares more
+// about find-references for rename audits. Detection is cheap substring-on-marker
+// (no AST, no graph): one fs.readFileSync per cwd. Failure mode is silent
+// fall-back to 'generic' — false-negatives are strictly safer than false-positives
+// that promote the wrong tool.
 function readFileQuiet(p) {
   try { return fs.readFileSync(p, 'utf8'); } catch { return ''; }
 }
@@ -241,53 +273,12 @@ function detectProjectType(cwd = process.cwd(), env = process.env) {
   return 'generic';
 }
 
-// Build the MEMORY.md index line for a project type. The 'generic' bucket
-// returns the canonical INDEX_LINE so untyped projects (and the existing
-// adopt.test.js fixtures, which use empty tmp dirs) stay byte-identical.
-//
-// For typed projects, the difference from generic is the tag set + the lead
-// sentence — body of plugin_code_graph_mcp.md is unchanged. Decision table
-// stays one source of truth; the index line just primes which subset matters
-// most for THIS project.
-function buildIndexLine(projectType = 'generic') {
-  const prefix = '- [code-graph-mcp](plugin_code_graph_mcp.md) ';
-  // v0.49 — CLI form leads: in Claude Code the MCP tools are deferred (need a
-  // ToolSearch load before first call) while Bash is always live; the only
-  // conversions observed in real coding nights were CLI invocations.
-  const coreSuffix =
-    'Bash 直呼 CLI 最快（零加载）：`code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`；' +
-    'MCP 核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map），决策表见全文';
-  switch (projectType) {
-    case 'web-rs':
-    case 'web-node':
-    case 'web-py':
-    case 'web-go':
-      return prefix +
-        '[trace-http-chain, http-route, callgraph, impact-analysis, find-references, module-overview, semantic-search, dependency-graph] — ' +
-        'HTTP 路由→handler 链路用 trace_http_chain（或 get_call_graph route_path=）；改 handler 影响面用 impact；' +
-        '其他结构化查询同上 优先于 Grep。' + coreSuffix;
-    case 'frontend':
-      return prefix +
-        '[find-references, module-overview, semantic-search, callgraph, impact-analysis, ast-search] — ' +
-        '组件重命名/重构用 find_references（含 imports/inherits）；模块层级用 module_overview；' +
-        '改 props/接口前用 impact 看下游；HTTP route 通常不适用。' + coreSuffix;
-    case 'rust':
-    case 'go':
-    case 'python':
-    case 'node':
-      return prefix +
-        '[callgraph, impact-analysis, find-references, module-overview, semantic-search, ast-search, dead-code, dependency-graph] — ' +
-        '改 X 影响面/谁调用 X/Y 模块 优先于 Grep；HTTP route 追踪通常不适用（无 web 框架）；' +
-        '字面匹配走 Grep。' + coreSuffix;
-    case 'generic':
-    default:
-      return INDEX_LINE;
-  }
-}
 const TEMPLATE_PATH = path.resolve(__dirname, '..', 'templates', 'plugin_code_graph_mcp.md');
 const TARGET_NAME = 'plugin_code_graph_mcp.md';
 
-// Claude Code slug convention: every non-alphanumeric-non-hyphen char → `-`.
+// LEGACY (pre-v0.74) memory-dir path — now used ONLY by migrateLegacyMemoryDir
+// to locate and remove the old MEMORY.md sentinel + detail file. Claude Code slug
+// convention: every non-alphanumeric-non-hyphen char → `-`.
 // `/mnt/data_ssd/dev/proj` → `-mnt-data-ssd-dev-proj`
 // `/home/sds/.claude/x`   → `-home-sds--claude-x`  (double-dash from `/.`)
 //
@@ -300,6 +291,13 @@ function memoryDir(cwd = process.cwd(), home = os.homedir()) {
   return path.join(claudeDir, 'projects', slug, 'memory');
 }
 
+// New-scheme targets: steering lives in the project tree, not the memory dir.
+// CLAUDE.md is auto-loaded each session (concise block); .claude/<detail> is
+// opened on demand. Both keyed off the project cwd — no lossy slug, no collision.
+function claudeMdPath(cwd = process.cwd()) { return path.join(cwd, 'CLAUDE.md'); }
+function detailDir(cwd = process.cwd()) { return path.join(cwd, '.claude'); }
+function detailPath(cwd = process.cwd()) { return path.join(detailDir(cwd), TARGET_NAME); }
+
 function escapeRegex(s) {
   return s.replace(/[\\/[\]^$.*+?()|{}]/g, '\\$&');
 }
@@ -307,16 +305,18 @@ function escapeRegex(s) {
 // Strip our sentinel block — well-formed first, then self-heal orphan begin/end.
 // Shared by adopt (so re-adopt rewrites a stale/malformed block) and unadopt.
 function stripSentinelBlock(text) {
+  // Match ANY begin version (v1 legacy MEMORY.md block, v2 CLAUDE.md block) so a
+  // single strip handles both the new target and the legacy migration cleanup.
   const wellFormed = new RegExp(
-    `${escapeRegex(SENTINEL_BEGIN)}[\\s\\S]*?${escapeRegex(SENTINEL_END)}\\n?`, 'g'
+    `${SENTINEL_BEGIN_SRC}[\\s\\S]*?${escapeRegex(SENTINEL_END)}\\n?`, 'g'
   );
   let out = text.replace(wellFormed, '');
   // Orphan BEGIN with no matching END (truncation / partial edit).
-  // Strip from BEGIN to the next blank line or EOF — the file is shared with
-  // claude-mem-lite, so we must not eat past a blank-line boundary.
-  if (out.includes(SENTINEL_BEGIN)) {
+  // Strip from BEGIN to the next blank line or EOF — the file may be shared with
+  // claude-mem-lite (legacy MEMORY.md), so we must not eat past a blank-line boundary.
+  if (new RegExp(SENTINEL_BEGIN_SRC).test(out)) {
     out = out.replace(
-      new RegExp(`${escapeRegex(SENTINEL_BEGIN)}[\\s\\S]*?(?=\\n\\n|$)`, 'g'),
+      new RegExp(`${SENTINEL_BEGIN_SRC}[\\s\\S]*?(?=\\n\\n|$)`, 'g'),
       ''
     );
   }
@@ -339,103 +339,89 @@ function platformGuard() {
 // now lives in project-detect.js — the single activation gate shared with
 // mcp-launcher.js and session-init.js. Imported above and re-exported below.
 
-function adopt({ cwd, home, templatePath } = {}) {
+function adopt({ cwd, templatePath } = {}) {
   const blocked = platformGuard();
   if (blocked) return blocked;
 
   const effectiveCwd = cwd || process.cwd();
-  // Gate adoption on a real-project cwd BEFORE touching the filesystem. The
-  // check must run even when the memory dir already exists: Claude Code
-  // pre-creates ~/.claude/projects/<slug>/memory for every session (including
-  // the ~2035 headless /tmp mem-lite calls), and the old guard — nested inside
-  // `if (!fs.existsSync(dir))` — was bypassed in exactly that case, letting
-  // /tmp get adopted (sentinel written into its MEMORY.md). See project-detect.js.
+  // Gate on a real-project cwd BEFORE touching the filesystem — Claude Code also
+  // spawns headless /tmp sessions (claude-mem-lite); we must leave those alone.
   if (isNonProjectCwd(effectiveCwd)) {
-    return { ok: false, reason: 'not-a-project', dir: memoryDir(cwd, home), cwd: effectiveCwd };
+    return { ok: false, reason: 'not-a-project', cwd: effectiveCwd };
   }
-  const dir = memoryDir(cwd, home);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const target = path.join(dir, TARGET_NAME);
   const tpl = templatePath || TEMPLATE_PATH;
   if (!fs.existsSync(tpl)) {
     return { ok: false, reason: 'no-template', template: tpl };
   }
-  // Slug-collision detection: read prior adopted-by marker before overwrite.
-  let collisionWith = null;
-  if (fs.existsSync(target)) {
-    const prevCwd = readAdoptedBy(target);
-    if (prevCwd && prevCwd !== effectiveCwd) collisionWith = prevCwd;
-  }
-  // Write marker + template. Marker is HTML comment → invisible in rendered
-  // markdown but preserved by needsRefresh's bytewise compare (skipped via
-  // ADOPTED_BY_RE strip below).
-  const tplBody = fs.readFileSync(tpl);
-  const marker = Buffer.from(`<!-- adopted-by: ${effectiveCwd} -->\n`);
-  writeFileAtomic(target, Buffer.concat([marker, tplBody]));
 
-  const indexPath = path.join(dir, 'MEMORY.md');
-  const index = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '# Memory Index\n';
-  // Per-project index line: tagged tools + lead sentence tailored to the
-  // detected project type. Falls back to the canonical INDEX_LINE for
-  // generic / untyped cwds (preserves byte-identity with prior versions).
-  const indexLine = buildIndexLine(detectProjectType(effectiveCwd));
-  const desiredBlock = `${SENTINEL_BEGIN}\n${indexLine}\n${SENTINEL_END}`;
-
-  // Already-adopted-and-well-formed: skip the write entirely.
-  if (index.includes(desiredBlock)) {
-    return { ok: true, target, indexPath, indexed: false, healed: false, collisionWith };
+  // 1. Install the detail doc at <cwd>/.claude/plugin_code_graph_mcp.md.
+  // First line is the MANAGED_BY marker (HTML comment → invisible in rendered
+  // markdown) so unadopt/needsRefresh can tell our generated copy from a user
+  // file of the same name. needsRefresh strips it before the bytewise compare.
+  const dDir = detailDir(effectiveCwd);
+  if (!fs.existsSync(dDir)) fs.mkdirSync(dDir, { recursive: true });
+  const dPath = detailPath(effectiveCwd);
+  const desiredDetail = Buffer.concat([Buffer.from(`${MANAGED_BY}\n`), fs.readFileSync(tpl)]);
+  let detailWritten = false;
+  if (!fs.existsSync(dPath) || !fs.readFileSync(dPath).equals(desiredDetail)) {
+    writeFileAtomic(dPath, desiredDetail);
+    detailWritten = true;
   }
 
-  const cleaned = stripSentinelBlock(index);
-  const healed = cleaned !== index;
-  const base = cleaned.endsWith('\n') ? cleaned : cleaned + '\n';
-  writeFileAtomic(indexPath, base + desiredBlock + '\n');
-  return { ok: true, target, indexPath, indexed: true, healed, collisionWith };
+  // 2. Ensure the managed block in <cwd>/CLAUDE.md. Create-if-missing, else
+  // inject — only our sentinel block is managed; the user's own prose is never
+  // touched. Per-project trigger rows tailored to the detected project type.
+  const cPath = claudeMdPath(effectiveCwd);
+  const block = buildBlock(detectProjectType(effectiveCwd));
+  const exists = fs.existsSync(cPath);
+  const current = exists ? fs.readFileSync(cPath, 'utf8') : '';
+  if (current.includes(block)) {
+    return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: false, created: false, healed: false };
+  }
+  const cleaned = exists ? stripSentinelBlock(current) : '';
+  const healed = exists && cleaned !== current;
+  const base = cleaned.replace(/\n+$/, '');
+  const prefix = base ? base + '\n\n' : '';
+  writeFileAtomic(cPath, prefix + block + '\n');
+  return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: true, created: !exists, healed };
 }
 
-// v0.9.0 — "已 adopt" 判定：template 文件在 + MEMORY.md 内有我们的 sentinel 块。
+// "已 install" 判定：detail 文件在 + CLAUDE.md 内有我们的 sentinel 块（任意版本）。
 // 用在 maybeAutoAdopt 里做幂等门，也用在 session-init 里推导 quietHooks。
-function isAdopted({ cwd, home } = {}) {
-  const dir = memoryDir(cwd, home);
-  const target = path.join(dir, TARGET_NAME);
-  const indexPath = path.join(dir, 'MEMORY.md');
-  if (!fs.existsSync(target) || !fs.existsSync(indexPath)) return false;
-  const index = fs.readFileSync(indexPath, 'utf8');
-  return index.includes(SENTINEL_BEGIN) && index.includes(SENTINEL_END);
+function isAdopted({ cwd } = {}) {
+  const effectiveCwd = cwd || process.cwd();
+  const cPath = claudeMdPath(effectiveCwd);
+  const dPath = detailPath(effectiveCwd);
+  if (!fs.existsSync(dPath) || !fs.existsSync(cPath)) return false;
+  const c = fs.readFileSync(cPath, 'utf8');
+  return new RegExp(SENTINEL_BEGIN_SRC).test(c) && c.includes(SENTINEL_END);
 }
 
-// v0.11.0 — shipped template / INDEX_LINE 与已落地版本出现漂移时返回 true。
-// 让已 adopt 的项目在下次 SessionStart 自动对齐到插件最新决策表，避免"老用户
-// 永远停留在首次 adopt 时的 snapshot"。手动编辑会被覆盖——锁定方式：
-// CODE_GRAPH_NO_TEMPLATE_REFRESH=1。
-function needsRefresh({ cwd, home, templatePath } = {}) {
-  const dir = memoryDir(cwd, home);
-  const target = path.join(dir, TARGET_NAME);
-  const indexPath = path.join(dir, 'MEMORY.md');
+// shipped template / 管理块 与已落地版本出现漂移时返回 true。让已 install 的项目
+// 在下次 SessionStart 自动对齐到插件最新决策表（含 v1→v2 升级、项目类型变更）。
+// 手动编辑会被覆盖——锁定方式：CODE_GRAPH_NO_TEMPLATE_REFRESH=1。
+function needsRefresh({ cwd, templatePath } = {}) {
+  const effectiveCwd = cwd || process.cwd();
+  const cPath = claudeMdPath(effectiveCwd);
+  const dPath = detailPath(effectiveCwd);
   const tpl = templatePath || TEMPLATE_PATH;
-  if (!fs.existsSync(target) || !fs.existsSync(tpl) || !fs.existsSync(indexPath)) {
+  if (!fs.existsSync(dPath) || !fs.existsSync(cPath) || !fs.existsSync(tpl)) {
     return false;
   }
+  // Detail-doc body drift — strip the leading MANAGED_BY marker line first.
   const shipped = fs.readFileSync(tpl);
-  const current = fs.readFileSync(target);
-  // Strip the leading "<!-- adopted-by: ... -->\n" collision marker (D fix)
-  // before bytewise comparing — its presence/path naturally diverges from
-  // the shipped template.
+  const current = fs.readFileSync(dPath);
   let body = current;
   const nl = current.indexOf(0x0a);
-  if (nl > 0 && ADOPTED_BY_RE.test(current.subarray(0, nl + 1).toString())) {
+  if (nl > 0 && current.subarray(0, nl).toString().includes('managed-by: code-graph-mcp')) {
     body = current.subarray(nl + 1);
   }
   if (!shipped.equals(body)) return true;
-  const index = fs.readFileSync(indexPath, 'utf8');
-  // Compare against the typed INDEX_LINE for this project. Detection is
-  // deterministic (file-existence + substring scan) so adopt and needsRefresh
-  // always agree on the variant. Drift triggers refresh — including when a
-  // project gains a web framework dep and switches type bucket.
-  const effectiveCwd = cwd || process.cwd();
-  const indexLine = buildIndexLine(detectProjectType(effectiveCwd));
-  const desiredBlock = `${SENTINEL_BEGIN}\n${indexLine}\n${SENTINEL_END}`;
-  return !index.includes(desiredBlock);
+  // CLAUDE.md managed-block drift. Detection is deterministic so adopt and
+  // needsRefresh always agree on the variant — including when a project gains a
+  // web-framework dep and switches type bucket, or on a sentinel version bump.
+  const block = buildBlock(detectProjectType(effectiveCwd));
+  return !fs.readFileSync(cPath, 'utf8').includes(block);
 }
 
 // 检测脚本是否从 Claude Code 插件 cache 运行。
@@ -454,9 +440,44 @@ function isPluginModeInstall(scriptPath = __dirname) {
   return false;
 }
 
-// C' 上下文感知默认（v0.9.0）：插件模式下首次 SessionStart 静默 adopt。
-// /plugin install 本身已构成知情同意；npm / npx / 裸 checkout 保持 opt-in。
-// 退出：CODE_GRAPH_NO_AUTO_ADOPT=1。
+// One-time per-project cleanup of the legacy memory-dir adoption (pre-v0.74):
+// the v1 sentinel block in MEMORY.md + the adopted-by-marked detail file under
+// ~/.claude/projects/<slug>/memory/. Touches only the CURRENT project's memory
+// dir (a single known path derived from cwd) — no ~/.claude traversal (§8 SAFETY).
+// Idempotent + guarded: only strips OUR sentinel, only deletes a file carrying
+// the adopted-by marker. Safe to run every SessionStart.
+function migrateLegacyMemoryDir({ cwd, home } = {}) {
+  const result = { memoryIndexPruned: false, legacyDetailRemoved: false };
+  if (platformGuard()) return result;
+  const dir = memoryDir(cwd, home);
+  const legacyDetail = path.join(dir, TARGET_NAME);
+  if (fs.existsSync(legacyDetail)) {
+    try {
+      const head = fs.readFileSync(legacyDetail, 'utf8').split('\n', 1)[0];
+      if (head.startsWith(LEGACY_ADOPTED_BY)) {
+        fs.unlinkSync(legacyDetail);
+        result.legacyDetailRemoved = true;
+      }
+    } catch { /* unreadable → leave it */ }
+  }
+  const legacyIndex = path.join(dir, 'MEMORY.md');
+  if (fs.existsSync(legacyIndex)) {
+    try {
+      const before = fs.readFileSync(legacyIndex, 'utf8');
+      const after = stripSentinelBlock(before);
+      if (after !== before) {
+        writeFileAtomic(legacyIndex, after);
+        result.memoryIndexPruned = true;
+      }
+    } catch { /* unreadable → leave it */ }
+  }
+  return result;
+}
+
+// 上下文感知默认：插件模式下首次 SessionStart 静默安装（创建/注入 CLAUDE.md 块 +
+// .claude/ detail 文件）。/plugin install 本身已构成知情同意；npm / npx / 裸 checkout
+// 保持 opt-in。退出：CODE_GRAPH_NO_AUTO_ADOPT=1。每次 SessionStart 先清理旧 memory-dir
+// 制品（升级自动迁移），再安装/刷新。
 function maybeAutoAdopt({ cwd, home, env, scriptPath } = {}) {
   env = env || process.env;
   if (env.CODE_GRAPH_NO_AUTO_ADOPT === '1') {
@@ -465,55 +486,71 @@ function maybeAutoAdopt({ cwd, home, env, scriptPath } = {}) {
   if (!isPluginModeInstall(scriptPath || __dirname)) {
     return { attempted: false, reason: 'not-plugin-mode' };
   }
-  if (isAdopted({ cwd, home })) {
-    // v0.11.0: shipped template / INDEX_LINE 漂移时重跑 adopt 对齐。
+  // Clean legacy memory-dir artifacts before installing the new CLAUDE.md scheme.
+  const migrated = migrateLegacyMemoryDir({ cwd, home });
+  if (isAdopted({ cwd })) {
+    // shipped template / 管理块 漂移时重跑 adopt 对齐。
     // opt-out: CODE_GRAPH_NO_TEMPLATE_REFRESH=1（锁定手动编辑）。
-    if (env.CODE_GRAPH_NO_TEMPLATE_REFRESH !== '1' && needsRefresh({ cwd, home })) {
-      const result = adopt({ cwd, home });
-      return { attempted: true, reason: 'refreshed', result };
+    if (env.CODE_GRAPH_NO_TEMPLATE_REFRESH !== '1' && needsRefresh({ cwd })) {
+      const result = adopt({ cwd });
+      return { attempted: true, reason: 'refreshed', result, migrated };
     }
-    return { attempted: false, reason: 'already-adopted' };
+    return { attempted: false, reason: 'already-adopted', migrated };
   }
-  const result = adopt({ cwd, home });
-  return { attempted: true, reason: 'adopted', result };
+  const result = adopt({ cwd });
+  return { attempted: true, reason: 'adopted', result, migrated };
 }
 
 function unadopt({ cwd, home } = {}) {
   const blocked = platformGuard();
   if (blocked) return blocked;
 
-  const dir = memoryDir(cwd, home);
-  const target = path.join(dir, TARGET_NAME);
-  const indexPath = path.join(dir, 'MEMORY.md');
+  const effectiveCwd = cwd || process.cwd();
+  const cPath = claudeMdPath(effectiveCwd);
+  const dPath = detailPath(effectiveCwd);
   let fileRemoved = false;
-  let indexPruned = false;
+  let blockPruned = false;
+  let claudeMdRemoved = false;
 
-  if (fs.existsSync(target)) {
-    fs.unlinkSync(target);
-    fileRemoved = true;
+  // Detail file — guard on our marker so a user's same-named file is never deleted.
+  if (fs.existsSync(dPath)) {
+    let mine = false;
+    try {
+      const head = fs.readFileSync(dPath, 'utf8').split('\n', 1)[0];
+      mine = head.includes(MANAGED_BY) || head.startsWith(LEGACY_ADOPTED_BY);
+    } catch { mine = false; }
+    if (mine) { fs.unlinkSync(dPath); fileRemoved = true; }
   }
-  if (fs.existsSync(indexPath)) {
-    const before = fs.readFileSync(indexPath, 'utf8');
+
+  // CLAUDE.md — strip only our block. If nothing else remains, remove the file
+  // we created; otherwise preserve the user's prose.
+  if (fs.existsSync(cPath)) {
+    const before = fs.readFileSync(cPath, 'utf8');
     const after = stripSentinelBlock(before);
     if (after !== before) {
-      writeFileAtomic(indexPath, after);
-      indexPruned = true;
+      blockPruned = true;
+      if (after.trim() === '') {
+        fs.unlinkSync(cPath);
+        claudeMdRemoved = true;
+      } else {
+        writeFileAtomic(cPath, after);
+      }
     }
   }
-  return { ok: true, fileRemoved, indexPruned, target, indexPath };
+
+  // Also sweep any legacy memory-dir remnants (uninstall before auto-migration ran).
+  const migrated = migrateLegacyMemoryDir({ cwd, home });
+
+  return { ok: true, fileRemoved, blockPruned, claudeMdRemoved, target: dPath, claudeMdPath: cPath, migrated };
 }
 
 function formatResult(action, result) {
   if (!result.ok && result.reason === 'windows-not-supported') {
-    return '[code-graph] adopt/unadopt are POSIX-only — claude-mem-lite slug ' +
-           'convention on Windows is unverified. Edit MEMORY.md manually to opt in.';
+    return '[code-graph] adopt/unadopt are POSIX-only on this build. ' +
+           'Edit CLAUDE.md manually to opt in.';
   }
   if (action === 'adopt') {
     if (!result.ok) {
-      if (result.reason === 'no-memory-dir') {
-        return `[code-graph] Memory dir not found: ${result.dir}\n` +
-               '  Run \`claude\` at least once in this project to create it.';
-      }
       if (result.reason === 'not-a-project') {
         return `[code-graph] Not a project root: ${result.cwd}\n` +
                '  No project marker (.git, Cargo.toml, package.json, pyproject.toml, ...).\n' +
@@ -524,28 +561,31 @@ function formatResult(action, result) {
       }
       return `[code-graph] adopt failed: ${result.reason || 'unknown'}`;
     }
-    const lines = [`[code-graph] Adopted → ${result.target}`];
-    if (result.collisionWith) {
-      lines.push(`[code-graph] ⚠ slug collision: this dir was previously adopted by ${result.collisionWith}.`);
-      lines.push('[code-graph]   Memory dir is shared — sentinels overwritten. ' +
-                 'Investigate path encoding clash (Claude Code slug = path with non-[a-zA-Z0-9-] → "-").');
-    }
-    if (result.healed) lines.push(`[code-graph] Healed malformed sentinel block → ${result.indexPath}`);
-    else if (result.indexed) lines.push(`[code-graph] Indexed → ${result.indexPath}`);
-    else lines.push(`[code-graph] Index already up-to-date — no write`);
-    // v0.17.0: SessionStart project_map injection is OFF by default (regardless
-    // of adoption). Adoption now only governs MEMORY.md sentinel + decision-table
-    // refresh; the noisy hook needs an explicit opt-in.
-    lines.push('[code-graph] Active. SessionStart project_map injection: OFF (default).');
-    lines.push('[code-graph] Opt in to map dump:  CODE_GRAPH_VERBOSE_HOOKS=1');
-    lines.push('[code-graph] Legacy override:     CODE_GRAPH_QUIET_HOOKS=0 (force noisy) / =1 (force quiet)');
+    const lines = [];
+    if (result.created) lines.push(`[code-graph] Created → ${result.claudeMdPath} (code-graph block)`);
+    else if (result.claudeMdWritten) lines.push(`[code-graph] Updated code-graph block → ${result.claudeMdPath}`);
+    else lines.push('[code-graph] CLAUDE.md block already up-to-date — no write');
+    if (result.healed) lines.push('[code-graph] Healed a malformed prior block.');
+    lines.push(`[code-graph] Detail table → ${result.detailPath}`);
+    lines.push('[code-graph] CLAUDE.md is git-tracked — commit the block, or gitignore');
+    lines.push('[code-graph]   .claude/plugin_code_graph_mcp.md (a generated copy) as you prefer.');
+    lines.push('[code-graph] Reverse:  code-graph-mcp unadopt');
+    lines.push('[code-graph] Opt out:  CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env');
     return lines.join('\n');
   }
   if (action === 'unadopt') {
     const lines = [];
+    if (result.claudeMdRemoved) lines.push(`[code-graph] Removed → ${result.claudeMdPath} (was code-graph-only)`);
+    else if (result.blockPruned) lines.push(`[code-graph] De-blocked → ${result.claudeMdPath}`);
     if (result.fileRemoved) lines.push(`[code-graph] Removed → ${result.target}`);
-    if (result.indexPruned) lines.push(`[code-graph] De-indexed → ${result.indexPath}`);
-    if (!result.fileRemoved && !result.indexPruned) lines.push('[code-graph] Nothing to unadopt');
+    const m = result.migrated || {};
+    if (m.memoryIndexPruned || m.legacyDetailRemoved) {
+      lines.push('[code-graph] Cleaned legacy memory-dir artifacts.');
+    }
+    if (!result.blockPruned && !result.fileRemoved && !result.claudeMdRemoved &&
+        !(m.memoryIndexPruned || m.legacyDetailRemoved)) {
+      lines.push('[code-graph] Nothing to unadopt');
+    }
     return lines.join('\n');
   }
   return '';
@@ -561,8 +601,10 @@ if (require.main === module) {
 module.exports = {
   adopt, unadopt, memoryDir, formatResult, stripSentinelBlock,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
-  detectProjectType, buildIndexLine,
+  detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,
+  claudeMdPath, detailDir, detailPath,
   extractCargoRuntimeDeps, extractPyRuntimeDeps, extractGoDirectRequires,
-  SENTINEL_BEGIN, SENTINEL_END, INDEX_LINE, TEMPLATE_PATH, TARGET_NAME,
+  SENTINEL_BEGIN, SENTINEL_END, SENTINEL_BEGIN_SRC, SENTINEL_VERSION,
+  MANAGED_BY, TEMPLATE_PATH, TARGET_NAME,
   PROJECT_MARKERS, PROJECT_TYPES, isNonProjectCwd,
 };

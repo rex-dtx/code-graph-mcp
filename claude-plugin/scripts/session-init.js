@@ -455,19 +455,27 @@ function runSessionInit({ source } = {}) {
   const autoUpdateLaunched = launchBackgroundAutoUpdate();
   const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
 
-  // v0.9.0 C' 上下文感知默认：插件模式下首次 SessionStart 自动 adopt。
-  // v0.11.0: 已 adopt 的项目如果 shipped template 漂移也会触发一次刷新。
-  // 两种情况都发一次 stderr 提示，让用户知道发生了什么 + 如何回退。
+  // 上下文感知默认：插件模式下首次 SessionStart 自动安装（创建/注入 CLAUDE.md 块 +
+  // .claude/ detail 文件），并清理旧 memory-dir 制品（升级自动迁移）。shipped 漂移
+  // 时刷新。三种情况发一次 stderr 提示，让用户知道发生了什么 + 如何回退。
   const autoAdopt = isRelic ? { attempted: false, result: null } : maybeAutoAdopt({ scriptPath: __dirname });
+  const migrated = autoAdopt.migrated || {};
+  if (migrated.memoryIndexPruned || migrated.legacyDetailRemoved) {
+    process.stderr.write(
+      '[code-graph] Migrated to CLAUDE.md steering — cleaned legacy memory-dir artifacts\n' +
+      '            (MEMORY.md sentinel + detail file). Your other memories are untouched.\n'
+    );
+  }
   if (autoAdopt.attempted && autoAdopt.result && autoAdopt.result.ok) {
     if (autoAdopt.reason === 'refreshed') {
       process.stderr.write(
-        '[code-graph] Refreshed decision table to latest shipped version.\n' +
+        '[code-graph] Refreshed CLAUDE.md decision block to latest shipped version.\n' +
         '            Lock file:  CODE_GRAPH_NO_TEMPLATE_REFRESH=1 in ~/.claude/settings.json env\n'
       );
     } else {
       process.stderr.write(
-        '[code-graph] Auto-adopted into project MEMORY.md (plugin install → knowing consent).\n' +
+        '[code-graph] Installed code-graph block into project CLAUDE.md (plugin install → knowing consent).\n' +
+        '            Detail table: .claude/plugin_code_graph_mcp.md (generated; safe to gitignore)\n' +
         '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
         '            Reverse:    code-graph-mcp unadopt\n'
       );

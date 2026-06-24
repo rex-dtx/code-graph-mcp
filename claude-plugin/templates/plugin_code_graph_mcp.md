@@ -5,15 +5,18 @@ type: reference
 ---
 # code-graph-mcp 插件契约
 
-> Invited-memory 模式：MCP `instructions` 仅留指针，决策细则集中在此。
+> 本文件是 code-graph 工具调度细则。项目根 `CLAUDE.md` 里有一个精炼的 managed
+> 块（sentinel 包裹）做路由摘要 + 指针；本完整决策表按需打开，不每会话常驻。
 >
-> **v0.9.0 起**：插件（`/plugin install`）模式下首次 SessionStart 自动 adopt，
-> 本文件自动写入到项目 memory 目录。
+> **v0.74 起**：插件（`/plugin install`）模式下首次 SessionStart 自动安装——
+> 在项目根 `CLAUDE.md` 注入/创建 managed 块，并把本文件写到 `.claude/plugin_code_graph_mcp.md`。
+> 旧版（≤v0.73）写到 `~/.claude/projects/<slug>/memory/`（MEMORY.md sentinel + 本文件），
+> 升级后首次 SessionStart 自动清理那些遗留制品（你的其它 memory 不受影响）。
 > 退出：`CODE_GRAPH_NO_AUTO_ADOPT=1` 阻止，`code-graph-mcp unadopt` 回退。
 >
-> **v0.11.0 起**：已 adopt 的项目在下次 SessionStart 会自动对齐到插件 shipped
-> 的最新决策表（本文件 SHA 与 template 差异时覆盖）。手动编辑会被覆盖——
-> 要锁定自己的版本，设 `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`（不影响首次 adopt）。
+> 已安装的项目在下次 SessionStart 会自动对齐到插件 shipped 的最新决策表
+> （本文件 / CLAUDE.md 块与 shipped 差异时覆盖）。手动编辑会被覆盖——
+> 要锁定自己的版本，设 `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`（不影响首次安装）。
 >
 > **Hook 默认值（两个 hook，默认不同 —— 故意的）**：
 > - **SessionStart `project_map` 注入：默认 OFF**（v0.17.0 起）。本文件 + 7 个
@@ -139,9 +142,9 @@ code-graph-mcp health-check              # 索引健康
 
 ## 卸载 / 回退
 
-- `code-graph-mcp unadopt` — 精确移除 sentinel 段 + 本文件。
-- `CODE_GRAPH_NO_AUTO_ADOPT=1`（`~/.claude/settings.json` env） — 阻止未来自动 adopt，不影响已 adopted 状态。
-- `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`（v0.11.0+） — 锁定本文件不随插件升级刷新；允许手动编辑长久保留。
+- `code-graph-mcp unadopt` — 精确移除 CLAUDE.md 里的 managed 块 + `.claude/plugin_code_graph_mcp.md`（块移光后若 CLAUDE.md 只剩我们的内容则连文件一起删，否则保留你的正文）；并清理任何遗留 memory-dir 制品。
+- `CODE_GRAPH_NO_AUTO_ADOPT=1`（`~/.claude/settings.json` env） — 阻止未来自动安装，不影响已安装状态。
+- `CODE_GRAPH_NO_TEMPLATE_REFRESH=1` — 锁定 CLAUDE.md 块 + 本文件不随插件升级刷新；允许手动编辑长久保留。
 - `CODE_GRAPH_VERBOSE_HOOKS=1`（v0.17.0+） — opt in 到 SessionStart `project_map` 注入（默认 OFF）。
 - `CODE_GRAPH_QUIET_HOOKS=1` — UserPromptSubmit context push 的 escape hatch（默认 ON）；同时强制 SessionStart `project_map` quiet。
 - `CODE_GRAPH_QUIET_HOOKS=0` — 强制恢复 SessionStart `project_map` 注入（向后兼容路径）。

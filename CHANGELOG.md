@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.74.0 — Steering moved from the auto-memory dir to the project's CLAUDE.md
+
+### Changed
+- **The tool-usage steering now installs into the project's `CLAUDE.md`, not the Claude Code
+  auto-memory dir.** Pre-v0.74, plugin-mode SessionStart "adopted" a project by writing a
+  sentinel block into `~/.claude/projects/<slug>/memory/MEMORY.md` (the claude-mem-lite index)
+  plus the full decision table beside it. That dir is **equal weight** to `CLAUDE.md` — not
+  higher — so the steering belonged in `CLAUDE.md`, and seeding `MEMORY.md` polluted an index
+  meant for the user's own memories. Now `adopt` installs:
+  - a concise, sentinel-wrapped **managed block** (`<!-- code-graph-mcp:begin v2 -->` … `:end`)
+    into `<project>/CLAUDE.md` — created if missing, injected if present; **only the block is
+    managed, your own prose is never touched**. A project-type-tailored trigger table (web →
+    HTTP-route tracing, frontend → reference audits) ending in a pointer to the detail doc.
+  - the full decision table at `<project>/.claude/plugin_code_graph_mcp.md` (a generated copy,
+    opened on demand — **not** auto-loaded each session; safe to gitignore).
+- **MCP `instructions` pointer** updated: `CLAUDE.md → .claude/plugin_code_graph_mcp.md`.
+
+### Migration (automatic, zero action)
+- On the first post-upgrade SessionStart **per project**, the plugin cleans the legacy
+  memory-dir artifacts — strips the old `MEMORY.md` sentinel block (preserving every other
+  memory) and deletes the `adopted-by`-marked detail file — then installs the new CLAUDE.md
+  scheme. Touches only the current project's memory dir (a single known path; no `~/.claude`
+  traversal). Idempotent and guarded: never removes a user file lacking our marker.
+- Opt-outs unchanged: `CODE_GRAPH_NO_AUTO_ADOPT=1` (block install), `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`
+  (lock manual edits), `code-graph-mcp unadopt` (full reverse — removes block + detail, deletes a
+  CLAUDE.md that held only our block, sweeps any legacy remnants).
+
 ## v0.73.1 — doctor: dev-mode rebuild preserves the embed-model feature set
 
 ### Fixed

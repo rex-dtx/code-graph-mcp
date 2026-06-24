@@ -1328,10 +1328,11 @@ impl McpServer {
 
     fn handle_initialize(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
         // CODE_GRAPH_QUIET_HOOKS=1 → ship a one-liner pointer; full decision
-        // rules live in MEMORY.md's plugin detail file (invited-memory pattern).
+        // rules live in the project's .claude/plugin_code_graph_mcp.md (the
+        // CLAUDE.md managed block points to it; auto-installed on plugin SessionStart).
         let quiet = std::env::var("CODE_GRAPH_QUIET_HOOKS").ok().as_deref() == Some("1");
         let instructions = if quiet {
-            "code-graph-mcp ready. See MEMORY.md \u{2192} plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`."
+            "code-graph-mcp ready. See CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`."
         } else {
             // v0.49: CLI form leads. In Claude Code the MCP tools are deferred
             // (a ToolSearch load must precede the first call) while Bash is
@@ -1346,7 +1347,7 @@ impl McpServer {
                 "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
                 "Still Grep for exact strings/regex; still Read files you will edit.\n",
                 "Diagnostics: `code-graph-mcp health-check`.\n",
-                "Full decision table: MEMORY.md \u{2192} plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
+                "Full decision table: CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
             );
             // Compile-time guard: calibrated from observed Claude Code truncation
             // at ~2048 bytes; 1500 leaves ~25% margin. Future edits that blow the

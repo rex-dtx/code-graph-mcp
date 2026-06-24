@@ -59,19 +59,24 @@ cargo test --no-default-features   # Tests without embedding
 - Error handling: `anyhow::Result` throughout, tracing for logging to stderr
 - Tests: Unit tests in modules, integration tests in `tests/integration.rs`
 
-## Code Graph Integration
+<!-- code-graph-mcp:begin v2 -->
+## Code Graph (repo-wide AST index)
 
-Repo-wide AST + FTS + vector index. Prefer code-graph MCP over multi-round Grep/Read when intent matches one of these triggers (LSP only sees open files; code-graph sees the whole repo):
+AST + FTS + vector index of the whole repo — prefer over multi-round Grep/Read for
+structural queries (LSP only sees open files; this sees everything). Fastest path = Bash CLI:
 
-| Intent | Tool | Replaces |
-|--------|------|----------|
-| "Who calls X?" / "X 调了什么？" | `get_call_graph symbol_name=X` | N rounds of `grep "X("` |
-| "改 X 影响什么？" / before editing a fn declaration | `get_ast_node symbol_name=X include_impact=true` | guess + read every caller |
-| "Y 模块/目录长啥样？" / unfamiliar dir | `module_overview path=Y/` | Glob + Read×N |
-| Concept search without exact symbol (e.g. "code that handles retries") | `semantic_code_search query="..."` | guesswork-driven Grep |
-| HTTP route → handler chain | `get_call_graph route_path="GET /api/x"` | manual route table + Read |
+| Intent | Command |
+|--------|---------|
+| Who calls X / what X calls | `code-graph-mcp callgraph X` |
+| Impact before editing a fn | `code-graph-mcp impact X` |
+| Unfamiliar dir / module | `code-graph-mcp overview <dir>` |
+| Symbol source / signature | `code-graph-mcp show X` |
+| Concept search (no exact name) | `code-graph-mcp search "…"` (vector: MCP `semantic_code_search`) |
+| grep + AST context | `code-graph-mcp grep "pat" [paths]` |
 
-Still use Grep for exact strings/regex (especially in non-code files: JSON, lockfiles, logs). Still use Read for files you're about to edit. CLI escape hatch: `code-graph-mcp <map|tour|overview|show|callgraph|impact|refs|dead-code|trace|grep|health-check>` — same data, Bash-friendly output. (`tour [PATH]` = dependency-ordered reading order: where to start reading a repo/subtree; CLI-only.) `code-graph-mcp grep` is a drop-in grep: `-n` line-numbers (always on) / `-F` literal / `-i` / `-w` / `-l` / `-A/-B/-C N` context / multi-path / `--max-count 0` (`-r`/`-R`/`-H` accepted as no-ops), grep-compatible exit codes (0/1/2), git-grep-grade recall (finds tracked-but-gitignored files like this CLAUDE.md), each hit annotated with its containing fn/class. Full decision table: `MEMORY.md → plugin_code_graph_mcp.md`.
+Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
+Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
+<!-- code-graph-mcp:end -->
 
 ## Autonomy
 

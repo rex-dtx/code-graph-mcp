@@ -57,7 +57,7 @@
 //! - `domain=frontend`  ~$0.27/run (20 q × 3 runs).
 //! - `domain=all`       ~$0.55/run (42 q × 3 runs).
 //!
-//! Context-rich mode (adds 10 FP queries + INDEX_LINE_MIRROR system prompt):
+//! Context-rich mode (adds 10 FP queries + STEERING_BLOCK_MIRROR system prompt):
 //! - `domain=backend`   ~$0.45/run (32 q × 3 runs).
 //! - `domain=frontend`  ~$0.40/run (30 q × 3 runs).
 //! - `domain=all`       ~$0.80/run (52 q × 3 runs).
@@ -74,10 +74,28 @@ const SYSTEM_PROMPT: &str = "You are a code-search assistant. For the user's que
     pick exactly ONE tool to invoke. Prefer the most specific tool whose description \
     matches the intent. Do not answer in prose — call a tool.";
 
-/// Mirror of `claude-plugin/scripts/adopt.js` `INDEX_LINE`. Used by
-/// context-rich bench mode to inject MEMORY.md hook into system prompt.
-/// Drift-checked at test time via `index_line_drift_check`.
-const INDEX_LINE_MIRROR: &str = "- [code-graph-mcp](plugin_code_graph_mcp.md) [impact-analysis, callgraph, find-references, module-overview, semantic-search, ast-search, dead-code, find-similar-code, dependency-graph, trace-http-chain] — 改 X 影响面/谁调用 X/X 被谁用/看 X 源码/Y 模块长啥样/概念查询 优先于 Grep；字面匹配走 Grep。Bash 直呼 CLI 最快（零加载）：`code-graph-mcp callgraph X / show X / overview <dir> / grep \"pat\" / impact X`；MCP 核心 7（get_call_graph/module_overview/semantic_code_search/ast_search/find_references/get_ast_node/project_map），决策表见全文";
+/// Mirror of the managed CLAUDE.md block produced by
+/// `claude-plugin/scripts/adopt.js` `buildBlock('generic')`. Used by
+/// context-rich bench mode to inject the project-CLAUDE.md steering into the
+/// system prompt. Drift-checked at test time via `steering_block_drift_check`.
+const STEERING_BLOCK_MIRROR: &str = r#"<!-- code-graph-mcp:begin v2 -->
+## Code Graph (repo-wide AST index)
+
+AST + FTS + vector index of the whole repo — prefer over multi-round Grep/Read for
+structural queries (LSP only sees open files; this sees everything). Fastest path = Bash CLI:
+
+| Intent | Command |
+|--------|---------|
+| Who calls X / what X calls | `code-graph-mcp callgraph X` |
+| Impact before editing a fn | `code-graph-mcp impact X` |
+| Unfamiliar dir / module | `code-graph-mcp overview <dir>` |
+| Symbol source / signature | `code-graph-mcp show X` |
+| Concept search (no exact name) | `code-graph-mcp search "…"` (vector: MCP `semantic_code_search`) |
+| grep + AST context | `code-graph-mcp grep "pat" [paths]` |
+
+Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
+Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
+<!-- code-graph-mcp:end -->"#;
 
 /// (natural-language query, expected tool name).
 /// 20 queries × 7 tools — 3 per tool except `find_references` with 2.
@@ -787,19 +805,19 @@ fn build_tools(mode: BenchMode, registry_tools: Vec<Value>) -> Vec<Value> {
 }
 
 /// Build the system prompt. ToolOnly returns SYSTEM_PROMPT verbatim;
-/// ContextRich appends the MEMORY.md framing line + INDEX_LINE_MIRROR;
+/// ContextRich appends the CLAUDE.md framing + STEERING_BLOCK_MIRROR;
 /// TriggerRate uses TRIGGER_SYSTEM_PROMPT (non-forcing) + the same
-/// MEMORY.md framing so the realistic Claude Code context applies.
+/// CLAUDE.md framing so the realistic Claude Code context applies.
 fn build_system_prompt(mode: BenchMode) -> String {
     match mode {
         BenchMode::ToolOnly => SYSTEM_PROMPT.to_string(),
         BenchMode::ContextRich => format!(
-            "{}\n\nUser has the following entry in their project MEMORY.md (auto-loaded):\n{}",
-            SYSTEM_PROMPT, INDEX_LINE_MIRROR
+            "{}\n\nThe project's CLAUDE.md (auto-loaded) contains this section:\n{}",
+            SYSTEM_PROMPT, STEERING_BLOCK_MIRROR
         ),
         BenchMode::TriggerRate => format!(
-            "{}\n\nUser has the following entry in their project MEMORY.md (auto-loaded):\n{}",
-            TRIGGER_SYSTEM_PROMPT, INDEX_LINE_MIRROR
+            "{}\n\nThe project's CLAUDE.md (auto-loaded) contains this section:\n{}",
+            TRIGGER_SYSTEM_PROMPT, STEERING_BLOCK_MIRROR
         ),
     }
 }
@@ -983,29 +1001,30 @@ fn majority_vote(picks: &[&str]) -> Option<String> {
     None
 }
 
-/// Drift detection: the Rust `INDEX_LINE_MIRROR` constant must match the
-/// `INDEX_LINE` exported by `claude-plugin/scripts/adopt.js` byte-for-byte.
-/// Single source of truth is adopt.js; the Rust mirror is a snapshot used
-/// by context-rich bench mode. This test catches forgotten updates.
+/// Drift detection: the Rust `STEERING_BLOCK_MIRROR` constant must match the
+/// managed block `buildBlock('generic')` produced by
+/// `claude-plugin/scripts/adopt.js` byte-for-byte. Single source of truth is
+/// adopt.js; the Rust mirror is a snapshot used by context-rich bench mode.
+/// This test catches forgotten updates.
 #[test]
-fn index_line_drift_check() {
+fn steering_block_drift_check() {
     let output = std::process::Command::new("node")
         .args([
             "-e",
-            "process.stdout.write(require('./claude-plugin/scripts/adopt.js').INDEX_LINE)",
+            "process.stdout.write(require('./claude-plugin/scripts/adopt.js').buildBlock('generic'))",
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("node binary required to verify INDEX_LINE drift");
+        .expect("node binary required to verify steering-block drift");
     assert!(
         output.status.success(),
         "node exited non-zero: stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let js_value = String::from_utf8(output.stdout).expect("INDEX_LINE is utf-8");
+    let js_value = String::from_utf8(output.stdout).expect("steering block is utf-8");
     assert_eq!(
-        INDEX_LINE_MIRROR, js_value,
-        "INDEX_LINE drift detected.\n  Rust mirror:  tests/routing_bench.rs INDEX_LINE_MIRROR\n  JS source:    claude-plugin/scripts/adopt.js INDEX_LINE\nFix: copy the JS value into INDEX_LINE_MIRROR (single-line literal preferred to avoid `\\`-continuation whitespace bugs)."
+        STEERING_BLOCK_MIRROR, js_value,
+        "Steering-block drift detected.\n  Rust mirror:  tests/routing_bench.rs STEERING_BLOCK_MIRROR\n  JS source:    claude-plugin/scripts/adopt.js buildBlock('generic')\nFix: copy the JS value into STEERING_BLOCK_MIRROR (raw string literal r#\"...\"#)."
     );
 }
 
@@ -1324,11 +1343,11 @@ mod builder_tests {
     }
 
     #[test]
-    fn build_system_prompt_context_rich_appends_memory_line() {
+    fn build_system_prompt_context_rich_appends_steering_block() {
         let p = build_system_prompt(BenchMode::ContextRich);
         assert!(p.starts_with(SYSTEM_PROMPT));
-        assert!(p.contains("MEMORY.md"));
-        assert!(p.contains(INDEX_LINE_MIRROR));
+        assert!(p.contains("CLAUDE.md"));
+        assert!(p.contains(STEERING_BLOCK_MIRROR));
     }
 
     #[test]
