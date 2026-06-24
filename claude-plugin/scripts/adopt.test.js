@@ -322,6 +322,7 @@ test('maybeAutoAdopt skips when CODE_GRAPH_NO_AUTO_ADOPT=1', () => {
   try {
     const res = maybeAutoAdopt({ cwd: sb.cwd, home: sb.home, scriptPath: PLUGIN_SCRIPTS, env: { CODE_GRAPH_NO_AUTO_ADOPT: '1' } });
     assert.strictEqual(res.reason, 'opted-out');
+    assert.deepStrictEqual(res.migrated, { memoryIndexPruned: false, legacyDetailRemoved: false }, 'consistent migrated shape on early return');
     assert.strictEqual(isAdopted({ cwd: sb.cwd }), false);
   } finally { sb.cleanup(); }
 });
@@ -331,6 +332,7 @@ test('maybeAutoAdopt skips when not plugin-mode (npm install path)', () => {
   try {
     const res = maybeAutoAdopt({ cwd: sb.cwd, home: sb.home, scriptPath: '/usr/local/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts', env: {} });
     assert.strictEqual(res.reason, 'not-plugin-mode');
+    assert.deepStrictEqual(res.migrated, { memoryIndexPruned: false, legacyDetailRemoved: false }, 'consistent migrated shape on early return');
     assert.strictEqual(isAdopted({ cwd: sb.cwd }), false);
   } finally { sb.cleanup(); }
 });

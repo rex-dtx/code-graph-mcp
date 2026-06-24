@@ -480,11 +480,14 @@ function migrateLegacyMemoryDir({ cwd, home } = {}) {
 // 制品（升级自动迁移），再安装/刷新。
 function maybeAutoAdopt({ cwd, home, env, scriptPath } = {}) {
   env = env || process.env;
+  // Consistent return shape: every path carries `migrated`. The two pre-gate
+  // early returns run before migration, so they report the zero result.
+  const noMigration = { memoryIndexPruned: false, legacyDetailRemoved: false };
   if (env.CODE_GRAPH_NO_AUTO_ADOPT === '1') {
-    return { attempted: false, reason: 'opted-out' };
+    return { attempted: false, reason: 'opted-out', migrated: noMigration };
   }
   if (!isPluginModeInstall(scriptPath || __dirname)) {
-    return { attempted: false, reason: 'not-plugin-mode' };
+    return { attempted: false, reason: 'not-plugin-mode', migrated: noMigration };
   }
   // Clean legacy memory-dir artifacts before installing the new CLAUDE.md scheme.
   const migrated = migrateLegacyMemoryDir({ cwd, home });

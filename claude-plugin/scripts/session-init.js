@@ -33,17 +33,17 @@ function computeQuietHooks({ env = {} } = {}) {
 // SessionStart project-map injection gate. Beyond the (already default-quiet)
 // verbose opt-in, the map is now also ADOPTED-ONLY: cross-project measurement
 // (memory cross-project-interference) found the ≈2 KB dump is zero-referenced
-// in projects the user hasn't adopted into their MEMORY.md workflow, so it only
-// earns its standing-context cost for adopted projects. Unadopted projects get
-// no map even under CODE_GRAPH_VERBOSE_HOOKS / legacy QUIET_HOOKS=0.
+// in projects the user hasn't adopted (no code-graph block in CLAUDE.md), so it
+// only earns its standing-context cost for adopted projects. Unadopted projects
+// get no map even under CODE_GRAPH_VERBOSE_HOOKS / legacy QUIET_HOOKS=0.
 function shouldInjectMap({ available, quietHooks, adopted } = {}) {
   return !!(available && !quietHooks && adopted);
 }
 
 // v0.63 — SessionStart "live context": the recent-change blast radius from the
 // AST index. UNLIKE injectProjectMap (default-OFF because the static module map
-// duplicates MEMORY.md + the on-demand project_map tool), this is git-delta-
-// derived — it changes every session and MEMORY.md cannot carry it, so it earns
+// duplicates the CLAUDE.md block + the on-demand project_map tool), this is git-delta-
+// derived — it changes every session and the static CLAUDE.md block cannot carry it, so it earns
 // being ON by default for adopted projects. It is the graph-unique, actionable
 // counterpart to mem's SessionStart dashboard (which pushes recent activity to
 // create engagement). Selectivity is automatic: a session with no recently
