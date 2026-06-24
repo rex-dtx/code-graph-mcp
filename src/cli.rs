@@ -1221,7 +1221,7 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
 
         // Re-search detection runs on every tool event, before action bucketing.
         let is_search_event = matches!(hook, Some("grep") | Some("read"))
-            && matches!(action, Some("deny") | Some("hint") | Some("bypass") | Some("observe"));
+            && matches!(action, Some("deny") | Some("hint") | Some("bypass") | Some("observe") | Some("inject"));
         if armed {
             if is_search_event {
                 s.researched_after_answer += 1;
@@ -1282,6 +1282,20 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                     armed_pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
                 } else {
                     s.deny_unanswered += 1;
+                }
+            } else if a == "inject" {
+                // Compound-grep PostToolUse: an answered inject delivered cg's
+                // AST-aware view of a grep that rode inside a compound command
+                // (so PreToolUse never denied it). It arms the funnel exactly like
+                // an answered deny — the next search event scores whether the
+                // inline inject sufficed (inject→fallthrough) or cg also answered
+                // the deeper step (sustained), parallel to deny→fallthrough.
+                // inject is recorded only when it actually delivered hits, so it is
+                // always answered; no unanswered counter (unlike deny). It still
+                // lands in total/by_action via the generic map above.
+                if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
+                    armed = true;
+                    armed_pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
                 }
             }
         }
@@ -5765,6 +5779,40 @@ mod tests {
         assert_eq!(s.fallthrough_after_answer, 2,
             "N6 (static deny cg couldn't satisfy) + N8 (same-pattern re-grep wins over no-hits)");
         assert_eq!(s.sustained_after_answer, 0, "no follow-up was itself answered by cg");
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_inject_arms_and_scores_fallthrough_vs_sustained() {
+        // Compound-grep PostToolUse inject: an ANSWERED inject (cg delivered the
+        // AST-aware view of a compound-command grep, permission-neutrally) arms the
+        // funnel exactly like an answered deny. The immediately-next search event
+        // scores the inject's sufficiency, parallel to deny→fallthrough:
+        //   I1 inject pattern=foo → arm(foo)
+        //   I2 grep observe pattern=foo  → SAME pattern re-grep = inline answer ignored → fall-through; disarm
+        //   I3 inject pattern=bar → arm(bar)
+        //   I4 grep deny answered=true pattern=qux → DIFFERENT pattern, cg also answered = sustained; re-arm(qux)
+        //   I5 cli use → conversion → disarm
+        //   I6 inject pattern=baz → arm(baz)
+        //   I7 (end) → no follow-up (answer sufficed)
+        // inject also counts in total/by_action via the generic map (it is a
+        // recommendation event, like deny/hint — NOT observe/use/live_impact).
+        let content = "\
+{\"ts\":\"I1\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"foo\",\"mode\":\"grep\"}
+{\"ts\":\"I2\",\"hook\":\"grep\",\"action\":\"observe\",\"pattern\":\"foo\"}
+{\"ts\":\"I3\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"bar\",\"mode\":\"grep\"}
+{\"ts\":\"I4\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"qux\"}
+{\"ts\":\"I5\",\"hook\":\"cli\",\"action\":\"use\",\"cmd\":\"grep\"}
+{\"ts\":\"I6\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"baz\",\"mode\":\"grep\"}
+";
+        let s = aggregate_recommendations_jsonl(content);
+        assert_eq!(s.by_action.get("inject"), Some(&3), "I1,I3,I6 are inject recommendation events");
+        assert_eq!(*s.by_hook.get("grep").unwrap(), 4, "I1,I3,I4,I6 are grep recommendation events (I2 observe excluded)");
+        assert_eq!(s.total, 4, "I1,I3,I4,I6 in total; I2 observe + I5 use excluded");
+        assert_eq!(s.researched_after_answer, 2, "I2 (after I1) and I4 (after I3) follow answered injects");
+        assert_eq!(s.fallthrough_after_answer, 1, "I1→I2: same-pattern re-grep = inline inject ignored");
+        assert_eq!(s.sustained_after_answer, 1, "I3→I4: different pattern, cg also answered = drill-down");
+        assert_eq!(s.observe, 1, "I2");
+        assert_eq!(s.cli_uses, 1, "I5");
     }
 
     #[test]

@@ -17,8 +17,8 @@ const { hookFireWarning, analyzeHookDark } = require('./session-init');
 
 test('verifyHooksFire: all real registered hooks run cleanly (exit 0)', () => {
   const { ok, results } = verifyHooksFire();
-  // 3 PreToolUse + 1 PostToolUse + 1 UserPromptSubmit = 5 settings.json hooks
-  assert.ok(results.length >= 5, `expected >=5 hook probes, got ${results.length}`);
+  // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit = 6 settings.json hooks
+  assert.ok(results.length >= 6, `expected >=6 hook probes, got ${results.length}`);
   for (const r of results) {
     assert.ok(r.ok, `hook ${r.label} (${r.script}) did not fire cleanly: code=${r.code} err=${r.error}`);
   }

@@ -382,6 +382,74 @@ function pickBlockPattern(cmd) {
   return extractPatterns(cmd).find(p => IDENTIFIER_LIKE.test(p));
 }
 
+// Compound-grep PostToolUse splitter. Split a command into top-level segments on
+// `&&`, `||`, `;`, newline, and shell `for … in` / `do` / `done` control-word
+// boundaries — but NOT on a single `|`: a `cargo test | grep X` is an OUTPUT
+// FILTER (its head stays `cargo`, so it is excluded from folding), exactly as
+// PIPE_INTO_GREP treats it in the PreToolUse path. Quote-aware: separators
+// inside single/double quotes are literal command text, never split points.
+// Returns trimmed, non-empty segments. Shared by post-grep-inject so the
+// PostToolUse path reuses this splitter instead of copying it.
+function splitTopLevelSegments(cmd) {
+  if (!cmd || typeof cmd !== 'string') return [];
+  const segs = [];
+  let cur = '';
+  let quote = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (quote) {
+      cur += c;
+      // Inside DOUBLE quotes a backslash escapes the next char, so `\"` does NOT
+      // close the quote (POSIX). Single quotes do no escaping — `\` is literal
+      // and `'` always closes — so this only applies to `"`. Without it,
+      // `echo "x\" && grep \"Y\" src/"` (one literal echo arg) mis-closes at
+      // `\"`, splits on `&&`, and yields a phantom foldable grep segment.
+      if (quote === '"' && c === '\\' && i + 1 < cmd.length) {
+        cur += cmd[i + 1];
+        i++;
+        continue;
+      }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; cur += c; continue; }
+    // `&&` and `||` (a single `&`/`|` is NOT a split — `|` is an output-filter
+    // pipe, lone `&` is background and rare in tool calls).
+    if ((c === '&' && cmd[i + 1] === '&') || (c === '|' && cmd[i + 1] === '|')) {
+      segs.push(cur); cur = ''; i++; continue;
+    }
+    if (c === ';' || c === '\n') { segs.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  segs.push(cur);
+  // Split out `for … in` / `do` / `done` control words as their own boundaries
+  // so a loop body grep is isolated (the head of `for s in …; do grep …` is the
+  // `for` keyword, which would otherwise mask the grep). Quote-safety already
+  // handled above — these run per already-split segment on whitespace-delimited
+  // control words only.
+  const out = [];
+  const CTRL = /(?:^|\s)(for\s+\S+\s+in\b|do\b|done\b|then\b|fi\b)(?=\s|$)/g;
+  for (const raw of segs) {
+    let last = 0;
+    let m;
+    CTRL.lastIndex = 0;
+    let pushed = false;
+    while ((m = CTRL.exec(raw)) !== null) {
+      const before = raw.slice(last, m.index);
+      if (before.trim()) out.push(before);
+      last = CTRL.lastIndex;
+      pushed = true;
+    }
+    if (pushed) {
+      const tail = raw.slice(last);
+      if (tail.trim()) out.push(tail);
+    } else {
+      out.push(raw);
+    }
+  }
+  return out.map(s => s.trim()).filter(Boolean);
+}
+
 function commandHash(cmd) {
   return crypto.createHash('sha1').update(cmd).digest('hex').slice(0, 12);
 }
@@ -664,8 +732,14 @@ function runMain() {
     return;
   }
 
-  recordRecommendation(root, { hook: 'grep', action: 'hint' });
-  process.stdout.write(buildHint() + '\n');
+  // Compound-grep change: the dark-stdout HINT fallthrough was DELETED. A grep
+  // that passes shouldHint but NOT classifyBlock used to record action:'hint'
+  // and write buildHint() to stdout — but PreToolUse exit-0 plain stdout goes to
+  // the DEBUG LOG ONLY and never reaches the model (CC docs v2026-06). It was
+  // pure noise. These hint-tier greps (unanswerable-flag / marker / multi-path)
+  // are exactly the cases cg cannot fold, so silence is correct: the model's own
+  // grep runs unimpeded. classifyBlock-positive compound greps are now picked up
+  // permission-neutrally by the PostToolUse post-grep-inject hook.
 }
 
 if (require.main === module) {
@@ -676,6 +750,7 @@ module.exports = {
   shouldHint,
   shouldBlock,
   classifyBlock,         // v0.49 — intent-aware block tiers
+  splitTopLevelSegments, // compound-grep — quote-aware top-level segment splitter (PostToolUse reuse)
   extractDeclSymbols,    // v0.49 — show-mode symbol extraction
   translateBreToRg,      // v0.49 — BRE→rust-regex dialect bridge
   buildShowDenyReason,   // v0.49 — show-mode deny copy

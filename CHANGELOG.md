@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.73.0 — Compound-grep answer injection + hints that reach the model
+
+### Added
+- **`grep` inside a compound command now gets the AST-aware answer too.** The PreToolUse grep
+  guard only fires when the command *head* is `grep`/`rg`/`ag`, so the dominant real shape —
+  `echo "=== X ===" && grep -rn "Sym" tests/`, `git diff && grep "Sym" src/`, `for s in …; do
+  grep "$s" src/` — sailed past it with no inline answer. A new **PostToolUse(Bash) hook**
+  (`post-grep-inject`) splits the command, finds the foldable source-grep segment, runs the same
+  `code-graph-mcp grep`/`show` the deny path uses, and injects the result **alongside** the grep's
+  own output. It is **permission-neutral** (`additionalContext` with no permission decision): it
+  never blocks the command and never auto-approves the bundled work (e.g. a `git push` in the same
+  line still goes through your normal permission flow). Opt-out: **`CODE_GRAPH_NO_INJECT=1`** (or
+  silence all hooks with `CODE_GRAPH_QUIET_HOOKS=1`).
+
+### Fixed
+- **Hint / impact output now actually reaches the model.** The PreToolUse grep hint, the read-fanout
+  hint (`pre-read-guide`), and the edit-impact summary (`pre-edit-guide`) were written to plain
+  stdout on exit 0 — which Claude Code routes to the *debug log only*, never into the model's
+  context. They now deliver via `additionalContext` (the same channel the deny reason already used),
+  so the read-fanout overview and the pre-edit impact summary are seen on the next model turn instead
+  of being silently dropped. The dead, model-invisible grep hint-tier emission was removed.
+
+> **Migration:** behavior-only change, no action required and no re-index (no schema/index-version
+> bump). After this upgrade, a Bash command that searches the source tree gets one extra AST-aware
+> context block after it runs, and Read/Edit nudges that were previously dark now appear. Opt out of
+> the grep injection with `CODE_GRAPH_NO_INJECT=1`; opt out of all code-graph hooks with
+> `CODE_GRAPH_QUIET_HOOKS=1`.
+
 ## v0.72.0 — Edit-time covering-test targeting
 
 ### Added

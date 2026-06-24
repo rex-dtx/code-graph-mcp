@@ -29,6 +29,7 @@ const { cgTmpDir } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
 const { resolveProjectRoot } = require('./project-root');
 const { runOverviewAnswer } = require('./cg-answer');
+const { emitPreToolAllowContext } = require('./hook-emit');
 
 // --- Configuration ---
 
@@ -185,7 +186,13 @@ function trackReadAndMaybeHint(root, rel, now = Date.now()) {
     // so the read-fanout funnel can tell a dark flagship apart from no result.
     ...(answered ? {} : { reason: answer.status }),
   });
-  process.stdout.write((answered ? buildHintWithAnswer(dir, answer) : buildHint(dir)) + '\n');
+  // Compound-grep sibling sweep: emit via the PreToolUse allow+additionalContext
+  // envelope (shared hook-emit.js). Bare stdout on a PreToolUse exit-0 lands in
+  // the debug log only and never reaches the model (CC docs v2026-06); the
+  // additionalContext channel is what actually surfaces the fanout hint. Read is
+  // a safe tool, so the allow elevation is negligible.
+  const hintText = answered ? buildHintWithAnswer(dir, answer) : buildHint(dir);
+  process.stdout.write(emitPreToolAllowContext(hintText) + '\n');
   return true;
 }
 

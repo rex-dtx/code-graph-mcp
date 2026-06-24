@@ -5,6 +5,7 @@ const {
   shouldHint,
   shouldBlock,
   classifyBlock,
+  splitTopLevelSegments,
   countNamedPaths,
   extractDeclSymbols,
   translateBreToRg,
@@ -1528,4 +1529,94 @@ test('extractSedReadTargets: pipeline sed after grep still extracted', () => {
   assert.deepEqual(
     extractSedReadTargets('grep -n "x" src/a.py | sed -n 1,5p src/b.py'),
     ['src/b.py']);
+});
+
+// ── splitTopLevelSegments (compound-grep PostToolUse §1) ─────────────
+// Quote-aware top-level splitter shared by post-grep-inject. Splits on &&, ||,
+// ;, newline, and for…in / do / done boundaries — NOT on a single `|` (so a
+// pipe-into-grep keeps head=cargo and is recognized as an output filter).
+
+test('splitTopLevelSegments: && joins two commands → two segments', () => {
+  assert.deepEqual(
+    splitTopLevelSegments('echo "x" && grep Sym tests/'),
+    ['echo "x"', 'grep Sym tests/']);
+});
+
+test('splitTopLevelSegments: ; and || are top-level separators', () => {
+  assert.deepEqual(
+    splitTopLevelSegments('git diff; grep Sym src/ || echo none'),
+    ['git diff', 'grep Sym src/', 'echo none']);
+});
+
+test('splitTopLevelSegments: a single pipe is NOT a separator (output filter)', () => {
+  // cargo test | grep X must keep head=cargo so it reads as an output filter,
+  // NOT a foldable grep segment.
+  assert.deepEqual(
+    splitTopLevelSegments('cargo test | grep FAIL'),
+    ['cargo test | grep FAIL']);
+});
+
+test('splitTopLevelSegments: for … in / do / done are segment boundaries', () => {
+  const segs = splitTopLevelSegments('for s in a b; do grep "$s" src/; done');
+  // the grep body is isolated as its own segment
+  assert.ok(segs.some(seg => /grep "\$s" src\//.test(seg)),
+    `grep body not isolated: ${JSON.stringify(segs)}`);
+  // the for-header / do / done keywords are not glued onto the grep
+  assert.ok(!segs.some(seg => /for s in/.test(seg) && /grep/.test(seg)),
+    `for-header glued to grep: ${JSON.stringify(segs)}`);
+});
+
+test('splitTopLevelSegments: separators inside quotes are literal, not splits', () => {
+  assert.deepEqual(
+    splitTopLevelSegments('grep "a && b; c" src/'),
+    ['grep "a && b; c" src/']);
+  assert.deepEqual(
+    splitTopLevelSegments("grep 'x || y' src/"),
+    ["grep 'x || y' src/"]);
+});
+
+test('splitTopLevelSegments: backslash-escaped quote inside double quotes does NOT close (no phantom segment)', () => {
+  // One literal echo arg — the \" must not close the quote, so && stays inside
+  // the string and no foldable `grep` segment is split out. (review L1)
+  assert.deepEqual(
+    splitTopLevelSegments('echo "x\\" && grep \\"Y\\" src/ rest"'),
+    ['echo "x\\" && grep \\"Y\\" src/ rest"']);
+  // Single quotes do NOT process backslashes (POSIX): a real separator after a
+  // closed single-quoted string still splits.
+  assert.deepEqual(
+    splitTopLevelSegments("echo 'a\\' && grep Sym src/"),
+    ["echo 'a\\'", 'grep Sym src/']);
+});
+
+test('splitTopLevelSegments: newline is a separator', () => {
+  assert.deepEqual(
+    splitTopLevelSegments('echo hi\ngrep Sym src/'),
+    ['echo hi', 'grep Sym src/']);
+});
+
+test('splitTopLevelSegments: empty / non-string → empty array', () => {
+  assert.deepEqual(splitTopLevelSegments(''), []);
+  assert.deepEqual(splitTopLevelSegments(null), []);
+  assert.deepEqual(splitTopLevelSegments(undefined), []);
+});
+
+test('splitTopLevelSegments: trims and drops empty segments', () => {
+  assert.deepEqual(
+    splitTopLevelSegments('  echo a  ;;  grep Sym src/  '),
+    ['echo a', 'grep Sym src/']);
+});
+
+// The dark-hint fallthrough (action:'hint' + stdout buildHint) was DELETED in
+// the compound-grep change: a grep that passes shouldHint but not classifyBlock
+// now exits silently from PreToolUse (PostToolUse handles only classifyBlock
+// non-null cases). buildHint stays exported (referenced above) but is never
+// emitted by the runMain hint tier.
+test('source-text: PreToolUse no longer emits the dark stdout hint fallthrough', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(path.join(__dirname, 'pre-grep-guide.js'), 'utf8');
+  assert.doesNotMatch(src, /process\.stdout\.write\(buildHint\(\)/,
+    'the dark hint stdout emission must be removed (PreToolUse exit-0 stdout is debug-log-only)');
+  assert.doesNotMatch(src, /action:\s*'hint'\s*\}\);\s*\n\s*process\.stdout\.write\(buildHint/,
+    'the hint-tier recordRecommendation + buildHint pair must be removed');
 });

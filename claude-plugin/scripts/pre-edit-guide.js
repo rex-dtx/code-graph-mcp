@@ -14,6 +14,7 @@ const { cgTmpDir } = require('./tmp-dir');
 const { resolveProjectRoot } = require('./project-root');
 const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
+const { emitPreToolAllowContext } = require('./hook-emit');
 
 // v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
 // gate kept this hook dark for entire sessions after `cd backend/` — daagu
@@ -211,4 +212,10 @@ summary += formatCoveringTests(jsonResult.test_callers, editedFile);
 // fire with the count alone — the verdict must stay coherent either way.
 summary += `  → Before this edit: confirm each caller of ${symbol}() still holds with your change, or note why it is unaffected.\n`;
 
-process.stdout.write(summary);
+// Compound-grep sibling sweep: deliver via the PreToolUse allow+additionalContext
+// envelope (shared hook-emit.js). Bare stdout on a PreToolUse exit-0 lands in the
+// debug log only and never reaches the model (CC docs v2026-06); additionalContext
+// is what actually surfaces the impact summary. Impact must stay PRE-edit (so the
+// reconciliation happens before the change), hence allow + additionalContext, not
+// a PostToolUse inject.
+process.stdout.write(emitPreToolAllowContext(summary) + '\n');

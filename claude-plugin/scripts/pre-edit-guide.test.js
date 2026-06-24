@@ -197,3 +197,22 @@ test('covering-tests: edit injection records test_targets for the forward funnel
   const source = fs.readFileSync(path.join(__dirname, 'pre-edit-guide.js'), 'utf8');
   assert.match(source, /test_targets:/);
 });
+
+// ── Compound-grep sibling sweep: impact summary → additionalContext ──
+// Bare `process.stdout.write(summary)` on a PreToolUse exit-0 lands in the debug
+// log only and never reaches the model (CC docs v2026-06). The impact summary
+// must ride the shared PreToolUse allow+additionalContext envelope instead.
+// Source-grep, same convention as the salience/pattern-sync guards (hook exits
+// on require: reads stdin, resolves the index).
+
+test('emit: impact summary is delivered via the PreToolUse allow+additionalContext envelope', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const source = fs.readFileSync(path.join(__dirname, 'pre-edit-guide.js'), 'utf8');
+  assert.match(source, /require\(['"]\.\/hook-emit['"]\)/,
+    'pre-edit-guide must use the shared hook-emit module (no inline envelope copy)');
+  assert.match(source, /emitPreToolAllowContext\(summary\)/,
+    'the impact summary must be carried inside additionalContext, not bare stdout');
+  assert.doesNotMatch(source, /process\.stdout\.write\(summary\)\s*;/,
+    'the bare stdout summary emission (debug-log-only) must be removed');
+});

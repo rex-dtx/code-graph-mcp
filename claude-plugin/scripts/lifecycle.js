@@ -310,6 +310,7 @@ const OUR_HOOK_SCRIPTS = [
   'pre-edit-guide.js',
   'pre-grep-guide.js',   // v0.32.0 — was in plugin-cache only, never fired
   'pre-read-guide.js',   // v0.32.0 — was in plugin-cache only, never fired
+  'post-grep-inject.js', // compound-grep — PostToolUse(Bash) permission-neutral answer inject
 ];
 
 // Description markers — primary cleanup discriminator (immune to env/path
@@ -318,6 +319,7 @@ const OUR_HOOK_SCRIPTS = [
 const SETTINGS_HOOK_DESC = {
   preToolUse:       '[code-graph-mcp v0.32+] PreToolUse re-routed via settings.json (cache hooks.json silently ignored for this event by current CC)',
   postToolUseEdit:  '[code-graph-mcp v0.32+] PostToolUse Write|Edit incremental-index update',
+  postToolUseInject:'[code-graph-mcp v0.32+] PostToolUse Bash compound-grep answer inject (permission-neutral additionalContext)',
   userPromptSubmit: '[code-graph-mcp v0.32+] UserPromptSubmit context push',
 };
 
@@ -330,6 +332,7 @@ const OUR_DESCRIPTIONS = [
   // v0.32.0 — new re-route markers
   SETTINGS_HOOK_DESC.preToolUse,
   SETTINGS_HOOK_DESC.postToolUseEdit,
+  SETTINGS_HOOK_DESC.postToolUseInject,
   SETTINGS_HOOK_DESC.userPromptSubmit,
 ];
 
@@ -385,6 +388,7 @@ function buildSettingsHookEntries() {
     ],
     PostToolUse: [
       { description: SETTINGS_HOOK_DESC.postToolUseEdit, matcher: 'Write|Edit', hooks: [scriptCmd('incremental-index.js', 10)] },
+      { description: SETTINGS_HOOK_DESC.postToolUseInject, matcher: 'Bash', hooks: [scriptCmd('post-grep-inject.js', 5)] },
     ],
     UserPromptSubmit: [
       { description: SETTINGS_HOOK_DESC.userPromptSubmit, matcher: '', hooks: [scriptCmd('user-prompt-context.js', 5)] },
@@ -481,7 +485,11 @@ function surveyHookCoverage(settings) {
 function hookFirePayload(matcher) {
   switch (matcher) {
     case 'Bash':
-      return { tool_name: 'Bash', tool_input: { command: 'grep -rn someUniqueSymbol src/' } };
+      // A QUOTED, identifier-like pattern → classifyBlock-positive → the
+      // PreToolUse deny tier emits (the hint-tier dark stdout fallthrough was
+      // removed in the compound-grep change, so a non-foldable pattern would now
+      // produce no output and falsely read as "didn't fire").
+      return { tool_name: 'Bash', tool_input: { command: 'grep -rn "SomeUniqueSymbol" src/' } };
     case 'Read':
       return { tool_name: 'Read', tool_input: { file_path: 'src/example.rs' } };
     case 'Edit':

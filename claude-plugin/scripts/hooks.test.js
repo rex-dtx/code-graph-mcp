@@ -182,8 +182,8 @@ function allRegisteredHookCommands() {
 
 test('every registered hook script exists on disk', () => {
   const commands = allRegisteredHookCommands();
-  // 3 PreToolUse + 1 PostToolUse + 1 UserPromptSubmit + 1 SessionStart = 6
-  assert.ok(commands.length >= 6, `expected >=6 registered hook commands, got ${commands.length}`);
+  // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit + 1 SessionStart = 7
+  assert.ok(commands.length >= 7, `expected >=7 registered hook commands, got ${commands.length}`);
   for (const cmd of commands) {
     const p = resolveHookScript(cmd);
     assert.ok(p, `could not extract a .js path from hook command: ${JSON.stringify(cmd)}`);
@@ -221,8 +221,8 @@ test('buildSettingsHookEntries: matcher surface is exactly the intended set', ()
   const setOf = (event) => (desired[event] || []).map(e => e.matcher).sort();
   assert.deepEqual(setOf('PreToolUse'), ['Bash', 'Edit', 'Read'],
     'PreToolUse matcher set changed — update this gate intentionally (does the new tool need a guide hook?)');
-  assert.deepEqual(setOf('PostToolUse'), ['Write|Edit'],
-    'PostToolUse matcher set changed — incremental-index re-index trigger surface must be deliberate');
+  assert.deepEqual(setOf('PostToolUse'), ['Bash', 'Write|Edit'],
+    'PostToolUse matcher set changed — incremental-index (Write|Edit) + compound-grep inject (Bash) trigger surface must be deliberate');
   assert.deepEqual(setOf('UserPromptSubmit'), [''],
     'UserPromptSubmit matcher set changed unexpectedly');
   assert.deepEqual(Object.keys(desired).sort(), ['PostToolUse', 'PreToolUse', 'UserPromptSubmit'],

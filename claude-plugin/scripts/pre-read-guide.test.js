@@ -279,7 +279,15 @@ test('trackReadAndMaybeHint: fires on 5th read with stubbed overview answer', ()
       fired = trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs');
     }
     assert.equal(fired, true, '5th same-dir read must fire');
-    assert.match(written.join(''), /Module overview stub/, 'hint must EMBED the overview answer');
+    // Compound-grep sibling sweep: the fanout hint is now emitted as a
+    // PreToolUse allow+additionalContext envelope (was bare stdout, which CC
+    // routes to the debug log only and never shows the model). The overview
+    // answer must ride inside additionalContext.
+    const emitted = JSON.parse(written.join(''));
+    assert.equal(emitted.hookSpecificOutput.hookEventName, 'PreToolUse');
+    assert.equal(emitted.hookSpecificOutput.permissionDecision, 'allow');
+    assert.match(emitted.hookSpecificOutput.additionalContext, /Module overview stub/,
+      'hint must EMBED the overview answer in additionalContext');
     const recs = fs.readFileSync(path.join(root, '.code-graph', 'recommendations.jsonl'), 'utf8');
     assert.match(recs, /"hook":"read"/);
     assert.match(recs, /"answered":true/);
