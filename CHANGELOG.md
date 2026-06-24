@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.74.1 — Post-release review fixups (no behavior change)
+
+### Fixed
+- **`maybeAutoAdopt` return shape is now consistent across all paths.** The two
+  pre-gate early returns (`CODE_GRAPH_NO_AUTO_ADOPT=1`, non-plugin-mode) now carry
+  the `migrated` field like every other path (session-init already defended with a
+  `|| {}` fallback, so no behavior changed). Locked by two new assertions.
+- Refreshed two stale `session-init.js` comments that still described the old
+  MEMORY.md adoption — the project-map / recent-impact injection gates key off the
+  CLAUDE.md block as of v0.74.0.
+
+Validated by a real plugin-cache install e2e (fresh install, legacy-user upgrade
+with claude-mem-lite coexistence, idempotency, CRLF, unadopt, marker-guard): 36/36.
+Full plugin suite 708/708. MCP instructions live-checked (noisy 916B, quiet 167B),
+both point to CLAUDE.md.
+
 ## v0.74.0 — Steering moved from the auto-memory dir to the project's CLAUDE.md
 
 ### Changed
