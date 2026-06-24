@@ -330,6 +330,32 @@ function relicRepairGuard({ log = console.log, relic = undefined } = {}) {
   return true;
 }
 
+// A dev-mode rebuild must PRESERVE the existing binary's feature set. This repair
+// used to hardcode `--no-default-features`, which silently downgraded a hybrid
+// (embed-model) dev binary to FTS5-only and ping-ponged against a manual
+// `cargo build --release --features embed-model`. Probe the binary's COMPILED
+// feature via `health-check --json` → `model_available` (= cfg!(feature =
+// "embed-model"), reported even with no index) and rebuild to match. Returns
+// true/false, or null when the binary can't be probed (missing/broken) — the
+// caller then defaults to FTS5 + an explicit note, never a silent downgrade.
+// End users never reach this path (binary-stale → auto-update; binary-missing
+// non-dev → install instructions); it is purely the source-repo dev convenience.
+function detectEmbedModel(binary, run = execFileSync) {
+  if (!binary) return null;
+  try {
+    const out = run(binary, ['health-check', '--json'], {
+      timeout: 10000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return JSON.parse(out).model_available === true;
+  } catch { return null; }
+}
+
+function devBuildCommand(embed) {
+  return embed
+    ? 'cargo build --release --features embed-model'
+    : 'cargo build --release --no-default-features';
+}
+
 function runRepairs(results) {
   const fixable = results.filter(r => r.fixId);
   if (fixable.length === 0) return 0;
@@ -353,14 +379,23 @@ function runRepairs(results) {
           }
           break;
         }
+        // Preserve the current binary's feature set \u2014 never silently downgrade
+        // a hybrid (embed-model) dev binary to FTS5-only (which also ping-pongs
+        // against a manual `--features embed-model` build).
+        const embed = detectEmbedModel(findBinary());
+        const buildCmd = devBuildCommand(embed === true);
         console.log('\n  Building binary...');
-        console.log('    \u2192 cargo build --release --no-default-features');
+        if (embed === null) {
+          console.log('    (could not detect current feature set \u2014 building FTS5-only;');
+          console.log('     for semantic search rebuild with `cargo build --release --features embed-model`)');
+        }
+        console.log(`    \u2192 ${buildCmd}`);
         try {
           const projectRoot = path.resolve(__dirname, '..', '..');
-          execSync('cargo build --release --no-default-features', {
+          execSync(buildCmd, {
             cwd: projectRoot,
             stdio: 'inherit',
-            timeout: 300000,
+            timeout: 600000,  // embed-model (Candle) builds exceed the old 5min
           });
           clearBinaryCache();
           console.log('  \u2705 Build complete');
@@ -374,13 +409,16 @@ function runRepairs(results) {
       case 'binary-missing': {
         console.log('\n  Installing binary...');
         if (isDevMode()) {
+          // No binary to probe \u2014 build the fast FTS5 binary, but point at the
+          // hybrid option so FTS5 isn't silently presented as the only choice.
           console.log('    \u2192 cargo build --release --no-default-features');
+          console.log('      (for semantic search: cargo build --release --features embed-model)');
           try {
             const projectRoot = path.resolve(__dirname, '..', '..');
             execSync('cargo build --release --no-default-features', {
               cwd: projectRoot,
               stdio: 'inherit',
-              timeout: 300000,
+              timeout: 600000,
             });
             clearBinaryCache();
             console.log('  \u2705 Build complete');
@@ -500,7 +538,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, surveyHookCoverage, relicRepairGuard, classifyEmbeddings };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, detectEmbedModel, devBuildCommand };
 
 if (require.main === module) {
   const args = process.argv.slice(2);

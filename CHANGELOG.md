@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.73.1 — doctor: dev-mode rebuild preserves the embed-model feature set
+
+### Fixed
+- **`doctor` no longer silently downgrades a hybrid dev binary to FTS5-only.** When a stale or
+  missing binary triggered the auto-fix **in the source repo (dev mode)**, `doctor` hardcoded
+  `cargo build --release --no-default-features` — silently dropping `embed-model` (so semantic
+  search degraded to FTS5) and ping-ponging against any manual `cargo build --release --features
+  embed-model`. It now probes the existing binary's compiled feature via `health-check --json`
+  (`model_available`) and rebuilds to match — `--features embed-model` for a hybrid binary,
+  `--no-default-features` for an FTS5 one; when it can't detect (binary missing/broken) it builds
+  FTS5 but prints the hybrid command instead of silently choosing. Build timeout raised 5→10min for
+  the slower Candle build. **Dev-only — end users are unaffected:** a stale binary triggers
+  auto-update to the published hybrid release binary, and a missing one prints install instructions
+  (both never hit the local rebuild path).
+
 ## v0.73.0 — Compound-grep answer injection + hints that reach the model
 
 ### Added

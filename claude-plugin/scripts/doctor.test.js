@@ -122,3 +122,30 @@ test('classifyEmbeddings OK for hybrid (partial + complete) and no-embeddable', 
   assert.equal(none.status, 'ok');
   assert.match(none.detail, /no embeddable nodes/);
 });
+
+// ── dev-rebuild feature preservation (no silent hybrid→FTS5 downgrade / ping-pong) ──
+test('devBuildCommand preserves feature set: hybrid → --features embed-model, fts → --no-default-features', () => {
+  const { devBuildCommand } = require('./doctor');
+  assert.match(devBuildCommand(true), /--features embed-model/);
+  assert.doesNotMatch(devBuildCommand(true), /--no-default-features/);
+  assert.match(devBuildCommand(false), /--no-default-features/);
+  assert.doesNotMatch(devBuildCommand(false), /--features embed-model/);
+});
+
+test('detectEmbedModel reads model_available from `health-check --json`; probe failure → null (never a false downgrade signal)', () => {
+  const { detectEmbedModel } = require('./doctor');
+  // hybrid binary
+  const hybridStub = (_bin, args) => {
+    assert.deepEqual(args, ['health-check', '--json']);
+    return JSON.stringify({ model_available: true });
+  };
+  assert.equal(detectEmbedModel('/bin/cg', hybridStub), true);
+  // FTS5-only binary
+  assert.equal(detectEmbedModel('/bin/cg', () => JSON.stringify({ model_available: false })), false);
+  // probe throws (binary broken) → null (caller defaults to FTS5 + note, not a downgrade claim)
+  assert.equal(detectEmbedModel('/bin/cg', () => { throw new Error('boom'); }), null);
+  // unparseable output → null
+  assert.equal(detectEmbedModel('/bin/cg', () => 'not json'), null);
+  // no binary → null
+  assert.equal(detectEmbedModel(null), null);
+});
