@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.74.2 — Polyglot extraction fixes (INDEX_VERSION 30)
+
+A dogfood sweep across languages surfaced six real extraction bugs (all `fix:`).
+Existing indexes auto-rebuild on upgrade (INDEX_VERSION 28→30).
+
+### Fixed
+- **Cross-file call-noise filter is now language-aware.** The
+  `CROSS_FILE_CALL_NOISE` skip-list is Rust/collection-stdlib flavored
+  (`Vec::insert`, `HashMap::remove`) but was applied to every language, silently
+  dropping legitimate method-call edges — JS/TS `db.insert()`/`cache.remove()`/
+  `set.contains()` (not ECMAScript builtins) and **all** PHP `$o->method()` calls
+  (PHP array ops are global functions, never methods). Those methods were reported
+  as orphan dead code and their callers hidden from callgraph/impact/refs. Genuine
+  ECMAScript builtins (`push`/`pop`/`get`/`map`...) still drop; Rust/Python/Ruby/
+  Java/Kotlin/Swift/C++ unchanged.
+- **Express routes with an imported handler now resolve.** `import { getUser }
+  from './ctrl'; app.get('/x', getUser)` (the routes-file + controller-file
+  layout) produced no `routes_to` edge — the handler was matched only against the
+  route file's own nodes, so trace/find_http_route/impact saw no route. Now
+  resolved cross-file (generalizes to Go `HandleFunc`).
+- **C/C++ types are no longer reported as dead code.** C/C++ extraction emits no
+  inheritance/type-reference edges, so every class/struct/enum was orphaned and
+  flagged dead (a guaranteed false positive that drowned real findings). Excluded,
+  like markdown headings and constructors; genuinely-unused functions still report.
+- **`.hh`/`.hxx` C++ headers are now indexed** (`.hxx` pairs with the already-
+  supported `.cxx`); previously skipped, leaving their symbols/includes invisible.
+- **Dart calls now resolve in all positions.** Calls were only extracted from
+  `expression_statement`, dropping `return foo()`, `var x = foo()`, `obj.run()`,
+  nested args, and arrow bodies — the majority. Now dispatched on the
+  `selector(argument_part)` node.
+- **Dart top-level functions are now extracted as symbols** (they parse as a bare
+  `function_signature` sibling under `program`, previously matched by no arm).
+
 ## v0.74.1 — Post-release review fixups (no behavior change)
 
 ### Fixed
