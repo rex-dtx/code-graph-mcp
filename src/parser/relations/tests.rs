@@ -1335,6 +1335,65 @@ fn test_extract_dart_calls() {
 }
 
 #[test]
+fn test_extract_dart_calls_in_non_statement_positions() {
+    // Regression: Dart call extraction only fired on `expression_statement`
+    // (`foo();`), so calls in return / assignment / argument / binary-expr
+    // positions — the majority — were silently dropped. Now dispatched on the
+    // `selector(argument_part)` node (callee = preceding sibling).
+    let code = "\
+String describe() {
+  return \"x \" + sound();
+}
+int compute(int y) {
+  return helper(y);
+}
+void build() {
+  var d = make();
+  obj.run();
+  wrap(inner());
+}
+String arrow() => render();
+";
+    let relations = extract_relations(code, "dart").unwrap();
+    let calls = |scope: &str| -> Vec<String> {
+        relations.iter()
+            .filter(|r| r.relation == REL_CALLS && r.source_name == scope)
+            .map(|r| r.target_name.clone())
+            .collect()
+    };
+    assert!(calls("describe").contains(&"sound".to_string()),
+        "call inside `return \"x\" + sound()` (binary expr) must resolve; got: {:?}", calls("describe"));
+    assert!(calls("compute").contains(&"helper".to_string()),
+        "call inside `return helper(y)` must resolve; got: {:?}", calls("compute"));
+    let b = calls("build");
+    assert!(b.contains(&"make".to_string()),
+        "call inside `var d = make()` must resolve; got: {:?}", b);
+    assert!(b.contains(&"run".to_string()),
+        "method call `obj.run()` must resolve to `run`; got: {:?}", b);
+    assert!(b.contains(&"wrap".to_string()) && b.contains(&"inner".to_string()),
+        "both outer `wrap(...)` and nested `inner()` must resolve; got: {:?}", b);
+    assert!(calls("arrow").contains(&"render".to_string()),
+        "call in arrow body `=> render()` must resolve; got: {:?}", calls("arrow"));
+}
+
+#[test]
+fn test_extract_dart_top_level_function_symbol() {
+    // Regression: top-level Dart functions parse as a bare function_signature
+    // sibling under `program` (no `declaration` wrapper), so they were never
+    // extracted as symbols — callgraph/impact/dead-code couldn't see them.
+    let code = "int helper(int x) {\n  return x + 1;\n}\n\nclass C {\n  int m() => 1;\n}\n";
+    let nodes = crate::parser::treesitter::parse_code(code, "dart").unwrap();
+    let helper = nodes.iter().find(|n| n.name == "helper");
+    assert!(helper.is_some(), "top-level Dart function `helper` must be a symbol node; got: {:?}",
+        nodes.iter().map(|n| (&n.node_type, &n.name)).collect::<Vec<_>>());
+    assert_eq!(helper.unwrap().node_type, "function",
+        "top-level function should be type `function`");
+    // The class method must NOT be double-extracted as a top-level function.
+    let m_count = nodes.iter().filter(|n| n.name == "m").count();
+    assert_eq!(m_count, 1, "class method `m` must be extracted exactly once (no double-extract)");
+}
+
+#[test]
 fn test_extract_dart_imports() {
     let code = "import 'package:flutter/material.dart';\nimport 'dart:async';\n\nvoid process() {}\n";
     let relations = extract_relations(code, "dart").unwrap();

@@ -70,59 +70,48 @@ pub(super) fn extract_dart_imports(
     }
 }
 
-/// Extract Dart function/method calls from expression_statement nodes.
-/// Dart calls: identifier + selector(argument_part) = simple call
-/// identifier + selector(unconditional_assignable_selector(identifier)) + selector(argument_part) = method call
-pub(super) fn extract_dart_calls(
+/// Extract a Dart function/method call from a `selector` node that carries an
+/// `argument_part` (i.e. `(...)`). The callee is the selector's preceding named
+/// sibling:
+///   - `foo()`            → `[identifier foo, selector(args)]`                 → `foo`
+///   - `obj.run()`        → `[identifier obj, selector(.run), selector(args)]` → `run`
+///   - `var d = make()`   → `[identifier d, identifier make, selector(args)]`  → `make`
+///   - `"x" + sound()`    → `additive_expression[string, identifier sound, selector(args)]` → `sound`
+///   - `foo(bar())`       → outer selector → `foo`; inner selector → `bar` (both)
+///
+/// Dispatching on the `selector` itself (rather than only on `expression_statement`)
+/// catches calls in return / assignment / argument / binary-expression positions
+/// — the bare-statement form (`fetch();`) is just the special case where the
+/// preceding sibling is a top-level identifier. tree-sitter-dart has no single
+/// `call_expression` node, so the `selector(argument_part)` is the one reliable
+/// call marker.
+pub(super) fn extract_dart_call_from_selector(
     node: &tree_sitter::Node,
     source: &str,
     scope: &str,
     results: &mut Vec<ParsedRelation>,
 ) {
-    // Walk children to find the pattern: identifier followed by selectors
-    let child_count = node.named_child_count();
-    if child_count < 2 { return; }
-
-    // First named child should be an identifier (the call target or receiver)
-    let first = match node.named_child(0) {
-        Some(c) if c.kind() == "identifier" => c,
-        _ => return,
-    };
-
-    // Check if any selector has an argument_part (making this a call)
-    let mut has_call = false;
-    let mut last_method_name: Option<String> = None;
-
-    for i in 1..child_count {
-        if let Some(sel) = node.named_child(i) {
-            if sel.kind() == "selector" {
-                // Check for argument_part (indicates a function call)
-                for j in 0..sel.named_child_count() {
-                    if let Some(inner) = sel.named_child(j) {
-                        if inner.kind() == "argument_part" {
-                            has_call = true;
-                        }
-                        // unconditional_assignable_selector contains the method name: .transform
-                        if inner.kind() == "unconditional_assignable_selector"
-                            || inner.kind() == "conditional_assignable_selector"
-                        {
-                            for k in 0..inner.named_child_count() {
-                                if let Some(id) = inner.named_child(k) {
-                                    if id.kind() == "identifier" {
-                                        last_method_name = Some(node_text(&id, source).to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // A selector is a call only when it directly contains an argument_part.
+    let is_call = (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i))
+        .any(|c| c.kind() == "argument_part");
+    if !is_call {
+        return;
     }
 
-    if has_call {
-        let callee = last_method_name
-            .unwrap_or_else(|| node_text(&first, source).to_string());
+    let prev = match node.prev_named_sibling() {
+        Some(p) => p,
+        None => return,
+    };
+    let callee = match prev.kind() {
+        // Method call: the preceding selector wraps `.name` / `?.name`.
+        "selector" => assignable_selector_name(&prev, source),
+        // Plain function / constructor call: `foo(...)` / `Widget(...)`.
+        "identifier" | "type_identifier" => Some(node_text(&prev, source).to_string()),
+        _ => None,
+    };
+
+    if let Some(callee) = callee {
         if !callee.is_empty() {
             results.push(ParsedRelation {
                 source_name: scope.to_string(),
@@ -134,3 +123,26 @@ pub(super) fn extract_dart_calls(
         }
     }
 }
+
+/// Pull the method name out of a `selector` that wraps an
+/// `unconditional_assignable_selector` / `conditional_assignable_selector`
+/// (`.name` / `?.name`) → the inner `identifier` text.
+fn assignable_selector_name(selector: &tree_sitter::Node, source: &str) -> Option<String> {
+    for i in 0..selector.named_child_count() {
+        let inner = selector.named_child(i)?;
+        if matches!(
+            inner.kind(),
+            "unconditional_assignable_selector" | "conditional_assignable_selector"
+        ) {
+            for j in 0..inner.named_child_count() {
+                if let Some(id) = inner.named_child(j) {
+                    if id.kind() == "identifier" {
+                        return Some(node_text(&id, source).to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+

@@ -70,7 +70,7 @@ use python::{extract_python_type_reference, extract_python_value_reference};
 use go::{extract_go_type_reference, extract_go_value_reference};
 use cpp::extract_cpp_value_reference;
 use java::extract_java_type_reference;
-use dart::{extract_dart_imports, extract_dart_calls};
+use dart::{extract_dart_imports, extract_dart_call_from_selector};
 
 pub struct ParsedRelation {
     pub source_name: String,
@@ -1132,11 +1132,15 @@ fn walk_for_relations(
             }
         }
 
-        // Dart: expression_statement with identifier + selector(argument_part) = function call
-        // e.g. fetchData() or result.transform() or print(result)
-        "expression_statement" if config.name == "dart" => {
+        // Dart: a `selector` carrying an argument_part marks a call in ANY
+        // position (return / assignment / argument / binary expr / bare
+        // statement) — not just `expression_statement`. tree-sitter-dart has no
+        // single call_expression node, so the selector is the reliable marker;
+        // the callee is its preceding sibling. active_scope propagates down from
+        // the enclosing function_body, so deeply-nested calls still attribute.
+        "selector" if config.name == "dart" => {
             if let Some(scope) = active_scope {
-                extract_dart_calls(&node, source, scope, results);
+                extract_dart_call_from_selector(&node, source, scope, results);
             }
         }
 

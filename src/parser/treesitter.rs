@@ -303,6 +303,26 @@ fn extract_nodes(
             }
         }
 
+        // Dart top-level function: `int helper(int x) { ... }` parses as a bare
+        // `function_signature` + `function_body` sibling directly under `program`
+        // — NOT wrapped in a `declaration` (handled above) and distinct from a
+        // class method (`method_signature`, handled above). Without this arm,
+        // top-level Dart functions were never extracted as symbols, leaving
+        // callgraph / impact / dead-code blind to them. Guard against the nested
+        // forms so a method's inner function_signature isn't double-extracted.
+        "function_signature"
+            if config.name == "dart"
+                && !matches!(
+                    node.parent().map(|p| p.kind()),
+                    Some("method_signature") | Some("declaration")
+                ) =>
+        {
+            if let Some(mut parsed) = extract_dart_top_level_function(&node, source, parent_class) {
+                parsed.is_test = node_is_test;
+                results.push(parsed);
+            }
+        }
+
         // Ruby modules — mapped to "interface" type
         "module" if config.name == "ruby" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
@@ -920,6 +940,55 @@ fn extract_dart_method_signature(
 }
 
 /// Extract a Dart function/constructor from a `declaration` node (class-body or top-level).
+/// Extract a top-level Dart function from a bare `function_signature` node (its
+/// `function_body` is the next sibling). Mirrors the `function_signature` branch
+/// of `extract_dart_declaration` but the span covers the signature + body so
+/// `code_content` carries the body (the dead-code same-file probe and FTS rely
+/// on it).
+fn extract_dart_top_level_function(
+    sig: &tree_sitter::Node,
+    source: &str,
+    parent_class: Option<&str>,
+) -> Option<ParsedNode> {
+    let name = get_child_by_field(sig, "name", source)?;
+    let node_type = if parent_class.is_some() { "method" } else { "function" };
+    let qualified_name = match parent_class {
+        Some(cls) => Some(format!("{}.{}", cls, name)),
+        None => Some(name.clone()),
+    };
+    let params = (0..sig.named_child_count())
+        .filter_map(|j| sig.named_child(j))
+        .find(|c| c.kind() == "formal_parameter_list")
+        .map(|p| node_text(&p, source).to_string());
+    let ret = (0..sig.named_child_count())
+        .filter_map(|j| sig.named_child(j))
+        .find(|c| matches!(c.kind(), "type_identifier" | "void_type" | "function_type"))
+        .map(|r| node_text(&r, source).to_string());
+    let signature = match (&params, &ret) {
+        (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
+        (Some(p), None) => Some(p.clone()),
+        _ => None,
+    };
+    // Span = signature .. function_body sibling (block `{...}` or arrow `=> e;`).
+    let end_node = sig.next_named_sibling()
+        .filter(|s| s.kind() == "function_body")
+        .unwrap_or(*sig);
+    let code = source.get(sig.start_byte()..end_node.end_byte()).unwrap_or("");
+    Some(ParsedNode {
+        node_type: node_type.into(),
+        name,
+        qualified_name,
+        start_line: sig.start_position().row as u32 + 1,
+        end_line: end_node.end_position().row as u32 + 1,
+        code_content: truncate_code_content(code).into_owned(),
+        signature,
+        doc_comment: get_preceding_comment(sig, source),
+        return_type: ret,
+        param_types: params,
+        is_test: false,
+    })
+}
+
 /// declaration can contain function_signature, constructor_signature, etc.
 fn extract_dart_declaration(
     node: &tree_sitter::Node,
