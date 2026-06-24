@@ -44,6 +44,17 @@ pub fn find_dead_code(
         // would be flagged). HTML/CSS/JSON contribute only a `<module>` node,
         // already excluded above.
         "n.type NOT IN ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')".to_string(),
+        // C/C++ "limited" extraction emits no inheritance and no type-reference
+        // edges (cpp.rs only emits `references` for bare function-VALUE
+        // identifiers, never for a type name). So a class/struct/enum node can
+        // never carry an incoming edge — a header-defined C++ class used only in
+        // a separate .cpp is ALWAYS orphaned. Reporting it dead is a guaranteed
+        // false positive (same category as headings/constructors above): every
+        // C/C++ type would be flagged, drowning real findings and inviting
+        // deletion of live types. Excluded here; functions/methods (which DO get
+        // call edges) are still reported when genuinely unused. Other languages
+        // emit inherits/references for their types, so they are unaffected.
+        "NOT (f.language IN ('c', 'cpp') AND n.type IN ('class', 'struct', 'enum'))".to_string(),
         // Implicitly-invoked methods (constructors, magic/dunder methods) are
         // dispatched by the language runtime, never called by explicit name, so
         // they carry no incoming `calls` edge even when the class is fully used.
@@ -667,6 +678,66 @@ mod tests {
              NOT be reported dead; got: {:?}", names);
         assert!(names.contains(&"OrphanConfig"),
             "OrphanConfig is referenced nowhere and must still be reported dead; got: {:?}", names);
+    }
+
+    /// Regression: C/C++ "limited" extraction emits no inheritance and no
+    /// type-reference edges (cpp.rs only emits `references` for bare function
+    /// VALUE identifiers), so a class/struct/enum node can essentially never
+    /// carry an incoming edge. A header-defined C++ class instantiated only in a
+    /// separate .cpp is therefore ALWAYS reported dead — a guaranteed false
+    /// positive, the same category as markdown headings and constructors. Such
+    /// type-definition nodes are excluded for C/C++ while genuinely-orphan
+    /// functions are still reported (no over-suppression), and OTHER languages'
+    /// structs/classes (which DO get inheritance/reference edges) are untouched.
+    #[test]
+    fn test_find_dead_code_excludes_c_cpp_type_definitions() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let hdr = upsert_file(conn, &FileRecord {
+            path: "shape.hpp".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("cpp".into()),
+        }).unwrap();
+        let csrc = upsert_file(conn, &FileRecord {
+            path: "util.c".into(), blake3_hash: "h2".into(), last_modified: 1,
+            language: Some("c".into()),
+        }).unwrap();
+
+        // C++ class in a header, instantiated only cross-file — no edge can
+        // target it (no inherit/type-ref extraction). Must NOT be flagged.
+        insert_node(conn, &NodeRecord {
+            file_id: hdr, node_type: "class".into(), name: "Circle".into(),
+            qualified_name: None, start_line: 1, end_line: 6,
+            code_content: "class Circle : public Shape {\n  double r;\n};".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // C struct, same situation.
+        insert_node(conn, &NodeRecord {
+            file_id: csrc, node_type: "struct".into(), name: "Point".into(),
+            qualified_name: None, start_line: 1, end_line: 4,
+            code_content: "struct Point {\n  int x;\n  int y;\n};".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // Genuinely-orphan C function MUST still be flagged (no over-suppression).
+        insert_node(conn, &NodeRecord {
+            file_id: csrc, node_type: "function".into(), name: "unused_helper".into(),
+            qualified_name: None, start_line: 6, end_line: 9,
+            code_content: "int unused_helper(int x) {\n  return x;\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let results = find_dead_code(conn, None, None, false, 1, 100).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(!names.contains(&"Circle"),
+            "C++ class (no inherit/type-ref edges emitted) must NOT be flagged dead; got: {:?}", names);
+        assert!(!names.contains(&"Point"),
+            "C struct (no type-ref edges emitted) must NOT be flagged dead; got: {:?}", names);
+        assert!(names.contains(&"unused_helper"),
+            "a genuinely-orphan C function must STILL be flagged (no over-suppression); got: {:?}", names);
     }
 
     /// Regression: implicitly-invoked methods (constructors + magic/dunder

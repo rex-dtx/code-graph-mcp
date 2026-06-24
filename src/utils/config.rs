@@ -27,7 +27,14 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
         "py" | "pyi" => Some("python"),
         "java" => Some("java"),
         "c" | "h" => Some("c"),
-        "cpp" | "cc" | "cxx" | "hpp" => Some("cpp"),
+        // `.hh`/`.hxx` are common C++ header spellings; `.hxx` in particular
+        // pairs with the already-supported `.cxx` source — without it those
+        // headers were silently never indexed (symbols missing, #includes to
+        // them unresolved). `.h` stays C: the C-vs-C++ `.h` ambiguity is
+        // unresolvable from the extension alone, and the c/cpp pair is treated
+        // as cross-compatible (is_compatible_lang) so C++ code in a `.h` still
+        // links to its `.cpp`.
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some("cpp"),
         "html" | "htm" => Some("html"),
         "css" => Some("css"),
         "cs" => Some("csharp"),
@@ -85,6 +92,10 @@ mod tests {
         assert_eq!(detect_language("Main.java"), Some("java"));
         assert_eq!(detect_language("main.c"), Some("c"));
         assert_eq!(detect_language("main.cpp"), Some("cpp"));
+        assert_eq!(detect_language("shape.hpp"), Some("cpp"));
+        assert_eq!(detect_language("shape.hh"), Some("cpp"));
+        assert_eq!(detect_language("widget.cxx"), Some("cpp"));
+        assert_eq!(detect_language("widget.hxx"), Some("cpp"));
         assert_eq!(detect_language("index.html"), Some("html"));
         assert_eq!(detect_language("style.css"), Some("css"));
         assert_eq!(detect_language("Program.cs"), Some("csharp"));
