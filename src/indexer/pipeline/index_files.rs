@@ -40,7 +40,7 @@ use crate::storage::queries::{
     update_context_strings_batch, upsert_file,
     FileRecord, NodeRecord, NodeResult,
 };
-use crate::domain::{REL_CALLS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_REFERENCES, max_file_size, CROSS_FILE_CALL_NOISE};
+use crate::domain::{REL_CALLS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_REFERENCES, max_file_size, is_cross_file_call_noise};
 use crate::utils::config::detect_language;
 
 use super::{IndexResult, IndexStats, ProgressFn};
@@ -453,7 +453,7 @@ pub(super) fn index_files(
                 // intra-class method-to-method edge is silently dropped.
                 // Bare-scope sources (Rust impl, Go receivers, free functions)
                 // still match on `name`.
-                let source_ids = (0..pf.node_ids.len())
+                let mut source_ids = (0..pf.node_ids.len())
                     .filter(|&i| {
                         pf.node_names[i] == rel.source_name
                             || pf.node_qualified_names[i].as_deref()
@@ -461,6 +461,30 @@ pub(super) fn index_files(
                     })
                     .map(|i| pf.node_ids[i])
                     .collect::<Vec<_>>();
+
+                // Route handlers are commonly imported from a controller file —
+                // the canonical Express layout `import { getUser } from './ctrl';
+                // app.get('/x', getUser)`. The routes_to relation names the handler
+                // (== source == target), but the handler node lives in another
+                // file, so the same-file scan above finds nothing and the route
+                // edge (the handler self-edge carrying method/path) is silently
+                // dropped — trace/impact/find_http_route then see no route at all.
+                // Recover by resolving the handler name cross-file, same-language,
+                // exactly like a call target below (refine breaks any ambiguity by
+                // path locality). Only fires for routes_to with an unresolved
+                // same-file source; inline + same-file named handlers already match.
+                if rel.relation == REL_ROUTES_TO && source_ids.is_empty() {
+                    let same_lang: Vec<i64> = name_to_ids
+                        .get(&rel.source_name)
+                        .map(|ids| ids.iter().copied()
+                            .filter(|id| matches!(
+                                node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                Some(l) if l == pf.language.as_str()
+                            ))
+                            .collect())
+                        .unwrap_or_default();
+                    source_ids = refine_ambiguous_targets(&same_lang, &pf.rel_path, &node_id_to_path);
+                }
 
                 // Namespace-require markers (`const m = require('./x')`) were
                 // consumed by the pre-scan above into ns_module_map; the variable
@@ -676,7 +700,7 @@ pub(super) fn index_files(
                             // the drop guarded against — so binding it is safe.
                             // Anything ambiguous (0 or >1 method candidates) or a
                             // noise name stays dropped (no buffer; re-scan won't help).
-                            if CROSS_FILE_CALL_NOISE.contains(&rel.target_name.as_str()) {
+                            if is_cross_file_call_noise(&rel.target_name, pf.language.as_str()) {
                                 continue;
                             }
                             let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
@@ -827,9 +851,12 @@ pub(super) fn index_files(
                 let target_ids = if !same_file_targets.is_empty() {
                     same_file_targets
                 } else if rel.relation == REL_CALLS
-                    && CROSS_FILE_CALL_NOISE.contains(&rel.target_name.as_str())
+                    && is_cross_file_call_noise(&rel.target_name, source_lang)
                 {
-                    // Stdlib method names (new/default/from) — drop regardless of language.
+                    // Stdlib method names (new/default/from) — drop. Language-aware:
+                    // the JS/TS family exempts non-ECMAScript names (insert/remove/
+                    // contains) so user methods resolve; all else drops regardless
+                    // of language (a Rust `hasher.update()` must not bind a JS fn).
                     continue;
                 } else if !same_language_targets.is_empty() {
                     // Ambiguous cross-file same-language candidates (e.g. a helper

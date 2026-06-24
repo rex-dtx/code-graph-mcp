@@ -90,7 +90,7 @@ pub fn normalize_confidence(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 28; // v28: Ruby bare (parens-less) method calls in statement position now produce calls edges via a scope-aware pass that excludes local variables (Ruby's own assigned-vs-call rule), closing a recall gap where `helper` (no parens) was dropped; v27: Python + Ruby top-level (module/class-body) calls now attribute to `<module>` too (same fix as bash v26) so an entry-point function called only at top level isn't reported dead; v26: bash top-level command invocations now attribute to `<module>` (were dropped) so an entry-point function called only at script top level (`run_app "$@"`) is no longer reported dead; external commands still drop at Phase-2 resolution; v25: Flask @app.route(..., methods=['GET']) now derives the HTTP verb from the methods= kwarg (was always "ANY", breaking method-scoped trace); v24: PHP file-include imports (require/require_once/include/include_once → REL_IMPORTS to the bare file stem)
+pub const INDEX_VERSION: i32 = 30; // v30: Dart fixes — (a) top-level functions (`int helper() {}`) are now extracted as symbols (parsed as a bare function_signature sibling under `program`, never matched before so callgraph/impact/dead-code were blind to them); (b) calls now dispatch on the `selector(argument_part)` node (callee = preceding sibling) instead of only `expression_statement`, so calls in return / assignment / argument / binary-expression positions resolve (were silently dropped — only bare `foo();` statements worked); v29 also: Express routes_to with an IMPORTED named handler (`import {getUser} from './ctrl'; app.get('/x', getUser)`) now resolves the handler cross-file (was matched only against the route file's own nodes → route silently dropped for the most common Express layout; inline + same-file handlers already worked); v29: cross-file call-noise filter is now language-aware — JS/TS `obj.insert()`/`remove()`/`contains()` resolve (not ECMAScript builtins) while genuine builtins (push/pop/get/map/filter...) still drop; PHP `$o->method()` calls are fully exempt (PHP array ops are global functions, not methods, so the Rust-collection list only produced false-positive dead code). Was reporting live JS/TS/PHP methods as dead code + hiding callers; v28: Ruby bare (parens-less) method calls in statement position now produce calls edges via a scope-aware pass that excludes local variables (Ruby's own assigned-vs-call rule), closing a recall gap where `helper` (no parens) was dropped; v27: Python + Ruby top-level (module/class-body) calls now attribute to `<module>` too (same fix as bash v26) so an entry-point function called only at top level isn't reported dead; v26: bash top-level command invocations now attribute to `<module>` (were dropped) so an entry-point function called only at script top level (`run_app "$@"`) is no longer reported dead; external commands still drop at Phase-2 resolution; v25: Flask @app.route(..., methods=['GET']) now derives the HTTP verb from the methods= kwarg (was always "ANY", breaking method-scoped trace); v24: PHP file-include imports (require/require_once/include/include_once → REL_IMPORTS to the bare file stem)
 
 // -- Embedding --
 pub const EMBEDDING_DIM: usize = 384;
@@ -436,6 +436,44 @@ pub const CROSS_FILE_CALL_NOISE: &[&str] = &[
     "to_owned", "to_vec", "collect", "join",
     "flush", "close", "read", "write",
 ];
+
+// Names that live in CROSS_FILE_CALL_NOISE because they are Rust/collection
+// stdlib methods (`Vec::insert`, `HashMap::remove`, `slice::contains`) but are
+// NOT core-ECMAScript builtin instance methods — Arrays use `splice`, Maps use
+// `has`, and there is no `Array/Object/String.insert`. In a JS/TS codebase these
+// are ordinary user-defined methods (`db.insert(x)`, `cache.remove(k)`,
+// `set.contains(v)`), so applying the Rust-flavored drop to them silently lost
+// legitimate `calls` edges — reporting live methods as dead code and hiding
+// their callers from impact/callers. Exempted for the JS family ONLY; genuine
+// ECMAScript builtins still in the noise set (`push`/`pop`/`get`/`map`/`filter`/
+// `join`/`read`/`write`...) stay dropped because the receiver type is unknown.
+pub const JS_CALL_NOISE_EXEMPT: &[&str] = &["insert", "remove", "contains"];
+
+/// Whether a cross-file `calls` target name should be dropped as stdlib noise
+/// for a given source language.
+///
+/// [`CROSS_FILE_CALL_NOISE`] is a Rust/collection-stdlib list and fits languages
+/// whose receivers expose method-style builtins under these exact (lowercase)
+/// names — Rust, Python (`list.insert`/`dict.get`), Ruby (`Array#push/#insert`),
+/// Java (`List.get`/`StringBuilder.insert`), Kotlin, Swift, C++ (`vector::insert`).
+/// Two families diverge:
+///   - **PHP**: `$o->method()` calls have NO stdlib-builtin-method collisions —
+///     PHP's array/collection ops are global functions (`array_push`, `count`,
+///     `in_array`), never methods, and SPL interface methods are user-implemented.
+///     The list would only ever drop legitimate user-method edges, so it is not
+///     applied (false-positive dead code otherwise).
+///   - **JS/TS**: keeps the genuine ECMAScript builtins (`push`/`pop`/`get`/`map`
+///     /`filter`...) but exempts the non-ECMAScript names in
+///     [`JS_CALL_NOISE_EXEMPT`] (`insert`/`remove`/`contains`).
+pub fn is_cross_file_call_noise(name: &str, language: &str) -> bool {
+    match language {
+        "php" => false,
+        "javascript" | "typescript" | "tsx" => {
+            !JS_CALL_NOISE_EXEMPT.contains(&name) && CROSS_FILE_CALL_NOISE.contains(&name)
+        }
+        _ => CROSS_FILE_CALL_NOISE.contains(&name),
+    }
+}
 
 // -- Python type-annotation noise filter --
 // Builtin types + `typing` generics that appear in annotation positions but

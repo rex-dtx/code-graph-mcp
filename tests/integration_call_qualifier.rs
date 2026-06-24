@@ -492,3 +492,180 @@ fn receiver_call_prefers_same_file_method_over_cross_file_ambiguity() {
         b_callers
     );
 }
+
+#[test]
+fn js_method_call_resolves_non_ecmascript_builtin_name() {
+    // Regression: the cross-file call-noise filter (`CROSS_FILE_CALL_NOISE`) is
+    // Rust-stdlib-flavored (`Vec::insert`, `HashMap::remove`, `.contains()`) but
+    // was applied to EVERY language. For a JS/TS project, `db.insert(x)` and
+    // `db.remove(x)` are ordinary user methods — `insert`/`remove`/`contains`
+    // are NOT core ECMAScript builtins (Array uses `splice`, Map uses `has`).
+    // Dropping these edges reported live methods as dead code and hid their
+    // callers from impact/callers. They must resolve to the unique project method.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "db.ts", r#"
+        export const db = {
+          findOne(id: string) { return { id }; },
+          insert(obj: any) { return obj; },
+          remove(id: string) { return id; },
+          contains(id: string) { return !!id; },
+        };
+    "#);
+    write(root, "handlers.ts", r#"
+        import { db } from './db';
+        export function createUser(body: any) { return db.insert(body); }
+        export function deleteUser(id: string) { return db.remove(id); }
+        export function hasUser(id: string) { return db.contains(id); }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    for (method, caller) in [("insert", "createUser"), ("remove", "deleteUser"), ("contains", "hasUser")] {
+        let callers = callers_of(&db, method);
+        assert!(
+            callers.iter().any(|c| c.contains(caller)),
+            "db.{method}() must resolve to the unique project `{method}` method (not dropped as Rust-stdlib noise); got: {:?}",
+            callers
+        );
+    }
+}
+
+#[test]
+fn js_method_call_still_drops_real_ecmascript_builtin() {
+    // The flip side: `arr.push(x)` / `m.get(k)` target real `Array.prototype`
+    // and `Map.prototype` builtins. Even when the project defines a same-named
+    // method, the receiver type is unknown and is very likely a real Array/Map,
+    // so these stay in the noise set and the edge is dropped — keeping the
+    // exemption narrow (only non-builtin names like `insert`/`remove`/`contains`).
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "store.ts", r#"
+        export const store = {
+          push(item: any) { return item; },
+          get(key: string) { return key; },
+        };
+    "#);
+    write(root, "use.ts", r#"
+        import { store } from './store';
+        export function add(x: any) { return store.push(x); }
+        export function read(k: string) { return store.get(k); }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    for method in ["push", "get"] {
+        let callers = callers_of(&db, method);
+        assert!(
+            callers.is_empty(),
+            "store.{method}() must NOT resolve — {method} is a real ECMAScript builtin and the receiver type is unknown; got: {:?}",
+            callers
+        );
+    }
+}
+
+#[test]
+fn php_method_call_resolves_collection_verb_names() {
+    // PHP `$o->method()` calls have NO stdlib-builtin-method collisions: PHP's
+    // array/collection ops are global FUNCTIONS (`array_push`, `count`,
+    // `in_array`), never object methods. So `insert`/`remove`/`get`/`push` on a
+    // `->` call are always user methods. The Rust-flavored cross-file call-noise
+    // list (built for `Vec::insert` / `HashMap::remove`) wrongly dropped these,
+    // reporting live PHP methods as dead code. They must resolve.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "repo.php", r#"<?php
+        class Repo {
+            public function insert($x) { return $x; }
+            public function remove($x) { return $x; }
+            public function get($x) { return $x; }
+            public function findOne($x) { return $x; }
+        }
+    "#);
+    write(root, "service.php", r#"<?php
+        class Service {
+            private $repo;
+            public function createThing($d) { return $this->repo->insert($d); }
+            public function deleteThing($id) { return $this->repo->remove($id); }
+            public function fetchById($id) { return $this->repo->get($id); }
+            public function getOne($id) { return $this->repo->findOne($id); }
+        }
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    for (method, caller) in [
+        ("insert", "createThing"),
+        ("remove", "deleteThing"),
+        ("get", "fetchById"),
+        ("findOne", "getOne"),
+    ] {
+        let callers = callers_of(&db, method);
+        assert!(
+            callers.iter().any(|c| c.contains(caller)),
+            "PHP $repo->{method}() must resolve to the unique project `{method}` method (no PHP method-builtin collision); got: {:?}",
+            callers
+        );
+    }
+}
+
+fn routes_to_handlers(db: &Database) -> Vec<(String, String)> {
+    // (handler_node_name, file_path) for every routes_to edge.
+    let mut stmt = db.conn().prepare(
+        "SELECT t.name, f.path FROM edges e
+         JOIN nodes t ON t.id = e.target_id
+         JOIN files f ON f.id = t.file_id
+         WHERE e.relation = 'routes_to'"
+    ).unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+#[test]
+fn express_route_with_imported_handler_produces_routes_to_edge() {
+    // The canonical Express layout: route registration in one file, handler
+    // implementations imported from a controller file —
+    //   `import { getUser } from './handlers'; app.get('/users/:id', getUser)`.
+    // The routes_to relation names the handler as both source and target, but
+    // the handler node lives in handlers.ts. The source-id match scanned ONLY
+    // the current (route) file's nodes, found nothing, and dropped the edge —
+    // so trace/impact/find_http_route saw no route at all for the most common
+    // real-world Express structure. The handler must carry a routes_to edge.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "handlers.ts", r#"
+        export function getUser(req: any, res: any) { res.json({}); }
+        export function createUser(req: any, res: any) { res.json({}); }
+    "#);
+    write(root, "server.ts", r#"
+        import express from 'express';
+        import { getUser, createUser } from './handlers';
+        const app = express();
+        app.get('/users/:id', getUser);
+        app.post('/users', createUser);
+        app.listen(3000);
+    "#);
+
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let routes = routes_to_handlers(&db);
+    for handler in ["getUser", "createUser"] {
+        assert!(
+            routes.iter().any(|(name, path)| name == handler && path == "handlers.ts"),
+            "imported Express handler `{handler}` must carry a routes_to edge in handlers.ts; got: {:?}",
+            routes
+        );
+    }
+}
