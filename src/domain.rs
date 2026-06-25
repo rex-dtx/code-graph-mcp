@@ -246,8 +246,12 @@ pub fn parse_timeout_ms() -> u64 {
 
 // -- Risk level assessment --
 /// Compute impact risk level from caller/route counts.
-pub fn compute_risk_level(prod_callers: usize, affected_routes: usize, is_removal: bool) -> &'static str {
-    if prod_callers > 10 || affected_routes >= 3 || is_removal {
+///
+/// `is_breaking` is `true` for changes that force every call site to change
+/// (a removal or a signature change), which pins the result to HIGH regardless
+/// of caller count; behaviour-only changes leave it `false` and scale by count.
+pub fn compute_risk_level(prod_callers: usize, affected_routes: usize, is_breaking: bool) -> &'static str {
+    if prod_callers > 10 || affected_routes >= 3 || is_breaking {
         "HIGH"
     } else if prod_callers > 3 || affected_routes > 0 {
         "MEDIUM"

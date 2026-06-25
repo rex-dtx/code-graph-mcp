@@ -5154,7 +5154,7 @@ pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
     writeln!(stdout, "Circular import dependencies ({} found):", cycles.len())?;
     writeln!(stdout, "(files that transitively import each other — a → b → … → a)\n")?;
     for c in &cycles {
-        writeln!(stdout, "  {}-file cycle: {}", c.size, c.path.join(" → "))?;
+        writeln!(stdout, "  {}", c.headline())?;
         // When the SCC has more files than the representative loop visits, list them all.
         if c.size + 1 > c.path.len() {
             writeln!(stdout, "    files: {}", c.files.join(", "))?;
@@ -5350,7 +5350,11 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
         writeln!(stdout, "  (none)")?;
     }
     for c in &cycles {
-        writeln!(stdout, "  {}-file cycle: {}", c.size, c.path.join(" → "))?;
+        writeln!(stdout, "  {}", c.headline())?;
+        // For larger SCCs the shortest loop omits members — name them so the report is actionable.
+        if c.size + 1 > c.path.len() {
+            writeln!(stdout, "    files: {}", c.files.join(", "))?;
+        }
     }
 
     writeln!(stdout, "\n## Surprising connections")?;

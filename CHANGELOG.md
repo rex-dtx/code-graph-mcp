@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.74.5 — Cycle labelling + meaningful `signature` impact
+
+E2E dogfooding of the analysis commands surfaced two output-correctness bugs.
+
+### Fixed
+- **`cycles` / `report` no longer mislabel a large import SCC as an "N-file
+  cycle".** A strongly-connected component of 12 files was printed as
+  `12-file cycle: cpp.rs → mod.rs → cpp.rs` — the count (SCC size) and the arrow
+  path (a 2-file shortest loop) contradicted each other, and `report` did not even
+  list the members. A component now reads as `N-file cyclic group (shortest loop:
+  …)` with the full member list when its shortest loop visits fewer files than the
+  component holds; a genuine N-file loop still reads as `N-file cycle`. JSON output
+  (`size` / `files` / `cycle`) is unchanged.
+- **`impact --change-type signature` is no longer a silent alias of `behavior`.**
+  Risk only branched on `change_type == "remove"`, so a `signature` change — which
+  breaks every call site exactly as a removal does — was scored like a behaviour
+  change (e.g. LOW for a single-caller symbol). Both `signature` and `remove` are
+  now treated as breaking and pin the result to HIGH; `behavior` still scales by
+  caller count. Applies to both the CLI and the MCP `get_ast_node` impact path
+  (shared `classify_impact`). The default `change_type` is `behavior`, so default
+  output is unchanged.
+
 ## v0.74.4 — Symmetric uninstall teardown
 
 A sandbox lifecycle E2E (isolated `HOME` + `CLAUDE_CONFIG_DIR`, real project) found

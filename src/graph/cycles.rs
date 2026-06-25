@@ -32,6 +32,28 @@ pub struct DependencyCycle {
     pub size: usize,
 }
 
+impl DependencyCycle {
+    /// Human-readable headline for one cycle.
+    ///
+    /// When the representative loop visits every member (`size` distinct files,
+    /// i.e. `path.len() == size + 1`) the count and the arrows agree, so it reads
+    /// as a plain `N-file cycle: a → b → … → a`. When the strongly-connected
+    /// component is larger than its shortest loop (e.g. a 12-file SCC whose
+    /// shortest back-edge is just `a → b → a`), labelling that "12-file cycle"
+    /// next to a 2-file arrow path is contradictory — so it reads as a
+    /// `N-file cyclic group (shortest loop: …)` instead, and callers should list
+    /// the full member set separately.
+    pub fn headline(&self) -> String {
+        let loop_files = self.path.len().saturating_sub(1); // distinct files in the loop
+        let arrows = self.path.join(" → ");
+        if loop_files >= self.size {
+            format!("{}-file cycle: {}", self.size, arrows)
+        } else {
+            format!("{}-file cyclic group (shortest loop: {})", self.size, arrows)
+        }
+    }
+}
+
 /// Detect circular import dependencies in a directed file graph.
 ///
 /// `edges` are `(from, to)` pairs meaning *from imports to*. Returns one
@@ -220,6 +242,34 @@ mod tests {
         assert_eq!(cycles[0].size, 2);
         // Representative path starts at the lex-smallest node and is closed.
         assert_eq!(path_of(&cycles[0]), ["a", "b", "a"]);
+    }
+
+    #[test]
+    fn headline_matches_arrows_when_loop_visits_all_members() {
+        // 2-node SCC: shortest loop visits both members → plain "N-file cycle".
+        let cycles = find_cycles(&[edge("a", "b"), edge("b", "a")]);
+        assert_eq!(cycles[0].headline(), "2-file cycle: a → b → a");
+    }
+
+    #[test]
+    fn headline_calls_it_a_group_when_scc_exceeds_shortest_loop() {
+        // 3 files all mutually reachable via the hub `b`, but the shortest loop
+        // through the lex-smallest member is just `a → b → a` (2 files), so the
+        // 3-file count must NOT be presented as a 3-file arrow path.
+        let cycles = find_cycles(&[
+            edge("a", "b"),
+            edge("b", "a"),
+            edge("b", "c"),
+            edge("c", "b"),
+        ]);
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].size, 3);
+        assert_eq!(path_of(&cycles[0]), ["a", "b", "a"]);
+        assert_eq!(
+            cycles[0].headline(),
+            "3-file cyclic group (shortest loop: a → b → a)",
+            "a 3-file SCC whose shortest loop is 2 files must not read as a 3-file cycle"
+        );
     }
 
     #[test]

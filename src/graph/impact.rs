@@ -125,7 +125,12 @@ pub fn classify_impact<'a>(
         domain::compute_risk_level(
             prod_callers.len(),
             route_callers.len(),
-            change_type == "remove",
+            // Both `remove` and `signature` are *breaking* changes: every call
+            // site must change or it won't compile/run. `behavior` keeps callers
+            // compiling, so only it scales risk by caller count. Treating
+            // `signature` like `behavior` (its prior behaviour) made the option a
+            // silent no-op.
+            matches!(change_type, "remove" | "signature"),
         )
     };
 
@@ -258,6 +263,18 @@ mod tests {
         let callers = vec![caller("one", "src/a.rs", 1, None)];
         let c = classify_impact(&callers, "remove", true);
         assert_eq!(c.risk_level, "HIGH");
+    }
+
+    #[test]
+    fn signature_change_is_breaking_and_forces_high() {
+        // A single prod caller would be LOW for a behaviour change, but a
+        // signature change breaks that call site, so it must escalate to HIGH —
+        // matching `remove`. Previously `signature` was a silent alias of
+        // `behavior` and reported LOW here.
+        let callers = vec![caller("one", "src/a.rs", 1, None)];
+        assert_eq!(classify_impact(&callers, "behavior", true).risk_level, "LOW");
+        assert_eq!(classify_impact(&callers, "signature", true).risk_level, "HIGH");
+        assert_eq!(classify_impact(&callers, "remove", true).risk_level, "HIGH");
     }
 
     #[test]
