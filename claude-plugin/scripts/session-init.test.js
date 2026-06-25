@@ -4,7 +4,26 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, verifyBinary, computeQuietHooks, shouldInjectMap, shouldInjectRecentImpact, recentImpactWorthShowing, filterSourceFiles, parseGitStatusPaths, formatRecentImpact } = require('./session-init');
+const os = require('os');
+const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, indexNeedsRevalidation, verifyBinary, computeQuietHooks, shouldInjectMap, shouldInjectRecentImpact, recentImpactWorthShowing, filterSourceFiles, parseGitStatusPaths, formatRecentImpact } = require('./session-init');
+
+// Write an executable stub named `code-graph-mcp` that emits `json` to stdout on
+// `health-check` and exits with `exitCode`. Mirrors how the real binary behaves:
+// non-zero exit on an unhealthy index, but the JSON report still goes to stdout.
+function stubHealthBin(t, { json, exitCode = 0 }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-sessinit-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'code-graph-mcp');
+  const payload = String(json).replace(/'/g, `'\\''`);
+  fs.writeFileSync(bin, [
+    '#!/usr/bin/env bash',
+    `printf '%s' '${payload}'`,
+    `exit ${exitCode}`,
+    '',
+  ].join('\n'));
+  fs.chmodSync(bin, 0o755);
+  return { bin, cwd: dir };
+}
 
 test('syncLifecycleConfig is exported as a callable helper', () => {
   assert.equal(typeof syncLifecycleConfig, 'function');
@@ -24,6 +43,36 @@ test('ensureIndexFresh returns skipped when no index exists', () => {
   } finally {
     process.chdir(origCwd);
   }
+});
+
+test('indexNeedsRevalidation true when health-check reports index_version_stale', (t) => {
+  const { bin, cwd } = stubHealthBin(t, {
+    json: JSON.stringify({ healthy: true, nodes: 5, index_version_stale: true }),
+    exitCode: 0,
+  });
+  assert.equal(indexNeedsRevalidation(bin, cwd), true);
+});
+
+test('indexNeedsRevalidation false when index is current', (t) => {
+  const { bin, cwd } = stubHealthBin(t, {
+    json: JSON.stringify({ healthy: true, nodes: 5, index_version_stale: false }),
+    exitCode: 0,
+  });
+  assert.equal(indexNeedsRevalidation(bin, cwd), false);
+});
+
+test('indexNeedsRevalidation recovers JSON from a non-zero exit (unhealthy index)', (t) => {
+  // health-check exits 1 on an empty/unhealthy index but still emits the report.
+  const { bin, cwd } = stubHealthBin(t, {
+    json: JSON.stringify({ healthy: false, nodes: 0, index_version_stale: true }),
+    exitCode: 1,
+  });
+  assert.equal(indexNeedsRevalidation(bin, cwd), true);
+});
+
+test('indexNeedsRevalidation false on garbage output (never forces work off a bad probe)', (t) => {
+  const { bin, cwd } = stubHealthBin(t, { json: 'not json at all', exitCode: 0 });
+  assert.equal(indexNeedsRevalidation(bin, cwd), false);
 });
 
 test('verifyBinary returns available:true when binary is found and executable', () => {

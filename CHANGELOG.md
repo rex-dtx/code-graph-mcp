@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.74.6 — Non-destructive reads + structure-first indexing
+
+Debugging a persistent `code-graph: ↻ updating` / `offline` statusline in a
+subdirectory project surfaced a chain: a read-only status poll was *destroying*
+the index, and the statusline could not tell an empty index from a dead binary.
+
+### Fixed
+- **A read-only consumer no longer wipes the index on an INDEX_VERSION mismatch.**
+  `Database::open` cleared all nodes/edges/files whenever the on-disk index was
+  built by an older extractor generation — intended to force a rebuild, but it
+  fired on *every* writable open, including the statusline's `health-check` poll
+  and one-off `grep` / `show`. In a project where no MCP server is running (e.g. a
+  subdirectory you only occasionally touch), nothing rebuilt the index afterward,
+  so a single status poll left it permanently empty. Reader opens (`CliContext` →
+  new `open_nondestructive`) now leave the data intact and report
+  `index_version_stale` ("rebuild pending"); only an indexer open
+  (`incremental-index` / `reindex` / server startup) performs the clear + rebuild.
+- **The statusline distinguishes an empty/unhealthy index from an offline binary.**
+  `health-check` exits non-zero on an empty index but still emits its full JSON
+  report; the statusline discarded that and showed the alarming `offline` (or
+  `↻ updating` during an update window). It now recovers the report from the
+  non-zero exit and renders `✗ 0 nodes | 0 files`; `offline` is reserved for a
+  binary that genuinely cannot produce a report.
+
+### Added
+- **`--no-embed` on `incremental-index` / `reindex` / `rebuild-index`** for a
+  fast, query-ready structural index (nodes/edges/FTS) that skips the slow
+  embedding pass. AST / grep / callgraph work immediately; vectors backfill in the
+  background (the MCP server's embedder fills any node lacking a vector, resumably)
+  or on a later run. The default still embeds, so existing behaviour is unchanged.
+- **Statusline embedding coverage.** A structurally-complete but partially embedded
+  index now reads as `… | 60% vec` / `… | vec pending` so the background vector
+  backfill is visible, and a version-stale index shows `… | ↻ rebuilding`.
+  `health-check --format json` gains an `index_version_stale` boolean.
+- **Background rebuild for dormant projects.** SessionStart's index-freshness check
+  now also triggers a detached background `incremental-index` when `health-check`
+  reports a version-stale index (previously only git-vs-mtime drift triggered it),
+  so a post-upgrade index self-heals even where the MCP server isn't running.
+
 ## v0.74.5 — Cycle labelling + meaningful `signature` impact
 
 E2E dogfooding of the analysis commands surfaced two output-correctness bugs.

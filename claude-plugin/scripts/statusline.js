@@ -58,24 +58,67 @@ if (!bin) {
   process.exit(0);
 }
 
+// Render the standard health line from a parsed health-check report. An
+// unhealthy/empty index (healthy:false, 0 nodes) is a real, accurate state and
+// is distinct from "offline" \u2014 the binary ran fine, the index just has no data.
+function renderHealth(s) {
+  const icon = s.healthy ? '\u2713' : '\u2717';
+  let line = `code-graph: ${icon} ${s.nodes} nodes | ${s.files} files`;
+  // Surface vector-backfill progress so a structurally-complete but only
+  // partially-embedded index reads as "healthy and improving" (the embedding
+  // backfill is resumable and runs in the background), not as something stuck.
+  // Hidden when embeddings are complete, unavailable (no model), or there are no
+  // nodes yet \u2014 only the in-progress states add the suffix.
+  if (s.nodes > 0) {
+    if (s.embedding_status === 'partial' && typeof s.embedding_coverage_pct === 'number') {
+      line += ` | ${s.embedding_coverage_pct}% vec`;
+    } else if (s.embedding_status === 'pending') {
+      line += ' | vec pending';
+    }
+  }
+  // An index built by an older extractor generation is usable but a rebuild is
+  // owed (a background incremental-index revalidates it). Flag it so a stale
+  // index doesn't masquerade as fully current.
+  if (s.index_version_stale) line += ' | \u21bb rebuilding';
+  if (s.watching) line += ' | watching';
+  return line;
+}
+
+// A genuine report carries a boolean `healthy` field. Returns null for anything
+// that isn't a parseable report (empty string, crash banner, partial output).
+function parseReport(text) {
+  try {
+    const s = JSON.parse(text);
+    return (s && typeof s.healthy === 'boolean') ? s : null;
+  } catch { return null; }
+}
+
+// No usable report: the binary couldn't produce one (crashed / missing / schema
+// too new). A schema-version error means the resolved binary is OLDER than the
+// index it is reading \u2014 the classic post-update window where the new binary is
+// still downloading. That, or any pending update, is transient: show "updating"
+// so the user knows it self-heals, rather than the misleading "offline".
+function statusUnavailable(errText) {
+  const binaryOutdated = /schema version/i.test(errText || '');
+  return (binaryOutdated || updatePending()) ? 'code-graph: \u21bb updating' : 'code-graph: offline';
+}
+
+let report = null;
+let errText = '';
 try {
-  const out = execFileSync(bin, ['health-check', '--format', 'json'], {
+  report = parseReport(execFileSync(bin, ['health-check', '--format', 'json'], {
     timeout: 3000,
     stdio: ['pipe', 'pipe', 'pipe']
-  }).toString().trim();
-  const s = JSON.parse(out);
-  const icon = s.healthy ? '\u2713' : '\u2717';
-  process.stdout.write(
-    `code-graph: ${icon} ${s.nodes} nodes | ${s.files} files` +
-    (s.watching ? ' | watching' : '')
-  );
+  }).toString());
 } catch (e) {
-  // A schema-too-new error means the resolved binary is OLDER than the index it
-  // is reading \u2014 the classic post-update window where the new binary is still
-  // downloading. That, or any pending update, is transient: show "updating" so
-  // the user knows it self-heals, rather than the misleading "offline".
-  const errOut = ((e && (e.stderr || e.stdout)) || '').toString();
-  const binaryOutdated = /schema version/i.test(errOut);
-  process.stdout.write(
-    (binaryOutdated || updatePending()) ? 'code-graph: \u21bb updating' : 'code-graph: offline');
+  // health-check exits NON-ZERO on an unhealthy/empty index but still writes the
+  // full JSON report to stdout. The binary ran fine \u2014 recover the report from the
+  // error object so an empty index shows "\u2717 0 nodes" rather than a bogus "offline".
+  report = parseReport(((e && e.stdout) || '').toString());
+  // Scan BOTH streams for the schema marker: the binary writes it to stderr, but
+  // an empty stderr Buffer is truthy, so `stderr || stdout` would never fall
+  // through — concatenate instead of short-circuiting.
+  errText = [(e && e.stderr) || '', (e && e.stdout) || ''].map(String).join('\n');
 }
+
+process.stdout.write(report ? renderHealth(report) : statusUnavailable(errText));

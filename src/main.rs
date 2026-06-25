@@ -53,7 +53,9 @@ fn main() -> Result<()> {
         Some("incremental-index") => {
             // clap-migrated (audit #4): flags via clap; the git/index guard below
             // stays in main() (must precede indexing side effects, may skip entirely).
-            let quiet = code_graph_mcp::cli::IncrementalIndexArgs::parse_from(args.iter().skip(1)).quiet;
+            let idx_args = code_graph_mcp::cli::IncrementalIndexArgs::parse_from(args.iter().skip(1));
+            let quiet = idx_args.quiet;
+            let no_embed = idx_args.no_embed;
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
             // Silent bail when the resolved root has neither a .git anchor nor an
             // existing index. Without this guard the PostToolUse hook would create
@@ -75,7 +77,7 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet)
+            code_graph_mcp::cli::cmd_incremental_index(&project_root, quiet, no_embed)
         }
         Some("rebuild-index") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;

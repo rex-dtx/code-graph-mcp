@@ -153,7 +153,11 @@ impl CliContext {
             );
         }
         cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
-        let db = Database::open(&db_path)?;
+        // CLI commands behind CliContext are READERS (grep, show, callgraph,
+        // health-check, …). Open non-destructively so a status poll or one-off
+        // query never triggers the INDEX_VERSION wipe — only an explicit indexer
+        // (reindex / incremental-index / server startup) clears + rebuilds.
+        let db = Database::open_nondestructive(&db_path)?;
         Ok(Self {
             db,
             project_root: project_root.to_path_buf(),
@@ -167,7 +171,7 @@ impl CliContext {
             return None;
         }
         cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
-        Database::open(&db_path).ok().map(|db| Self {
+        Database::open_nondestructive(&db_path).ok().map(|db| Self {
             db,
             project_root: project_root.to_path_buf(),
         })
@@ -403,6 +407,10 @@ pub struct IncrementalIndexArgs {
     /// Suppress progress output (used by the PostToolUse hook)
     #[arg(long)]
     pub quiet: bool,
+    /// Index structure only (nodes/edges/FTS) and skip embeddings for a fast,
+    /// query-ready index. Vectors backfill later (MCP server / a later run).
+    #[arg(long)]
+    pub no_embed: bool,
 }
 
 /// Run incremental index update.
@@ -457,7 +465,7 @@ fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
 /// opened and dropped within this call, so on return the WAL is checkpointed and
 /// `db_path` is self-contained — which lets `rebuild-index` build into a temp
 /// file and atomically rename it over `index.db`.
-fn build_full_index_at(db_path: &Path, project_root: &Path, quiet: bool) -> Result<()> {
+fn build_full_index_at(db_path: &Path, project_root: &Path, quiet: bool, no_embed: bool) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
         cleanup_legacy_db_files(parent);
@@ -472,11 +480,39 @@ fn build_full_index_at(db_path: &Path, project_root: &Path, quiet: bool) -> Resu
             result.files_indexed, result.nodes_created, result.edges_created
         );
     }
-    embed_missing_nodes(&db, quiet)?;
+    finish_embedding(&db, quiet, no_embed)?;
     Ok(())
 }
 
-pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
+/// Shared structure-first → embedding handoff for the CLI index commands.
+///
+/// The structural graph (nodes/edges/FTS) is already committed and usable for
+/// AST / grep / callgraph queries the moment indexing returns — embedding is a
+/// separate, slow (CPU-bound) pass that only powers semantic/vector search. On a
+/// large repo it dominates wall-clock (≈5 nodes/s), so a foreground `reindex`
+/// could block for many minutes after the graph was already query-ready.
+///
+/// `--no-embed` skips it: the caller gets the fast structural index and the
+/// vectors backfill later (the MCP server's background embedder fills any node
+/// lacking a vector, resumably; or rerun without the flag to embed now).
+fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Result<()> {
+    if no_embed {
+        if !quiet && db.vec_enabled() {
+            let (embedded, embeddable) = queries::count_nodes_with_vectors(db.conn())
+                .unwrap_or((0, 0));
+            eprintln!(
+                "Structure index ready (AST/grep/callgraph usable now). Skipping embeddings \
+                 (--no-embed): {}/{} nodes have vectors; the rest backfill in the background \
+                 or via `code-graph-mcp incremental-index`.",
+                embedded, embeddable
+            );
+        }
+        return Ok(());
+    }
+    embed_missing_nodes(db, quiet)
+}
+
+pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -> Result<()> {
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
 
     // No existing DB → full index. Delegate to build_full_index_at so the
@@ -485,7 +521,7 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
         if !quiet {
             eprintln!("No index found, creating full index...");
         }
-        return build_full_index_at(&db_path, project_root, quiet);
+        return build_full_index_at(&db_path, project_root, quiet, no_embed);
     }
 
     cleanup_legacy_db_files(&project_root.join(CODE_GRAPH_DIR));
@@ -510,7 +546,7 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool) -> Result<()> {
         }
     }
 
-    embed_missing_nodes(&db, quiet)?;
+    finish_embedding(&db, quiet, no_embed)?;
     Ok(())
 }
 
@@ -537,11 +573,15 @@ pub struct RebuildIndexArgs {
     /// Suppress progress output
     #[arg(long)]
     pub quiet: bool,
+    /// Index structure only and skip embeddings (vectors backfill later).
+    #[arg(long)]
+    pub no_embed: bool,
 }
 
 pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<()> {
     let confirm = args.confirm;
     let quiet = args.quiet;
+    let no_embed = args.no_embed;
     // `--confirm` is a business-logic confirmation gate, NOT a clap-required arg:
     // a missing confirm is a deliberate exit-1 anyhow bail (not a parse error),
     // preserving the prior contract (test_cli_rebuild_index_requires_confirm).
@@ -597,7 +637,7 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     // index.db intact — the rename below is the only mutation of the live index,
     // so a failed rebuild no longer leaves the user with NO index (the old
     // remove-first path did).
-    if let Err(e) = build_full_index_at(&temp_path, project_root, quiet) {
+    if let Err(e) = build_full_index_at(&temp_path, project_root, quiet, no_embed) {
         remove_all(&temp_files);
         return Err(e);
     }
@@ -694,6 +734,10 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
         }
     }
     let ctx = CliContext::open(project_root)?;
+    // The reader open above is non-destructive: if the on-disk index was built by
+    // an older INDEX_VERSION, the data is intact but a rebuild is owed. Report it
+    // rather than (as before) silently wiping it on this status poll.
+    let index_version_stale = ctx.db.index_version_stale();
     let conn = ctx.db.conn();
     let status = queries::get_index_status(conn, false)?;
 
@@ -797,6 +841,7 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "model_available": model_available,
                 "snapshot": snapshot_block,
                 "conversion_metric": recommendation_metric_state(project_root),
+                "index_version_stale": index_version_stale.is_some(),
             });
             if let Some(ref r) = resolution {
                 json["resolution"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
@@ -814,6 +859,15 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 ));
             } else if !has_data {
                 json["issue"] = serde_json::json!("index is empty");
+            } else if let Some(old) = index_version_stale {
+                // Has data + correct schema, but built by an older extractor
+                // generation. Usable now (FTS/AST), but results sharpen after a
+                // rebuild — which an indexer (reindex / incremental-index / server
+                // startup), not this poll, performs.
+                json["issue"] = serde_json::json!(format!(
+                    "index built by older version (v{} ≠ v{}); rebuild pending",
+                    old, crate::domain::INDEX_VERSION
+                ));
             }
             println!("{}", json);
             if !healthy {
@@ -5601,6 +5655,9 @@ pub struct ReindexArgs {
     /// Refetch the published snapshot before indexing (falls back to full index)
     #[arg(long)]
     pub from_snapshot: bool,
+    /// Index structure only and skip embeddings (vectors backfill later).
+    #[arg(long)]
+    pub no_embed: bool,
 }
 
 /// `reindex [--from-snapshot]` — wipe `.code-graph/` index files and re-fetch
@@ -5611,6 +5668,7 @@ pub struct ReindexArgs {
 /// MCP server, but with optional snapshot-bootstrap acceleration.
 pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
     let from_snapshot = args.from_snapshot;
+    let no_embed = args.no_embed;
     let cg_dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
 
     if from_snapshot && cg_dir.exists() {
@@ -5625,7 +5683,7 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
             match crate::snapshot::try_install(&url, project_root) {
                 Ok(commit) => {
                     eprintln!("Snapshot installed at commit {commit}");
-                    return cmd_incremental_index(project_root, false);
+                    return cmd_incremental_index(project_root, false, no_embed);
                 }
                 Err(e) => eprintln!("Snapshot install failed ({e}), falling back to full index"),
             }
@@ -5634,12 +5692,50 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
         }
     }
 
-    cmd_incremental_index(project_root, false)
+    cmd_incremental_index(project_root, false, no_embed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_no_embed_flag_parses_on_index_commands() {
+        // `--no-embed` is the published fast-path opt-out: structure-first index,
+        // skip the slow embedding pass. Verify it wires on every index command and
+        // defaults off (embedding stays the default so existing behaviour holds).
+        assert!(IncrementalIndexArgs::parse_from(["incremental-index", "--no-embed"]).no_embed);
+        assert!(!IncrementalIndexArgs::parse_from(["incremental-index"]).no_embed);
+        assert!(ReindexArgs::parse_from(["reindex", "--no-embed"]).no_embed);
+        assert!(!ReindexArgs::parse_from(["reindex"]).no_embed);
+        assert!(
+            RebuildIndexArgs::parse_from(["rebuild-index", "--confirm", "--no-embed"]).no_embed
+        );
+        assert!(!RebuildIndexArgs::parse_from(["rebuild-index", "--confirm"]).no_embed);
+    }
+
+    #[test]
+    fn test_no_embed_builds_structural_index_without_vectors() {
+        // A --no-embed full index must still produce the structural graph (nodes),
+        // and must leave zero vectors regardless of model availability — the fast,
+        // query-ready state the flag promises.
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.rs"), "fn alpha() { beta(); }\nfn beta() {}\n").unwrap();
+        let db_path = root.join(CODE_GRAPH_DIR).join("index.db");
+
+        build_full_index_at(&db_path, root, true, true).unwrap();
+
+        let db = Database::open_nondestructive(&db_path).unwrap();
+        let nodes: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert!(nodes > 0, "structure index must be built even with --no-embed");
+        let (embedded, _embeddable) = queries::count_nodes_with_vectors(db.conn()).unwrap();
+        assert_eq!(embedded, 0, "--no-embed must leave zero vectors");
+    }
 
     #[test]
     fn test_aggregate_recommendations_research_after_answer_and_observe() {

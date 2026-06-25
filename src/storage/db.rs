@@ -30,15 +30,34 @@ fn register_sqlite_vec() {
 pub struct Database {
     conn: Connection,
     vec_enabled: bool,
+    /// `Some(old_version)` when this handle opened a DB built by a *different*
+    /// `INDEX_VERSION` in non-destructive (reader) mode — the data was left
+    /// intact and a rebuild is owed. `None` when fresh, current, or already
+    /// revalidated (wiped) by an indexer open. See [`Database::index_version_stale`].
+    index_version_stale: Option<i32>,
 }
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_impl(path, false)
+        Self::open_impl(path, false, true)
     }
 
     pub fn open_with_vec(path: &Path) -> Result<Self> {
-        Self::open_impl(path, true)
+        Self::open_impl(path, true, true)
+    }
+
+    /// Open for READ / observability (health-check, grep, show, callgraph …).
+    /// Forward schema migration still runs, but an `INDEX_VERSION` mismatch does
+    /// NOT wipe data — it sets [`Database::index_version_stale`] so the caller can
+    /// report "rebuild pending" instead of a passive reader destroying the index.
+    ///
+    /// Rationale: the destructive version sweep is only safe when a rebuild
+    /// follows in the same context (an indexer). A status poll (statusline →
+    /// `health-check`) or a one-off `grep` opened writably and wiped the index to
+    /// 0 nodes; in a project where no MCP server is running, nothing rebuilt it,
+    /// so the index stayed empty. Readers must never trigger the wipe.
+    pub fn open_nondestructive(path: &Path) -> Result<Self> {
+        Self::open_impl(path, false, false)
     }
 
     /// Open an existing database in strict read-only mode. Used by secondary
@@ -76,10 +95,12 @@ impl Database {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        Ok(Self { conn, vec_enabled })
+        // Secondary read-only instances never migrate or revalidate (the primary
+        // owns bootstrap), so they don't compute a staleness verdict.
+        Ok(Self { conn, vec_enabled, index_version_stale: None })
     }
 
-    fn open_impl(path: &Path, enable_vec: bool) -> Result<Self> {
+    fn open_impl(path: &Path, enable_vec: bool, revalidate: bool) -> Result<Self> {
         // Proactive sub-header size guard: any pre-existing main file smaller
         // than the 100-byte SQLite database header cannot be a valid database.
         // Without this, post-crash residue (0-byte main + stale .wal/.shm,
@@ -91,7 +112,7 @@ impl Database {
         // triple (main + wal + shm) so the retry starts blank.
         Self::sub_header_size_guard(path);
 
-        match Self::open_impl_inner(path, enable_vec) {
+        match Self::open_impl_inner(path, enable_vec, revalidate) {
             Ok(db) => Ok(db),
             Err(e) if Self::is_corruption_error(&e) && path.exists() => {
                 tracing::warn!(
@@ -105,7 +126,7 @@ impl Database {
                 if wal_path.exists() { std::fs::remove_file(&wal_path).ok(); }
                 if shm_path.exists() { std::fs::remove_file(&shm_path).ok(); }
                 // Retry once with a fresh database
-                Self::open_impl_inner(path, enable_vec)
+                Self::open_impl_inner(path, enable_vec, revalidate)
             }
             Err(e) => Err(e),
         }
@@ -136,7 +157,7 @@ impl Database {
         if shm_path.exists() { std::fs::remove_file(&shm_path).ok(); }
     }
 
-    fn open_impl_inner(path: &Path, enable_vec: bool) -> Result<Self> {
+    fn open_impl_inner(path: &Path, enable_vec: bool, revalidate: bool) -> Result<Self> {
         // Always register sqlite-vec extension (it's process-global anyway via auto_extension)
         register_sqlite_vec();
 
@@ -236,45 +257,75 @@ impl Database {
         conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
 
         // Check INDEX_VERSION (stored in application_id pragma).
-        // When parser/indexer logic changes, INDEX_VERSION is bumped and
-        // we clear all indexed data so the next ensure_indexed does a full rebuild.
+        // When parser/indexer logic changes, INDEX_VERSION is bumped. An INDEXER
+        // open (`revalidate = true`) clears the stale data so the rebuild it is
+        // about to run starts clean. A READER open (`revalidate = false`:
+        // health-check, grep, show, …) must NOT clear — a passive consumer that
+        // destroys the index is the daagu failure (a status poll wiped it to 0
+        // nodes and, with no MCP server running in that project, nothing rebuilt
+        // it). Readers instead flag staleness and leave the data intact.
         let stored_index_version: i32 = conn.pragma_query_value(None, "application_id", |row| row.get(0))?;
-        if stored_index_version != 0 && stored_index_version != crate::domain::INDEX_VERSION {
-            tracing::info!(
-                "[index] Index version changed ({} → {}), clearing stale data for rebuild",
-                stored_index_version, crate::domain::INDEX_VERSION
-            );
-            // Double-write to stderr: the CLI/MCP startup paths install no tracing
-            // subscriber (feedback_tracing_invisible_in_cli.md), so the tracing line
-            // above is invisible to users. Without this, a version-mismatch wipe
-            // surfaces only as a confusing "index is empty" — most often when two
-            // code-graph binaries of different INDEX_VERSION (e.g. a stale server +
-            // a freshly-built one) share one .code-graph/index.db and clear each
-            // other's data on every open. Name the cause so the fix (restart all
-            // servers / rebuild to one version) is obvious.
-            eprintln!(
-                "[code-graph] Index version mismatch (stored v{} ≠ binary v{}): clearing + rebuilding. \
+        let version_mismatch =
+            stored_index_version != 0 && stored_index_version != crate::domain::INDEX_VERSION;
+        let mut index_version_stale = None;
+        if version_mismatch {
+            if revalidate {
+                tracing::info!(
+                    "[index] Index version changed ({} → {}), clearing stale data for rebuild",
+                    stored_index_version, crate::domain::INDEX_VERSION
+                );
+                // Double-write to stderr: the CLI/MCP startup paths install no tracing
+                // subscriber (feedback_tracing_invisible_in_cli.md), so the tracing line
+                // above is invisible to users. Without this, a version-mismatch wipe
+                // surfaces only as a confusing "index is empty" — most often when two
+                // code-graph binaries of different INDEX_VERSION (e.g. a stale server +
+                // a freshly-built one) share one .code-graph/index.db and clear each
+                // other's data on every open. Name the cause so the fix (restart all
+                // servers / rebuild to one version) is obvious.
+                eprintln!(
+                    "[code-graph] Index version mismatch (stored v{} ≠ binary v{}): clearing + rebuilding. \
 If you see this repeatedly, another code-graph server of a different version is sharing this index — restart all servers so they run one version.",
-                stored_index_version, crate::domain::INDEX_VERSION
-            );
-            conn.execute_batch(
-                "BEGIN; DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; COMMIT;"
-            )?;
-            // Reclaim the pages freed by the sweep so a version bump that shrinks
-            // the index (fewer nodes under the new INDEX_VERSION, or a shrunk
-            // codebase) doesn't carry the old high-water-mark of free pages into
-            // the rebuild. Benefit is bounded — the immediate rebuild reuses free
-            // pages when the new index is >= the old size — so this is hygiene on
-            // the rare version-mismatch open, not a hot path. Best-effort: another
-            // code-graph binary sharing this DB can make VACUUM fail with
-            // "database is locked", which must never block opening the DB.
-            if let Err(e) = conn.execute_batch("VACUUM;") {
-                tracing::warn!("[index] post-sweep VACUUM skipped: {}", e);
+                    stored_index_version, crate::domain::INDEX_VERSION
+                );
+                conn.execute_batch(
+                    "BEGIN; DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; COMMIT;"
+                )?;
+                // Reclaim the pages freed by the sweep so a version bump that shrinks
+                // the index (fewer nodes under the new INDEX_VERSION, or a shrunk
+                // codebase) doesn't carry the old high-water-mark of free pages into
+                // the rebuild. Benefit is bounded — the immediate rebuild reuses free
+                // pages when the new index is >= the old size — so this is hygiene on
+                // the rare version-mismatch open, not a hot path. Best-effort: another
+                // code-graph binary sharing this DB can make VACUUM fail with
+                // "database is locked", which must never block opening the DB.
+                if let Err(e) = conn.execute_batch("VACUUM;") {
+                    tracing::warn!("[index] post-sweep VACUUM skipped: {}", e);
+                }
+            } else {
+                // Reader/observability open: leave the data alone, just surface the
+                // mismatch so callers can report "rebuild pending". Crucially do NOT
+                // bump application_id below — stamping current would mask the
+                // staleness from the next indexer open that should rebuild.
+                index_version_stale = Some(stored_index_version);
             }
         }
-        conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION)?;
+        // Stamp current version only when we actually revalidated (wiped) or on a
+        // fresh DB (application_id == 0). A non-destructive reader leaves a
+        // mismatched application_id untouched so the rebuild is still owed.
+        if revalidate || stored_index_version == 0 {
+            conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION)?;
+        }
 
-        Ok(Self { conn, vec_enabled: enable_vec })
+        Ok(Self { conn, vec_enabled: enable_vec, index_version_stale })
+    }
+
+    /// `Some(old_version)` when this handle opened (non-destructively) a DB built
+    /// by a different `INDEX_VERSION` — the structural data is intact but a full
+    /// rebuild is owed. `None` for a fresh, current, or indexer-revalidated DB.
+    /// Lets readers (e.g. `health-check`) report a stale index instead of having
+    /// silently wiped it. See [`Database::open_nondestructive`].
+    pub fn index_version_stale(&self) -> Option<i32> {
+        self.index_version_stale
     }
 
     /// Check if an error indicates SQLite database corruption.
@@ -460,6 +511,66 @@ mod tests {
             freelist, 0,
             "post-sweep VACUUM must reclaim freed pages (freelist_count)"
         );
+    }
+
+    #[test]
+    fn test_nondestructive_open_preserves_data_on_version_mismatch() {
+        // A READER open (health-check, grep, …) must NOT wipe an index built by a
+        // different INDEX_VERSION — that was the daagu failure: a statusline poll
+        // opened writably and cleared the index to 0 nodes, and with no indexer
+        // running nothing rebuilt it. The reader must keep the data and flag stale.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        {
+            let db = Database::open_with_vec(&db_path).unwrap();
+            let tx = db.conn().unchecked_transaction().unwrap();
+            for i in 0..10 {
+                tx.execute(
+                    "INSERT INTO files (path, blake3_hash, last_modified, indexed_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![format!("f/{i}.rs"), "h", 0_i64, 0_i64],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            // Stamp an older generation so the next open sees a version mismatch.
+            db.conn()
+                .pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1)
+                .unwrap();
+        }
+
+        // Reader open: data intact, staleness flagged, application_id left at OLD
+        // so the rebuild is still owed (a later indexer open will revalidate).
+        let reader = Database::open_nondestructive(&db_path).unwrap();
+        let files: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files, 10, "non-destructive reader must NOT clear files");
+        assert_eq!(
+            reader.index_version_stale(),
+            Some(crate::domain::INDEX_VERSION - 1),
+            "reader must flag the stale generation it observed"
+        );
+        let stamped: i32 = reader
+            .conn()
+            .pragma_query_value(None, "application_id", |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stamped,
+            crate::domain::INDEX_VERSION - 1,
+            "reader must NOT bump application_id (would mask the owed rebuild)"
+        );
+
+        // A subsequent INDEXER open revalidates: wipes + stamps current + clears stale.
+        let indexer = Database::open_with_vec(&db_path).unwrap();
+        let files_after: i64 = indexer
+            .conn()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files_after, 0, "indexer open must perform the deferred wipe");
+        assert_eq!(indexer.index_version_stale(), None, "post-revalidate handle is current");
     }
 
     #[test]

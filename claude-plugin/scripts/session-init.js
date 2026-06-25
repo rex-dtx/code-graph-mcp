@@ -263,8 +263,39 @@ function syncLifecycleConfig() {
 }
 
 /**
- * Check if the index is stale by comparing git HEAD timestamp vs index.db mtime.
- * If stale, spawn background incremental-index to refresh.
+ * Cheap probe for a rebuild reason that mtime/git can't see: an INDEX_VERSION
+ * mismatch (the on-disk index was built by an older extractor generation). Since
+ * P0, a reader (statusline `health-check`, `grep`) no longer wipes such an index —
+ * it serves the stale structural data and reports "rebuild pending" — so in a
+ * project where the MCP server isn't running, nothing else nudges a rebuild.
+ * health-check carries the verdict in `index_version_stale`. Best-effort: any
+ * failure → false (never force work off a bad probe).
+ */
+function indexNeedsRevalidation(bin, cwd) {
+  try {
+    let out;
+    try {
+      out = execFileSync(bin, ['health-check', '--format', 'json'],
+        { cwd, timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+    } catch (e) {
+      // health-check exits non-zero on an unhealthy index but still writes JSON.
+      out = ((e && e.stdout) || '').toString();
+    }
+    return JSON.parse(out).index_version_stale === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decide whether the index needs a background refresh and, if so, spawn a
+ * detached `incremental-index` (which revalidates: an indexer open wipes +
+ * rebuilds a version-stale index, then re-indexes all files).
+ *
+ * Two independent triggers:
+ *   1. git HEAD newer than index.db mtime — content drifted since last index.
+ *   2. INDEX_VERSION mismatch (post-upgrade) — see indexNeedsRevalidation.
+ *
  * Returns 'fresh' | 'refreshing' | 'skipped'.
  */
 function ensureIndexFresh() {
@@ -276,25 +307,28 @@ function ensureIndexFresh() {
   const dbPath = path.join(cwd, '.code-graph', 'index.db');
   if (!fs.existsSync(dbPath)) return 'skipped';
 
+  let needsRefresh = false;
+  // Trigger 1: git HEAD newer than index mtime.
   try {
     const dbMtime = fs.statSync(dbPath).mtimeMs;
-    // Compare with git HEAD commit timestamp
     const gitTs = parseInt(
       execSync('git log -1 --format=%ct', { cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim()
     ) * 1000;
-    if (gitTs <= dbMtime) return 'fresh';
+    if (gitTs > dbMtime) needsRefresh = true;
+  } catch { /* no git / not a repo — fall through to the version probe */ }
 
-    // Index is stale — run incremental-index in background
-    const child = spawn(bin, ['incremental-index', '--quiet'], {
-      cwd,
-      detached: true,
-      stdio: 'ignore',
-    });
-    if (child && typeof child.unref === 'function') child.unref();
-    return 'refreshing';
-  } catch {
-    return 'skipped';
-  }
+  // Trigger 2: INDEX_VERSION mismatch (only probe when mtime looked fresh).
+  if (!needsRefresh && indexNeedsRevalidation(bin, cwd)) needsRefresh = true;
+
+  if (!needsRefresh) return 'fresh';
+
+  const child = spawn(bin, ['incremental-index', '--quiet'], {
+    cwd,
+    detached: true,
+    stdio: 'ignore',
+  });
+  if (child && typeof child.unref === 'function') child.unref();
+  return 'refreshing';
 }
 
 /**
@@ -720,6 +754,7 @@ module.exports = {
   launchBackgroundAutoUpdate,
   syncLifecycleConfig,
   ensureIndexFresh,
+  indexNeedsRevalidation,
   injectProjectMap,
   injectRecentImpact,
   verifyBinary,
