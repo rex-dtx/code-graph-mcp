@@ -871,9 +871,31 @@ function healthCheck() {
   };
 }
 
+// True when the plugin has been UNINSTALLED (removed from installed_plugins.json),
+// as opposed to merely toggled OFF (isPluginExplicitlyDisabled — the user may
+// re-enable). The distinction matters because the uninstall teardown below is
+// destructive (deletes the cached binary, unwinds project adoption); doing that
+// on a temporary disable would force a re-download + re-adopt on re-enable.
+function isPluginUninstalled(settings = readJson(settingsPath()) || {}) {
+  if (isPluginExplicitlyDisabled(settings)) return false;
+  return isPluginInactive(settings);
+}
+
+// Remove the ~/.cache/code-graph residue (the ~40MB binary, update-state,
+// statusline-registry, install-manifest). The settings-only self-heal
+// (cleanupDisabledStatusline) leaves this behind; the SessionStart teardown calls
+// this so a CC `/plugin uninstall` (which fires no uninstall hook) still reclaims
+// the disk. Idempotent: rm is force, so repeat SessionStarts are no-ops. Does NOT
+// touch the plugin-cache script dirs — those are CC-managed and may be executing.
+function removeCacheResidue() {
+  try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); return true; }
+  catch { return false; }
+}
+
 module.exports = {
   install, uninstall, update, healthCheck, scanForBrokenPaths, checkScopeConflict,
-  isPluginExplicitlyDisabled, isPluginInactive, cleanupDisabledStatusline,
+  isPluginExplicitlyDisabled, isPluginInactive, isPluginUninstalled, removeCacheResidue,
+  cleanupDisabledStatusline,
   readManifest, readJson, writeJsonAtomic,
   readRegistry, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
@@ -898,7 +920,8 @@ if (require.main === module) {
   } else if (cmd === 'uninstall') {
     const r = uninstall();
     console.log(`Uninstalled | settings cleaned=${r.settingsChanged}`);
-    console.log('  Note: also run `/plugin uninstall code-graph-mcp` inside Claude Code to sync its UI state.');
+    console.log('  Note: also run `/plugin uninstall code-graph-mcp` inside Claude Code to sync its UI state,');
+    console.log('  and `code-graph-mcp unadopt` in each adopted project to remove its CLAUDE.md block.');
   } else if (cmd === 'update') {
     const r = update();
     console.log(`Updated ${r.oldVersion} → ${r.version} | settings=${r.settingsChanged}`);

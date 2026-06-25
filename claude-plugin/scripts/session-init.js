@@ -5,11 +5,11 @@ const path = require('path');
 const fs = require('fs');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
-  cleanupDisabledStatusline, isPluginInactive, readJson, CACHE_DIR,
-  settingsPath, isStaleRelicContext,
+  cleanupDisabledStatusline, isPluginInactive, isPluginUninstalled, removeCacheResidue,
+  readJson, CACHE_DIR, settingsPath, isStaleRelicContext,
 } = require('./lifecycle');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
-const { maybeAutoAdopt, isAdopted } = require('./adopt');
+const { maybeAutoAdopt, isAdopted, unadopt } = require('./adopt');
 const { isNonProjectCwd } = require('./project-detect');
 
 // v0.17.0 — quietHooks: unconditional quiet 默认。
@@ -420,8 +420,31 @@ function consistencyCheck(binary) {
 
 function runSessionInit({ source } = {}) {
   if (isPluginInactive()) {
+    // Capture the uninstalled-vs-disabled verdict BEFORE cleanupDisabledStatusline()
+    // runs — it removes our composite + registry entry, which are the very signals
+    // isPluginUninstalled()/isPluginInactive() read, so calling it afterwards would
+    // always see "no composite/registry" and report not-uninstalled (teardown skipped).
+    const uninstalled = isPluginUninstalled();
     cleanupDisabledStatusline();
-    return { inactive: true, lifecycle: 'noop', autoUpdateLaunched: false };
+    // Genuine uninstall (not a temporary disable) leaves residue the settings-only
+    // self-heal can't reach: ~/.cache/code-graph (the ~40MB binary + state) and the
+    // current project's CLAUDE.md adoption block. CC fires no uninstall hook, so this
+    // SessionStart is the only automated teardown — symmetric to install's auto-adopt.
+    // Per-project: only the cwd we're in; other adopted projects self-clean when next
+    // opened, or via `code-graph-mcp unadopt`.
+    let teardown = null;
+    if (uninstalled) {
+      const cacheRemoved = removeCacheResidue();
+      let unadopted = false;
+      try {
+        if (!isNonProjectCwd(process.cwd())) {
+          const r = unadopt({ cwd: process.cwd() });
+          unadopted = !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved));
+        }
+      } catch { /* best-effort — never let teardown break SessionStart */ }
+      teardown = { cacheRemoved, unadopted };
+    }
+    return { inactive: true, lifecycle: 'noop', autoUpdateLaunched: false, teardown };
   }
 
   // Non-project cwd (no .git/manifest — e.g. /tmp, where claude-mem-lite

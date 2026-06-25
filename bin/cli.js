@@ -36,6 +36,36 @@ if (sub === "adopt" || sub === "unadopt") {
   process.exit(result.ok === false ? 1 : 0);
 }
 
+// Intercept `uninstall` — full local teardown (restore prior statusline, strip
+// code-graph hooks from settings.json, delete ~/.cache/code-graph, and unadopt the
+// CURRENT project). Node-only; no Rust counterpart. CC's `/plugin uninstall` fires
+// no uninstall hook, so this is the user's one-shot CLI teardown. Guard `--help`
+// before the destructive work (same discipline as adopt/unadopt above).
+if (sub === "uninstall") {
+  if (process.argv.slice(3).some((a) => a === "--help" || a === "-h")) {
+    process.stdout.write(
+      "code-graph-mcp uninstall — remove code-graph config + cache from this machine\n\n" +
+      "USAGE:\n    code-graph-mcp uninstall\n\n" +
+      "Restores your prior statusline, strips code-graph hooks from settings.json,\n" +
+      "deletes ~/.cache/code-graph, and removes this project's CLAUDE.md adoption\n" +
+      "block. Also run `/plugin uninstall code-graph-mcp` in Claude Code to sync its\n" +
+      "UI, and `code-graph-mcp unadopt` in any OTHER adopted project.\n");
+    process.exit(0);
+  }
+  const lifecycle = require("../claude-plugin/scripts/lifecycle");
+  const { unadopt } = require("../claude-plugin/scripts/adopt");
+  const r = lifecycle.uninstall();
+  let ua = { ok: false };
+  try { ua = unadopt(); } catch { /* best-effort — settings/cache already cleaned */ }
+  const projectUnadopted = !!(ua && (ua.blockPruned || ua.fileRemoved || ua.claudeMdRemoved));
+  process.stdout.write(
+    `Uninstalled code-graph-mcp | settings cleaned=${r.settingsChanged}` +
+    ` | this project unadopted=${projectUnadopted}\n` +
+    "  Also run `/plugin uninstall code-graph-mcp` in Claude Code, and\n" +
+    "  `code-graph-mcp unadopt` in any other adopted project.\n");
+  process.exit(0);
+}
+
 const { findBinary, unsupportedPlatformHint } = require("../claude-plugin/scripts/find-binary");
 
 const binary = findBinary();

@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.74.4 — Symmetric uninstall teardown
+
+A sandbox lifecycle E2E (isolated `HOME` + `CLAUDE_CONFIG_DIR`, real project) found
+that uninstall was far less automated than install. Install is one SessionStart
+(`install()` + auto-adopt); uninstall via Claude Code's `/plugin uninstall` fires no
+hook, so the only automated cleanup was the SessionStart settings self-heal — leaving
+`~/.cache/code-graph` (the ~40MB binary + state), the `CLAUDE.md` adoption block, and
+the `.claude/plugin_code_graph_mcp.md` detail doc behind in every adopted project.
+
+### Fixed
+- **SessionStart now fully tears down a genuine uninstall.** When the plugin is gone
+  from `installed_plugins.json` (not merely toggled off), the inactive-branch self-heal
+  also removes `~/.cache/code-graph` and unadopts the current project (strips its
+  `CLAUDE.md` block + detail doc, preserving user content) — symmetric to install's
+  auto-adopt. A temporary **disable** (`enabledPlugins[id]=false`) is deliberately left
+  untouched so re-enabling doesn't force a binary re-download + re-adopt. Other adopted
+  projects self-clean when next opened, or via `code-graph-mcp unadopt`.
+
+### Added
+- **`code-graph-mcp uninstall` CLI** — one-shot local teardown: restores the prior
+  statusline, strips code-graph hooks from `settings.json`, deletes
+  `~/.cache/code-graph`, and unadopts the current project. `--help` is side-effect-free.
+
 ## v0.74.3 — Statusline: distinguish "updating" from "offline"
 
 ### Fixed

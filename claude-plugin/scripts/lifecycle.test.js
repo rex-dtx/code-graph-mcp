@@ -99,6 +99,39 @@ test('cleanupDisabledStatusline also heals orphaned statusline after uninstall',
   assert.equal(fs.existsSync(registryPath), false);
 });
 
+test('isPluginUninstalled distinguishes a genuine uninstall from a temporary disable', (t) => {
+  // Orphaned composite (installed_plugins exists, no code-graph record) = uninstalled.
+  const uninstalledHome = mkHome(t);
+  seedOrphanedComposite(uninstalledHome);
+  // enabledPlugins[id]=false = user toggled it off; may re-enable → NOT uninstalled.
+  const disabledHome = mkHome(t);
+  seedDisabledComposite(disabledHome);
+
+  const probe = (home) => JSON.parse(execFileSync(process.execPath, ['-e', `
+    const { isPluginUninstalled } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(isPluginUninstalled()));
+  `], { env: { ...process.env, HOME: home } }).toString());
+
+  assert.equal(probe(uninstalledHome), true, 'orphaned/no-record → uninstalled');
+  assert.equal(probe(disabledHome), false, 'explicit disable → not uninstalled (re-enable safe)');
+});
+
+test('removeCacheResidue deletes ~/.cache/code-graph and is idempotent', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  writeJson(path.join(cacheDir, 'bin', 'marker.json'), { v: 1 });
+  fs.writeFileSync(path.join(cacheDir, 'update-state.json'), '{}');
+
+  const run = () => execFileSync(process.execPath, ['-e', `
+    const { removeCacheResidue } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(removeCacheResidue()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.equal(run(), 'true');
+  assert.equal(fs.existsSync(cacheDir), false, 'cache dir removed');
+  assert.equal(run(), 'true', 'second call is a no-op success (idempotent force-rm)');
+});
+
 function legacyHooksFromPlugin() {
   return {
     SessionStart: [{

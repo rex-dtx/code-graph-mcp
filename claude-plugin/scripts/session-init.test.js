@@ -99,6 +99,53 @@ test('runSessionInit no-ops (nonProject) in a non-project cwd', (t) => {
   }
 });
 
+test('runSessionInit tears down cache + adoption on a genuine uninstall (order regression)', (t) => {
+  // Subprocess isolation: lifecycle.js evaluates CACHE_DIR from os.homedir() at
+  // MODULE LOAD, so HOME/CLAUDE_CONFIG_DIR must be set before require — only a
+  // fresh child honors them. This locks the order bug: isPluginUninstalled() MUST be
+  // read BEFORE cleanupDisabledStatusline() wipes the composite/registry signals it
+  // depends on — otherwise teardown is skipped (was null pre-fix).
+  const os = require('os');
+  const { execFileSync } = require('child_process');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-teardown-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const home = sb, cfg = path.join(sb, '.claude'), proj = path.join(sb, 'proj');
+  fs.mkdirSync(path.join(cfg, 'plugins'), { recursive: true });
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p","version":"1.0.0"}');
+  fs.writeFileSync(path.join(proj, 'CLAUDE.md'), '# P\n\nKEEP THIS USER LINE.\n');
+  fs.writeFileSync(path.join(cfg, 'settings.json'), '{"statusLine":{"type":"command","command":"/bin/prior.sh"}}');
+  const env = { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: cfg };
+  const lc = path.join(__dirname, 'lifecycle.js'), ad = path.join(__dirname, 'adopt.js');
+  const si = path.join(__dirname, 'session-init.js');
+
+  // install + adopt, then simulate a downloaded binary + a post-/plugin-uninstall
+  // installed_plugins.json (record for some OTHER plugin, none for code-graph).
+  execFileSync(process.execPath, [lc, 'install'], { env, cwd: proj, stdio: 'ignore' });
+  execFileSync(process.execPath, ['-e',
+    `require(${JSON.stringify(ad)}).adopt({cwd:process.cwd()})`], { env, cwd: proj, stdio: 'ignore' });
+  fs.mkdirSync(path.join(home, '.cache', 'code-graph', 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.cache', 'code-graph', 'bin', 'code-graph-mcp'), 'x');
+  fs.writeFileSync(path.join(cfg, 'plugins', 'installed_plugins.json'),
+    JSON.stringify({ plugins: { 'other@mkt': [{ version: '1.0.0', installPath: '/x' }] } }));
+  assert.ok(fs.readFileSync(path.join(proj, 'CLAUDE.md'), 'utf8').includes('code-graph'), 'adopt injected block');
+
+  const res = JSON.parse(execFileSync(process.execPath, ['-e',
+    `process.stdout.write(JSON.stringify(require(${JSON.stringify(si)}).runSessionInit({source:'startup'})))`],
+    { env, cwd: proj }).toString());
+
+  assert.equal(res.inactive, true);
+  assert.ok(res.teardown, 'teardown ran (null pre-fix = order bug)');
+  assert.equal(res.teardown.cacheRemoved, true);
+  assert.equal(res.teardown.unadopted, true);
+  assert.equal(fs.existsSync(path.join(home, '.cache', 'code-graph')), false, 'cache residue gone');
+  const md = fs.readFileSync(path.join(proj, 'CLAUDE.md'), 'utf8');
+  assert.ok(!md.includes('code-graph'), 'adopt block removed');
+  assert.ok(md.includes('KEEP THIS USER LINE'), 'user content preserved');
+  const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+  assert.equal(settings.statusLine.command, '/bin/prior.sh', 'prior statusline restored');
+});
+
 test('consistencyCheck returns empty array when binary version matches plugin', () => {
   const result = consistencyCheck('/tmp/nonexistent-binary');
   assert.ok(Array.isArray(result));
