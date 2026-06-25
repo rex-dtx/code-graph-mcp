@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.74.3 — Statusline: distinguish "updating" from "offline"
+
+### Fixed
+- **Statusline no longer shows a misleading `offline` during the post-update
+  binary-download window.** After a plugin update, the npm package version jumps
+  immediately but the platform binary is still being fetched in the background
+  (`session-init.js` → detached download). During that window `find-binary.js`'s
+  version gates reject the stale cached binary and fall through to an older one
+  (e.g. a leftover `~/.cargo/bin` install) that can't read the newer DB schema and
+  exits with `Database schema version vN is newer than supported vM`. The statusline
+  collapsed every health-check failure into `code-graph: offline`, so users saw a
+  broken-looking state for minutes until the download finished. It now shows
+  `code-graph: ↻ updating` when the failure is a schema-too-old error or an update
+  is pending (`~/.cache/code-graph/update-state.json`); genuine failures still show
+  `offline`. Display-only change — no index, schema, or CLI/MCP contract impact.
+
 ## v0.74.2 — Polyglot extraction fixes (INDEX_VERSION 30)
 
 A dogfood sweep across languages surfaced six real extraction bugs (all `fix:`).

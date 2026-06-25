@@ -2,10 +2,24 @@
 'use strict';
 const { execFileSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { findBinary } = require('./find-binary');
 const lifecycle = require('./lifecycle');
 const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
+
+// True when auto-update has a newer release queued or in flight (the background
+// downloader in session-init.js hasn't promoted the new binary yet). Used to show
+// a transient "updating" state instead of the alarming "offline" during that window.
+function updatePending() {
+  try {
+    const st = JSON.parse(fs.readFileSync(
+      path.join(os.homedir(), '.cache', 'code-graph', 'update-state.json'), 'utf8'));
+    if (st.updateAvailable) return true;
+    if (st.latestVersion && st.installedVersion && st.latestVersion !== st.installedVersion) return true;
+  } catch { /* no state file or unreadable — treat as no pending update */ }
+  return false;
+}
 
 const disabledCleanup = cleanupDisabledStatusline();
 if (disabledCleanup.cleaned) process.exit(0);
@@ -38,7 +52,9 @@ if (!fs.existsSync(path.join(codeGraphDir, 'index.db'))) {
 
 const bin = findBinary();
 if (!bin) {
-  process.stdout.write('code-graph: offline');
+  // No usable binary yet. If an update is queued, the background downloader is
+  // still fetching it \u2014 that is "updating", not a broken "offline" state.
+  process.stdout.write(updatePending() ? 'code-graph: \u21bb updating' : 'code-graph: offline');
   process.exit(0);
 }
 
@@ -53,6 +69,13 @@ try {
     `code-graph: ${icon} ${s.nodes} nodes | ${s.files} files` +
     (s.watching ? ' | watching' : '')
   );
-} catch {
-  process.stdout.write('code-graph: offline');
+} catch (e) {
+  // A schema-too-new error means the resolved binary is OLDER than the index it
+  // is reading \u2014 the classic post-update window where the new binary is still
+  // downloading. That, or any pending update, is transient: show "updating" so
+  // the user knows it self-heals, rather than the misleading "offline".
+  const errOut = ((e && (e.stderr || e.stdout)) || '').toString();
+  const binaryOutdated = /schema version/i.test(errOut);
+  process.stdout.write(
+    (binaryOutdated || updatePending()) ? 'code-graph: \u21bb updating' : 'code-graph: offline');
 }
