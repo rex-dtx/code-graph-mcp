@@ -376,3 +376,57 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
     'code-graph-mcp', 'code-graph-mcp', '9.9.9', '.claude-plugin', 'plugin.json');
   assert.equal(fs.existsSync(dst), true, 'plugin copied into sandbox plugins cache');
 });
+
+test('downloadAndInstall does NOT repoint install state when the plugin copy is skipped (version drift)', async (t) => {
+  // Guard for a silent-breakage bug: when the extracted tarball's plugin.json version
+  // doesn't match latest.version, the copy is skipped and pluginDst is never created.
+  // installed_plugins.json must NOT be advanced to that nonexistent dir, or Claude Code
+  // ends up pointed at a missing install while state reads "up to date".
+  const sandboxHome = mkDir(t, 'code-graph-dai-skip-');
+  const installedDir = path.join(sandboxHome, '.claude', 'plugins');
+  fs.mkdirSync(installedDir, { recursive: true });
+  const installedPath = path.join(installedDir, 'installed_plugins.json');
+  fs.writeFileSync(installedPath, JSON.stringify({
+    plugins: { 'code-graph-mcp@code-graph-mcp': [
+      { installPath: '/old/install/path', version: '0.0.1', lastUpdated: 'seed' },
+    ] },
+  }));
+
+  const script = `
+    const fs = require('fs');
+    const path = require('path');
+    const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    const latest = { version: '9.9.9', tarballUrl: 'https://example/tar', binaryUrl: null };
+    const exec = (cmd, args) => {
+      if (cmd === 'tar') {
+        // Extract a claude-plugin/ whose version DRIFTS from latest → copy is skipped.
+        const tmpDir = args[args.indexOf('-C') + 1];
+        const mDir = path.join(tmpDir, 'claude-plugin', '.claude-plugin');
+        fs.mkdirSync(mDir, { recursive: true });
+        fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '0.0.0' }));
+      }
+    };
+    (async () => {
+      const result = await downloadAndInstall(latest, {
+        exec,
+        refreshMarketplace: () => true,
+        downloadBin: async () => true,
+      });
+      console.log(JSON.stringify({ result }));
+    })();
+  `;
+  const out = execGit(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: sandboxHome },
+    encoding: 'utf8',
+  });
+  const { result } = JSON.parse(out.trim().split('\n').pop());
+  assert.equal(result.pluginUpdated, false, 'version drift must skip the plugin copy');
+
+  // The pre-seeded record must be UNTOUCHED — not repointed to the 9.9.9 dir.
+  const rec = JSON.parse(fs.readFileSync(installedPath, 'utf8'))
+    .plugins['code-graph-mcp@code-graph-mcp'][0];
+  assert.equal(rec.installPath, '/old/install/path',
+    'installPath must not be repointed when the copy was skipped');
+  assert.equal(rec.version, '0.0.1',
+    'version must not be advanced when the copy was skipped');
+});

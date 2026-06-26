@@ -393,30 +393,35 @@ async function downloadAndInstall(latest, {
       pluginUpdated = true;
     }
 
-    // Update installed_plugins.json to point to new version
-    const installedPath = installedPluginsPath();
-    try {
-      const installed = readJson(installedPath);
-      if (installed && installed.plugins && installed.plugins[PLUGIN_ID]) {
-        installed.plugins[PLUGIN_ID][0].installPath = pluginDst;
-        installed.plugins[PLUGIN_ID][0].version = latest.version;
-        installed.plugins[PLUGIN_ID][0].lastUpdated = new Date().toISOString();
-        writeJsonAtomic(installedPath, installed);
-      }
-    } catch { /* not fatal */ }
-
-    // Update install manifest
-    try {
-      const manifest = readManifest();
-      manifest.version = latest.version;
-      manifest.updatedAt = new Date().toISOString();
-      writeJsonAtomic(path.join(CACHE_DIR, 'install-manifest.json'), manifest);
-    } catch { /* not fatal */ }
-
-    // Run the NEW lifecycle.js to update settings.json hooks with new paths.
-    // Without this, settings.json hooks still point to the old version directory
-    // until the next session's self-heal corrects them.
+    // Repoint state at the new version ONLY if the plugin copy actually landed.
+    // Guarding on pluginUpdated: when the copy above was skipped (pluginSrc absent, or
+    // its plugin.json version drifted from the tag — the project's version sync is known
+    // fragile), pluginDst was never created. Advancing installPath/manifest to it anyway
+    // pointed Claude Code at a nonexistent install dir while state read "up to date".
     if (pluginUpdated) {
+      // Update installed_plugins.json to point to new version
+      const installedPath = installedPluginsPath();
+      try {
+        const installed = readJson(installedPath);
+        if (installed && installed.plugins && installed.plugins[PLUGIN_ID]) {
+          installed.plugins[PLUGIN_ID][0].installPath = pluginDst;
+          installed.plugins[PLUGIN_ID][0].version = latest.version;
+          installed.plugins[PLUGIN_ID][0].lastUpdated = new Date().toISOString();
+          writeJsonAtomic(installedPath, installed);
+        }
+      } catch { /* not fatal */ }
+
+      // Update install manifest
+      try {
+        const manifest = readManifest();
+        manifest.version = latest.version;
+        manifest.updatedAt = new Date().toISOString();
+        writeJsonAtomic(path.join(CACHE_DIR, 'install-manifest.json'), manifest);
+      } catch { /* not fatal */ }
+
+      // Run the NEW lifecycle.js to update settings.json hooks with new paths.
+      // Without this, settings.json hooks still point to the old version directory
+      // until the next session's self-heal corrects them.
       try {
         const newLifecycle = path.join(pluginDst, 'scripts', 'lifecycle.js');
         if (fs.existsSync(newLifecycle)) {
