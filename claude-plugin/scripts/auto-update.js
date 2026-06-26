@@ -354,9 +354,10 @@ async function downloadAndInstall(latest, {
   exec = execFileSync,
   downloadBin = downloadBinary,
   refreshMarketplace = refreshMarketplaceClone,
+  cmdExists = commandExists,
 } = {}) {
   // Pre-flight: check required CLI tools before attempting any download
-  const missingTools = ['curl', 'tar'].filter(cmd => !commandExists(cmd));
+  const missingTools = ['curl', 'tar'].filter(cmd => !cmdExists(cmd));
   if (missingTools.length > 0) {
     console.error(`[code-graph] Auto-update skipped: missing required tools: ${missingTools.join(', ')}. Install them to enable auto-updates.`);
     return { pluginUpdated: false, binaryUpdated: false };

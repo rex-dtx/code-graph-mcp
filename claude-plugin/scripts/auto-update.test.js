@@ -355,6 +355,7 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
       let binDownloads = 0;
       const result = await downloadAndInstall(latest, {
         exec,
+        cmdExists: () => true, // don't depend on host curl/tar
         refreshMarketplace: () => { refreshed++; return true; },
         downloadBin: async () => { binDownloads++; return true; },
       });
@@ -409,6 +410,7 @@ test('downloadAndInstall does NOT repoint install state when the plugin copy is 
     (async () => {
       const result = await downloadAndInstall(latest, {
         exec,
+        cmdExists: () => true, // don't depend on host curl/tar — exercise the guard deterministically
         refreshMarketplace: () => true,
         downloadBin: async () => true,
       });
