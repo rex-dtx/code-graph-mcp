@@ -102,9 +102,19 @@ console.log(`\nVersion synced to ${version} (${changed} file${changed !== 1 ? 's
 if (process.env.SYNC_VERSIONS_SKIP_BUILD === '1') {
   console.log('\nSkipped cargo build (SYNC_VERSIONS_SKIP_BUILD=1).');
 } else {
-  console.log('\nRebuilding release binary so local MCP picks up new version...');
+  // SYNC_VERSIONS_FEATURES (e.g. "embed-model") appends `--features <val>` to the
+  // local rebuild. The dev MCP server (.mcp.json → target/release/code-graph-mcp)
+  // is built with the crate default (`default = []`, no embedding) and therefore
+  // reports `model_available:false` / `vec pending`; set this to "embed-model" so
+  // the dev server can produce semantic vectors. CI/release set SKIP_BUILD=1, so
+  // this never affects them.
+  const features = (process.env.SYNC_VERSIONS_FEATURES || '').trim();
+  const buildArgs = ['build', '--release'];
+  if (features) buildArgs.push('--features', features);
+  const featureNote = features ? ` (--features ${features})` : '';
+  console.log(`\nRebuilding release binary so local MCP picks up new version${featureNote}...`);
   const t0 = Date.now();
-  const result = spawnSync('cargo', ['build', '--release'], {
+  const result = spawnSync('cargo', buildArgs, {
     cwd: root,
     stdio: 'inherit',
   });
