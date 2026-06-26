@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.76.0 — Call graph & impact: hide ambiguous by-name fan-out by default
+
+`get_call_graph` / `callgraph` and impact analysis now apply a confidence floor of
+`inferred` by default, hiding the `ambiguous` by-name fan-out — the false-positive
+class where a method/function name shared by many definitions (e.g. a `.execute()`
+call) resolves to *every* same-named def. On a real Python monorepo this class was
+~64% of all `calls` edges (one `execute` name absorbed 11,850 phantom edges across
+56 definitions), drowning the real call relationships.
+
+### Changed (user-visible default)
+- **`callgraph` / `get_call_graph` traversal now follows only `inferred`+`extracted`
+  edges by default.** Sub-threshold edges are pruned inside the recursive CTE — before
+  they expand — so the depth-N blowup is stopped at the source. The count of hidden
+  direct seed edges is disclosed (`ambiguous_edges_hidden` in JSON; `(N ambiguous
+  by-name edge(s) hidden …)` in text).
+- **`impact` analysis folds ambiguous callers out of the risk count by default**, but
+  always discloses the excluded count (`ambiguous_callers_excluded` + a note) so a
+  folded real caller never silently under-states risk.
+
+### Opt-out / revert
+- CLI: `--min-confidence ambiguous` on `callgraph` / `impact` restores every edge
+  (`extracted` = same-file-precise only).
+- MCP: `min_confidence: "ambiguous"` on `get_call_graph`, `get_ast_node`
+  (`include_impact`), and `impact_analysis`.
+- No reindex required — query-layer change; the stored confidence tiers are unchanged,
+  so the flag flips behavior back instantly. No `INDEX_VERSION` bump.
+
+### Unchanged
+- `show` and other bare caller listings still show all edges.
+
 ## v0.75.4 — Periodic backfill hardening (code-review follow-ups)
 
 Follow-ups to v0.75.3's periodic embedding-backfill driver, from a code review.

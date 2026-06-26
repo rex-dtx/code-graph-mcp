@@ -2794,6 +2794,12 @@ pub struct CallgraphArgs {
     /// Disambiguate same-name symbols by file path
     #[arg(long)]
     pub file: Option<String>,
+    /// Minimum edge-resolution confidence to FOLLOW: extracted, inferred, or
+    /// ambiguous. Default 'inferred' hides the ambiguous by-name fan-out (a
+    /// method name shared by many defs resolving to all of them); pass
+    /// 'ambiguous' to show every edge.
+    #[arg(long = "min-confidence")]
+    pub min_confidence: Option<String>,
 }
 
 /// Call graph display.
@@ -2825,6 +2831,20 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     };
     let explicit_file = explicit_file_owned.as_deref();
 
+    // Confidence floor: default 'inferred' hides the ambiguous by-name fan-out
+    // (the known false-positive class) from the traversal; --min-confidence
+    // ambiguous restores every edge. Validated at entry, mirroring `refs`.
+    let min_conf_tier: &'static str = match args.min_confidence.as_deref() {
+        None => crate::domain::CONF_INFERRED,
+        Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
+                c
+            )
+        })?,
+    };
+    let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
+
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
@@ -2840,7 +2860,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         }
     }
 
-    let mut result = crate::graph::query::get_call_graph(conn, symbol, direction, depth, file_filter)?;
+    let mut result = crate::graph::query::get_call_graph_filtered(conn, symbol, direction, depth, file_filter, min_conf_rank)?;
     // Fuzzy auto-resolve: if exact-name lookup returned nothing (or only the seed
     // node with no edges) and no --file was specified, promote a unique fuzzy
     // match. Matches MCP get_call_graph behavior.
@@ -2851,7 +2871,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         match resolve_fuzzy_name_cli(conn, symbol)? {
             CliFuzzyResolution::Unique(resolved) => {
                 if resolved != symbol {
-                    result = crate::graph::query::get_call_graph(conn, &resolved, direction, depth, file_filter)?;
+                    result = crate::graph::query::get_call_graph_filtered(conn, &resolved, direction, depth, file_filter, min_conf_rank)?;
                     eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
                 }
                 resolved_symbol = resolved;
@@ -2947,6 +2967,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             output["effective_max_depth"] = serde_json::json!(result.effective_max_depth);
             output["requested_max_depth"] = serde_json::json!(result.requested_max_depth);
         }
+        if result.suppressed_ambiguous > 0 {
+            output["ambiguous_edges_hidden"] = serde_json::json!(result.suppressed_ambiguous);
+        }
         writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
         return Ok(());
     }
@@ -3036,6 +3059,13 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             result.effective_max_depth, result.requested_max_depth,
         )?;
     }
+    if result.suppressed_ambiguous > 0 {
+        writeln!(
+            stdout,
+            "  ({} ambiguous by-name edge(s) hidden — use --min-confidence ambiguous to show)",
+            result.suppressed_ambiguous,
+        )?;
+    }
 
     Ok(())
 }
@@ -3064,6 +3094,12 @@ pub struct ImpactArgs {
     /// Change type: signature, behavior, or remove
     #[arg(long = "change-type", default_value = "behavior")]
     pub change_type: String,
+    /// Minimum caller-edge confidence to count toward risk: extracted, inferred,
+    /// or ambiguous. Default 'inferred' folds the ambiguous by-name fan-out out
+    /// of the blast radius (the excluded count is still reported); pass
+    /// 'ambiguous' to count every resolved caller.
+    #[arg(long = "min-confidence")]
+    pub min_confidence: Option<String>,
 }
 
 /// Impact analysis.
@@ -3087,6 +3123,20 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     if !matches!(change_type, "signature" | "behavior" | "remove") {
         anyhow::bail!("--change-type must be one of: signature, behavior, remove");
     }
+    // Confidence floor for caller traversal: default 'inferred' folds the
+    // ambiguous by-name fan-out out of the risk count; --min-confidence ambiguous
+    // counts every caller. The excluded count is disclosed below so a folded
+    // ambiguous caller never silently under-states risk.
+    let min_conf_tier: &'static str = match args.min_confidence.as_deref() {
+        None => crate::domain::CONF_INFERRED,
+        Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
+                c
+            )
+        })?,
+    };
+    let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -3120,7 +3170,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
     }
 
-    let callers = queries::get_callers_with_route_info(conn, symbol, file_filter, depth)?;
+    let callers = queries::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
+    // Direct ambiguous callers folded out of the blast radius by the confidence
+    // floor. Surfaced (not silently dropped) so a folded real caller never
+    // under-states risk; --min-confidence ambiguous counts them.
+    let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
+        conn, symbol, file_filter, crate::graph::query::Direction::Callers, min_conf_rank,
+    )?;
 
     // Partition prod/test callers (deduped by name,file,depth), count routes/files,
     // and assess risk via the surface-shared classifier — the MCP impact tool runs
@@ -3182,6 +3238,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         if let Some(warning) = impact.type_warning {
             result["warning"] = serde_json::json!(warning);
         }
+        if ambiguous_callers_excluded > 0 {
+            result["ambiguous_callers_excluded"] = serde_json::json!(ambiguous_callers_excluded);
+            result["ambiguous_note"] = serde_json::json!(format!(
+                "{} direct caller(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-run with --min-confidence ambiguous to include them.",
+                ambiguous_callers_excluded
+            ));
+        }
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
     }
@@ -3199,6 +3262,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         routes.len(),
         impact.test_count
     )?;
+    if ambiguous_callers_excluded > 0 {
+        writeln!(
+            stdout,
+            "  ⚠ {} ambiguous by-name caller(s) excluded from risk — actual blast radius may be larger; use --min-confidence ambiguous to include",
+            ambiguous_callers_excluded
+        )?;
+    }
     if value_references > 0 {
         writeln!(
             stdout,
@@ -3983,7 +4053,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 }
             }
             if include_impact {
-                let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3).unwrap_or_default();
+                let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
                 let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
                 let prod: Vec<_> = callers.iter().filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path)).collect();
                 let routes = callers.iter().filter(|c| c.route_info.is_some()).count();
@@ -4049,7 +4119,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             }
         }
         if include_impact {
-            let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3).unwrap_or_default();
+            let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
             let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
             let prod: Vec<_> = callers.iter().filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path)).collect();
             let routes = callers.iter().filter(|c| c.route_info.is_some()).count();

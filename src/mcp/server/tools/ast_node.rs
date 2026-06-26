@@ -21,12 +21,25 @@ impl McpServer {
         let include_similar = args["include_similar"].as_bool().unwrap_or(false);
         let similar_top_k = args["similar_top_k"].as_i64().unwrap_or(5);
         let compact = args["compact"].as_bool().unwrap_or(false);
+        // Confidence floor for the include_impact caller traversal (default
+        // 'inferred'): fold the ambiguous by-name fan-out out of the risk summary
+        // (parity with the impact tool/CLI); min_confidence:"ambiguous" includes
+        // every caller. append_impact_summary discloses what was folded.
+        let impact_conf_rank = {
+            let tier = match args["min_confidence"].as_str() {
+                None | Some("") => crate::domain::CONF_INFERRED,
+                Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+                    anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+                })?,
+            };
+            crate::domain::confidence_rank(tier)
+        };
 
         // Support lookup by node_id or file_path+symbol_name
         if let Some(nid) = args["node_id"].as_i64() {
             // When called with node_id, default context_lines=3
             let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
-            let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact, ctx, compact)?;
+            let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact, ctx, compact, impact_conf_rank)?;
             if include_similar {
                 self.attach_similar(&mut out, nid, similar_top_k)?;
             }
@@ -50,7 +63,7 @@ impl McpServer {
                 0 => Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", sym)),
                 1 => {
                     let nid = non_test[0].node.id;
-                    let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact, context_lines, compact)?;
+                    let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact, context_lines, compact, impact_conf_rank)?;
                     if include_similar {
                         self.attach_similar(&mut out, nid, similar_top_k)?;
                     }
@@ -136,7 +149,7 @@ impl McpServer {
                 }
 
                 if include_impact {
-                    self.append_impact_summary(&mut result, &n.name, file_path, &n.node_type)?;
+                    self.append_impact_summary(&mut result, &n.name, file_path, &n.node_type, impact_conf_rank)?;
                 }
 
                 if include_similar {
@@ -187,7 +200,8 @@ impl McpServer {
     }
 
     /// Lookup AST node by node_id.
-    pub(in crate::mcp::server) fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_tests: bool, include_impact: bool, context_lines: usize, compact: bool) -> Result<serde_json::Value> {
+    #[allow(clippy::too_many_arguments)] // flag-driven introspection: 7 independent display toggles + the impact-summary confidence floor; a struct would just relocate the same fields
+    pub(in crate::mcp::server) fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_tests: bool, include_impact: bool, context_lines: usize, compact: bool, min_confidence_rank: u8) -> Result<serde_json::Value> {
         let nf = queries::get_node_with_file_by_id(self.db.conn(), node_id)?
             .ok_or_else(|| anyhow!(
                 "Node {} not found in index. node_ids are rebuild-scoped — a reindex (file change, incremental update, or rebuild_index) may have renumbered nodes. Re-resolve by calling get_ast_node(symbol_name, file_path) or semantic_code_search to obtain a current node_id.",
@@ -248,7 +262,7 @@ impl McpServer {
         }
 
         if include_impact {
-            self.append_impact_summary(&mut result, &node.name, &file_path, &node.node_type)?;
+            self.append_impact_summary(&mut result, &node.name, &file_path, &node.node_type, min_confidence_rank)?;
         }
 
         Ok(result)
@@ -259,11 +273,18 @@ impl McpServer {
     /// `node_type` is required so that impact on non-function symbols (constant /
     /// struct / enum / trait / ...) with zero callers reports `risk_level: UNKNOWN`
     /// plus a warning, rather than a misleading LOW.
-    pub(in crate::mcp::server) fn append_impact_summary(&self, result: &mut serde_json::Value, symbol_name: &str, file_path: &str, node_type: &str) -> Result<()> {
+    pub(in crate::mcp::server) fn append_impact_summary(&self, result: &mut serde_json::Value, symbol_name: &str, file_path: &str, node_type: &str, min_confidence_rank: u8) -> Result<()> {
         let callers = queries::get_callers_with_route_info(
-            self.db.conn(), symbol_name, Some(file_path), 3
+            self.db.conn(), symbol_name, Some(file_path), 3, min_confidence_rank
         )?;
         let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
+        // Direct ambiguous callers folded out of the risk count by the floor —
+        // disclosed (not silently dropped) so a hidden real caller never
+        // under-states risk; min_confidence:"ambiguous" includes them.
+        let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
+            self.db.conn(), symbol_name, Some(file_path),
+            crate::graph::query::Direction::Callers, min_confidence_rank,
+        )?;
         let prod_callers: Vec<_> = callers.iter()
             .filter(|c| !is_test_symbol(&c.name, &c.file_path))
             .collect();
@@ -295,6 +316,9 @@ impl McpServer {
         }
         if warn_non_function {
             impact["warning"] = json!(crate::domain::NON_FUNCTION_IMPACT_WARNING);
+        }
+        if ambiguous_callers_excluded > 0 {
+            impact["ambiguous_callers_excluded"] = json!(ambiguous_callers_excluded);
         }
         result["impact"] = impact;
         Ok(())

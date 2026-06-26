@@ -42,6 +42,24 @@ pub(super) fn attach_truncation_flags(
     target["truncation_warning"] = json!(warning);
 }
 
+/// Disclose the by-name fan-out hidden by the confidence floor, instead of
+/// silently dropping it: when the seed had `ambiguous` direct edges below the
+/// requested `min_confidence`, add a count + how to reveal them. Silent when
+/// none were suppressed (clean symbol, or `min_confidence:"ambiguous"`).
+pub(super) fn attach_suppressed_ambiguous(
+    target: &mut serde_json::Value,
+    results: &crate::graph::query::CallGraphResult,
+) {
+    if results.suppressed_ambiguous == 0 {
+        return;
+    }
+    target["ambiguous_edges_hidden"] = json!(results.suppressed_ambiguous);
+    target["ambiguous_hint"] = json!(format!(
+        "{} low-confidence (ambiguous, by-name-collision) direct edge(s) hidden — the bare-name fan-out class (a method/function name shared by many defs, resolved to all of them). Re-query with min_confidence:\"ambiguous\" to include them.",
+        results.suppressed_ambiguous
+    ));
+}
+
 impl McpServer {
     pub(in crate::mcp::server) fn tool_get_call_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
         // Route mode: when route_path is set, dispatch to HTTP-chain tracer.
@@ -90,6 +108,17 @@ impl McpServer {
         let file_path = args["file_path"].as_str().filter(|s| !s.is_empty());
         let compact = args["compact"].as_bool().unwrap_or(false);
         let include_tests = args["include_tests"].as_bool().unwrap_or(false);
+        // Confidence floor (default 'inferred'): hide the ambiguous by-name
+        // fan-out from the default response so Claude Code isn't fed phantom
+        // call edges; min_confidence:"ambiguous" includes every edge. Validated
+        // here so a bad value errors loudly rather than silently passing all.
+        let min_conf_tier = match args["min_confidence"].as_str() {
+            None | Some("") => crate::domain::CONF_INFERRED,
+            Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+                anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+            })?,
+        };
+        let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -112,8 +141,8 @@ impl McpServer {
             }
         }
 
-        let results = crate::graph::query::get_call_graph(
-            self.db.conn(), function_name, direction, depth, file_path,
+        let results = crate::graph::query::get_call_graph_filtered(
+            self.db.conn(), function_name, direction, depth, file_path, min_conf_rank,
         )?;
 
         // If exact match returns empty (only seed node, no edges), try fuzzy name resolution
@@ -122,8 +151,8 @@ impl McpServer {
         if !(has_edges || (has_seed && file_path.is_some())) {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
-                    let results2 = crate::graph::query::get_call_graph(
-                        self.db.conn(), &resolved, direction, depth, file_path,
+                    let results2 = crate::graph::query::get_call_graph_filtered(
+                        self.db.conn(), &resolved, direction, depth, file_path, min_conf_rank,
                     )?;
                     return self.format_call_graph_response(&resolved, direction, &results2, compact, include_tests);
                 }
@@ -280,6 +309,7 @@ impl McpServer {
                 },
             });
             attach_truncation_flags(&mut rollup, results);
+            attach_suppressed_ambiguous(&mut rollup, results);
             return Ok(rollup);
         }
 
@@ -300,6 +330,7 @@ impl McpServer {
             result["test_callers_filtered"] = json!(test_callers_count);
         }
         attach_truncation_flags(&mut result, results);
+        attach_suppressed_ambiguous(&mut result, results);
         Ok(result)
     }
 }

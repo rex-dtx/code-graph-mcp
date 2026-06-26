@@ -1258,7 +1258,10 @@ fn test_cli_callgraph_import_disambiguates_same_name() {
     drop(db);
 
     // run() must call EXACTLY ONE save — the imported db.save — not fan out.
-    let (stdout, _, code) = run_cli(&project, &["callgraph", "run", "--json"]);
+    // The surviving edge is `ambiguous` (target name `save` has 2 same-language
+    // defs), so probe with --min-confidence ambiguous: the default floor
+    // (inferred) hides the by-name class this resolution-layer test asserts on.
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "run", "--min-confidence", "ambiguous", "--json"]);
     assert_eq!(code, 0, "callgraph run should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let results = v["results"].as_array().expect("results array");
@@ -1270,7 +1273,7 @@ fn test_cli_callgraph_import_disambiguates_same_name() {
         "the surviving save edge must be db.save (imported), not cache.save; got: {stdout}");
 
     // cache.save must have NO caller — `run` imports from db, not cache.
-    let (stdout2, _, _) = run_cli(&project, &["callgraph", "save", "--file", "src/cache.py", "--json"]);
+    let (stdout2, _, _) = run_cli(&project, &["callgraph", "save", "--file", "src/cache.py", "--min-confidence", "ambiguous", "--json"]);
     let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
     let cache_results = v2["results"].as_array().cloned().unwrap_or_default();
     assert!(!cache_results.iter().any(|r| r["name"] == "run"),
@@ -1297,7 +1300,9 @@ fn test_cli_callgraph_no_import_tie_keeps_both() {
     code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
     drop(db);
 
-    let (stdout, _, code) = run_cli(&project, &["callgraph", "main", "--json"]);
+    // Tied `thing` edges are `ambiguous` (2 same-language defs); probe with
+    // --min-confidence ambiguous since the default floor hides that class.
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "main", "--min-confidence", "ambiguous", "--json"]);
     assert_eq!(code, 0, "callgraph main should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let results = v["results"].as_array().expect("results array");
@@ -1332,7 +1337,9 @@ fn test_cli_callgraph_prune_keeps_qualified_call_to_same_name() {
     code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
     drop(db);
 
-    let (stdout, _, code) = run_cli(&project, &["callgraph", "run", "--json"]);
+    // Both surviving edges are `ambiguous` (`save` has 2 same-language defs);
+    // probe with --min-confidence ambiguous since the default floor hides them.
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "run", "--min-confidence", "ambiguous", "--json"]);
     assert_eq!(code, 0, "callgraph run should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let results = v["results"].as_array().expect("results array");
@@ -1344,6 +1351,87 @@ fn test_cli_callgraph_prune_keeps_qualified_call_to_same_name() {
         "the bare imported call must keep run→db.save; got: {stdout}");
     assert!(save_files.contains("src/cache.py"),
         "the qualified cache.save() call must NOT be false-pruned; got: {stdout}");
+}
+
+#[test]
+fn test_cli_callgraph_hides_ambiguous_fanout_by_default() {
+    // New default (v0.76): the confidence floor `inferred` hides the `ambiguous`
+    // by-name fan-out from callgraph output so the agent isn't fed phantom edges
+    // (a method name shared by many defs resolving to all of them). Same fixture
+    // as the tie test: `main` calls `thing()` with two `thing` defs, so both call
+    // edges are ambiguous. Default view: neither shown, suppressed count
+    // disclosed. --min-confidence ambiguous: both restored.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.rs"), "pub fn thing() -> i32 { 1 }\n").unwrap();
+    std::fs::write(src.join("b.rs"), "pub fn thing() -> i32 { 2 }\n").unwrap();
+    std::fs::write(src.join("main.rs"),
+        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    // Default floor: ambiguous `thing` edges hidden, disclosure present.
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "main", "--json"]);
+    assert_eq!(code, 0, "callgraph main should succeed; {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let results = v["results"].as_array().expect("results array");
+    assert!(!results.iter().any(|r| r["name"] == "thing"),
+        "default floor must hide the ambiguous `thing` fan-out; got: {stdout}");
+    assert_eq!(v["ambiguous_edges_hidden"].as_u64(), Some(2),
+        "default view must disclose the 2 hidden ambiguous edges; got: {stdout}");
+
+    // Opt-in: --min-confidence ambiguous restores both edges, nothing suppressed.
+    let (stdout2, _, _) = run_cli(&project, &["callgraph", "main", "--min-confidence", "ambiguous", "--json"]);
+    let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
+    let shown = v2["results"].as_array().expect("results array")
+        .iter().filter(|r| r["name"] == "thing").count();
+    assert_eq!(shown, 2, "--min-confidence ambiguous must show both tied edges; got: {stdout2}");
+    assert!(v2.get("ambiguous_edges_hidden").is_none(),
+        "nothing is suppressed at the ambiguous floor; got: {stdout2}");
+}
+
+#[test]
+fn test_cli_impact_folds_ambiguous_callers_but_discloses() {
+    // New default (v0.76): impact folds the ambiguous by-name caller fan-out out
+    // of the risk count, but DISCLOSES the excluded count so a folded real caller
+    // never silently under-states risk (unlike callgraph, an ambiguous caller may
+    // be a true dependency). Fixture: `save` is defined in two files, so any edge
+    // into it is classified ambiguous; `run` calls the imported db.save.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("db.py"), "def save(r):\n    return True\n").unwrap();
+    std::fs::write(src.join("cache.py"), "def save(i):\n    return True\n").unwrap();
+    std::fs::write(src.join("app.py"),
+        "from db import save\n\ndef run():\n    return save({\"id\": 1})\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    // Default floor: the ambiguous caller `run` is folded out of the count, but
+    // the exclusion is disclosed. --file disambiguates so the exact-name guard
+    // doesn't fire.
+    let (stdout, _, code) = run_cli(&project, &["impact", "save", "--file", "src/db.py", "--json"]);
+    assert_eq!(code, 0, "impact should succeed; {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["total_callers"].as_u64(), Some(0),
+        "ambiguous caller folded out of the risk count by default; got: {stdout}");
+    assert_eq!(v["ambiguous_callers_excluded"].as_u64(), Some(1),
+        "the folded caller must be disclosed, not silently dropped; got: {stdout}");
+
+    // Opt-in: --min-confidence ambiguous counts the ambiguous caller.
+    let (stdout2, _, _) = run_cli(&project, &["impact", "save", "--file", "src/db.py", "--min-confidence", "ambiguous", "--json"]);
+    let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
+    assert_eq!(v2["total_callers"].as_u64(), Some(1),
+        "--min-confidence ambiguous counts the ambiguous caller; got: {stdout2}");
+    assert!(v2.get("ambiguous_callers_excluded").is_none(),
+        "nothing excluded at the ambiguous floor; got: {stdout2}");
 }
 
 // ============================================================

@@ -59,7 +59,8 @@ impl ToolRegistry {
                         "file_path": { "type": "string", "description": "Disambiguate same-name functions" },
                         "include_middleware": { "type": "boolean", "description": "For route_path mode: include downstream middleware/calls (default true)" },
                         "compact": { "type": "boolean", "description": "Compact mode: name+file+depth only (saves tokens)" },
-                        "include_tests": { "type": "boolean", "description": "Include test callers (default false)" }
+                        "include_tests": { "type": "boolean", "description": "Include test callers (default false)" },
+                        "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "Min edge confidence to FOLLOW (default 'inferred'): hides 'ambiguous' by-name fan-out — a method name shared by many defs that resolves to all of them (e.g. `.execute()` → every execute). Pass 'ambiguous' to include every edge; 'extracted' for same-file-precise only. `ambiguous_edges_hidden` in the response counts what was suppressed." }
                     }
                 }),
             },
@@ -75,6 +76,7 @@ impl ToolRegistry {
                         "include_references": { "type": "boolean", "description": "Include callers/callees (default false)" },
                         "include_tests": { "type": "boolean", "description": "Include test callers in references (default false)" },
                         "include_impact": { "type": "boolean", "description": "Include impact summary: risk level, caller count, affected files/routes (default false)" },
+                        "min_confidence": { "type": "string", "enum": ["extracted", "inferred", "ambiguous"], "description": "For include_impact: min caller-edge confidence counted toward risk (default 'inferred'). Folds the ambiguous by-name fan-out (a name shared by many defs) out of the blast radius; pass 'ambiguous' to count every resolved caller. `impact.ambiguous_callers_excluded` discloses what was folded." },
                         "include_similar": { "type": "boolean", "description": "Include embedding-similar nodes (default false; requires embed-model + indexed embeddings)" },
                         "similar_top_k": { "type": "number", "description": "With include_similar: max similar results (default 5)" },
                         "context_lines": { "type": "number", "description": "Surrounding source lines to include (default 0, default 3 when using node_id)" },

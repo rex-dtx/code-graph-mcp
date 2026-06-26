@@ -60,16 +60,24 @@ pub struct CallerWithRouteInfo {
 }
 
 /// Get all callers of a symbol, annotating any that are HTTP route handlers.
+///
+/// `min_confidence_rank` gates which caller edges are followed (per
+/// `domain::confidence_rank`: extracted=2, inferred=1, ambiguous=0). Impact
+/// surfaces pass `inferred` to fold the ambiguous by-name fan-out out of the
+/// risk assessment; pass `0` (ambiguous) to traverse every caller edge (the
+/// historical behavior — used by callers that are not risk assessment, e.g.
+/// `show`).
 pub fn get_callers_with_route_info(
     conn: &Connection,
     symbol_name: &str,
     file_path: Option<&str>,
     max_depth: i32,
+    min_confidence_rank: u8,
 ) -> Result<Vec<CallerWithRouteInfo>> {
-    use crate::graph::query::get_call_graph;
+    use crate::graph::query::get_call_graph_filtered;
     use crate::domain::REL_ROUTES_TO;
 
-    let callers = get_call_graph(conn, symbol_name, "callers", max_depth, file_path)?;
+    let callers = get_call_graph_filtered(conn, symbol_name, "callers", max_depth, file_path, min_confidence_rank)?;
 
     if callers.nodes.is_empty() {
         return Ok(vec![]);
@@ -254,7 +262,7 @@ mod tests {
         // caller (node 2) is also a route handler
         conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (2, 2, 'routes_to', '{\"method\":\"GET\",\"path\":\"/api/test\"}')", []).unwrap();
 
-        let results = get_callers_with_route_info(db.conn(), "handler", None, 3).unwrap();
+        let results = get_callers_with_route_info(db.conn(), "handler", None, 3, 0).unwrap();
         assert!(!results.is_empty());
         // Verify route info is attached to the caller that is a route handler
         assert!(results.iter().any(|r| r.route_info.is_some()));

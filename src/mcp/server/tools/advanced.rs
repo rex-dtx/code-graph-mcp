@@ -151,6 +151,18 @@ impl McpServer {
             .unwrap_or(3)
             .clamp(1, 20) as i32;
         let file_path = args.get("file_path").and_then(|v| v.as_str());
+        // Confidence floor for caller traversal (default 'inferred'): fold the
+        // ambiguous by-name fan-out out of the blast radius so risk isn't
+        // inflated by phantom callers; the excluded count is disclosed below so a
+        // folded real caller never silently under-states risk. Parity with the
+        // `impact` CLI subcommand.
+        let min_conf_tier = match args["min_confidence"].as_str() {
+            None | Some("") => crate::domain::CONF_INFERRED,
+            Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+                anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+            })?,
+        };
+        let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
         // Disambiguate: check if symbol matches multiple distinct nodes (cross-file
         // OR same-file overloads). Message + suggestion shape shared with the CLI
@@ -168,7 +180,7 @@ impl McpServer {
 
         let mut resolved_name = symbol_name.to_string();
         let mut callers = queries::get_callers_with_route_info(
-            self.db.conn(), symbol_name, file_path, depth
+            self.db.conn(), symbol_name, file_path, depth, min_conf_rank
         )?;
 
         // Fuzzy fallback: if no callers found, try fuzzy name resolution
@@ -177,7 +189,7 @@ impl McpServer {
                 FuzzyResolution::Unique(resolved) => {
                     resolved_name = resolved;
                     callers = queries::get_callers_with_route_info(
-                        self.db.conn(), &resolved_name, file_path, depth
+                        self.db.conn(), &resolved_name, file_path, depth, min_conf_rank
                     )?;
                 }
                 FuzzyResolution::Ambiguous(suggestions) => {
@@ -271,6 +283,20 @@ impl McpServer {
         });
         if let Some(warning) = impact.type_warning {
             result["warning"] = json!(warning);
+        }
+        // Disclose the by-name callers folded out of the risk count so the agent
+        // knows the blast radius may be larger and can re-query with
+        // min_confidence:"ambiguous". Explicitly attached (not a struct field).
+        let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
+            self.db.conn(), &resolved_name, file_path,
+            crate::graph::query::Direction::Callers, min_conf_rank,
+        )?;
+        if ambiguous_callers_excluded > 0 {
+            result["ambiguous_callers_excluded"] = json!(ambiguous_callers_excluded);
+            result["ambiguous_note"] = json!(format!(
+                "{} direct caller(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-query with min_confidence:\"ambiguous\" to include them.",
+                ambiguous_callers_excluded
+            ));
         }
         Ok(result)
     }

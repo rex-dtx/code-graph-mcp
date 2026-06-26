@@ -61,6 +61,13 @@ pub struct CallGraphResult {
     pub effective_max_depth: i32,
     /// Depth originally requested by the caller (pre-clamp).
     pub requested_max_depth: i32,
+    /// Count of the seed symbol's DIRECT edges (in the queried direction(s))
+    /// pruned because their confidence ranked below the requested
+    /// `min_confidence` floor — the by-name `ambiguous` fan-out class. Lets a
+    /// surface disclose the hidden edges and point at `--min-confidence ambiguous`
+    /// (CLI) / `min_confidence:"ambiguous"` (MCP) instead of silently dropping
+    /// them. Always 0 when the floor is `ambiguous` (rank 0 — nothing is below it).
+    pub suppressed_ambiguous: usize,
 }
 
 /// Traverse the call graph starting from a function by name.
@@ -69,6 +76,12 @@ pub struct CallGraphResult {
 /// `depth` controls the maximum recursion depth (clamped to `CALL_GRAPH_MAX_DEPTH`;
 /// `CallGraphResult::depth_capped` flags when the clamp fires).
 /// `file_path` optionally disambiguates when multiple functions share the same name.
+/// Back-compat entry point: traverses the full call graph with NO confidence
+/// filtering — every edge is followed, including the `ambiguous` bare-name
+/// fan-out class. Equivalent to `get_call_graph_filtered(.., 0)`. Callers that
+/// want the low-noise default (hide ambiguous fan-out) call `_filtered` with a
+/// higher rank; kept as a thin wrapper so existing callers (trace, route
+/// resolution) and their tests are unchanged.
 pub fn get_call_graph(
     conn: &Connection,
     function_name: &str,
@@ -76,26 +89,60 @@ pub fn get_call_graph(
     max_depth: i32,
     file_path: Option<&str>,
 ) -> Result<CallGraphResult> {
+    // rank 0 = ambiguous floor = follow every edge (historical behavior).
+    get_call_graph_filtered(conn, function_name, direction, max_depth, file_path, 0)
+}
+
+/// Traverse the call graph, following only edges whose resolution confidence
+/// ranks at or above `min_confidence_rank` (per `domain::confidence_rank`:
+/// extracted=2, inferred=1, ambiguous=0). The filter is applied INSIDE the
+/// recursive CTE, so a sub-threshold edge is never expanded — this is what stops
+/// the depth-N blowup from `ambiguous` bare-name edges (e.g. a `.execute()` call
+/// resolving to every same-named def) rather than post-filtering after the
+/// fan-out already exploded. `CallGraphResult::suppressed_ambiguous` reports how
+/// many direct seed edges the floor pruned.
+pub fn get_call_graph_filtered(
+    conn: &Connection,
+    function_name: &str,
+    direction: &str,
+    max_depth: i32,
+    file_path: Option<&str>,
+    min_confidence_rank: u8,
+) -> Result<CallGraphResult> {
     let requested_max_depth = max_depth;
     let effective_max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH);
     let depth_capped = max_depth > CALL_GRAPH_MAX_DEPTH;
 
     let (nodes, limit_hit) = match direction {
-        "callees" => query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callees)?,
-        "callers" => query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callers)?,
+        "callees" => query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callees, min_confidence_rank)?,
+        "callers" => query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callers, min_confidence_rank)?,
         "both" => {
-            let (callees, c1) = query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callees)?;
-            let (callers, c2) = query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callers)?;
+            let (callees, c1) = query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callees, min_confidence_rank)?;
+            let (callers, c2) = query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callers, min_confidence_rank)?;
             (merge_results(callees, callers), c1 || c2)
         }
         other => return Err(anyhow!("invalid direction '{}': must be callers, callees, or both", other)),
     };
+
+    // Disclose, rather than silently drop, the pruned fan-out: count the seed's
+    // direct sub-threshold edges in the queried direction(s).
+    let suppressed_ambiguous = match direction {
+        "callees" => count_suppressed_seed_edges(conn, function_name, file_path, Direction::Callees, min_confidence_rank)?,
+        "callers" => count_suppressed_seed_edges(conn, function_name, file_path, Direction::Callers, min_confidence_rank)?,
+        "both" => {
+            count_suppressed_seed_edges(conn, function_name, file_path, Direction::Callees, min_confidence_rank)?
+                + count_suppressed_seed_edges(conn, function_name, file_path, Direction::Callers, min_confidence_rank)?
+        }
+        _ => 0,
+    };
+
     Ok(CallGraphResult {
         nodes,
         limit_hit,
         depth_capped,
         effective_max_depth,
         requested_max_depth,
+        suppressed_ambiguous,
     })
 }
 
@@ -108,6 +155,7 @@ fn query_direction(
     max_depth: i32,
     file_path: Option<&str>,
     direction: Direction,
+    min_confidence_rank: u8,
 ) -> Result<(Vec<CallGraphNode>, bool)> {
     let max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH); // Hard cap to prevent CTE blowup on highly connected graphs
     // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
@@ -117,13 +165,21 @@ fn query_direction(
     // In the recursive step:
     // - callees: follow edges forward (source_id = current, target_id = next)
     // - callers: follow edges backward (target_id = current, source_id = next)
+    // Confidence gate (?5): only FOLLOW edges whose resolution-confidence rank
+    // is >= the requested floor. The CASE mirrors `domain::confidence_rank`
+    // (extracted=2, inferred=1, ambiguous/unknown=0) — a test pins the two in
+    // sync. Spliced into the recursive step's edge JOIN so a sub-threshold edge
+    // is pruned BEFORE it expands, which is what kills the ambiguous fan-out
+    // (one `.execute()` → 56 same-named defs) at the source instead of after.
+    let conf_gate =
+        "AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) >= ?5";
     let (edge_join, next_node_join) = match direction {
         Direction::Callees => (
-            "JOIN edges e ON e.source_id = cg.node_id AND e.relation = ?4",
+            format!("JOIN edges e ON e.source_id = cg.node_id AND e.relation = ?4 {conf_gate}"),
             "JOIN nodes t ON t.id = e.target_id",
         ),
         Direction::Callers => (
-            "JOIN edges e ON e.target_id = cg.node_id AND e.relation = ?4",
+            format!("JOIN edges e ON e.target_id = cg.node_id AND e.relation = ?4 {conf_gate}"),
             "JOIN nodes t ON t.id = e.source_id",
         ),
     };
@@ -196,11 +252,53 @@ fn query_direction(
     };
 
     let results: Vec<CallGraphNode> = stmt
-        .query_map(rusqlite::params![function_name, file_path_param, max_depth, REL_CALLS], map_row)?
+        .query_map(rusqlite::params![function_name, file_path_param, max_depth, REL_CALLS, min_confidence_rank as i64], map_row)?
         .collect::<Result<Vec<_>, _>>()?;
 
     let limit_hit = results.len() == CALL_GRAPH_ROW_LIMIT;
     Ok((results, limit_hit))
+}
+
+/// Count the seed symbol's DIRECT edges (in `direction`) whose confidence rank
+/// is below `min_confidence_rank` — exactly the edges `query_direction`'s
+/// recursive step pruned one level out. Mirrors the CTE's seed selection
+/// (`name` + optional `file_path`) and the same rank CASE, so the number is the
+/// true count of hidden direct fan-out. Returns 0 for a rank-0 (ambiguous) floor
+/// — nothing ranks below it, so no query is run.
+///
+/// `pub` so impact surfaces can disclose how many ambiguous callers their
+/// confidence floor excluded from the risk assessment (impact folds ambiguous
+/// by default like callgraph, but there a hidden edge could be a real caller, so
+/// the count must be surfaced — risk is never silently under-stated).
+pub fn count_suppressed_seed_edges(
+    conn: &Connection,
+    function_name: &str,
+    file_path: Option<&str>,
+    direction: Direction,
+    min_confidence_rank: u8,
+) -> Result<usize> {
+    if min_confidence_rank == 0 {
+        return Ok(0);
+    }
+    // Callees: the seed is the edge SOURCE (edges out). Callers: the seed is the
+    // edge TARGET (edges in). Matches `query_direction`'s edge orientation.
+    let seed_col = match direction {
+        Direction::Callees => "source_id",
+        Direction::Callers => "target_id",
+    };
+    let sql = format!(
+        "SELECT COUNT(*) FROM edges e
+         JOIN nodes n ON n.id = e.{seed_col}
+         JOIN files f ON f.id = n.file_id
+         WHERE n.name = ?1 AND (?2 IS NULL OR f.path = ?2) AND e.relation = ?3
+           AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) < ?4"
+    );
+    let count: i64 = conn.query_row(
+        &sql,
+        rusqlite::params![function_name, file_path, REL_CALLS, min_confidence_rank as i64],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
 }
 
 /// Merge callee and caller results, deduplicating by (node_id, direction) and keeping the entry
@@ -514,5 +612,74 @@ mod tests {
         assert!(!small.depth_capped, "depth=5 must not trip the cap");
         assert_eq!(small.requested_max_depth, 5);
         assert_eq!(small.effective_max_depth, 5);
+    }
+
+    fn set_edge_confidence(conn: &Connection, src: i64, tgt: i64, conf: &str) {
+        conn.execute(
+            "UPDATE edges SET confidence = ?3 WHERE source_id = ?1 AND target_id = ?2",
+            rusqlite::params![src, tgt, conf],
+        )
+        .unwrap();
+    }
+
+    /// The confidence filter prunes the recursive CTE traversal: at the default
+    /// threshold (inferred, rank 1) an `ambiguous` edge — the bare-name fan-out
+    /// class where a `.execute()` call resolves to every same-named def — is NOT
+    /// followed, so it drops out of both directions, while `inferred`/`extracted`
+    /// edges remain. Lowering the threshold to `ambiguous` (rank 0) restores the
+    /// full graph. `suppressed_ambiguous` reports how many direct seed edges were
+    /// hidden so the surface can point the user at `--min-confidence ambiguous`.
+    #[test]
+    fn test_min_confidence_filters_ambiguous_edges() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: Some("typescript".into()),
+        }).unwrap();
+
+        let s = insert_node(conn, &node("S", fid)).unwrap();
+        let b = insert_node(conn, &node("B", fid)).unwrap();
+        let c = insert_node(conn, &node("C", fid)).unwrap();
+        let p = insert_node(conn, &node("P", fid)).unwrap();
+
+        // S calls B (inferred — kept) and C (ambiguous — fan-out noise, hidden).
+        insert_edge(conn, s, b, REL_CALLS, None).unwrap();
+        insert_edge(conn, s, c, REL_CALLS, None).unwrap();
+        // P calls S, ambiguous — an ambiguous CALLER, hidden in the callers view.
+        insert_edge(conn, p, s, REL_CALLS, None).unwrap();
+        set_edge_confidence(conn, s, b, crate::domain::CONF_INFERRED);
+        set_edge_confidence(conn, s, c, crate::domain::CONF_AMBIGUOUS);
+        set_edge_confidence(conn, p, s, crate::domain::CONF_AMBIGUOUS);
+
+        let inferred = crate::domain::confidence_rank(crate::domain::CONF_INFERRED);
+        let show_all = crate::domain::confidence_rank(crate::domain::CONF_AMBIGUOUS);
+
+        // Callees at default threshold: B kept, C (ambiguous) pruned.
+        let callees = get_call_graph_filtered(conn, "S", "callees", 2, None, inferred).unwrap();
+        let cn: Vec<&str> = callees.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(cn.contains(&"B"), "inferred callee kept at default threshold");
+        assert!(!cn.contains(&"C"), "ambiguous callee pruned at default threshold");
+        assert_eq!(callees.suppressed_ambiguous, 1, "one ambiguous direct callee hidden");
+
+        // Callers at default threshold: ambiguous caller P pruned.
+        let callers = get_call_graph_filtered(conn, "S", "callers", 2, None, inferred).unwrap();
+        let rn: Vec<&str> = callers.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(!rn.contains(&"P"), "ambiguous caller pruned at default threshold");
+        assert_eq!(callers.suppressed_ambiguous, 1, "one ambiguous direct caller hidden");
+
+        // Lowering the threshold to ambiguous restores everything; nothing suppressed.
+        let all = get_call_graph_filtered(conn, "S", "both", 2, None, show_all).unwrap();
+        let an: Vec<&str> = all.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(an.contains(&"C"), "ambiguous callee shown when threshold lowered to ambiguous");
+        assert!(an.contains(&"P"), "ambiguous caller shown when threshold lowered to ambiguous");
+        assert_eq!(all.suppressed_ambiguous, 0, "no edges below an ambiguous threshold");
+
+        // Back-compat: the bare get_call_graph wrapper shows all (rank 0).
+        let compat = get_call_graph(conn, "S", "callees", 2, None).unwrap();
+        let kn: Vec<&str> = compat.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(kn.contains(&"C"), "bare get_call_graph preserves show-all behavior");
     }
 }
