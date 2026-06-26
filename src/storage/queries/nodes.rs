@@ -535,6 +535,38 @@ pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Resul
     Ok(all_results)
 }
 
+/// Batch-fetch a `node_id -> file path` map for the given IDs, chunked under
+/// SQLite's bind limit (`MAX_IN_PARAMS` per IN-clause). Returns only the path
+/// (not the full `NodeWithFile`) for callers that just need a proximity hint —
+/// notably `resolve_pending_calls`, where a single source function with N
+/// unresolved calls yields N pending rows sharing one `source_id`, so the raw
+/// list can be ~2× the node count and a single unchunked `IN (...)` blows past
+/// SQLite's variable cap. IDs absent from the DB are omitted from the map.
+pub fn get_node_paths_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i64, String>> {
+    let mut map = HashMap::new();
+    if node_ids.is_empty() {
+        return Ok(map);
+    }
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!(
+            "SELECT n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, path) = row?;
+            map.insert(id, path);
+        }
+    }
+    Ok(map)
+}
+
 /// Find nodes that are missing context strings (likely from a failed Phase 3).
 /// Excludes external pseudo-nodes which never have context strings.
 pub fn get_nodes_missing_context(conn: &Connection) -> Result<Vec<i64>> {
@@ -665,6 +697,42 @@ mod tests {
         assert!(names.contains(&"alpha"));
         assert!(names.contains(&"beta"));
         assert!(names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn test_get_node_paths_by_ids_crosses_chunk_boundary() {
+        // Regression for issue #30: resolve_pending_calls built one IN(...) over
+        // every (un-deduped) source_id, exceeding SQLite's bind cap on large
+        // repos. The chunked helper must return every path across the
+        // MAX_IN_PARAMS boundary in a single logical lookup.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "src/big.rs".into(), blake3_hash: "h".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+
+        let n = MAX_IN_PARAMS + 1; // force >1 chunk
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = insert_node(conn, &NodeRecord {
+                file_id: fid, node_type: "function".into(), name: format!("f{i}"),
+                qualified_name: None, start_line: i as i64 + 1, end_line: i as i64 + 1,
+                code_content: String::new(), signature: None, doc_comment: None,
+                context_string: None, name_tokens: None, return_type: None,
+                param_types: None, is_test: false,
+            }).unwrap();
+            ids.push(id);
+        }
+
+        let map = get_node_paths_by_ids(conn, &ids).unwrap();
+        assert_eq!(map.len(), n, "all ids across the chunk boundary must resolve");
+        for id in &ids {
+            assert_eq!(map.get(id).map(String::as_str), Some("src/big.rs"));
+        }
+
+        // Empty input is a no-op, not an error.
+        assert!(get_node_paths_by_ids(conn, &[]).unwrap().is_empty());
     }
 
     #[test]
