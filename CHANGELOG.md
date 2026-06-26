@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.76.3 — Backfill robustness follow-ups (code review)
+
+Follow-ups to v0.76.2 from a code review. No schema, index-format, or
+public-interface change.
+
+### Fixed
+- **`code-graph-mcp incremental-index` no longer hangs when a node can't be
+  embedded.** Both embedding-backfill loops (the long-lived server's and the CLI's)
+  now skip past a node that fails to vectorize instead of re-fetching it forever: the
+  CLI loop, which only stopped on an empty result, previously spun indefinitely on a
+  single un-embeddable node, and the server loop starved the embeddable nodes queued
+  behind it.
+
+### Internal
+- FK-recovery detection now matches the full error cause chain (guarded by a test),
+  so a future error-wrapping change can't silently bypass the index rebuild.
+- Plugin auto-update tests no longer depend on the host having `curl`/`tar`.
+
 ## v0.76.2 — Indexing & embedding robustness (audit + code review)
 
 Robustness hardening of the incremental-index / embedding / install-update
