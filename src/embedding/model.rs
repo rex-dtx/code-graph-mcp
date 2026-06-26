@@ -82,6 +82,13 @@ mod inner {
         /// Marker file recording which model content the cache dir holds.
         const MODEL_ID_MARKER: &'static str = ".model-id";
 
+        /// Files the loader (`load_model_data`) reads BEYOND the hash-pinned weights.
+        /// A cache dir with correct `model.safetensors` but missing either of these is
+        /// unusable — `try_load` fails and `load()` degrades to FTS5-only. They are
+        /// checked before the `.model-id` marker is written so a partial extraction
+        /// (killed after the weights but before these) can never be blessed as current.
+        const REQUIRED_COMPANION_FILES: [&'static str; 2] = ["tokenizer.json", "config.json"];
+
         fn hash_file_blake3(path: &std::path::Path) -> Result<String> {
             use std::io::Read as IoRead;
             let mut hasher = blake3::Hasher::new();
@@ -110,19 +117,36 @@ mod inner {
                     actual, expected
                 );
             }
+            // Correct weights are necessary but NOT sufficient — the loader also needs the
+            // companion files. Refuse to write the marker (which blesses the dir as current
+            // and short-circuits re-download) until the dir is complete, so a partial
+            // extraction can't pin a half-populated, unloadable cache.
+            for f in Self::REQUIRED_COMPANION_FILES {
+                if !dir.join(f).exists() {
+                    let _ = std::fs::remove_file(dir.join(Self::MODEL_ID_MARKER));
+                    anyhow::bail!("model dir incomplete: missing {} (partial download?) — rejected", f);
+                }
+            }
             std::fs::write(dir.join(Self::MODEL_ID_MARKER), expected)?;
             Ok(())
         }
 
         /// Version/identity-aware cache check (testable core; `expected` is the
         /// blake3 the running binary requires). True iff the cached weights are
-        /// present AND match. A marker hit short-circuits; a missing marker
-        /// (pre-v0.50 install) triggers a one-time hash, writing the marker on
-        /// match. Unreadable file → treat as current (never churn-redownload on
-        /// a flaky FS; load() will surface the real error).
+        /// present, match, AND the loader's companion files are present. A marker hit
+        /// short-circuits the hash (but still re-checks companions, so a dir that LOSES
+        /// tokenizer.json/config.json after blessing — external mutation / AV quarantine —
+        /// is reported not-current and re-downloaded instead of stranding FTS5-only). A
+        /// missing marker (pre-v0.50 install) triggers a one-time hash, writing the marker
+        /// on match. Unreadable weights → treat as current (never churn-redownload on a
+        /// flaky FS; load() surfaces the real error).
         pub fn cached_model_matches(dir: &std::path::Path, expected: &str) -> bool {
             let weights = dir.join("model.safetensors");
             if !weights.exists() {
+                return false;
+            }
+            // "Current" must imply "loadable": a complete dir needs the companions too.
+            if !Self::REQUIRED_COMPANION_FILES.iter().all(|f| dir.join(f).exists()) {
                 return false;
             }
             let marker = dir.join(Self::MODEL_ID_MARKER);
@@ -131,6 +155,8 @@ mod inner {
             }
             match Self::hash_file_blake3(&weights) {
                 Ok(h) if h == expected => {
+                    // Companions already confirmed present above — safe to bless this
+                    // pre-marker (pre-v0.50) cache by writing the one-time marker.
                     let _ = std::fs::write(&marker, expected);
                     true
                 }
@@ -155,6 +181,107 @@ mod inner {
                 "https://github.com/sdsrss/code-graph-mcp/releases/download/v{}/models.tar.gz",
                 version
             )
+        }
+
+        /// Unpack an in-memory model tar.gz into `dest_dir` ATOMICALLY: extract to a
+        /// per-process staging dir, verify the weights hash (`expected`) AND companion-file
+        /// completeness, then rename into place (rolling the previous cache back on a failed
+        /// promote). Returns Err WITHOUT mutating `dest_dir` on any failure — bad hash,
+        /// incomplete archive, or a path-traversal entry — so a partial/poisoned download can
+        /// never replace a good cache, and a kill mid-extraction leaves only the staging dir.
+        ///
+        /// A testable seam: production passes `MODEL_CONTENT_BLAKE3`; tests pass the blake3 of
+        /// their fixture weights so the success-promote path can be exercised without the real
+        /// (un-forgeable-hash) model. `pub` only so the sibling test module can drive it.
+        pub(crate) fn extract_and_promote(body: &[u8], dest_dir: &std::path::Path, expected: &str) -> Result<()> {
+            let parent = dest_dir.parent()
+                .ok_or_else(|| anyhow::anyhow!("model cache dir has no parent: {:?}", dest_dir))?;
+            std::fs::create_dir_all(parent)?;
+
+            // GC orphaned staging/old dirs from prior runs killed abnormally. StagingGuard
+            // (below) only fires on a graceful unwind — a SIGKILL/OOM-kill/power-loss, or a
+            // release-build panic (`panic = "abort"` skips Drop), leaves a model-sized dir
+            // with no other reclaimer, accumulating across version bumps. PID-liveness isn't
+            // portable here, so use age: a staging/old dir older than this threshold cannot be
+            // an in-flight concurrent download (those complete in seconds), so removing it is
+            // safe even while another instance is mid-download.
+            const ORPHAN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+            if let Ok(rd) = std::fs::read_dir(parent) {
+                let now = std::time::SystemTime::now();
+                for ent in rd.flatten() {
+                    let name = ent.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with(".models-staging.") || name.starts_with(".models-old.") {
+                        let orphaned = ent.metadata().ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| now.duration_since(t).ok())
+                            .is_some_and(|age| age > ORPHAN_MAX_AGE);
+                        if orphaned {
+                            let _ = std::fs::remove_dir_all(ent.path());
+                        }
+                    }
+                }
+            }
+
+            let staging = parent.join(format!(".models-staging.{}", std::process::id()));
+
+            // RAII: always remove the staging dir on any exit (error OR after a successful
+            // rename, where it no longer exists and the removal harmlessly no-ops). The
+            // PID-scoped name also isolates concurrent multi-instance downloads so they can't
+            // interleave writes into one shared dir and tear the weights.
+            struct StagingGuard<'a>(&'a std::path::Path);
+            impl Drop for StagingGuard<'_> {
+                fn drop(&mut self) { let _ = std::fs::remove_dir_all(self.0); }
+            }
+            let _ = std::fs::remove_dir_all(&staging); // clear any aborted prior staging
+            std::fs::create_dir_all(&staging)?;
+            let _staging_guard = StagingGuard(&staging);
+
+            // Extract tar.gz with path traversal protection
+            let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(body));
+            let mut archive = tar::Archive::new(gz);
+            archive.set_overwrite(true);
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?;
+                // Reject entries with path traversal components
+                if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    anyhow::bail!("Tar entry contains path traversal: {:?}", path);
+                }
+                entry.unpack_in(&staging)?;
+            }
+
+            // Content verification against the pin. The release also publishes
+            // models.tar.gz.sha256, but that asset only self-validates the bundle — a swapped
+            // GitHub release asset would ship a matching .sha256. The binary pinning the
+            // expected weights hash is the only check the attacker can't ship alongside.
+            // verify_model_dir ALSO enforces companion-file completeness in staging.
+            Self::verify_model_dir(&staging, expected)?;
+
+            // Write version marker (blake3 of tarball for cache invalidation)
+            let hash = blake3::hash(body);
+            std::fs::write(staging.join(".version"), hash.to_hex().as_str())?;
+
+            // Atomically promote staging → dest_dir. rename onto a non-empty dir fails
+            // (ENOTEMPTY), so move any existing cache aside first. The brief window where
+            // dest_dir is absent is safe: a concurrent reader just sees no model and runs
+            // FTS5-only until the next call. On promote failure, roll the old dir back so we
+            // never leave the cache with NO model.
+            if dest_dir.exists() {
+                let old = parent.join(format!(".models-old.{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&old);
+                std::fs::rename(dest_dir, &old)?;
+                match std::fs::rename(&staging, dest_dir) {
+                    Ok(()) => { let _ = std::fs::remove_dir_all(&old); }
+                    Err(e) => {
+                        let _ = std::fs::rename(&old, dest_dir); // restore previous cache
+                        return Err(anyhow::Error::from(e).context("promoting staged model into cache"));
+                    }
+                }
+            } else {
+                std::fs::rename(&staging, dest_dir)?;
+            }
+            Ok(())
         }
 
         /// Download model tarball from URL with timeout, extract to dest_dir.
@@ -184,31 +311,8 @@ mod inner {
                 .take(200 * 1024 * 1024)
                 .read_to_end(&mut body)?;
 
-            // Extract tar.gz with path traversal protection
-            std::fs::create_dir_all(dest_dir)?;
-            let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&body));
-            let mut archive = tar::Archive::new(gz);
-            archive.set_overwrite(true);
-            for entry in archive.entries()? {
-                let mut entry = entry?;
-                let path = entry.path()?;
-                // Reject entries with path traversal components
-                if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-                    anyhow::bail!("Tar entry contains path traversal: {:?}", path);
-                }
-                entry.unpack_in(dest_dir)?;
-            }
-
-            // Content verification against the compiled-in pin. The release
-            // also publishes models.tar.gz.sha256, but that asset only
-            // self-validates the bundle — a swapped GitHub release asset would
-            // come with a matching .sha256. The binary pinning the expected
-            // weights hash is the only check the attacker can't ship alongside.
-            Self::verify_model_dir(dest_dir, Self::MODEL_CONTENT_BLAKE3)?;
-
-            // Write version marker (blake3 hash of tarball for cache invalidation)
-            let hash = blake3::hash(&body);
-            std::fs::write(dest_dir.join(".version"), hash.to_hex().as_str())?;
+            // Extract + verify + atomically promote (see `extract_and_promote`).
+            Self::extract_and_promote(&body, dest_dir, Self::MODEL_CONTENT_BLAKE3)?;
 
             tracing::info!("[model] Model extracted and verified at {:?} ({} bytes)", dest_dir, body.len());
             Ok(())
@@ -428,6 +532,117 @@ mod tests {
         }
     }
 
+    /// I1 (partial-download self-heal): a dir with correct weights but missing the
+    /// loader's companion files must be REJECTED by verify (no marker) and reported
+    /// not-current — never pinned as a usable cache. Adding the companions makes it
+    /// verify and bless. Without this, a kill mid-extraction stranded the model FTS5-only.
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_verify_model_dir_rejects_incomplete_then_accepts_complete() {
+        use std::fs;
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"fake-weights-bytes").unwrap();
+        let expected = blake3::hash(b"fake-weights-bytes").to_hex().to_string();
+
+        // Weights match the pin but companions are missing → reject + don't bless.
+        assert!(EmbeddingModel::verify_model_dir(dir.path(), &expected).is_err(),
+            "incomplete dir (no tokenizer/config) must be rejected by verify");
+        assert!(!EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "an incomplete dir must not be reported as the current cached model");
+
+        // Complete the dir → verify succeeds and the dir is now blessed.
+        fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        EmbeddingModel::verify_model_dir(dir.path(), &expected)
+            .expect("a complete, hash-matching dir must verify");
+        assert!(EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "a complete, verified dir must be reported as current");
+    }
+
+    /// The no-marker fallback in `cached_model_matches` (pre-marker caches / partial
+    /// extractions) must likewise require companion files before writing the marker.
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_cached_model_matches_no_marker_requires_companions() {
+        use std::fs;
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"weights-v1").unwrap();
+        let expected = blake3::hash(b"weights-v1").to_hex().to_string();
+
+        // Correct weights, no marker, companions missing → must NOT bless.
+        assert!(!EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "weights-only dir (no marker, no companions) must not be treated as current");
+
+        // Add companions → fallback blesses and writes the marker; short-circuit then holds.
+        fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        assert!(EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "complete dir must be treated as current");
+        assert!(EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "marker short-circuit must also report current on the second call");
+    }
+
+    /// I1 end-to-end: drive the real extract → verify → atomic-promote path with an
+    /// in-memory model tar.gz. Covers (1) a complete archive promoting into a fresh cache,
+    /// (2) an INCOMPLETE archive being rejected with the previous good cache left intact
+    /// (self-heal: a partial download can't poison the cache), and (3) a new complete
+    /// archive atomically replacing the old one — with no staging/old residue left behind.
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_extract_and_promote_is_atomic_and_rejects_incomplete() {
+        use std::fs;
+        use inner::EmbeddingModel as M;
+
+        fn put(b: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>, name: &str, data: &[u8]) {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, data).unwrap();
+        }
+        fn make_targz(weights: &[u8], with_companions: bool) -> Vec<u8> {
+            let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut b = tar::Builder::new(gz);
+            put(&mut b, "model.safetensors", weights);
+            if with_companions {
+                put(&mut b, "tokenizer.json", b"{}");
+                put(&mut b, "config.json", b"{}");
+            }
+            b.into_inner().unwrap().finish().unwrap()
+        }
+
+        let root = tempfile::TempDir::new().unwrap();
+        let dest = root.path().join("models");
+
+        // (1) Complete archive promotes into a fresh dest.
+        let w1 = b"fixture-weights-v1";
+        let id1 = blake3::hash(w1).to_hex().to_string();
+        M::extract_and_promote(&make_targz(w1, true), &dest, &id1).unwrap();
+        assert!(dest.join("model.safetensors").exists());
+        assert!(dest.join("tokenizer.json").exists() && dest.join("config.json").exists());
+        assert!(M::cached_model_matches(&dest, &id1), "promoted dir must be current");
+
+        // (2) Incomplete archive (no companions) is rejected; the good v1 cache survives.
+        let w2 = b"fixture-weights-v2";
+        let id2 = blake3::hash(w2).to_hex().to_string();
+        assert!(M::extract_and_promote(&make_targz(w2, false), &dest, &id2).is_err(),
+            "an archive missing companion files must be rejected");
+        assert!(M::cached_model_matches(&dest, &id1),
+            "a rejected partial download must leave the previous good cache intact");
+
+        // (3) New complete archive atomically replaces the old one.
+        M::extract_and_promote(&make_targz(w2, true), &dest, &id2).unwrap();
+        assert!(M::cached_model_matches(&dest, &id2), "new model must replace old");
+        assert!(!M::cached_model_matches(&dest, &id1), "old model id must no longer match");
+
+        // No staging/old residue — only the live cache dir remains in the parent.
+        let mut names: Vec<_> = fs::read_dir(root.path()).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, vec!["models".to_string()],
+            "staging/old dirs must be cleaned up, found: {:?}", names);
+    }
+
     #[cfg(feature = "embed-model")]
     #[test]
     fn test_embed_produces_correct_dims() {
@@ -566,8 +781,18 @@ mod tests {
         // Missing weights → not current.
         assert!(!M::cached_model_matches(dir, &expected));
 
-        // Pre-v0.50 cache (no marker): matching content → current, marker written.
+        // Weights present but companions missing (partial extraction) → NOT current,
+        // and no marker written — the dir is unloadable until completed.
         std::fs::write(dir.join("model.safetensors"), content).unwrap();
+        assert!(!M::cached_model_matches(dir, &expected),
+            "weights-only dir without tokenizer/config must not be blessed");
+        assert!(!dir.join(".model-id").exists(),
+            "an incomplete dir must not get a blessing marker");
+
+        // Pre-v0.50 cache (no marker) that is COMPLETE: matching content → current,
+        // marker written by the one-time hash fallback.
+        std::fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
         assert!(M::cached_model_matches(dir, &expected));
         assert_eq!(
             std::fs::read_to_string(dir.join(".model-id")).unwrap().trim(),
@@ -619,8 +844,10 @@ mod tests {
         assert!(!dir.join("model.safetensors").exists(),
             "rejected weights must be removed so a poisoned cache can't load later");
 
-        // Matching content verifies and writes the marker.
+        // Matching content in a COMPLETE dir verifies and writes the marker.
         std::fs::write(dir.join("model.safetensors"), b"genuine").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
         M::verify_model_dir(dir, &expected).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join(".model-id")).unwrap().trim(),
