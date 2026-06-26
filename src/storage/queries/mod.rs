@@ -33,13 +33,14 @@ pub use imports::{
     all_file_import_edges, file_is_indexed, get_import_tree, get_reverse_dependents, FileDependency,
 };
 pub use nodes::{
-    delete_nodes_by_file, get_all_node_names_with_ids, get_dirty_node_ids,
+    delete_nodes_by_file, filter_method_ids, get_all_node_names_with_ids, get_dirty_node_ids,
     get_first_node_id_by_name, get_inbound_calls_for_pending, get_inbound_cross_file_edges,
     get_node_by_id, get_node_ids_by_name, get_node_names_with_paths_excluding_files,
-    get_node_paths_by_ids, get_node_with_file_by_id, get_nodes_by_file_path, get_nodes_by_name,
-    get_nodes_missing_context, get_nodes_with_files_by_filters, get_nodes_with_files_by_ids,
-    get_nodes_with_files_by_name, insert_node, insert_node_cached, update_context_strings_batch,
-    NameEntry, NodeRecord, NodeResult, NodeWithFile,
+    get_node_paths_by_ids, get_node_qualified_names_by_ids, get_node_with_file_by_id,
+    get_nodes_by_file_path, get_nodes_by_name, get_nodes_missing_context,
+    get_nodes_with_files_by_filters, get_nodes_with_files_by_ids, get_nodes_with_files_by_name,
+    insert_node, insert_node_cached, update_context_strings_batch, NameEntry, NodeRecord,
+    NodeResult, NodeWithFile,
 };
 #[cfg(test)]
 pub use nodes::update_context_string;

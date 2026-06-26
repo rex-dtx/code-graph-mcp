@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use crate::storage::db::Database;
 use crate::storage::queries::{
-    delete_pending_unresolved_call, get_node_paths_by_ids, insert_edge_cached,
-    list_pending_unresolved_calls,
+    delete_pending_unresolved_call, filter_method_ids, get_node_paths_by_ids,
+    get_node_qualified_names_by_ids, insert_edge_cached, list_pending_unresolved_calls,
 };
 use crate::domain::REL_CALLS;
 
@@ -442,23 +442,9 @@ pub(super) fn path_filter_candidates(
     let path_chain = segments.join("/");
     let qn_chain = segments.join(".");
 
-    let placeholders: String = std::iter::repeat_n("?", candidates.len()).collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT id, COALESCE(qualified_name, '') FROM nodes WHERE id IN ({})",
-        placeholders
-    );
-    let mut stmt = db.conn().prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = candidates.iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut id_to_qn: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-    for r in rows {
-        let (id, qn) = r?;
-        id_to_qn.insert(id, qn);
-    }
+    // Chunked under MAX_IN_PARAMS to keep large same-name candidate sets within
+    // SQLite's variable cap (issue #30).
+    let id_to_qn = get_node_qualified_names_by_ids(db.conn(), candidates)?;
 
     // For the LAST segment, also accept the path ending in `<seg>.rs` —
     // Rust commonly puts single-file mods at `src/<mod>.rs` (e.g. `src/domain.rs`
@@ -502,28 +488,8 @@ pub(super) fn self_filter_candidates(
     candidates: &[i64],
     db: &crate::storage::db::Database,
 ) -> anyhow::Result<Vec<i64>> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders: String = std::iter::repeat_n("?", candidates.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT id FROM nodes
-         WHERE id IN ({})
-           AND qualified_name LIKE ? || '.%'",
-        placeholders
-    );
-    let mut stmt = db.conn().prepare(&sql)?;
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = candidates
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-        .collect();
-    params.push(Box::new(impl_type.to_string()));
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
-    let kept: Vec<i64> = rows.filter_map(|r| r.ok()).collect();
-    Ok(kept)
+    // Chunked under MAX_IN_PARAMS (issue #30).
+    filter_method_ids(db.conn(), candidates, Some(impl_type))
 }
 
 /// Filter candidates to those whose `qualified_name` denotes a METHOD — i.e.
@@ -539,25 +505,10 @@ pub(super) fn method_candidates(
     candidates: &[i64],
     db: &crate::storage::db::Database,
 ) -> anyhow::Result<Vec<i64>> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders: String = std::iter::repeat_n("?", candidates.len())
-        .collect::<Vec<_>>()
-        .join(",");
     // qualified_name LIKE '%.%' — any node whose qualified_name carries a
-    // `Type.` prefix. NULL qualified_name (rare) is excluded by LIKE.
-    let sql = format!(
-        "SELECT id FROM nodes WHERE id IN ({}) AND qualified_name LIKE '%.%'",
-        placeholders
-    );
-    let mut stmt = db.conn().prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = candidates
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    // `Type.` prefix. NULL qualified_name (rare) is excluded by LIKE. Chunked
+    // under MAX_IN_PARAMS (issue #30).
+    filter_method_ids(db.conn(), candidates, None)
 }
 
 #[cfg(test)]

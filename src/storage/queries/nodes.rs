@@ -567,6 +567,78 @@ pub fn get_node_paths_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<Hash
     Ok(map)
 }
 
+/// Batch-fetch a `node_id -> COALESCE(qualified_name, "")` map for the given
+/// IDs, chunked under `MAX_IN_PARAMS` like [`get_node_paths_by_ids`]. Used by
+/// `path_filter_candidates`, whose candidate set is every node sharing a bare
+/// name in one language — a single unchunked `IN (...)` would risk SQLite's
+/// variable cap on pathological repos (issue #30). IDs absent from the DB are
+/// omitted from the map.
+pub fn get_node_qualified_names_by_ids(
+    conn: &Connection,
+    node_ids: &[i64],
+) -> Result<HashMap<i64, String>> {
+    let mut map = HashMap::new();
+    if node_ids.is_empty() {
+        return Ok(map);
+    }
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!(
+            "SELECT id, COALESCE(qualified_name, '') FROM nodes WHERE id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, qn) = row?;
+            map.insert(id, qn);
+        }
+    }
+    Ok(map)
+}
+
+/// Filter `node_ids` to those whose `qualified_name` denotes a method, chunked
+/// under `MAX_IN_PARAMS`. `of_type = Some("Type")` keeps only `Type.*` methods
+/// (the impl-type gate); `of_type = None` keeps any `*.*` qualified_name (the
+/// receiver-call gate that excludes same-named free functions). NULL
+/// qualified_name is excluded by the LIKE. Replaces the unchunked `IN (...)`
+/// clauses in `self_filter_candidates` / `method_candidates` (issue #30).
+pub fn filter_method_ids(
+    conn: &Connection,
+    node_ids: &[i64],
+    of_type: Option<&str>,
+) -> Result<Vec<i64>> {
+    let mut kept = Vec::new();
+    if node_ids.is_empty() {
+        return Ok(kept);
+    }
+    let like = match of_type {
+        Some(t) => format!("{t}.%"),
+        None => "%.%".to_string(),
+    };
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!(
+            "SELECT id FROM nodes WHERE id IN ({}) AND qualified_name LIKE ?{}",
+            placeholders,
+            chunk.len() + 1
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        params.push(&like as &dyn rusqlite::types::ToSql);
+        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
+        for row in rows {
+            kept.push(row?);
+        }
+    }
+    Ok(kept)
+}
+
 /// Find nodes that are missing context strings (likely from a failed Phase 3).
 /// Excludes external pseudo-nodes which never have context strings.
 pub fn get_nodes_missing_context(conn: &Connection) -> Result<Vec<i64>> {
@@ -733,6 +805,62 @@ mod tests {
 
         // Empty input is a no-op, not an error.
         assert!(get_node_paths_by_ids(conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_qn_helpers_cross_chunk_boundary() {
+        // Regression for issue #30: the resolve.rs candidate filters
+        // (path/self/method) bound one parameter per same-name candidate in an
+        // unchunked IN(...). The chunked helpers must behave identically across
+        // the MAX_IN_PARAMS boundary.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "src/big.rs".into(), blake3_hash: "h".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+
+        // > MAX_IN_PARAMS methods of type "T", plus two free functions (no dot).
+        let n_methods = MAX_IN_PARAMS + 1;
+        let mut method_ids = Vec::with_capacity(n_methods);
+        let mut all_ids = Vec::with_capacity(n_methods + 2);
+        let mk = |name: String, qn: Option<String>, line: i64| NodeRecord {
+            file_id: fid, node_type: "function".into(), name, qualified_name: qn,
+            start_line: line, end_line: line, code_content: String::new(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        };
+        for i in 0..n_methods {
+            let id = insert_node(conn, &mk(format!("m{i}"), Some(format!("T.m{i}")), i as i64 + 1)).unwrap();
+            method_ids.push(id);
+            all_ids.push(id);
+        }
+        for i in 0..2 {
+            let id = insert_node(conn, &mk(format!("free{i}"), None, n_methods as i64 + i as i64 + 1)).unwrap();
+            all_ids.push(id);
+        }
+
+        // qualified_name map covers every id (free functions map to "").
+        let qns = get_node_qualified_names_by_ids(conn, &all_ids).unwrap();
+        assert_eq!(qns.len(), all_ids.len());
+        assert_eq!(qns.get(&method_ids[0]).map(String::as_str), Some("T.m0"));
+
+        // None gate keeps only `*.*` (methods); free functions excluded.
+        let mut methods = filter_method_ids(conn, &all_ids, None).unwrap();
+        methods.sort_unstable();
+        let mut expected = method_ids.clone();
+        expected.sort_unstable();
+        assert_eq!(methods, expected, "method gate must span the chunk boundary");
+
+        // Some("T") gate keeps only T.* — same set here.
+        let mut of_type = filter_method_ids(conn, &all_ids, Some("T")).unwrap();
+        of_type.sort_unstable();
+        assert_eq!(of_type, expected);
+
+        // A non-matching type keeps nothing; empty input is a no-op.
+        assert!(filter_method_ids(conn, &all_ids, Some("Other")).unwrap().is_empty());
+        assert!(filter_method_ids(conn, &[], None).unwrap().is_empty());
+        assert!(get_node_qualified_names_by_ids(conn, &[]).unwrap().is_empty());
     }
 
     #[test]

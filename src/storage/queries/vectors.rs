@@ -109,27 +109,22 @@ pub fn get_unembedded_nodes_excluding(
     if exclude.is_empty() {
         return get_unembedded_nodes(conn, limit);
     }
-    let placeholders = std::iter::repeat_n("?", exclude.len()).collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT n.id, n.context_string
-         FROM nodes n
-         LEFT JOIN node_vectors nv ON n.id = nv.node_id
-         LEFT JOIN edges e ON e.target_id = n.id
-         WHERE nv.node_id IS NULL AND n.context_string IS NOT NULL
-           AND n.id NOT IN ({placeholders})
-         GROUP BY n.id
-         ORDER BY COUNT(e.target_id) DESC
-         LIMIT ?"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut params: Vec<&dyn rusqlite::ToSql> =
-        exclude.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-    let lim = limit as i64;
-    params.push(&lim);
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    // Don't bind one parameter per excluded id: on a large repo the backfill
+    // loop's `failed` set can grow toward the full node count, and a single
+    // `NOT IN (?,?,…)` would exceed SQLite's variable cap (issue #30). The
+    // GROUP BY / ORDER BY / LIMIT ranking can't be split across NOT-IN chunks,
+    // so instead over-fetch by |exclude| and drop the excluded ids in Rust:
+    // the limit-th non-excluded row sits at position <= limit + |exclude| in
+    // the ranked stream, so this window always yields the same top-`limit` set
+    // the SQL filter would have.
+    let exclude_set: std::collections::HashSet<i64> = exclude.iter().copied().collect();
+    let over_fetch = limit.saturating_add(exclude.len());
+    let rows = get_unembedded_nodes(conn, over_fetch)?;
+    Ok(rows
+        .into_iter()
+        .filter(|(id, _)| !exclude_set.contains(id))
+        .take(limit)
+        .collect())
 }
 
 /// Count nodes with embeddings vs total embeddable nodes.
@@ -291,5 +286,42 @@ mod tests {
 
         // Excluding every unembedded node → empty, the backfill loop's termination signal.
         assert!(get_unembedded_nodes_excluding(conn, 10, &[a, b, c]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_unembedded_nodes_excluding_large_set() {
+        // Regression for issue #30: the old NOT IN (?,?,…) bound one parameter
+        // per excluded id, so a `failed` set near the node count blew SQLite's
+        // variable cap. The over-fetch+filter path must still return the right
+        // non-excluded nodes when |exclude| > MAX_IN_PARAMS.
+        use super::super::helpers::MAX_IN_PARAMS;
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+
+        let n = MAX_IN_PARAMS + 3; // 503 unembedded nodes
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(insert_node(conn, &NodeRecord {
+                file_id: fid, node_type: "function".into(), name: format!("f{i}"),
+                qualified_name: None, start_line: i as i64 + 1, end_line: i as i64 + 1,
+                code_content: String::new(), signature: None, doc_comment: None,
+                context_string: Some(format!("ctx{i}")), name_tokens: None,
+                return_type: None, param_types: None, is_test: false,
+            }).unwrap());
+        }
+
+        // Exclude the first MAX_IN_PARAMS + 1 ids (crosses the old IN-clause cap).
+        let exclude = &ids[..MAX_IN_PARAMS + 1];
+        let got = get_unembedded_nodes_excluding(conn, 10, exclude).unwrap();
+        let got_ids: std::collections::HashSet<i64> = got.iter().map(|(id, _)| *id).collect();
+        let expected: std::collections::HashSet<i64> = ids[MAX_IN_PARAMS + 1..].iter().copied().collect();
+        assert_eq!(got_ids, expected, "exactly the non-excluded nodes must remain");
+
+        // Excluding everything still terminates with an empty result.
+        assert!(get_unembedded_nodes_excluding(conn, 10, &ids).unwrap().is_empty());
     }
 }
