@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.75.3 — Periodic embedding backfill for no-tool-call sessions
+
+Fixes the "✓ N nodes … 99% vec, never finishes" symptom in a session that drives
+code-graph only through the PreToolUse CLI hooks and never sends an MCP tool call.
+
+### Fixed
+- **Embedding backfill now self-drives on a timer, not only on a tool call.** The
+  pass that vectors un-embedded nodes previously fired only from the startup-index
+  thread, an MCP tool call (`ensure_indexed`), or `rebuild-index`. The file watcher
+  and other post-index services are deferred to the first tool call
+  (`consume_startup_index_result`), so a pure hook/CLI session — where edited files
+  are re-indexed by `ensure_file_indexed` with `model=None` and never embedded —
+  left the new nodes stranded below 100% vector coverage until restart. A new
+  periodic driver, spawned at startup from `run_startup_tasks` (not the tool-call-
+  gated `start_post_index_services`), polls for un-embedded nodes every 60s and
+  drains them, so coverage reaches 100% within a minute of an out-of-band edit with
+  no tool call required. It tracks the un-embeddable residue as a floor and only
+  re-measures it after a backfill it actually ran, so it never spins re-loading the
+  model on nodes that can't be embedded. Gated on vector storage only — not the
+  lazily-loaded in-process model — since that model stays unloaded in exactly the
+  no-tool-call sessions this targets.
+
 ## v0.75.2 — Resolver parity: home boundary + indexed-ancestor preference
 
 Code-review follow-ups to v0.75.1's stray-index fix, closing two ways the Rust

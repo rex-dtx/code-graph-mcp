@@ -110,6 +110,22 @@ pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
     Ok((with_vectors, total))
 }
 
+/// Count embeddable-but-unembedded nodes (have a `context_string`, no vector yet).
+/// Mirrors the `WHERE` filter of [`get_unembedded_nodes`] but returns only the count,
+/// so the periodic backfill driver can cheaply detect whether NEW un-embedded work has
+/// appeared (e.g. nodes added by a CLI/hook `ensure_file_indexed` with `model=None`)
+/// without fetching payloads or loading the embedding model. Returns 0 when the vector
+/// table is absent (embed-model feature disabled).
+pub fn count_unembedded_nodes(conn: &Connection) -> Result<i64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nodes n \
+         LEFT JOIN node_vectors nv ON n.id = nv.node_id \
+         WHERE nv.node_id IS NULL AND n.context_string IS NOT NULL",
+        [], |r| r.get(0)
+    ).unwrap_or(0);
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -135,6 +135,18 @@ pub(super) const INCREMENTAL_DEBOUNCE_SECS: u64 = 30;
 #[cfg(test)]
 pub(super) const INCREMENTAL_DEBOUNCE_SECS: u64 = 0;
 
+/// Poll interval for the no-traffic embedding backfill driver.
+/// Nodes can be added to the index by a SHORT-LIVED CLI process — the PreToolUse
+/// grep/read/edit hooks call `ensure_file_indexed` with `model=None` for speed — which
+/// never triggers the server's tool-call-gated `ensure_indexed` backfill. With the file
+/// watcher off, such a session would strand those nodes unembedded until restart. This
+/// interval bounds how long the long-lived primary server takes to notice and embed them.
+/// In tests, poll fast so the driver converges within the test timeout.
+#[cfg(not(test))]
+pub(super) const PERIODIC_BACKFILL_SECS: u64 = 60;
+#[cfg(test)]
+pub(super) const PERIODIC_BACKFILL_SECS: u64 = 1;
+
 /// Token threshold for auto-compressing tool results.
 /// Results exceeding this estimated token count are returned as summaries
 /// with node_ids for expansion via get_ast_node.
@@ -181,6 +193,10 @@ pub(super) struct IndexingState {
     /// covering the case where a prior session crashed mid-Phase-3 and left nodes
     /// with NULL context_string.
     pub(super) startup_repair_done: Arc<AtomicBool>,
+    /// True once the periodic no-traffic backfill driver has been spawned this
+    /// session. `start_post_index_services` runs on every tool call, so this guards
+    /// the driver thread to exactly one per process.
+    pub(super) periodic_backfill_started: Arc<AtomicBool>,
 }
 
 impl IndexingState {
@@ -193,6 +209,7 @@ impl IndexingState {
             startup_index_error: Arc::new(Mutex::new(None)),
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
             startup_repair_done: Arc::new(AtomicBool::new(false)),
+            periodic_backfill_started: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -543,7 +560,13 @@ impl McpServer {
                     None
                 };
                 self.spawn_startup_indexing(project_root, has_existing, dir_cache);
-                return; // watcher + embedding start after indexing completes
+                // The watcher and other post-index services wait for the first tool call
+                // (consume_startup_index_result), but the embedding backfill driver must
+                // run even in a NO-tool-call session — that's exactly when out-of-band
+                // CLI/hook node additions would otherwise strand unembedded. It polls the
+                // DB independently and no-ops while the startup backfill holds the flag.
+                self.spawn_periodic_backfill();
+                return;
             }
 
             // Already indexed — just start watcher + embedding
@@ -784,6 +807,10 @@ impl McpServer {
 
         self.spawn_background_embedding();
 
+        // Watcher- and traffic-independent backfill: drains nodes added out-of-band by
+        // the CLI/hook freshness path (which never triggers the tool-call backfill).
+        self.spawn_periodic_backfill();
+
         #[cfg(feature = "embed-model")]
         self.spawn_model_download();
     }
@@ -842,6 +869,71 @@ impl McpServer {
         });
     }
 
+    /// Spawn the no-traffic embedding backfill driver (exactly once per process).
+    ///
+    /// The server only re-checks freshness and backfills on an MCP tool call
+    /// (`ensure_indexed`). A session that exercises code-graph purely through the
+    /// PreToolUse CLI hooks adds nodes via `ensure_file_indexed` (`model=None`) without
+    /// ever sending a tool call, and with the watcher off nothing embeds them — they
+    /// strand at <100% vector coverage until restart. This driver gives the primary
+    /// server a watcher- and traffic-independent path to drain that backlog.
+    ///
+    /// It re-runs the guarded backfill only when the unembedded count rises ABOVE the
+    /// residue the previous run left behind, so it never reloads the model to spin on
+    /// permanently un-embeddable nodes (empty-content symbols that keep a
+    /// `context_string` but yield no vector). The idle tick is a single cheap COUNT.
+    fn spawn_periodic_backfill(&self) {
+        if !self.is_primary {
+            return;
+        }
+        if self.indexing.periodic_backfill_started.swap(true, Ordering::AcqRel) {
+            return; // already spawned this session
+        }
+        // Gate only on vector storage — NOT on `self.embedding_model`, which stays None
+        // until a tool call lazily loads it (exactly the no-tool-call sessions this driver
+        // exists for). `run_unembedded_backfill` loads its own model and no-ops if absent,
+        // mirroring the startup-index backfill path.
+        if !self.db.vec_enabled() {
+            return;
+        }
+        let db_path = match &self.project_root {
+            Some(p) => p.join(CODE_GRAPH_DIR).join("index.db"),
+            None => return,
+        };
+        let flag = Arc::clone(&self.indexing.embedding_in_progress);
+        std::thread::spawn(move || {
+            // `floor` = unembedded count left after the last drain (the un-embeddable
+            // residue). Start at 0 so the first non-empty observation — including nodes
+            // stranded by a prior session — triggers one run that establishes the true
+            // floor. Re-opening the DB each tick (rather than holding a connection) keeps
+            // us correct across a rebuild-index atomic swap.
+            let mut floor: i64 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(PERIODIC_BACKFILL_SECS));
+                let unembedded = match Database::open_with_vec(&db_path) {
+                    Ok(db) => queries::count_unembedded_nodes(db.conn()).unwrap_or(floor),
+                    Err(_) => continue, // transient (e.g. mid-swap) — retry next tick
+                };
+                if unembedded > floor {
+                    // New embeddable work appeared. Reuses the in-progress guard, so it
+                    // harmlessly no-ops if a tool-call/startup backfill is already draining.
+                    // Only re-measure the residue floor when WE actually drained — a
+                    // re-measurement after a no-op'd call would capture the other backfill's
+                    // mid-drain count and pin the floor too high, masking the new work.
+                    if Self::run_guarded_backfill(&db_path, &flag) {
+                        if let Ok(db) = Database::open_with_vec(&db_path) {
+                            floor = queries::count_unembedded_nodes(db.conn()).unwrap_or(floor);
+                        }
+                    }
+                } else if unembedded < floor {
+                    // Another backfill (or a rebuild) lowered the residue — track it down so
+                    // a stale-high floor can't mask future work.
+                    floor = unembedded;
+                }
+            }
+        });
+    }
+
     /// Claim the `embedding_in_progress` flag and run [`Self::run_unembedded_backfill`]
     /// to completion, releasing the flag on return — and on unwind, via the drop guard
     /// (release builds use `panic = "abort"`, where a panic ends the process and resets
@@ -849,9 +941,14 @@ impl McpServer {
     /// the caller, so it must be
     /// invoked on a background thread (the embedding thread, or the startup-index
     /// thread once its own work is committed and the indexing flag is clear).
-    fn run_guarded_backfill(db_path: &Path, in_progress: &AtomicBool) {
+    ///
+    /// Returns `true` if this call actually claimed the flag and ran the backfill, or
+    /// `false` if it no-op'd because another backfill already held it. The periodic driver
+    /// uses this to avoid trusting a residue re-measurement taken while a *different*
+    /// backfill is still mid-drain (which would otherwise pin its floor too high).
+    fn run_guarded_backfill(db_path: &Path, in_progress: &AtomicBool) -> bool {
         if in_progress.swap(true, Ordering::AcqRel) {
-            return; // a backfill is already running
+            return false; // a backfill is already running
         }
         // Drop guard ensures the flag is always cleared, even on panic.
         struct FlagGuard<'a>(&'a AtomicBool);
@@ -864,6 +961,7 @@ impl McpServer {
         if let Err(e) = Self::run_unembedded_backfill(db_path) {
             tracing::warn!("[embed-bg] Failed: {}", e);
         }
+        true
     }
 
     /// Embed every node that still lacks a vector, hot-path first, in batches.

@@ -52,6 +52,7 @@ pub use search::{find_functions_by_fuzzy_name, fts5_search, FtsResult, NameCandi
 #[cfg(test)]
 pub use search::fts5_search_with_tests;
 pub use vectors::{
-    count_nodes_with_vectors, delete_node_vectors_batch, get_node_embedding, get_unembedded_nodes,
-    insert_node_vector, insert_node_vectors_batch, vector_search,
+    count_nodes_with_vectors, count_unembedded_nodes, delete_node_vectors_batch,
+    get_node_embedding, get_unembedded_nodes, insert_node_vector, insert_node_vectors_batch,
+    vector_search,
 };

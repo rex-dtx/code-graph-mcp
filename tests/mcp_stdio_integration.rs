@@ -615,3 +615,107 @@ fn mcp_startup_embeds_without_any_tool_call() {
         "startup index must embed nodes with NO tool call; got {embedded} vectors after 60s"
     );
 }
+
+/// The server backfills embeddings only on startup or on an MCP tool call
+/// (`ensure_indexed`). A session that uses code-graph purely through the PreToolUse
+/// CLI hooks adds nodes via `ensure_file_indexed` (model=None) with NO tool call, and
+/// — with the watcher off — nothing embeds them: they strand at <100% vector coverage
+/// until restart (the mem "99% vec, never finishes" symptom). The periodic backfill
+/// driver must drain such out-of-band additions on its own, with no tool call at all.
+#[cfg(feature = "embed-model")]
+#[test]
+fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
+    use code_graph_mcp::storage::db::Database;
+    use code_graph_mcp::storage::queries::{count_nodes_with_vectors, count_unembedded_nodes};
+
+    if code_graph_mcp::embedding::model::EmbeddingModel::load().ok().flatten().is_none() {
+        eprintln!("[skip] embedding model weights unavailable; cannot observe backfill");
+        return;
+    }
+
+    let project = setup_fixture_project();
+    let project_root = project.path().to_path_buf();
+    let db_path = project_root
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+
+    // Bring the server up and let the startup backfill settle, so the periodic driver's
+    // floor converges on the un-embeddable residue. Send ONLY the lifecycle handshake.
+    let mut client = McpClient::spawn(project.path());
+    client.notify("notifications/initialized", json!({}));
+
+    // Wait for the startup backfill to FULLY DRAIN (every embeddable node vectored,
+    // `count_unembedded_nodes == 0`) before adding the out-of-band node. A "count stopped
+    // changing" heuristic is unreliable — model inference is bursty, so the startup loop
+    // can stall for seconds mid-drain and look settled while embeddable nodes remain.
+    // Draining to exactly zero is the unambiguous "startup backfill is done" signal, so
+    // afterwards ONLY a fresh trigger (the periodic driver — no tool call is ever sent)
+    // can embed the node we insert.
+    let mut base_vectors = 0i64;
+    let settled_unembedded = 0i64;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(90) {
+        std::thread::sleep(Duration::from_millis(1000));
+        let db = match Database::open_with_vec(&db_path) { Ok(d) => d, Err(_) => continue };
+        let (with_vectors, _) = count_nodes_with_vectors(db.conn()).unwrap_or((0, 0));
+        let unembedded = count_unembedded_nodes(db.conn()).unwrap_or(i64::MAX);
+        if with_vectors > 0 && unembedded == 0 {
+            base_vectors = with_vectors;
+            break;
+        }
+    }
+    assert!(base_vectors > 0, "startup must fully drain the initial embeddings before the out-of-band test");
+
+    // Add an embeddable node OUT OF BAND, by DIRECT DB insert and NO filesystem write —
+    // this is the stranded state a CLI/hook `ensure_file_indexed` (model=None) leaves
+    // behind: a node with a `context_string` and no vector, with no pending tool call to
+    // drain it. Inserting via the DB (not a file write) also keeps the server's file
+    // watcher entirely out of the picture, so ONLY a DB-polling embedder can pick it up.
+    {
+        use code_graph_mcp::storage::queries::{upsert_file, FileRecord, insert_node, NodeRecord};
+        let db = Database::open_with_vec(&db_path).unwrap();
+        let fid = upsert_file(db.conn(), &FileRecord {
+            path: "src/out_of_band.rs".into(), blake3_hash: "oob-hash".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "periodically_backfilled_fn".into(),
+            qualified_name: None, start_line: 1, end_line: 3,
+            code_content: "pub fn periodically_backfilled_fn() -> i32 { 1234 }".into(),
+            signature: None, doc_comment: None,
+            context_string: Some(
+                "rust function periodically_backfilled_fn — pub fn periodically_backfilled_fn() -> i32 { 1234 }".into()),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+    }
+    // Precondition: the new node is present but UNembedded — it raised the unembedded
+    // count above the settled residue.
+    {
+        let db = Database::open_with_vec(&db_path).unwrap();
+        let unembedded = count_unembedded_nodes(db.conn()).unwrap();
+        assert!(
+            unembedded > settled_unembedded,
+            "out-of-band insert must add an unembedded node (settled={settled_unembedded}, now={unembedded})"
+        );
+    }
+
+    // No tool call is ever sent. The periodic driver alone must embed the new node.
+    let mut now_vectors = base_vectors;
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(db) = Database::open_with_vec(&db_path) {
+            if let Ok((with_vectors, _)) = count_nodes_with_vectors(db.conn()) {
+                now_vectors = with_vectors;
+                if now_vectors > base_vectors {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        now_vectors > base_vectors,
+        "periodic backfill must embed out-of-band nodes with NO tool call; \
+         base={base_vectors}, after={now_vectors}"
+    );
+}
