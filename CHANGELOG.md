@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.76.1 — Confidence-floor disclosure follow-ups (code review)
+
+Follow-ups to v0.76.0 from a code review. The default floor is unchanged; these
+tighten the *disclosure* so the fold is never silently lossy on the risk surface.
+
+### Fixed
+- **Impact now discloses folded ambiguous callers across the whole returned
+  frontier, not just the seed's direct callers.** A uniquely-named symbol with a
+  clean (inferred) direct caller but an ambiguously-named *transitive* caller
+  previously folded that caller from the risk count with zero disclosure
+  (`ambiguous_callers_excluded` was seed-direct-only → could read 0). It now also
+  counts sub-floor edges into the entire returned caller set, so a folded real
+  caller never silently under-states risk.
+- **`get_ast_node include_impact` now emits `ambiguous_note`** alongside the count,
+  matching the `impact` CLI and `impact_analysis` tool (was count-only).
+- **`min_confidence` is validated at tool entry on `impact_analysis` and
+  `get_ast_node`**, before any index/freshness work, so a bad value errors cleanly
+  instead of after a possible reindex (enum-validate-at-entry).
+
+### Changed
+- CLI `callgraph`'s hidden-edge line now says "direct ambiguous … edge(s)" (the
+  callgraph count is seed-direct), and `--min-confidence ""` is treated as the
+  default on the CLI, matching the MCP surface.
+
 ## v0.76.0 — Call graph & impact: hide ambiguous by-name fan-out by default
 
 `get_call_graph` / `callgraph` and impact analysis now apply a confidence floor of

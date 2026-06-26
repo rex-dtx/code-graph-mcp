@@ -7,6 +7,21 @@ use super::super::*;
 
 impl McpServer {
     pub(in crate::mcp::server) fn tool_get_ast_node(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+        // Validate min_confidence at entry, BEFORE any index/freshness work, so a
+        // bad value errors cleanly instead of after a possible reindex (and isn't
+        // preempted by a freshness error) — enum-validate-at-entry. Used by the
+        // include_impact caller traversal; min_confidence:"ambiguous" includes
+        // every caller, default 'inferred' folds the ambiguous by-name fan-out.
+        let impact_conf_rank = {
+            let tier = match args["min_confidence"].as_str() {
+                None | Some("") => crate::domain::CONF_INFERRED,
+                Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+                    anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+                })?,
+            };
+            crate::domain::confidence_rank(tier)
+        };
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
             // Edit-aware refresh fires only on the file_path branch — node_id
@@ -21,19 +36,6 @@ impl McpServer {
         let include_similar = args["include_similar"].as_bool().unwrap_or(false);
         let similar_top_k = args["similar_top_k"].as_i64().unwrap_or(5);
         let compact = args["compact"].as_bool().unwrap_or(false);
-        // Confidence floor for the include_impact caller traversal (default
-        // 'inferred'): fold the ambiguous by-name fan-out out of the risk summary
-        // (parity with the impact tool/CLI); min_confidence:"ambiguous" includes
-        // every caller. append_impact_summary discloses what was folded.
-        let impact_conf_rank = {
-            let tier = match args["min_confidence"].as_str() {
-                None | Some("") => crate::domain::CONF_INFERRED,
-                Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-                    anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
-                })?,
-            };
-            crate::domain::confidence_rank(tier)
-        };
 
         // Support lookup by node_id or file_path+symbol_name
         if let Some(nid) = args["node_id"].as_i64() {
@@ -281,10 +283,13 @@ impl McpServer {
         // Direct ambiguous callers folded out of the risk count by the floor —
         // disclosed (not silently dropped) so a hidden real caller never
         // under-states risk; min_confidence:"ambiguous" includes them.
+        // Frontier-wide: seed direct + every kept caller's pruned callers, so a
+        // transitive ambiguous caller is disclosed too (not just seed-direct).
+        let caller_ids: Vec<i64> = callers.iter().map(|c| c.node_id).collect();
         let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
             self.db.conn(), symbol_name, Some(file_path),
             crate::graph::query::Direction::Callers, min_confidence_rank,
-        )?;
+        )? + crate::graph::query::count_suppressed_into(self.db.conn(), &caller_ids, min_confidence_rank)?;
         let prod_callers: Vec<_> = callers.iter()
             .filter(|c| !is_test_symbol(&c.name, &c.file_path))
             .collect();
@@ -319,6 +324,12 @@ impl McpServer {
         }
         if ambiguous_callers_excluded > 0 {
             impact["ambiguous_callers_excluded"] = json!(ambiguous_callers_excluded);
+            // Note parity with cmd_impact / tool_impact_analysis — the count alone
+            // doesn't tell the agent the risk may be larger or how to see them.
+            impact["ambiguous_note"] = json!(format!(
+                "{} caller(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-query with min_confidence:\"ambiguous\" to include them.",
+                ambiguous_callers_excluded
+            ));
         }
         result["impact"] = impact;
         Ok(())

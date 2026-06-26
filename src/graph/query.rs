@@ -301,6 +301,45 @@ pub fn count_suppressed_seed_edges(
     Ok(count as usize)
 }
 
+/// Count sub-floor `calls` edges INTO any node in `target_ids` — the callers the
+/// confidence floor pruned from the traversal FRONTIER. Impact passes the whole
+/// returned caller set (seed + kept callers) so a TRANSITIVE ambiguous caller —
+/// one whose parent was kept but whose own inbound edge was sub-floor — is
+/// disclosed too. Without this, a uniquely-named symbol (clean direct callers, so
+/// `count_suppressed_seed_edges` returns 0 → no disclosure) whose deeper callers
+/// are ambiguous would under-state risk with ZERO disclosure. Returns 0 for a
+/// rank-0 floor or an empty set. `target_ids` is bounded by CALL_GRAPH_ROW_LIMIT,
+/// well under SQLite's variable cap, so no chunking is needed.
+pub fn count_suppressed_into(
+    conn: &Connection,
+    target_ids: &[i64],
+    min_confidence_rank: u8,
+) -> Result<usize> {
+    if min_confidence_rank == 0 || target_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = std::iter::repeat_n("?", target_ids.len()).collect::<Vec<_>>().join(",");
+    // CASE mirrors domain::confidence_rank (extracted=2, inferred=1, else=0), same
+    // as query_direction's conf_gate; `< rank` is the complement of the `>= rank`
+    // traversal gate, so this counts exactly the edges that gate pruned.
+    let sql = format!(
+        "SELECT COUNT(*) FROM edges e \
+         WHERE e.target_id IN ({placeholders}) \
+           AND e.relation = ?{rel} \
+           AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) < ?{rank}",
+        rel = target_ids.len() + 1,
+        rank = target_ids.len() + 2,
+    );
+    let rel_param: &dyn rusqlite::types::ToSql = &REL_CALLS;
+    let rank_param: i64 = min_confidence_rank as i64;
+    let mut params: Vec<&dyn rusqlite::types::ToSql> =
+        target_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+    params.push(rel_param);
+    params.push(&rank_param);
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
 /// Merge callee and caller results, deduplicating by (node_id, direction) and keeping the entry
 /// with minimum depth (preserving its `parent_id` so the renderer can build a tree).
 fn merge_results(callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Vec<CallGraphNode> {
@@ -681,5 +720,46 @@ mod tests {
         let compat = get_call_graph(conn, "S", "callees", 2, None).unwrap();
         let kn: Vec<&str> = compat.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(kn.contains(&"C"), "bare get_call_graph preserves show-all behavior");
+    }
+
+    /// Pins the `extracted` tier of the SQL rank CASE (the leg
+    /// test_min_confidence_filters_ambiguous_edges does not exercise) against
+    /// `domain::confidence_rank`: an `extracted` edge survives the `inferred`
+    /// floor, and the `extracted` floor drops an `inferred` edge. If a tier were
+    /// re-mapped in Rust OR SQL alone, one of these assertions flips.
+    #[test]
+    fn test_min_confidence_extracted_tier_parity() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: Some("typescript".into()),
+        }).unwrap();
+        let s = insert_node(conn, &node("S", fid)).unwrap();
+        let x = insert_node(conn, &node("X", fid)).unwrap();
+        let y = insert_node(conn, &node("Y", fid)).unwrap();
+        insert_edge(conn, s, x, REL_CALLS, None).unwrap();
+        insert_edge(conn, s, y, REL_CALLS, None).unwrap();
+        set_edge_confidence(conn, s, x, crate::domain::CONF_EXTRACTED);
+        set_edge_confidence(conn, s, y, crate::domain::CONF_INFERRED);
+
+        let extracted = crate::domain::confidence_rank(crate::domain::CONF_EXTRACTED);
+        let inferred = crate::domain::confidence_rank(crate::domain::CONF_INFERRED);
+
+        // inferred floor (rank 1): extracted(2) and inferred(1) both survive.
+        let at_inferred = get_call_graph_filtered(conn, "S", "callees", 2, None, inferred).unwrap();
+        let n1: Vec<&str> = at_inferred.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(n1.contains(&"X") && n1.contains(&"Y"),
+            "inferred floor keeps both extracted and inferred edges; got {n1:?}");
+
+        // extracted floor (rank 2): only extracted(2) survives; inferred(1) dropped + counted.
+        let at_extracted = get_call_graph_filtered(conn, "S", "callees", 2, None, extracted).unwrap();
+        let n2: Vec<&str> = at_extracted.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(n2.contains(&"X"), "extracted floor keeps the extracted edge; got {n2:?}");
+        assert!(!n2.contains(&"Y"), "extracted floor drops the inferred edge; got {n2:?}");
+        assert_eq!(at_extracted.suppressed_ambiguous, 1,
+            "the inferred edge counts as suppressed at the extracted floor");
     }
 }

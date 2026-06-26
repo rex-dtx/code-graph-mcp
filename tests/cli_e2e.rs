@@ -1434,6 +1434,40 @@ fn test_cli_impact_folds_ambiguous_callers_but_discloses() {
         "nothing excluded at the ambiguous floor; got: {stdout2}");
 }
 
+#[test]
+fn test_cli_impact_discloses_transitive_ambiguous_callers() {
+    // Regression for the frontier-disclosure fix (v0.76.1): a uniquely-named
+    // target `uniq_target` has a clean (inferred) direct caller `amb`, so
+    // SEED-DIRECT excluded == 0. But `amb` is ambiguously named (2 defs), so its
+    // own caller `caller_b` is folded at the default floor. The disclosure must
+    // count `caller_b` (frontier-wide), else a uniquely-named symbol under-states
+    // risk with ZERO hint — the silent under-statement the reviewer flagged.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("core.py"), "def uniq_target():\n    return 1\n").unwrap();
+    // `amb` (ambiguous — 2 defs) is the clean inferred direct caller of uniq_target.
+    std::fs::write(src.join("a.py"),
+        "from core import uniq_target\n\ndef amb():\n    return uniq_target()\n").unwrap();
+    std::fs::write(src.join("a2.py"), "def amb():\n    return 2\n").unwrap();
+    // `caller_b` calls amb — a TRANSITIVE caller folded because amb is ambiguous.
+    std::fs::write(src.join("b.py"),
+        "from a import amb\n\ndef caller_b():\n    return amb()\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "uniq_target", "--json"]);
+    assert_eq!(code, 0, "impact should succeed; {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["total_callers"].as_u64(), Some(1),
+        "inferred direct caller kept, transitive ambiguous one folded; got: {stdout}");
+    assert!(v["ambiguous_callers_excluded"].as_u64().unwrap_or(0) >= 1,
+        "the folded TRANSITIVE ambiguous caller must be disclosed (seed-direct excluded is 0 here); got: {stdout}");
+}
+
 // ============================================================
 // stats (clap-migrated, audit #4) — contract lock
 // ============================================================

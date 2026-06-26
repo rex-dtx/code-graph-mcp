@@ -136,6 +136,16 @@ impl McpServer {
         if !matches!(change_type, "signature" | "behavior" | "remove") {
             return Err(anyhow!("change_type must be one of: signature, behavior, remove (got '{}')", change_type));
         }
+        // Validate min_confidence at entry too (enum-validate-at-entry), before any
+        // index/freshness work — default 'inferred' folds the ambiguous by-name
+        // fan-out out of the risk count; min_confidence:"ambiguous" counts every caller.
+        let min_conf_tier = match args["min_confidence"].as_str() {
+            None | Some("") => crate::domain::CONF_INFERRED,
+            Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+                anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+            })?,
+        };
+        let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -151,18 +161,6 @@ impl McpServer {
             .unwrap_or(3)
             .clamp(1, 20) as i32;
         let file_path = args.get("file_path").and_then(|v| v.as_str());
-        // Confidence floor for caller traversal (default 'inferred'): fold the
-        // ambiguous by-name fan-out out of the blast radius so risk isn't
-        // inflated by phantom callers; the excluded count is disclosed below so a
-        // folded real caller never silently under-states risk. Parity with the
-        // `impact` CLI subcommand.
-        let min_conf_tier = match args["min_confidence"].as_str() {
-            None | Some("") => crate::domain::CONF_INFERRED,
-            Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-                anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
-            })?,
-        };
-        let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
         // Disambiguate: check if symbol matches multiple distinct nodes (cross-file
         // OR same-file overloads). Message + suggestion shape shared with the CLI
@@ -287,10 +285,13 @@ impl McpServer {
         // Disclose the by-name callers folded out of the risk count so the agent
         // knows the blast radius may be larger and can re-query with
         // min_confidence:"ambiguous". Explicitly attached (not a struct field).
+        // Frontier-wide: seed direct + every kept caller's pruned callers, so a
+        // transitive ambiguous caller is disclosed too (not just seed-direct).
+        let caller_ids: Vec<i64> = callers.iter().map(|c| c.node_id).collect();
         let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
             self.db.conn(), &resolved_name, file_path,
             crate::graph::query::Direction::Callers, min_conf_rank,
-        )?;
+        )? + crate::graph::query::count_suppressed_into(self.db.conn(), &caller_ids, min_conf_rank)?;
         if ambiguous_callers_excluded > 0 {
             result["ambiguous_callers_excluded"] = json!(ambiguous_callers_excluded);
             result["ambiguous_note"] = json!(format!(

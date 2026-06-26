@@ -2835,7 +2835,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // (the known false-positive class) from the traversal; --min-confidence
     // ambiguous restores every edge. Validated at entry, mirroring `refs`.
     let min_conf_tier: &'static str = match args.min_confidence.as_deref() {
-        None => crate::domain::CONF_INFERRED,
+        None | Some("") => crate::domain::CONF_INFERRED,
         Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
             anyhow::anyhow!(
                 "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
@@ -3062,7 +3062,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     if result.suppressed_ambiguous > 0 {
         writeln!(
             stdout,
-            "  ({} ambiguous by-name edge(s) hidden — use --min-confidence ambiguous to show)",
+            "  ({} direct ambiguous by-name edge(s) hidden — use --min-confidence ambiguous to show)",
             result.suppressed_ambiguous,
         )?;
     }
@@ -3128,7 +3128,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // counts every caller. The excluded count is disclosed below so a folded
     // ambiguous caller never silently under-states risk.
     let min_conf_tier: &'static str = match args.min_confidence.as_deref() {
-        None => crate::domain::CONF_INFERRED,
+        None | Some("") => crate::domain::CONF_INFERRED,
         Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
             anyhow::anyhow!(
                 "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
@@ -3171,12 +3171,15 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     }
 
     let callers = queries::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
-    // Direct ambiguous callers folded out of the blast radius by the confidence
-    // floor. Surfaced (not silently dropped) so a folded real caller never
-    // under-states risk; --min-confidence ambiguous counts them.
+    // Ambiguous callers folded out of the blast radius by the confidence floor,
+    // counted across the whole returned frontier (seed direct + every kept
+    // caller's pruned callers) so a TRANSITIVE ambiguous caller of a
+    // uniquely-named symbol is disclosed too. Surfaced (not silently dropped) so a
+    // folded real caller never under-states risk; --min-confidence ambiguous counts them.
+    let caller_ids: Vec<i64> = callers.iter().filter(|c| c.depth > 0).map(|c| c.node_id).collect();
     let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
         conn, symbol, file_filter, crate::graph::query::Direction::Callers, min_conf_rank,
-    )?;
+    )? + crate::graph::query::count_suppressed_into(conn, &caller_ids, min_conf_rank)?;
 
     // Partition prod/test callers (deduped by name,file,depth), count routes/files,
     // and assess risk via the surface-shared classifier — the MCP impact tool runs
