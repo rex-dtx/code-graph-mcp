@@ -1,6 +1,6 @@
 [package]
 name = "code-graph-mcp"
-version = "0.74.8"
+version = "0.75.0"
 edition = "2021"
 
 [features]
@@ -9,8 +9,11 @@ edition = "2021"
 # Opt in to embedding via `cargo install code-graph-mcp --features embed-model`.
 # npm releases still ship with embed-model (release.yml builds with the flag),
 # so npm/npx/plugin users see no behavior change. Embedding model files are
-# downloaded lazily on first semantic_code_search invocation (load() returns
-# Ok(None) gracefully when files missing — search degrades to FTS5-only).
+# downloaded by a background thread at server startup (run_startup_tasks ->
+# start_post_index_services -> spawn_model_download), not gated on a tool call;
+# embedding then self-drives via spawn_background_embedding/run_unembedded_backfill.
+# Until the download finishes, load() returns Ok(None) gracefully (files missing)
+# and search degrades to FTS5-only.
 default = []
 embed-model = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers",
                "dep:tokenizers", "dep:ureq", "dep:flate2", "dep:tar", "dep:dirs"]

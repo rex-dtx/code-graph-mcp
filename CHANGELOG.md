@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.75.0 — Cross-file call graph in the grep inject
+
+The PostToolUse compound-grep inject now delivers a grepped symbol's cross-file
+caller/callee tree instead of re-echoing the grep's own hits.
+
+### Changed
+- **`post-grep-inject` prefers the call graph over the grep echo.** A 2026-06-26
+  audit of the non-blocking inject (13 delivered events, 0 consumed by the model)
+  found the prior payload redundant — it re-stated the hits the model's own grep
+  had already returned. When a compound grep targets a single clean identifier the
+  hook now runs `code-graph-mcp callgraph <symbol>` and injects the cross-file
+  caller/callee tree (the one structural fact a raw grep cannot surface), falling
+  back to the AST-aware grep echo only when the symbol has no call edges
+  (leaf/absent) or the pattern is not a bare identifier. New `runCallgraphAnswer`
+  (`cg-answer.js`) keeps the same bounded, best-effort, `CODE_GRAPH_INTERNAL`-marked
+  posture as the sibling answer runners; the inject records `mode:'callgraph'` so
+  the conversion funnel can segment call-graph injects from echo injects. Hook
+  logic only — no INDEX_VERSION/schema bump.
+
 ## v0.74.8 — Bounded embedding backfill
 
 A code review of v0.74.7 caught a latent loop hazard in the now-eager embedding

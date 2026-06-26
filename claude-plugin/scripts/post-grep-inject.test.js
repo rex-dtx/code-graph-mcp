@@ -95,6 +95,19 @@ test('buildInjectText: no truncation note when not truncated', () => {
   assert.doesNotMatch(out, /truncated/);
 });
 
+test('buildInjectText: callgraph mode uses the cross-file header (not the grep-echo header)', () => {
+  const out = buildInjectText({ text: '  ← called by: alpha (src/b.rs)', truncated: false }, 'callgraph');
+  assert.match(out, /Cross-file call graph/);
+  assert.match(out, /grep can't show this/);
+  assert.doesNotMatch(out, /AST-aware view of your grep/);
+  assert.match(out, /← called by` = callers/);
+});
+
+test('buildInjectText: callgraph truncation note points at the callgraph command', () => {
+  const out = buildInjectText({ text: 'tree', truncated: true }, 'callgraph');
+  assert.match(out, /code-graph-mcp callgraph <symbol>/);
+});
+
 // ── opt-out / kill switch ───────────────────────────────────────────
 
 test('isSilenced: CODE_GRAPH_QUIET_HOOKS=1 → silenced; default not', () => {

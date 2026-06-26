@@ -243,6 +243,67 @@ function runOverviewAnswer(opts = {}) {
   }
 }
 
+/**
+ * v0.75 — Run `code-graph-mcp callgraph <symbol>` for the cross-file caller/callee
+ * tree. This is the ONE thing a raw grep CANNOT return: a symbol-targeted grep
+ * hands the model the definition + same-file usages it already scoped to, but NOT
+ * "who calls this across the repo". The 2026-06-26 inject audit (13 events, 0
+ * CONSUMED) found the grep-echo payload redundant precisely because it re-stated
+ * the model's own hits; the caller tree is the marginal signal grep can't give.
+ *
+ * "hits" requires an actual EDGE line (`← called by` / `→ calls`) — a bare symbol
+ * header with no edges (leaf symbol, or name not in the graph) carries no marginal
+ * value over the grep the model already ran, so it degrades to `no-hits` and the
+ * caller falls back to the grep/show echo. Same bounded/best-effort posture as the
+ * sibling runners; any failure → `unavailable` / `no-binary`, never a new failure.
+ * @returns {{status: 'hits', text: string, truncated: boolean}
+ *         | {status: 'no-hits'}
+ *         | {status: 'no-binary'}
+ *         | {status: 'unavailable'}}
+ */
+function runCallgraphAnswer(opts = {}) {
+  const {
+    cwd,
+    symbol,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    maxBytes = DEFAULT_MAX_BYTES,
+  } = opts;
+  try {
+    if (typeof symbol !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(symbol)) {
+      return { status: 'unavailable' };
+    }
+    let binary = opts.binary;
+    if (binary === undefined) {
+      binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
+    }
+    if (!binary) return { status: 'no-binary' };
+
+    const res = spawnSync(binary, ['callgraph', symbol], {
+      cwd,
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
+    });
+    if (res.error || res.signal) return { status: 'unavailable' };
+    // grep-parity exit codes: 1 = symbol not found (no graph node).
+    if (res.status === 1) return { status: 'no-hits' };
+    if (res.status !== 0) return { status: 'unavailable' };
+    const out = (res.stdout || '').trim();
+    // Only an edge-bearing tree is marginal over the grep the model already ran.
+    if (!out || out.startsWith(NO_MATCH_PREFIX) ||
+        !(out.includes('← called by') || out.includes('→ calls'))) {
+      return { status: 'no-hits' };
+    }
+    const { text, truncated } = truncateAtLine(out, maxBytes);
+    return { status: 'hits', text, truncated };
+  } catch {
+    return { status: 'unavailable' };
+  }
+}
+
 module.exports = {
-  runGrepAnswer, runShowAnswer, runOverviewAnswer, truncateAtLine, sanitizeSearchPath,
+  runGrepAnswer, runShowAnswer, runOverviewAnswer, runCallgraphAnswer,
+  truncateAtLine, sanitizeSearchPath,
 };

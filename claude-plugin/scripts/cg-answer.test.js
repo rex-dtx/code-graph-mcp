@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { runGrepAnswer, runShowAnswer, runOverviewAnswer, truncateAtLine } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, runOverviewAnswer, runCallgraphAnswer, truncateAtLine } = require('./cg-answer');
 
 // Stub "binary": a node script that reacts to its first real arg so one stub
 // covers hits / no-hits / error / timeout cases.
@@ -24,6 +24,15 @@ else if (pattern === 'NothingHere') {
 } else if (pattern === 'NothingHereExit1') {
   // v0.50 grep-parity binary: no match → empty stdout + exit 1
   process.exit(1);
+} else if (pattern === 'HasCallers') {
+  // callgraph with real edges → runCallgraphAnswer 'hits'
+  process.stdout.write(
+    'HasCallers (src/a.rs)\\n' +
+    '  \\u2190 called by: alpha (src/b.rs)\\n' +
+    '  \\u2192 calls: beta (src/c.rs)\\n');
+} else if (pattern === 'LeafSymbol') {
+  // callgraph with a bare header, no edge lines → 'no-hits' (no marginal value)
+  process.stdout.write('LeafSymbol (src/a.rs)\\n');
 } else {
   process.stdout.write(
     'src/storage/db.rs:42  fn ' + pattern + '() {\\n' +
@@ -250,4 +259,51 @@ test('runOverviewAnswer: empty/oversized dir → unavailable (never spawns)', ()
   assert.equal(
     runOverviewAnswer({ cwd: stubDir, dir: 'a'.repeat(301), binary: stubBinary() }).status,
     'unavailable');
+});
+
+// ── runCallgraphAnswer (v0.75) — cross-file caller/callee tree ────────
+
+test('runCallgraphAnswer: edge-bearing tree → hits with caller/callee lines', () => {
+  const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'HasCallers', binary: stubBinary() });
+  assert.equal(r.status, 'hits');
+  assert.match(r.text, /called by: alpha/);
+  assert.match(r.text, /calls: beta/);
+});
+
+test('runCallgraphAnswer: passes callgraph subcommand + symbol as argv', () => {
+  // 'HasCallers' is the only stub branch that emits edges; assert it reached it.
+  const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'HasCallers', binary: stubBinary() });
+  assert.equal(r.status, 'hits');
+  assert.match(r.text, /← called by/);
+});
+
+test('runCallgraphAnswer: bare header with no edges → no-hits (no marginal value)', () => {
+  const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'LeafSymbol', binary: stubBinary() });
+  assert.equal(r.status, 'no-hits');
+});
+
+test('runCallgraphAnswer: symbol not in graph (exit 1) → no-hits', () => {
+  const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'NothingHereExit1', binary: stubBinary() });
+  assert.equal(r.status, 'no-hits');
+});
+
+test('runCallgraphAnswer: failing binary → unavailable', () => {
+  const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'ExplodePlease', binary: stubBinary() });
+  assert.equal(r.status, 'unavailable');
+});
+
+test('runCallgraphAnswer: missing binary → no-binary (distinct from runtime unavailable)', () => {
+  const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'HasCallers', binary: null });
+  assert.equal(r.status, 'no-binary');
+});
+
+test('runCallgraphAnswer: non-identifier symbol → unavailable (never spawns)', () => {
+  assert.equal(runCallgraphAnswer({ cwd: stubDir, symbol: 'a|b', binary: stubBinary() }).status, 'unavailable');
+  assert.equal(runCallgraphAnswer({ cwd: stubDir, symbol: '', binary: stubBinary() }).status, 'unavailable');
+  assert.equal(runCallgraphAnswer({ cwd: stubDir, symbol: 'def foo', binary: stubBinary() }).status, 'unavailable');
+});
+
+test('runCallgraphAnswer: timeout → unavailable', () => {
+  const r = runCallgraphAnswer({ cwd: stubDir, symbol: 'HangForever', binary: stubBinary(), timeoutMs: 300 });
+  assert.equal(r.status, 'unavailable');
 });

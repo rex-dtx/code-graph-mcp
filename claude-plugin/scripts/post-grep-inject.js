@@ -25,7 +25,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
-const { runGrepAnswer, runShowAnswer, sanitizeSearchPath } = require('./cg-answer');
+const { runGrepAnswer, runShowAnswer, runCallgraphAnswer, sanitizeSearchPath } = require('./cg-answer');
 const { emitPostToolContext } = require('./hook-emit');
 const {
   splitTopLevelSegments,
@@ -65,8 +65,21 @@ function findFoldableGrepSegment(cmd) {
 // Short header so the model recognizes this as cg's parallel structural view of
 // the grep it just ran (the grep already executed; this is additive context).
 const INJECT_HEADER = '[code-graph] AST-aware view of your grep (ran alongside):';
+// callgraph mode carries the cross-file caller/callee tree — the marginal signal
+// the grep CANNOT return (2026-06-26 audit: the grep-echo above was redundant
+// with the model's own hits; the caller tree is what moves behavior).
+const CALLGRAPH_HEADER =
+  '[code-graph] Cross-file call graph for the symbol you grepped (grep can\'t show this):';
 
 function buildInjectText(answer, mode) {
+  if (mode === 'callgraph') {
+    const lines = [CALLGRAPH_HEADER, answer.text];
+    if (answer.truncated) {
+      lines.push('(truncated — run `code-graph-mcp callgraph <symbol>` yourself for the full tree)');
+    }
+    lines.push('`← called by` = callers, `→ calls` = callees, across all files — use these directly.');
+    return lines.join('\n');
+  }
   const lines = [INJECT_HEADER, answer.text];
   if (answer.truncated) {
     lines.push(mode === 'show'
@@ -142,18 +155,39 @@ function runMain() {
 
   const { segment, block } = found;
   // Run the answer exactly like the deny path.
-  const pattern = translateBreToRg(segment, pickBlockPattern(segment));
+  const rawPattern = pickBlockPattern(segment);
+  const pattern = translateBreToRg(segment, rawPattern);
   const searchPath = sanitizeSearchPath(extractSearchPath(segment));
   let answer = { status: 'unavailable' };
   let answeredMode = block.mode;
-  if (block.mode === 'show') {
-    answer = runShowAnswer({ cwd: root, symbols: block.symbols });
-    if (answer.status !== 'hits' && pattern) {
+
+  // PREFER the cross-file caller/callee tree when the grep targets a single clean
+  // identifier — that is the marginal signal a raw grep can't return (2026-06-26
+  // inject audit: 13 events / 0 CONSUMED because the grep-echo just re-stated the
+  // model's own hits). runCallgraphAnswer returns `hits` ONLY when the symbol has
+  // real edges; a leaf/absent symbol degrades to the show/grep echo below.
+  const symbol = (typeof rawPattern === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(rawPattern))
+    ? rawPattern : null;
+  if (symbol) {
+    const cg = runCallgraphAnswer({ cwd: root, symbol });
+    if (cg.status === 'hits') {
+      answer = cg;
+      answeredMode = 'callgraph';
+    }
+  }
+
+  if (answer.status !== 'hits') {
+    if (block.mode === 'show') {
+      answeredMode = 'show';
+      answer = runShowAnswer({ cwd: root, symbols: block.symbols });
+      if (answer.status !== 'hits' && pattern) {
+        answeredMode = 'grep';
+        answer = runGrepAnswer({ cwd: root, pattern, searchPath });
+      }
+    } else if (pattern) {
       answeredMode = 'grep';
       answer = runGrepAnswer({ cwd: root, pattern, searchPath });
     }
-  } else if (pattern) {
-    answer = runGrepAnswer({ cwd: root, pattern, searchPath });
   }
 
   // Only inject on hits — no-hits / unavailable / no-binary stay silent (the grep
