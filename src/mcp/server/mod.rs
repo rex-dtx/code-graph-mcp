@@ -221,6 +221,15 @@ fn apply_backfill_outcome(
     }
 }
 
+/// True if `e`'s anyhow cause chain contains a SQLite FOREIGN KEY constraint failure.
+/// Matches the FULL chain (`{:#}`), not just the outer `to_string()`: the incremental
+/// pipeline today surfaces rusqlite's message verbatim, but a future `.context()` wrapper
+/// would hide it from a `to_string()` substring check and silently bypass the truncate+
+/// rebuild recovery — regressing to the v0.11–0.14 "raw FK bubbles to the tool handler" bug.
+fn is_fk_constraint_error(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("FOREIGN KEY constraint failed")
+}
+
 /// Token threshold for auto-compressing tool results.
 /// Results exceeding this estimated token count are returned as summaries
 /// with node_ids for expansion via get_ast_node.
@@ -1107,44 +1116,52 @@ impl McpServer {
         const EMBED_BATCH: usize = 32;
         let mut total_embedded = 0usize;
         let t0 = std::time::Instant::now();
-        // No-progress guard. `embed_and_store_batch` returns Ok even when an
-        // individual node's inference deterministically fails — its sequential
-        // fallback drops that node (never inserted, never marked), so
-        // `get_unembedded_nodes` (WHERE node_vectors IS NULL) would hand the same
-        // node back every iteration. Counting vectors actually written (not chunk
-        // sizes) lets us break when a non-empty batch adds nothing, instead of
-        // spinning forever on an un-embeddable node and pinning embedding_in_progress
-        // for the whole session.
-        let mut embedded = queries::count_nodes_with_vectors(db.conn())?.0;
+        // Nodes that failed to embed THIS run (a deterministically un-embeddable
+        // context_string, or a transient per-node inference error in the sequential
+        // fallback). embed_and_store_batch returns the IDs that actually got a vector,
+        // so we learn failures directly; we exclude them from the next query so a poison
+        // node at the head of the caller-count ordering can't be re-fetched forever and
+        // starve the embeddable nodes behind it — we advance past it instead of stopping.
+        let mut failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-        let outcome = loop {
-            let chunk = queries::get_unembedded_nodes(db.conn(), EMBED_BATCH)?;
+        loop {
+            let exclude: Vec<i64> = failed.iter().copied().collect();
+            let chunk = queries::get_unembedded_nodes_excluding(db.conn(), EMBED_BATCH, &exclude)?;
             if chunk.is_empty() {
-                break BackfillOutcome::Drained;
+                break;
             }
-            let batch_len = chunk.len();
-            // embed_and_store_batch manages its own transaction internally
-            embed_and_store_batch(&db, &model, &chunk)?;
-            let now = queries::count_nodes_with_vectors(db.conn())?.0;
-            if now <= embedded {
-                tracing::warn!(
-                    "[embed-bg] batch of {} produced no new vectors (transient error or \
-                     un-embeddable node?); stopping backfill after {} embedded",
-                    batch_len, total_embedded
-                );
-                // `progressed` lets the driver pin genuine residue immediately (model
-                // proven working) vs bounded-retry an ambiguous first-batch stall.
-                break BackfillOutcome::Stalled { progressed: total_embedded > 0 };
+            let chunk_len = chunk.len();
+            // embed_and_store_batch manages its own transaction internally.
+            let embedded_ids = embed_and_store_batch(&db, &model, &chunk)?;
+            total_embedded += embedded_ids.len();
+            if embedded_ids.len() < chunk_len {
+                let ok: std::collections::HashSet<i64> = embedded_ids.into_iter().collect();
+                for (id, _) in &chunk {
+                    if !ok.contains(id) {
+                        failed.insert(*id);
+                    }
+                }
             }
-            total_embedded += (now - embedded) as usize;
-            embedded = now;
-            tracing::info!("[embed-bg] Progress: {} nodes embedded", total_embedded);
-        };
+        }
 
         if total_embedded > 0 {
             tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
                 total_embedded, t0.elapsed().as_secs_f64());
         }
+        if !failed.is_empty() {
+            tracing::warn!(
+                "[embed-bg] {} node(s) could not be embedded this run (skipped as residue)",
+                failed.len()
+            );
+        }
+        // No failures → every embeddable node now has a vector. Failures remain → genuine
+        // residue we advanced past (not starved on); `progressed` lets the periodic driver
+        // pin that residue immediately when the model is proven working this pass.
+        let outcome = if failed.is_empty() {
+            BackfillOutcome::Drained
+        } else {
+            BackfillOutcome::Stalled { progressed: total_embedded > 0 }
+        };
         Ok(outcome)
     }
 
@@ -1511,8 +1528,7 @@ impl McpServer {
                 Ok(())
             }
             Err(e) => {
-                let err_msg = format!("{:#}", e);
-                if err_msg.contains("FOREIGN KEY constraint failed") {
+                if is_fk_constraint_error(&e) {
                     // DB state is inconsistent with in-memory caches (e.g., DB replaced
                     // externally, stale node IDs from a previous session, or orphan rows
                     // left by the failed incremental). Recovery must truncate first —
@@ -2021,6 +2037,23 @@ mod tests {
         assert_eq!(apply_backfill_outcome(0, 0, progressed, 5), (5, 0));
         // Even with retries already accrued, a progressed stall pins and resets them.
         assert_eq!(apply_backfill_outcome(0, 2, progressed, 5), (5, 0));
+    }
+
+    #[test]
+    fn test_is_fk_constraint_error_matches_full_chain() {
+        // A bare FK error matches.
+        let bare = anyhow::anyhow!("FOREIGN KEY constraint failed");
+        assert!(is_fk_constraint_error(&bare));
+        // A .context()-WRAPPED FK error: the outer message hides the cause, so a
+        // to_string() substring check would MISS it — this is exactly why the predicate
+        // matches the full chain ({:#}). Locks the W3 fix against a future .context() regression.
+        let wrapped = bare.context("while running incremental index");
+        assert!(!wrapped.to_string().contains("FOREIGN KEY constraint failed"),
+            "precondition: the outer message hides the cause from to_string()");
+        assert!(is_fk_constraint_error(&wrapped),
+            "full-chain match must still detect the wrapped FK cause");
+        // A non-FK error must not match (no spurious truncate+rebuild).
+        assert!(!is_fk_constraint_error(&anyhow::anyhow!("disk full")));
     }
 
     #[test]

@@ -500,15 +500,31 @@ fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
     use crate::indexer::pipeline::embed_and_store_batch;
     if let Some(model) = EmbeddingModel::load()? {
         let mut total = 0usize;
+        // Skip nodes that fail to embed this run. This loop only stops on an empty
+        // result, so without excluding failures a single deterministically-un-embeddable
+        // node (which stays `node_vectors IS NULL` and sorts first by caller-count) would
+        // be re-fetched at the head of every batch and spin the loop forever.
+        let mut failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
         loop {
-            let chunk = wrap_index_busy(queries::get_unembedded_nodes(db.conn(), 64))?;
+            let exclude: Vec<i64> = failed.iter().copied().collect();
+            let chunk = wrap_index_busy(queries::get_unembedded_nodes_excluding(db.conn(), 64, &exclude))?;
             if chunk.is_empty() { break; }
-            wrap_index_busy(embed_and_store_batch(db, &model, &chunk))?;
-            total += chunk.len();
+            let chunk_len = chunk.len();
+            let embedded_ids = wrap_index_busy(embed_and_store_batch(db, &model, &chunk))?;
+            total += embedded_ids.len();
+            if embedded_ids.len() < chunk_len {
+                let ok: std::collections::HashSet<i64> = embedded_ids.into_iter().collect();
+                for (id, _) in &chunk {
+                    if !ok.contains(id) { failed.insert(*id); }
+                }
+            }
         }
         if total > 0 && !quiet {
             let (embedded, embeddable) = queries::count_nodes_with_vectors(db.conn())?;
             eprintln!("Embedded {} nodes ({}/{})", total, embedded, embeddable);
+        }
+        if !failed.is_empty() && !quiet {
+            eprintln!("{} node(s) could not be embedded (skipped)", failed.len());
         }
     }
     Ok(())

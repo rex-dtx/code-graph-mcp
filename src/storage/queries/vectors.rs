@@ -97,6 +97,41 @@ pub fn get_unembedded_nodes(conn: &Connection, limit: usize) -> Result<Vec<(i64,
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Like [`get_unembedded_nodes`] but skips `exclude` node IDs in SQL. The backfill loops
+/// pass the set of nodes that failed to embed THIS run so the same hot-path-first poison
+/// node isn't re-fetched at the head of every batch (which would starve the embeddable
+/// nodes behind it, or — in the CLI loop that only stops on an empty result — spin forever).
+pub fn get_unembedded_nodes_excluding(
+    conn: &Connection,
+    limit: usize,
+    exclude: &[i64],
+) -> Result<Vec<(i64, String)>> {
+    if exclude.is_empty() {
+        return get_unembedded_nodes(conn, limit);
+    }
+    let placeholders = std::iter::repeat_n("?", exclude.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT n.id, n.context_string
+         FROM nodes n
+         LEFT JOIN node_vectors nv ON n.id = nv.node_id
+         LEFT JOIN edges e ON e.target_id = n.id
+         WHERE nv.node_id IS NULL AND n.context_string IS NOT NULL
+           AND n.id NOT IN ({placeholders})
+         GROUP BY n.id
+         ORDER BY COUNT(e.target_id) DESC
+         LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> =
+        exclude.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let lim = limit as i64;
+    params.push(&lim);
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 /// Count nodes with embeddings vs total embeddable nodes.
 /// Returns (with_vectors, total_embeddable).
 pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
@@ -221,5 +256,40 @@ mod tests {
         assert_eq!(results[1].0, nid2, "moderately referenced node should be second");
         // Third should be "lonely" (0 edges)
         assert_eq!(results[2].0, nid3, "unreferenced node should be last");
+    }
+
+    #[test]
+    fn test_get_unembedded_nodes_excluding_skips_ids() {
+        // The backfill loops use this to advance past nodes that failed to embed; verify
+        // excluded IDs are never returned even though they're still unembedded, and that
+        // excluding the whole set yields empty (so the loop terminates instead of spinning).
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let mk = |name: &str| insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: name.into(),
+            qualified_name: None, start_line: 1, end_line: 2,
+            code_content: format!("function {name}() {{}}"),
+            signature: None, doc_comment: None, context_string: Some(format!("function {name}")),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        let a = mk("aa");
+        let b = mk("bb");
+        let c = mk("cc");
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+
+        // No exclusion → all three (delegates to get_unembedded_nodes).
+        assert_eq!(get_unembedded_nodes_excluding(conn, 10, &[]).unwrap().len(), 3);
+
+        // Excluding b → only a and c; b never appears though it's still unembedded.
+        let got = get_unembedded_nodes_excluding(conn, 10, &[b]).unwrap();
+        let ids: Vec<i64> = got.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids.len(), 2, "excluded node must be skipped");
+        assert!(ids.contains(&a) && ids.contains(&c) && !ids.contains(&b));
+
+        // Excluding every unembedded node → empty, the backfill loop's termination signal.
+        assert!(get_unembedded_nodes_excluding(conn, 10, &[a, b, c]).unwrap().is_empty());
     }
 }

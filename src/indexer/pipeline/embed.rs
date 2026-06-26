@@ -14,9 +14,16 @@ use crate::storage::queries::insert_node_vectors_batch;
 /// Embed context strings using batched inference and batch-insert vectors.
 /// Public so the background embedding thread in server.rs can call it.
 /// Wraps vector inserts in a transaction for atomicity and performance.
-pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_updates: &[(i64, String)]) -> Result<()> {
+///
+/// Returns the node IDs that ACTUALLY got a vector (≤ input). The backfill driver uses
+/// this to advance past nodes that failed to embed — a deterministically un-embeddable
+/// node (or a transient per-node inference error in the sequential fallback) otherwise
+/// stays `WHERE node_vectors IS NULL` and, being ordered first by caller-count, would be
+/// re-fetched at the head of every batch and starve the embeddable nodes behind it.
+/// Indexing callers ignore the return.
+pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_updates: &[(i64, String)]) -> Result<Vec<i64>> {
     if context_updates.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let t0 = std::time::Instant::now();
@@ -41,18 +48,20 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
             let vectors: Vec<(i64, Vec<f32>)> = ids.iter().zip(embs)
                 .filter_map(|(&id, emb)| emb.map(|e| (id, e)))
                 .collect();
+            let embedded_ids: Vec<i64> = vectors.iter().map(|(id, _)| *id).collect();
             if !vectors.is_empty() {
                 let tx = db.conn().unchecked_transaction()?;
                 insert_node_vectors_batch(db.conn(), &vectors)?;
                 tx.commit()?;
             }
-            tracing::info!("[embed] {} nodes (sequential fallback) in {:.1}s",
-                context_updates.len(), t0.elapsed().as_secs_f64());
-            return Ok(());
+            tracing::info!("[embed] {}/{} nodes (sequential fallback) in {:.1}s",
+                embedded_ids.len(), context_updates.len(), t0.elapsed().as_secs_f64());
+            return Ok(embedded_ids);
         }
     };
 
     let vectors: Vec<(i64, Vec<f32>)> = ids.into_iter().zip(embeddings).collect();
+    let embedded_ids: Vec<i64> = vectors.iter().map(|(id, _)| *id).collect();
     let t_embed = t0.elapsed();
 
     if !vectors.is_empty() {
@@ -62,10 +71,10 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
     }
 
     tracing::info!("[embed] {} nodes in {:.1}s (embed {:.1}s, store {:.1}s)",
-        context_updates.len(),
+        embedded_ids.len(),
         t0.elapsed().as_secs_f64(),
         t_embed.as_secs_f64(),
         (t0.elapsed() - t_embed).as_secs_f64(),
     );
-    Ok(())
+    Ok(embedded_ids)
 }
