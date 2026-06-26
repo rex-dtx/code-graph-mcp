@@ -164,6 +164,15 @@ impl McpClient {
             json!({"name": name, "arguments": args}),
             Duration::from_secs(30))
     }
+
+    /// Fire-and-forget JSON-RPC notification (no id, no response expected).
+    #[cfg_attr(not(feature = "embed-model"), allow(dead_code))]
+    fn notify(&mut self, method: &str, params: Value) {
+        let req = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let stdin = self.child.stdin.as_mut().expect("stdin piped");
+        writeln!(stdin, "{}", req).expect("write notification");
+        stdin.flush().expect("flush notification");
+    }
 }
 
 impl Drop for McpClient {
@@ -541,4 +550,65 @@ fn mcp_find_dead_code_rejects_unknown_node_type() {
     };
     assert!(text.contains("Unknown type filter"),
         "find_dead_code must reject unknown node_type; got: '{}'", text);
+}
+
+/// Regression: an "edit-only" session that issues NO code-graph tool call must
+/// still get its index embedded. The embedding backfill used to be kicked off
+/// only by `consume_startup_index_result()`, which runs on an incoming MCP
+/// message (i.e. a tool call). With no tool call the finished startup index's
+/// vectors were stranded — the daagu "2% vec, never moves" symptom. The fix
+/// drives the backfill from the startup-index thread itself, so the handshake
+/// alone is enough.
+#[cfg(feature = "embed-model")]
+#[test]
+fn mcp_startup_embeds_without_any_tool_call() {
+    use code_graph_mcp::storage::db::Database;
+    use code_graph_mcp::storage::queries::count_nodes_with_vectors;
+
+    // Needs real model weights to observe embedding. Skip when absent (CI without
+    // the downloaded model) — there is nothing to embed with.
+    if code_graph_mcp::embedding::model::EmbeddingModel::load().ok().flatten().is_none() {
+        eprintln!("[skip] embedding model weights unavailable; cannot observe backfill");
+        return;
+    }
+
+    let project = setup_fixture_project();
+    let db_path = project.path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+
+    // Precondition: the in-process index (built with model=None) has embeddable
+    // nodes but zero vectors. Open with vec so node_vectors exists for polling.
+    {
+        let db = Database::open_with_vec(&db_path).unwrap();
+        let (with_vectors, total) = count_nodes_with_vectors(db.conn()).unwrap();
+        assert!(total > 0, "fixture must have embeddable nodes (got total={total})");
+        assert_eq!(with_vectors, 0, "fixture must start with 0 vectors (got {with_vectors})");
+    }
+
+    // Drive ONLY the lifecycle handshake: initialize (in spawn) + the initialized
+    // notification. Never send a tools/call.
+    let mut client = McpClient::spawn(project.path());
+    client.notify("notifications/initialized", json!({}));
+
+    // The backfill runs asynchronously in the startup-index thread. Poll the
+    // vector count until it climbs above zero.
+    let mut embedded = 0i64;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(db) = Database::open_with_vec(&db_path) {
+            if let Ok((with_vectors, _)) = count_nodes_with_vectors(db.conn()) {
+                embedded = with_vectors;
+                if embedded > 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(
+        embedded > 0,
+        "startup index must embed nodes with NO tool call; got {embedded} vectors after 60s"
+    );
 }

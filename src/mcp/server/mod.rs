@@ -588,88 +588,107 @@ impl McpServer {
         let result_slot = Arc::clone(&self.indexing.startup_index_result);
         let error_slot = Arc::clone(&self.indexing.startup_index_error);
         let progress_file = project_root.join(CODE_GRAPH_DIR).join("indexing-status.json");
+        let embedding_flag = Arc::clone(&self.indexing.embedding_in_progress);
 
         std::thread::spawn(move || {
-            // Guard ensures flags are always cleared, even on panic
-            struct IndexGuard {
-                flag: Arc<AtomicBool>,
-                done: Arc<(Mutex<bool>, Condvar)>,
-                progress_file: PathBuf,
-            }
-            impl Drop for IndexGuard {
-                fn drop(&mut self) {
-                    self.flag.store(false, Ordering::Release);
-                    let _ = std::fs::remove_file(&self.progress_file);
-                    let (lock, cvar) = &*self.done;
-                    if let Ok(mut done) = lock.lock() {
-                        *done = true;
-                    }
-                    cvar.notify_all();
+            // The index work runs under IndexGuard (clears the startup flag, removes
+            // the progress file, signals the done condvar on drop). Scoped to its own
+            // block so the guard drops — and `startup_indexing` reads false — BEFORE
+            // the embedding backfill below, which can run for minutes; otherwise the
+            // server would look "still indexing" for the whole embed.
+            {
+                // Guard ensures flags are always cleared, even on panic
+                struct IndexGuard {
+                    flag: Arc<AtomicBool>,
+                    done: Arc<(Mutex<bool>, Condvar)>,
+                    progress_file: PathBuf,
                 }
-            }
-            let _guard = IndexGuard {
-                flag: indexing_flag,
-                done: done_signal,
-                progress_file: progress_file.clone(),
-            };
-
-            let db = match Database::open_with_vec(&db_path) {
-                Ok(db) => db,
-                Err(e) => {
-                    tracing::error!("Background indexing: failed to open DB: {}", e);
-                    return;
-                }
-            };
-
-            let pf = progress_file.clone();
-            let progress_cb = move |current: usize, total: usize| {
-                let json = format!(r#"{{"s":"indexing","d":{},"t":{}}}"#, current, total);
-                let _ = std::fs::write(&pf, json);
-            };
-
-            let index_start = std::time::Instant::now();
-            let result = if has_existing_index {
-                run_incremental_index_cached(
-                    &db, &project_root, None,
-                    dir_cache.as_ref(),
-                    Some(&progress_cb),
-                ).map(|(r, cache)| (r, Some(cache)))
-            } else {
-                run_full_index(&db, &project_root, None, Some(&progress_cb))
-                    .map(|r| (r, None))
-            };
-
-            match result {
-                Ok((result, new_cache)) => {
-                    let elapsed_ms = index_start.elapsed().as_millis() as u64;
-                    tracing::info!(
-                        "Background indexing complete: {} files, {} nodes in {}ms",
-                        result.files_indexed, result.nodes_created, elapsed_ms
-                    );
-                    match result_slot.lock() {
-                        Ok(mut slot) => {
-                            *slot = Some(StartupIndexResult {
-                                files_indexed: result.files_indexed,
-                                nodes_created: result.nodes_created,
-                                edges_created: result.edges_created,
-                                elapsed_ms,
-                                was_full: !has_existing_index,
-                                new_cache,
-                                stats: result.stats,
-                            });
+                impl Drop for IndexGuard {
+                    fn drop(&mut self) {
+                        self.flag.store(false, Ordering::Release);
+                        let _ = std::fs::remove_file(&self.progress_file);
+                        let (lock, cvar) = &*self.done;
+                        if let Ok(mut done) = lock.lock() {
+                            *done = true;
                         }
-                        Err(e) => tracing::error!("Background indexing: result slot poisoned: {}", e),
+                        cvar.notify_all();
                     }
                 }
-                Err(e) => {
-                    let msg = format!("Background indexing failed: {}", e);
-                    tracing::error!("{}", msg);
-                    if let Ok(mut slot) = error_slot.lock() {
-                        *slot = Some(msg);
+                let _guard = IndexGuard {
+                    flag: indexing_flag,
+                    done: done_signal,
+                    progress_file: progress_file.clone(),
+                };
+
+                let db = match Database::open_with_vec(&db_path) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        tracing::error!("Background indexing: failed to open DB: {}", e);
+                        return;
+                    }
+                };
+
+                let pf = progress_file.clone();
+                let progress_cb = move |current: usize, total: usize| {
+                    let json = format!(r#"{{"s":"indexing","d":{},"t":{}}}"#, current, total);
+                    let _ = std::fs::write(&pf, json);
+                };
+
+                let index_start = std::time::Instant::now();
+                let result = if has_existing_index {
+                    run_incremental_index_cached(
+                        &db, &project_root, None,
+                        dir_cache.as_ref(),
+                        Some(&progress_cb),
+                    ).map(|(r, cache)| (r, Some(cache)))
+                } else {
+                    run_full_index(&db, &project_root, None, Some(&progress_cb))
+                        .map(|r| (r, None))
+                };
+
+                match result {
+                    Ok((result, new_cache)) => {
+                        let elapsed_ms = index_start.elapsed().as_millis() as u64;
+                        tracing::info!(
+                            "Background indexing complete: {} files, {} nodes in {}ms",
+                            result.files_indexed, result.nodes_created, elapsed_ms
+                        );
+                        match result_slot.lock() {
+                            Ok(mut slot) => {
+                                *slot = Some(StartupIndexResult {
+                                    files_indexed: result.files_indexed,
+                                    nodes_created: result.nodes_created,
+                                    edges_created: result.edges_created,
+                                    elapsed_ms,
+                                    was_full: !has_existing_index,
+                                    new_cache,
+                                    stats: result.stats,
+                                });
+                            }
+                            Err(e) => tracing::error!("Background indexing: result slot poisoned: {}", e),
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("Background indexing failed: {}", e);
+                        tracing::error!("{}", msg);
+                        if let Ok(mut slot) = error_slot.lock() {
+                            *slot = Some(msg);
+                        }
                     }
                 }
+                // IndexGuard drops here: clears startup flag, removes progress file, signals condvar.
             }
-            // _guard drop: clears flag, removes progress file, signals condvar
+
+            // Embed the freshly-indexed nodes right here, in the same background
+            // thread. The index is committed and `startup_indexing` is now clear, so
+            // a long embed won't masquerade as "still indexing". Driving the backfill
+            // from the index thread — not only from consume_startup_index_result(),
+            // which fires solely on an incoming MCP message — means an edit-only
+            // session that issues NO code-graph tool call still gets a fully embedded
+            // index instead of stranding the vectors at whatever a prior search left.
+            // Guarded by embedding_in_progress so it never double-runs with a
+            // search-triggered embed; no-ops when no model is available locally.
+            Self::run_guarded_backfill(&db_path, &embedding_flag);
         });
     }
 
@@ -807,58 +826,73 @@ impl McpServer {
             None => return,
         };
 
-        // Acquire flag AFTER precondition checks to avoid permanent flag leak
-        if self.indexing.embedding_in_progress.swap(true, Ordering::AcqRel) {
+        // Cheap pre-filter to skip spawning a doomed thread; run_guarded_backfill
+        // re-checks authoritatively via swap, so the small load→swap race is benign.
+        if self.indexing.embedding_in_progress.load(Ordering::Acquire) {
             return; // already running
         }
         let flag = Arc::clone(&self.indexing.embedding_in_progress);
-
         std::thread::spawn(move || {
-            // Drop guard ensures flag is always cleared, even on panic
-            struct FlagGuard(Arc<AtomicBool>);
-            impl Drop for FlagGuard {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
-            }
-            let _guard = FlagGuard(flag);
-
-            let result = (|| -> Result<()> {
-                let model = match EmbeddingModel::load()? {
-                    Some(m) => m,
-                    None => return Ok(()),
-                };
-                let db = Database::open_with_vec(&db_path)?;
-
-                const EMBED_BATCH: usize = 32;
-                let mut total_embedded = 0usize;
-                let t0 = std::time::Instant::now();
-
-                loop {
-                    let chunk = queries::get_unembedded_nodes(db.conn(), EMBED_BATCH)?;
-                    if chunk.is_empty() {
-                        break;
-                    }
-
-                    // embed_and_store_batch manages its own transaction internally
-                    embed_and_store_batch(&db, &model, &chunk)?;
-
-                    total_embedded += chunk.len();
-                    tracing::info!("[embed-bg] Progress: {} nodes embedded", total_embedded);
-                }
-
-                if total_embedded > 0 {
-                    tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
-                        total_embedded, t0.elapsed().as_secs_f64());
-                }
-                Ok(())
-            })();
-
-            if let Err(e) = result {
-                tracing::warn!("[embed-bg] Failed: {}", e);
-            }
-            // FlagGuard::drop() clears the flag automatically
+            Self::run_guarded_backfill(&db_path, &flag);
         });
+    }
+
+    /// Claim the `embedding_in_progress` flag and run [`Self::run_unembedded_backfill`]
+    /// to completion, releasing the flag on return (incl. panic via the drop guard).
+    /// No-ops if a backfill is already running. Blocks the caller, so it must be
+    /// invoked on a background thread (the embedding thread, or the startup-index
+    /// thread once its own work is committed and the indexing flag is clear).
+    fn run_guarded_backfill(db_path: &Path, in_progress: &AtomicBool) {
+        if in_progress.swap(true, Ordering::AcqRel) {
+            return; // a backfill is already running
+        }
+        // Drop guard ensures the flag is always cleared, even on panic.
+        struct FlagGuard<'a>(&'a AtomicBool);
+        impl Drop for FlagGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = FlagGuard(in_progress);
+        if let Err(e) = Self::run_unembedded_backfill(db_path) {
+            tracing::warn!("[embed-bg] Failed: {}", e);
+        }
+    }
+
+    /// Embed every node that still lacks a vector, hot-path first, in batches.
+    /// Loads its own model + DB connection (EmbeddingModel is `!Send`, so it can't
+    /// cross the thread boundary) and no-ops when no model is available locally or
+    /// vec is disabled. Append-only writes — safe to run alongside a reader.
+    fn run_unembedded_backfill(db_path: &Path) -> Result<()> {
+        let model = match EmbeddingModel::load()? {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+        let db = Database::open_with_vec(db_path)?;
+        if !db.vec_enabled() {
+            return Ok(());
+        }
+
+        const EMBED_BATCH: usize = 32;
+        let mut total_embedded = 0usize;
+        let t0 = std::time::Instant::now();
+
+        loop {
+            let chunk = queries::get_unembedded_nodes(db.conn(), EMBED_BATCH)?;
+            if chunk.is_empty() {
+                break;
+            }
+            // embed_and_store_batch manages its own transaction internally
+            embed_and_store_batch(&db, &model, &chunk)?;
+            total_embedded += chunk.len();
+            tracing::info!("[embed-bg] Progress: {} nodes embedded", total_embedded);
+        }
+
+        if total_embedded > 0 {
+            tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
+                total_embedded, t0.elapsed().as_secs_f64());
+        }
+        Ok(())
     }
 
     /// Spawn a background thread to download the embedding model if not available.

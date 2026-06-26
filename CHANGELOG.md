@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.74.7 — Background embedding completes without a tool call
+
+A project whose semantic index sat partially embedded — the statusline showing a
+stuck `N% vec` that never advanced — turned out to be a server-lifecycle gap, not
+a slow or failed embed.
+
+### Fixed
+- **The background embedding backfill no longer stalls in a session that issues no
+  code-graph tool call.** After the startup index finished, the embedding pass was
+  kicked only by the index-result consumer, which runs on an incoming MCP message
+  (i.e. a tool call). An "edit-only" session that never queried the graph left the
+  freshly-indexed nodes' vectors stranded at whatever a prior search had embedded
+  (e.g. a `2% vec` statusline that never moved). The startup-index thread now runs
+  the backfill itself, once the index is committed and the indexing flag is
+  cleared, so the index embeds to completion on its own — guarded so it never
+  double-runs with a search-triggered embed, and a no-op when no embedding model
+  is present locally. The file watcher's start remains driven by the first tool
+  call (a narrower, self-healing gap: each new session's startup index catches up).
+
 ## v0.74.6 — Non-destructive reads + structure-first indexing
 
 Debugging a persistent `code-graph: ↻ updating` / `offline` statusline in a
