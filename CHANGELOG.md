@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.74.8 — Bounded embedding backfill
+
+A code review of v0.74.7 caught a latent loop hazard in the now-eager embedding
+backfill.
+
+### Fixed
+- **The background embedding backfill can no longer spin on an un-embeddable node.**
+  `embed_and_store_batch` returns success even when an individual node's inference
+  deterministically fails (it drops that node rather than tanking the whole batch),
+  so the backfill's "loop until no unembedded nodes remain" could hand the same
+  failing node back forever — pinning a CPU at 100% and holding the
+  `embedding_in_progress` flag for the rest of the session (which in turn makes
+  incremental re-index skip). The loop now tracks vectors actually written and
+  stops, with a warning, when a non-empty batch produces none. v0.74.7's eager
+  startup backfill is what made this reachable in every session; the loop itself
+  predates it. In no-embed builds (`default = []`) the startup backfill is now
+  skipped outright rather than attempting a model-load no-op each session.
+
 ## v0.74.7 — Background embedding completes without a tool call
 
 A project whose semantic index sat partially embedded — the statusline showing a
