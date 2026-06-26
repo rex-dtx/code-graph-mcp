@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.76.2 — Indexing & embedding robustness (audit + code review)
+
+Robustness hardening of the incremental-index / embedding / install-update
+subsystem, from a full audit + two rounds of code review. All fixes restore
+intended behavior; no schema, index-format, or public-interface change —
+existing indexes keep working without a rebuild.
+
+### Fixed
+- **Embedding backfill no longer strands at 0% vectors on a fresh install.** The
+  periodic backfill driver stopped advancing its "un-embeddable" floor when the
+  model was merely still downloading at the first tick (or hit a transient embed
+  stall) — which pinned the floor and left the index vector-less until a restart.
+  It now keeps re-attempting until the model lands and bounded-retries stalls.
+- **Edits made while the model is embedding are no longer lost.** A watcher-
+  triggered incremental that was skipped because a background embedding held the
+  write path had already consumed the change signal, stranding the change until an
+  unrelated edit or a restart. The incremental is now re-armed and runs on the
+  next tool call.
+- **A killed or interrupted model download can no longer pin a broken cache.**
+  Model extraction is now atomic (staging dir + verified rename), and the cache is
+  treated as ready only when the tokenizer/config companion files are present — so
+  a partial download self-heals (re-downloads) instead of leaving the server
+  silently FTS5-only. Orphaned staging dirs from abnormal termination are GC'd.
+- **Plugin auto-update no longer repoints at a missing install dir** when the
+  plugin copy is skipped (tarball version drift): the installed-plugins/manifest
+  repoint is now guarded on the copy actually landing.
+
 ## v0.76.1 — Confidence-floor disclosure follow-ups (code review)
 
 Follow-ups to v0.76.0 from a code review. The default floor is unchanged; these
