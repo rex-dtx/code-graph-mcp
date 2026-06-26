@@ -135,6 +135,14 @@ pub(super) const INCREMENTAL_DEBOUNCE_SECS: u64 = 30;
 #[cfg(test)]
 pub(super) const INCREMENTAL_DEBOUNCE_SECS: u64 = 0;
 
+/// How long an incremental waits for an in-flight embedding backfill to release the write
+/// path before skipping (and leaving the incremental owed via `pending_incremental`).
+/// In tests, 0s so the skip-path test doesn't burn the full wait.
+#[cfg(not(test))]
+const EMBEDDING_WAIT_SECS: u64 = 2;
+#[cfg(test)]
+const EMBEDDING_WAIT_SECS: u64 = 0;
+
 /// Poll interval for the no-traffic embedding backfill driver.
 /// Nodes can be added to the index by a SHORT-LIVED CLI process — the PreToolUse
 /// grep/read/edit hooks call `ensure_file_indexed` with `model=None` for speed — which
@@ -146,6 +154,72 @@ pub(super) const INCREMENTAL_DEBOUNCE_SECS: u64 = 0;
 pub(super) const PERIODIC_BACKFILL_SECS: u64 = 60;
 #[cfg(test)]
 pub(super) const PERIODIC_BACKFILL_SECS: u64 = 1;
+
+/// How many consecutive `Stalled` drains the periodic backfill driver tolerates at
+/// a given floor before it pins the floor and stops re-attempting. A stall is
+/// ambiguous — a transient model/device error (which a retry recovers) or genuinely
+/// un-embeddable residue (which would spin forever). A small budget lets the
+/// transient case self-heal while bounding wasted model reloads on real residue.
+const MAX_BACKFILL_STALL_RETRIES: u32 = 3;
+
+/// Why an unembedded-node backfill pass stopped — the signal the periodic driver
+/// needs to decide whether its "confirmed un-embeddable" floor may advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillOutcome {
+    /// No embedding model on disk yet (download in flight, or FTS5-only env). The
+    /// pass embedded nothing, but that says NOTHING about node embeddability — the
+    /// floor must NOT advance, or every node strands until restart.
+    NoModel,
+    /// Every embeddable node now has a vector (the unembedded set emptied).
+    Drained,
+    /// A non-empty batch produced no new vectors. `progressed` distinguishes the two
+    /// causes the driver must treat differently:
+    /// - `true`: earlier batches this pass DID embed nodes, so the model is present and
+    ///   working — the remainder is genuine un-embeddable residue. Pin the floor now;
+    ///   no point retrying a proven-working model on content that can't embed.
+    /// - `false`: the very first batch stalled, so we can't tell a transient model/device
+    ///   error (a retry recovers) from residue. Bounded-retry before trusting it.
+    Stalled { progressed: bool },
+}
+
+/// Decide the periodic backfill driver's next `(floor, stall_retries)` from one
+/// drain attempt's [`BackfillOutcome`] and the freshly re-measured unembedded count.
+///
+/// `floor` = the count of nodes the driver has confirmed it cannot embed right now,
+/// so it stops re-attempting them. It advances ONLY on evidence a model-present drain
+/// ran and could make no further progress — never on a no-op caused by an absent
+/// model. Pure (no I/O) so the branch logic is unit-testable without a live server.
+fn apply_backfill_outcome(
+    floor: i64,
+    stall_retries: u32,
+    outcome: BackfillOutcome,
+    remeasured: i64,
+) -> (i64, u32) {
+    match outcome {
+        // Learned nothing — leave the floor low so the very next tick re-attempts;
+        // the drain fires for real the moment the model finishes downloading.
+        BackfillOutcome::NoModel => (floor, stall_retries),
+        // Embeddable set emptied. Reset to 0: any count observed later is fresh work
+        // that must be picked up, not residue to skip. Clears the retry budget too.
+        BackfillOutcome::Drained => (0, 0),
+        // Model proven working this pass — the remainder is genuine residue. Pin the
+        // floor to it immediately and reset the retry budget; retrying a working model
+        // on un-embeddable content would just churn.
+        BackfillOutcome::Stalled { progressed: true } => (remeasured, 0),
+        // Zero-progress stall (ambiguous: transient vs residue). Keep the floor low so
+        // the next tick re-attempts and a transient failure self-heals, until the retry
+        // budget is spent — then pin to the residue so we stop reloading the model to
+        // spin on nodes that truly cannot embed this session.
+        BackfillOutcome::Stalled { progressed: false } => {
+            let retries = stall_retries + 1;
+            if retries >= MAX_BACKFILL_STALL_RETRIES {
+                (remeasured, 0)
+            } else {
+                (floor, retries)
+            }
+        }
+    }
+}
 
 /// Token threshold for auto-compressing tool results.
 /// Results exceeding this estimated token count are returned as summaries
@@ -197,6 +271,13 @@ pub(super) struct IndexingState {
     /// session. `start_post_index_services` runs on every tool call, so this guards
     /// the driver thread to exactly one per process.
     pub(super) periodic_backfill_started: Arc<AtomicBool>,
+    /// Set when a watcher-triggered incremental was SKIPPED mid-flight (background
+    /// embedding held the write path past the wait deadline). `drain_watcher_events`
+    /// already consumed the signal that triggered it, so without this the change would
+    /// strand until an unrelated future edit re-signals or the server restarts. The
+    /// next `ensure_indexed` honors this flag and runs the owed incremental even with
+    /// no fresh watcher event; cleared once an incremental actually completes.
+    pub(super) pending_incremental: Arc<AtomicBool>,
 }
 
 impl IndexingState {
@@ -210,6 +291,7 @@ impl IndexingState {
             embedding_in_progress: Arc::new(AtomicBool::new(false)),
             startup_repair_done: Arc::new(AtomicBool::new(false)),
             periodic_backfill_started: Arc::new(AtomicBool::new(false)),
+            pending_incremental: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -717,7 +799,7 @@ impl McpServer {
             // with, spawning the backfill + its model-load attempt is pure per-session
             // waste (the message-driven spawn_background_embedding is already guarded).
             if cfg!(feature = "embed-model") {
-                Self::run_guarded_backfill(&db_path, &embedding_flag);
+                let _ = Self::run_guarded_backfill(&db_path, &embedding_flag);
             }
         });
     }
@@ -869,7 +951,7 @@ impl McpServer {
         }
         let flag = Arc::clone(&self.indexing.embedding_in_progress);
         std::thread::spawn(move || {
-            Self::run_guarded_backfill(&db_path, &flag);
+            let _ = Self::run_guarded_backfill(&db_path, &flag);
         });
     }
 
@@ -885,7 +967,8 @@ impl McpServer {
     /// It re-runs the guarded backfill only when the unembedded count rises ABOVE the
     /// residue the previous run left behind, so it never reloads the model to spin on
     /// permanently un-embeddable nodes (empty-content symbols that keep a
-    /// `context_string` but yield no vector). The idle tick is a single cheap COUNT.
+    /// `context_string` but yield no vector). An idle tick (no new work) is a single
+    /// cheap COUNT; only a tick that finds new work pays for a drain + a residue re-count.
     fn spawn_periodic_backfill(&self) {
         if !self.is_primary {
             return;
@@ -912,6 +995,7 @@ impl McpServer {
             // floor. Re-opening the DB each tick (rather than holding a connection) keeps
             // us correct across a rebuild-index atomic swap.
             let mut floor: i64 = 0;
+            let mut stall_retries: u32 = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(PERIODIC_BACKFILL_SECS));
                 // Open NON-destructively for the read-only count: the destructive
@@ -925,22 +1009,37 @@ impl McpServer {
                     Ok(db) => queries::count_unembedded_nodes(db.conn()).unwrap_or(floor),
                     Err(_) => continue, // transient (e.g. mid-swap) — retry next tick
                 };
-                if unembedded > floor {
-                    // New embeddable work appeared. Reuses the in-progress guard, so it
-                    // harmlessly no-ops if a tool-call/startup backfill is already draining.
-                    // Only re-measure the residue floor when WE actually drained — a
-                    // re-measurement after a no-op'd call would capture the other backfill's
-                    // mid-drain count and pin the floor too high, masking the new work.
-                    if Self::run_guarded_backfill(&db_path, &flag) {
-                        if let Ok(db) = Database::open_nondestructive(&db_path) {
-                            floor = queries::count_unembedded_nodes(db.conn()).unwrap_or(floor);
-                        }
-                    }
-                } else if unembedded < floor {
-                    // Another backfill (or a rebuild) lowered the residue — track it down so
-                    // a stale-high floor can't mask future work.
-                    floor = unembedded;
+                if unembedded <= floor {
+                    continue; // no embeddable work above the confirmed floor
                 }
+                // Embeddable work exists above the floor. Attempt a drain. The guard
+                // no-ops (None) if a tool-call/startup backfill is already draining — leave
+                // the floor untouched and retry next tick rather than trusting that other
+                // run's mid-drain count.
+                let Some(outcome) = Self::run_guarded_backfill(&db_path, &flag) else {
+                    continue;
+                };
+                // Re-measure the residue for the floor decision. `apply_backfill_outcome`
+                // only consumes this for the Stalled-pin branches; computing it
+                // unconditionally keeps the driver loop trivial (a 60s nondestructive read
+                // is negligible) and the decision logic pure + unit-testable.
+                //
+                // TOCTOU note (accepted, self-healing): this read happens AFTER the drain
+                // released the flag, so a node added in that sub-second window inflates
+                // `remeasured` and, on a pin, gets folded into the floor — stranding it
+                // until the count next rises above that floor (the next write) or restart.
+                // This only bites in the rare pin path (healthy installs always Drain, never
+                // pin) and resolves on the next file change. Do NOT "fix" it by pinning to a
+                // count captured before the drain — that reintroduces the original bug of
+                // pinning a stale-high floor.
+                let remeasured = match Database::open_nondestructive(&db_path) {
+                    Ok(db) => queries::count_unembedded_nodes(db.conn()).unwrap_or(floor),
+                    Err(_) => floor,
+                };
+                let (new_floor, new_retries) =
+                    apply_backfill_outcome(floor, stall_retries, outcome, remeasured);
+                floor = new_floor;
+                stall_retries = new_retries;
             }
         });
     }
@@ -953,13 +1052,14 @@ impl McpServer {
     /// invoked on a background thread (the embedding thread, or the startup-index
     /// thread once its own work is committed and the indexing flag is clear).
     ///
-    /// Returns `true` if this call actually claimed the flag and ran the backfill, or
-    /// `false` if it no-op'd because another backfill already held it. The periodic driver
-    /// uses this to avoid trusting a residue re-measurement taken while a *different*
-    /// backfill is still mid-drain (which would otherwise pin its floor too high).
-    fn run_guarded_backfill(db_path: &Path, in_progress: &AtomicBool) -> bool {
+    /// Returns `Some(outcome)` if this call claimed the flag and ran the backfill, or
+    /// `None` if it no-op'd because another backfill already held it. The periodic driver
+    /// uses both the `None` (don't trust a residue re-measurement taken while a *different*
+    /// backfill is mid-drain) and the [`BackfillOutcome`] (don't advance the floor on a
+    /// model-absent no-op) to decide whether its floor may advance.
+    fn run_guarded_backfill(db_path: &Path, in_progress: &AtomicBool) -> Option<BackfillOutcome> {
         if in_progress.swap(true, Ordering::AcqRel) {
-            return false; // a backfill is already running
+            return None; // a backfill is already running
         }
         // Drop guard ensures the flag is always cleared, even on panic.
         struct FlagGuard<'a>(&'a AtomicBool);
@@ -969,24 +1069,39 @@ impl McpServer {
             }
         }
         let _guard = FlagGuard(in_progress);
-        if let Err(e) = Self::run_unembedded_backfill(db_path) {
-            tracing::warn!("[embed-bg] Failed: {}", e);
+        match Self::run_unembedded_backfill(db_path) {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                // A hard error (DB open / count query failed) embedded nothing — a
+                // zero-progress stall. Report it that way (not a clean drain) so the driver
+                // bounded-retries instead of pinning the floor on what may be a transient
+                // (e.g. mid-swap) failure.
+                tracing::warn!("[embed-bg] Failed: {}", e);
+                Some(BackfillOutcome::Stalled { progressed: false })
+            }
         }
-        true
     }
 
     /// Embed every node that still lacks a vector, hot-path first, in batches.
     /// Loads its own model + DB connection (EmbeddingModel is `!Send`, so it can't
     /// cross the thread boundary) and no-ops when no model is available locally or
     /// vec is disabled. Append-only writes — safe to run alongside a reader.
-    fn run_unembedded_backfill(db_path: &Path) -> Result<()> {
+    fn run_unembedded_backfill(db_path: &Path) -> Result<BackfillOutcome> {
         let model = match EmbeddingModel::load()? {
             Some(m) => m,
-            None => return Ok(()),
+            // Model not on disk yet (download in flight). Report NoModel so the periodic
+            // driver keeps its floor low and re-attempts once the download lands, instead
+            // of pinning the floor and stranding every node until restart.
+            None => return Ok(BackfillOutcome::NoModel),
         };
         let db = Database::open_with_vec(db_path)?;
         if !db.vec_enabled() {
-            return Ok(());
+            // Vectors disabled for the session — nothing is embeddable; treat as drained.
+            // Safe for the periodic driver despite `Drained` resetting the floor to 0:
+            // that driver only spawns when `self.db.vec_enabled()` is already true (and
+            // sqlite-vec is process-global), so it never reaches this branch in a loop —
+            // i.e. this can't cause a per-tick full-model-load spin.
+            return Ok(BackfillOutcome::Drained);
         }
 
         const EMBED_BATCH: usize = 32;
@@ -1002,10 +1117,10 @@ impl McpServer {
         // for the whole session.
         let mut embedded = queries::count_nodes_with_vectors(db.conn())?.0;
 
-        loop {
+        let outcome = loop {
             let chunk = queries::get_unembedded_nodes(db.conn(), EMBED_BATCH)?;
             if chunk.is_empty() {
-                break;
+                break BackfillOutcome::Drained;
             }
             let batch_len = chunk.len();
             // embed_and_store_batch manages its own transaction internally
@@ -1013,22 +1128,24 @@ impl McpServer {
             let now = queries::count_nodes_with_vectors(db.conn())?.0;
             if now <= embedded {
                 tracing::warn!(
-                    "[embed-bg] batch of {} produced no new vectors (un-embeddable node?); \
-                     stopping backfill after {} embedded",
+                    "[embed-bg] batch of {} produced no new vectors (transient error or \
+                     un-embeddable node?); stopping backfill after {} embedded",
                     batch_len, total_embedded
                 );
-                break;
+                // `progressed` lets the driver pin genuine residue immediately (model
+                // proven working) vs bounded-retry an ambiguous first-batch stall.
+                break BackfillOutcome::Stalled { progressed: total_embedded > 0 };
             }
             total_embedded += (now - embedded) as usize;
             embedded = now;
             tracing::info!("[embed-bg] Progress: {} nodes embedded", total_embedded);
-        }
+        };
 
         if total_embedded > 0 {
             tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
                 total_embedded, t0.elapsed().as_secs_f64());
         }
-        Ok(())
+        Ok(outcome)
     }
 
     /// Spawn a background thread to download the embedding model if not available.
@@ -1283,7 +1400,11 @@ impl McpServer {
         } else {
             // Check if watcher detected changes (locks watcher only)
             let has_changes = self.drain_watcher_events();
-            if has_changes {
+            // An incremental owed from a prior skip (embedding held the write path) must
+            // run even with no fresh event — `drain_watcher_events` already consumed the
+            // original signal, so this sticky flag is the only record the change exists.
+            let owed = self.indexing.pending_incremental.load(Ordering::Acquire);
+            if has_changes || owed {
                 // Skip inline embedding — background thread handles it (avoids holding model lock across I/O)
                 self.run_incremental_with_cache_restore(&project_root, None)?;
             } else {
@@ -1344,11 +1465,19 @@ impl McpServer {
     /// to avoid a race condition where the embedding thread inserts vectors for
     /// node IDs that are being deleted and re-inserted by the incremental index.
     fn run_incremental_with_cache_restore(&self, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<()> {
+        // Mark an incremental owed for the whole attempt, cleared only on success below.
+        // The caller (`ensure_indexed`) already drained the watcher event that triggered
+        // us, so this flag is the sole surviving record of the change. Arming up front (vs
+        // only on the embedding-skip path) means a hard error ALSO leaves the obligation
+        // recorded, so the next `ensure_indexed` retries instead of stranding the change.
+        self.indexing.pending_incremental.store(true, Ordering::Release);
         if self.indexing.embedding_in_progress.load(Ordering::Acquire) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(EMBEDDING_WAIT_SECS);
             while self.indexing.embedding_in_progress.load(Ordering::Acquire) {
                 if std::time::Instant::now() > deadline {
-                    tracing::info!("Skipping incremental re-index: background embedding still in progress");
+                    // Embedding still holds the write path — skip; the incremental stays owed
+                    // (flag set above) so the next ensure_indexed runs it once embedding frees up.
+                    tracing::info!("Skipping incremental re-index: background embedding still in progress (incremental still owed)");
                     return Ok(());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1377,10 +1506,12 @@ impl McpServer {
                 }
                 *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
                 *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
+                // Authoritative merkle scan completed — any owed incremental is now satisfied.
+                self.indexing.pending_incremental.store(false, Ordering::Release);
                 Ok(())
             }
             Err(e) => {
-                let err_msg = e.to_string();
+                let err_msg = format!("{:#}", e);
                 if err_msg.contains("FOREIGN KEY constraint failed") {
                     // DB state is inconsistent with in-memory caches (e.g., DB replaced
                     // externally, stale node IDs from a previous session, or orphan rows
@@ -1412,6 +1543,8 @@ impl McpServer {
                             *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
                             *lock_or_recover(&self.indexed, "indexed") = true;
                             self.spawn_background_embedding();
+                            // Full rebuild captured current on-disk state — clear owed flag.
+                            self.indexing.pending_incremental.store(false, Ordering::Release);
                             tracing::info!("Full re-index recovery successful");
                             Ok(())
                         }
@@ -1841,6 +1974,53 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(resp).unwrap();
         let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
         serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn test_backfill_outcome_no_model_never_advances_floor() {
+        // The bug this guards: on a fresh install the model is still downloading at the
+        // first periodic tick. The drain embeds nothing (NoModel) — but if that advanced
+        // the floor, every node would strand at 0% vec until restart. NoModel must leave
+        // BOTH floor and retries untouched so the next tick re-attempts once the model
+        // lands. `remeasured` is irrelevant here and must be ignored.
+        assert_eq!(apply_backfill_outcome(0, 0, BackfillOutcome::NoModel, 500), (0, 0));
+        assert_eq!(apply_backfill_outcome(7, 2, BackfillOutcome::NoModel, 500), (7, 2));
+    }
+
+    #[test]
+    fn test_backfill_outcome_drained_resets() {
+        // A full drain means the embeddable set emptied. Floor → 0 so any later count is
+        // treated as fresh work, and the stall-retry budget resets. `remeasured` is
+        // ignored (a race-added node should be picked up next tick, not skipped).
+        assert_eq!(apply_backfill_outcome(0, 0, BackfillOutcome::Drained, 0), (0, 0));
+        assert_eq!(apply_backfill_outcome(42, 2, BackfillOutcome::Drained, 3), (0, 0));
+    }
+
+    #[test]
+    fn test_backfill_outcome_stalled_no_progress_retries_then_pins() {
+        // A zero-progress stall is ambiguous (transient vs un-embeddable). Below the retry
+        // budget the floor stays low (so the next tick re-attempts and a transient failure
+        // self-heals) while the retry counter climbs.
+        let stalled = BackfillOutcome::Stalled { progressed: false };
+        let (f1, r1) = apply_backfill_outcome(0, 0, stalled, 9);
+        assert_eq!((f1, r1), (0, 1), "first stall: floor stays low, retry counted");
+        let (f2, r2) = apply_backfill_outcome(f1, r1, stalled, 9);
+        assert_eq!((f2, r2), (0, 2), "second stall: still retrying");
+        // Budget spent (MAX = 3): pin the floor to the residue and reset retries so a
+        // FUTURE rise above this floor still re-triggers a drain.
+        let (f3, r3) = apply_backfill_outcome(f2, r2, stalled, 9);
+        assert_eq!((f3, r3), (9, 0), "budget spent: pin floor to residue, reset retries");
+    }
+
+    #[test]
+    fn test_backfill_outcome_stalled_with_progress_pins_immediately() {
+        // A stall AFTER embedding some nodes proves the model works, so the remainder is
+        // genuine residue — pin the floor at once (no retry budget consumed) instead of
+        // churning a proven-working model on un-embeddable content.
+        let progressed = BackfillOutcome::Stalled { progressed: true };
+        assert_eq!(apply_backfill_outcome(0, 0, progressed, 5), (5, 0));
+        // Even with retries already accrued, a progressed stall pins and resets them.
+        assert_eq!(apply_backfill_outcome(0, 2, progressed, 5), (5, 0));
     }
 
     #[test]
@@ -2639,6 +2819,75 @@ app.post('/api/login', handleLogin);
         let compressed_tokens = crate::sandbox::compressor::estimate_json_tokens(&compressed);
         assert!(compressed_tokens <= COMPRESSION_TOKEN_THRESHOLD * 2,
             "compressed result should be much smaller: {} tokens", compressed_tokens);
+    }
+
+    /// W2 end-to-end: a watcher-triggered incremental skipped because embedding holds the
+    /// write path must ARM `pending_incremental` (the caller already consumed the watcher
+    /// event), and a later run must honor + clear it — indexing the otherwise-stranded change.
+    #[test]
+    fn test_incremental_skip_during_embedding_arms_then_clears_pending() {
+        use std::fs;
+        let project = TempDir::new().unwrap();
+        fs::write(project.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap(); // initial full index → indexed=true
+        assert!(!server.indexing.pending_incremental.load(Ordering::SeqCst));
+
+        // A real on-disk change for the incremental to pick up.
+        fs::write(project.path().join("beta.rs"), "fn beta_fn() {}\n").unwrap();
+
+        // Embedding holds the write path → the incremental SKIPS (after its 2s wait) and
+        // must arm pending so the consumed change isn't lost.
+        server.indexing.embedding_in_progress.store(true, Ordering::SeqCst);
+        server.run_incremental_with_cache_restore(project.path(), None).unwrap();
+        assert!(server.indexing.pending_incremental.load(Ordering::SeqCst),
+            "a skipped incremental must arm pending_incremental");
+        assert!(crate::storage::queries::get_node_ids_by_name(server.db.conn(), "beta_fn")
+            .unwrap().is_empty(), "the skipped incremental must NOT have indexed beta yet");
+
+        // Release embedding; the owed incremental runs, clears the flag, and indexes beta.
+        server.indexing.embedding_in_progress.store(false, Ordering::SeqCst);
+        server.run_incremental_with_cache_restore(project.path(), None).unwrap();
+        assert!(!server.indexing.pending_incremental.load(Ordering::SeqCst),
+            "a completed incremental must clear pending_incremental");
+        assert!(!crate::storage::queries::get_node_ids_by_name(server.db.conn(), "beta_fn")
+            .unwrap().is_empty(),
+            "the previously-stranded beta.rs must be indexed once the owed incremental runs");
+    }
+
+    /// W2: with a watcher ACTIVE but NO fresh events, `ensure_indexed` must still run an
+    /// incremental that's owed via `pending_incremental` — `owed` is the SOLE trigger here.
+    /// (A watcher being present makes the no-watcher debounce path — which would otherwise
+    /// mask `owed` — unreachable, so reverting the `|| owed` wiring makes this test fail.)
+    #[test]
+    fn test_ensure_indexed_honors_owed_pending_without_new_events() {
+        use std::fs;
+        let project = TempDir::new().unwrap();
+        fs::write(project.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        // Install a watcher on an UNRELATED idle dir: this makes `has_watcher == true`
+        // (so ensure_indexed's no-watcher debounce branch is skipped) while guaranteeing
+        // `drain_watcher_events()` stays empty — the idle dir never changes, so there is no
+        // fs-event race. `owed` becomes the only thing that can run the incremental.
+        let idle = TempDir::new().unwrap();
+        let (tx, rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        let fw = FileWatcher::start(idle.path(), tx).expect("watcher must start");
+        *lock_or_recover(&server.watcher, "watcher") = Some(WatcherState { _watcher: fw, receiver: rx });
+
+        // Stranded state: a real change on disk + pending armed (as a prior embedding-skip
+        // would leave it), with a watcher active and no events for it.
+        fs::write(project.path().join("gamma.rs"), "fn gamma_fn() {}\n").unwrap();
+        server.indexing.pending_incremental.store(true, Ordering::SeqCst);
+        assert!(!server.drain_watcher_events(), "precondition: no watcher events queued");
+
+        server.ensure_indexed().unwrap();
+        assert!(!server.indexing.pending_incremental.load(Ordering::SeqCst),
+            "ensure_indexed must run and clear the owed incremental");
+        assert!(!crate::storage::queries::get_node_ids_by_name(server.db.conn(), "gamma_fn")
+            .unwrap().is_empty(),
+            "owed incremental must index the stranded change (watcher active, no new events)");
     }
 
     #[test]
