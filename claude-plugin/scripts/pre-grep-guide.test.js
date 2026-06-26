@@ -1359,6 +1359,38 @@ test('resolveProjectRoot: no index up to $HOME → null (home itself still check
   } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
 });
 
+test('resolveProjectRoot: skips a STRAY nested subdir index, prefers the .git root', () => {
+  // monorepo (daagu shape): root has .git + index; a subdir carries a stray
+  // index relic but no .git. Resolving from the subdir must climb to the root,
+  // not pin the stray nested index (the statusline "oscillation" root cause).
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const proj = pathE2e.join(base, 'proj');
+    fsE2e.mkdirSync(pathE2e.join(proj, '.git'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(proj, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(proj, '.code-graph', 'index.db'), '');
+    const sub = pathE2e.join(proj, 'backend');
+    fsE2e.mkdirSync(pathE2e.join(sub, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(sub, '.code-graph', 'index.db'), '');
+    assert.equal(resolveProjectRoot(sub, { home: base }), proj);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: a nested index with its OWN .git (submodule) still wins', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const proj = pathE2e.join(base, 'proj');
+    fsE2e.mkdirSync(pathE2e.join(proj, '.git'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(proj, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(proj, '.code-graph', 'index.db'), '');
+    const sub = pathE2e.join(proj, 'vendored');
+    fsE2e.mkdirSync(pathE2e.join(sub, '.git'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(sub, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(sub, '.code-graph', 'index.db'), '');
+    assert.equal(resolveProjectRoot(sub, { home: base }), sub);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
 test('rebaseRelativePaths: daagu shape — bare `app` from backend/ cwd', () => {
   const exists = (p) => p.endsWith(pathE2e.join('backend', 'app'));
   const cmd = 'grep -rn "rr_source\\|max_retries" app --include=*.py';

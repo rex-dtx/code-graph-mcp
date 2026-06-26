@@ -14,16 +14,55 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Resolves to the project's CANONICAL index dir, skipping STRAY nested indexes.
+// A monorepo subdir (`daagu/backend`, `daagu/frontend`) can carry its own
+// `.code-graph/index.db` — a relic an older binary created — nested under the
+// real root's index. Returning the nearest such index made every consumer
+// (statusline gate, hooks) read a different DB per cwd (statusline "oscillation",
+// `✗ 0 nodes` in an empty subdir index). Mirror the Rust resolver: the start's
+// own index wins only if it is NOT a stray nested index (no indexed ancestor) OR
+// start is itself a project boundary (`.git`, i.e. a real submodule). Otherwise
+// prefer the project root: the nearest indexed `.git` root, else the outermost
+// indexed dir on the chain. `null` when nothing on start→…→home is indexed.
 function resolveProjectRoot(startDir, opts = {}) {
   const home = opts.home !== undefined ? opts.home : os.homedir();
   const exists = opts.exists || fs.existsSync;
-  let dir = path.resolve(startDir || '.');
+  const hasIndex = (d) => exists(path.join(d, '.code-graph', 'index.db'));
+  const hasGit = (d) => exists(path.join(d, '.git'));
+  const start = path.resolve(startDir || '.');
+
+  // Detect whether `start` is a STRAY nested index: walk STRICT ancestors up to
+  // the nearest `.git` root (project boundary), bounded at home. An indexed
+  // ancestor within that boundary means start's own index is a monorepo-subdir
+  // relic. Stop AT the git root — an index above it (e.g. `~/.code-graph`) is an
+  // unrelated outer project and must not poison this one.
+  let gitRootIndexed = null;
+  let ancestorIndexed = false;
+  let dir = start;
   for (;;) {
-    if (exists(path.join(dir, '.code-graph', 'index.db'))) return dir;
-    if (dir === home) return null;
     const parent = path.dirname(dir);
-    if (parent === dir) return null;
+    // Stop BEFORE home (and fs root): an index at/above home (e.g. ~/.code-graph
+    // from indexing a home dir) is an unrelated outer project, never a parent
+    // that makes `start` stray.
+    if (parent === dir || parent === home) break;
     dir = parent;
+    if (hasIndex(dir)) ancestorIndexed = true;
+    if (hasGit(dir)) { if (hasIndex(dir)) gitRootIndexed = dir; break; }
+  }
+
+  // start's own index wins unless it is stray (indexed ancestor within the git
+  // boundary) and start is not itself a boundary (`.git`, a real submodule).
+  if (hasIndex(start) && (!ancestorIndexed || hasGit(start))) return start;
+  if (gitRootIndexed) return gitRootIndexed;
+  // Otherwise the nearest indexed ancestor (skipping a stray start), bounded at
+  // home; null if nothing on the chain is indexed. Mirrors the original walk.
+  let d = hasIndex(start) ? path.dirname(start) : start;
+  for (;;) {
+    if (hasIndex(d)) return d;
+    if (d === home) return null;
+    const parent = path.dirname(d);
+    if (parent === d) return null;
+    d = parent;
   }
 }
 

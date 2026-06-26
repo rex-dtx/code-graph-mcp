@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { findBinary } = require('./find-binary');
+const { resolveProjectRoot } = require('./project-root');
 const lifecycle = require('./lifecycle');
 const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
@@ -24,14 +25,19 @@ function updatePending() {
 const disabledCleanup = cleanupDisabledStatusline();
 if (disabledCleanup.cleaned) process.exit(0);
 
-// Only show status in projects that have a code-graph directory.
-// The statusLine config is global, so we must exit silently for
-// directories that aren't code-graph projects.
-const cwd = process.cwd();
-const codeGraphDir = path.join(cwd, '.code-graph');
-if (!fs.existsSync(codeGraphDir)) {
+// Only show status in projects that have a code-graph directory. The statusLine
+// config is global, so we must exit silently for non-code-graph directories.
+// Walk UP to the canonical project root (resolveProjectRoot) rather than keying
+// on the bare process.cwd(): when the shell sits in a subdir, the bare-cwd gate
+// either showed a STRAY nested subdir index (monorepo relic — the statusline
+// "oscillating" between root/backend/frontend node counts) or, in a clean subdir
+// with no local index, showed nothing at all. The resolver skips stray nested
+// indexes, so the statusline tracks one DB — the project root — from any subdir.
+const root = resolveProjectRoot(process.cwd());
+if (!root) {
   process.exit(0);
 }
+const codeGraphDir = path.join(root, '.code-graph');
 
 // Check for background indexing progress file first
 const progressFile = path.join(codeGraphDir, 'indexing-status.json');
@@ -108,7 +114,11 @@ let errText = '';
 try {
   report = parseReport(execFileSync(bin, ['health-check', '--format', 'json'], {
     timeout: 3000,
-    stdio: ['pipe', 'pipe', 'pipe']
+    stdio: ['pipe', 'pipe', 'pipe'],
+    // Run the binary FROM the resolved root so its own project-root resolution
+    // lands on the same DB the gate above picked (a subdir cwd would otherwise
+    // re-resolve to a stray nested index inside the binary).
+    cwd: root
   }).toString());
 } catch (e) {
   // health-check exits NON-ZERO on an unhealthy/empty index but still writes the

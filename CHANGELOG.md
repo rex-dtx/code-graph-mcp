@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.75.1 — Stray nested indexes no longer hijack a monorepo
+
+### Fixed
+- **Project-root resolution now skips a STRAY nested `.code-graph` index inside an
+  already-indexed repo.** In a monorepo whose subdirs carry their own markers
+  (`backend/requirements.txt`, `frontend/package.json`), an older binary could
+  create a separate `.code-graph` index in those subdirs. The `priority-1` rule
+  ("a cwd-local index wins") then pinned it forever, so every tool — statusline,
+  CLI, MCP server — read a *different* database depending on which subdir the
+  shell sat in: the statusline appeared to "oscillate" (root 15k nodes / backend
+  14k / `✗ 0 nodes` in an empty subdir index), and the subdir tree got needlessly
+  re-indexed and re-embedded. `resolve_project_root_from` (Rust) and
+  `resolveProjectRoot` (JS) now treat a cwd-local index as authoritative only when
+  it is NOT nested under another indexed dir within the same `.git` boundary (a
+  real submodule with its own `.git` still keeps its index). The walk stops at the
+  `.git` root so an unrelated `~/.code-graph` never poisons a project beneath it.
+- **The statusline walks up to the canonical project root** instead of keying on
+  the bare `process.cwd()`, and runs `health-check` from that root — so it tracks
+  one DB (the project root) from any subdir, with or without a stray relic present.
+
+Existing stray subdir indexes are now inert (ignored), so no manual cleanup is
+required; they can be deleted to reclaim disk.
+
 ## v0.75.0 — Cross-file call graph in the grep inject
 
 The PostToolUse compound-grep inject now delivers a grepped symbol's cross-file

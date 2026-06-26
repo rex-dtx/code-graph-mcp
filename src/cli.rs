@@ -17,15 +17,45 @@ use crate::storage::queries;
 /// 2. Nearest ancestor containing `.git` → use that (avoids polluting subdirs).
 /// 3. Fall back to `cwd`.
 pub fn resolve_project_root_from(cwd: &Path) -> PathBuf {
-    if cwd.join(CODE_GRAPH_DIR).join("index.db").exists() {
-        return cwd.to_path_buf();
-    }
-    let mut cursor: Option<&Path> = Some(cwd);
+    let cwd_has_index = cwd.join(CODE_GRAPH_DIR).join("index.db").exists();
+    let cwd_has_git = cwd.join(".git").exists();
+    // One ancestor walk: nearest `.git` root, and whether any STRICT ancestor is
+    // itself indexed. An indexed ancestor means a cwd-local index is a STRAY
+    // nested index inside an already-indexed project — the monorepo-subdir relic
+    // (e.g. `daagu/backend/.code-graph` under `daagu/.code-graph`) that an older
+    // binary created and `priority-1` then pinned, so every tool reads a different
+    // DB depending on which subdir the shell sits in.
+    // Walk ancestors only up to (and including) the nearest `.git` root — the
+    // project boundary. An indexed ancestor WITHIN that boundary makes cwd stray.
+    // Stop AT the git root: an index above it (e.g. `~/.code-graph` from indexing
+    // a home dir) is an unrelated outer project and must not poison this one.
+    let mut nearest_git: Option<PathBuf> = None;
+    let mut ancestor_indexed = false;
+    let mut cursor = cwd.parent();
     while let Some(c) = cursor {
+        if c.join(CODE_GRAPH_DIR).join("index.db").exists() {
+            ancestor_indexed = true;
+        }
         if c.join(".git").exists() {
-            return c.to_path_buf();
+            nearest_git = Some(c.to_path_buf());
+            break;
         }
         cursor = c.parent();
+    }
+    // cwd's own `.git` makes it a project boundary — always root here. Covers a
+    // fresh project dir that has a `.git` but not yet an index (the metrics-
+    // isolation fixture), and a real submodule / nested distinct repo. Checked
+    // before the stray logic and before any ancestor `.git`.
+    if cwd_has_git {
+        return cwd.to_path_buf();
+    }
+    // A cwd-local index wins UNLESS it is stray: an ancestor within the `.git`
+    // boundary is also indexed (the monorepo-subdir relic).
+    if cwd_has_index && !ancestor_indexed {
+        return cwd.to_path_buf();
+    }
+    if let Some(g) = nearest_git {
+        return g;
     }
     cwd.to_path_buf()
 }
@@ -5943,6 +5973,52 @@ mod tests {
         let idx_dir = cwd.join(CODE_GRAPH_DIR);
         std::fs::create_dir_all(&idx_dir).unwrap();
         std::fs::write(idx_dir.join("index.db"), b"").unwrap();
+        assert_eq!(resolve_project_root_from(cwd), cwd);
+    }
+
+    // Helper: give `dir` a `.code-graph/index.db` (explicit join per #937).
+    fn write_index(dir: &Path) {
+        let idx = dir.join(CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&idx).unwrap();
+        std::fs::write(idx.join("index.db"), b"").unwrap();
+    }
+
+    #[test]
+    fn resolve_project_root_skips_stray_nested_index() {
+        // monorepo: root has .git + index; a subdir carries a STRAY index (relic
+        // from an older binary) but no .git of its own. Resolving from the subdir
+        // must climb to the real root, not pin the stray nested index.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        write_index(root);
+        let sub = root.join("backend");
+        std::fs::create_dir_all(&sub).unwrap();
+        write_index(&sub);
+        assert_eq!(resolve_project_root_from(&sub), root);
+    }
+
+    #[test]
+    fn resolve_project_root_nested_index_with_own_git_still_wins() {
+        // A real nested repo (submodule / vendored project) has its OWN .git, so
+        // its index is legitimate even under an indexed parent — keep it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        write_index(root);
+        let sub = root.join("vendored");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+        write_index(&sub);
+        assert_eq!(resolve_project_root_from(&sub), sub);
+    }
+
+    #[test]
+    fn resolve_project_root_standalone_index_no_ancestor_still_wins() {
+        // No ancestor index → a cwd index is the genuine root (guards against the
+        // stray-skip over-reaching into the common single-project case).
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        write_index(cwd);
         assert_eq!(resolve_project_root_from(cwd), cwd);
     }
 
