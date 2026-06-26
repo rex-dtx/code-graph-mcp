@@ -31,6 +31,12 @@ function resolveProjectRoot(startDir, opts = {}) {
   const hasGit = (d) => exists(path.join(d, '.git'));
   const start = path.resolve(startDir || '.');
 
+  // start's own `.git` is a hard project boundary (a real submodule / distinct
+  // repo): use its index if present, else `null` — never escape to an ancestor's
+  // index. Mirrors the Rust resolver's rule 1 (which returns cwd even without an
+  // index because it CREATES one; the JS reader has nothing to read → null).
+  if (hasGit(start)) return hasIndex(start) ? start : null;
+
   // Detect whether `start` is a STRAY nested index: walk STRICT ancestors up to
   // the nearest `.git` root (project boundary), bounded at home. An indexed
   // ancestor within that boundary means start's own index is a monorepo-subdir
@@ -50,9 +56,9 @@ function resolveProjectRoot(startDir, opts = {}) {
     if (hasGit(dir)) { if (hasIndex(dir)) gitRootIndexed = dir; break; }
   }
 
-  // start's own index wins unless it is stray (indexed ancestor within the git
-  // boundary) and start is not itself a boundary (`.git`, a real submodule).
-  if (hasIndex(start) && (!ancestorIndexed || hasGit(start))) return start;
+  // start's own index wins unless it is stray (an indexed ancestor within the
+  // git boundary). start's own `.git` was already handled above.
+  if (hasIndex(start) && !ancestorIndexed) return start;
   if (gitRootIndexed) return gitRootIndexed;
   // Otherwise the nearest indexed ancestor (skipping a stray start), bounded at
   // home; null if nothing on the chain is indexed. Mirrors the original walk.

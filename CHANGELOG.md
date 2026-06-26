@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.75.2 — Resolver parity: home boundary + indexed-ancestor preference
+
+Code-review follow-ups to v0.75.1's stray-index fix, closing two ways the Rust
+and JS resolvers could still disagree.
+
+### Fixed
+- **The Rust resolver now stops at `$HOME`, matching the JS one.** Without a home
+  bound, a machine where `~` is itself a git repo (`~/.git`) *and* was indexed
+  once (`~/.code-graph`) would resolve any non-git project beneath it (e.g.
+  `~/proj` with its own index) up to `~`, so the statusline / CLI read `~`'s DB
+  instead of the project's. The walk now stops below `$HOME` so an unrelated
+  `~/.code-graph` / `~/.git` never poisons a project under it.
+- **The Rust resolver prefers the nearest INDEXED ancestor, then a `.git` root,
+  matching the JS resolver.** Previously it returned the nearest `.git` ancestor
+  even when that dir had no index (showing an empty `✗ 0 nodes`) and did not skip
+  a stray subdir index in a non-git-rooted monorepo. Both resolvers now agree on
+  every layout (git-rooted, non-git-rooted, submodule, `~`-indexed). The JS reader
+  additionally treats a cwd with its own `.git` but no index as `null` (a distinct
+  project with nothing to show) rather than escaping to an ancestor index.
+
+`resolve_project_root_from` is split into a `home`-injectable core so the
+boundary is unit-tested without mutating the process environment.
+
 ## v0.75.1 — Stray nested indexes no longer hijack a monorepo
 
 ### Fixed

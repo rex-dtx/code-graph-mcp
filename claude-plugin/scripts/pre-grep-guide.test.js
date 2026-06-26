@@ -1391,6 +1391,31 @@ test('resolveProjectRoot: a nested index with its OWN .git (submodule) still win
   } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
 });
 
+test('resolveProjectRoot: start with its OWN .git but no index → null (boundary, no escape)', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const proj = pathE2e.join(base, 'proj'); // indexed parent
+    fsE2e.mkdirSync(pathE2e.join(proj, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(proj, '.code-graph', 'index.db'), '');
+    const sub = pathE2e.join(proj, 'sub'); // own .git, no index
+    fsE2e.mkdirSync(pathE2e.join(sub, '.git'), { recursive: true });
+    assert.equal(resolveProjectRoot(sub, { home: base }), null);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: non-git monorepo — stray subdir index resolves to indexed ancestor', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const root = pathE2e.join(base, 'mono'); // indexed, NO .git
+    fsE2e.mkdirSync(pathE2e.join(root, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(root, '.code-graph', 'index.db'), '');
+    const sub = pathE2e.join(root, 'backend'); // stray index, no .git
+    fsE2e.mkdirSync(pathE2e.join(sub, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(sub, '.code-graph', 'index.db'), '');
+    assert.equal(resolveProjectRoot(sub, { home: base }), root);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
 test('rebaseRelativePaths: daagu shape — bare `app` from backend/ cwd', () => {
   const exists = (p) => p.endsWith(pathE2e.join('backend', 'app'));
   const cmd = 'grep -rn "rr_source\\|max_retries" app --include=*.py';

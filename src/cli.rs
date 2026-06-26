@@ -10,31 +10,56 @@ use crate::domain::{CODE_GRAPH_DIR, NO_METRICS_SENTINEL};
 use crate::storage::db::Database;
 use crate::storage::queries;
 
-/// Resolve the project root from an explicit `cwd`.
+/// `$HOME` (Unix) / `%USERPROFILE%` (Windows) without pulling the `dirs` crate,
+/// which lives behind the `embed-model` feature. `None` when unset → the walk is
+/// simply unbounded (degrades to the pre-home-bound behavior).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Resolve the project root from an explicit `cwd`. Mirrors the JS
+/// `resolveProjectRoot` (`claude-plugin/scripts/project-root.js`); keep the two
+/// in lock-step (see `feedback_hook_class_bug_sweep`).
 ///
-/// Priority:
-/// 1. Existing `.code-graph/index.db` at `cwd` → use `cwd` (respects explicit per-dir indexes).
-/// 2. Nearest ancestor containing `.git` → use that (avoids polluting subdirs).
-/// 3. Fall back to `cwd`.
+/// Order:
+/// 1. cwd's OWN `.git` → cwd (a real project boundary: submodule, or a fresh
+///    project with a `.git` but not yet an index — the metrics-isolation fixture).
+/// 2. cwd's index wins UNLESS it is STRAY — an ancestor within the `.git`
+///    boundary, below `$HOME`, is itself indexed (the monorepo-subdir relic an
+///    older binary created and `priority-1` then pinned, so every tool read a
+///    different DB per subdir).
+/// 3. Otherwise the canonical project root: nearest INDEXED ancestor, else nearest
+///    ancestor `.git`, else cwd.
+///
+/// The walk stops at `$HOME` (exclusive) so an unrelated `~/.code-graph` /
+/// `~/.git` never poisons a project beneath it.
 pub fn resolve_project_root_from(cwd: &Path) -> PathBuf {
+    resolve_project_root_bounded(cwd, home_dir().as_deref())
+}
+
+/// `home`-injectable core so the `$HOME` boundary is unit-testable without
+/// mutating the process environment (mirrors the JS resolver's `opts.home`).
+fn resolve_project_root_bounded(cwd: &Path, home: Option<&Path>) -> PathBuf {
+    // 1. cwd's own `.git` is always a boundary.
+    if cwd.join(".git").exists() {
+        return cwd.to_path_buf();
+    }
     let cwd_has_index = cwd.join(CODE_GRAPH_DIR).join("index.db").exists();
-    let cwd_has_git = cwd.join(".git").exists();
-    // One ancestor walk: nearest `.git` root, and whether any STRICT ancestor is
-    // itself indexed. An indexed ancestor means a cwd-local index is a STRAY
-    // nested index inside an already-indexed project — the monorepo-subdir relic
-    // (e.g. `daagu/backend/.code-graph` under `daagu/.code-graph`) that an older
-    // binary created and `priority-1` then pinned, so every tool reads a different
-    // DB depending on which subdir the shell sits in.
-    // Walk ancestors only up to (and including) the nearest `.git` root — the
-    // project boundary. An indexed ancestor WITHIN that boundary makes cwd stray.
-    // Stop AT the git root: an index above it (e.g. `~/.code-graph` from indexing
-    // a home dir) is an unrelated outer project and must not poison this one.
+
+    // Walk STRICT ancestors, stopping AT `$HOME` (exclusive) or the nearest
+    // `.git` root. Track the nearest indexed ancestor (the canonical root of an
+    // already-indexed project) and the nearest `.git` root within that bound.
+    let mut nearest_indexed: Option<PathBuf> = None;
     let mut nearest_git: Option<PathBuf> = None;
-    let mut ancestor_indexed = false;
     let mut cursor = cwd.parent();
     while let Some(c) = cursor {
-        if c.join(CODE_GRAPH_DIR).join("index.db").exists() {
-            ancestor_indexed = true;
+        if home == Some(c) {
+            break; // an index/.git at-or-above home is an unrelated outer project
+        }
+        if nearest_indexed.is_none() && c.join(CODE_GRAPH_DIR).join("index.db").exists() {
+            nearest_indexed = Some(c.to_path_buf());
         }
         if c.join(".git").exists() {
             nearest_git = Some(c.to_path_buf());
@@ -42,17 +67,15 @@ pub fn resolve_project_root_from(cwd: &Path) -> PathBuf {
         }
         cursor = c.parent();
     }
-    // cwd's own `.git` makes it a project boundary — always root here. Covers a
-    // fresh project dir that has a `.git` but not yet an index (the metrics-
-    // isolation fixture), and a real submodule / nested distinct repo. Checked
-    // before the stray logic and before any ancestor `.git`.
-    if cwd_has_git {
+
+    // 2. cwd's index wins only when it is NOT stray (no indexed ancestor in bound).
+    if cwd_has_index && nearest_indexed.is_none() {
         return cwd.to_path_buf();
     }
-    // A cwd-local index wins UNLESS it is stray: an ancestor within the `.git`
-    // boundary is also indexed (the monorepo-subdir relic).
-    if cwd_has_index && !ancestor_indexed {
-        return cwd.to_path_buf();
+    // 3. Prefer the indexed ancestor (canonical project index), then a `.git`
+    //    root, then cwd.
+    if let Some(idx) = nearest_indexed {
+        return idx;
     }
     if let Some(g) = nearest_git {
         return g;
@@ -6020,6 +6043,62 @@ mod tests {
         let cwd = tmp.path();
         write_index(cwd);
         assert_eq!(resolve_project_root_from(cwd), cwd);
+    }
+
+    #[test]
+    fn resolve_project_root_cwd_own_git_no_index_is_boundary() {
+        // A fresh project dir with its own `.git` but no index yet (the metrics-
+        // isolation fixture) roots at itself, never an indexed ancestor.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_index(root);
+        let sub = root.join("pkg");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+        assert_eq!(resolve_project_root_from(&sub), sub);
+    }
+
+    #[test]
+    fn resolve_project_root_home_boundary_ignores_outer_index() {
+        // `~` is both a git repo AND indexed; a project below it with its own
+        // index but no `.git` must resolve to itself, not be hijacked to `~`.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        write_index(home);
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_index(&proj);
+        assert_eq!(resolve_project_root_bounded(&proj, Some(home)), proj);
+    }
+
+    #[test]
+    fn resolve_project_root_non_git_monorepo_prefers_indexed_ancestor() {
+        // No `.git` anywhere: a stray subdir index under a non-git indexed root
+        // resolves to the indexed ancestor (parity with the JS resolver).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_index(root);
+        let sub = root.join("backend");
+        std::fs::create_dir_all(&sub).unwrap();
+        write_index(&sub);
+        // Bound at the tmp parent so the real `~/.code-graph` can't interfere.
+        assert_eq!(resolve_project_root_bounded(&sub, root.parent()), root);
+    }
+
+    #[test]
+    fn resolve_project_root_unindexed_git_root_uses_indexed_mid() {
+        // outer/.git (unindexed) / proj/index / backend/stray-index → resolve to
+        // the indexed mid dir, not the empty git root.
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        let proj = outer.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_index(&proj);
+        let backend = proj.join("backend");
+        std::fs::create_dir_all(&backend).unwrap();
+        write_index(&backend);
+        assert_eq!(resolve_project_root_bounded(&backend, outer.parent()), proj);
     }
 
     #[test]
