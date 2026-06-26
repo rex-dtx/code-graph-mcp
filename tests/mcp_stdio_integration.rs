@@ -565,8 +565,11 @@ fn mcp_startup_embeds_without_any_tool_call() {
     use code_graph_mcp::storage::db::Database;
     use code_graph_mcp::storage::queries::count_nodes_with_vectors;
 
-    // Needs real model weights to observe embedding. Skip when absent (CI without
-    // the downloaded model) — there is nothing to embed with.
+    // Coverage note: this is a LOCAL gate. CI (ci.yml) runs only --no-default-features
+    // and default (both no-embed), and release.yml builds embed-model but does not
+    // `cargo test --features embed-model`, so this executes only on a local
+    // `cargo test --features embed-model` with the model present. It needs real weights
+    // to observe embedding; skip loudly when absent rather than false-fail.
     if code_graph_mcp::embedding::model::EmbeddingModel::load().ok().flatten().is_none() {
         eprintln!("[skip] embedding model weights unavailable; cannot observe backfill");
         return;

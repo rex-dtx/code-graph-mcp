@@ -688,7 +688,12 @@ impl McpServer {
             // index instead of stranding the vectors at whatever a prior search left.
             // Guarded by embedding_in_progress so it never double-runs with a
             // search-triggered embed; no-ops when no model is available locally.
-            Self::run_guarded_backfill(&db_path, &embedding_flag);
+            // Skipped in no-embed builds (`default = []`): with no model to embed
+            // with, spawning the backfill + its model-load attempt is pure per-session
+            // waste (the message-driven spawn_background_embedding is already guarded).
+            if cfg!(feature = "embed-model") {
+                Self::run_guarded_backfill(&db_path, &embedding_flag);
+            }
         });
     }
 
@@ -838,8 +843,10 @@ impl McpServer {
     }
 
     /// Claim the `embedding_in_progress` flag and run [`Self::run_unembedded_backfill`]
-    /// to completion, releasing the flag on return (incl. panic via the drop guard).
-    /// No-ops if a backfill is already running. Blocks the caller, so it must be
+    /// to completion, releasing the flag on return — and on unwind, via the drop guard
+    /// (release builds use `panic = "abort"`, where a panic ends the process and resets
+    /// the in-memory flag regardless). No-ops if a backfill is already running. Blocks
+    /// the caller, so it must be
     /// invoked on a background thread (the embedding thread, or the startup-index
     /// thread once its own work is committed and the indexing flag is clear).
     fn run_guarded_backfill(db_path: &Path, in_progress: &AtomicBool) {
@@ -876,15 +883,35 @@ impl McpServer {
         const EMBED_BATCH: usize = 32;
         let mut total_embedded = 0usize;
         let t0 = std::time::Instant::now();
+        // No-progress guard. `embed_and_store_batch` returns Ok even when an
+        // individual node's inference deterministically fails — its sequential
+        // fallback drops that node (never inserted, never marked), so
+        // `get_unembedded_nodes` (WHERE node_vectors IS NULL) would hand the same
+        // node back every iteration. Counting vectors actually written (not chunk
+        // sizes) lets us break when a non-empty batch adds nothing, instead of
+        // spinning forever on an un-embeddable node and pinning embedding_in_progress
+        // for the whole session.
+        let mut embedded = queries::count_nodes_with_vectors(db.conn())?.0;
 
         loop {
             let chunk = queries::get_unembedded_nodes(db.conn(), EMBED_BATCH)?;
             if chunk.is_empty() {
                 break;
             }
+            let batch_len = chunk.len();
             // embed_and_store_batch manages its own transaction internally
             embed_and_store_batch(&db, &model, &chunk)?;
-            total_embedded += chunk.len();
+            let now = queries::count_nodes_with_vectors(db.conn())?.0;
+            if now <= embedded {
+                tracing::warn!(
+                    "[embed-bg] batch of {} produced no new vectors (un-embeddable node?); \
+                     stopping backfill after {} embedded",
+                    batch_len, total_embedded
+                );
+                break;
+            }
+            total_embedded += (now - embedded) as usize;
+            embedded = now;
             tracing::info!("[embed-bg] Progress: {} nodes embedded", total_embedded);
         }
 
