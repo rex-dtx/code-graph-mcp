@@ -650,7 +650,10 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
     // can stall for seconds mid-drain and look settled while embeddable nodes remain.
     // Draining to exactly zero is the unambiguous "startup backfill is done" signal, so
     // afterwards ONLY a fresh trigger (the periodic driver — no tool call is ever sent)
-    // can embed the node we insert.
+    // can embed the node we insert. NOTE: this assumes `setup_fixture_project`'s sources
+    // produce NO un-embeddable residue (every node with a context_string embeds). If a
+    // future fixture symbol breaks that, this loop times out and the assert below fires —
+    // a real signal to revisit the fixture, not a flake.
     let mut base_vectors = 0i64;
     let settled_unembedded = 0i64;
     let start = Instant::now();

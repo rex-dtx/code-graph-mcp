@@ -565,7 +565,9 @@ impl McpServer {
                 // run even in a NO-tool-call session — that's exactly when out-of-band
                 // CLI/hook node additions would otherwise strand unembedded. It polls the
                 // DB independently and no-ops while the startup backfill holds the flag.
-                self.spawn_periodic_backfill();
+                if cfg!(feature = "embed-model") {
+                    self.spawn_periodic_backfill();
+                }
                 return;
             }
 
@@ -809,7 +811,9 @@ impl McpServer {
 
         // Watcher- and traffic-independent backfill: drains nodes added out-of-band by
         // the CLI/hook freshness path (which never triggers the tool-call backfill).
-        self.spawn_periodic_backfill();
+        if cfg!(feature = "embed-model") {
+            self.spawn_periodic_backfill();
+        }
 
         #[cfg(feature = "embed-model")]
         self.spawn_model_download();
@@ -910,7 +914,14 @@ impl McpServer {
             let mut floor: i64 = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(PERIODIC_BACKFILL_SECS));
-                let unembedded = match Database::open_with_vec(&db_path) {
+                // Open NON-destructively for the read-only count: the destructive
+                // `open_with_vec` revalidates and could WIPE the index on an
+                // INDEX_VERSION skew window (a downgraded sibling binary), and a poller
+                // doing that every tick forever is a standing hazard. sqlite-vec is
+                // registered process-globally regardless, so the vec0 `node_vectors`
+                // join still resolves. Re-opening each tick (vs holding a connection)
+                // keeps us correct across a rebuild-index atomic swap.
+                let unembedded = match Database::open_nondestructive(&db_path) {
                     Ok(db) => queries::count_unembedded_nodes(db.conn()).unwrap_or(floor),
                     Err(_) => continue, // transient (e.g. mid-swap) — retry next tick
                 };
@@ -921,7 +932,7 @@ impl McpServer {
                     // re-measurement after a no-op'd call would capture the other backfill's
                     // mid-drain count and pin the floor too high, masking the new work.
                     if Self::run_guarded_backfill(&db_path, &flag) {
-                        if let Ok(db) = Database::open_with_vec(&db_path) {
+                        if let Ok(db) = Database::open_nondestructive(&db_path) {
                             floor = queries::count_unembedded_nodes(db.conn()).unwrap_or(floor);
                         }
                     }

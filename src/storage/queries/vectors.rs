@@ -117,12 +117,24 @@ pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
 /// without fetching payloads or loading the embedding model. Returns 0 when the vector
 /// table is absent (embed-model feature disabled).
 pub fn count_unembedded_nodes(conn: &Connection) -> Result<i64> {
+    // Probe for the vec table explicitly so its ABSENCE (embed-model disabled) returns 0,
+    // while a genuine read error on the count below (e.g. SQLITE_BUSY under writer
+    // contention) PROPAGATES as Err. A blanket `.unwrap_or(0)` would mask that transient
+    // as "no work", and the periodic backfill driver — which falls back to its current
+    // floor on Err — would instead reset its floor to 0 and futilely reload the model.
+    let has_vectors_table: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
+        [], |r| r.get(0),
+    )?;
+    if has_vectors_table == 0 {
+        return Ok(0);
+    }
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM nodes n \
          LEFT JOIN node_vectors nv ON n.id = nv.node_id \
          WHERE nv.node_id IS NULL AND n.context_string IS NOT NULL",
-        [], |r| r.get(0)
-    ).unwrap_or(0);
+        [], |r| r.get(0),
+    )?;
     Ok(n)
 }
 

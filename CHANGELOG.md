@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.75.4 — Periodic backfill hardening (code-review follow-ups)
+
+Follow-ups to v0.75.3's periodic embedding-backfill driver, from a code review.
+No behavior change for a healthy single-binary install; these close edge cases
+around contention, version skew, and no-embed builds.
+
+### Fixed
+- **The driver's un-embedded count now propagates read errors instead of masking
+  them as zero.** `count_unembedded_nodes` previously swallowed any query error to
+  `0`, so under writer contention (`SQLITE_BUSY`) the driver could read "0 un-embedded",
+  reset its residue floor, and on the next tick futilely reload the embedding model. It
+  now returns `0` only when the vector table is genuinely absent and propagates real
+  errors, so the driver keeps its floor across a transient read glitch.
+- **The driver's per-tick count opens the index non-destructively.** It previously
+  used the revalidating `open_with_vec`, which can wipe the index during an
+  INDEX_VERSION skew window (a downgraded sibling binary) — a standing hazard for a
+  60s poller. The count is read-only and sqlite-vec is registered process-globally, so
+  `open_nondestructive` is both safer and cheaper.
+- **The driver is gated behind the `embed-model` feature at its spawn sites,** matching
+  the sibling embedding services, so a `--no-default-features` build never starts an
+  idle polling thread.
+
 ## v0.75.3 — Periodic embedding backfill for no-tool-call sessions
 
 Fixes the "✓ N nodes … 99% vec, never finishes" symptom in a session that drives
