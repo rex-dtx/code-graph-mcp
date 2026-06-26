@@ -8,8 +8,15 @@
 //! Cycles are detected over `imports` edges only, NOT `calls`: mutual recursion
 //! (a call cycle) is normal and expected, whereas circular *imports* are the
 //! architectural smell this surfaces. Most actionable for languages where
-//! circular imports are problematic (JS/TS/Python/Go); Rust intra-crate module
-//! cycles are frequently benign.
+//! circular imports are problematic (JS/TS/Python/Go/C/C++).
+//!
+//! Rust `.rs`↔`.rs` import edges are dropped before detection (see
+//! [`is_rust_intra_crate_edge`]): a Rust crate compiles as a unit, so `use`
+//! cycles between its modules — a parent module and its submodules, or sibling
+//! modules sharing types — are idiomatic and carry none of the load-order hazard
+//! this detector exists to surface, and Cargo forbids cross-crate cycles
+//! outright. Reporting a crate's own module tree as "4 circular dependencies"
+//! is noise that buries the actionable cross-language cycles.
 //!
 //! Algorithm: iterative Tarjan SCC (O(V+E), no recursion so deep graphs can't
 //! overflow the stack), then for each SCC of size ≥ 2 a shortest representative
@@ -54,18 +61,31 @@ impl DependencyCycle {
     }
 }
 
+/// True when both endpoints are Rust source files. Rust compiles a crate as a
+/// unit, so intra-crate `use` cycles between modules (a parent module and its
+/// submodules, or sibling modules sharing types) are idiomatic and never the
+/// load-order hazard this detector targets — and Cargo forbids cross-crate
+/// cycles outright. Such edges are dropped before SCC detection so the report
+/// stays focused on languages where circular imports are actually problematic.
+/// Cross-language edges (e.g. `.rs`↔`.py`) are kept: only same-`.rs` pairs go.
+fn is_rust_intra_crate_edge(from: &str, to: &str) -> bool {
+    from.ends_with(".rs") && to.ends_with(".rs")
+}
+
 /// Detect circular import dependencies in a directed file graph.
 ///
 /// `edges` are `(from, to)` pairs meaning *from imports to*. Returns one
 /// [`DependencyCycle`] per strongly-connected component of ≥ 2 files, sorted by
-/// size descending then by first file lexically. Self-edges (`from == to`) are
-/// ignored. Deterministic for a fixed input.
+/// size descending then by first file lexically. Self-edges (`from == to`) and
+/// Rust intra-crate edges (see [`is_rust_intra_crate_edge`]) are ignored.
+/// Deterministic for a fixed input.
 pub fn find_cycles(edges: &[(String, String)]) -> Vec<DependencyCycle> {
     // 1. Distinct file names in sorted order → dense indices (deterministic:
-    //    smallest index == lexically smallest file). Self-edges are dropped here.
+    //    smallest index == lexically smallest file). Self-edges and benign Rust
+    //    intra-crate module edges are dropped here.
     let mut names_set: BTreeSet<&str> = BTreeSet::new();
     for (from, to) in edges {
-        if from == to {
+        if from == to || is_rust_intra_crate_edge(from, to) {
             continue;
         }
         names_set.insert(from.as_str());
@@ -83,7 +103,7 @@ pub fn find_cycles(edges: &[(String, String)]) -> Vec<DependencyCycle> {
     //    binary_search in shortest_cycle and keeps traversal deterministic).
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (from, to) in edges {
-        if from == to {
+        if from == to || is_rust_intra_crate_edge(from, to) {
             continue;
         }
         adj[index_of[from.as_str()]].push(index_of[to.as_str()]);
@@ -323,6 +343,44 @@ mod tests {
         assert_eq!(cycles.len(), 2);
         assert_eq!(files_of(&cycles[0]), ["b", "c", "d"], "larger SCC first");
         assert_eq!(files_of(&cycles[1]), ["a", "e"]);
+    }
+
+    #[test]
+    fn rust_intra_crate_module_cycle_is_suppressed() {
+        // Parent module ↔ submodule (mod.rs uses `use sub::f`, sub uses `super::T`)
+        // and sibling ↔ sibling — both are idiomatic Rust, not load-order hazards.
+        let cycles = find_cycles(&[
+            edge("src/parser/relations/mod.rs", "src/parser/relations/cpp.rs"),
+            edge("src/parser/relations/cpp.rs", "src/parser/relations/mod.rs"),
+            edge("src/storage/queries/edges.rs", "src/storage/queries/nodes.rs"),
+            edge("src/storage/queries/nodes.rs", "src/storage/queries/edges.rs"),
+        ]);
+        assert!(cycles.is_empty(), "Rust intra-crate import cycles must not be reported");
+    }
+
+    #[test]
+    fn non_rust_cycle_is_still_detected_alongside_suppressed_rust() {
+        // A genuine JS require cycle survives even when Rust edges are present.
+        let cycles = find_cycles(&[
+            edge("a/mod.rs", "a/sub.rs"),
+            edge("a/sub.rs", "a/mod.rs"),
+            edge("scripts/doctor.js", "scripts/lifecycle.js"),
+            edge("scripts/lifecycle.js", "scripts/doctor.js"),
+        ]);
+        assert_eq!(cycles.len(), 1, "only the JS cycle should remain");
+        assert_eq!(files_of(&cycles[0]), ["scripts/doctor.js", "scripts/lifecycle.js"]);
+    }
+
+    #[test]
+    fn cross_language_cycle_with_rust_endpoint_is_kept() {
+        // Only same-`.rs` edges are dropped; a `.rs`↔`.py` cycle is cross-language
+        // and genuinely worth surfacing, so it must still be reported.
+        let cycles = find_cycles(&[
+            edge("src/a.rs", "src/b.py"),
+            edge("src/b.py", "src/a.rs"),
+        ]);
+        assert_eq!(cycles.len(), 1, "a cross-language cycle is not a benign intra-crate cycle");
+        assert_eq!(files_of(&cycles[0]), ["src/a.rs", "src/b.py"]);
     }
 
     #[test]
