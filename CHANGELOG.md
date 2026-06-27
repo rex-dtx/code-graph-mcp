@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.76.4 — SQLite variable-cap crash fix (issue #30) + cycle-detection noise
+
+### Fixed
+- **Large repos no longer abort indexing with a SQLite variable-cap error
+  (issue #30).** Several `IN`/`NOT IN` lookups bound one parameter per id in a
+  single clause and could exceed `SQLITE_MAX_VARIABLE_NUMBER` once the id list
+  scaled with the repo — the pending-call `source_id` list reaches ~2× the node
+  count. This aborted every `ensure_indexed()` sweep, so `incremental-index` and
+  all MCP tools (including `semantic_code_search`) failed on big projects. The
+  affected lookups are now deduped and chunked under a 500-parameter cap.
+- **`cycles` no longer reports a Rust crate's own module tree as circular
+  dependencies.** Intra-crate `.rs`↔`.rs` `use` cycles are idiomatic (a crate
+  compiles as a unit; Cargo forbids cross-crate cycles), so they are dropped
+  before detection; cross-language cycles are kept. On this repo: 4 → 1.
+
 ## v0.76.3 — Backfill robustness follow-ups (code review)
 
 Follow-ups to v0.76.2 from a code review. No schema, index-format, or
