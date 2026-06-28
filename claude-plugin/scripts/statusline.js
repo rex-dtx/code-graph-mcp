@@ -12,10 +12,17 @@ const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => 
 // True when auto-update has a newer release queued or in flight (the background
 // downloader in session-init.js hasn't promoted the new binary yet). Used to show
 // a transient "updating" state instead of the alarming "offline" during that window.
+// After this many consecutive failed download attempts (auto-update.js tracks
+// updateAttempts), a pending update is treated as STUCK: the statusline stops
+// showing "↻ updating" (which asserts an in-progress self-heal) and surfaces the
+// real status instead. Without this, a persistently-failing update (missing
+// tar/curl, full disk, blocked network) pins "updating" forever.
+const STUCK_UPDATE_ATTEMPTS = 5;
 function updatePending() {
   try {
     const st = JSON.parse(fs.readFileSync(
       path.join(os.homedir(), '.cache', 'code-graph', 'update-state.json'), 'utf8'));
+    if ((st.updateAttempts || 0) >= STUCK_UPDATE_ATTEMPTS) return false;
     if (st.updateAvailable) return true;
     if (st.latestVersion && st.installedVersion && st.latestVersion !== st.installedVersion) return true;
   } catch { /* no state file or unreadable — treat as no pending update */ }
@@ -113,7 +120,11 @@ function parseReport(text) {
 // still downloading. That, or any pending update, is transient: show "updating"
 // so the user knows it self-heals, rather than the misleading "offline".
 function statusUnavailable(errText) {
-  const binaryOutdated = /schema version/i.test(errText || '');
+  // Primary signal: the binary's STABLE schema-too-new marker (Rust
+  // domain::SCHEMA_TOO_NEW_MARKER) \u2014 not reword-able prose. Fallback to the legacy
+  // phrase so a cached binary predating the marker still reads as "updating".
+  const errStr = errText || '';
+  const binaryOutdated = errStr.includes('code-graph:schema-too-new') || /schema version/i.test(errStr);
   return (binaryOutdated || updatePending()) ? 'code-graph: \u21bb updating' : 'code-graph: offline';
 }
 

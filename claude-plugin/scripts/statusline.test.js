@@ -117,6 +117,17 @@ test('no report + update pending → updating', (t) => {
   assert.equal(runStatusline(home, project), 'code-graph: ↻ updating');
 });
 
+test('stuck update (updateAttempts exhausted) → offline, not updating', (t) => {
+  // A persistently-failing update must not pin "↻ updating" forever. Past
+  // STUCK_UPDATE_ATTEMPTS the statusline drops the optimistic state and surfaces
+  // the real one (here: no report → offline).
+  const home = mkHome(t);
+  const project = mkProject(home);
+  installStubBinary(home, { report: 'boom', exitCode: 1 });
+  setUpdateState(home, { updateAvailable: true, updateAttempts: 5 });
+  assert.equal(runStatusline(home, project), 'code-graph: offline');
+});
+
 test('schema-version error on stderr (no report) → updating', (t) => {
   const home = mkHome(t);
   const project = mkProject(home);
@@ -124,6 +135,20 @@ test('schema-version error on stderr (no report) → updating', (t) => {
   installStubBinary(home, {
     report: '',
     stderr: 'Error: Database schema version v9 is newer than supported v8',
+    exitCode: 1,
+  });
+  assert.equal(runStatusline(home, project), 'code-graph: ↻ updating');
+});
+
+test('schema-too-new MARKER on stderr → updating (keys on the stable token, not prose)', (t) => {
+  // The binary appends domain::SCHEMA_TOO_NEW_MARKER; the statusline must detect
+  // the post-update window via that token even when the surrounding prose is
+  // reworded/translated (the old `/schema version/i` regex would miss this).
+  const home = mkHome(t);
+  const project = mkProject(home);
+  installStubBinary(home, {
+    report: '',
+    stderr: 'Error: totally reworded wording here [code-graph:schema-too-new]',
     exitCode: 1,
   });
   assert.equal(runStatusline(home, project), 'code-graph: ↻ updating');

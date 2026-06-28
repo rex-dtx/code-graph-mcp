@@ -192,10 +192,14 @@ impl Database {
         let existing_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
         if existing_version > schema::SCHEMA_VERSION {
+            // The trailing [marker] is a stable token the plugin statusline keys on
+            // to render "↻ updating" (post-update window) vs "offline". See
+            // domain::SCHEMA_TOO_NEW_MARKER — keep it in the message.
             anyhow::bail!(
-                "Database schema version v{} is newer than supported v{}. Please update code-graph-mcp.",
+                "Database schema version v{} is newer than supported v{}. Please update code-graph-mcp. [{}]",
                 existing_version,
-                schema::SCHEMA_VERSION
+                schema::SCHEMA_VERSION,
+                crate::domain::SCHEMA_TOO_NEW_MARKER
             );
         }
 
@@ -571,6 +575,30 @@ mod tests {
             .unwrap();
         assert_eq!(files_after, 0, "indexer open must perform the deferred wipe");
         assert_eq!(indexer.index_version_stale(), None, "post-revalidate handle is current");
+    }
+
+    #[test]
+    fn open_rejects_future_schema_with_stable_marker() {
+        // A DB whose SCHEMA is newer than this binary supports must be REFUSED
+        // (not wiped), carrying the stable statusline marker. Closes the audit's
+        // "future-schema refusal untested" gap AND pins domain::SCHEMA_TOO_NEW_MARKER
+        // so a reworded message can't silently break the statusline's
+        // "↻ updating" vs "offline" discrimination (statusline.js keys on it).
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("future.db");
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.conn()
+                .pragma_update(None, "user_version", schema::SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        // .map(|_| ()) — Database isn't Debug, so unwrap_err needs the Ok type erased.
+        let err = Database::open(&db_path).map(|_| ()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(crate::domain::SCHEMA_TOO_NEW_MARKER),
+            "future-schema bail must carry the stable marker; got: {msg}"
+        );
     }
 
     #[test]

@@ -520,6 +520,12 @@ async function checkForUpdate({ installMissing = false } = {}) {
         installedVersion: success ? latest.version : installedVersion,
         latestVersion: latest.version,
         updateAvailable: !success,
+        // Consecutive failed-download counter. The statusline shows "↻ updating"
+        // while updateAvailable is set; without a bound, a persistently-failing
+        // update (missing tar/curl, full disk, blocked network) pins "updating"
+        // forever, asserting a self-heal that never happens. The statusline stops
+        // trusting it past STUCK_UPDATE_ATTEMPTS; success resets to 0.
+        updateAttempts: success ? 0 : (state.updateAttempts || 0) + 1,
         lastUpdate: success ? new Date().toISOString() : state.lastUpdate,
         rateLimited: false,
         binaryUpdated: result.binaryUpdated,
