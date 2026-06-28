@@ -49,3 +49,7 @@ scripts/embedding_benchmark/query_set.jsonl
 scripts/embedding_benchmark/results/*.json
 scripts/embedding_benchmark/__pycache__/
 tests/embedding_benchmark/__pycache__/
+
+# Auto-generated session-exit paused stubs (claudemd session-end-check.sh).
+# Real paused-task files (tasks/<slug>-paused.md) stay tracked.
+tasks/session-end-*-paused.md
