@@ -88,6 +88,13 @@ jobs:
         run: cargo clippy --features embed-model -- -D warnings
 
       - name: Test
+        # CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: the spawned `serve` integration tests
+        # would otherwise background-fetch the ~90 MB model on this cache-less
+        # runner (slow + flaky as cache population flips which tests skip). Embed
+        # UNIT tests use synthetic-weight seams; model-requiring integration tests
+        # self-skip without a cached model.
+        env:
+          CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
         run: cargo test --features embed-model
 
   # Plugin/lifecycle/release-smoke tests are Node-based and OS-independent —

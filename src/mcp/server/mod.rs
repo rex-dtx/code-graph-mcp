@@ -1175,6 +1175,19 @@ impl McpServer {
             return;
         }
 
+        // Test/CI escape hatch. `cargo test --features embed-model` (the embed-check
+        // CI job + the integration harness) builds this bin WITH embedding and
+        // spawns `serve` many times; on a cache-less runner each spawn would
+        // background-download the ~90 MB model from the GitHub release — slow,
+        // and flaky because cache population mid-suite flips which model-requiring
+        // tests skip vs run. The flag (set by ci.yml's embed-check job and by the
+        // test harness `McpClient::spawn`) disables only the AUTO-DOWNLOAD; a model
+        // already cached is still loaded and used, so local embed tests with a
+        // cached model are unaffected.
+        if std::env::var("CODE_GRAPH_DISABLE_MODEL_DOWNLOAD").ok().as_deref() == Some("1") {
+            return;
+        }
+
         std::thread::spawn(move || {
             let cache_dir = match EmbeddingModel::cache_models_dir() {
                 Ok(d) => d,
