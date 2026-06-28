@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { PROJECT_MARKERS, isProjectRoot, isNonProjectCwd } = require('./project-detect');
+const { PROJECT_MARKERS, isProjectRoot, findProjectRoot, isNonProjectCwd } = require('./project-detect');
 
 function mkTmp(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pd-'));
@@ -70,4 +70,26 @@ test('isProjectRoot detects each marker', (t) => {
     else fs.writeFileSync(markerPath, '');
     assert.equal(isProjectRoot(dir), true, `${marker} should make cwd a project`);
   }
+});
+
+test('isNonProjectCwd: a marker-less SUBDIR of a project resolves to the project (walk-up, monorepo fix)', (t) => {
+  // Regression (v0.79.1 audit #7): the gate checked ONLY the literal cwd, so a
+  // monorepo subdir (`.git` only at the repo root) served the 0-tool stub even
+  // though the Rust binary's resolver walks up and would answer queries. The
+  // gate now walks up too.
+  const root = mkTmp(t);
+  fs.mkdirSync(path.join(root, '.git'));
+  const sub = path.join(root, 'backend', 'src');
+  fs.mkdirSync(sub, { recursive: true });
+  assert.equal(isProjectRoot(sub), false, 'the subdir itself has no marker');
+  assert.equal(isNonProjectCwd(sub), false, 'but it is INSIDE a project → not non-project');
+  assert.equal(findProjectRoot(sub), root, 'walk-up returns the repo root');
+});
+
+test('findProjectRoot: a marker-less tree with no ancestor marker → null (tmp/headless stays gated)', (t) => {
+  const dir = mkTmp(t);
+  const sub = path.join(dir, 'a', 'b');
+  fs.mkdirSync(sub, { recursive: true });
+  assert.equal(findProjectRoot(sub), null);
+  assert.equal(isNonProjectCwd(sub), true);
 });

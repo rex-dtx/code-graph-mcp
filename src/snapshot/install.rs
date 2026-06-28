@@ -10,7 +10,7 @@ use super::config::load_config;
 /// 2. `[snapshot] disabled = true` → None
 /// 3. Auto-detect from `git remote get-url origin` → GitHub release asset
 pub fn resolve_snapshot_source(root: &Path) -> Option<String> {
-    resolve_snapshot_source_impl(root, url_override_trusted())
+    resolve_snapshot_source_impl(root, url_override_trusted(), origin_trusted())
 }
 
 /// Out-of-band trust signal for a `.code-graph.toml [snapshot] url` override.
@@ -23,9 +23,23 @@ fn url_override_trusted() -> bool {
     std::env::var("CODE_GRAPH_SNAPSHOT_TRUST_URL").ok().as_deref() == Some("1")
 }
 
+/// Out-of-band trust for the auto-detected origin GitHub-release snapshot path.
+/// Symmetric with [`url_override_trusted`]: opening an UNTRUSTED repo (e.g. cloned
+/// to review before building) would otherwise auto-fetch + install that repo's
+/// own published `code-graph-snapshot-*.db.zst` with only same-origin TOFU
+/// verification — seeding a misleading graph (no code execution, but callgraph /
+/// impact / dead-code on unchanged files would reflect attacker-chosen edges).
+/// Trusted when the developer explicitly opts in, OR when a `CODE_GRAPH_SNAPSHOT_PIN`
+/// is set (the pin makes a poisoned download fail content verification, so an
+/// auto-fetch is safe).
+fn origin_trusted() -> bool {
+    std::env::var("CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN").ok().as_deref() == Some("1")
+        || std::env::var("CODE_GRAPH_SNAPSHOT_PIN").ok().filter(|s| !s.is_empty()).is_some()
+}
+
 /// Testable core of [`resolve_snapshot_source`]: `url_trusted` is the out-of-band
 /// consent for a toml url override (env-read in the public wrapper).
-pub(crate) fn resolve_snapshot_source_impl(root: &Path, url_trusted: bool) -> Option<String> {
+pub(crate) fn resolve_snapshot_source_impl(root: &Path, url_trusted: bool, origin_trusted: bool) -> Option<String> {
     let cfg = load_config(root).ok()?;
     if cfg.snapshot.disabled {
         return None;
@@ -54,7 +68,29 @@ pub(crate) fn resolve_snapshot_source_impl(root: &Path, url_trusted: bool) -> Op
         }
         return Some(url);
     }
-    resolve_from_github(root)
+    gate_origin_url(resolve_from_github(root), origin_trusted)
+}
+
+/// Gate the auto-detected origin GitHub-release snapshot behind out-of-band trust
+/// ([`origin_trusted`]). The URL is resolved FIRST so the opt-in hint is printed
+/// only when the repo actually publishes a snapshot — a normal repo (no snapshot
+/// asset) stays silent. Untrusted + a published snapshot → install is skipped
+/// (the security fix); trusted (env opt-in or a pin) → install proceeds.
+pub(crate) fn gate_origin_url(origin_url: Option<String>, origin_trusted: bool) -> Option<String> {
+    let url = origin_url?;
+    if !origin_trusted {
+        let msg = format!(
+            "warning: this repo publishes a code-graph snapshot ({url}) but auto-installing it \
+             from the repo's own GitHub release is opt-in — a snapshot from an untrusted repo \
+             could seed a misleading code graph (no code execution, but callgraph / impact / \
+             dead-code on unchanged files would reflect attacker-chosen edges). Set \
+             CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN=1 (or a CODE_GRAPH_SNAPSHOT_PIN) to install it."
+        );
+        tracing::warn!("{msg}");
+        eprintln!("{msg}");
+        return None;
+    }
+    Some(url)
 }
 
 fn resolve_from_github(root: &Path) -> Option<String> {

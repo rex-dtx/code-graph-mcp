@@ -7,6 +7,12 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// Hook cooldown flags + the restart notice go under cgTmpDir() (a code-graph-mcp/
+// subdir of os.tmpdir()), NOT bare os.tmpdir(): Claude Code overrides $TMPDIR to
+// ~/.claude/tmp/, so bare-tmp flags interleave with transcript captures —
+// diagnostic blindness + the §8 recursive-grep footgun (see tmp-dir.js). The
+// other hook scripts already route through here; this one was the lone holdout.
+const { cgTmpDir } = require('./tmp-dir');
 
 // Mid-session install detection: hook fires but no manifest yet.
 const MANIFEST_PATH = path.join(os.homedir(), '.cache', 'code-graph', 'install-manifest.json');
@@ -22,7 +28,7 @@ const COOLDOWNS = {
 
 function isCoolingDown(type) {
   try {
-    const flag = path.join(os.tmpdir(), `.code-graph-ctx-${type}`);
+    const flag = path.join(cgTmpDir(), `.code-graph-ctx-${type}`);
     const stat = fs.statSync(flag);
     return Date.now() - stat.mtimeMs < (COOLDOWNS[type] || 60000);
   } catch { return false; }
@@ -30,7 +36,7 @@ function isCoolingDown(type) {
 
 function markCooldown(type) {
   try {
-    fs.writeFileSync(path.join(os.tmpdir(), `.code-graph-ctx-${type}`), '');
+    fs.writeFileSync(path.join(cgTmpDir(), `.code-graph-ctx-${type}`), '');
   } catch { /* ok */ }
 }
 
@@ -398,7 +404,7 @@ function runMain() {
   // Mid-session install: lifecycle.js install() hasn't run yet (no manifest).
   // MCP server only starts at session startup — tell the user to restart.
   if (!fs.existsSync(MANIFEST_PATH)) {
-    const noticeFile = path.join(os.tmpdir(), '.code-graph-mcp-restart-notice');
+    const noticeFile = path.join(cgTmpDir(), '.code-graph-mcp-restart-notice');
     try {
       // Show once per hour to avoid spam
       if (Date.now() - fs.statSync(noticeFile).mtimeMs < 3600000) return;

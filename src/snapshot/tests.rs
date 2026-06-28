@@ -153,7 +153,7 @@ fn config_load_rejects_malformed_toml() {
         "got error message: {err}");
 }
 
-use crate::snapshot::install::{resolve_snapshot_source, resolve_snapshot_source_impl, try_install};
+use crate::snapshot::install::{gate_origin_url, resolve_snapshot_source, resolve_snapshot_source_impl, try_install};
 use crate::snapshot::meta::{META_SNAPSHOT_FETCHED_AT, META_SNAPSHOT_SOURCE_URL};
 
 #[test]
@@ -173,7 +173,7 @@ fn resolve_rejects_untrusted_url_override() {
         "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
     ).unwrap();
     // url_trusted=false (env var absent) → override ignored.
-    assert_eq!(resolve_snapshot_source_impl(dir.path(), false), None);
+    assert_eq!(resolve_snapshot_source_impl(dir.path(), false, false), None);
 }
 
 #[test]
@@ -184,10 +184,28 @@ fn resolve_returns_url_from_trusted_override() {
         "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
     ).unwrap();
     // url_trusted=true (developer set CODE_GRAPH_SNAPSHOT_TRUST_URL=1) → honored.
+    // origin_trusted is irrelevant here — the toml url branch returns first.
     assert_eq!(
-        resolve_snapshot_source_impl(dir.path(), true),
+        resolve_snapshot_source_impl(dir.path(), true, false),
         Some("https://example.com/x.db.zst".to_string()),
     );
+}
+
+// Security (#9): the auto-detected origin GitHub-release snapshot is gated by an
+// out-of-band trust signal, symmetric with the toml-url override. Opening an
+// untrusted repo (cloned to review) must NOT auto-install its published snapshot.
+#[test]
+fn origin_snapshot_is_gated_behind_trust() {
+    let url = Some("https://github.com/o/r/releases/download/v1/code-graph-snapshot-x.db.zst".to_string());
+    // Untrusted (no CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN, no pin) → install skipped.
+    assert_eq!(gate_origin_url(url.clone(), false), None,
+        "an untrusted repo's published snapshot must not auto-install");
+    // Trusted (developer opted in, or a pin is set) → install proceeds.
+    assert_eq!(gate_origin_url(url.clone(), true), url,
+        "an opt-in / pinned origin snapshot installs");
+    // No published snapshot → None either way (no spurious hint for normal repos).
+    assert_eq!(gate_origin_url(None, false), None);
+    assert_eq!(gate_origin_url(None, true), None);
 }
 
 #[test]

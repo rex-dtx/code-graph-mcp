@@ -22,6 +22,7 @@
 // this tool, so counting it would let a once-polluted /tmp self-certify as a
 // project on the next session (circular).
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const PROJECT_MARKERS = [
@@ -33,11 +34,32 @@ function isProjectRoot(cwd) {
   return PROJECT_MARKERS.some(m => fs.existsSync(path.join(cwd, m)));
 }
 
-// A cwd is "non-project" when it carries none of the recognized project
-// markers. The plugin's activation gates short-circuit there: no MCP tools,
-// no index creation, no SessionStart map injection, no auto-adoption.
-function isNonProjectCwd(cwd = process.cwd()) {
-  return !isProjectRoot(cwd);
+// Walk up from `cwd` to the nearest ancestor carrying a project marker, bounded
+// by $HOME (exclusive) and the filesystem root. Returns the marker dir, or null
+// if none. Mirrors the Rust binary's `resolve_project_root_bounded` so the JS
+// activation gate and the binary AGREE: before this, the gate checked ONLY the
+// literal cwd, so launching from a marker-less monorepo SUBDIR (e.g.
+// `repo/backend/` with `.git` only at `repo/`) classified it non-project and
+// served the 0-tool stub — even though the binary would have resolved `repo/`
+// and answered queries. The $HOME-exclusive bound keeps every /tmp / headless
+// cwd non-project (a stray marker in $HOME must not certify them).
+function findProjectRoot(cwd = process.cwd()) {
+  const home = os.homedir();
+  let dir = path.resolve(cwd);
+  for (;;) {
+    if (dir === home) return null;        // $HOME-exclusive: don't certify $HOME or above
+    if (isProjectRoot(dir)) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;      // filesystem root
+    dir = parent;
+  }
 }
 
-module.exports = { PROJECT_MARKERS, isProjectRoot, isNonProjectCwd };
+// A cwd is "non-project" when neither it NOR any ancestor (up to $HOME) carries a
+// recognized project marker. The plugin's activation gates short-circuit there:
+// no MCP tools, no index creation, no SessionStart map injection, no auto-adoption.
+function isNonProjectCwd(cwd = process.cwd()) {
+  return findProjectRoot(cwd) === null;
+}
+
+module.exports = { PROJECT_MARKERS, isProjectRoot, findProjectRoot, isNonProjectCwd };
