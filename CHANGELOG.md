@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.79.1 — grep: `-t`/`-g`/`-c` now constrain the git-grep supplement
+
+Follow-up to v0.79.0 from a code review.
+
+### Fixed
+- **`-t`/`--type`, `-g`/`--glob`, and `-c`/`--count` no longer leak git-tracked
+  files the rg walk misses.** ripgrep does not apply `--type`/`--glob` to files
+  passed explicitly on the command line, so the git-grep *supplement*
+  (tracked-but-gitignored / hidden-tracked files, appended as explicit args) was
+  searched/counted even when it didn't match the active filter. The supplement is
+  now re-filtered through ripgrep's own `ignore` matchers (rg-identical) before
+  being appended. Only affected repos with force-tracked-into-gitignored or
+  hidden-tracked files when using `-t`/`-g`/`-c`.
+- The unsupported-flag error's "Supported:" list now includes `-c -t -g -M`.
+
+### Changed
+- `grep --json` `text` omits the trailing newline (uniform with the
+  `-M`/`--max-columns` path); now covered by a test.
+
 ## v0.79.0 — grep: scope filters (`-t`/`-g`), count mode (`-c`), line-width cap (`-M`)
 
 Higher-leverage `code-graph-mcp grep` for agent workflows — scope a search, count
