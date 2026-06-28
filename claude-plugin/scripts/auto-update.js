@@ -83,6 +83,10 @@ function shouldCheck(state) {
 
 // ── Version Comparison (semver) ────────────────────────────
 
+// Assumes plain numeric "M.m.p" releases (the project's tag scheme). A pre-release
+// tag (e.g. "1.2.4-rc1") is NOT semver-ordered: `Number("4-rc1")` is NaN → coerced
+// to 0, dropping that segment's number (so "1.2.4-rc1" wrongly sorts below "1.2.3").
+// Revisit with a real semver compare only if the release process adopts pre-releases.
 function compareVersions(a, b) {
   const pa = a.split('.').map(Number);
   const pb = b.split('.').map(Number);

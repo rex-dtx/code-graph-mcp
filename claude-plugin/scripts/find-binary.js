@@ -57,7 +57,13 @@ function getPackageVersion() {
   catch { return null; }
 }
 
-/** Compare semver-ish "M.m.p" strings; returns -1, 0, or 1. Non-numeric parts → 0. */
+/**
+ * Compare semver-ish "M.m.p" strings; returns -1, 0, or 1. Non-numeric parts → 0.
+ * Assumes plain numeric releases (the project's tag scheme); a pre-release tag
+ * (e.g. "1.2.3-rc1") is NOT semver-ordered — `parseInt("3-rc1", 10)` keeps the
+ * leading 3 and drops the suffix, so "1.2.3-rc1" compares EQUAL to "1.2.3".
+ * Revisit only if releases adopt pre-release tags.
+ */
 function compareVersions(a, b) {
   const pa = String(a).split('.').map(s => parseInt(s, 10));
   const pb = String(b).split('.').map(s => parseInt(s, 10));
