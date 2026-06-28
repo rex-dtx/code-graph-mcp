@@ -282,8 +282,12 @@ pub(super) fn index_files(
 
         let mut batch_parsed: Vec<FileParsed> = Vec::new();
         // Saved inbound edges from other files → batch files (to restore after cascade delete)
-        // Tuple: (source_id, source_file_id, target_name, relation, metadata)
-        let mut saved_inbound_edges: Vec<(i64, i64, String, String, Option<String>)> = Vec::new();
+        // Tuple: (source_id, source_file_id, target_file_id, target_name, relation, metadata).
+        // target_file_id is the re-indexed file the edge pointed INTO; the restore
+        // re-binds ONLY to the new same-name node in THAT file, not every same-name
+        // node in the batch (which fanned out cross-file / cross-language).
+        #[allow(clippy::type_complexity)]
+        let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> = Vec::new();
         // Track file_ids in this batch to filter intra-batch edges in Phase 2c
         let mut batch_file_ids: HashSet<i64> = HashSet::new();
 
@@ -296,8 +300,14 @@ pub(super) fn index_files(
                 language: Some(pp.language.clone()),
             })?;
 
-            // Save cross-file inbound edges before cascade delete destroys them
-            saved_inbound_edges.extend(get_inbound_cross_file_edges(db.conn(), file_id)?);
+            // Save cross-file inbound edges before cascade delete destroys them.
+            // file_id IS the target file these edges point into — attach it so the
+            // Phase 2c restore can re-bind to the same-name node in THIS file only.
+            saved_inbound_edges.extend(
+                get_inbound_cross_file_edges(db.conn(), file_id)?
+                    .into_iter()
+                    .map(|(src, src_file, tname, rel, meta)| (src, src_file, file_id, tname, rel, meta)),
+            );
             batch_file_ids.insert(file_id);
 
             delete_nodes_by_file(db.conn(), file_id)?;
@@ -905,7 +915,25 @@ pub(super) fn index_files(
                     // resolves; incremental-timing gap is the documented calls limit).
                     continue;
                 } else {
-                    all_target_ids
+                    // Structural relations (imports / inherits / implements /
+                    // exports / routes_to) with no same-file and no same-language
+                    // target. Previously this fell through to `all_target_ids` —
+                    // the GLOBAL all-language pool — so a non-empty cross-language
+                    // same-name node bound a false edge AND pre-empted the
+                    // `<external>` sentinel below (which only fires when target_ids
+                    // is empty). That produced cross-language phantom imports/
+                    // inherits (e.g. Rust `use anyhow::Result` → a markdown
+                    // "Result" heading; JS `require('fs')` → a Rust `fs` symbol),
+                    // stamped `extracted` so `--min-confidence` couldn't filter
+                    // them, polluting deps / project_map / affected / cycles /
+                    // find_references. Bind structural edges to same-language
+                    // targets ONLY (branch above already handled the non-empty
+                    // same-language case via refine_ambiguous_targets); here that
+                    // set is empty, so yield empty → IMPORTS/IMPLEMENTS reach the
+                    // `<external>` sentinel, the rest drop rather than bind across
+                    // languages. Same-language gating subsumes the markdown/HTML/
+                    // CSS/JSON case (those nodes are a different language).
+                    Vec::new()
                 };
 
                 if target_ids.is_empty()
@@ -1045,24 +1073,29 @@ pub(super) fn index_files(
         // When a file is re-indexed, its old nodes are deleted (cascade-deleting edges).
         // Edges from OTHER files into the re-indexed file must be rebuilt using new node IDs.
         if !saved_inbound_edges.is_empty() {
-            // Build name → new_node_id map for batch files only
-            let mut batch_name_to_ids: HashMap<&str, Vec<i64>> = HashMap::new();
+            // Build (target_file_id, name) → new_node_id map for batch files. Keying
+            // on the file the edge pointed INTO — not just the bare name — pins the
+            // restore to the same-name node in THAT file, so a re-indexed sibling
+            // file sharing the symbol name (or a cross-language same-name node in the
+            // batch) can no longer steal the edge. A genuinely-removed symbol yields
+            // no match → the edge drops, exactly as a full rebuild would.
+            let mut batch_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
             for pf in &batch_parsed {
                 for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
-                    batch_name_to_ids.entry(name.as_str()).or_default().push(*id);
+                    batch_name_to_ids.entry((pf.file_id, name.as_str())).or_default().push(*id);
                 }
             }
 
             let mut restored = 0usize;
             let mut skipped_intra_batch = 0usize;
-            for (source_id, source_file_id, target_name, relation, metadata) in &saved_inbound_edges {
+            for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in &saved_inbound_edges {
                 // Source file is also in this batch — source_id is stale (deleted + re-created).
                 // Phase 2 already resolves cross-file edges for intra-batch files.
                 if batch_file_ids.contains(source_file_id) {
                     skipped_intra_batch += 1;
                     continue;
                 }
-                if let Some(new_target_ids) = batch_name_to_ids.get(target_name.as_str()) {
+                if let Some(new_target_ids) = batch_name_to_ids.get(&(*target_file_id, target_name.as_str())) {
                     for &new_tgt_id in new_target_ids {
                         if *source_id != new_tgt_id
                             && insert_edge_cached(db.conn(), *source_id, new_tgt_id, relation, metadata.as_deref())? {

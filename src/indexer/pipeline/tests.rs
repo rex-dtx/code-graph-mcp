@@ -709,6 +709,98 @@ fn test_edge_flip_invalidates_caller_vector() {
 }
 
 #[test]
+fn test_cross_language_structural_edges_isolated() {
+    // v31 regression (#3): structural relations (imports/inherits/implements/
+    // exports/routes_to) must NOT fall through to the global all-language name
+    // pool. Before the fix a Rust `use anyhow::Result` bound an `imports` edge to
+    // a markdown "Result" heading, and `require('fs')` bound to a Rust `fs`
+    // symbol — cross-language phantom edges stamped `extracted` (unfilterable),
+    // polluting deps/project_map/cycles/find_references. Same-language gating (+
+    // the `<external>` sentinel for genuine externals) must eliminate them.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+
+    // Rust `use anyhow::Result` (import target_name "Result") + a Rust fn `fs`.
+    fs::write(project_dir.path().join("src/lib.rs"),
+        "use anyhow::Result;\npub fn foo() -> Result<()> { Ok(()) }\npub fn fs() {}\n").unwrap();
+    // Markdown heading "Result" — the cross-language collision target.
+    fs::write(project_dir.path().join("README.md"), "# Result\n\nDocs.\n").unwrap();
+    // JS `require('fs')` (import target_name "fs") collides with the Rust `fs` fn.
+    fs::write(project_dir.path().join("app.js"),
+        "const fs = require('fs');\nfunction g() { return fs; }\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    let conn = db.conn();
+
+    // Sanity: the markdown collision target exists (so a passing test can't be a
+    // false pass from the heading simply not being indexed).
+    let md_result: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id \
+         WHERE n.name = 'Result' AND f.language = 'markdown'", [], |r| r.get(0)).unwrap();
+    assert_eq!(md_result, 1, "markdown 'Result' heading must be indexed (the collision target)");
+
+    // No structural edge may cross language to a NON-external target. The
+    // `<external>` sentinel (language 'external') is the only allowed
+    // not-same-language import/implements target.
+    let cross_lang_structural: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edges e \
+         JOIN nodes s ON s.id = e.source_id JOIN files fs ON fs.id = s.file_id \
+         JOIN nodes t ON t.id = e.target_id JOIN files ft ON ft.id = t.file_id \
+         WHERE e.relation IN ('imports','inherits','implements','exports','routes_to') \
+           AND fs.language IS NOT ft.language \
+           AND COALESCE(ft.language,'') != 'external'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(cross_lang_structural, 0,
+        "structural edges must bind same-language only; got {cross_lang_structural} cross-language");
+}
+
+#[test]
+fn test_phase2c_restore_binds_only_original_target_file() {
+    // v31 regression (#4) + the previously-untested happy path. The Phase-2c
+    // incremental inbound-edge restore must re-bind a saved cross-file edge ONLY
+    // to the same-name node in the file the edge originally pointed into — not
+    // every same-name node in the batch. caller.ts → target() resolves into
+    // target.ts; an incremental then re-indexes target.ts AND other.ts in one
+    // batch and other.ts gains its own `target`. The restored edge must land on
+    // target.ts only (a fan-out to other.ts is an edge a full rebuild never makes).
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(project_dir.path().join("src/caller.ts"), "function caller() { target(); }").unwrap();
+    fs::write(project_dir.path().join("src/target.ts"), "function target() {}").unwrap();
+    fs::write(project_dir.path().join("src/other.ts"), "function unrelated() {}").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let count_caller_to = |path: &str| -> i64 {
+        db.conn().query_row(
+            "SELECT COUNT(*) FROM edges e \
+             JOIN nodes s ON s.id = e.source_id JOIN files fs ON fs.id = s.file_id \
+             JOIN nodes t ON t.id = e.target_id JOIN files ft ON ft.id = t.file_id \
+             WHERE e.relation = 'calls' AND s.name = 'caller' AND t.name = 'target' \
+               AND fs.path = 'src/caller.ts' AND ft.path = ?1",
+            [path], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(count_caller_to("src/target.ts"), 1, "initial: caller → target.ts:target");
+    assert_eq!(count_caller_to("src/other.ts"), 0, "initial: other.ts has no target yet");
+
+    // Re-index BOTH target.ts (keep `target`) and other.ts (ADD a `target`) in one batch.
+    fs::write(project_dir.path().join("src/target.ts"), "function target() { return 1; }").unwrap();
+    fs::write(project_dir.path().join("src/other.ts"), "function unrelated() {}\nfunction target() {}").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Happy path: the cascade-deleted edge was restored to the NEW target.ts node.
+    assert_eq!(count_caller_to("src/target.ts"), 1,
+        "restore must rebind caller → target.ts:target to the new node id");
+    // Over-creation guard: must NOT fan out to other.ts's same-name target.
+    assert_eq!(count_caller_to("src/other.ts"), 0,
+        "restore must NOT bind caller → other.ts:target (cross-file fan-out a rebuild never makes)");
+}
+
+#[test]
 fn test_deleted_file_cleanup() {
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
