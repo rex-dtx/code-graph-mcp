@@ -4,12 +4,22 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 
 # ── 1. Version consistency check ─────────────────────────────
-# If any version-bearing file is staged, verify all 4 locations match.
+# If any version-bearing file is staged, verify EVERY location sync-versions.js
+# writes matches the staged package.json: Cargo.toml, plugin.json, marketplace.json
+# (metadata.version AND plugins[0].version — the field the marketplace actually
+# reads), the 5 npm/<plat>/package.json, and package.json's 5 optionalDependencies
+# pins. The old guard checked only 4 — a lagging linux-arm64 pin or plugins[0].version
+# (no CI runner for either) shipped a release npm/marketplace couldn't resolve.
 VERSION_FILES=(
   "package.json"
   "Cargo.toml"
   "claude-plugin/.claude-plugin/plugin.json"
   ".claude-plugin/marketplace.json"
+  "npm/linux-x64/package.json"
+  "npm/linux-arm64/package.json"
+  "npm/darwin-x64/package.json"
+  "npm/darwin-arm64/package.json"
+  "npm/win32-x64/package.json"
 )
 
 staged_files=$(git diff --cached --name-only)
@@ -22,37 +32,33 @@ for vf in "${VERSION_FILES[@]}"; do
 done
 
 if $version_staged; then
-  # Extract versions from staged content (not working tree)
-  v_pkg=$(git show :package.json | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version)")
-  v_cargo=$(git show :Cargo.toml | grep -m1 '^version' | sed 's/version = "\(.*\)"/\1/')
-  v_plugin=$(git show :"claude-plugin/.claude-plugin/plugin.json" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version)")
-  v_market=$(git show :".claude-plugin/marketplace.json" | node -e "
-    const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
-    process.stdout.write(d.metadata.version)
-  ")
-
+  # Read versions from STAGED content (git show :<path>), so a partial bump is
+  # caught before it lands. $2 is a JS accessor (.version / .metadata.version / ...).
+  read_json_ver() { git show ":$1" | node -e "process.stdout.write(String(JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'))$2))"; }
+  ref=$(read_json_ver package.json .version)
   mismatch=false
-  if [ "$v_pkg" != "$v_cargo" ]; then
-    echo "❌ Version mismatch: package.json=$v_pkg vs Cargo.toml=$v_cargo"
-    mismatch=true
-  fi
-  if [ "$v_pkg" != "$v_plugin" ]; then
-    echo "❌ Version mismatch: package.json=$v_pkg vs plugin.json=$v_plugin"
-    mismatch=true
-  fi
-  if [ "$v_pkg" != "$v_market" ]; then
-    echo "❌ Version mismatch: package.json=$v_pkg vs marketplace.json=$v_market"
-    mismatch=true
-  fi
+  report() { if [ "$2" != "$ref" ]; then echo "❌ Version mismatch: $1=$2 vs package.json=$ref"; mismatch=true; fi; }
+
+  report Cargo.toml "$(git show :Cargo.toml | grep -m1 '^version' | sed 's/version = "\(.*\)"/\1/')"
+  report plugin.json "$(read_json_ver 'claude-plugin/.claude-plugin/plugin.json' .version)"
+  report marketplace.metadata "$(read_json_ver '.claude-plugin/marketplace.json' .metadata.version)"
+  report 'marketplace.plugins[0]' "$(read_json_ver '.claude-plugin/marketplace.json' '.plugins[0].version')"
+  for plat in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+    report "npm/$plat" "$(read_json_ver "npm/$plat/package.json" .version)"
+  done
+  # package.json optionalDependencies pins (npm install resolves the platform binary via these)
+  while IFS=$'\t' read -r dep ver; do
+    [ -n "$dep" ] && report "optionalDependencies[$dep]" "$ver"
+  done < <(git show :package.json | node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).optionalDependencies||{};for(const[k,v]of Object.entries(d))process.stdout.write(k+'\t'+v+'\n')")
 
   if $mismatch; then
     echo ""
-    echo "Fix: node scripts/sync-versions.js $v_pkg"
+    echo "Fix: node scripts/sync-versions.js $ref"
     echo "Then: git add the updated files"
     exit 1
   fi
 
-  echo "✓ Version consistency: $v_pkg"
+  echo "✓ Version consistency: $ref (Cargo + plugin + marketplace×2 + 5 npm + optionalDeps)"
 fi
 
 # ── 2. Plugin JS tests ───────────────────────────────────────
