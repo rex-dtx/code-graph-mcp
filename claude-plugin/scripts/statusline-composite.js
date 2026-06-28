@@ -72,11 +72,12 @@ function runProvider(command, needsStdin, stdin) {
     const argv = parts.map(expandTilde);
 
     // Forward Claude Code's authoritative current dir (from the stdin payload) as
-    // an env var. The code-graph provider gates on it instead of its own
-    // process.cwd(), which need not track the session's working dir. Harmless to
-    // `_previous`/third-party providers, which ignore the unknown var.
+    // a plugin-scoped env var. The code-graph provider gates on it instead of its
+    // own process.cwd(), which need not track the session's working dir. Harmless
+    // to `_previous`/third-party providers, which ignore the unknown var. The
+    // CODE_GRAPH_ prefix (not CLAUDE_) keeps it out of Claude Code's own namespace.
     const cwd = cwdFromStdin(stdin);
-    const env = cwd ? { ...process.env, CLAUDE_STATUSLINE_CWD: cwd } : process.env;
+    const env = cwd ? { ...process.env, CODE_GRAPH_STATUSLINE_CWD: cwd } : process.env;
 
     const out = execFileSync(argv[0], argv.slice(1), {
       timeout: 3000,
@@ -93,11 +94,15 @@ function runProvider(command, needsStdin, stdin) {
 // Prefer the top-level `cwd`, then `workspace.current_dir`; both track the
 // session's working dir (after the model runs `cd`). Returns null for empty,
 // non-JSON, or cwd-less payloads (e.g. the stdin-timeout fallback passes '').
+// Only a non-empty STRING is accepted: a malformed `cwd` (number/object) would
+// otherwise be coerced to a bogus env path that resolves nowhere and silently
+// blanks the segment — null keeps the gate on the safe process.cwd() fallback.
 function cwdFromStdin(stdin) {
   if (!stdin) return null;
   try {
     const ctx = JSON.parse(stdin);
-    return (ctx && (ctx.cwd || (ctx.workspace && ctx.workspace.current_dir))) || null;
+    const v = ctx && (ctx.cwd || (ctx.workspace && ctx.workspace.current_dir));
+    return typeof v === 'string' && v ? v : null;
   } catch { return null; }
 }
 

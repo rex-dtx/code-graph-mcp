@@ -70,7 +70,7 @@ function runStatusline(home, projectDir) {
 }
 
 // Run statusline.js from an arbitrary process.cwd() with extra env vars. Used to
-// prove the gate keys on Claude Code's authoritative cwd (CLAUDE_STATUSLINE_CWD,
+// prove the gate keys on Claude Code's authoritative cwd (CODE_GRAPH_STATUSLINE_CWD,
 // forwarded by the composite from the stdin payload), NOT the spawn's cwd.
 function runStatuslineIn(home, processCwd, extraEnv) {
   return execFileSync('node', [STATUSLINE], {
@@ -176,12 +176,12 @@ test('version-stale index shows rebuilding marker', (t) => {
   assert.equal(runStatusline(home, project), 'code-graph: ✓ 14119 nodes | 922 files | ↻ rebuilding');
 });
 
-// CLAUDE_STATUSLINE_CWD is Claude Code's authoritative current dir, forwarded by
+// CODE_GRAPH_STATUSLINE_CWD is Claude Code's authoritative current dir, forwarded by
 // the composite from its stdin payload. The gate must trust it over process.cwd():
 // Claude Code may spawn the statusline from a cwd unrelated to the session (the
 // classic regression — the segment vanished when the shell sat in a subdir whose
 // process.cwd() didn't resolve to the project root).
-test('CLAUDE_STATUSLINE_CWD overrides process.cwd() for the gate', (t) => {
+test('CODE_GRAPH_STATUSLINE_CWD overrides process.cwd() for the gate', (t) => {
   const home = mkHome(t);
   const project = mkProject(home);
   installStubBinary(home, {
@@ -190,11 +190,11 @@ test('CLAUDE_STATUSLINE_CWD overrides process.cwd() for the gate', (t) => {
   });
   // process.cwd() = home (no .code-graph → resolves null → would be blank), but
   // the authoritative cwd points at the project → must render the health line.
-  const out = runStatuslineIn(home, home, { CLAUDE_STATUSLINE_CWD: project });
+  const out = runStatuslineIn(home, home, { CODE_GRAPH_STATUSLINE_CWD: project });
   assert.equal(out, 'code-graph: ✓ 3145 nodes | 205 files');
 });
 
-test('CLAUDE_STATUSLINE_CWD in a subdir walks up to the project root', (t) => {
+test('CODE_GRAPH_STATUSLINE_CWD in a subdir walks up to the project root', (t) => {
   const home = mkHome(t);
   const project = mkProject(home);
   const subdir = path.join(project, 'claude-plugin', 'scripts');
@@ -205,6 +205,6 @@ test('CLAUDE_STATUSLINE_CWD in a subdir walks up to the project root', (t) => {
   });
   // The reported symptom: shell in <root>/claude-plugin/scripts. The subdir has
   // no .code-graph of its own; resolveProjectRoot must walk up to <root>.
-  const out = runStatuslineIn(home, home, { CLAUDE_STATUSLINE_CWD: subdir });
+  const out = runStatuslineIn(home, home, { CODE_GRAPH_STATUSLINE_CWD: subdir });
   assert.equal(out, 'code-graph: ✓ 3145 nodes | 205 files');
 });

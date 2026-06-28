@@ -34,13 +34,13 @@ if (disabledCleanup.cleaned) process.exit(0);
 // with no local index, showed nothing at all. The resolver skips stray nested
 // indexes, so the statusline tracks one DB — the project root — from any subdir.
 //
-// Start from Claude Code's AUTHORITATIVE current dir (CLAUDE_STATUSLINE_CWD,
+// Start from Claude Code's AUTHORITATIVE current dir (CODE_GRAPH_STATUSLINE_CWD,
 // forwarded by the composite from its stdin payload) rather than process.cwd().
 // The spawned statusline's process.cwd() is an implementation detail of how
 // Claude Code launches the command and need not track the session's working dir;
 // the stdin `cwd` always does. Fall back to process.cwd() when unset (direct
 // invocation, tests).
-const startDir = process.env.CLAUDE_STATUSLINE_CWD || process.cwd();
+const startDir = process.env.CODE_GRAPH_STATUSLINE_CWD || process.cwd();
 const root = resolveProjectRoot(startDir);
 if (!root) {
   process.exit(0);
