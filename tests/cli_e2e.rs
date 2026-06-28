@@ -1140,6 +1140,86 @@ fn test_cli_impact_json() {
     assert!(v["value_references"].is_number(), "CLI impact json must expose value_references like MCP");
 }
 
+#[test]
+fn test_cli_impact_json_reports_value_references() {
+    // Migrated from the MCP `test_r15_impact_reports_value_references` (removed with
+    // the standalone impact_analysis MCP tool): `impact` is the canonical full-impact
+    // surface, so a fn passed as a callback must surface value_references >= 1 there —
+    // rename / signature-change risk must include callback coupling.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("app.rs"),
+        "pub fn caller() { register(handler); }\nfn register<F>(_f: F) {}\nfn handler() {}\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "handler", "--json"]);
+    assert_eq!(code, 0, "impact handler should succeed; got: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(v["value_references"].as_u64().unwrap_or(0) >= 1,
+        "CLI impact(handler) must report value_references >= 1 (callback coupling); got: {stdout}");
+    // The referencer (`caller`) references but never CALLS `handler`, so it must NOT
+    // inflate the direct-caller count — the calls-vs-references separation (migrated
+    // from the MCP test_r14). Only a value reference exists, so direct_callers == 0.
+    assert_eq!(v["direct_callers"].as_u64(), Some(0),
+        "a callback referencer must not count as a direct CALLER; got: {stdout}");
+}
+
+#[test]
+fn test_cli_impact_json_struct_returns_unknown_risk() {
+    // Migrated from the MCP `test_impact_analysis_struct_*` tests (removed with the
+    // standalone impact_analysis MCP tool): a non-function symbol (struct) with no
+    // call-graph callers must get UNKNOWN risk (not LOW) plus a non-function warning,
+    // so "0 callers" on a type isn't misread as safe to change.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("models.rs"), "pub struct UserModel { pub id: i64 }\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "UserModel", "--json"]);
+    assert_eq!(code, 0, "impact UserModel should succeed; got: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["risk"].as_str(), Some("UNKNOWN"),
+        "non-function struct with no callers must be UNKNOWN risk, not LOW; got: {stdout}");
+    assert!(v["warning"].is_string(),
+        "non-function impact must carry a warning steering to refs/find_references; got: {stdout}");
+}
+
+#[test]
+fn test_cli_impact_json_route_handler_affected_routes() {
+    // Migrated from the MCP `test_e2e_impact_on_inline_route_handler` (removed with the
+    // standalone impact_analysis tool): an inline (arrow) route handler materializes as
+    // a function node and flows through impact as a route-carrying caller of what it
+    // calls, so impact on that callee reports a caller + affected_routes >= 1.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("server.js"),
+        "function logAccess(msg) { return msg; }\napp.get(\"/widgets\", (req, res) => { logAccess(\"hit\"); res.json([]); });\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "logAccess", "--json"]);
+    assert_eq!(code, 0, "impact logAccess should succeed; got: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(v["direct_callers"].as_u64().unwrap_or(0) >= 1,
+        "the inline route handler must count as a direct caller of logAccess; got: {stdout}");
+    assert!(v["affected_routes"].as_u64().unwrap_or(0) >= 1,
+        "the materialized handler carries a route, so affected_routes must be >= 1; got: {stdout}");
+}
+
 // clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection;
 // --change-type stays an in-handler String so invalid-change-type is exit-1 (above).
 #[test]

@@ -233,7 +233,7 @@ function greet(name: string): string {
 
     // 6. prompts/get for each prompt
     for (name, arg_name, arg_val, expected_text) in [
-        ("impact-analysis", "symbol_name", "greet", "impact_analysis"),
+        ("impact-analysis", "symbol_name", "greet", "get_ast_node"),
         ("understand-module", "path", "app.ts", "module_overview"),
         ("trace-request", "route", "/api/users", "trace_http_chain"),
     ] {
@@ -301,7 +301,7 @@ fn test_e2e_prompts_get_all() {
     let server = McpServer::from_project_root(project.path()).unwrap();
 
     let cases = vec![
-        ("impact-analysis", "symbol_name", "handleLogin", "impact_analysis"),
+        ("impact-analysis", "symbol_name", "handleLogin", "get_ast_node"),
         ("understand-module", "path", "src/auth/", "module_overview"),
         ("trace-request", "route", "/api/users", "trace_http_chain"),
     ];
@@ -334,131 +334,6 @@ fn test_e2e_resources_read_unknown_uri() {
     assert!(parsed["error"].is_object());
     assert_eq!(parsed["error"]["code"], -32602);
     assert!(parsed["error"]["message"].as_str().unwrap().contains("Unknown resource URI"));
-}
-
-#[test]
-fn test_e2e_impact_analysis() {
-    let project = TempDir::new().unwrap();
-
-    fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/utils.ts"), r#"
-export function formatDate(d: Date): string {
-    return d.toISOString();
-}
-"#).unwrap();
-
-    fs::write(project.path().join("src/service.ts"), r#"
-import { formatDate } from './utils';
-
-export function createReport(data: any) {
-    return { date: formatDate(new Date()), data };
-}
-
-export function createLog(msg: string) {
-    return formatDate(new Date()) + ': ' + msg;
-}
-"#).unwrap();
-
-    fs::write(project.path().join("src/handler.ts"), r#"
-import { createReport } from './service';
-
-export function handleRequest(req: Request, res: Response) {
-    const report = createReport(req.body);
-    res.json(report);
-}
-"#).unwrap();
-
-    let server = McpServer::from_project_root(project.path()).unwrap();
-    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
-    server.handle_message(init).unwrap();
-
-    // Trigger indexing
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "formatDate"}));
-    let _ = server.handle_message(&search).unwrap();
-
-    // impact_analysis on formatDate — should have callers
-    let msg = tool_call_json("impact_analysis", serde_json::json!({
-        "symbol_name": "formatDate",
-        "change_type": "signature",
-        "depth": 3
-    }));
-    let resp = server.handle_message(&msg).unwrap();
-    let result = parse_tool_result(&resp);
-    assert_eq!(result["symbol"], "formatDate");
-    assert_eq!(result["change_type"], "signature");
-    assert!(result["risk_level"].is_string(), "should have risk_level");
-    assert!(result["summary"].as_str().unwrap().contains("formatDate"));
-    assert!(result["direct_callers"].is_array());
-    assert!(result["transitive_callers"].is_array());
-    assert!(result["affected_files"].is_number());
-
-    // Direct callers should include createReport and createLog
-    let direct = result["direct_callers"].as_array().unwrap();
-    let direct_names: Vec<&str> = direct.iter()
-        .filter_map(|c| c["name"].as_str()).collect();
-    assert!(direct_names.contains(&"createReport"), "direct callers should include createReport, got {:?}", direct_names);
-    assert!(direct_names.contains(&"createLog"), "direct callers should include createLog, got {:?}", direct_names);
-
-    // impact_analysis on a leaf function — should have LOW risk
-    let msg = tool_call_json("impact_analysis", serde_json::json!({
-        "symbol_name": "handleRequest"
-    }));
-    let resp = server.handle_message(&msg).unwrap();
-    let result = parse_tool_result(&resp);
-    assert_eq!(result["symbol"], "handleRequest");
-    assert_eq!(result["risk_level"], "LOW", "leaf function should be LOW risk");
-}
-
-/// E2E: an inline (arrow) Express route handler is materialized as a function node
-/// (bfa3723) and that node flows through impact analysis — a function the handler
-/// calls reports the handler ("GET /widgets") as a route-carrying caller. bfa3723
-/// only manually verified trace/overview; impact/map share the graph but were not
-/// separately e2e'd, so this pins impact + the route survival end to end.
-#[test]
-fn test_e2e_impact_on_inline_route_handler() {
-    let project = TempDir::new().unwrap();
-    fs::write(project.path().join("server.ts"), r#"
-function logAccess(msg: string) {
-    return msg;
-}
-
-app.get('/widgets', (req: Request, res: Response) => {
-    logAccess('widgets hit');
-    res.json([]);
-});
-"#).unwrap();
-
-    let server = McpServer::from_project_root(project.path()).unwrap();
-    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
-    server.handle_message(init).unwrap();
-
-    // Trigger indexing.
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "logAccess"}));
-    let _ = server.handle_message(&search).unwrap();
-
-    // Impact on the function the inline handler calls: the materialized handler
-    // node ("GET /widgets") must appear as a caller, carrying its route metadata.
-    let msg = tool_call_json("impact_analysis", serde_json::json!({
-        "symbol_name": "logAccess",
-        "change_type": "signature",
-        "depth": 3
-    }));
-    let resp = server.handle_message(&msg).unwrap();
-    let result = parse_tool_result(&resp);
-
-    let direct = result["direct_callers"].as_array().unwrap();
-    let direct_names: Vec<&str> = direct.iter().filter_map(|c| c["name"].as_str()).collect();
-    assert!(
-        direct_names.iter().any(|n| n.contains("/widgets")),
-        "the inline handler must materialize as a caller of logAccess; got {:?}",
-        direct_names
-    );
-    let routes = result["affected_routes"].as_array().unwrap();
-    assert!(
-        !routes.is_empty(),
-        "the materialized handler carries a route, so affected_routes must be non-empty; got {:?}",
-        result["affected_routes"]
-    );
 }
 
 #[test]
@@ -963,31 +838,6 @@ fn test_dependency_graph_directory_hint() {
     let result = parse_tool_result(&resp);
     let warning = result["warning"].as_str().unwrap();
     assert!(warning.contains("module_overview"), "extensionless path should suggest module_overview, got: {}", warning);
-}
-
-#[test]
-fn test_impact_analysis_struct_warning() {
-    let project = TempDir::new().unwrap();
-    fs::write(project.path().join("models.ts"), r#"
-export class UserModel {
-    id: number;
-    name: string;
-}
-"#).unwrap();
-
-    let server = McpServer::from_project_root(project.path()).unwrap();
-    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
-    server.handle_message(init).unwrap();
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "UserModel"}));
-    let _ = server.handle_message(&search).unwrap();
-
-    // impact_analysis on a class with no callers should include a type warning
-    let msg = tool_call_json("impact_analysis", serde_json::json!({"symbol_name": "UserModel", "change_type": "remove"}));
-    let resp = server.handle_message(&msg).unwrap();
-    let result = parse_tool_result(&resp);
-    assert!(result["warning"].is_string(), "class with no callers should have type-usage warning");
-    assert!(result["warning"].as_str().unwrap().contains("not a function"),
-        "warning should flag non-function symbol, got: {}", result["warning"]);
 }
 
 #[test]
@@ -1762,32 +1612,6 @@ pub fn gamma() -> i32 { 3 }
     }
 }
 
-/// Fix #6: impact_analysis on a struct with no call-graph callers must
-/// return risk_level="UNKNOWN" (not LOW) so LLMs don't misread it as safe.
-///
-/// Uses a struct that is never referenced by a function body so the call
-/// graph legitimately finds zero callers — which is the exact "risky UNKNOWN"
-/// case (call-graph says 0, but real usage may be broad).
-#[test]
-fn test_impact_analysis_struct_returns_unknown_risk() {
-    let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
-pub struct OrphanStruct { pub name: String }
-pub fn something_else() { println!("no refs to OrphanStruct"); }
-"#).unwrap();
-    let server = common::init_server(&project);
-
-    let msg = tool_call_json("impact_analysis",
-        serde_json::json!({"symbol_name":"OrphanStruct","change_type":"signature"}));
-    let resp = server.handle_message(&msg).unwrap();
-    let result = parse_tool_result(&resp);
-
-    assert_eq!(result["risk_level"], "UNKNOWN",
-        "struct with no call-graph callers must be UNKNOWN, got: {}", result);
-    assert!(result["warning"].is_string(),
-        "type query must carry the type_warning alongside UNKNOWN");
-}
-
 /// v0.11.2 fix: `module_overview` must not leak inline `#[cfg(test)]` functions
 /// whose names don't match the `test_*` / `*Test` naming heuristic.
 #[test]
@@ -1971,10 +1795,10 @@ pub fn make_them() {
         "node_id selection should not be ambiguous: {}", result2);
 }
 
-/// Audit #6: get_call_graph and impact_analysis must flag a same-file overload
-/// (≥2 non-test defs of one name in one file) as ambiguous — matching the CLI
-/// after the shared crate::resolve unification. Closes the MCP-side e2e gap the
-/// branch review flagged (CLI had 3 reproductions; MCP had none).
+/// Audit #6: get_call_graph must flag a same-file overload (≥2 non-test defs of
+/// one name in one file) as ambiguous — matching the CLI after the shared
+/// crate::resolve unification. (The CLI `impact` side is covered by
+/// test_cli_impact_same_file_overload_is_ambiguous.)
 #[test]
 fn test_mcp_callgraph_impact_same_file_overload_is_ambiguous() {
     let project = TempDir::new().unwrap();
@@ -1997,7 +1821,7 @@ pub fn make_them() {
 "#).unwrap();
     let server = common::init_server(&project);
 
-    for tool in ["get_call_graph", "impact_analysis"] {
+    for tool in ["get_call_graph"] {
         // No file_path / node_id → must report ambiguity, not silently merge the
         // two distinct `new` definitions.
         let msg = tool_call_json(tool, serde_json::json!({"symbol_name": "new"}));
@@ -2146,8 +1970,9 @@ function process() {}
 #[test]
 fn test_r14_value_reference_excluded_from_call_graph() {
     // `handler` is passed as a callback (referenced) but NEVER called. It must
-    // surface in find_references but NOT as a direct CALLER in impact_analysis
-    // (the calls-vs-references separation that keeps the call graph pure).
+    // surface in find_references. The complementary "NOT a direct CALLER" half of
+    // the calls-vs-references separation is asserted on the CLI impact surface in
+    // test_cli_impact_json_reports_value_references.
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
     fs::write(project.path().join("src/app.rs"), r#"
@@ -2160,15 +1985,6 @@ fn handler() {}
     server.handle_message(INIT_MSG).unwrap();
     let _ = server.handle_message(&tool_call_json("semantic_code_search",
         serde_json::json!({"query": "handler"}))).unwrap();
-
-    // Calls-based impact must NOT count the referencer as a direct caller.
-    let impact = parse_tool_result(&server.handle_message(&tool_call_json("impact_analysis",
-        serde_json::json!({"symbol_name": "handler"}))).unwrap());
-    let caller_names: Vec<&str> = impact["direct_callers"].as_array()
-        .map(|a| a.iter().filter_map(|c| c["name"].as_str()).collect())
-        .unwrap_or_default();
-    assert!(!caller_names.contains(&"caller"),
-        "a callback referencer must NOT appear as a direct CALLER (calls vs references); got {:?}", caller_names);
 
     // find_references must surface the referencer.
     let fr = parse_tool_result(&server.handle_message(&tool_call_json("find_references",
@@ -2177,30 +1993,6 @@ fn handler() {}
         .iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(ref_names.contains(&"caller"),
         "find_references should surface the callback referencer; got {:?}", ref_names);
-}
-
-#[test]
-fn test_r15_impact_reports_value_references() {
-    // After a fn is passed as a callback, impact_analysis must surface a
-    // `value_references` count so rename / signature-change risk includes
-    // callback coupling.
-    let project = TempDir::new().unwrap();
-    fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/app.rs"), r#"
-pub fn caller() { register(handler); }
-fn register<F>(_f: F) {}
-fn handler() {}
-"#).unwrap();
-
-    let server = McpServer::from_project_root(project.path()).unwrap();
-    server.handle_message(INIT_MSG).unwrap();
-    let _ = server.handle_message(&tool_call_json("semantic_code_search",
-        serde_json::json!({"query": "handler"}))).unwrap();
-
-    let impact = parse_tool_result(&server.handle_message(&tool_call_json("impact_analysis",
-        serde_json::json!({"symbol_name": "handler"}))).unwrap());
-    assert!(impact["value_references"].as_u64().unwrap_or(0) >= 1,
-        "impact_analysis(handler) should report value_references >= 1; got {}", impact);
 }
 
 #[test]

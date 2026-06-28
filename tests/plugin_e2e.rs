@@ -262,7 +262,7 @@ fn test_stdio_protocol_endpoints() {
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["messages"][0]["content"]["text"].as_str().unwrap();
     assert!(text.contains("foo"));
-    assert!(text.contains("impact_analysis"));
+    assert!(text.contains("get_ast_node"));
 
     drop(stdin);
     let _ = child.wait();

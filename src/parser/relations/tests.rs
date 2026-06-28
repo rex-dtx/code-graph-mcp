@@ -1102,7 +1102,6 @@ impl McpServer {
             "stop_watch" => self.tool_stop_watch(),
             "get_index_status" => self.tool_get_index_status(),
             "rebuild_index" => self.tool_rebuild_index(args),
-            "impact_analysis" => self.tool_impact_analysis(args),
             "module_overview" => self.tool_module_overview(args),
             "dependency_graph" => self.tool_dependency_graph(args),
             "find_similar_code" => self.tool_find_similar_code(args),

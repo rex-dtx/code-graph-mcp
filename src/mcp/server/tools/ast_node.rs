@@ -271,7 +271,7 @@ impl McpServer {
     }
 
     /// Append a lightweight impact summary to an existing result JSON.
-    /// Reuses the impact_analysis query logic but returns a compact summary object.
+    /// Reuses the shared impact query logic (graph::impact) but returns a compact summary object.
     /// `node_type` is required so that impact on non-function symbols (constant /
     /// struct / enum / trait / ...) with zero callers reports `risk_level: UNKNOWN`
     /// plus a warning, rather than a misleading LOW.
@@ -324,7 +324,7 @@ impl McpServer {
         }
         if ambiguous_callers_excluded > 0 {
             impact["ambiguous_callers_excluded"] = json!(ambiguous_callers_excluded);
-            // Note parity with cmd_impact / tool_impact_analysis — the count alone
+            // Note parity with cmd_impact — the count alone
             // doesn't tell the agent the risk may be larger or how to see them.
             impact["ambiguous_note"] = json!(format!(
                 "{} caller(s) resolved only by ambiguous name-match were excluded from this risk assessment; actual blast radius may be larger. Re-query with min_confidence:\"ambiguous\" to include them.",

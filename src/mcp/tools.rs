@@ -7,7 +7,10 @@ use serde_json::json;
 /// find_similar_code / find_dead_code / trace_http_chain) collapsed into
 /// flags on the core 7 — `get_ast_node include_similar / include_impact`,
 /// `module_overview include_deps / include_dead`, `get_call_graph route_path`.
-/// The standalone tool names no longer dispatch; CLI subcommands
+/// `impact_analysis` was since removed (the lone orphan — no advertised tool
+/// delegated to it; full impact is CLI `impact --json`, compact via `get_ast_node
+/// include_impact`). The other four standalone names still dispatch as the live
+/// backends for their folded flags; CLI subcommands
 /// (`code-graph-mcp impact|deps|similar|dead-code|trace`) keep the
 /// out-of-MCP path open for Bash workflows.
 ///

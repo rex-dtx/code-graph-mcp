@@ -1857,7 +1857,7 @@ impl McpServer {
                             "type": "text",
                             "text": format!(
                                 "Analyze the impact of changing the symbol '{}'. \
-                                 Use the impact_analysis tool with symbol_name='{}' to get the blast radius, \
+                                 Use get_ast_node with include_impact=true and symbol_name='{}' to get the blast radius, \
                                  then use get_call_graph to understand the full caller/callee chain. \
                                  Present: affected files, affected routes, risk level, and recommendations.",
                                 symbol, symbol
@@ -1929,7 +1929,6 @@ impl McpServer {
             "stop_watch" => self.tool_stop_watch(),
             "get_index_status" => self.tool_get_index_status(),
             "rebuild_index" => self.tool_rebuild_index(args),
-            "impact_analysis" => self.tool_impact_analysis(args),
             "module_overview" => self.tool_module_overview(args),
             "dependency_graph" => self.tool_dependency_graph(args),
             "find_similar_code" => self.tool_find_similar_code(args),

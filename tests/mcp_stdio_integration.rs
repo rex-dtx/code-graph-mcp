@@ -445,53 +445,6 @@ fn mcp_caller_count_prod_only_and_test_symbol_error_explains() {
     );
 }
 
-#[test]
-fn mcp_impact_analysis_lists_test_callers() {
-    // CLI/MCP parity: impact_analysis must surface the covering-test identities
-    // (name + file) behind `tests_affected`, mirroring the `impact` CLI subcommand,
-    // so an editor hook can build a runnable test command. target_fn is exercised by
-    // 25 inline tests (src/inline_tests.rs) + integration tests + a bench; the 3
-    // prod_caller_* are NOT test callers.
-    let project = setup_fixture_project();
-    let mut client = McpClient::spawn(project.path());
-    let resp = client.call_tool("impact_analysis", json!({ "symbol_name": "target_fn" }));
-    let body = extract_tool_payload(&resp);
-
-    let tests_affected = body["tests_affected"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("tests_affected u64 in: {}", body));
-    assert!(
-        tests_affected >= 1,
-        "target_fn is exercised by test/bench callers; got {tests_affected}"
-    );
-
-    // Parity invariant: the surfaced identity list is the FULL set behind the
-    // count (no data-layer cap), mirroring the `impact` CLI subcommand. (Magnitude
-    // is intentionally not pinned — call edges from macro-wrapped calls in the
-    // fixture resolve unevenly; the invariant below is what guarantees the feature.)
-    let test_callers = body["test_callers"]
-        .as_array()
-        .unwrap_or_else(|| panic!("test_callers must be a JSON array (CLI/MCP parity); body: {}", body));
-    assert_eq!(
-        test_callers.len() as u64,
-        tests_affected,
-        "the surfaced identity list must match tests_affected exactly (full list, no cap)"
-    );
-    for tc in test_callers {
-        let name = tc["name"].as_str().expect("test caller carries a name");
-        let file = tc["file"].as_str().expect("test caller carries a file");
-        assert!(!file.is_empty(), "file identity needed to build the test command");
-        assert!(
-            name.starts_with("test_") || name.starts_with("bench_"),
-            "covering tests are the fixture's test_*/bench_* callers; got {name}"
-        );
-        assert!(
-            !name.starts_with("prod_caller_"),
-            "a prod caller must not appear among covering tests: {name}"
-        );
-    }
-}
-
 /// Regression: enum-valued direction/deps_direction args must be validated at the
 /// tool entry. Previously, `get_call_graph` echoed a bogus direction back through
 /// the ambiguity-resolution path (two errors for one mistake), `dependency_graph`
@@ -541,19 +494,30 @@ fn mcp_enum_args_validated_at_tool_entry() {
     assert!(tool_err(&r).contains("deps_direction must be one of"),
         "module_overview must reject bad deps_direction even without include_deps; got: {}", tool_err(&r));
 
-    // impact_analysis change_type enum (validated at entry, before index work)
-    let r = client.call_tool("impact_analysis", json!({
-        "symbol_name": "target_fn", "change_type": "sideways",
-    }));
-    assert!(tool_err(&r).contains("change_type must be one of"),
-        "impact_analysis should reject bad change_type at entry; got: {}", tool_err(&r));
-
     // find_references relation enum typo
     let r = client.call_tool("find_references", json!({
         "symbol_name": "target_fn", "relation": "call",
     }));
     assert!(tool_err(&r).contains("Unknown relation filter"),
         "find_references should reject bad relation at entry; got: {}", tool_err(&r));
+}
+
+/// Contract: `impact_analysis` was removed as an MCP tool — it was the lone orphaned
+/// folded handler (no advertised tool delegated to it; `get_ast_node include_impact`
+/// has its own compact summary). Full impact now lives on the CLI (`impact --json`),
+/// compact impact via `get_ast_node include_impact`. Calling the legacy name must
+/// error cleanly, not silently dispatch — pins the removal so a future re-add is a
+/// conscious decision.
+#[test]
+fn mcp_impact_analysis_tool_is_removed() {
+    let project = setup_fixture_project();
+    let mut client = McpClient::spawn(project.path());
+    let resp = client.call_tool("impact_analysis", json!({ "symbol_name": "target_fn" }));
+    assert_eq!(resp["result"]["isError"].as_bool(), Some(true),
+        "the removed impact_analysis tool name must return isError; got: {resp}");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("Unknown tool"),
+        "calling the removed impact_analysis name must report Unknown tool; got: {text}");
 }
 
 /// Regression: `relation` must be validated BEFORE symbol resolution, so a bogus

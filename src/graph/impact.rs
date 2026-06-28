@@ -3,7 +3,8 @@
 //! The single source for the prod/test caller partition, route counting, and
 //! risk assessment that both impact surfaces apply to a symbol's callers:
 //! `cli::cmd_impact` (the `impact` subcommand) and
-//! `mcp::server::tools::tool_impact_analysis` (the `get_ast_node`/impact tool).
+//! `mcp::server::tools::ast_node::append_impact_summary` (the `get_ast_node`
+//! `include_impact` summary).
 //!
 //! Before this module the two surfaces reimplemented the partition and had
 //! drifted: the MCP path counted routes reachable through *test* callers into the

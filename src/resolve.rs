@@ -107,7 +107,7 @@ pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) 
             ),
             Surface::Mcp => format!(
                 "Ambiguous symbol '{name}': {n} definitions in the same file ({file}). \
-                 get_call_graph/impact_analysis resolve by name and can't split same-file \
+                 get_call_graph resolves by name and can't split same-file \
                  overloads — pass a node_id below to get_ast_node or find_references."
             ),
         }
