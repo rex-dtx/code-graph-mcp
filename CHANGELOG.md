@@ -1,6 +1,28 @@
 # Changelog
 
-## v0.78.0 — grep: `-m` short flag, clear unsupported-flag errors, `--json` truncation marker
+## v0.79.0 — grep: scope filters (`-t`/`-g`), count mode (`-c`), line-width cap (`-M`)
+
+Higher-leverage `code-graph-mcp grep` for agent workflows — scope a search, count
+matches, and stop one long line from flooding output. Aligns the AST-aware grep
+with the filters Claude Code's built-in Grep already exposes, so scoping no longer
+means dropping the `→ fn`/`→ class` annotation. Steering (CLAUDE.md managed block,
+`.claude/plugin_code_graph_mcp.md`, MCP `instructions`) updated; routing_bench
+re-run (context-rich, backend): Recall 22/22, FP-rate 0/10, Overall 100%.
+
+### Added
+- **`-t` / `--type <lang>`** — restrict to a ripgrep file type (e.g. `rust`, `py`,
+  `ts`, `go`). An unknown type is surfaced as an error (exit 2), not swallowed.
+- **`-g` / `--glob <pat>`** — include/exclude by path glob; repeatable; `!`-prefix
+  excludes (e.g. `-g '!*test*'`).
+- **`-c` / `--count`** — print `file:count` per file. Exhaustive: the per-file
+  `--max-count` cap does not apply. `--json` emits `[{"file","count"}]`.
+- **`-M` / `--max-columns <N>`** — truncate displayed lines to N characters
+  (default **512**; `0` = unlimited). Text output appends ` … [+K chars]`; `--json`
+  carries `"line_truncated": <K>`. Keeps a long minified/generated line from
+  flooding output (and an agent's context).
+
+### Changed
+- The empty-pattern usage hint and `grep --help` now list the new flags.
 
 `code-graph-mcp grep` parity + honesty fixes from a command audit.
 
