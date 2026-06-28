@@ -85,6 +85,45 @@ path = "src/lib.rs"
     project
 }
 
+/// Fixture with two `ambiguous` by-name fan-out cases for the v0.76 confidence
+/// floor disclosure, mirroring the cli_e2e fixtures but indexed for the stdio
+/// server. Cargo.toml is present so `serve` serves the full tool catalog rather
+/// than the 0-tool stub a bare cwd gets (see mcp_non_project_cwd_serves_zero_tool_stub).
+///   - Rust: `main` bare-calls `thing()`, defined in BOTH a.rs and b.rs → both
+///     call edges are `ambiguous` (drives `get_call_graph` ambiguous_edges_hidden).
+///   - Python: `save` defined in BOTH db.py and cache.py; `run` calls the imported
+///     db.save → that caller edge is `ambiguous` (drives `get_ast_node
+///     include_impact` ambiguous_callers_excluded).
+fn setup_ambiguous_fanout_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // Rust: ambiguous callee fan-out.
+    std::fs::write(src.join("a.rs"), "pub fn thing() -> i32 { 1 }\n").unwrap();
+    std::fs::write(src.join("b.rs"), "pub fn thing() -> i32 { 2 }\n").unwrap();
+    std::fs::write(src.join("main.rs"),
+        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n").unwrap();
+
+    // Python: ambiguous caller fan-out.
+    std::fs::write(src.join("db.py"), "def save(r):\n    return True\n").unwrap();
+    std::fs::write(src.join("cache.py"), "def save(i):\n    return True\n").unwrap();
+    std::fs::write(src.join("app.py"),
+        "from db import save\n\ndef run():\n    return save({\"id\": 1})\n").unwrap();
+
+    // Project marker so the spawned server serves the full catalog.
+    std::fs::write(project.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n").unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    project
+}
+
 struct McpClient {
     child: Child,
     next_id: i64,
@@ -721,4 +760,66 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
         "periodic backfill must embed out-of-band nodes with NO tool call; \
          base={base_vectors}, after={now_vectors}"
     );
+}
+
+/// Wire-layer contract for the v0.76 confidence floor (closes the previously
+/// deferred MCP stdio assertion). The disclosure field NAMES must survive the
+/// JSON-RPC round-trip on the advertised tools an agent actually consumes, and
+/// the `min_confidence` opt-in must make them disappear. The query layer is
+/// already covered by unit tests + cli_e2e, but a field present in a Rust struct
+/// yet dropped from serde output would pass those and fail only a real client —
+/// so this pins the serialized names over the wire (field presence != serialization).
+#[test]
+fn mcp_confidence_floor_disclosure_over_wire() {
+    let project = setup_ambiguous_fanout_project();
+    let mut client = McpClient::spawn(project.path());
+
+    let thing_callees = |b: &Value| b["callees"].as_array()
+        .map(|a| a.iter().filter(|c| c["name"].as_str() == Some("thing")).count())
+        .unwrap_or(0);
+
+    // get_call_graph: ambiguous callee fan-out hidden + disclosed by default.
+    // file_path pins the seed so the all-suppressed result routes straight to
+    // format_call_graph_response (not the fuzzy-resolve fallback that can return
+    // a bare object without the disclosure).
+    let body = extract_tool_payload(&client.call_tool("get_call_graph", json!({
+        "symbol_name": "main", "file_path": "src/main.rs", "direction": "callees",
+    })));
+    assert_eq!(
+        body["ambiguous_edges_hidden"].as_u64(), Some(2),
+        "get_call_graph default floor must disclose the 2 hidden ambiguous `thing` edges over the wire; got: {body}"
+    );
+    assert_eq!(thing_callees(&body), 0,
+        "default floor must hide the ambiguous `thing` fan-out from callees; got: {body}");
+
+    // Opt-in restores the edges and drops the disclosure field.
+    let body = extract_tool_payload(&client.call_tool("get_call_graph", json!({
+        "symbol_name": "main", "file_path": "src/main.rs", "direction": "callees",
+        "min_confidence": "ambiguous",
+    })));
+    assert!(body.get("ambiguous_edges_hidden").is_none(),
+        "nothing is suppressed at the ambiguous floor; got: {body}");
+    assert_eq!(thing_callees(&body), 2,
+        "min_confidence:\"ambiguous\" must show both tied `thing` edges over the wire; got: {body}");
+
+    // get_ast_node include_impact: ambiguous caller folded + disclosed by default.
+    // file_path disambiguates the seed to the db.py `save` def.
+    let body = extract_tool_payload(&client.call_tool("get_ast_node", json!({
+        "symbol_name": "save", "file_path": "src/db.py",
+        "include_impact": true, "compact": true,
+    })));
+    assert_eq!(body["impact"]["ambiguous_callers_excluded"].as_u64(), Some(1),
+        "get_ast_node include_impact must disclose the 1 folded ambiguous caller over the wire; got: {body}");
+    assert_eq!(body["impact"]["direct_callers"].as_u64(), Some(0),
+        "the ambiguous caller is folded out of the default risk count; got: {body}");
+
+    // Opt-in counts the caller and drops the disclosure field.
+    let body = extract_tool_payload(&client.call_tool("get_ast_node", json!({
+        "symbol_name": "save", "file_path": "src/db.py",
+        "include_impact": true, "compact": true, "min_confidence": "ambiguous",
+    })));
+    assert!(body["impact"].get("ambiguous_callers_excluded").is_none(),
+        "nothing excluded at the ambiguous floor; got: {body}");
+    assert_eq!(body["impact"]["direct_callers"].as_u64(), Some(1),
+        "min_confidence:\"ambiguous\" must count the ambiguous caller over the wire; got: {body}");
 }
