@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.80.0 — audit remediation: edge-resolution, impact, path & snapshot hardening
+
+A full-codebase audit (6 parallel reviewers) plus an adversarial pre-landing
+review of the fixes. **Bumps INDEX_VERSION (30→31): existing indexes rebuild once
+on first use after upgrade.** One default-behavior change — snapshot auto-install
+is now opt-in (see Changed).
+
+### Fixed
+- **`impact` / `get_ast_node` no longer miscounts inline unit tests as production
+  callers.** Inline Rust `#[cfg(test)] mod tests` functions with descriptive
+  (non-`test_`) names were counted as prod callers — inverting the risk level
+  (e.g. `impact find_cycles` → HIGH / "0 tests affected" when the callers were
+  unit tests) and emptying the covering-test suggestion. The authoritative AST
+  `is_test` flag now drives the prod/test partition on all impact surfaces.
+- **Cross-language phantom structural edges removed.** `imports` / `inherits` /
+  `implements` / `exports` / `routes_to` no longer fall through to a global
+  all-language name pool: a Rust `use anyhow::Result` could bind to a markdown
+  "Result" heading and `require('fs')` to a Rust `fs` symbol — at max confidence,
+  so `--min-confidence` couldn't filter them. Edges bind within a language family
+  (js/ts/tsx and c/cpp still cross-reference); genuine externals reach the
+  `<external>` sentinel.
+- **Incremental re-index no longer over-creates cross-file edges.** The Phase-2c
+  inbound-edge restore rebound a saved edge to every same-name node in the batch
+  (cross-file / cross-language); it now rebinds only to the same-name node in the
+  file the edge originally pointed into, matching a full rebuild.
+- **CLI path-traversal escape closed.** An absolute path beginning with the
+  project root then climbing out via `..` (`<root>/../../etc/passwd`), and the
+  `./../…` shortcut, bypassed the relative-path escape check — letting `deps`
+  read a file outside the project. All CLI paths now route through one escape guard.
+
+### Changed
+- **Snapshot auto-install from a repo's own GitHub release is now opt-in.** Set
+  `CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN=1` (or a `CODE_GRAPH_SNAPSHOT_PIN`) to enable
+  it. Without it, opening an untrusted repo no longer auto-fetches that repo's
+  published code-graph snapshot (which used same-origin TOFU verification and
+  could seed a misleading graph). Mirrors the existing `.code-graph.toml` url
+  override gate.
+- **Plugin activates in monorepo subdirectories.** Launching from a marker-less
+  subdirectory (`.git` only at the repo root) now resolves the project root by
+  walking up (matching the binary) instead of serving a zero-tool stub.
+
+### CI / internal
+- embed-model is now compiled, clippy'd, and unit-tested in pre-merge CI (it was
+  never actually built before — the matrix leg built the empty default). Release
+  publishes npm only after the model tarball + GitHub Release exist (no
+  half-release on a transient model fetch), and the model fetch now retries.
+- Hook cooldown / restart-notice temp files moved out of the bare temp dir.
+
 ## v0.79.1 — grep: `-t`/`-g`/`-c` now constrain the git-grep supplement
 
 Follow-up to v0.79.0 from a code review.
