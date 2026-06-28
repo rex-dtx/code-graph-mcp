@@ -849,6 +849,10 @@ fn test_cli_grep_json_truncated_marker() {
     let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
     assert!(v2.as_array().unwrap().iter().all(|e| e.get("truncated").is_none()),
         "no cap → no truncated marker, got: {stdout2}");
+    // v0.79: the JSON `text` value carries no trailing newline (strip is applied
+    // uniformly, truncated or not).
+    assert!(v2[0]["text"].as_str().is_some_and(|t| !t.ends_with('\n')),
+        "json text must not carry a trailing newline, got: {stdout2}");
 }
 
 #[test]
@@ -1093,6 +1097,50 @@ fn test_cli_grep_tracked_but_gitignored() {
     // Untracked + ignored stays invisible (matches git grep semantics).
     let (_, _, code2) = run_cli(&project, &["grep", "scratch_needle"]);
     assert_eq!(code2, 1, "untracked ignored file must stay skipped");
+}
+
+#[test]
+fn test_cli_grep_supplement_respects_filters() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_git() { eprintln!("skipping: git not installed"); return; }
+    let project = setup_indexed_project();
+    let root = project.path();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    // Markdown in a gitignored dir, force-tracked → reaches grep via the git-grep
+    // SUPPLEMENT (appended as an explicit rg arg), NOT the rg walk. rg does not
+    // apply --type/--glob to explicit args, so without our supplement re-filter
+    // this markdown would leak past -t rust / -g '!*.md'.
+    std::fs::write(root.join("docs/leak.md"), "LEAKPAT in markdown\n").unwrap();
+    // A normal rust file the rg walk finds (untracked-but-not-ignored).
+    std::fs::write(root.join("probe.rs"), "fn p() { /* LEAKPAT */ }\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "docs/\n.code-graph/\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "-f", "docs/leak.md"]);
+
+    // Baseline: no filter → supplement brings in the gitignored-but-tracked md.
+    let (base, _, bc) = run_cli(&project, &["grep", "LEAKPAT"]);
+    assert_eq!(bc, 0);
+    assert!(base.contains("docs/leak.md") && base.contains("probe.rs"),
+        "no filter must find both walk + supplement, got: {base}");
+
+    // -t rust must NOT leak the markdown supplement; the rust walk file stays.
+    let (t, _, tc) = run_cli(&project, &["grep", "-t", "rust", "LEAKPAT"]);
+    assert_eq!(tc, 0, "rust file still matches");
+    assert!(t.contains("probe.rs"), "rust walk file kept, got: {t}");
+    assert!(!t.contains("leak.md"), "-t rust must filter the md supplement, got: {t}");
+
+    // -g '!*.md' must exclude the markdown supplement too.
+    let (g, _, _gc) = run_cli(&project, &["grep", "-g", "!*.md", "LEAKPAT"]);
+    assert!(g.contains("probe.rs") && !g.contains("leak.md"),
+        "-g '!*.md' must exclude the md supplement, got: {g}");
+
+    // -c -t rust must not count the markdown supplement file.
+    let (c, _, _cc) = run_cli(&project, &["grep", "-c", "-t", "rust", "LEAKPAT"]);
+    assert!(!c.contains("leak.md"), "-c -t rust must not count the md supplement, got: {c}");
 }
 
 #[test]

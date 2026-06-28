@@ -1948,7 +1948,7 @@ pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
             println!("[]");
         }
         eprintln!(
-            "[code-graph] unsupported flag: {bad}. Supported: -i -w -F -l -A -B -C -m \
+            "[code-graph] unsupported flag: {bad}. Supported: -i -w -F -l -c -A -B -C -m -M -t -g \
              (and no-op -n/-r/-R/-H). To search a literal flag-shaped string, put it \
              after --: code-graph-mcp grep -- {bad}"
         );
@@ -2128,6 +2128,39 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // user appear in the walk output and dedup naturally.
     const SUPPLEMENT_CAP: usize = 500;
     let mut supplement = tracked_files_missed_by_walk(project_root, &search_rels);
+    // rg does NOT apply --type/--glob to files passed explicitly on the command
+    // line, so the supplement (appended as explicit args below) would leak files
+    // the -t/-g filters should exclude. Re-apply the same filters here via
+    // ripgrep's own `ignore` crate matchers (rg-identical) before appending.
+    if file_type.is_some() || !glob.is_empty() {
+        let types = file_type.as_deref().and_then(|t| {
+            let mut b = ignore::types::TypesBuilder::new();
+            b.add_defaults();
+            b.select(t);
+            b.build().ok()
+        });
+        let overrides = if glob.is_empty() {
+            None
+        } else {
+            let mut b = ignore::overrides::OverrideBuilder::new(project_root);
+            let ok = glob.iter().all(|g| b.add(g).is_ok());
+            if ok { b.build().ok() } else { None }
+        };
+        supplement.retain(|rel| {
+            let p = Path::new(rel);
+            if let Some(t) = &types {
+                if t.matched(p, false).is_ignore() {
+                    return false;
+                }
+            }
+            if let Some(ov) = &overrides {
+                if ov.matched(p, false).is_ignore() {
+                    return false;
+                }
+            }
+            true
+        });
+    }
     if supplement.len() > SUPPLEMENT_CAP {
         eprintln!(
             "[code-graph] {} tracked files outside the rg walk; searching the first {} only",
