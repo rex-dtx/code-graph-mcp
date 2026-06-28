@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.78.0 — grep: `-m` short flag, clear unsupported-flag errors, `--json` truncation marker
+
+`code-graph-mcp grep` parity + honesty fixes from a command audit.
+
+### Added
+- **`-m` / `-m N` short alias for `--max-count`** — grep and ripgrep both use
+  `-m` for the per-file match cap, but the subcommand only accepted the long
+  `--max-count`. Attached (`-m2`), separated (`-m 2`), and bundled (`-nm2`) forms
+  all work.
+
+### Fixed
+- **Unsupported short flags fail with a clear message instead of a cryptic "No
+  such file"** — the pattern positional's `allow_hyphen_values` silently bound any
+  unknown short flag (`-v`, `-c`, `-o`, `-e`, …) as the search pattern, pushing the
+  real pattern into the path list → `rg: No such file or directory: <pattern>`,
+  exit 2. Such flags now report `unsupported flag: -X` with the `-- -X` escape hint
+  (and still emit `[]` under `--json`). Dash-then-symbol patterns (`->`, `-1`,
+  `-.*`) and the `--`-escaped literal form are unaffected.
+
+### Changed
+- **`grep --json` marks truncated results** — each match in a file that hit the
+  per-file cap now carries `"truncated": true`. The cap warning was previously
+  stderr-only, so a `--json` consumer parsing stdout saw silently truncated
+  results (the default cap of 100 could drop hundreds of matches). The top-level
+  array shape and empty-result `[]` contract are unchanged.
+
 ## v0.77.2 — status line cwd-bridge hardening (code-review follow-up)
 
 Defensive hardening of the v0.77.1 stdin-cwd bridge, from a fresh-context code review.
