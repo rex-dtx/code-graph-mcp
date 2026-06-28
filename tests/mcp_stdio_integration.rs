@@ -823,3 +823,64 @@ fn mcp_confidence_floor_disclosure_over_wire() {
     assert_eq!(body["impact"]["direct_callers"].as_u64(), Some(1),
         "min_confidence:\"ambiguous\" must count the ambiguous caller over the wire; got: {body}");
 }
+
+/// Express-style route fixture whose handler makes an ambiguous by-name call, so
+/// the trace chain + one-hop downstream list both carry the `ambiguous` fan-out.
+fn setup_route_ambiguous_fanout_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // Two same-name `thing` defs, not imported into server.ts, so the handler's
+    // bare `thing()` call resolves ambiguously to both (the fan-out class).
+    std::fs::write(src.join("a.ts"), "export function thing() { return 1; }\n").unwrap();
+    std::fs::write(src.join("b.ts"), "export function thing() { return 2; }\n").unwrap();
+    std::fs::write(src.join("server.ts"), "\nconst app = express();\nfunction widgetsHandler(req, res) {\n    thing();\n    res.json([]);\n}\napp.get('/widgets', widgetsHandler);\n").unwrap();
+
+    // Project marker so the spawned server resolves the root (language-agnostic).
+    std::fs::write(project.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n").unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    project
+}
+
+/// Wire-layer contract for the v0.77 trace confidence floor. `get_call_graph` in
+/// `route_path` mode dispatches to the HTTP-chain tracer, which (pre-v0.77) ran at
+/// rank-0 show-all and ignored the already-advertised `min_confidence` arg. This
+/// pins, over the real JSON-RPC round-trip, that the default floor hides the
+/// ambiguous downstream fan-out from the trace chain and discloses the count, and
+/// that `min_confidence:"ambiguous"` restores it. Sibling to
+/// `mcp_confidence_floor_disclosure_over_wire` for the route surface.
+#[test]
+fn mcp_trace_confidence_floor_over_wire() {
+    let project = setup_route_ambiguous_fanout_project();
+    let mut client = McpClient::spawn(project.path());
+
+    let chain_things = |b: &Value| b["handlers"][0]["call_chain"].as_array()
+        .map(|a| a.iter().filter(|n| n["name"].as_str() == Some("thing")).count())
+        .unwrap_or(0);
+
+    // Default floor: ambiguous `thing` fan-out hidden from the trace chain + disclosed.
+    let body = extract_tool_payload(&client.call_tool("get_call_graph", json!({
+        "route_path": "GET /widgets",
+    })));
+    assert_eq!(chain_things(&body), 0,
+        "trace default floor must hide the ambiguous `thing` fan-out over the wire; got: {body}");
+    assert_eq!(body["ambiguous_edges_hidden"].as_u64(), Some(2),
+        "trace default floor must disclose the 2 hidden ambiguous edges over the wire; got: {body}");
+
+    // Opt-in restores the fan-out and drops the disclosure field.
+    let body = extract_tool_payload(&client.call_tool("get_call_graph", json!({
+        "route_path": "GET /widgets", "min_confidence": "ambiguous",
+    })));
+    assert_eq!(chain_things(&body), 2,
+        "min_confidence:\"ambiguous\" must show both tied `thing` edges over the wire; got: {body}");
+    assert!(body.get("ambiguous_edges_hidden").is_none(),
+        "nothing is suppressed at the ambiguous floor; got: {body}");
+}

@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.77.0 — `trace` inherits the v0.76 confidence floor
+
+`trace` was the one call-graph surface left at rank-0 show-all when callgraph and
+impact gained the default `inferred` confidence floor in v0.76. So a route handler
+that made an **ambiguous by-name call** (one name resolving to many same-language
+defs — e.g. `.execute()` resolving to every `execute`) splattered every tied edge
+into both the recursive call chain and the one-hop downstream list. This completes
+that work: `trace` now applies the same floor on both the CLI and MCP surfaces.
+
+### Changed
+- **`trace` hides the `ambiguous` by-name fan-out by default** — on both the
+  recursive call chain and the one-hop downstream list, on the CLI (`code-graph-mcp
+  trace`) and MCP (`get_call_graph` `route_path` mode, plus the legacy
+  `trace_http_chain` / `find_http_route` names). A handler's genuine, uniquely-named
+  calls are unaffected; only the by-name fan-out is folded.
+- **The hidden count is disclosed, never silently dropped**: `ambiguous_edges_hidden`
+  in `--json` / MCP responses (including the compressed-chain response), and a
+  `(N direct ambiguous by-name edge(s) hidden — use --min-confidence ambiguous to
+  show)` line in the human CLI output.
+- **Opt out** with `--min-confidence ambiguous` (CLI) / `min_confidence: "ambiguous"`
+  (MCP) to restore every edge, or `extracted` for same-file-precise only. The MCP arg
+  was already advertised on `get_call_graph`'s schema; `route_path` mode now honors it
+  (it was previously parsed-then-dropped on that path). `routes` / `show` are
+  unchanged (still rank-0 show-all).
+
+Query-layer only — reads the existing edge `confidence` column; no `INDEX_VERSION`
+bump, no reindex.
+
 ## v0.76.4 — SQLite variable-cap crash fix (issue #30) + cycle-detection noise
 
 ### Fixed

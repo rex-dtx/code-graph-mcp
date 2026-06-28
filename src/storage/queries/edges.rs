@@ -146,17 +146,25 @@ pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) 
 
 /// Batch-fetch edge target names for multiple source IDs in one query.
 /// Returns a map from source_id to list of target names.
-pub fn get_edge_target_names_batch(conn: &Connection, source_ids: &[i64], relation: &str) -> Result<HashMap<i64, Vec<String>>> {
+pub fn get_edge_target_names_batch(conn: &Connection, source_ids: &[i64], relation: &str, min_confidence_rank: u8) -> Result<HashMap<i64, Vec<String>>> {
     let mut result: HashMap<i64, Vec<String>> = HashMap::new();
     if source_ids.is_empty() {
         return Ok(result);
     }
+    // Confidence floor: drop sub-threshold (ambiguous by-name) edges so trace's
+    // one-hop downstream list matches its floored recursive call chain instead of
+    // contradicting it. rank 0 makes the CASE >= 0 always true, preserving the
+    // historical show-all behavior for any caller passing 0. Mirrors the conf_gate
+    // in graph::query::query_direction; the rank is a validated u8 (0..=2), so
+    // inlining it into the SQL is injection-safe.
+    let conf_gate = format!(
+        "AND (CASE e.confidence WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 1 ELSE 0 END) >= {min_confidence_rank}"
+    );
     for chunk in source_ids.chunks(MAX_IN_PARAMS) {
         let placeholders = make_placeholders(2, chunk.len());
         let sql = format!(
             "SELECT e.source_id, n.name FROM edges e JOIN nodes n ON n.id = e.target_id
-             WHERE e.source_id IN ({}) AND e.relation = ?1",
-            placeholders
+             WHERE e.source_id IN ({placeholders}) AND e.relation = ?1 {conf_gate}"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&relation as &dyn rusqlite::types::ToSql];

@@ -2221,6 +2221,63 @@ app.get('/widgets', (req, res) => {
         "--include-tests must show test callees; got:\n{out2}");
 }
 
+#[test]
+fn test_cli_trace_hides_ambiguous_fanout_by_default() {
+    // v0.77: trace inherits the v0.76 confidence floor (was deliberately left at
+    // rank-0 show-all). A route handler that makes an ambiguous by-name call (one
+    // name resolving to many same-language defs) used to splatter every tied edge
+    // into BOTH the recursive call_chain AND the one-hop downstream list. The
+    // default floor `inferred` now hides that fan-out on both surfaces, discloses
+    // the count via `ambiguous_edges_hidden`, and --min-confidence ambiguous
+    // restores every edge. Mirrors test_cli_callgraph_hides_ambiguous_fanout_by_default.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // Two same-name `thing` defs in different files, not imported into server.ts, so
+    // the handler's bare `thing()` call resolves ambiguously to both (the fan-out class).
+    std::fs::write(src.join("a.ts"), "export function thing() { return 1; }\n").unwrap();
+    std::fs::write(src.join("b.ts"), "export function thing() { return 2; }\n").unwrap();
+    std::fs::write(src.join("server.ts"), r#"
+const app = express();
+function widgetsHandler(req, res) {
+    thing();
+    res.json([]);
+}
+app.get('/widgets', widgetsHandler);
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    // Default floor: ambiguous `thing` fan-out hidden from BOTH the chain and the
+    // one-hop downstream list; the count is disclosed at the top level.
+    let (stdout, _, code) = run_cli(&project, &["trace", "GET /widgets", "--json"]);
+    assert_eq!(code, 0, "trace should resolve the route; got code {code}: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let handler = &v["handlers"][0];
+    let chain = handler["call_chain"].as_array().expect("call_chain array");
+    assert!(!chain.iter().any(|n| n["name"] == "thing"),
+        "default floor must hide the ambiguous `thing` fan-out from the chain; got: {stdout}");
+    let downstream = handler["downstream_calls"].as_array().expect("downstream_calls array");
+    assert!(!downstream.iter().any(|n| n == "thing"),
+        "default floor must hide the ambiguous fan-out from the one-hop downstream list too; got: {stdout}");
+    assert_eq!(v["ambiguous_edges_hidden"].as_u64(), Some(2),
+        "default view must disclose the 2 hidden ambiguous edges; got: {stdout}");
+
+    // Opt-in: --min-confidence ambiguous restores the fan-out on the chain, and the
+    // disclosure field disappears (nothing suppressed at rank 0).
+    let (stdout2, _, code2) = run_cli(&project, &["trace", "GET /widgets", "--min-confidence", "ambiguous", "--json"]);
+    assert_eq!(code2, 0, "trace --min-confidence ambiguous should succeed; got: {stdout2}");
+    let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
+    let shown = v2["handlers"][0]["call_chain"].as_array().expect("call_chain array")
+        .iter().filter(|n| n["name"] == "thing").count();
+    assert_eq!(shown, 2, "--min-confidence ambiguous must show both tied `thing` edges in the chain; got: {stdout2}");
+    assert!(v2.get("ambiguous_edges_hidden").is_none(),
+        "nothing is suppressed at the ambiguous floor; got: {stdout2}");
+}
+
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection.
 #[test]
 fn test_cli_trace_help_exits_zero() {

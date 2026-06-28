@@ -26,6 +26,19 @@ impl McpServer {
             .ok_or_else(|| anyhow!("route_path is required (e.g. 'GET /api/users')"))?;
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         let include_middleware = args["include_middleware"].as_bool().unwrap_or(true);
+        // Confidence floor (default 'inferred'): hide the ambiguous by-name fan-out
+        // from both the call chain and the downstream list, matching get_call_graph.
+        // route_path mode of get_call_graph reaches here, where min_confidence was
+        // advertised on the schema but previously dropped (this handler ran rank-0
+        // show-all). Validated at entry (enum-validate-at-entry) so a bad value
+        // errors before any index work.
+        let min_conf_tier = match args["min_confidence"].as_str() {
+            None | Some("") => crate::domain::CONF_INFERRED,
+            Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+                anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+            })?,
+        };
+        let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -40,12 +53,13 @@ impl McpServer {
         // Batch-fetch downstream calls for all handlers in one query
         let downstream_map = if include_middleware {
             let node_ids: Vec<i64> = rows.iter().map(|rm| rm.node_id).collect();
-            queries::get_edge_target_names_batch(self.db.conn(), &node_ids, REL_CALLS)?
+            queries::get_edge_target_names_batch(self.db.conn(), &node_ids, REL_CALLS, min_conf_rank)?
         } else {
             std::collections::HashMap::new()
         };
 
         let mut handlers: Vec<serde_json::Value> = Vec::new();
+        let mut ambiguous_hidden: usize = 0;
         for rm in &rows {
             let mut handler = json!({
                 "node_id": rm.node_id,
@@ -67,9 +81,10 @@ impl McpServer {
             }
 
             // Recursive call chain via call graph
-            let chain = crate::graph::query::get_call_graph(
-                self.db.conn(), &rm.handler_name, "callees", depth, Some(&rm.file_path),
+            let chain = crate::graph::query::get_call_graph_filtered(
+                self.db.conn(), &rm.handler_name, "callees", depth, Some(&rm.file_path), min_conf_rank,
             )?;
+            ambiguous_hidden += chain.suppressed_ambiguous;
             let chain_nodes: Vec<serde_json::Value> = chain.nodes.iter()
                 .filter(|n| n.depth > 0) // exclude root (the handler itself)
                 .filter(|n| !is_test_symbol(&n.name, &n.file_path))
@@ -96,6 +111,12 @@ impl McpServer {
         if handlers.is_empty() {
             result["message"] = json!("No matching routes found. This may mean: (1) the project has no HTTP routes, (2) the route pattern didn't match, or (3) routes use a framework not yet supported. Try a broader pattern or use semantic_code_search to find route handlers.");
         }
+        // Disclose the ambiguous by-name fan-out folded out of the chain/downstream
+        // so the agent knows the trace may be wider and can re-query with
+        // min_confidence:"ambiguous". Explicitly attached (not a struct field).
+        if ambiguous_hidden > 0 {
+            result["ambiguous_edges_hidden"] = json!(ambiguous_hidden);
+        }
 
         // Compress if result exceeds token threshold
         let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
@@ -110,12 +131,16 @@ impl McpServer {
                     "chain_count": h["call_chain"].as_array().map_or(0, |a| a.len()),
                 })
             }).collect();
-            return Ok(json!({
+            let mut compressed = json!({
                 "mode": "compressed_http_chain",
                 "message": "HTTP chain exceeded token limit. Use get_ast_node(node_id) or get_call_graph(symbol_name) to expand.",
                 "route": route_path,
                 "results": compressed_handlers,
-            }));
+            });
+            if ambiguous_hidden > 0 {
+                compressed["ambiguous_edges_hidden"] = json!(ambiguous_hidden);
+            }
+            return Ok(compressed);
         }
 
         // Discourage attach_truncation_flags compile-warn for unused import in

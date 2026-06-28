@@ -4198,6 +4198,12 @@ pub struct TraceArgs {
     /// Include test symbols in the call chain (hidden by default, matching the MCP trace tool)
     #[arg(long)]
     pub include_tests: bool,
+    /// Minimum edge-resolution confidence to FOLLOW: extracted, inferred, or
+    /// ambiguous. Default 'inferred' hides the ambiguous by-name fan-out (a method
+    /// name shared by many defs resolving to all of them) from both the call chain
+    /// and the downstream list; pass 'ambiguous' to show every edge.
+    #[arg(long = "min-confidence")]
+    pub min_confidence: Option<String>,
     /// JSON output
     #[arg(long)]
     pub json: bool,
@@ -4218,8 +4224,25 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     let include_middleware = !args.no_middleware;
     // Hide test symbols from the recursive call chain by default, matching the MCP
     // trace_http_chain tool (server/tools/advanced.rs). The one-hop downstream list
-    // stays unfiltered on both surfaces. --include-tests opts the chain back in.
+    // stays unfiltered FOR TEST SYMBOLS on both surfaces (it still honors the
+    // confidence floor below). --include-tests opts the chain back in.
     let include_tests = args.include_tests;
+
+    // Confidence floor (default 'inferred'): hide the ambiguous by-name fan-out from
+    // both the recursive chain and the one-hop downstream list, matching callgraph /
+    // impact / get_call_graph (v0.77 — trace was previously rank-0 show-all).
+    // --min-confidence ambiguous restores every edge. Validated at entry, mirroring
+    // cmd_callgraph.
+    let min_conf_tier: &'static str = match args.min_confidence.as_deref() {
+        None | Some("") => crate::domain::CONF_INFERRED,
+        Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--min-confidence must be one of: extracted, inferred, ambiguous (got '{}')",
+                c
+            )
+        })?,
+    };
+    let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -4258,7 +4281,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     use crate::domain::REL_CALLS;
     let downstream_map = if include_middleware {
         let node_ids: Vec<i64> = rows.iter().map(|rm| rm.node_id).collect();
-        queries::get_edge_target_names_batch(conn, &node_ids, REL_CALLS)?
+        queries::get_edge_target_names_batch(conn, &node_ids, REL_CALLS, min_conf_rank)?
     } else {
         std::collections::HashMap::new()
     };
@@ -4266,10 +4289,12 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     if json_mode {
         // Single JSON object envelope matching MCP trace_http_chain shape
         let mut handlers = Vec::with_capacity(rows.len());
+        let mut ambiguous_hidden: usize = 0;
         for rm in &rows {
-            let chain = crate::graph::query::get_call_graph(
-                conn, &rm.handler_name, "callees", depth, Some(&rm.file_path),
+            let chain = crate::graph::query::get_call_graph_filtered(
+                conn, &rm.handler_name, "callees", depth, Some(&rm.file_path), min_conf_rank,
             )?;
+            ambiguous_hidden += chain.suppressed_ambiguous;
             let chain_nodes: Vec<serde_json::Value> = chain.nodes.iter()
                 .filter(|n| n.depth > 0)
                 .filter(|n| include_tests || !crate::domain::is_test_symbol(&n.name, &n.file_path))
@@ -4296,14 +4321,18 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
             }
             handlers.push(entry);
         }
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "route": path,
             "handlers": handlers,
         });
+        if ambiguous_hidden > 0 {
+            envelope["ambiguous_edges_hidden"] = serde_json::json!(ambiguous_hidden);
+        }
         writeln!(stdout, "{}", serde_json::to_string(&envelope)?)?;
         return Ok(());
     }
 
+    let mut ambiguous_hidden: usize = 0;
     for rm in &rows {
         // Render the route label as "METHOD path" from the routes_to metadata
         // (matching the map's Entry Points) instead of dumping the raw JSON blob.
@@ -4325,9 +4354,10 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         }
 
         // Show call chain
-        let chain = crate::graph::query::get_call_graph(
-            conn, &rm.handler_name, "callees", depth, Some(&rm.file_path),
+        let chain = crate::graph::query::get_call_graph_filtered(
+            conn, &rm.handler_name, "callees", depth, Some(&rm.file_path), min_conf_rank,
         )?;
+        ambiguous_hidden += chain.suppressed_ambiguous;
         for n in &chain.nodes {
             if n.depth == 0 { continue; }
             if !include_tests && crate::domain::is_test_symbol(&n.name, &n.file_path) { continue; }
@@ -4337,6 +4367,13 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         if chain.limit_hit || chain.depth_capped {
             writeln!(stdout, "  ⚠ chain truncated for {}", rm.handler_name)?;
         }
+    }
+    if ambiguous_hidden > 0 {
+        writeln!(
+            stdout,
+            "  ({} direct ambiguous by-name edge(s) hidden — use --min-confidence ambiguous to show)",
+            ambiguous_hidden,
+        )?;
     }
 
     Ok(())
