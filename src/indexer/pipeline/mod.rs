@@ -77,7 +77,7 @@ pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&Embeddi
 /// files table by this relative path, so anything else is meaningless as a key
 /// *and* a path-traversal risk — the MCP `file_path` args reach the freshness
 /// path (`ensure_file_fresh_opt`) without going through `normalize_user_path`.
-fn is_safe_relative_path(rel_path: &str) -> bool {
+pub(crate) fn is_safe_relative_path(rel_path: &str) -> bool {
     use std::path::Component;
     let mut depth: i32 = 0;
     for comp in Path::new(rel_path).components() {

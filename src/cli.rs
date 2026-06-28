@@ -252,40 +252,51 @@ impl CliContext {
 /// `project_root.join(raw)`, turning `deps ../../secret.js` into a path-traversal
 /// file read that leaks the file's import/re-export lines. Reject the escape.
 fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
+    use crate::indexer::pipeline::is_safe_relative_path;
+    // Single source of truth for the escape check (shared with the MCP freshness
+    // path) — eliminates the three-way divergence between this fn, the MCP
+    // `read_source_context` canonicalize guard, and `is_safe_relative_path`. ANY
+    // project-relative result, whether typed directly OR derived by stripping the
+    // root prefix off an absolute path, must not climb above the root via `..`.
+    let escape = || anyhow::anyhow!(
+        "path '{}' escapes the project root '{}' \u{2014} use a path inside the project",
+        raw, project_root.display()
+    );
+
     if raw == "." {
         return Ok(String::new());
     }
     if let Some(rest) = raw.strip_prefix("./") {
+        // `./foo` → `foo`, but `./../secret` still climbs out — validate the rest.
+        if !is_safe_relative_path(rest) {
+            return Err(escape());
+        }
         return Ok(rest.to_string());
     }
     let p = Path::new(raw);
     if !p.is_absolute() {
-        // Resolve `..`/`.` lexically (no filesystem touch — the target may be
-        // gitignored or already deleted) and reject any prefix that climbs above
-        // the root. `depth` is the component count relative to the root; it going
-        // negative at any point means the path escaped.
-        let mut depth: i32 = 0;
-        for comp in p.components() {
-            match comp {
-                std::path::Component::ParentDir => {
-                    depth -= 1;
-                    if depth < 0 {
-                        anyhow::bail!(
-                            "path '{}' escapes the project root '{}' \u{2014} use a path inside the project",
-                            raw, project_root.display()
-                        );
-                    }
-                }
-                std::path::Component::Normal(_) => depth += 1,
-                // CurDir (`.`) and any RootDir/Prefix don't climb above the root.
-                _ => {}
-            }
+        // Lexical escape check (no filesystem touch — target may be gitignored or
+        // deleted): reject any prefix that climbs above the root.
+        if !is_safe_relative_path(raw) {
+            return Err(escape());
         }
         return Ok(raw.to_string());
     }
+    // Absolute path. CRITICAL: `Path::strip_prefix` matches components and does
+    // NOT collapse `..`, so `<root>/../../etc/passwd` strips to `../../etc/passwd`
+    // — a remainder that still escapes. The old code returned it unchecked (the
+    // escape check ran only in the relative branch above), so a barrel-scan
+    // `deps <root>/../../secret` did an out-of-root read (the absolute-prefix
+    // sibling of the relative `..` traversal). Re-validate the stripped remainder.
     if let Ok(rel) = p.strip_prefix(project_root) {
-        return Ok(rel.to_string_lossy().into_owned());
+        let rel = rel.to_string_lossy().into_owned();
+        if !is_safe_relative_path(&rel) {
+            return Err(escape());
+        }
+        return Ok(rel);
     }
+    // Symlink fallback: canonicalize resolves `..` and links, so a successful
+    // strip_prefix here is genuinely under the root (no `..` can survive).
     if let (Ok(canon_p), Ok(canon_root)) = (p.canonicalize(), project_root.canonicalize()) {
         if let Ok(rel) = canon_p.strip_prefix(&canon_root) {
             return Ok(rel.to_string_lossy().into_owned());
@@ -6842,6 +6853,33 @@ mod tests {
         let root = tmp.path();
         let abs = root.join("src/parser");
         assert_eq!(normalize_user_path(root, abs.to_str().unwrap()).unwrap(), "src/parser");
+    }
+
+    #[test]
+    fn test_normalize_user_path_rejects_absolute_prefix_climb() {
+        // v0.79.1 audit (#5): an ABSOLUTE path that begins with the root then
+        // climbs out via `..` (`<root>/../../etc/passwd`) must error. `strip_prefix`
+        // matches components and does NOT collapse `..`, so it returned the
+        // escaping remainder unchecked — the absolute-prefix sibling of the
+        // relative `..` escape. Also covers the `./`-prefix shortcut (`./../x`).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let root_str = root.to_str().unwrap();
+        let climbs = [
+            format!("{root_str}/../../etc/passwd"),
+            format!("{root_str}/../sibling/secret.js"),
+            "./../secret".to_string(),
+            "./../../etc/passwd".to_string(),
+        ];
+        for c in &climbs {
+            let err = normalize_user_path(root, c)
+                .expect_err(&format!("{c:?} must be rejected as an escape"));
+            assert!(format!("{err}").contains("escapes the project root"),
+                "{c:?} should be rejected as an escape; got: {err}");
+        }
+        // Absolute path under root with interior `..` that stays in-root is allowed.
+        let inroot = format!("{root_str}/src/../lib.rs");
+        assert_eq!(normalize_user_path(root, &inroot).unwrap(), "src/../lib.rs");
     }
 
     #[test]
