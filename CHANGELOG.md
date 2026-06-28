@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.77.2 — status line cwd-bridge hardening (code-review follow-up)
+
+Defensive hardening of the v0.77.1 stdin-cwd bridge, from a fresh-context code review.
+
+### Fixed
+- **`cwdFromStdin` accepts only a non-empty string cwd** — a malformed stdin payload
+  (`cwd` as a number/object) was coerced into a bogus env path that resolved nowhere
+  and silently blanked the code-graph status-line segment. It now falls back to
+  `process.cwd()`.
+
+### Changed
+- **Forwarding env var renamed `CLAUDE_STATUSLINE_CWD` → `CODE_GRAPH_STATUSLINE_CWD`**
+  so the plugin's internal composite→provider signal doesn't squat on Claude Code's
+  `CLAUDE_` namespace. Internal channel only — no user-facing surface or behavior change.
+
 ## v0.77.1 — status line tracks Claude Code's working dir, not the spawn's cwd
 
 The code-graph status line vanished whenever the shell sat in a project
