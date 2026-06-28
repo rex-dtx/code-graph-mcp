@@ -757,6 +757,56 @@ fn test_cross_language_structural_edges_isolated() {
 }
 
 #[test]
+fn test_cross_family_structural_edges_preserved() {
+    // Regression caught by adversarial review of the #3 fix: structural edges
+    // WITHIN one language family (js/ts/tsx) must SURVIVE. detect_language gives
+    // different strings per family member (.ts->typescript, .tsx->tsx), so a
+    // same-EXACT-language gate dropped a real `.tsx` class extending a `.ts` base
+    // (inherits gone; implements degraded to a phantom <external>). Family-
+    // compatibility filtering must keep these while still dropping different-family
+    // phantoms (covered by test_cross_language_structural_edges_isolated).
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+
+    fs::write(project_dir.path().join("src/base.ts"), "export class Base {}\n").unwrap();
+    fs::write(project_dir.path().join("src/iface.ts"), "export interface Iface { go(): void; }\n").unwrap();
+    fs::write(project_dir.path().join("src/comp.tsx"),
+        "class DerTsx extends Base {}\nclass ImplTsx implements Iface { go() {} }\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    let conn = db.conn();
+
+    // inherits: DerTsx(.tsx) -> Base(.ts) binds to the REAL ts node (not dropped).
+    let inherits_to_base: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edges e \
+         JOIN nodes s ON s.id = e.source_id \
+         JOIN nodes t ON t.id = e.target_id JOIN files ft ON ft.id = t.file_id \
+         WHERE e.relation = 'inherits' AND s.name = 'DerTsx' \
+           AND t.name = 'Base' AND ft.path = 'src/base.ts'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(inherits_to_base, 1,
+        "cross-family inherits (.tsx -> .ts) must bind to the real base class");
+
+    // implements: ImplTsx(.tsx) -> Iface(.ts) binds to the real node, not <external>.
+    let implements_to_iface: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edges e \
+         JOIN nodes s ON s.id = e.source_id \
+         JOIN nodes t ON t.id = e.target_id JOIN files ft ON ft.id = t.file_id \
+         WHERE e.relation = 'implements' AND s.name = 'ImplTsx' \
+           AND t.name = 'Iface' AND ft.path = 'src/iface.ts'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(implements_to_iface, 1,
+        "cross-family implements (.tsx -> .ts) must bind to the real interface");
+    let external_iface: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id \
+         WHERE n.name = 'Iface' AND f.path = '<external>'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(external_iface, 0, "no phantom <external>/Iface when the real interface exists");
+}
+
+#[test]
 fn test_phase2c_restore_binds_only_original_target_file() {
     // v31 regression (#4) + the previously-untested happy path. The Phase-2c
     // incremental inbound-edge restore must re-bind a saved cross-file edge ONLY

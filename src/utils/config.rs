@@ -59,22 +59,25 @@ pub fn is_compatible_lang(root_path: &str, dep_path: &str) -> bool {
     if dep_path == "<external>" {
         return false;
     }
-    let root_lang = detect_language(root_path);
-    let dep_lang = detect_language(dep_path);
-    match (root_lang, dep_lang) {
+    match (detect_language(root_path), detect_language(dep_path)) {
         (None, _) | (_, None) => true, // unknown language → keep (conservative)
-        (Some(a), Some(b)) if a == b => true,
-        // JS/TS family can cross-reference
-        (Some(a), Some(b))
-            if matches!((a, b),
-                ("javascript" | "typescript" | "tsx", "javascript" | "typescript" | "tsx")) =>
-        {
-            true
-        }
-        // C/C++ family can cross-reference
-        (Some(a), Some(b)) if matches!((a, b), ("c" | "cpp", "c" | "cpp")) => true,
-        _ => false,
+        (Some(a), Some(b)) => languages_compatible(a, b),
     }
+}
+
+/// Family compatibility on detected language STRINGS (not paths). Same language,
+/// or within the JS/TS (`javascript`/`typescript`/`tsx`) or C/C++ (`c`/`cpp`)
+/// families which legitimately cross-reference. Single source of the family rule,
+/// shared by [`is_compatible_lang`] (path-level reverse-dep filter) AND the
+/// structural-edge resolver in the indexer (which holds language strings, not
+/// paths). `detect_language` assigns DIFFERENT strings within one family
+/// (`.ts`→`typescript`, `.tsx`→`tsx`, `.js`→`javascript`), so exact-string
+/// equality would wrongly drop a `.tsx` class extending a `.ts` base.
+pub fn languages_compatible(a: &str, b: &str) -> bool {
+    a == b
+        || matches!((a, b),
+            ("javascript" | "typescript" | "tsx", "javascript" | "typescript" | "tsx"))
+        || matches!((a, b), ("c" | "cpp", "c" | "cpp"))
 }
 
 #[cfg(test)]

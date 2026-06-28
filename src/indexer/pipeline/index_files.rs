@@ -916,24 +916,28 @@ pub(super) fn index_files(
                     continue;
                 } else {
                     // Structural relations (imports / inherits / implements /
-                    // exports / routes_to) with no same-file and no same-language
-                    // target. Previously this fell through to `all_target_ids` —
-                    // the GLOBAL all-language pool — so a non-empty cross-language
-                    // same-name node bound a false edge AND pre-empted the
-                    // `<external>` sentinel below (which only fires when target_ids
-                    // is empty). That produced cross-language phantom imports/
-                    // inherits (e.g. Rust `use anyhow::Result` → a markdown
-                    // "Result" heading; JS `require('fs')` → a Rust `fs` symbol),
-                    // stamped `extracted` so `--min-confidence` couldn't filter
-                    // them, polluting deps / project_map / affected / cycles /
-                    // find_references. Bind structural edges to same-language
-                    // targets ONLY (branch above already handled the non-empty
-                    // same-language case via refine_ambiguous_targets); here that
-                    // set is empty, so yield empty → IMPORTS/IMPLEMENTS reach the
-                    // `<external>` sentinel, the rest drop rather than bind across
-                    // languages. Same-language gating subsumes the markdown/HTML/
-                    // CSS/JSON case (those nodes are a different language).
-                    Vec::new()
+                    // exports / routes_to) with no same-file and no same-EXACT-
+                    // language target. Previously this fell through to the GLOBAL
+                    // all-language pool, binding cross-LANGUAGE phantoms (Rust
+                    // `use anyhow::Result` → a markdown "Result" heading; JS
+                    // `require('fs')` → a Rust `fs` symbol) stamped `extracted`
+                    // (unfilterable), polluting deps / project_map / cycles /
+                    // find_references. Bind to same-language-FAMILY targets only:
+                    // `detect_language` gives DIFFERENT strings within one family
+                    // (`.ts`→typescript, `.tsx`→tsx, `.js`→javascript), so exact
+                    // equality would wrongly DROP a real `.tsx` class extending a
+                    // `.ts` base. Family filtering keeps those cross-family edges
+                    // while still dropping genuinely cross-language phantoms
+                    // (different families). Empty → IMPORTS/IMPLEMENTS reach the
+                    // `<external>` sentinel below; the rest drop.
+                    all_target_ids.iter()
+                        .filter(|id| !local_ids.contains(id))
+                        .filter(|id| matches!(
+                            node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                            Some(l) if crate::utils::config::languages_compatible(l, source_lang)
+                        ))
+                        .copied()
+                        .collect()
                 };
 
                 if target_ids.is_empty()
