@@ -57,6 +57,11 @@ pub struct CallerWithRouteInfo {
     pub file_path: String,
     pub depth: i32,
     pub route_info: Option<String>, // JSON metadata from routes_to edge
+    /// Authoritative AST-level test flag (`nodes.is_test`) carried from the call
+    /// graph. Drives the prod/test partition in `classify_impact` so an inline
+    /// unit test the `is_test_symbol` name/path heuristic misses is still excluded
+    /// from the production blast radius.
+    pub is_test: bool,
 }
 
 /// Get all callers of a symbol, annotating any that are HTTP route handlers.
@@ -118,6 +123,7 @@ pub fn get_callers_with_route_info(
             file_path: caller.file_path.clone(),
             depth: caller.depth,
             route_info: route_map.get(&caller.node_id).cloned(),
+            is_test: caller.is_test,
         })
         .collect();
     Ok(results)

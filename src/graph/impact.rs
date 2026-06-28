@@ -77,7 +77,12 @@ pub fn classify_impact<'a>(
     let mut test_callers: Vec<&CallerWithRouteInfo> = Vec::new();
     for c in callers.iter().filter(|c| c.depth > 0) {
         let key = (c.name.as_str(), c.file_path.as_str(), c.depth);
-        if domain::is_test_symbol(&c.name, &c.file_path) {
+        // Authoritative AST flag first, then the name/path heuristic as a fallback
+        // (mirrors `centrality.rs`). The flag catches inline `#[cfg(test)] mod
+        // tests` fns whose descriptive names the heuristic misses; the heuristic
+        // still catches integration tests in `tests/` and `test_`-prefixed names
+        // for nodes whose `is_test` flag predates this projection.
+        if c.is_test || domain::is_test_symbol(&c.name, &c.file_path) {
             if seen_test.insert(key) {
                 test_callers.push(c);
             }
@@ -151,6 +156,19 @@ mod tests {
     use super::*;
 
     fn caller(name: &str, file: &str, depth: i32, route: Option<&str>) -> CallerWithRouteInfo {
+        caller_t(name, file, depth, route, false)
+    }
+
+    /// Like `caller` but sets the authoritative AST `is_test` flag — for callers
+    /// whose name/path the `is_test_symbol` heuristic does NOT catch (inline Rust
+    /// `mod tests` fns with descriptive snake_case names in a `src/` file).
+    fn caller_t(
+        name: &str,
+        file: &str,
+        depth: i32,
+        route: Option<&str>,
+        is_test: bool,
+    ) -> CallerWithRouteInfo {
         CallerWithRouteInfo {
             node_id: 0,
             name: name.to_string(),
@@ -158,6 +176,7 @@ mod tests {
             file_path: file.to_string(),
             depth,
             route_info: route.map(|s| s.to_string()),
+            is_test,
         }
     }
 
@@ -313,5 +332,41 @@ mod tests {
             .find(|tc| tc.name == "test_alpha")
             .unwrap();
         assert_eq!(alpha.file_path, "tests/a.rs");
+    }
+
+    #[test]
+    fn ast_is_test_flag_partitions_inline_unit_test_caller() {
+        // v0.79.1 audit HIGH: an inline Rust `#[cfg(test)] mod tests` fn has a
+        // descriptive snake_case name (no `test_` prefix) and lives in a `src/`
+        // file, so the `is_test_symbol` name/path heuristic MISSES it. Without the
+        // authoritative AST `is_test` flag it is counted as a production caller,
+        // inverting the risk level (e.g. `impact find_cycles` reported HIGH / 0
+        // tests when its 13 callers were inline unit tests). The flag must drive
+        // the partition.
+        let callers = vec![
+            caller("target", "src/graph/cycles.rs", 0, None), // root — excluded
+            caller("cmd_cycles", "src/cli.rs", 1, None),      // genuine prod caller
+            // inline unit tests — heuristic-invisible, but is_test=true:
+            caller_t("two_node_cycle_is_detected", "src/graph/cycles.rs", 1, None, true),
+            caller_t("headline_matches_arrows", "src/graph/cycles.rs", 1, None, true),
+        ];
+        let c = classify_impact(&callers, "behavior", true);
+        assert_eq!(
+            c.prod_callers.len(),
+            1,
+            "only cmd_cycles is a prod caller; got {:?}",
+            c.prod_callers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(c.test_count, 2, "both inline unit tests counted as tests");
+        assert_eq!(c.risk_level, "LOW", "1 prod caller ⇒ LOW, not HIGH");
+        // The heuristic-catchable convention still works alongside the flag.
+        let with_named = vec![
+            caller("target", "src/a.rs", 0, None),
+            caller("real", "src/a.rs", 1, None),
+            caller("test_named", "tests/a.rs", 1, None), // is_test=false but heuristic catches it
+        ];
+        let c2 = classify_impact(&with_named, "behavior", true);
+        assert_eq!(c2.test_count, 1, "name/path heuristic still classifies");
+        assert_eq!(c2.prod_callers.len(), 1);
     }
 }

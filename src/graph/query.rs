@@ -43,6 +43,12 @@ pub struct CallGraphNode {
     /// the root (depth=0). When a node is reachable via multiple paths, this
     /// records one parent on the shortest path.
     pub parent_id: Option<i64>,
+    /// The node's authoritative AST-level test flag (`nodes.is_test`), set by the
+    /// parser for `#[cfg(test)] mod tests` / `#[test]` / `@Test` etc. Carried so
+    /// caller-partitioning surfaces (impact risk, covering-tests) can classify an
+    /// inline unit test whose descriptive snake_case name the `is_test_symbol`
+    /// name/path heuristic misses (see [`crate::domain::is_test_symbol`]).
+    pub is_test: bool,
 }
 
 /// Wraps `Vec<CallGraphNode>` with truncation provenance. Returned by
@@ -223,8 +229,9 @@ fn query_direction(
             WHERE relation = ?4
             GROUP BY target_id
         )
-        SELECT node_id, name, type, file_path, depth, parent_id FROM (
+        SELECT node_id, name, type, file_path, depth, parent_id, is_test FROM (
             SELECT cg.node_id, cg.name, cg.type, f.path AS file_path, cg.depth, cg.parent_id,
+                   n.is_test AS is_test,
                    COALESCE(cc.callers, 0) AS caller_count,
                    ROW_NUMBER() OVER (PARTITION BY cg.node_id ORDER BY cg.depth) AS rn
             FROM call_graph cg
@@ -248,6 +255,7 @@ fn query_direction(
             depth: row.get(4)?,
             direction,
             parent_id: row.get(5)?,
+            is_test: row.get(6)?,
         })
     };
 
