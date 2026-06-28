@@ -2900,14 +2900,21 @@ app.post('/api/login', handleLogin);
         let server = McpServer::new_test_with_project(project.path());
         server.ensure_indexed().unwrap();
 
-        // Install a watcher on an UNRELATED idle dir: this makes `has_watcher == true`
-        // (so ensure_indexed's no-watcher debounce branch is skipped) while guaranteeing
-        // `drain_watcher_events()` stays empty — the idle dir never changes, so there is no
-        // fs-event race. `owed` becomes the only thing that can run the incremental.
+        // Make `has_watcher == true` (so ensure_indexed's no-watcher debounce branch is
+        // skipped) while guaranteeing `drain_watcher_events()` returns false — so `owed` is
+        // provably the only thing that can run the incremental.
+        //
+        // Keep a REAL watcher alive on an idle dir (for has_watcher) but route ITS events to a
+        // sink we never read, and drain a SEPARATE channel nothing ever sends to. Why the
+        // decoupling: macOS FSEvents can emit a coalesced bare Any/Other event when a watch
+        // starts, and since 823a561 `is_content_event` treats Any/Other as content — so such a
+        // startup event now reaches the channel and made this precondition flaky on macos-no-embed
+        // CI. Draining an isolated channel removes that platform-specific fs-event race.
         let idle = TempDir::new().unwrap();
-        let (tx, rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
-        let fw = FileWatcher::start(idle.path(), tx).expect("watcher must start");
-        *lock_or_recover(&server.watcher, "watcher") = Some(WatcherState { _watcher: fw, receiver: rx });
+        let (sink_tx, _sink_rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        let fw = FileWatcher::start(idle.path(), sink_tx).expect("watcher must start");
+        let (_quiet_tx, quiet_rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        *lock_or_recover(&server.watcher, "watcher") = Some(WatcherState { _watcher: fw, receiver: quiet_rx });
 
         // Stranded state: a real change on disk + pending armed (as a prior embedding-skip
         // would leave it), with a watcher active and no events for it.
