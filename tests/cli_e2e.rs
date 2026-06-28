@@ -780,6 +780,78 @@ fn test_cli_grep_max_count_truncation_note() {
 }
 
 #[test]
+fn test_cli_grep_max_count_short_flag() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    std::fs::write(project.path().join("many.txt"), "needle\n".repeat(5)).unwrap();
+    // grep/ripgrep short `-m` is the `--max-count` alias. Separated `-m 2` and
+    // attached `-m2` must both cap — pre-fix `-m`/`-m2` had no short and were
+    // bound as the pattern via allow_hyphen_values → cryptic "No such file".
+    let forms: [&[&str]; 2] = [
+        &["grep", "-m", "2", "needle", "many.txt"],
+        &["grep", "-m2", "needle", "many.txt"],
+    ];
+    for argv in forms {
+        let (stdout, stderr, code) = run_cli(&project, argv);
+        assert_eq!(code, 0, "{argv:?} must succeed; stderr={stderr}");
+        assert_eq!(stdout.matches("needle").count(), 2, "{argv:?}: -m caps at 2, got: {stdout}");
+    }
+    // -m0 lifts the cap (attached zero).
+    let (stdout0, _, code0) = run_cli(&project, &["grep", "-m0", "needle", "many.txt"]);
+    assert_eq!(code0, 0);
+    assert_eq!(stdout0.matches("needle").count(), 5, "-m0 = unlimited, got: {stdout0}");
+}
+
+#[test]
+fn test_cli_grep_unsupported_flag_clear_error() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // Unsupported common grep shorts (-v invert, -c count, -o only-matching) must
+    // fail with a clear "unsupported flag" message + exit 2, NOT bind as the
+    // pattern and emit a cryptic "No such file: <next-arg>" (allow_hyphen_values
+    // trap, same class as the -A2/-n parity fixes).
+    for bad in ["-v", "-c", "-o"] {
+        let (_, stderr, code) = run_cli(&project, &["grep", bad, "validateToken"]);
+        assert_eq!(code, 2, "{bad} must exit 2; stderr={stderr}");
+        assert!(stderr.contains("unsupported flag"), "{bad}: clear message expected, got: {stderr}");
+        assert!(!stderr.contains("No such file"), "{bad}: must not leak cryptic rg error, got: {stderr}");
+    }
+    // --json keeps the empty-array contract even on this usage error.
+    let (stdout, _, code) = run_cli(&project, &["grep", "-v", "validateToken", "--json"]);
+    assert_eq!(code, 2);
+    assert_eq!(stdout.trim(), "[]", "--json unsupported-flag bail must emit []");
+    // The `--` escape still lets a literal "-v" be searched (parity preserved).
+    std::fs::write(project.path().join("DASHV.md"), "the -v flag here\n").unwrap();
+    let (stdout2, _, code2) = run_cli(&project, &["grep", "--", "-v"]);
+    assert_eq!(code2, 0, "literal -v via -- must search; got code {code2}");
+    assert!(stdout2.contains("DASHV.md"), "should find literal -v, got: {stdout2}");
+}
+
+#[test]
+fn test_cli_grep_json_truncated_marker() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    std::fs::write(project.path().join("many.txt"), "needle\n".repeat(5)).unwrap();
+    // A `--json` consumer can't see the stderr truncation note, so each match in
+    // a file that hit the per-file cap carries `"truncated": true`.
+    let (stdout, _, code) =
+        run_cli(&project, &["grep", "needle", "many.txt", "--max-count", "2", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON array");
+    let arr = v.as_array().expect("grep --json is an array");
+    assert_eq!(arr.len(), 2, "cap applies in JSON too, got: {stdout}");
+    assert!(arr.iter().all(|e| e["truncated"] == serde_json::json!(true)),
+        "each capped-file entry must be marked truncated, got: {stdout}");
+    // Uncapped search carries no truncated marker.
+    let (stdout2, _, code2) =
+        run_cli(&project, &["grep", "needle", "many.txt", "--max-count", "0", "--json"]);
+    assert_eq!(code2, 0);
+    let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
+    assert!(v2.as_array().unwrap().iter().all(|e| e.get("truncated").is_none()),
+        "no cap → no truncated marker, got: {stdout2}");
+}
+
+#[test]
 fn test_cli_grep_files_with_matches() {
     if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();

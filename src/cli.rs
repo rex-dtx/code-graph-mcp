@@ -1792,7 +1792,7 @@ pub struct GrepArgs {
     #[arg(short = 'B', long, value_name = "N")]
     pub before_context: Option<u64>,
     /// Max matches per file; 0 = unlimited
-    #[arg(long, default_value_t = 100)]
+    #[arg(short = 'm', long, value_name = "N", default_value_t = 100)]
     pub max_count: u64,
     /// Accepted for grep parity; line numbers are always printed (no-op).
     #[arg(short = 'n', long = "line-number")]
@@ -1839,17 +1839,18 @@ pub fn normalize_grep_argv(args: Vec<String>) -> Vec<String> {
     out
 }
 
-/// If `tok` is a single-dash short-flag cluster ending in an attached context
-/// value — `-A2`, `-C10`, or a bundle like `-nA2`/`-niB3` (leading boolean
-/// shorts, then `-A`/`-B`/`-C`, then digits) — return `(cluster_without_digits,
-/// digits)`. Returns `None` otherwise (incl. `--long`, bare `-A`, `-m2`, `-A2x`,
-/// and `-A2B3` where a value flag is not last in the bundle).
+/// If `tok` is a single-dash short-flag cluster ending in an attached value —
+/// `-A2`, `-C10`, `-m5`, or a bundle like `-nA2`/`-niB3` (leading boolean shorts,
+/// then a value flag `-A`/`-B`/`-C`/`-m`, then digits) — return
+/// `(cluster_without_digits, digits)`. Returns `None` otherwise (incl. `--long`,
+/// bare `-A`, `-z2`, `-A2x`, and `-A2B3` where a value flag is not last in the
+/// bundle).
 ///
 /// grep and ripgrep both accept these attached forms, and the value flag is only
 /// ever last in a bundle (`-nA2` valid; `-A2n`/`-An2` rejected by real grep), so
-/// we peel a trailing `[ABC][0-9]+` run that sits after a run of ASCII-letter
+/// we peel a trailing `[ABCm][0-9]+` run that sits after a run of ASCII-letter
 /// shorts. clap then bundle-parses the cluster (`-nA` → `-n -A`) and the bare
-/// `-A`/`-B`/`-C` takes the now-separate digit token as its value.
+/// `-A`/`-B`/`-C`/`-m` takes the now-separate digit token as its value.
 fn split_attached_context(tok: &str) -> Option<(String, String)> {
     let b = tok.as_bytes();
     // single dash, not `--`, at least `-X0` (a flag char + ≥1 digit).
@@ -1861,10 +1862,10 @@ fn split_attached_context(tok: &str) -> Option<(String, String)> {
     if digit_start == b.len() {
         return None; // no trailing digits (e.g. `-A2x`, `-nr`)
     }
-    // The byte immediately before the digits must be a value-taking context flag,
-    // and everything between `-` and the digits must be ASCII letters (the
-    // leading boolean shorts + that context flag). Rejects `-A2B3`, `-m2`, `-2`.
-    if !matches!(b[digit_start - 1], b'A' | b'B' | b'C')
+    // The byte immediately before the digits must be a value-taking flag, and
+    // everything between `-` and the digits must be ASCII letters (the leading
+    // boolean shorts + that value flag). Rejects `-A2B3`, `-z2`, `-2`.
+    if !matches!(b[digit_start - 1], b'A' | b'B' | b'C' | b'm')
         || !b[1..digit_start].iter().all(|c| c.is_ascii_alphabetic())
     {
         return None;
@@ -1872,13 +1873,75 @@ fn split_attached_context(tok: &str) -> Option<(String, String)> {
     Some((tok[..digit_start].to_string(), tok[digit_start..].to_string()))
 }
 
+/// Return the first single-dash short-flag cluster (pre-`--`) that contains a
+/// flag the `grep` subcommand does not implement — e.g. `-v`, `-c`, `-o`, `-e`,
+/// `-P`. The pattern positional's `allow_hyphen_values` would otherwise swallow
+/// such a flag AS the search term, pushing the real pattern into the path list →
+/// a cryptic `rg: No such file or directory: <pattern>` (same failure class the
+/// `-A2`/`-n` parity fixes addressed). Surfacing it lets the caller emit a clear
+/// "unsupported flag" message instead.
+///
+/// Only clusters starting with an ASCII letter are flag candidates; `--long`
+/// tokens, bare `-`, and dash-then-symbol/digit terms (`->`, `-1`, `-.*`) are
+/// legitimate searchable patterns and are left for the positional. A value-taking
+/// short (`-A`/`-B`/`-C`/`-m`) consumes the rest of the cluster, so judging stops
+/// there. Scanning stops at the first `--` so `grep -- -v` searches the literal.
+fn first_unsupported_grep_flag(args: &[String]) -> Option<String> {
+    const BOOL_SHORTS: &[u8] = b"iwFlnrRHh"; // supported value-less shorts (+ -h help)
+    const VALUE_SHORTS: &[u8] = b"ABCm"; // shorts that take a value (consume the tail)
+    for a in args {
+        if a == "--" {
+            break;
+        }
+        let b = a.as_bytes();
+        if b.len() < 2 || b[0] != b'-' || !b[1].is_ascii_alphabetic() {
+            continue;
+        }
+        let mut i = 1;
+        let mut bad = false;
+        while i < b.len() {
+            let c = b[i];
+            if VALUE_SHORTS.contains(&c) {
+                break; // value short eats the remainder (attached or next token)
+            }
+            if !BOOL_SHORTS.contains(&c) {
+                bad = true;
+                break;
+            }
+            i += 1;
+        }
+        if bad {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
 /// Parse `grep` arguments from the full process argv (including argv\[0]),
 /// applying [`normalize_grep_argv`] first. Mirrors the other subcommands'
 /// `skip(1)`; clap consumes the leading `grep` token as the binary-name slot.
+///
+/// Rejects unsupported short flags ([`first_unsupported_grep_flag`]) up front so
+/// they fail with a clear message instead of being swallowed as the pattern.
 pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
-    GrepArgs::parse_from(normalize_grep_argv(
-        argv.iter().skip(1).cloned().collect(),
-    ))
+    let raw: Vec<String> = argv.iter().skip(1).cloned().collect();
+    if let Some(bad) = first_unsupported_grep_flag(&raw) {
+        // --json early-bail must still emit an empty array (CLI JSON contract).
+        let json = raw
+            .iter()
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| a.as_str() == "--json");
+        if json {
+            println!("[]");
+        }
+        eprintln!(
+            "[code-graph] unsupported flag: {bad}. Supported: -i -w -F -l -A -B -C -m \
+             (and no-op -n/-r/-R/-H). To search a literal flag-shaped string, put it \
+             after --: code-graph-mcp grep -- {bad}"
+        );
+        grep_exit(2);
+    }
+    GrepArgs::parse_from(normalize_grep_argv(raw))
 }
 
 /// AST-context grep: ripgrep + AST context from index.
@@ -2151,6 +2214,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     } else {
         Vec::new()
     };
+    // Fast membership for the per-match `truncated` JSON marker below: stderr
+    // alone is invisible to a `--json` consumer parsing stdout, so each match in
+    // a file that hit the cap carries `"truncated": true`.
+    let capped_set: std::collections::HashSet<&str> = capped_files.iter().copied().collect();
 
     // Try to open index for AST context; cache per-file nodes for both modes.
     let ctx = CliContext::try_open(project_root);
@@ -2230,16 +2297,22 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                 });
                 if m.is_context {
                     entry["context"] = serde_json::json!(true);
-                } else if let Some(container) = lookup_container(&m.file, m.line) {
-                    let mut c = serde_json::json!({
-                        "type": container.0,
-                        "name": container.1,
-                        "lines": format!("{}-{}", container.2, container.3),
-                    });
-                    if container.4 {
-                        c["stale"] = serde_json::json!(true);
+                } else {
+                    if let Some(container) = lookup_container(&m.file, m.line) {
+                        let mut c = serde_json::json!({
+                            "type": container.0,
+                            "name": container.1,
+                            "lines": format!("{}-{}", container.2, container.3),
+                        });
+                        if container.4 {
+                            c["stale"] = serde_json::json!(true);
+                        }
+                        entry["container"] = c;
                     }
-                    entry["container"] = c;
+                    // This file hit the per-file cap — results for it are truncated.
+                    if capped_set.contains(m.file.as_str()) {
+                        entry["truncated"] = serde_json::json!(true);
+                    }
                 }
                 json_results.push(entry);
             }
@@ -6727,11 +6800,53 @@ mod tests {
         assert_eq!(normalize_grep_argv(s(&["grep", "-n", "pat"])), s(&["grep", "-n", "pat"]));
         assert_eq!(normalize_grep_argv(s(&["grep", "--no-default-features"])),
                    s(&["grep", "--no-default-features"]));
-        // Digit-suffix on a non-context flag (`-m2`) is left alone.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-m2", "pat"])), s(&["grep", "-m2", "pat"]));
+        // `-m` is the `--max-count` short alias: attached `-m2` splits like `-A2`
+        // (the same allow_hyphen_values quirk forces the peel — see the fn doc).
+        assert_eq!(normalize_grep_argv(s(&["grep", "-m2", "pat"])), s(&["grep", "-m", "2", "pat"]));
+        assert_eq!(normalize_grep_argv(s(&["grep", "-nm2", "pat"])), s(&["grep", "-nm", "2", "pat"]));
+        // Digit-suffix on an unsupported short (`-z2`) is left alone.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-z2", "pat"])), s(&["grep", "-z2", "pat"]));
         // Non-digit tail (`-A2x`) is not a valid attached form → left alone.
         assert_eq!(normalize_grep_argv(s(&["grep", "-A2x"])), s(&["grep", "-A2x"]));
         // `--` stops normalization so a literal `-A2` pattern survives.
         assert_eq!(normalize_grep_argv(s(&["grep", "--", "-A2"])), s(&["grep", "--", "-A2"]));
+    }
+
+    #[test]
+    fn test_first_unsupported_grep_flag() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Common grep flags we don't implement are flagged (would otherwise be
+        // swallowed as the pattern → cryptic "No such file").
+        for bad in ["-v", "-c", "-o", "-e", "-P", "-x", "-nv"] {
+            assert_eq!(
+                first_unsupported_grep_flag(&s(&["grep", bad, "pat"])).as_deref(),
+                Some(bad),
+                "{bad} should be reported as unsupported"
+            );
+        }
+        // Supported shorts (incl. bundles + attached/standalone value shorts) pass.
+        for ok in ["-i", "-w", "-F", "-l", "-n", "-r", "-R", "-H", "-A2", "-nA2",
+                   "-niB3", "-C", "-m", "-m5", "-iw"] {
+            assert_eq!(
+                first_unsupported_grep_flag(&s(&["grep", ok, "pat"])),
+                None,
+                "{ok} is supported, must not be flagged"
+            );
+        }
+        // Dash-then-symbol/digit terms are searchable patterns, not flags.
+        for pat in ["->", "-1", "-.*", "-->foo"] {
+            assert_eq!(
+                first_unsupported_grep_flag(&s(&["grep", pat])),
+                None,
+                "{pat} is a pattern, must not be flagged"
+            );
+        }
+        // `--` escapes a literal flag-shaped term.
+        assert_eq!(first_unsupported_grep_flag(&s(&["grep", "--", "-v"])), None);
+        // Unsupported flag after a supported value short's value is still caught.
+        assert_eq!(
+            first_unsupported_grep_flag(&s(&["grep", "-A", "2", "-v", "pat"])).as_deref(),
+            Some("-v")
+        );
     }
 }
