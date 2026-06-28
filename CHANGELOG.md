@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.77.1 — status line tracks Claude Code's working dir, not the spawn's cwd
+
+The code-graph status line vanished whenever the shell sat in a project
+subdirectory whose `process.cwd()` didn't resolve to the project root. The gate
+now starts from Claude Code's authoritative current dir (forwarded from the stdin
+payload), falling back to `process.cwd()` only when that is absent.
+
+### Fixed
+- **Status line no longer disappears in project subdirectories** — the composite
+  statusline forwards Claude Code's stdin `cwd` / `workspace.current_dir` to every
+  provider as `CLAUDE_STATUSLINE_CWD`, and the code-graph segment resolves the
+  project root from that instead of the spawned process's `process.cwd()` (which
+  need not track the session's working directory). The code-graph provider
+  registers with `needsStdin=false`, so it cannot read the stdin payload directly —
+  the env bridge is what carries the authoritative cwd to it. Falls back to
+  `process.cwd()` for direct invocation, so existing behavior is unchanged when the
+  env var is absent.
+
+### Internal
+- Removed the orphaned `impact_analysis` MCP tool — it was unadvertised with zero
+  post-fold calls across 194 dogfood sessions and no advertised tool delegated to
+  it. Full impact stays on the CLI (`impact --json`); compact impact on `get_ast_node
+  include_impact`. No advertised MCP surface changed.
+
 ## v0.77.0 — `trace` inherits the v0.76 confidence floor
 
 `trace` was the one call-graph surface left at rank-0 show-all when callgraph and
