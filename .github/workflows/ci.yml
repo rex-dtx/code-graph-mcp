@@ -20,12 +20,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        feature-flag: ["--no-default-features", ""]
+        # Only the FTS5-only default here (Cargo.toml `default = []`). The previous
+        # `""` ("with-embed") leg built the EMPTY default — feature-identical to
+        # --no-default-features, so embed-model never actually compiled in CI. Real
+        # embed coverage now lives in the dedicated `embed-check` job below.
+        feature-flag: ["--no-default-features"]
         include:
           - feature-flag: "--no-default-features"
             feature-label: "no-embed"
-          - feature-flag: ""
-            feature-label: "with-embed"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -51,6 +53,42 @@ jobs:
 
       - name: Test
         run: cargo test ${{ matrix.feature-flag }}
+
+  # The shipped binary is built `--features embed-model` (release.yml), but the
+  # matrix above only exercises the FTS5-only default — so a regression in the
+  # Candle / embedding / vector-search path passed CI and was caught only by the
+  # post-publish smoke-verify (after npm publish). Compile + clippy + test the
+  # embed feature once on Linux to catch it pre-merge. Embed unit tests use
+  # synthetic-weight seams (blake3 of fake bytes), so NO model download is needed.
+  # Linux-only keeps the heavy Candle compile to a single runner.
+  embed-check:
+    name: Check & Test (ubuntu-latest, with-embed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-latest-with-embed
+
+      - name: Check
+        run: cargo check --features embed-model
+
+      - name: Clippy
+        run: cargo clippy --features embed-model -- -D warnings
+
+      - name: Test
+        run: cargo test --features embed-model
 
   # Plugin/lifecycle/release-smoke tests are Node-based and OS-independent —
   # run once on Linux to avoid the 3× matrix blow-up.

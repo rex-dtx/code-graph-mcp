@@ -139,6 +139,73 @@ jobs:
       - name: Release smoke test
         run: node --test scripts/release-smoke.test.js
 
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            cp artifacts/binary-$pkg/code-graph-mcp release-assets/code-graph-mcp-$pkg
+          done
+          cp artifacts/binary-win32-x64/code-graph-mcp.exe release-assets/code-graph-mcp-win32-x64.exe
+          # Per-binary sha256 sidecar (mirrors models.tar.gz.sha256 below).
+          # auto-update.js fetches <asset>.sha256 and verifies the downloaded
+          # binary BEFORE chmod/exec; same-origin, so it guards transit/CDN
+          # corruption + truncation, not a full release-asset swap.
+          for asset in code-graph-mcp-linux-x64 code-graph-mcp-linux-arm64 code-graph-mcp-darwin-x64 code-graph-mcp-darwin-arm64 code-graph-mcp-win32-x64.exe; do
+            sha256sum "release-assets/$asset" | cut -d' ' -f1 > "release-assets/$asset.sha256"
+          done
+
+      - name: Package model files
+        # Pinned to a specific HuggingFace commit (cso #2) instead of the
+        # mutable `main` ref — without this, `main` moving (or HF account
+        # compromise) silently changes the bundled model and the downstream
+        # tarball sha256 would only validate the bundle against itself, not
+        # against a known-good upstream. --fail makes curl exit non-zero on
+        # HTTP 4xx/5xx so a 404 HTML page can't masquerade as model.safetensors.
+        # Content pins below verify the downloaded bytes against known-good
+        # hashes of the pinned revision, so even a compromised HF response (or
+        # a silent revision bump in this file) fails the release instead of
+        # shipping different weights. When HF_REVISION changes, recompute all
+        # three sha256s AND bump MODEL_CONTENT_BLAKE3 in src/embedding/model.rs
+        # (the client-side verifier) in the same commit — clients reject any
+        # models.tar.gz whose model.safetensors doesn't match that constant.
+        run: |
+          mkdir -p models-pkg
+          HF_REVISION=c9745ed1d9f207416be6d2e6f8de32d1f16199bf
+          for f in model.safetensors tokenizer.json config.json; do
+            # --retry: a transient HF 5xx must not fail the release. Mirrors the
+            # smoke-verify model fetch. Combined with the publish-after-assets
+            # ordering below, a HF blip now fails BEFORE npm publish (no half-
+            # release shipping a version whose models.tar.gz 404s → FTS5-only).
+            curl -L --fail --retry 3 --retry-delay 2 -o models-pkg/$f \
+              "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/$HF_REVISION/$f"
+          done
+          sha256sum -c - <<'PINS'
+          53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db  models-pkg/model.safetensors
+          be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  models-pkg/tokenizer.json
+          953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41  models-pkg/config.json
+          PINS
+          tar czf release-assets/models.tar.gz -C models-pkg .
+          sha256sum release-assets/models.tar.gz | cut -d' ' -f1 > release-assets/models.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          generate_release_notes: true
+          files: release-assets/*
+          # On push.tags trigger github.ref_name = "vX.Y.Z" and softprops picks
+          # it up implicitly. On workflow_dispatch from main, github.ref_name =
+          # "main" — softprops then errors with "GitHub Releases requires a
+          # tag". Explicit tag_name with the same inputs.tag fallback the rest
+          # of the job uses keeps both triggers working.
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+
+      # npm publish runs LAST — only after the binaries, model tarball, and the
+      # GitHub Release are all built and uploaded. Previously publish ran before
+      # "Package model files" + "Create GitHub Release", so a transient HF failure
+      # (or a forgotten sha bump) shipped npm packages for a version whose
+      # models.tar.gz release asset never existed → every user on that version
+      # silently degraded to FTS5-only until the workflow was re-run. The
+      # EPUBLISHCONFLICT skip keeps re-runs idempotent.
       - name: Publish platform packages
         run: |
           for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
@@ -179,62 +246,6 @@ jobs:
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Prepare release assets
-        run: |
-          mkdir -p release-assets
-          for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-            cp artifacts/binary-$pkg/code-graph-mcp release-assets/code-graph-mcp-$pkg
-          done
-          cp artifacts/binary-win32-x64/code-graph-mcp.exe release-assets/code-graph-mcp-win32-x64.exe
-          # Per-binary sha256 sidecar (mirrors models.tar.gz.sha256 below).
-          # auto-update.js fetches <asset>.sha256 and verifies the downloaded
-          # binary BEFORE chmod/exec; same-origin, so it guards transit/CDN
-          # corruption + truncation, not a full release-asset swap.
-          for asset in code-graph-mcp-linux-x64 code-graph-mcp-linux-arm64 code-graph-mcp-darwin-x64 code-graph-mcp-darwin-arm64 code-graph-mcp-win32-x64.exe; do
-            sha256sum "release-assets/$asset" | cut -d' ' -f1 > "release-assets/$asset.sha256"
-          done
-
-      - name: Package model files
-        # Pinned to a specific HuggingFace commit (cso #2) instead of the
-        # mutable `main` ref — without this, `main` moving (or HF account
-        # compromise) silently changes the bundled model and the downstream
-        # tarball sha256 would only validate the bundle against itself, not
-        # against a known-good upstream. --fail makes curl exit non-zero on
-        # HTTP 4xx/5xx so a 404 HTML page can't masquerade as model.safetensors.
-        # Content pins below verify the downloaded bytes against known-good
-        # hashes of the pinned revision, so even a compromised HF response (or
-        # a silent revision bump in this file) fails the release instead of
-        # shipping different weights. When HF_REVISION changes, recompute all
-        # three sha256s AND bump MODEL_CONTENT_BLAKE3 in src/embedding/model.rs
-        # (the client-side verifier) in the same commit — clients reject any
-        # models.tar.gz whose model.safetensors doesn't match that constant.
-        run: |
-          mkdir -p models-pkg
-          HF_REVISION=c9745ed1d9f207416be6d2e6f8de32d1f16199bf
-          for f in model.safetensors tokenizer.json config.json; do
-            curl -L --fail -o models-pkg/$f \
-              "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/$HF_REVISION/$f"
-          done
-          sha256sum -c - <<'PINS'
-          53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db  models-pkg/model.safetensors
-          be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037  models-pkg/tokenizer.json
-          953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41  models-pkg/config.json
-          PINS
-          tar czf release-assets/models.tar.gz -C models-pkg .
-          sha256sum release-assets/models.tar.gz | cut -d' ' -f1 > release-assets/models.tar.gz.sha256
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
-        with:
-          generate_release_notes: true
-          files: release-assets/*
-          # On push.tags trigger github.ref_name = "vX.Y.Z" and softprops picks
-          # it up implicitly. On workflow_dispatch from main, github.ref_name =
-          # "main" — softprops then errors with "GitHub Releases requires a
-          # tag". Explicit tag_name with the same inputs.tag fallback the rest
-          # of the job uses keeps both triggers working.
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
 
   # Post-publish verification: in a clean env on each OS, install the JUST-
   # PUBLISHED package from the npm registry and assert the binary runs and
