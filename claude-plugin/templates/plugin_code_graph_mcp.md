@@ -45,8 +45,9 @@ type: reference
 > ToolSearch 加载），而 Bash 永远在线——真实编程夜（2026-06-12）观测到的全部
 > 转化都是 CLI 调用。结构化查询的最快路径是 Bash 直呼
 > `code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`。
-> `grep` 是 drop-in 替代：`-F` 字面 / `-i` / `-w` / `-l` / `-A/-B/-C N` 上下文 /
-> 多路径 / `--max-count 0`，退出码兼容 grep（0/1/2），召回达 git-grep 级
+> `grep` 是 drop-in 替代：`-F` 字面 / `-i` / `-w` / `-l` / `-c` 计数 / `-t <lang>` 按语言筛 /
+> `-g <glob>` 路径过滤 / `-A/-B/-C N` 上下文 / `-M N` 行宽上限（默认 512，防长行刷屏）/
+> 多路径 / `-m 0` 取消每文件上限，退出码兼容 grep（0/1/2），召回达 git-grep 级
 > （tracked-but-gitignored 也能搜到），每条命中标注所属 fn/class。
 >
 > v0.10.0 起：tools/list 默认只暴露 7 个核心工具；下表"进阶 5"中的工具
@@ -112,7 +113,7 @@ hidden 5 加载 schema —— 实操中走新 flag。CLI 子命令保持原样�
 ## CLI 速查（替 Bash）
 
 ```
-code-graph-mcp grep "pattern" [path]     # ripgrep + AST 上下文
+code-graph-mcp grep "pattern" [path]     # ripgrep + AST 上下文（-t lang / -g glob / -c 计数 / -M 行宽）
 code-graph-mcp search "concept"          # 纯 FTS5（要混合检索走 MCP semantic_code_search）
 code-graph-mcp ast-search "q" --type fn  # 结构化筛选
 code-graph-mcp map                       # 项目架构

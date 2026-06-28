@@ -1794,6 +1794,19 @@ pub struct GrepArgs {
     /// Max matches per file; 0 = unlimited
     #[arg(short = 'm', long, value_name = "N", default_value_t = 100)]
     pub max_count: u64,
+    /// Truncate displayed lines to N chars; 0 = unlimited (default 512 — keeps a
+    /// long minified/generated line from flooding output).
+    #[arg(short = 'M', long = "max-columns", value_name = "N", default_value_t = 512)]
+    pub max_columns: u64,
+    /// Print only a count of matching lines per file (the per-file cap is ignored)
+    #[arg(short = 'c', long)]
+    pub count: bool,
+    /// Restrict to a ripgrep file type (e.g. rust, py, js, ts, go)
+    #[arg(short = 't', long = "type", value_name = "TYPE")]
+    pub file_type: Option<String>,
+    /// Only search files matching this glob; repeatable; prefix `!` to exclude
+    #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+    pub glob: Vec<String>,
     /// Accepted for grep parity; line numbers are always printed (no-op).
     #[arg(short = 'n', long = "line-number")]
     pub line_number: bool,
@@ -1841,16 +1854,16 @@ pub fn normalize_grep_argv(args: Vec<String>) -> Vec<String> {
 
 /// If `tok` is a single-dash short-flag cluster ending in an attached value —
 /// `-A2`, `-C10`, `-m5`, or a bundle like `-nA2`/`-niB3` (leading boolean shorts,
-/// then a value flag `-A`/`-B`/`-C`/`-m`, then digits) — return
+/// then a value flag `-A`/`-B`/`-C`/`-m`/`-M`, then digits) — return
 /// `(cluster_without_digits, digits)`. Returns `None` otherwise (incl. `--long`,
 /// bare `-A`, `-z2`, `-A2x`, and `-A2B3` where a value flag is not last in the
 /// bundle).
 ///
 /// grep and ripgrep both accept these attached forms, and the value flag is only
 /// ever last in a bundle (`-nA2` valid; `-A2n`/`-An2` rejected by real grep), so
-/// we peel a trailing `[ABCm][0-9]+` run that sits after a run of ASCII-letter
+/// we peel a trailing `[ABCmM][0-9]+` run that sits after a run of ASCII-letter
 /// shorts. clap then bundle-parses the cluster (`-nA` → `-n -A`) and the bare
-/// `-A`/`-B`/`-C`/`-m` takes the now-separate digit token as its value.
+/// `-A`/`-B`/`-C`/`-m`/`-M` takes the now-separate digit token as its value.
 fn split_attached_context(tok: &str) -> Option<(String, String)> {
     let b = tok.as_bytes();
     // single dash, not `--`, at least `-X0` (a flag char + ≥1 digit).
@@ -1865,7 +1878,7 @@ fn split_attached_context(tok: &str) -> Option<(String, String)> {
     // The byte immediately before the digits must be a value-taking flag, and
     // everything between `-` and the digits must be ASCII letters (the leading
     // boolean shorts + that value flag). Rejects `-A2B3`, `-z2`, `-2`.
-    if !matches!(b[digit_start - 1], b'A' | b'B' | b'C' | b'm')
+    if !matches!(b[digit_start - 1], b'A' | b'B' | b'C' | b'm' | b'M')
         || !b[1..digit_start].iter().all(|c| c.is_ascii_alphabetic())
     {
         return None;
@@ -1884,11 +1897,11 @@ fn split_attached_context(tok: &str) -> Option<(String, String)> {
 /// Only clusters starting with an ASCII letter are flag candidates; `--long`
 /// tokens, bare `-`, and dash-then-symbol/digit terms (`->`, `-1`, `-.*`) are
 /// legitimate searchable patterns and are left for the positional. A value-taking
-/// short (`-A`/`-B`/`-C`/`-m`) consumes the rest of the cluster, so judging stops
+/// short (`-A`/`-B`/`-C`/`-m`/`-M`) consumes the rest of the cluster, so judging stops
 /// there. Scanning stops at the first `--` so `grep -- -v` searches the literal.
 fn first_unsupported_grep_flag(args: &[String]) -> Option<String> {
-    const BOOL_SHORTS: &[u8] = b"iwFlnrRHh"; // supported value-less shorts (+ -h help)
-    const VALUE_SHORTS: &[u8] = b"ABCm"; // shorts that take a value (consume the tail)
+    const BOOL_SHORTS: &[u8] = b"iwFlnrRHhc"; // supported value-less shorts (+ -h help)
+    const VALUE_SHORTS: &[u8] = b"ABCmMtg"; // shorts that take a value (consume the tail)
     for a in args {
         if a == "--" {
             break;
@@ -2014,6 +2027,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         pattern, paths, json: json_mode,
         ignore_case, word_regexp, fixed_strings, max_count,
         files_with_matches, context, after_context, before_context,
+        max_columns, count: count_mode, file_type, glob,
         // -n/-r/-R/-H: accepted for grep muscle-memory parity, all no-ops here
         // (line numbers, recursion, and filenames are already the default).
         line_number: _, recursive: _, with_filename: _,
@@ -2025,7 +2039,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         if json_mode {
             println!("[]");
         }
-        eprintln!("Usage: code-graph-mcp grep <pattern> [paths...] [-i] [-w] [-F] [--max-count N] [--json]");
+        eprintln!("Usage: code-graph-mcp grep <pattern> [paths...] [-i] [-w] [-F] [-c] [-t TYPE] [-g GLOB] [-m N] [-M N] [--json]");
         grep_exit(2);
     }
 
@@ -2055,6 +2069,13 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         // -l: plain one-path-per-line output (rg stops at the first match per
         // file); context flags are meaningless here, like grep, and ignored.
         rg_cmd.arg("-l");
+    } else if count_mode {
+        // -c: ripgrep --count prints `path:N` (matching LINES per file, listing
+        // only files with ≥1 match). The per-file --max-count cap is intentionally
+        // NOT applied so the count is exhaustive; context flags don't apply.
+        // --with-filename forces the `path:` prefix even for a single file (rg
+        // omits it otherwise, like `grep -c`), so the `path:N` parse is uniform.
+        rg_cmd.arg("--count").arg("--with-filename");
     } else {
         rg_cmd.arg("--json").arg("-n");
         if let Some(n) = context {
@@ -2078,6 +2099,15 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     }
     if fixed_strings {
         rg_cmd.arg("-F");
+    }
+    // Scope filters (apply to every mode): --type by language, --glob by path.
+    // rg validates a --type name and errors (exit 2) on an unknown one, surfaced
+    // like any other rg error below.
+    if let Some(ref t) = file_type {
+        rg_cmd.arg("--type").arg(t);
+    }
+    for g in &glob {
+        rg_cmd.arg("--glob").arg(g);
     }
     // `--` so leading-dash patterns (e.g. searching for "--no-default-features")
     // reach rg as the pattern instead of being parsed as flags.
@@ -2167,6 +2197,48 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             } else {
                 for f in &files {
                     writeln!(stdout, "{}", f)?;
+                }
+            }
+            Ok(())
+        })();
+        match write_result {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => grep_exit(0),
+            other => other?,
+        }
+        return Ok(());
+    }
+
+    // -c mode: rg --count printed `path:N` per file with a match; relativize and
+    // pass through. No AST annotation (like -l); the count is exhaustive.
+    if count_mode {
+        let root_str = project_root.to_string_lossy().into_owned();
+        let counts: Vec<(String, u64)> = String::from_utf8_lossy(&rg_output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .filter_map(|l| {
+                let (path, n) = l.rsplit_once(':')?;
+                Some((relativize_path(path, &root_str).to_string(), n.trim().parse().ok()?))
+            })
+            .collect();
+        if counts.is_empty() {
+            if json_mode {
+                println!("[]");
+            }
+            eprintln!("[code-graph] No matches for: {}", pattern);
+            grep_exit(1);
+        }
+        let write_result: std::io::Result<()> = (|| {
+            let mut stdout = std::io::stdout().lock();
+            if json_mode {
+                let arr: Vec<_> = counts
+                    .iter()
+                    .map(|(f, n)| serde_json::json!({ "file": f, "count": n }))
+                    .collect();
+                let serialized = serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string());
+                writeln!(stdout, "{}", serialized)?;
+            } else {
+                for (f, n) in &counts {
+                    writeln!(stdout, "{}:{}", f, n)?;
                 }
             }
             Ok(())
@@ -2290,11 +2362,16 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         if json_mode {
             let mut json_results = Vec::new();
             for m in &matches {
+                let (text, line_omitted) = truncate_columns(&m.text, max_columns);
                 let mut entry = serde_json::json!({
                     "file": m.file,
                     "line": m.line,
-                    "text": m.text,
+                    "text": text,
                 });
+                if let Some(omitted) = line_omitted {
+                    // chars dropped by the -M/--max-columns width cap
+                    entry["line_truncated"] = serde_json::json!(omitted);
+                }
                 if m.is_context {
                     entry["context"] = serde_json::json!(true);
                 } else {
@@ -2333,10 +2410,12 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                     prev = Some((m.file.clone(), m.line));
                 }
                 let sep = if m.is_context { '-' } else { ':' };
-                write!(stdout, "{}{}{}  {}", m.file, sep, m.line, m.text)?;
-                if !m.text.ends_with('\n') {
-                    writeln!(stdout)?;
+                let (text, line_omitted) = truncate_columns(&m.text, max_columns);
+                write!(stdout, "{}{}{}  {}", m.file, sep, m.line, text)?;
+                if let Some(omitted) = line_omitted {
+                    write!(stdout, " … [+{} chars]", omitted)?;
                 }
+                writeln!(stdout)?;
                 if !m.is_context {
                     if let Some((node_type, name, start, end, stale)) =
                         lookup_container(&m.file, m.line)
@@ -2428,6 +2507,25 @@ fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
         });
     }
     matches
+}
+
+/// Truncate a line to `max_cols` characters for display (0 = no limit). Returns
+/// the line without its trailing newline plus the number of characters omitted
+/// (`None` if untouched). Counts characters, not bytes, so multibyte UTF-8 is
+/// never split mid-codepoint — keeps one long minified/generated line from
+/// flooding output (and an agent's context).
+fn truncate_columns(line: &str, max_cols: u64) -> (String, Option<usize>) {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    if max_cols == 0 {
+        return (line.to_string(), None);
+    }
+    let max = max_cols as usize;
+    let total = line.chars().count();
+    if total <= max {
+        return (line.to_string(), None);
+    }
+    let kept: String = line.chars().take(max).collect();
+    (kept, Some(total - max))
 }
 
 /// Find the innermost AST node containing the given line (from pre-loaded nodes).
@@ -6804,6 +6902,8 @@ mod tests {
         // (the same allow_hyphen_values quirk forces the peel — see the fn doc).
         assert_eq!(normalize_grep_argv(s(&["grep", "-m2", "pat"])), s(&["grep", "-m", "2", "pat"]));
         assert_eq!(normalize_grep_argv(s(&["grep", "-nm2", "pat"])), s(&["grep", "-nm", "2", "pat"]));
+        // `-M` (`--max-columns`) is also a numeric value short → attached splits.
+        assert_eq!(normalize_grep_argv(s(&["grep", "-M512", "pat"])), s(&["grep", "-M", "512", "pat"]));
         // Digit-suffix on an unsupported short (`-z2`) is left alone.
         assert_eq!(normalize_grep_argv(s(&["grep", "-z2", "pat"])), s(&["grep", "-z2", "pat"]));
         // Non-digit tail (`-A2x`) is not a valid attached form → left alone.
@@ -6817,7 +6917,7 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // Common grep flags we don't implement are flagged (would otherwise be
         // swallowed as the pattern → cryptic "No such file").
-        for bad in ["-v", "-c", "-o", "-e", "-P", "-x", "-nv"] {
+        for bad in ["-v", "-o", "-e", "-P", "-x", "-nv"] {
             assert_eq!(
                 first_unsupported_grep_flag(&s(&["grep", bad, "pat"])).as_deref(),
                 Some(bad),
@@ -6825,8 +6925,9 @@ mod tests {
             );
         }
         // Supported shorts (incl. bundles + attached/standalone value shorts) pass.
+        // -c (count), -t (type), -g (glob), -M (max-columns) were added in v0.79.
         for ok in ["-i", "-w", "-F", "-l", "-n", "-r", "-R", "-H", "-A2", "-nA2",
-                   "-niB3", "-C", "-m", "-m5", "-iw"] {
+                   "-niB3", "-C", "-m", "-m5", "-iw", "-c", "-t", "-g", "-M", "-M512"] {
             assert_eq!(
                 first_unsupported_grep_flag(&s(&["grep", ok, "pat"])),
                 None,

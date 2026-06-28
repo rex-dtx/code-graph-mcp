@@ -59,7 +59,7 @@ function buildTriggerRows(projectType = 'generic') {
     ['Unfamiliar dir / module', '`code-graph-mcp overview <dir>`'],
     ['Symbol source / signature', '`code-graph-mcp show X`'],
     ['Concept search (no exact name)', '`code-graph-mcp search "…"` (vector: MCP `semantic_code_search`)'],
-    ['grep + AST context', '`code-graph-mcp grep "pat" [paths]`'],
+    ['grep + AST context', '`code-graph-mcp grep "pat" [paths] [-t lang] [-g glob] [-c]`'],
   ];
   switch (projectType) {
     case 'web-rs':

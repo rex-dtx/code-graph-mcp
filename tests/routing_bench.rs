@@ -91,7 +91,7 @@ structural queries (LSP only sees open files; this sees everything). Fastest pat
 | Unfamiliar dir / module | `code-graph-mcp overview <dir>` |
 | Symbol source / signature | `code-graph-mcp show X` |
 | Concept search (no exact name) | `code-graph-mcp search "…"` (vector: MCP `semantic_code_search`) |
-| grep + AST context | `code-graph-mcp grep "pat" [paths]` |
+| grep + AST context | `code-graph-mcp grep "pat" [paths] [-t lang] [-g glob] [-c]` |
 
 Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
 Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`

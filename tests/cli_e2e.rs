@@ -810,7 +810,7 @@ fn test_cli_grep_unsupported_flag_clear_error() {
     // fail with a clear "unsupported flag" message + exit 2, NOT bind as the
     // pattern and emit a cryptic "No such file: <next-arg>" (allow_hyphen_values
     // trap, same class as the -A2/-n parity fixes).
-    for bad in ["-v", "-c", "-o"] {
+    for bad in ["-v", "-o", "-e"] {
         let (_, stderr, code) = run_cli(&project, &["grep", bad, "validateToken"]);
         assert_eq!(code, 2, "{bad} must exit 2; stderr={stderr}");
         assert!(stderr.contains("unsupported flag"), "{bad}: clear message expected, got: {stderr}");
@@ -849,6 +849,85 @@ fn test_cli_grep_json_truncated_marker() {
     let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
     assert!(v2.as_array().unwrap().iter().all(|e| e.get("truncated").is_none()),
         "no cap → no truncated marker, got: {stdout2}");
+}
+
+#[test]
+fn test_cli_grep_type_filter() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    std::fs::write(project.path().join("probe.rs"), "fn x() { NEEDLE }\n").unwrap();
+    std::fs::write(project.path().join("probe.md"), "doc NEEDLE here\n").unwrap();
+    // -t rust restricts to ripgrep's `rust` type (*.rs), excluding the md hit.
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "-t", "rust", "NEEDLE"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("probe.rs"), "should hit the rust file, got: {stdout}");
+    assert!(!stdout.contains("probe.md"), "must exclude non-rust, got: {stdout}");
+    // An unknown type is an rg error (exit 2), surfaced not swallowed.
+    let (_, _, code_bad) = run_cli(&project, &["grep", "-t", "nosuchtype", "NEEDLE"]);
+    assert_eq!(code_bad, 2, "unknown --type must error");
+}
+
+#[test]
+fn test_cli_grep_glob_filter() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    std::fs::write(project.path().join("probe.rs"), "fn x() { NEEDLE }\n").unwrap();
+    std::fs::write(project.path().join("probe.md"), "doc NEEDLE here\n").unwrap();
+    // include-glob: only *.md
+    let (inc, _, code) = run_cli(&project, &["grep", "-g", "*.md", "NEEDLE"]);
+    assert_eq!(code, 0);
+    assert!(inc.contains("probe.md") && !inc.contains("probe.rs"), "include glob, got: {inc}");
+    // exclude-glob: drop *.md
+    let (exc, _, code2) = run_cli(&project, &["grep", "-g", "!*.md", "NEEDLE"]);
+    assert_eq!(code2, 0);
+    assert!(exc.contains("probe.rs") && !exc.contains("probe.md"), "exclude glob, got: {exc}");
+}
+
+#[test]
+fn test_cli_grep_count_mode() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    std::fs::write(project.path().join("many.txt"), "needle\n".repeat(150)).unwrap();
+    // -c prints file:count and is exhaustive — it ignores the default per-file
+    // cap of 100 (150 > 100), unlike content mode.
+    let (stdout, _, code) = run_cli(&project, &["grep", "-c", "needle", "many.txt"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("many.txt") && stdout.trim().ends_with(":150"),
+        "exhaustive count expected, got: {stdout}");
+    // --json count shape: [{file, count}]
+    let (j, _, cj) = run_cli(&project, &["grep", "-c", "needle", "many.txt", "--json"]);
+    assert_eq!(cj, 0);
+    let v: serde_json::Value = serde_json::from_str(j.trim()).unwrap();
+    assert_eq!(v[0]["file"], "many.txt");
+    assert_eq!(v[0]["count"], 150);
+    // no match → exit 1 + [] (JSON contract)
+    let (je, _, ce) = run_cli(&project, &["grep", "-c", "zzz_nothing", "many.txt", "--json"]);
+    assert_eq!(ce, 1);
+    assert_eq!(je.trim(), "[]");
+}
+
+#[test]
+fn test_cli_grep_max_columns() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    let long = format!("NEEDLE_{}", "x".repeat(1000)); // 1007 chars
+    std::fs::write(project.path().join("long.txt"), format!("{long}\n")).unwrap();
+    // Default -M 512: the 1007-char line is truncated with a marker.
+    let (stdout, _, code) = run_cli(&project, &["grep", "NEEDLE", "long.txt"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("NEEDLE"), "match still shown, got len {}", stdout.len());
+    assert!(stdout.contains("[+") && stdout.contains("chars]"), "truncation marker, got len {}", stdout.len());
+    let maxlen = stdout.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    assert!(maxlen < 1007, "emitted line must be capped, got max {maxlen}");
+    // -M 0 disables the cap — full line present.
+    let (full, _, codef) = run_cli(&project, &["grep", "-M", "0", "NEEDLE", "long.txt"]);
+    assert_eq!(codef, 0);
+    assert!(full.contains(&long), "-M 0 must show the full line");
+    // --json marks the omitted char count.
+    let (jc, _, cj) = run_cli(&project, &["grep", "NEEDLE", "long.txt", "--json"]);
+    assert_eq!(cj, 0);
+    let v: serde_json::Value = serde_json::from_str(jc.trim()).unwrap();
+    assert!(v[0]["line_truncated"].as_u64().unwrap_or(0) > 0, "line_truncated expected, got: {jc}");
 }
 
 #[test]
