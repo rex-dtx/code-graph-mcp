@@ -7,7 +7,14 @@ use std::sync::mpsc;
 /// Check if a file system event kind represents a content change (not just metadata/access).
 fn is_content_event(kind: &EventKind) -> bool {
     matches!(kind,
-        EventKind::Create(_)
+        // Bare top-level catch-alls: a degraded/poll backend may report a real
+        // content change as Any/Other rather than a specific kind. Treat them as
+        // content — an active watcher that silently drops them strands the index
+        // stale (ensure_indexed skips the merkle rescan while a watcher is
+        // trusted). Over-triggering is safe: the merkle rescan is idempotent.
+        EventKind::Any
+        | EventKind::Other
+        | EventKind::Create(_)
         | EventKind::Remove(_)
         | EventKind::Modify(ModifyKind::Data(_))
         | EventKind::Modify(ModifyKind::Name(_))
@@ -125,5 +132,35 @@ mod tests {
         assert!(!events.is_empty());
 
         drop(watcher);
+    }
+
+    #[test]
+    fn test_is_content_event_treats_unknown_kinds_as_content() {
+        use notify::event::{
+            AccessKind, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode,
+        };
+
+        // Bare catch-all variants: a degraded/poll backend may report a real
+        // content change as a top-level Any/Other instead of a specific kind.
+        // These MUST count as content. Dropping them strands the index stale:
+        // `ensure_indexed` trusts an active watcher and skips the merkle rescan
+        // whenever it reports no events, so a silently-blind watcher never
+        // self-heals (the no-watcher debounce fallback does not apply when a
+        // watcher is active). Over-triggering is safe — the merkle rescan is
+        // idempotent.
+        assert!(is_content_event(&EventKind::Any), "bare EventKind::Any must count as content");
+        assert!(is_content_event(&EventKind::Other), "bare EventKind::Other must count as content");
+
+        // Specific content kinds remain detected.
+        assert!(is_content_event(&EventKind::Create(CreateKind::Any)));
+        assert!(is_content_event(&EventKind::Remove(RemoveKind::Any)));
+        assert!(is_content_event(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(is_content_event(&EventKind::Modify(ModifyKind::Name(RenameMode::Any))));
+        assert!(is_content_event(&EventKind::Modify(ModifyKind::Any)));
+
+        // Metadata/access-only events stay excluded — we did not over-broaden to
+        // "every event". A chmod/xattr or atime touch must not trigger a rescan.
+        assert!(!is_content_event(&EventKind::Access(AccessKind::Any)));
+        assert!(!is_content_event(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))));
     }
 }
