@@ -71,13 +71,33 @@ function runProvider(command, needsStdin, stdin) {
     // swallowed below, silently dropping the user's original statusline.
     const argv = parts.map(expandTilde);
 
+    // Forward Claude Code's authoritative current dir (from the stdin payload) as
+    // an env var. The code-graph provider gates on it instead of its own
+    // process.cwd(), which need not track the session's working dir. Harmless to
+    // `_previous`/third-party providers, which ignore the unknown var.
+    const cwd = cwdFromStdin(stdin);
+    const env = cwd ? { ...process.env, CLAUDE_STATUSLINE_CWD: cwd } : process.env;
+
     const out = execFileSync(argv[0], argv.slice(1), {
       timeout: 3000,
       stdio: ['pipe', 'pipe', 'pipe'],
       input: needsStdin ? stdin : '',
+      env,
     }).toString().trim();
 
     return out || null;
+  } catch { return null; }
+}
+
+// Extract Claude Code's current working directory from the stdin JSON context.
+// Prefer the top-level `cwd`, then `workspace.current_dir`; both track the
+// session's working dir (after the model runs `cd`). Returns null for empty,
+// non-JSON, or cwd-less payloads (e.g. the stdin-timeout fallback passes '').
+function cwdFromStdin(stdin) {
+  if (!stdin) return null;
+  try {
+    const ctx = JSON.parse(stdin);
+    return (ctx && (ctx.cwd || (ctx.workspace && ctx.workspace.current_dir))) || null;
   } catch { return null; }
 }
 
@@ -109,4 +129,4 @@ function codeGraphCommand() {
   return `node "${path.join(__dirname, 'statusline.js')}"`;
 }
 
-module.exports = { run, runProvider, parseCommand, expandTilde };
+module.exports = { run, runProvider, parseCommand, expandTilde, cwdFromStdin };
