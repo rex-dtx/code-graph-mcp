@@ -331,8 +331,9 @@ fn print_help() {
     println!("    incremental-index   Run incremental index update");
     println!("    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)");
     println!("    reindex [--from-snapshot]");
-    println!("                        Reset index; with --from-snapshot, refetches the");
-    println!("                        published snapshot (else falls back to full index)");
+    println!("                        Incremental index refresh. With --from-snapshot, drop the");
+    println!("                        index and refetch the published snapshot (full rebuild if");
+    println!("                        unavailable). For an unconditional rebuild use rebuild-index.");
     println!("    health-check        Query index status");
     println!("                        (Note: file watcher start/stop is MCP-only — see start_watch/stop_watch tools)");
     println!("    doctor              Diagnose and repair environment issues");

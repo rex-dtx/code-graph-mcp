@@ -2671,7 +2671,10 @@ fn test_cli_incremental_index_unknown_flag_errors() {
 
 #[test]
 fn test_cli_reindex_runs() {
-    // Plain `reindex` (no --from-snapshot) resets + re-indexes via cmd_incremental_index.
+    // Plain `reindex` (no --from-snapshot) is an incremental refresh via
+    // cmd_incremental_index — it does NOT drop the index (only --from-snapshot
+    // does). rebuild-index is the unconditional rebuild. Asserting the
+    // "Incremental index:" banner pins that contract against the help text.
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["reindex"]);
     assert_eq!(code, 0, "reindex should run to completion; stderr={stderr:?}");

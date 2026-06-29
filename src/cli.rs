@@ -6096,7 +6096,7 @@ pub fn cmd_snapshot_inspect(args: SnapshotInspectArgs) -> Result<()> {
 /// CLI arguments for the `reindex` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
 #[command(name = "code-graph-mcp reindex",
-          about = "Reset index; with --from-snapshot, refetch the published snapshot")]
+          about = "Incremental index refresh; --from-snapshot drops the index and refetches the published snapshot (rebuild-index for an unconditional rebuild)")]
 pub struct ReindexArgs {
     /// Refetch the published snapshot before indexing (falls back to full index)
     #[arg(long)]
