@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 /// cg PULL tools whose results are relevance-ordered → rank is meaningful.
-const RANKED_TOOLS: &[&str] = &["semantic_code_search", "ast_search"];
+pub const RANKED_TOOLS: &[&str] = &["semantic_code_search", "ast_search"];
 
 /// If `name` is a code-graph MCP tool_use name (`mcp__code-graph[-dev]__<tool>`),
 /// return the bare `<tool>` when it is one of the known cg query tools. The server
@@ -81,5 +81,19 @@ mod tests {
         assert!(paths_match("src/outcome.rs", "/x/src/outcome.rs"));
         assert!(!paths_match("src/outcome.rs", "/x/src/cli.rs"));
         assert!(!paths_match("", "/x/y"));
+    }
+
+    #[test]
+    fn transcript_dir_joins_claude_projects() {
+        assert_eq!(
+            transcript_dir(std::path::Path::new("/a/b"), std::path::Path::new("/home/u")),
+            std::path::PathBuf::from("/home/u/.claude/projects/-a-b")
+        );
+    }
+
+    #[test]
+    fn paths_match_when_returned_is_the_longer_path() {
+        // returned absolute, touched relative — exercises the (long, short) swap
+        assert!(paths_match("/x/src/outcome.rs", "src/outcome.rs"));
     }
 }
