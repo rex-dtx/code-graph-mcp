@@ -47,6 +47,54 @@ pub fn paths_match(returned: &str, touched: &str) -> bool {
     long[long.len() - short.len()..] == short[..]
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnedItem {
+    pub file_path: String,
+    pub rank: Option<usize>,
+}
+
+/// Extract the returned files from a cg tool_result payload. Ranked-list tools
+/// (`ranked == true`) return a top-level JSON array → array index is the rank.
+/// Structural tools return a nested object/tree → recursively collect every
+/// `file_path`/`file`/`path` string value, rank = None. Robust to per-tool shape.
+pub fn extract_returned(payload: &serde_json::Value, ranked: bool) -> Vec<ReturnedItem> {
+    if ranked {
+        if let Some(arr) = payload.as_array() {
+            return arr.iter().enumerate().filter_map(|(i, el)| {
+                file_path_field(el).map(|fp| ReturnedItem { file_path: fp, rank: Some(i) })
+            }).collect();
+        }
+    }
+    let mut out = Vec::new();
+    collect_file_paths(payload, &mut out);
+    out
+}
+
+/// First of `file_path` / `file` / `path` that is a non-empty string.
+fn file_path_field(v: &serde_json::Value) -> Option<String> {
+    for key in ["file_path", "file", "path"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            if !s.is_empty() { return Some(s.to_string()); }
+        }
+    }
+    None
+}
+
+fn collect_file_paths(v: &serde_json::Value, out: &mut Vec<ReturnedItem>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(fp) = file_path_field(v) {
+                out.push(ReturnedItem { file_path: fp, rank: None });
+            }
+            for (_, val) in map { collect_file_paths(val, out); }
+        }
+        serde_json::Value::Array(arr) => {
+            for el in arr { collect_file_paths(el, out); }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +143,39 @@ mod tests {
     fn paths_match_when_returned_is_the_longer_path() {
         // returned absolute, touched relative — exercises the (long, short) swap
         assert!(paths_match("/x/src/outcome.rs", "src/outcome.rs"));
+    }
+
+    #[test]
+    fn extract_ranked_array_assigns_index_rank() {
+        let payload = serde_json::json!([
+            {"file_path": "a/b.rs", "relevance": 0.9, "name": "f"},
+            {"file_path": "c/d.rs", "relevance": 0.5, "name": "g"}
+        ]);
+        let items = extract_returned(&payload, true);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].file_path, "a/b.rs");
+        assert_eq!(items[0].rank, Some(0));
+        assert_eq!(items[1].rank, Some(1));
+    }
+
+    #[test]
+    fn extract_structural_tree_collects_paths_without_rank() {
+        // callgraph-style nested payload: file_path values buried in callers/callees.
+        let payload = serde_json::json!({
+            "symbol": "foo",
+            "callers": [{"name": "x", "file_path": "src/x.rs"}],
+            "callees": [{"name": "y", "file": "src/y.rs"}]
+        });
+        let items = extract_returned(&payload, false);
+        let paths: Vec<&str> = items.iter().map(|i| i.file_path.as_str()).collect();
+        assert!(paths.contains(&"src/x.rs"));
+        assert!(paths.contains(&"src/y.rs"));
+        assert!(items.iter().all(|i| i.rank.is_none()));
+    }
+
+    #[test]
+    fn extract_handles_empty_and_garbage() {
+        assert!(extract_returned(&serde_json::json!([]), true).is_empty());
+        assert!(extract_returned(&serde_json::json!("oops"), true).is_empty());
     }
 }
