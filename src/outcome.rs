@@ -194,11 +194,26 @@ fn tool_result_text(content: &serde_json::Value) -> Option<String> {
 fn detect_cli_cg_call(cmd: &str) -> Option<&'static str> {
     let toks: Vec<&str> = cmd.split_whitespace().collect();
     for (i, t) in toks.iter().enumerate() {
-        if *t == "code-graph-mcp" || t.ends_with("/code-graph-mcp") {
-            if let Some(sub) = toks.get(i + 1) {
-                if let Some(canon) = crate::cli::canonical_query_cmd(sub) {
-                    return Some(canon);
-                }
+        let is_bin = *t == "code-graph-mcp" || t.ends_with("/code-graph-mcp");
+        if !is_bin {
+            continue;
+        }
+        // Command-position guard: the binary must begin a command — token 0, or
+        // right after a shell separator. Excludes mid-command mentions in echo /
+        // commit messages / comments (`echo code-graph-mcp grep`, `git commit -m
+        // "… code-graph-mcp grep …"`). Best-effort: forms like `env X=Y
+        // code-graph-mcp …` or `$(code-graph-mcp …)` are conservatively skipped.
+        let prev_is_separator = i > 0
+            && (matches!(toks[i - 1], "&&" | "||" | "|" | ";" | "&")
+                || toks[i - 1].ends_with(';')
+                || toks[i - 1].ends_with('&')
+                || toks[i - 1].ends_with('|'));
+        if i != 0 && !prev_is_separator {
+            continue;
+        }
+        if let Some(sub) = toks.get(i + 1) {
+            if let Some(canon) = crate::cli::canonical_query_cmd(sub) {
+                return Some(canon);
             }
         }
     }
@@ -921,6 +936,25 @@ mod tests {
         assert_eq!(summary.adopted, 1);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].adopted);
+    }
+
+    #[test]
+    fn detect_rejects_non_head_code_graph_mcp_mentions() {
+        // mid-command mentions (echo / commit message / comment) are NOT cg calls
+        assert_eq!(detect_cli_cg_call("echo code-graph-mcp grep foo"), None);
+        assert_eq!(detect_cli_cg_call("git commit -m \"fix code-graph-mcp grep parsing\""), None);
+        // real invocations still detected: at head, after `&&`, and head-then-pipe
+        assert_eq!(detect_cli_cg_call("code-graph-mcp callgraph Foo"), Some("callgraph"));
+        assert_eq!(detect_cli_cg_call("cd be && code-graph-mcp search x"), Some("search"));
+        assert_eq!(detect_cli_cg_call("code-graph-mcp grep p | head"), Some("grep"));
+    }
+
+    #[test]
+    fn parse_cli_cg_call_without_result_increments_unresolved() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"x1","name":"Bash","input":{"command":"code-graph-mcp callgraph Foo"}}]}}"#;
+        let p = parse_transcript(&format!("{call}\n"));
+        assert_eq!(p.events.len(), 0);
+        assert_eq!(p.unresolved, 1);
     }
 
     #[test]
