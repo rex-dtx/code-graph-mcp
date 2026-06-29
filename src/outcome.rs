@@ -291,6 +291,7 @@ mod tests {
         }
         assert!(matches!(&p.events[1], Event::FileTouch { path } if path == "/proj/src/auth.rs"));
         assert_eq!(p.first_ts.as_deref(), Some("2026-06-29T10:00:00Z"));
+        assert_eq!(p.last_ts.as_deref(), Some("2026-06-29T10:01:00Z"));
     }
 
     #[test]
@@ -305,5 +306,36 @@ mod tests {
     fn parse_skips_malformed_lines() {
         let p = parse_transcript("not json\n{}\n");
         assert_eq!(p.events.len(), 0);
+    }
+
+    #[test]
+    fn parse_counts_unparseable_result_payload() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"mcp__code-graph-dev__semantic_code_search","input":{"query":"q"}}]}}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"not valid json"}]}]}}"#;
+        let p = parse_transcript(&format!("{call}\n{result}\n"));
+        assert_eq!(p.unparseable, 1);
+        assert_eq!(p.unresolved, 0);
+        assert!(p.events.iter().all(|e| !matches!(e, Event::CgCall { .. })));
+    }
+
+    #[test]
+    fn parse_classifies_bash_grep_as_raw_grep() {
+        let bash = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"rg some_fn src/"}}]}}"#;
+        let p = parse_transcript(&format!("{bash}\n"));
+        assert_eq!(p.events.len(), 1);
+        assert!(matches!(&p.events[0], Event::RawGrep));
+    }
+
+    #[test]
+    fn parse_handles_bare_string_tool_result_content() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"mcp__code-graph-dev__semantic_code_search","input":{"query":"q"}}]}}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"[{\"file_path\":\"src/a.rs\"}]"}]}}"#;
+        let p = parse_transcript(&format!("{call}\n{result}\n"));
+        assert_eq!(p.unresolved, 0);
+        assert_eq!(p.unparseable, 0);
+        match &p.events[0] {
+            Event::CgCall { returned, .. } => assert_eq!(returned[0].file_path, "src/a.rs"),
+            _ => panic!("expected CgCall"),
+        }
     }
 }
