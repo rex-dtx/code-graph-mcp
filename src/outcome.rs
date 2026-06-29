@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 /// cg PULL tools whose results are relevance-ordered → rank is meaningful.
-pub const RANKED_TOOLS: &[&str] = &["semantic_code_search", "ast_search"];
+pub const RANKED_TOOLS: &[&str] = &["semantic_code_search", "ast_search", "search_cli"];
 
 /// If `name` is a code-graph MCP tool_use name (`mcp__code-graph[-dev]__<tool>`),
 /// return the bare `<tool>` when it is one of the known cg query tools. The server
@@ -102,6 +102,56 @@ fn collect_file_paths(v: &serde_json::Value, out: &mut Vec<ReturnedItem>) {
         }
         _ => {}
     }
+}
+
+/// Extract file paths from cg CLI human output, where hits appear as `path:line`
+/// or `path:line-line` (e.g. `src/foo.rs:63`, `CHANGELOG.md:3708-3709`). Returns the
+/// path part of each `<path-like>:<digit>` token, in order WITH duplicates (caller
+/// dedupes). A path-like token contains `/` or `.` and ends just before the `:`.
+fn scan_path_line_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b':' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+                let mut start = i;
+                while start > 0 {
+                    let c = b[start - 1];
+                    if c == b'/' || c == b'.' || c == b'-' || c == b'_' || c.is_ascii_alphanumeric() {
+                        start -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                let token = &line[start..i];
+                if !token.is_empty() && (token.contains('/') || token.contains('.')) {
+                    out.push(token.to_string());
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Returned files from a model-initiated cg CLI call's stdout. JSON fast-path
+/// (model passed `--json` → same `{results}` shape as MCP); else scan human
+/// `path:line` tokens. Dedupe to unique paths in first-occurrence order; `ranked`
+/// → rank = first-occurrence index, else None.
+pub fn extract_returned_from_cli(stdout: &str, ranked: bool) -> Vec<ReturnedItem> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        return extract_returned(&v, ranked);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for path in scan_path_line_paths(stdout) {
+        if seen.insert(path.clone()) {
+            let rank = if ranked { Some(out.len()) } else { None };
+            out.push(ReturnedItem { file_path: path, rank });
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -683,6 +733,54 @@ mod tests {
         assert!(outs[0].adopted, "structural tool file should be adopted when touched");
         assert_eq!(outs[0].adopted_rank, None, "structural items carry no rank");
         assert!(!outs[0].ranked, "get_call_graph is not a ranked tool");
+    }
+
+    // ── Phase-2 CLI tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_extracts_path_line_tokens() {
+        // grep-style + search-style lines; path:line and path:line-line
+        let text = "src/a.rs:5  fn foo\nsrc/a.rs:9  bar\nh3 Title  CHANGELOG.md:3708-3709";
+        let paths = scan_path_line_paths(text);
+        assert_eq!(paths, vec!["src/a.rs", "src/a.rs", "CHANGELOG.md"]); // raw, with dups
+    }
+
+    #[test]
+    fn cli_extract_human_dedupes_first_occurrence() {
+        let stdout = "src/a.rs:5\nsrc/a.rs:9\nsrc/b.rs:2";
+        let items = extract_returned_from_cli(stdout, false);
+        let paths: Vec<&str> = items.iter().map(|i| i.file_path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]); // unique, first-occurrence order
+        assert!(items.iter().all(|i| i.rank.is_none()));
+    }
+
+    #[test]
+    fn cli_extract_ranked_assigns_index_rank() {
+        let stdout = "h3 A  x/a.rs:1-2\nh3 B  y/b.rs:3-4";
+        let items = extract_returned_from_cli(stdout, true);
+        assert_eq!(items[0].file_path, "x/a.rs");
+        assert_eq!(items[0].rank, Some(0));
+        assert_eq!(items[1].rank, Some(1));
+    }
+
+    #[test]
+    fn cli_extract_json_fast_path() {
+        let stdout = r#"{"results":[{"file_path":"src/z.rs"}]}"#;
+        let items = extract_returned_from_cli(stdout, true);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].file_path, "src/z.rs");
+        assert_eq!(items[0].rank, Some(0));
+    }
+
+    #[test]
+    fn cli_extract_no_paths_is_empty() {
+        assert!(extract_returned_from_cli("[code-graph] No call graph results for: foo", false).is_empty());
+    }
+
+    #[test]
+    fn search_cli_is_ranked() {
+        assert!(is_ranked_tool("search_cli"));
+        assert!(!is_ranked_tool("callgraph_cli"));
     }
 
     #[test]
