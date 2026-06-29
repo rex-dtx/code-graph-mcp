@@ -187,6 +187,64 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
     out
 }
 
+#[derive(Debug, Clone)]
+pub struct CallOutcome {
+    pub tool: String,
+    pub query: String,
+    pub returned_files: Vec<String>,
+    pub adopted: bool,
+    pub adopted_rank: Option<usize>,
+    pub ranked: bool,
+}
+
+pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
+    use std::collections::HashSet;
+    let mut touched_before: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for (i, ev) in events.iter().enumerate() {
+        match ev {
+            Event::FileTouch { path } => { touched_before.insert(path.clone()); }
+            Event::CgCall { tool, query, returned } => {
+                // Candidate returned files not already opened before this call.
+                let candidates: Vec<&ReturnedItem> = returned.iter()
+                    .filter(|it| !touched_before.iter().any(|t| paths_match(&it.file_path, t)))
+                    .collect();
+                // Forward scan until the next CgCall.
+                let mut best_rank: Option<usize> = None;
+                let mut adopted = false;
+                for ev2 in &events[i + 1..] {
+                    match ev2 {
+                        Event::CgCall { .. } => break,
+                        Event::FileTouch { path } => {
+                            for it in &candidates {
+                                if paths_match(&it.file_path, path) {
+                                    adopted = true;
+                                    best_rank = match (best_rank, it.rank) {
+                                        (None, r) => r,
+                                        (Some(b), Some(r)) => Some(b.min(r)),
+                                        (Some(b), None) => Some(b),
+                                    };
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out.push(CallOutcome {
+                    tool: tool.clone(),
+                    query: query.clone(),
+                    returned_files: returned.iter().map(|r| r.file_path.clone()).collect(),
+                    adopted,
+                    adopted_rank: best_rank,
+                    ranked: is_ranked_tool(tool),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +374,83 @@ mod tests {
         assert_eq!(p.unparseable, 1);
         assert_eq!(p.unresolved, 0);
         assert!(p.events.iter().all(|e| !matches!(e, Event::CgCall { .. })));
+    }
+
+    // ── score_session helpers ──────────────────────────────────────────────
+
+    fn cg(tool: &str, files: &[(&str, Option<usize>)]) -> Event {
+        Event::CgCall {
+            tool: tool.into(),
+            query: "q".into(),
+            returned: files.iter().map(|(f, r)| ReturnedItem { file_path: f.to_string(), rank: *r }).collect(),
+        }
+    }
+    fn touch(p: &str) -> Event { Event::FileTouch { path: p.into() } }
+
+    #[test]
+    fn adopted_when_forward_edit_hits_returned_untouched_file() {
+        let events = vec![
+            cg("semantic_code_search", &[("src/a.rs", Some(0)), ("src/b.rs", Some(1))]),
+            touch("/proj/src/b.rs"),
+        ];
+        let outs = score_session(&events);
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].adopted);
+        assert_eq!(outs[0].adopted_rank, Some(1));
+    }
+
+    #[test]
+    fn not_adopted_when_file_touched_before_the_call() {
+        let events = vec![
+            touch("/proj/src/a.rs"),
+            cg("semantic_code_search", &[("src/a.rs", Some(0))]),
+            touch("/proj/src/a.rs"),
+        ];
+        let outs = score_session(&events);
+        assert!(!outs[0].adopted, "a.rs was already open before the call");
+    }
+
+    #[test]
+    fn window_stops_at_next_cg_call() {
+        let events = vec![
+            cg("ast_search", &[("src/a.rs", Some(0))]),
+            cg("ast_search", &[("src/z.rs", Some(0))]),
+            touch("/proj/src/a.rs"), // after the 2nd call → not credited to the 1st
+        ];
+        let outs = score_session(&events);
+        assert!(!outs[0].adopted); // a.rs touched after call 2 — outside call 1's window
+        assert!(!outs[1].adopted); // call 2 returned z.rs; only a.rs was touched
+    }
+
+    #[test]
+    fn best_rank_is_lowest_when_multiple_returned_items_are_touched() {
+        // rank 2 and rank 0 both touched → adopted_rank should be Some(0) (the lower)
+        let events = vec![
+            cg("semantic_code_search", &[
+                ("src/a.rs", Some(2)),
+                ("src/b.rs", Some(0)),
+                ("src/c.rs", Some(5)),
+            ]),
+            touch("/proj/src/a.rs"),
+            touch("/proj/src/b.rs"),
+        ];
+        let outs = score_session(&events);
+        assert!(outs[0].adopted);
+        assert_eq!(outs[0].adopted_rank, Some(0), "lowest rank among touched items wins");
+    }
+
+    #[test]
+    fn structural_tool_adopted_with_no_rank() {
+        // get_call_graph is NOT ranked — returned items have rank: None
+        // touching a returned file should still mark adopted=true; adopted_rank stays None
+        let events = vec![
+            cg("get_call_graph", &[("src/graph.rs", None), ("src/storage.rs", None)]),
+            touch("/proj/src/graph.rs"),
+        ];
+        let outs = score_session(&events);
+        assert!(outs[0].adopted, "structural tool file should be adopted when touched");
+        assert_eq!(outs[0].adopted_rank, None, "structural items carry no rank");
+        assert!(!outs[0].ranked, "get_call_graph is not a ranked tool");
     }
 
     #[test]
