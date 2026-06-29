@@ -268,15 +268,56 @@ impl Database {
         // destroys the index is the daagu failure (a status poll wiped it to 0
         // nodes and, with no MCP server running in that project, nothing rebuilt
         // it). Readers instead flag staleness and leave the data intact.
+        // INDEX_VERSION lives in the application_id pragma. The comparison is
+        // DIRECTIONAL, not symmetric (the bare `stored != INDEX_VERSION` it replaced
+        // wiped in both directions, which let an older binary clobber a newer index):
+        //
+        //   stored < current  → UPGRADE: the stored index was built by an OLDER
+        //     binary and is genuinely stale. An INDEXER open (revalidate=true) clears
+        //     it so the rebuild it is about to run starts clean; a READER open
+        //     (revalidate=false: health-check, grep, …) must NOT clear — a passive
+        //     consumer that destroys the index is the daagu failure (a status poll
+        //     wiped it to 0 nodes and, with no MCP server running, nothing rebuilt
+        //     it). Readers flag staleness and leave the data intact.
+        //
+        //   stored > current  → DOWNGRADE: the stored index was built by a NEWER
+        //     binary. An older binary must NEVER wipe it — that is the destructive
+        //     half of the version ping-pong (a stale old server clobbering the index
+        //     a current binary just built; the two then wipe each other on every
+        //     open → 0 nodes, never stable). Leave the data AND application_id intact
+        //     so the newer binary stays the owner; flag staleness and, on an
+        //     indexer/server-startup open, warn on stderr. A genuine permanent
+        //     downgrade still rebuilds by deleting .code-graph/index.db* first (fresh
+        //     DB → application_id 0 → this binary stamps its own version cleanly).
         let stored_index_version: i32 = conn.pragma_query_value(None, "application_id", |row| row.get(0))?;
-        let version_mismatch =
-            stored_index_version != 0 && stored_index_version != crate::domain::INDEX_VERSION;
+        let current_index_version = crate::domain::INDEX_VERSION;
+        let is_downgrade = stored_index_version > current_index_version;
         let mut index_version_stale = None;
-        if version_mismatch {
-            if revalidate {
+        let mut wiped = false;
+        if stored_index_version != 0 && stored_index_version != current_index_version {
+            if is_downgrade {
+                // Older binary, newer index: refuse to clobber it (reader OR indexer).
+                index_version_stale = Some(stored_index_version);
+                tracing::warn!(
+                    "[index] index built by a newer code-graph (v{} > binary v{}); leaving it intact, not rebuilding",
+                    stored_index_version, current_index_version
+                );
+                if revalidate {
+                    // Only the indexer/server-startup path warns on stderr — readers
+                    // (the statusline health-check polls every few seconds) would
+                    // otherwise spam it. CLI/MCP install no tracing subscriber
+                    // (feedback_tracing_invisible_in_cli.md), so double-write here.
+                    eprintln!(
+                        "[code-graph] Index was built by a NEWER code-graph (v{} > this binary v{}): \
+not rebuilding — an older binary must not clobber a newer index. Restart all code-graph servers on one \
+version, or update this binary. To force a rebuild at this older version, delete .code-graph/index.db* first.",
+                        stored_index_version, current_index_version
+                    );
+                }
+            } else if revalidate {
                 tracing::info!(
                     "[index] Index version changed ({} → {}), clearing stale data for rebuild",
-                    stored_index_version, crate::domain::INDEX_VERSION
+                    stored_index_version, current_index_version
                 );
                 // Double-write to stderr: the CLI/MCP startup paths install no tracing
                 // subscriber (feedback_tracing_invisible_in_cli.md), so the tracing line
@@ -289,7 +330,7 @@ impl Database {
                 eprintln!(
                     "[code-graph] Index version mismatch (stored v{} ≠ binary v{}): clearing + rebuilding. \
 If you see this repeatedly, another code-graph server of a different version is sharing this index — restart all servers so they run one version.",
-                    stored_index_version, crate::domain::INDEX_VERSION
+                    stored_index_version, current_index_version
                 );
                 conn.execute_batch(
                     "BEGIN; DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; COMMIT;"
@@ -305,19 +346,21 @@ If you see this repeatedly, another code-graph server of a different version is 
                 if let Err(e) = conn.execute_batch("VACUUM;") {
                     tracing::warn!("[index] post-sweep VACUUM skipped: {}", e);
                 }
+                wiped = true;
             } else {
-                // Reader/observability open: leave the data alone, just surface the
-                // mismatch so callers can report "rebuild pending". Crucially do NOT
-                // bump application_id below — stamping current would mask the
-                // staleness from the next indexer open that should rebuild.
+                // Reader/observability open on an OLDER (upgrade-pending) index: leave
+                // the data alone, just surface the mismatch so callers can report
+                // "rebuild pending". Crucially do NOT bump application_id below —
+                // stamping current would mask the staleness from the next indexer
+                // open that should rebuild.
                 index_version_stale = Some(stored_index_version);
             }
         }
-        // Stamp current version only when we actually revalidated (wiped) or on a
-        // fresh DB (application_id == 0). A non-destructive reader leaves a
-        // mismatched application_id untouched so the rebuild is still owed.
-        if revalidate || stored_index_version == 0 {
-            conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION)?;
+        // Stamp current version only on a fresh DB (application_id == 0) or after an
+        // upgrade-wipe. NEVER on a downgrade (the index belongs to the newer binary)
+        // and never on a passive reader (would mask the owed rebuild).
+        if stored_index_version == 0 || wiped {
+            conn.pragma_update(None, "application_id", current_index_version)?;
         }
 
         Ok(Self { conn, vec_enabled: enable_vec, index_version_stale })
@@ -575,6 +618,63 @@ mod tests {
             .unwrap();
         assert_eq!(files_after, 0, "indexer open must perform the deferred wipe");
         assert_eq!(indexer.index_version_stale(), None, "post-revalidate handle is current");
+    }
+
+    #[test]
+    fn test_downgrade_open_never_wipes_newer_index() {
+        // The destructive half of the version ping-pong: an OLDER binary opening an
+        // index built by a NEWER INDEX_VERSION must NOT wipe it. Before the
+        // directional guard, the symmetric `stored != INDEX_VERSION` check made an
+        // INDEXER open (revalidate=true) DELETE the newer index and stamp DOWN to
+        // this binary's version — so a stale v30 server clobbered the v31 index a
+        // current binary had just built, and the two wiped each other on every open
+        // (0 nodes, never stable). An older binary must instead leave the newer
+        // index (data AND application_id) intact and flag it stale. A genuine
+        // permanent downgrade still rebuilds by deleting .code-graph/index.db* first
+        // (fresh DB → application_id 0 → this binary stamps its own version cleanly).
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        let newer = crate::domain::INDEX_VERSION + 1;
+        {
+            let db = Database::open_with_vec(&db_path).unwrap();
+            let tx = db.conn().unchecked_transaction().unwrap();
+            for i in 0..10 {
+                tx.execute(
+                    "INSERT INTO files (path, blake3_hash, last_modified, indexed_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![format!("f/{i}.rs"), "h", 0_i64, 0_i64],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            // Stamp a NEWER generation than this binary → a downgrade from its POV.
+            db.conn()
+                .pragma_update(None, "application_id", newer)
+                .unwrap();
+        }
+
+        // INDEXER open (revalidate=true) — the exact path a stale older server's
+        // startup / a downgrade `incremental-index` takes. Must NOT wipe.
+        let indexer = Database::open_with_vec(&db_path).unwrap();
+        let files: i64 = indexer
+            .conn()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files, 10, "downgrade open must NOT wipe a newer index");
+        let stamped: i32 = indexer
+            .conn()
+            .pragma_query_value(None, "application_id", |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stamped, newer,
+            "downgrade open must leave the newer application_id intact (index belongs to the newer binary)"
+        );
+        assert_eq!(
+            indexer.index_version_stale(),
+            Some(newer),
+            "downgrade must be flagged stale so the caller can warn"
+        );
     }
 
     #[test]
