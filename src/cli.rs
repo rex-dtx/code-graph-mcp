@@ -252,6 +252,22 @@ impl CliContext {
 /// `project_root.join(raw)`, turning `deps ../../secret.js` into a path-traversal
 /// file read that leaks the file's import/re-export lines. Reject the escape.
 fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
+    // Relative path args resolve against the caller's current directory (like
+    // grep/ls/cat), not the project root — so `deps main.rs` works from `src/`.
+    // Every programmatic caller (hooks, cg-answer) spawns the binary with
+    // cwd==root, so for them this is byte-identical to the historical
+    // root-relative behavior; only a human running the CLI from a subdirectory
+    // sees paths resolve from where they stand. cwd lookup can only fail in
+    // pathological environments — fall back to the root (root-relative reading).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| project_root.to_path_buf());
+    normalize_user_path_from(project_root, &cwd, raw)
+}
+
+/// cwd-parameterized core of [`normalize_user_path`] (split out so tests pin the
+/// working directory instead of depending on the process cwd). `cwd` is the
+/// directory a relative `raw` resolves against; in production it is always the
+/// project root or a descendant (`resolve_project_root` walks UP from cwd).
+fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Result<String> {
     use crate::indexer::pipeline::is_safe_relative_path;
     // Single source of truth for the escape check (shared with the MCP freshness
     // path) — eliminates the three-way divergence between this fn, the MCP
@@ -263,18 +279,52 @@ fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
         raw, project_root.display()
     );
 
-    if raw == "." {
-        return Ok(String::new());
-    }
-    if let Some(rest) = raw.strip_prefix("./") {
-        // `./foo` → `foo`, but `./../secret` still climbs out — validate the rest.
-        if !is_safe_relative_path(rest) {
-            return Err(escape());
-        }
-        return Ok(rest.to_string());
-    }
+    // Absolute path: cwd-independent. CRITICAL: `Path::strip_prefix` matches
+    // components and does NOT collapse `..`, so `<root>/../../etc/passwd` strips
+    // to `../../etc/passwd` — a remainder that still escapes. The old code
+    // returned it unchecked (the escape check ran only in the relative branch),
+    // so a barrel-scan `deps <root>/../../secret` did an out-of-root read (the
+    // absolute-prefix sibling of the relative `..` traversal). Re-validate the
+    // stripped remainder.
     let p = Path::new(raw);
-    if !p.is_absolute() {
+    if p.is_absolute() {
+        if let Ok(rel) = p.strip_prefix(project_root) {
+            let rel = rel.to_string_lossy().into_owned();
+            if !is_safe_relative_path(&rel) {
+                return Err(escape());
+            }
+            return Ok(rel);
+        }
+        // Symlink fallback: canonicalize resolves `..` and links, so a successful
+        // strip_prefix here is genuinely under the root (no `..` can survive).
+        if let (Ok(canon_p), Ok(canon_root)) = (p.canonicalize(), project_root.canonicalize()) {
+            if let Ok(rel) = canon_p.strip_prefix(&canon_root) {
+                return Ok(rel.to_string_lossy().into_owned());
+            }
+        }
+        anyhow::bail!(
+            "path '{}' is outside the project root '{}' \u{2014} use a relative path or one under the project root",
+            raw, project_root.display()
+        );
+    }
+
+    // Relative path: resolve against the cwd's offset from the root. In
+    // production cwd is the root or a descendant; a non-descendant cwd (only
+    // reachable in tests / pathological envs) yields an empty offset and the
+    // historical root-relative reading.
+    let cwd_rel = cwd.strip_prefix(project_root).map(|r| r.to_path_buf()).unwrap_or_default();
+    if cwd_rel.as_os_str().is_empty() {
+        // cwd == project root: historical root-relative behavior, unchanged.
+        if raw == "." {
+            return Ok(String::new());
+        }
+        if let Some(rest) = raw.strip_prefix("./") {
+            // `./foo` → `foo`, but `./../secret` still climbs out — validate the rest.
+            if !is_safe_relative_path(rest) {
+                return Err(escape());
+            }
+            return Ok(rest.to_string());
+        }
         // Lexical escape check (no filesystem touch — target may be gitignored or
         // deleted): reject any prefix that climbs above the root.
         if !is_safe_relative_path(raw) {
@@ -282,30 +332,29 @@ fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
         }
         return Ok(raw.to_string());
     }
-    // Absolute path. CRITICAL: `Path::strip_prefix` matches components and does
-    // NOT collapse `..`, so `<root>/../../etc/passwd` strips to `../../etc/passwd`
-    // — a remainder that still escapes. The old code returned it unchecked (the
-    // escape check ran only in the relative branch above), so a barrel-scan
-    // `deps <root>/../../secret` did an out-of-root read (the absolute-prefix
-    // sibling of the relative `..` traversal). Re-validate the stripped remainder.
-    if let Ok(rel) = p.strip_prefix(project_root) {
-        let rel = rel.to_string_lossy().into_owned();
-        if !is_safe_relative_path(&rel) {
-            return Err(escape());
+
+    // cwd is a subdirectory of the root: resolve `raw` against it, collapsing
+    // `.`/`..` lexically so a `../` climbs back toward (but never above) the
+    // root. A `..` that pops past the root is the subdir-relative escape.
+    collapse_within_root(&cwd_rel.join(raw)).ok_or_else(escape)
+}
+
+/// Lexically collapse a root-relative path's `.`/`..` components and return the
+/// `/`-joined remainder. `None` when a `..` climbs above the root (escape) or an
+/// absolute/Windows-prefix component appears (no filesystem access — the target
+/// may be gitignored or not yet created).
+fn collapse_within_root(rel: &Path) -> Option<String> {
+    use std::path::Component;
+    let mut stack: Vec<String> = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(c) => stack.push(c.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => { stack.pop()?; }
+            Component::RootDir | Component::Prefix(_) => return None,
         }
-        return Ok(rel);
     }
-    // Symlink fallback: canonicalize resolves `..` and links, so a successful
-    // strip_prefix here is genuinely under the root (no `..` can survive).
-    if let (Ok(canon_p), Ok(canon_root)) = (p.canonicalize(), project_root.canonicalize()) {
-        if let Ok(rel) = canon_p.strip_prefix(&canon_root) {
-            return Ok(rel.to_string_lossy().into_owned());
-        }
-    }
-    anyhow::bail!(
-        "path '{}' is outside the project root '{}' \u{2014} use a relative path or one under the project root",
-        raw, project_root.display()
-    );
+    Some(stack.join("/"))
 }
 
 /// Strip qualified name prefix (e.g. "McpServer.handle_message" -> "handle_message")
@@ -2055,12 +2104,18 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     }
 
     let root_canonical = project_root.canonicalize().unwrap_or(project_root.to_path_buf());
+    // Relative search paths resolve against the caller's cwd (like ripgrep/grep),
+    // so `grep foo parser` from `src/` searches `src/parser`. Hooks and agents
+    // spawn the binary with cwd==root, where `cwd.join` equals the historical
+    // `project_root.join`; the canonicalize + starts_with(root) guard below still
+    // rejects any path that escapes the project. Absolute paths ignore cwd.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| project_root.to_path_buf());
 
     // Validate every search path is within the project root (path traversal guard).
     let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut search_rels: Vec<String> = Vec::new();
     for path in &paths {
-        let resolved = project_root.join(path);
+        let resolved = cwd.join(path);
         let canonical = resolved.canonicalize().unwrap_or(resolved);
         if !canonical.starts_with(&root_canonical) {
             if json_mode {
@@ -6827,21 +6882,63 @@ mod tests {
 
     #[test]
     fn test_normalize_user_path_dot_means_whole_project() {
+        // From the project root, `.` is the whole project (empty prefix).
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(normalize_user_path(tmp.path(), ".").unwrap(), "");
+        assert_eq!(normalize_user_path_from(tmp.path(), tmp.path(), ".").unwrap(), "");
     }
 
     #[test]
     fn test_normalize_user_path_strips_dot_slash() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(normalize_user_path(tmp.path(), "./src/parser").unwrap(), "src/parser");
+        assert_eq!(normalize_user_path_from(tmp.path(), tmp.path(), "./src/parser").unwrap(), "src/parser");
     }
 
     #[test]
     fn test_normalize_user_path_passes_relative_through() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(normalize_user_path(tmp.path(), "src/parser").unwrap(), "src/parser");
-        assert_eq!(normalize_user_path(tmp.path(), "src/parser/").unwrap(), "src/parser/");
+        let root = tmp.path();
+        assert_eq!(normalize_user_path_from(root, root, "src/parser").unwrap(), "src/parser");
+        assert_eq!(normalize_user_path_from(root, root, "src/parser/").unwrap(), "src/parser/");
+    }
+
+    #[test]
+    fn test_normalize_user_path_relative_resolves_against_subdir_cwd() {
+        // Running from a subdirectory, a relative path resolves against the cwd
+        // (like grep/ls), then maps to a root-relative key. This is the
+        // subdir-cwd fix — from `src/`, `main.rs` means `src/main.rs`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join("src");
+        let deep = root.join("src/parser");
+        // Plain name + `./name` from src/ → src/name.
+        assert_eq!(normalize_user_path_from(root, &sub, "main.rs").unwrap(), "src/main.rs");
+        assert_eq!(normalize_user_path_from(root, &sub, "./parser").unwrap(), "src/parser");
+        assert_eq!(normalize_user_path_from(root, &sub, "parser/mod.rs").unwrap(), "src/parser/mod.rs");
+        // `.` from a subdir is that subdir, NOT the whole repo (the bug fixed).
+        assert_eq!(normalize_user_path_from(root, &sub, ".").unwrap(), "src");
+        assert_eq!(normalize_user_path_from(root, &deep, ".").unwrap(), "src/parser");
+        // `../` climbs back toward the root.
+        assert_eq!(normalize_user_path_from(root, &deep, "../mod.rs").unwrap(), "src/mod.rs");
+        assert_eq!(normalize_user_path_from(root, &sub, "../Cargo.toml").unwrap(), "Cargo.toml");
+        // An absolute path is still root-relative regardless of cwd.
+        let abs = root.join("lib.rs");
+        assert_eq!(normalize_user_path_from(root, &sub, abs.to_str().unwrap()).unwrap(), "lib.rs");
+    }
+
+    #[test]
+    fn test_normalize_user_path_subdir_cwd_rejects_climb_above_root() {
+        // From a subdir, enough `../` to climb above the project root is an escape.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let deep = root.join("src/parser");
+        // src/parser is depth 2, so escaping the root needs 3+ `../`.
+        for escape in ["../../../etc/passwd", "../../../../secret.js"] {
+            let err = normalize_user_path_from(root, &deep, escape)
+                .expect_err(&format!("{escape:?} from src/parser must escape"));
+            assert!(format!("{err}").contains("escapes the project root"), "got: {err}");
+        }
+        // Exactly enough `../` to reach the root (not past) is still in-root.
+        assert_eq!(normalize_user_path_from(root, &deep, "../../lib.rs").unwrap(), "lib.rs");
     }
 
     #[test]
