@@ -55,12 +55,20 @@ pub struct ReturnedItem {
 }
 
 /// Extract the returned files from a cg tool_result payload. Ranked-list tools
-/// (`ranked == true`) return a top-level JSON array → array index is the rank.
-/// Structural tools return a nested object/tree → recursively collect every
+/// (`ranked == true`) return EITHER a bare top-level array OR an object wrapping a
+/// `results` array (ast_search always `{results,count}`; semantic_code_search when
+/// FTS-only `{results,search_mode}` or compressed `{mode,results}`). Array index is
+/// the rank. Structural tools return a nested object/tree → recursively collect every
 /// `file_path`/`file`/`path` string value, rank = None. Robust to per-tool shape.
 pub fn extract_returned(payload: &serde_json::Value, ranked: bool) -> Vec<ReturnedItem> {
     if ranked {
-        if let Some(arr) = payload.as_array() {
+        // Ranked tools return EITHER a bare top-level array, OR an object wrapping a
+        // `results` array: ast_search always (`{results,count}`); semantic_code_search
+        // when FTS-only (`{results,search_mode}`) or compressed (`{mode,results}`).
+        // Unwrap `results` so the rank (array index) is not silently dropped to None.
+        let arr = payload.as_array()
+            .or_else(|| payload.get("results").and_then(|r| r.as_array()));
+        if let Some(arr) = arr {
             return arr.iter().enumerate().filter_map(|(i, el)| {
                 file_path_field(el).map(|fp| ReturnedItem { file_path: fp, rank: Some(i) })
             }).collect();
@@ -533,6 +541,24 @@ mod tests {
     fn extract_handles_empty_and_garbage() {
         assert!(extract_returned(&serde_json::json!([]), true).is_empty());
         assert!(extract_returned(&serde_json::json!("oops"), true).is_empty());
+    }
+
+    #[test]
+    fn extract_ranked_object_with_results_array_assigns_rank() {
+        // ast_search always returns {results,count}; semantic_code_search returns
+        // {results,search_mode} (FTS-only) or {mode,results} (compressed). Rank must
+        // come from the results-array index, not be dropped to None.
+        let payload = serde_json::json!({
+            "results": [
+                {"file_path": "a/b.rs", "name": "f"},
+                {"file_path": "c/d.rs", "name": "g"}
+            ],
+            "count": 2
+        });
+        let items = extract_returned(&payload, true);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].rank, Some(0));
+        assert_eq!(items[1].rank, Some(1));
     }
 
     #[test]
