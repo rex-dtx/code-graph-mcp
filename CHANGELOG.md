@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.82.0 — cwd-relative CLI paths, prune-safe plugin updates, bounded dev disk
+
+Three independent changes: relative CLI path arguments now resolve against your working
+directory (closing a path-traversal hole along the way), plugin auto-update no longer
+deletes a cache version a live MCP server is still running from, and a dev-only script
+bounds `target/debug` growth. No index rebuild, no schema change.
+
+### Changed
+- **Relative path arguments to the CLI now resolve against the current directory** (like
+  grep/ls/cat) instead of always against the project root — so `code-graph-mcp deps main.rs`
+  works from `src/`. Programmatic callers (hooks, cg-answer) always spawn with cwd == project
+  root, so for them this is byte-identical to the previous behavior; only a human running the
+  CLI from a subdirectory sees the change. `affected` and the MCP freshness path stay
+  root-relative by design (git / schema contracts).
+
+### Fixed
+- **Absolute path arguments could escape the project root.** `normalize_user_path`'s
+  absolute branch used `Path::strip_prefix`, which matches components and does not collapse
+  `..`, so `deps <root>/../../secret` stripped to a remainder that still climbed out and
+  leaked an out-of-root file's import/re-export lines — the absolute-path sibling of the
+  previously fixed relative `..` traversal. The stripped remainder is now re-validated, with
+  a canonicalize fallback for symlinked-but-in-root paths.
+- **Plugin auto-update no longer breaks `/mcp` reconnect with `-32000`.** `lifecycle.js`
+  pruned old cache versions purely by recency (keep latest N), which could delete the version
+  directory a live MCP server was launched from; Claude Code caches that launcher path for
+  the session, so a subsequent reconnect failed with `MODULE_NOT_FOUND` (`-32000`). Pruning
+  now skips any version still referenced by a running process (it scans process command
+  lines, falling back to recency-only where it cannot enumerate) and keeps the latest 5.
+
+### Added
+- **`scripts/cap-target-debug.sh`** (dev tooling, not shipped): clears `target/debug` once it
+  exceeds `CG_DEBUG_CAP_GB` (default 25 GiB), skipping while a compile is active and never
+  touching `target/release`. rust-analyzer plus cargo's lack of stale-fingerprint GC can
+  balloon `target/debug` to tens of GB; this bounds it without manual cleanup.
+
 ## v0.81.1 — `outcome` hardening: trustworthy field-MRR, correct replay labels
 
 Follow-up to v0.81.0 from a code review of the `outcome` reader. Three correctness fixes
