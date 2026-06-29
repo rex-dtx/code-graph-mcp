@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.80.1 — statusline + release-tooling robustness
+
+Follow-up fixes from the v0.80.0 audit's remaining cluster (no index rebuild).
+
+### Fixed
+- **Statusline no longer pins "↻ updating" forever when an auto-update keeps
+  failing.** A consecutive-failure counter caps the optimistic state; past the cap
+  the statusline surfaces the real status instead of asserting a self-heal that
+  isn't happening.
+- **"updating" (post-update window) vs "offline" now keys on a stable marker, not
+  translatable prose.** The binary's "schema is newer than this binary supports"
+  error carries a fixed token the statusline matches (old phrase kept as fallback).
+- **The pre-commit version-drift guard now checks every version location** — the 5
+  platform npm packages, marketplace `plugins[0].version`, and package.json's
+  optionalDependencies pins, not just 4. A partial bump could otherwise ship a
+  release npm/marketplace can't resolve.
+- **`bump-version.sh` defaults to an embed-model dev rebuild**, so a local bump no
+  longer silently produces a no-embed binary that disables vector search.
+
 ## v0.80.0 — audit remediation: edge-resolution, impact, path & snapshot hardening
 
 A full-codebase audit (6 parallel reviewers) plus an adversarial pre-landing
