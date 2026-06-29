@@ -756,10 +756,13 @@ function update() {
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
 
-  // 7. Clean up old cached versions (keep latest 3). Claude Code only fires
-  //    hooks from the active version (per installed_plugins.json), so older
-  //    cache dirs are inert disk clutter, not correctness risks.
-  cleanupOldCacheVersions(3);
+  // 7. Clean up old cached versions (keep the newest few). NOTE: older cache
+  //    dirs are NOT always inert — a running MCP server's launcher path
+  //    (<version>/scripts/mcp-launcher.js) is resolved + cached by Claude Code
+  //    for the whole session, so pruning the version a live process is bound to
+  //    breaks `/mcp` reconnect with -32000 (MODULE_NOT_FOUND). cleanupOldCacheVersions
+  //    therefore skips any version still referenced by a live process cmdline.
+  cleanupOldCacheVersions(5);
 
   return { oldVersion, version, settingsChanged, hooksRegistered };
 }
@@ -768,8 +771,16 @@ function update() {
  * Remove old plugin cache versions, keeping the N most recent.
  * Cache layout: ~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/
  */
-function cleanupOldCacheVersions(keep = 3) {
-  const cacheParent = path.join(pluginsCacheDir(), MARKETPLACE_NAME);
+function cleanupOldCacheVersions(
+  keep = 5,
+  getActiveCmdlines = readActiveProcessCmdlines,
+  cacheParent = path.join(pluginsCacheDir(), MARKETPLACE_NAME),
+) {
+  // Command lines of all live processes — used by the in-use guard below to
+  // avoid deleting a version a running MCP server is still bound to. Failure to
+  // enumerate ⇒ [] ⇒ pruning falls back to recency-only (pre-guard behavior).
+  let cmdlines;
+  try { cmdlines = getActiveCmdlines() || []; } catch { cmdlines = []; }
   try {
     // List all subdirectories under the marketplace cache
     const entries = fs.readdirSync(cacheParent, { withFileTypes: true });
@@ -788,15 +799,49 @@ function cleanupOldCacheVersions(keep = 3) {
 
         if (versions.length <= keep) continue;
 
-        const toRemove = versions.slice(keep);
-        for (const v of toRemove) {
+        for (const v of versions.slice(keep)) {
+          // In-use guard: never delete a version dir a live process is running
+          // from. Claude Code caches the resolved launcher path
+          // (<version>/scripts/mcp-launcher.js) for the session; deleting that
+          // dir breaks `/mcp` reconnect with -32000. Trailing separator stops
+          // `0.8` from matching `0.80.x`.
+          if (cmdlines.some(c => c.includes(v.path + path.sep))) continue;
           try {
             fs.rmSync(v.path, { recursive: true, force: true });
-          } catch { /* permission error or in-use — skip */ }
+          } catch { /* permission error — skip */ }
         }
       } catch { /* can't read plugin dir — skip */ }
     }
   } catch { /* cache dir doesn't exist — nothing to clean */ }
+}
+
+/**
+ * Best-effort list of running process command lines, for cleanupOldCacheVersions'
+ * in-use guard. Linux reads /proc/<pid>/cmdline; macOS/BSD shells out to `ps`;
+ * any other platform or failure returns [] (pruning then falls back to
+ * recency-only — the same behavior as before the guard existed).
+ */
+function readActiveProcessCmdlines() {
+  try {
+    if (process.platform === 'linux' && fs.existsSync('/proc')) {
+      const out = [];
+      for (const pid of fs.readdirSync('/proc')) {
+        if (!/^\d+$/.test(pid)) continue;
+        try {
+          const raw = fs.readFileSync(path.join('/proc', pid, 'cmdline'), 'utf8');
+          if (raw) out.push(raw.replace(/\0/g, ' '));
+        } catch { /* pid exited or unreadable — skip */ }
+      }
+      return out;
+    }
+  } catch { /* fall through to ps */ }
+  try {
+    const { execFileSync } = require('child_process');
+    return execFileSync('ps', ['-axww', '-o', 'command='], {
+      encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
+    }).split('\n').filter(Boolean);
+  } catch { /* unsupported platform — caller falls back to recency-only */ }
+  return [];
 }
 
 // --- Health Check ---

@@ -733,3 +733,54 @@ test('isStaleRelicContext: relic in plugins cache defers to a different active i
     existsSync: () => false,
   }), false);
 });
+
+test('cleanupOldCacheVersions keeps an in-use version even beyond the keep window', (t) => {
+  const { cleanupOldCacheVersions } = require('./lifecycle.js');
+  const cacheParent = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-cache-'));
+  t.after(() => fs.rmSync(cacheParent, { recursive: true, force: true }));
+  const pluginDir = path.join(cacheParent, 'code-graph-mcp');
+  // Seven versions, oldest -> newest by mtime.
+  const vers = ['0.78.0', '0.80.2', '0.80.3', '0.81.0', '0.81.1', '0.81.2', '0.81.3'];
+  vers.forEach((v, i) => {
+    const scripts = path.join(pluginDir, v, 'scripts');
+    fs.mkdirSync(scripts, { recursive: true });
+    fs.writeFileSync(path.join(scripts, 'mcp-launcher.js'), '// stub');
+    const ts = (i + 1) * 3600; // distinct, increasing mtimes
+    fs.utimesSync(path.join(pluginDir, v), ts, ts);
+  });
+  // A live MCP server is running from the OLDEST version (beyond keep=5) — this
+  // is the v0.80.2 reconnect-(-32000) scenario.
+  const inUse = path.join(pluginDir, '0.78.0');
+  const fakeCmdlines = [`node ${path.join(inUse, 'scripts', 'mcp-launcher.js')} `];
+
+  cleanupOldCacheVersions(5, () => fakeCmdlines, cacheParent);
+
+  assert.equal(fs.existsSync(inUse), true,
+    'in-use version must survive prune even when it is the oldest');
+  assert.equal(fs.existsSync(path.join(pluginDir, '0.80.2')), false,
+    'a non-in-use version beyond the keep window is still pruned');
+  assert.equal(fs.existsSync(path.join(pluginDir, '0.81.3')), true,
+    'newest version (within keep window) is kept');
+});
+
+test('cleanupOldCacheVersions prunes beyond keep when nothing is in use', (t) => {
+  const { cleanupOldCacheVersions } = require('./lifecycle.js');
+  const cacheParent = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-cache-'));
+  t.after(() => fs.rmSync(cacheParent, { recursive: true, force: true }));
+  const pluginDir = path.join(cacheParent, 'code-graph-mcp');
+  const vers = ['0.78.0', '0.80.2', '0.80.3', '0.81.0', '0.81.1', '0.81.2', '0.81.3'];
+  vers.forEach((v, i) => {
+    fs.mkdirSync(path.join(pluginDir, v), { recursive: true });
+    const ts = (i + 1) * 3600;
+    fs.utimesSync(path.join(pluginDir, v), ts, ts);
+  });
+  // No live process references any version → recency-only pruning (pre-guard).
+  cleanupOldCacheVersions(5, () => [], cacheParent);
+
+  assert.equal(fs.existsSync(path.join(pluginDir, '0.78.0')), false, 'oldest pruned');
+  assert.equal(fs.existsSync(path.join(pluginDir, '0.80.2')), false, '2nd-oldest pruned');
+  assert.equal(fs.existsSync(path.join(pluginDir, '0.80.3')), true, 'within keep window kept');
+  assert.equal(
+    fs.readdirSync(pluginDir).filter(n => fs.statSync(path.join(pluginDir, n)).isDirectory()).length,
+    5, 'exactly keep=5 versions remain');
+});
