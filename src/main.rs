@@ -213,6 +213,11 @@ fn main() -> Result<()> {
             let stats_args = code_graph_mcp::cli::StatsArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_stats(&project_root, stats_args)
         }
+        Some("outcome") => {
+            let project_root = code_graph_mcp::cli::resolve_project_root()?;
+            let outcome_args = code_graph_mcp::outcome::OutcomeArgs::parse_from(args.iter().skip(1));
+            code_graph_mcp::outcome::cmd_outcome(&project_root, outcome_args)
+        }
         Some("doctor") => {
             // doctor/adopt/unadopt are JS-dispatched and bypass clap, so `--help`
             // would otherwise RUN them — and doctor's default repairs rewrite
@@ -334,6 +339,7 @@ fn print_help() {
     println!("    benchmark           Benchmark index speed, query latency, token savings");
     println!("    stats               Aggregate session metrics from .code-graph/usage.jsonl");
     println!("                        (which tools you used, search/index activity)");
+    println!("    outcome             Retrieval adoption from session transcripts (field-MRR; read-only)");
     println!("    adopt               Install plugin_code_graph_mcp.md memory + MEMORY.md sentinel");
     println!("    unadopt             Remove the memory file + sentinel block");
     println!("    snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]");
@@ -523,7 +529,7 @@ const SUBCOMMANDS: &[&str] = &[
     "serve", "grep", "search", "ast-search", "callgraph", "impact",
     "show", "map", "overview", "deps", "trace", "similar", "refs",
     "dead-code", "incremental-index", "rebuild-index", "reindex", "health-check", "doctor",
-    "centrality", "cycles", "surprising", "report", "benchmark", "stats", "adopt", "unadopt", "snapshot",
+    "centrality", "cycles", "surprising", "report", "benchmark", "stats", "outcome", "adopt", "unadopt", "snapshot",
     // MCP tool names accepted as aliases (see dispatch above). Listed here so
     // typo-suggester picks the closer alias for inputs like "project_mapp".
     "project_map", "module_overview", "get_ast_node", "find_references",

@@ -13,7 +13,7 @@ use crate::storage::queries;
 /// `$HOME` (Unix) / `%USERPROFILE%` (Windows) without pulling the `dirs` crate,
 /// which lives behind the `embed-model` feature. `None` when unset → the walk is
 /// simply unbounded (degrades to the pre-home-bound behavior).
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)

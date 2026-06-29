@@ -313,6 +313,119 @@ pub fn aggregate(
     s
 }
 
+// ── Task 6: Orchestration, render, CLI wiring ────────────────────────────────
+
+use anyhow::Result;
+use clap::Parser;
+use std::time::{Duration, SystemTime};
+
+#[derive(Parser, Debug)]
+#[command(name = "code-graph-mcp outcome",
+          about = "Measure whether code-graph retrieval results get adopted by the model (read-only; reads session transcripts)")]
+pub struct OutcomeArgs {
+    /// Project whose transcripts to read (absolute path; default: resolved project root)
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Only transcripts modified within the last N days
+    #[arg(long)]
+    pub since: Option<u64>,
+    /// JSON output
+    #[arg(long)]
+    pub json: bool,
+    /// Append (query, returned, adopted, rank) label rows as JSONL to this path
+    #[arg(long)]
+    pub emit_labels: Option<String>,
+}
+
+/// Read every transcript in `dir`, score each session, aggregate. Pure-ish (only fs reads).
+pub fn run_outcome(dir: &std::path::Path, since_days: Option<u64>) -> (OutcomeSummary, Vec<CallOutcome>) {
+    let cutoff = since_days.map(|d| SystemTime::now() - Duration::from_secs(d * 86_400));
+    let mut all_calls = Vec::new();
+    let mut transcripts = 0usize;
+    let mut unresolved = 0usize;
+    let mut unparseable = 0usize;
+    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+        if let Some(cut) = cutoff {
+            if let Ok(meta) = entry.metadata() {
+                if meta.modified().map(|m| m < cut).unwrap_or(false) { continue; }
+            }
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else { continue; };
+        let parsed = parse_transcript(&content);
+        unresolved += parsed.unresolved;
+        unparseable += parsed.unparseable;
+        all_calls.extend(score_session(&parsed.events));
+        transcripts += 1;
+    }
+    let summary = aggregate(&all_calls, transcripts, transcripts, unresolved, unparseable);
+    (summary, all_calls)
+}
+
+pub fn cmd_outcome(project_root: &std::path::Path, args: OutcomeArgs) -> Result<()> {
+    let home = crate::cli::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory ($HOME / $USERPROFILE not set)"))?;
+    let target = match &args.project {
+        Some(p) => std::path::PathBuf::from(p),
+        None => project_root.to_path_buf(),
+    };
+    let dir = transcript_dir(&target, &home);
+    if !dir.is_dir() {
+        if args.json {
+            println!("{}", serde_json::json!({"outcome": {"state": "absent", "dir": dir.display().to_string()}}));
+        } else {
+            eprintln!("No transcripts for {} at {}", target.display(), dir.display());
+        }
+        return Ok(());
+    }
+    let (s, calls) = run_outcome(&dir, args.since);
+    if let Some(path) = &args.emit_labels {
+        emit_labels(&calls, path)?;
+    }
+    if args.json { render_json(&s, &target); } else { render_human(&s, &target); }
+    Ok(())
+}
+
+/// Stub — Task 7 replaces this with the real body that writes JSONL label rows.
+pub fn emit_labels(_calls: &[CallOutcome], _path: &str) -> Result<()> { Ok(()) }
+
+fn render_human(s: &OutcomeSummary, target: &std::path::Path) {
+    println!("Outcome (retrieval adoption)  \u{2014}  project: {}", target.display());
+    println!("Transcripts: {}   resolved cg calls: {}   (unresolved {}, unparseable {})",
+             s.transcripts, s.cg_calls, s.unresolved, s.unparseable);
+    if s.low_confidence {
+        println!("LOW CONFIDENCE: N={} (< {}) \u{2014} too small to conclude", s.cg_calls, MIN_N);
+    }
+    println!("Adoption: {}/{} = {:.0}%", s.adopted, s.cg_calls, s.adoption_rate * 100.0);
+    println!("field-MRR (ranked tools)  adopted: {:.2}   all: {:.2}", s.field_mrr_adopted, s.field_mrr_all);
+    let hist: Vec<String> = s.rank_histogram.iter().map(|(r, n)| format!("r{r}={n}")).collect();
+    println!("Adopted-rank histogram: {}", if hist.is_empty() { "-".into() } else { hist.join("  ") });
+    for (tool, (calls, adopted)) in &s.by_tool {
+        println!("  {:<24} {}/{}", tool, adopted, calls);
+    }
+}
+
+fn render_json(s: &OutcomeSummary, target: &std::path::Path) {
+    println!("{}", serde_json::json!({"outcome": {
+        "state": "live",
+        "project": target.display().to_string(),
+        "transcripts": s.transcripts,
+        "cg_calls": s.cg_calls,
+        "unresolved": s.unresolved,
+        "unparseable": s.unparseable,
+        "adopted": s.adopted,
+        "adoption_rate": (s.adoption_rate * 100.0).round() / 100.0,
+        "ranked_calls": s.ranked_calls,
+        "field_mrr_adopted": (s.field_mrr_adopted * 1000.0).round() / 1000.0,
+        "field_mrr_all": (s.field_mrr_all * 1000.0).round() / 1000.0,
+        "rank_histogram": s.rank_histogram.iter().map(|(k,v)| (k.to_string(), *v)).collect::<std::collections::BTreeMap<_,_>>(),
+        "by_tool": s.by_tool.iter().map(|(k,(c,a))| (k.clone(), serde_json::json!({"calls": c, "adopted": a}))).collect::<serde_json::Map<_,_>>(),
+        "low_confidence": s.low_confidence,
+    }}));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +685,21 @@ mod tests {
             Event::CgCall { returned, .. } => assert_eq!(returned[0].file_path, "src/a.rs"),
             _ => panic!("expected CgCall"),
         }
+    }
+
+    #[test]
+    fn run_outcome_e2e_over_temp_transcript_dir() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = std::fs::File::create(dir.path().join("session1.jsonl")).unwrap();
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__code-graph-dev__semantic_code_search","input":{"query":"q"}}]}}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"[{\"file_path\":\"src/a.rs\"}]"}]}]}}"#;
+        let edit = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/x/src/a.rs"}}]}}"#;
+        writeln!(f, "{call}\n{result}\n{edit}").unwrap();
+        let (summary, calls) = run_outcome(dir.path(), None);
+        assert_eq!(summary.cg_calls, 1);
+        assert_eq!(summary.adopted, 1);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].adopted);
     }
 }
