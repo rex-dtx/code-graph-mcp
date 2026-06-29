@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.80.3 — test/prod caller accuracy across callgraph, trace, show & get_ast_node
+
+The graph surfaces now trust the AST-level `is_test` flag (not just a name heuristic)
+when separating test callers from production, so inline unit tests no longer pollute
+"who calls X" or inflate impact risk. No index rebuild.
+
+### Fixed
+- **callgraph, trace, `show`, and `get_ast_node` now exclude inline `#[cfg(test)]`
+  unit tests from the default production view.** They partitioned callers with a
+  name/path heuristic (`test_`-prefix / `tests/` path), so a Rust inline unit test
+  with a descriptive snake_case name leaked in as a production caller and inflated
+  `--impact` risk — the same inversion the v0.80.0 `impact` fix addressed, on the
+  parallel surfaces. They now use the authoritative `is_test` flag with the heuristic
+  as a fallback (`get_ast_node`'s impact summary and `show --impact` also route
+  through the shared `classify_impact`, gaining caller dedup + test-route exclusion).
+  `--include-tests` still shows them. No `INDEX_VERSION` bump — query-path only.
+- **The MCP server survives a handler panic.** The stdio request loop wraps message
+  handling in `catch_unwind`, so a single tool's panic returns a JSON-RPC internal
+  error instead of tearing down the whole session.
+- **`ast_search` type / name / return-type filters treat `_` and `%` literally.**
+  They built a SQL `LIKE` pattern without escaping, so an underscore in an identifier
+  (e.g. `get_node`) matched any character; the filters now escape LIKE wildcards.
+
+### Internal
+- Schema drift-guard test now covers the `meta` and `pending_unresolved_calls` tables.
+- Pre-commit hook strips `GIT_*` env before `cargo test`, so fixture git tests are
+  hermetic (they were silently breaking `.rs` commits under the hook). Added an
+  invariant test that a node delete reaps its vector via the delete trigger on both
+  the FK-cascade and direct paths — no orphan vectors (a prior audit suspicion,
+  disproven).
+
 ## v0.80.2 — downgrade-safe index open (no index rebuild)
 
 A version-mismatch index open is now directional: an older binary never wipes an
