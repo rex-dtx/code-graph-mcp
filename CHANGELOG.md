@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.81.1 — `outcome` hardening: trustworthy field-MRR, correct replay labels
+
+Follow-up to v0.81.0 from a code review of the `outcome` reader. Three correctness fixes
+(none crash — each silently skewed a measurement) and two output-completeness gaps. Still
+read-only; no index rebuild, no schema change.
+
+### Fixed
+- **field-MRR is no longer presented as confident off a single ranked sample.** The
+  low-confidence flag was keyed on total cg calls, but the field-MRR denominator is the
+  ranked-tool calls only — so a run with plenty of adoption samples but one ranked call
+  (e.g. a single `search`) printed `field-MRR 1.00` with no caveat. A separate
+  `field_mrr_low_confidence` (ranked N < 20) now gates it, and both the human and JSON
+  output show the ranked adopted/total counts.
+- **`--emit-labels` no longer mislabels the adopted file.** The adopted rank is the index
+  into the *original* result array, but the emitted file list is compacted (items without
+  a `file_path` are dropped), so indexing that list by rank could point at the wrong file
+  or none. The adopted path is now captured during the adoption scan, and is populated for
+  structural (unranked) adoptions too, not just ranked ones.
+- **Multi-line Bash `code-graph-mcp` calls are now counted.** Command tokenization
+  collapsed newlines, so a `cd …` on one line followed by `code-graph-mcp callgraph …` on
+  the next was missed (the binary no longer sat at a command head). Each line is now
+  scanned independently.
+
+### Changed
+- **`--json` output adds `n_sessions`, `since_days`, `first_ts`, `last_ts`** (the
+  transcript window was parsed but never reported); the human view gains a `Window:` line.
+- **CLI-via-Bash replay labels now carry the query.** A `code-graph-mcp search "…"` call
+  emitted an empty query, so its ranked `--emit-labels` row wasn't usable as a
+  (query → adopted-file) pair; the quoted/positional query argument is now recovered.
+
 ## v0.81.0 — `outcome`: does retrieval actually get used?
 
 A new read-only `code-graph-mcp outcome` reads your Claude Code session transcripts and
