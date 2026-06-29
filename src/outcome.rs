@@ -191,33 +191,85 @@ fn tool_result_text(content: &serde_json::Value) -> Option<String> {
 /// matches both the bare binary and a path-suffixed form
 /// (`./target/release/code-graph-mcp`). Housekeeping subcommands (stats/serve/…)
 /// return None (canonical_query_cmd yields None for them).
+///
+/// A newline is a command separator in shell, but `split_whitespace` collapses it,
+/// so scan each line independently — otherwise a multi-line script
+/// (`cd backend\ncode-graph-mcp callgraph Foo`) hides the binary mid-token-stream
+/// behind a non-separator predecessor and the call goes uncounted.
+#[cfg(test)]
 fn detect_cli_cg_call(cmd: &str) -> Option<&'static str> {
-    let toks: Vec<&str> = cmd.split_whitespace().collect();
+    cli_call(cmd).map(|(canon, _)| canon)
+}
+
+/// Detection + best-effort query recovery: returns `(canonical subcommand, query)`.
+/// The query is the first positional (non-flag) argument after the subcommand, with
+/// surrounding quotes stripped — so ranked `search_cli` replay labels carry the real
+/// query (`code-graph-mcp search "login flow"` → `"login flow"`) instead of empty.
+/// Best-effort: a value-taking flag placed before the positional could be mistaken for
+/// the query; the common shapes (`search "q"`, `search "q" --json`, `grep -i p path`)
+/// are correct. Empty string when no positional is present.
+fn cli_call(cmd: &str) -> Option<(&'static str, String)> {
+    cmd.lines().find_map(cli_call_in_line)
+}
+
+fn cli_call_in_line(line: &str) -> Option<(&'static str, String)> {
+    let toks = shell_tokens(line);
     for (i, t) in toks.iter().enumerate() {
-        let is_bin = *t == "code-graph-mcp" || t.ends_with("/code-graph-mcp");
+        let is_bin = t == "code-graph-mcp" || t.ends_with("/code-graph-mcp");
         if !is_bin {
             continue;
         }
-        // Command-position guard: the binary must begin a command — token 0, or
-        // right after a shell separator. Excludes mid-command mentions in echo /
-        // commit messages / comments (`echo code-graph-mcp grep`, `git commit -m
-        // "… code-graph-mcp grep …"`). Best-effort: forms like `env X=Y
-        // code-graph-mcp …` or `$(code-graph-mcp …)` are conservatively skipped.
-        let prev_is_separator = i > 0
-            && (matches!(toks[i - 1], "&&" | "||" | "|" | ";" | "&")
-                || toks[i - 1].ends_with(';')
-                || toks[i - 1].ends_with('&')
-                || toks[i - 1].ends_with('|'));
+        // Command-position guard: the binary must begin a command — token 0, or right
+        // after a shell separator. Excludes mid-command mentions in echo / commit
+        // messages / comments. Quoted spans are single tokens (so a binary name inside
+        // `git commit -m "… code-graph-mcp grep …"` is never a bare token here). Forms
+        // like `env X=Y code-graph-mcp …` or `$(code-graph-mcp …)` are conservatively skipped.
+        let prev_is_separator = i > 0 && {
+            let p = toks[i - 1].as_str();
+            matches!(p, "&&" | "||" | "|" | ";" | "&")
+                || p.ends_with(';') || p.ends_with('&') || p.ends_with('|')
+        };
         if i != 0 && !prev_is_separator {
             continue;
         }
-        if let Some(sub) = toks.get(i + 1) {
-            if let Some(canon) = crate::cli::canonical_query_cmd(sub) {
-                return Some(canon);
-            }
+        if let Some(canon) = toks.get(i + 1).and_then(|s| crate::cli::canonical_query_cmd(s)) {
+            let query = toks[i + 2..]
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .cloned()
+                .unwrap_or_default();
+            return Some((canon, query));
         }
     }
     None
+}
+
+/// Minimal shell-ish tokenizer: splits on whitespace but keeps a `"…"` / `'…'` quoted
+/// span as one token (quotes stripped), so a space-containing query survives. Shell
+/// separators (`&&`, `|`, `;`) remain their own tokens. Best-effort — no escape or
+/// variable-expansion handling.
+fn shell_tokens(s: &str) -> Vec<String> {
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let mut has = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '\'' => {
+                has = true;
+                for n in chars.by_ref() {
+                    if n == c { break; }
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if has { toks.push(std::mem::take(&mut cur)); has = false; }
+            }
+            c => { has = true; cur.push(c); }
+        }
+    }
+    if has { toks.push(cur); }
+    toks
 }
 
 pub fn parse_transcript(content: &str) -> ParsedTranscript {
@@ -272,14 +324,14 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
                 }
             } else if name == "Bash" {
                 let cmd = input.get("command").and_then(|x| x.as_str()).unwrap_or("");
-                if let Some(canon) = detect_cli_cg_call(cmd) {
+                if let Some((canon, query)) = cli_call(cmd) {
                     let tool = format!("{canon}_cli");
                     let ranked = is_ranked_tool(&tool);
                     match results.get(id) {
                         None => out.unresolved += 1,
                         Some(stdout) => {
                             let returned = extract_returned_from_cli(stdout, ranked);
-                            out.events.push(Event::CgCall { tool, query: String::new(), returned });
+                            out.events.push(Event::CgCall { tool, query, returned });
                         }
                     }
                 } else if cmd.contains("grep ") || cmd.contains("rg ") {
@@ -298,6 +350,12 @@ pub struct CallOutcome {
     pub returned_files: Vec<String>,
     pub adopted: bool,
     pub adopted_rank: Option<usize>,
+    /// The returned file that was actually adopted (the path matched during the
+    /// forward scan). Captured directly so it never depends on indexing the
+    /// compacted `returned_files` by `adopted_rank` — those indices diverge when a
+    /// ranked payload item lacks a `file_path` and is filtered out (rank carries the
+    /// ORIGINAL array index; `returned_files` is positional). None when not adopted.
+    pub adopted_file: Option<String>,
     pub ranked: bool,
 }
 
@@ -313,8 +371,12 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
                 let candidates: Vec<&ReturnedItem> = returned.iter()
                     .filter(|it| !touched_before.iter().any(|t| paths_match(&it.file_path, t)))
                     .collect();
-                // Forward scan until the next CgCall.
-                let mut best_rank: Option<usize> = None;
+                // Forward scan until the next CgCall. Track the lowest-rank matched
+                // ranked item (rank + its file) and the first matched file overall, so
+                // `adopted_file` is the path that was actually touched — not a re-index
+                // of the compacted `returned_files` by rank (those indices diverge).
+                let mut best_ranked: Option<(usize, String)> = None;
+                let mut first_match_file: Option<String> = None;
                 let mut adopted = false;
                 for ev2 in &events[i + 1..] {
                     match ev2 {
@@ -323,23 +385,33 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
                             for it in &candidates {
                                 if paths_match(&it.file_path, path) {
                                     adopted = true;
-                                    best_rank = match (best_rank, it.rank) {
-                                        (None, r) => r,
-                                        (Some(b), Some(r)) => Some(b.min(r)),
-                                        (Some(b), None) => Some(b),
-                                    };
+                                    if first_match_file.is_none() {
+                                        first_match_file = Some(it.file_path.clone());
+                                    }
+                                    if let Some(r) = it.rank {
+                                        if best_ranked.as_ref().is_none_or(|(b, _)| r < *b) {
+                                            best_ranked = Some((r, it.file_path.clone()));
+                                        }
+                                    }
                                 }
                             }
                         }
                         _ => {}
                     }
                 }
+                // Prefer the lowest-rank ranked match; fall back to the first match
+                // (structural/unranked adoptions previously yielded a null adopted_file).
+                let (adopted_rank, adopted_file) = match best_ranked {
+                    Some((r, f)) => (Some(r), Some(f)),
+                    None => (None, first_match_file),
+                };
                 out.push(CallOutcome {
                     tool: tool.clone(),
                     query: query.clone(),
                     returned_files: returned.iter().map(|r| r.file_path.clone()).collect(),
                     adopted,
-                    adopted_rank: best_rank,
+                    adopted_rank,
+                    adopted_file,
                     ranked: is_ranked_tool(tool),
                 });
             }
@@ -366,7 +438,19 @@ pub struct OutcomeSummary {
     pub field_mrr_all: f64,
     pub rank_histogram: std::collections::BTreeMap<usize, usize>,
     pub by_tool: std::collections::BTreeMap<String, (usize, usize)>, // tool -> (calls, adopted)
+    /// Adoption-rate confidence: total cg calls below MIN_N.
     pub low_confidence: bool,
+    /// field-MRR confidence: RANKED calls below MIN_N. Distinct from `low_confidence`
+    /// because the MRR denominator is `ranked_calls`, not `cg_calls` — a run can have
+    /// plenty of adoption samples yet a single ranked sample (the headline MRR would
+    /// otherwise read as a confident 1.00 off N=1).
+    pub field_mrr_low_confidence: bool,
+    /// Reporting-window context (design §8): oldest / newest transcript timestamp seen
+    /// (ISO8601, compared lexicographically) and the `--since` day filter if any. Set by
+    /// `run_outcome` after aggregation, not derived from the call list.
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+    pub since_days: Option<u64>,
 }
 
 pub fn aggregate(
@@ -414,6 +498,7 @@ pub fn aggregate(
     s.field_mrr_adopted = if s.ranked_adopted > 0 { rr_adopted_sum / s.ranked_adopted as f64 } else { 0.0 };
     s.field_mrr_all = if s.ranked_calls > 0 { rr_all_sum / s.ranked_calls as f64 } else { 0.0 };
     s.low_confidence = s.cg_calls < MIN_N;
+    s.field_mrr_low_confidence = s.ranked_calls < MIN_N;
     s
 }
 
@@ -448,6 +533,8 @@ pub fn run_outcome(dir: &std::path::Path, since_days: Option<u64>) -> (OutcomeSu
     let mut transcripts = 0usize;
     let mut unresolved = 0usize;
     let mut unparseable = 0usize;
+    let mut first_ts: Option<String> = None;
+    let mut last_ts: Option<String> = None;
     let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
     for entry in entries {
         let path = entry.path();
@@ -461,10 +548,19 @@ pub fn run_outcome(dir: &std::path::Path, since_days: Option<u64>) -> (OutcomeSu
         let parsed = parse_transcript(&content);
         unresolved += parsed.unresolved;
         unparseable += parsed.unparseable;
+        if let Some(ft) = &parsed.first_ts {
+            if first_ts.as_ref().is_none_or(|c| ft < c) { first_ts = Some(ft.clone()); }
+        }
+        if let Some(lt) = &parsed.last_ts {
+            if last_ts.as_ref().is_none_or(|c| lt > c) { last_ts = Some(lt.clone()); }
+        }
         all_calls.extend(score_session(&parsed.events));
         transcripts += 1;
     }
-    let summary = aggregate(&all_calls, transcripts, transcripts, unresolved, unparseable);
+    let mut summary = aggregate(&all_calls, transcripts, transcripts, unresolved, unparseable);
+    summary.first_ts = first_ts;
+    summary.last_ts = last_ts;
+    summary.since_days = since_days;
     (summary, all_calls)
 }
 
@@ -499,16 +595,13 @@ pub fn emit_labels(calls: &[CallOutcome], path: &str) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     for c in calls {
-        let adopted_file = if c.adopted {
-            c.adopted_rank.and_then(|r| c.returned_files.get(r)).cloned()
-        } else { None };
         let row = serde_json::json!({
             "tool": c.tool,
             "query": c.query,
             "returned_files": c.returned_files,
             "adopted": c.adopted,
             "adopted_rank": c.adopted_rank,
-            "adopted_file": adopted_file,
+            "adopted_file": c.adopted_file,
         });
         writeln!(f, "{}", serde_json::to_string(&row)?)?;
     }
@@ -519,11 +612,21 @@ fn render_human(s: &OutcomeSummary, target: &std::path::Path) {
     println!("Outcome (retrieval adoption)  \u{2014}  project: {}", target.display());
     println!("Transcripts: {}   resolved cg calls: {}   (unresolved {}, unparseable {})",
              s.transcripts, s.cg_calls, s.unresolved, s.unparseable);
+    if let (Some(f), Some(l)) = (&s.first_ts, &s.last_ts) {
+        let since = s.since_days.map(|d| format!("   (--since {d}d)")).unwrap_or_default();
+        println!("Window: {f}  \u{2192}  {l}{since}");
+    }
     if s.low_confidence {
         println!("LOW CONFIDENCE: N={} (< {}) \u{2014} too small to conclude", s.cg_calls, MIN_N);
     }
     println!("Adoption: {}/{} = {:.0}%", s.adopted, s.cg_calls, s.adoption_rate * 100.0);
-    println!("field-MRR (ranked tools)  adopted: {:.2}   all: {:.2}", s.field_mrr_adopted, s.field_mrr_all);
+    let mrr_caveat = if s.field_mrr_low_confidence {
+        format!("   [LOW CONFIDENCE: ranked N={} < {}]", s.ranked_calls, MIN_N)
+    } else {
+        String::new()
+    };
+    println!("field-MRR (ranked tools, {}/{} ranked adopted)  adopted: {:.2}   all: {:.2}{}",
+             s.ranked_adopted, s.ranked_calls, s.field_mrr_adopted, s.field_mrr_all, mrr_caveat);
     let hist: Vec<String> = s.rank_histogram.iter().map(|(r, n)| format!("r{r}={n}")).collect();
     println!("Adopted-rank histogram: {}", if hist.is_empty() { "-".into() } else { hist.join("  ") });
     for (tool, (calls, adopted)) in &s.by_tool {
@@ -536,14 +639,20 @@ fn render_json(s: &OutcomeSummary, target: &std::path::Path) {
         "state": "live",
         "project": target.display().to_string(),
         "transcripts": s.transcripts,
+        "n_sessions": s.sessions,
+        "since_days": s.since_days,
+        "first_ts": s.first_ts,
+        "last_ts": s.last_ts,
         "cg_calls": s.cg_calls,
         "unresolved": s.unresolved,
         "unparseable": s.unparseable,
         "adopted": s.adopted,
         "adoption_rate": (s.adoption_rate * 100.0).round() / 100.0,
         "ranked_calls": s.ranked_calls,
+        "ranked_adopted": s.ranked_adopted,
         "field_mrr_adopted": (s.field_mrr_adopted * 1000.0).round() / 1000.0,
         "field_mrr_all": (s.field_mrr_all * 1000.0).round() / 1000.0,
+        "field_mrr_low_confidence": s.field_mrr_low_confidence,
         "rank_histogram": s.rank_histogram.iter().map(|(k,v)| (k.to_string(), *v)).collect::<std::collections::BTreeMap<_,_>>(),
         "by_tool": s.by_tool.iter().map(|(k,(c,a))| (k.clone(), serde_json::json!({"calls": c, "adopted": a}))).collect::<serde_json::Map<_,_>>(),
         "low_confidence": s.low_confidence,
@@ -880,7 +989,7 @@ mod tests {
     // ── aggregate / OutcomeSummary helpers ───────────────────────────────────
 
     fn co(tool: &str, ranked: bool, adopted: bool, rank: Option<usize>) -> CallOutcome {
-        CallOutcome { tool: tool.into(), query: "q".into(), returned_files: vec![], adopted, adopted_rank: rank, ranked }
+        CallOutcome { tool: tool.into(), query: "q".into(), returned_files: vec![], adopted, adopted_rank: rank, adopted_file: None, ranked }
     }
 
     #[test]
@@ -964,7 +1073,7 @@ mod tests {
         let calls = vec![CallOutcome {
             tool: "semantic_code_search".into(), query: "login".into(),
             returned_files: vec!["src/a.rs".into(), "src/b.rs".into()],
-            adopted: true, adopted_rank: Some(1), ranked: true,
+            adopted: true, adopted_rank: Some(1), adopted_file: Some("src/b.rs".into()), ranked: true,
         }];
         emit_labels(&calls, path.to_str().unwrap()).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
@@ -973,5 +1082,112 @@ mod tests {
         assert_eq!(row["adopted_rank"], 1);
         assert_eq!(row["adopted"], true);
         assert_eq!(row["adopted_file"], "src/b.rs");
+    }
+
+    #[test]
+    fn field_mrr_low_confidence_keys_on_ranked_n_not_total() {
+        // adoption N can clear MIN_N while ranked N does not: 25 structural + 1 ranked.
+        // low_confidence (adoption) must be false; field_mrr_low_confidence must be true
+        // so the headline MRR isn't presented as a confident value off a single sample.
+        let mut calls: Vec<CallOutcome> =
+            (0..25).map(|_| co("get_call_graph", false, true, None)).collect();
+        calls.push(co("semantic_code_search", true, true, Some(0)));
+        let s = aggregate(&calls, 1, 1, 0, 0);
+        assert_eq!(s.cg_calls, 26);
+        assert!(!s.low_confidence, "adoption N=26 ≥ MIN_N");
+        assert_eq!(s.ranked_calls, 1);
+        assert!(s.field_mrr_low_confidence, "ranked N=1 < MIN_N → MRR untrustworthy");
+    }
+
+    #[test]
+    fn adopted_file_tracks_matched_path_not_rank_index() {
+        // Returned list has a rank GAP (rank 0 then rank 2 — the rank-1 payload item had
+        // no file_path and was compacted out). returned_files is the positional list
+        // [a, c]; indexing it by adopted_rank (2) would be out of bounds. The adopted
+        // file must be the path actually touched, captured during the forward scan.
+        let events = vec![
+            Event::CgCall {
+                tool: "semantic_code_search".into(),
+                query: "q".into(),
+                returned: vec![
+                    ReturnedItem { file_path: "src/a.rs".into(), rank: Some(0) },
+                    ReturnedItem { file_path: "src/c.rs".into(), rank: Some(2) },
+                ],
+            },
+            touch("/proj/src/c.rs"),
+        ];
+        let outs = score_session(&events);
+        assert!(outs[0].adopted);
+        assert_eq!(outs[0].adopted_rank, Some(2));
+        assert_eq!(outs[0].adopted_file.as_deref(), Some("src/c.rs"));
+        assert_eq!(outs[0].returned_files, vec!["src/a.rs", "src/c.rs"]);
+        // The old rank-as-index approach would have read returned_files[2] = out of bounds.
+        assert!(outs[0].returned_files.get(2).is_none());
+    }
+
+    #[test]
+    fn adopted_file_set_for_unranked_structural_adoption() {
+        // Structural (unranked) adoptions previously yielded adopted_file = null because
+        // it was derived from adopted_rank (always None here). Now it is the matched path.
+        let events = vec![
+            cg("get_call_graph", &[("src/graph.rs", None), ("src/storage.rs", None)]),
+            touch("/proj/src/storage.rs"),
+        ];
+        let outs = score_session(&events);
+        assert!(outs[0].adopted);
+        assert_eq!(outs[0].adopted_rank, None);
+        assert_eq!(outs[0].adopted_file.as_deref(), Some("src/storage.rs"));
+    }
+
+    #[test]
+    fn detect_cli_cg_call_across_newline_separated_commands() {
+        // A newline is a command separator — the binary at the head of a later line must
+        // be detected even though the previous token isn't a shell separator (`backend`).
+        assert_eq!(detect_cli_cg_call("cd backend\ncode-graph-mcp callgraph Foo"), Some("callgraph"));
+        assert_eq!(detect_cli_cg_call("set -e\nexport X=1\ncode-graph-mcp search \"q\""), Some("search"));
+        // Mid-command mentions on their own line are still rejected.
+        assert_eq!(detect_cli_cg_call("echo hi\necho code-graph-mcp grep foo"), None);
+    }
+
+    #[test]
+    fn cli_call_captures_query_and_skips_flags() {
+        // first positional after the subcommand is the query; quotes stripped, flags skipped
+        assert_eq!(cli_call("code-graph-mcp search \"login flow\""), Some(("search", "login flow".to_string())));
+        assert_eq!(cli_call("code-graph-mcp grep -i pat src/"), Some(("grep", "pat".to_string())));
+        assert_eq!(cli_call("code-graph-mcp callgraph Foo"), Some(("callgraph", "Foo".to_string())));
+        assert_eq!(cli_call("code-graph-mcp stats"), None); // housekeeping → not a query call
+        // a quoted span containing the binary name is one token, never a bare invocation
+        assert_eq!(cli_call("git commit -m \"tweak code-graph-mcp grep parsing\""), None);
+    }
+
+    #[test]
+    fn parse_cli_search_captures_query_through_event() {
+        // the ranked search_cli label must carry the real query, not an empty string
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b9","name":"Bash","input":{"command":"code-graph-mcp search \"login flow\""}}]}}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b9","content":[{"type":"text","text":"h3 a  src/auth.rs:1-2"}]}]}}"#;
+        let p = parse_transcript(&format!("{call}\n{result}\n"));
+        match &p.events[0] {
+            Event::CgCall { tool, query, returned } => {
+                assert_eq!(tool, "search_cli");
+                assert_eq!(query, "login flow");
+                assert_eq!(returned[0].rank, Some(0));
+            }
+            _ => panic!("expected search_cli CgCall"),
+        }
+    }
+
+    #[test]
+    fn run_outcome_populates_window_and_since() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = std::fs::File::create(dir.path().join("s.jsonl")).unwrap();
+        let a = r#"{"type":"assistant","timestamp":"2026-06-01T08:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__code-graph-dev__semantic_code_search","input":{"query":"q"}}]}}"#;
+        let r = r#"{"type":"user","timestamp":"2026-06-01T08:00:05Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"[{\"file_path\":\"src/a.rs\"}]"}]}]}}"#;
+        writeln!(f, "{a}\n{r}").unwrap();
+        let (s, _) = run_outcome(dir.path(), Some(3650)); // wide --since so the fresh temp file is in-window
+        assert_eq!(s.first_ts.as_deref(), Some("2026-06-01T08:00:00Z"));
+        assert_eq!(s.last_ts.as_deref(), Some("2026-06-01T08:00:05Z"));
+        assert_eq!(s.since_days, Some(3650));
+        assert_eq!(s.sessions, 1);
     }
 }
