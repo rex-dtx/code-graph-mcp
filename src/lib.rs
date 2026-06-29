@@ -4,6 +4,7 @@ pub mod embedding;
 pub mod graph;
 pub mod indexer;
 pub mod mcp;
+pub mod outcome;
 pub mod parser;
 pub mod resolve;
 pub mod sandbox;
