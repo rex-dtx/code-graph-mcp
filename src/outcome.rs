@@ -95,6 +95,98 @@ fn collect_file_paths(v: &serde_json::Value, out: &mut Vec<ReturnedItem>) {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum Event {
+    CgCall { tool: String, query: String, returned: Vec<ReturnedItem> },
+    FileTouch { path: String },
+    RawGrep,
+    Other,
+}
+
+#[derive(Debug, Default)]
+pub struct ParsedTranscript {
+    pub events: Vec<Event>,
+    pub unresolved: usize,
+    pub unparseable: usize,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+}
+
+/// Pull the inner text payload out of a tool_result's `content` (array of
+/// {type:text,text} blocks, or a bare string).
+fn tool_result_text(content: &serde_json::Value) -> Option<String> {
+    if let Some(s) = content.as_str() { return Some(s.to_string()); }
+    if let Some(arr) = content.as_array() {
+        for block in arr {
+            if let Some(t) = block.get("text").and_then(|x| x.as_str()) {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn parse_transcript(content: &str) -> ParsedTranscript {
+    use std::collections::HashMap;
+    // Pass 1: tool_use_id -> result payload text.
+    let mut results: HashMap<String, String> = HashMap::new();
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue; };
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else { continue; };
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                if let (Some(id), Some(text)) = (
+                    b.get("tool_use_id").and_then(|x| x.as_str()),
+                    b.get("content").and_then(|c| tool_result_text(c)),
+                ) {
+                    results.insert(id.to_string(), text);
+                }
+            }
+        }
+    }
+    // Pass 2: build events in order from tool_use blocks.
+    let mut out = ParsedTranscript::default();
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue; };
+        if let Some(ts) = v.get("timestamp").and_then(|x| x.as_str()) {
+            if out.first_ts.is_none() { out.first_ts = Some(ts.to_string()); }
+            out.last_ts = Some(ts.to_string());
+        }
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else { continue; };
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") { continue; }
+            let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let id = b.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let input = b.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            if let Some(tool) = cg_pull_tool(name) {
+                match results.get(id) {
+                    None => out.unresolved += 1,
+                    Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+                        Ok(payload) => {
+                            let query = input.get("query").or_else(|| input.get("symbol"))
+                                .or_else(|| input.get("name"))
+                                .and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            let returned = extract_returned(&payload, is_ranked_tool(&tool));
+                            out.events.push(Event::CgCall { tool, query, returned });
+                        }
+                        Err(_) => out.unparseable += 1,
+                    },
+                }
+            } else if name == "Read" || name == "Edit" || name == "Write" {
+                if let Some(fp) = input.get("file_path").and_then(|x| x.as_str()) {
+                    out.events.push(Event::FileTouch { path: fp.to_string() });
+                }
+            } else if name == "Bash" {
+                let cmd = input.get("command").and_then(|x| x.as_str()).unwrap_or("");
+                if cmd.contains("grep ") || cmd.contains("rg ") {
+                    out.events.push(Event::RawGrep);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +269,41 @@ mod tests {
     fn extract_handles_empty_and_garbage() {
         assert!(extract_returned(&serde_json::json!([]), true).is_empty());
         assert!(extract_returned(&serde_json::json!("oops"), true).is_empty());
+    }
+
+    #[test]
+    fn parse_pairs_cg_call_with_result_then_edit() {
+        let call = r#"{"type":"assistant","timestamp":"2026-06-29T10:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"mcp__code-graph-dev__semantic_code_search","input":{"query":"login flow"}}]}}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"[{\"file_path\":\"src/auth.rs\",\"name\":\"login\"}]"}]}]}}"#;
+        let edit = r#"{"type":"assistant","timestamp":"2026-06-29T10:01:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"Edit","input":{"file_path":"/proj/src/auth.rs"}}]}}"#;
+        let content = format!("{call}\n{result}\n{edit}\n");
+        let p = parse_transcript(&content);
+        assert_eq!(p.unresolved, 0);
+        assert_eq!(p.events.len(), 2);
+        match &p.events[0] {
+            Event::CgCall { tool, query, returned } => {
+                assert_eq!(tool, "semantic_code_search");
+                assert_eq!(query, "login flow");
+                assert_eq!(returned[0].file_path, "src/auth.rs");
+                assert_eq!(returned[0].rank, Some(0));
+            }
+            _ => panic!("expected CgCall"),
+        }
+        assert!(matches!(&p.events[1], Event::FileTouch { path } if path == "/proj/src/auth.rs"));
+        assert_eq!(p.first_ts.as_deref(), Some("2026-06-29T10:00:00Z"));
+    }
+
+    #[test]
+    fn parse_counts_unresolved_cg_call() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tuX","name":"mcp__code-graph-dev__ast_search","input":{"query":"q"}}]}}"#;
+        let p = parse_transcript(&format!("{call}\n"));
+        assert_eq!(p.unresolved, 1);
+        assert!(p.events.iter().all(|e| !matches!(e, Event::CgCall { .. })));
+    }
+
+    #[test]
+    fn parse_skips_malformed_lines() {
+        let p = parse_transcript("not json\n{}\n");
+        assert_eq!(p.events.len(), 0);
     }
 }
