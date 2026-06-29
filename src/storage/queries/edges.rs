@@ -208,16 +208,20 @@ pub fn get_edge_targets_with_files(conn: &Connection, source_id: i64, relation: 
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Like get_edge_source_names but also returns the file path for each source node.
-pub fn get_edge_sources_with_files(conn: &Connection, target_id: i64, relation: &str) -> Result<Vec<(String, String)>> {
+/// Like get_edge_source_names but also returns the file path and the authoritative
+/// AST-level `nodes.is_test` flag for each source node, as `(name, file_path, is_test)`.
+/// The flag lets caller-partitioning surfaces (`show --refs`, `get_ast_node`
+/// references) exclude inline unit tests the `is_test_symbol` name heuristic misses —
+/// pair with [`crate::domain::is_test_node`].
+pub fn get_edge_sources_with_files(conn: &Connection, target_id: i64, relation: &str) -> Result<Vec<(String, String, bool)>> {
     let mut stmt = conn.prepare(
-        "SELECT n.name, COALESCE(f.path, '') FROM edges e
+        "SELECT n.name, COALESCE(f.path, ''), n.is_test FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
          WHERE e.target_id = ?1 AND e.relation = ?2"
     )?;
     let rows = stmt.query_map(rusqlite::params![target_id, relation], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }

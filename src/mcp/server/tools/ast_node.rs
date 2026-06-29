@@ -134,17 +134,17 @@ impl McpServer {
                         // keeps first 10 + last 5; without this, test-heavy SQL row order can
                         // crowd all production callers out of the kept window.
                         let mut all = callers;
-                        all.sort_by_key(|(n, f)| is_test_symbol(n, f));
+                        all.sort_by_key(|(n, f, t)| crate::domain::is_test_node(*t, n, f));
                         (all, 0)
                     } else {
                         let total = callers.len();
                         let prod: Vec<_> = callers.into_iter()
-                            .filter(|(n, f)| !is_test_symbol(n, f))
+                            .filter(|(n, f, t)| !crate::domain::is_test_node(*t, n, f))
                             .collect();
                         let tc = total - prod.len();
                         (prod, tc)
                     };
-                    result["called_by"] = json!(filtered.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+                    result["called_by"] = json!(filtered.into_iter().map(|(name, file, _)| json!({"name": name, "file": file})).collect::<Vec<_>>());
                     if test_count > 0 {
                         result["test_callers_hidden"] = json!(test_count);
                     }
@@ -247,17 +247,17 @@ impl McpServer {
                 // keeps first 10 + last 5; without this, test-heavy SQL row order can
                 // crowd all production callers out of the kept window.
                 let mut all = callers;
-                all.sort_by_key(|(n, f)| is_test_symbol(n, f));
+                all.sort_by_key(|(n, f, t)| crate::domain::is_test_node(*t, n, f));
                 (all, 0)
             } else {
                 let total = callers.len();
                 let prod: Vec<_> = callers.into_iter()
-                    .filter(|(n, f)| !is_test_symbol(n, f))
+                    .filter(|(n, f, t)| !crate::domain::is_test_node(*t, n, f))
                     .collect();
                 let tc = total - prod.len();
                 (prod, tc)
             };
-            result["called_by"] = json!(filtered.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+            result["called_by"] = json!(filtered.into_iter().map(|(name, file, _)| json!({"name": name, "file": file})).collect::<Vec<_>>());
             if test_count > 0 {
                 result["test_callers_hidden"] = json!(test_count);
             }
@@ -290,37 +290,28 @@ impl McpServer {
             self.db.conn(), symbol_name, Some(file_path),
             crate::graph::query::Direction::Callers, min_confidence_rank,
         )? + crate::graph::query::count_suppressed_into(self.db.conn(), &caller_ids, min_confidence_rank)?;
-        let prod_callers: Vec<_> = callers.iter()
-            .filter(|c| !is_test_symbol(&c.name, &c.file_path))
-            .collect();
-        let affected_files: std::collections::HashSet<&str> = prod_callers.iter()
-            .map(|c| c.file_path.as_str()).collect();
-        let affected_routes: usize = callers.iter()
-            .filter(|c| c.route_info.is_some())
-            .count();
-
-        let test_callers_count = callers.len() - prod_callers.len();
-
+        // Shared prod/test partition + route + risk classification (graph::impact) —
+        // the single source that also drives `cmd_impact`. Trusts the AST `is_test`
+        // flag (catches inline `#[cfg(test)]` unit tests whose descriptive names the
+        // name heuristic misses), excludes routes reachable only through test callers,
+        // and dedups callers by (name, file, depth). Previously this summary
+        // reimplemented the partition with the weaker `is_test_symbol` heuristic and
+        // counted unparseable/test-only routes — the v0.79.1 audit sibling-hole.
         let is_function_like = crate::domain::is_function_node_type(node_type);
-        let warn_non_function = prod_callers.is_empty() && !is_function_like;
-        let risk: &'static str = if warn_non_function {
-            "UNKNOWN"
-        } else {
-            crate::domain::compute_risk_level(prod_callers.len(), affected_routes, false)
-        };
+        let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
 
         let mut impact = json!({
-            "risk_level": risk,
-            "direct_callers": prod_callers.iter().filter(|c| c.depth == 1).count(),
-            "transitive_callers": prod_callers.iter().filter(|c| c.depth > 1).count(),
-            "affected_files": affected_files.len(),
-            "affected_routes": affected_routes,
+            "risk_level": cls.risk_level,
+            "direct_callers": cls.prod_callers.iter().filter(|c| c.depth == 1).count(),
+            "transitive_callers": cls.prod_callers.iter().filter(|c| c.depth > 1).count(),
+            "affected_files": cls.affected_files,
+            "affected_routes": cls.route_callers.len(),
         });
-        if test_callers_count > 0 {
-            impact["test_callers_filtered"] = json!(test_callers_count);
+        if cls.test_count > 0 {
+            impact["test_callers_filtered"] = json!(cls.test_count);
         }
-        if warn_non_function {
-            impact["warning"] = json!(crate::domain::NON_FUNCTION_IMPACT_WARNING);
+        if let Some(warning) = cls.type_warning {
+            impact["warning"] = json!(warning);
         }
         if ambiguous_callers_excluded > 0 {
             impact["ambiguous_callers_excluded"] = json!(ambiguous_callers_excluded);
@@ -399,31 +390,37 @@ impl McpServer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::is_test_symbol;
+    use crate::domain::is_test_node;
 
     #[test]
     fn called_by_prod_first_sort_survives_truncation() {
         // SQL row order without ORDER BY can interleave or cluster test callers.
         // Worst case observed: tests/integration.rs hits at array tail and
         // src/foo/bar.rs unit tests at head, leaving zero prod callers in
-        // a `first 10 + last 5` truncation window.
-        let mut callers: Vec<(String, String)> = vec![
-            ("test_v1_to_v2_migration".into(), "src/storage/db.rs".into()),
-            ("test_init_creates_db_and_tables".into(), "src/storage/db.rs".into()),
-            ("cmd_health_check".into(), "src/cli.rs".into()),
-            ("run_full_index".into(), "src/indexer/pipeline/mod.rs".into()),
-            ("tool_module_overview".into(), "src/mcp/server/tools/overview.rs".into()),
-            ("test_camelcase_search_finds_split_tokens".into(), "tests/integration.rs".into()),
-            ("test_type_based_search".into(), "tests/integration.rs".into()),
+        // a `first 10 + last 5` truncation window. The sort must also push inline
+        // `#[cfg(test)]` unit tests (is_test=1, name with no `test` substring in a
+        // src/ file) to the back — only the AST flag catches those.
+        let mut callers: Vec<(String, String, bool)> = vec![
+            ("test_v1_to_v2_migration".into(), "src/storage/db.rs".into(), false),
+            ("test_init_creates_db_and_tables".into(), "src/storage/db.rs".into(), false),
+            ("cmd_health_check".into(), "src/cli.rs".into(), false),
+            ("run_full_index".into(), "src/indexer/pipeline/mod.rs".into(), false),
+            ("tool_module_overview".into(), "src/mcp/server/tools/overview.rs".into(), false),
+            ("test_camelcase_search_finds_split_tokens".into(), "tests/integration.rs".into(), false),
+            // inline unit test: heuristic-invisible name + src/ path, only is_test=1 classifies it
+            ("two_node_cycle_is_detected".into(), "src/graph/cycles.rs".into(), true),
         ];
-        callers.sort_by_key(|(n, f)| is_test_symbol(n, f));
+        callers.sort_by_key(|(n, f, t)| is_test_node(*t, n, f));
 
-        let prod_count = callers.iter().take_while(|(n, f)| !is_test_symbol(n, f)).count();
+        let prod_count = callers.iter().take_while(|(n, f, t)| !is_test_node(*t, n, f)).count();
         assert_eq!(prod_count, 3, "prod callers must occupy contiguous prefix");
         let prod_names: std::collections::HashSet<&str> =
-            callers[..prod_count].iter().map(|(n, _)| n.as_str()).collect();
+            callers[..prod_count].iter().map(|(n, _, _)| n.as_str()).collect();
         assert!(prod_names.contains("cmd_health_check"));
         assert!(prod_names.contains("run_full_index"));
         assert!(prod_names.contains("tool_module_overview"));
+        // The inline unit test must NOT sit in the prod prefix — the flag drives it back.
+        assert!(!prod_names.contains("two_node_cycle_is_detected"),
+            "inline unit test (is_test=1) leaked into the prod prefix");
     }
 }

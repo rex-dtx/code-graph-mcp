@@ -176,6 +176,50 @@ mod tests {
     use super::super::nodes::{insert_node, NodeRecord};
 
     #[test]
+    fn node_delete_reaps_vector_no_orphan_either_path() {
+        // The v0.79.1 audit flagged "orphan vectors never GC'd: vec0 has no FK". In
+        // fact the `nodes_vectors_ad` AFTER DELETE trigger reaps a node's vector on
+        // BOTH a direct node delete AND an FK-cascade delete (file removal): SQLite
+        // fires a child table's AFTER DELETE trigger on FK cascade even with
+        // recursive_triggers off (production: foreign_keys=ON, recursive_triggers
+        // unset). So no orphan is ever created — this guards that invariant against a
+        // future change to the trigger, the delete path, or the pragmas.
+        use super::super::files::delete_files_by_paths;
+        use super::super::nodes::delete_nodes_by_file;
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        let vec_count = |c: &Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0)).unwrap()
+        };
+        let add_embedded = |c: &Connection, path: &str| -> i64 {
+            let fid = upsert_file(c, &FileRecord {
+                path: path.into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+            }).unwrap();
+            let nid = insert_node(c, &NodeRecord {
+                file_id: fid, node_type: "function".into(), name: "f".into(),
+                qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
+                signature: None, doc_comment: None, context_string: Some("ctx".into()),
+                name_tokens: None, return_type: None, param_types: None, is_test: false,
+            }).unwrap();
+            insert_node_vector(c, nid, &vec![0.0f32; crate::domain::EMBEDDING_DIM]).unwrap();
+            fid
+        };
+
+        // Path 1 — file removal → FK cascade deletes the node → trigger reaps the vector.
+        add_embedded(conn, "a.ts");
+        assert_eq!(vec_count(conn), 1, "vector inserted");
+        delete_files_by_paths(conn, &["a.ts".into()]).unwrap();
+        assert_eq!(vec_count(conn), 0, "FK-cascade delete must reap the vector (no orphan)");
+
+        // Path 2 — direct node delete (the changed-file reindex path) → trigger reaps it.
+        let fid2 = add_embedded(conn, "b.ts");
+        assert_eq!(vec_count(conn), 1, "vector inserted");
+        delete_nodes_by_file(conn, fid2).unwrap();
+        assert_eq!(vec_count(conn), 0, "direct node delete must reap the vector (no orphan)");
+    }
+
+    #[test]
     fn test_get_unembedded_nodes_priority_order() {
         // Verify that get_unembedded_nodes returns nodes ordered by edge reference count (most referenced first)
         let (db, _tmp) = test_db();

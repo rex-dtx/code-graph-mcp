@@ -2030,3 +2030,84 @@ fn test_code_explorer_agent_references_only_live_tools() {
     assert!(referenced >= 1,
         "expected code-explorer.md to reference at least one mcp__code-graph__ tool");
 }
+
+/// v0.79.1 audit sibling-hole (the deferred half of HIGH #1): an inline Rust
+/// `#[cfg(test)]` unit test with a descriptive snake_case name in a `src/` file is
+/// `is_test=1` in the DB, but the `is_test_symbol` name/path heuristic MISSES it
+/// (no `test_` prefix, not a `tests/` path). HIGH #1 fixed `impact`/`classify_impact`;
+/// the parallel surfaces — `get_ast_node` (include_references + include_impact) and
+/// `get_call_graph` — kept filtering on the weak heuristic, so the inline test leaked
+/// into the production caller view and inflated the impact risk count. This drives the
+/// real parser (so the `is_test` flag is genuine) end-to-end across all three surfaces.
+#[test]
+fn test_e2e_inline_unit_test_caller_excluded_across_surfaces() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    // `descriptive_*_check` names contain no "test" substring and live in src/, so the
+    // name/path heuristic classifies them as PROD; only the AST `is_test` flag catches
+    // them. `real_caller` is a genuine production caller.
+    fs::write(project.path().join("src/lib.rs"), r#"
+pub fn target_fn() -> i32 { 42 }
+
+pub fn real_caller() -> i32 { target_fn() }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn descriptive_behavior_check() {
+        // Direct call (not inside a macro arg) so the edge is extracted.
+        let v = target_fn();
+        assert_eq!(v, 42);
+    }
+    #[test]
+    fn another_descriptive_check() {
+        let v = target_fn();
+        assert_eq!(v, 42);
+    }
+}
+"#).unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    // --- get_ast_node include_references: inline tests hidden by default ---
+    let refs = tool_call_json("get_ast_node", serde_json::json!({
+        "symbol_name": "target_fn", "file_path": "src/lib.rs", "include_references": true
+    }));
+    let r = parse_tool_result(&server.handle_message(&refs).unwrap());
+    let called_by: Vec<&str> = r["called_by"].as_array().map(|a| a.iter()
+        .filter_map(|c| c["name"].as_str()).collect()).unwrap_or_default();
+    assert!(called_by.contains(&"real_caller"),
+        "prod caller must be present; got called_by={called_by:?}");
+    assert!(!called_by.contains(&"descriptive_behavior_check")
+            && !called_by.contains(&"another_descriptive_check"),
+        "inline unit tests (is_test=1, heuristic-invisible) leaked into prod callers: {called_by:?}");
+    assert_eq!(r["test_callers_hidden"].as_i64(), Some(2),
+        "both inline unit tests must be counted as hidden test callers; got {}", r);
+
+    // --- get_ast_node include_impact: inline tests must not inflate risk count ---
+    let imp = tool_call_json("get_ast_node", serde_json::json!({
+        "symbol_name": "target_fn", "file_path": "src/lib.rs", "include_impact": true
+    }));
+    let r = parse_tool_result(&server.handle_message(&imp).unwrap());
+    assert_eq!(r["impact"]["direct_callers"].as_i64(), Some(1),
+        "only real_caller is a prod direct caller; got impact={}", r["impact"]);
+    assert_eq!(r["impact"]["test_callers_filtered"].as_i64(), Some(2),
+        "impact must exclude both inline unit tests; got impact={}", r["impact"]);
+
+    // --- get_call_graph callers: inline tests excluded from default view ---
+    let cg = tool_call_json("get_call_graph", serde_json::json!({
+        "symbol_name": "target_fn", "direction": "callers", "depth": 2
+    }));
+    let r = parse_tool_result(&server.handle_message(&cg).unwrap());
+    // Normal (non-rollup) get_call_graph keys the list under `callers`/`callees`.
+    let callers: Vec<&str> = r["callers"].as_array().map(|a| a.iter()
+        .filter_map(|n| n["name"].as_str()).collect()).unwrap_or_default();
+    assert!(callers.contains(&"real_caller"),
+        "prod caller must appear in the default call graph; got callers={callers:?}");
+    assert!(!callers.contains(&"descriptive_behavior_check")
+            && !callers.contains(&"another_descriptive_check"),
+        "inline unit tests leaked into the default call graph: {callers:?}");
+}

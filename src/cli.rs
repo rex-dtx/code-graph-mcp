@@ -3154,7 +3154,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         for n in &result.nodes {
             if n.depth > 0
                 && matches!(n.direction, crate::graph::query::Direction::Callers)
-                && crate::domain::is_test_symbol(&n.name, &n.file_path)
+                && crate::domain::is_test_node(n.is_test, &n.name, &n.file_path)
             {
                 tests += 1;
             } else {
@@ -4276,9 +4276,9 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 let filtered_callers: Vec<_> = if include_tests {
                     callers.iter().collect()
                 } else {
-                    callers.iter().filter(|(n, f)| !crate::domain::is_test_symbol(n, f)).collect()
+                    callers.iter().filter(|(n, f, t)| !crate::domain::is_test_node(*t, n, f)).collect()
                 };
-                obj["called_by"] = serde_json::json!(filtered_callers.iter().map(|(n, f)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
+                obj["called_by"] = serde_json::json!(filtered_callers.iter().map(|(n, f, _)| serde_json::json!({"name": n, "file": f})).collect::<Vec<_>>());
                 if !include_tests {
                     let test_count = callers.len() - filtered_callers.len();
                     if test_count > 0 {
@@ -4287,18 +4287,18 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 }
             }
             if include_impact {
+                // Shared prod/test partition + risk (graph::impact) — same source as
+                // `cmd_impact`/MCP get_ast_node. Trusts the AST `is_test` flag so inline
+                // `#[cfg(test)]` unit tests don't inflate the prod count / risk level.
                 let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
-                let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
-                let prod: Vec<_> = callers.iter().filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path)).collect();
-                let routes = callers.iter().filter(|c| c.route_info.is_some()).count();
-                let files: std::collections::HashSet<&str> = prod.iter().map(|c| c.file_path.as_str()).collect();
-                let risk = crate::domain::compute_risk_level(prod.len(), routes, false);
+                let is_function_like = crate::domain::is_function_node_type(&node.node_type);
+                let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
                 obj["impact"] = serde_json::json!({
-                    "risk_level": risk,
-                    "direct_callers": prod.iter().filter(|c| c.depth == 1).count(),
-                    "transitive_callers": prod.iter().filter(|c| c.depth > 1).count(),
-                    "affected_files": files.len(),
-                    "affected_routes": routes,
+                    "risk_level": cls.risk_level,
+                    "direct_callers": cls.prod_callers.iter().filter(|c| c.depth == 1).count(),
+                    "transitive_callers": cls.prod_callers.iter().filter(|c| c.depth > 1).count(),
+                    "affected_files": cls.affected_files,
+                    "affected_routes": cls.route_callers.len(),
                 });
             }
             obj
@@ -4340,8 +4340,8 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             if !callers.is_empty() {
                 let mut test_count = 0usize;
                 writeln!(stdout, "  Called by:")?;
-                for (name, file) in &callers {
-                    if !include_tests && crate::domain::is_test_symbol(name, file) {
+                for (name, file, is_test) in &callers {
+                    if !include_tests && crate::domain::is_test_node(*is_test, name, file) {
                         test_count += 1;
                     } else {
                         writeln!(stdout, "    ← {} ({})", name, file)?;
@@ -4354,14 +4354,11 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         }
         if include_impact {
             let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
-            let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
-            let prod: Vec<_> = callers.iter().filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path)).collect();
-            let routes = callers.iter().filter(|c| c.route_info.is_some()).count();
-            let files: std::collections::HashSet<&str> = prod.iter().map(|c| c.file_path.as_str()).collect();
-            let risk = crate::domain::compute_risk_level(prod.len(), routes, false);
+            let is_function_like = crate::domain::is_function_node_type(&node.node_type);
+            let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
             writeln!(stdout, "  Impact: {} — {} direct, {} transitive, {} files, {} routes",
-                risk, prod.iter().filter(|c| c.depth == 1).count(),
-                prod.iter().filter(|c| c.depth > 1).count(), files.len(), routes)?;
+                cls.risk_level, cls.prod_callers.iter().filter(|c| c.depth == 1).count(),
+                cls.prod_callers.iter().filter(|c| c.depth > 1).count(), cls.affected_files, cls.route_callers.len())?;
         }
     }
 
@@ -4512,7 +4509,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
             ambiguous_hidden += chain.suppressed_ambiguous;
             let chain_nodes: Vec<serde_json::Value> = chain.nodes.iter()
                 .filter(|n| n.depth > 0)
-                .filter(|n| include_tests || !crate::domain::is_test_symbol(&n.name, &n.file_path))
+                .filter(|n| include_tests || !crate::domain::is_test_node(n.is_test, &n.name, &n.file_path))
                 .map(|n| serde_json::json!({
                     "name": n.name, "file_path": n.file_path, "depth": n.depth,
                 }))
@@ -4575,7 +4572,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         ambiguous_hidden += chain.suppressed_ambiguous;
         for n in &chain.nodes {
             if n.depth == 0 { continue; }
-            if !include_tests && crate::domain::is_test_symbol(&n.name, &n.file_path) { continue; }
+            if !include_tests && crate::domain::is_test_node(n.is_test, &n.name, &n.file_path) { continue; }
             let indent = "  ".repeat(n.depth as usize);
             writeln!(stdout, "{}→ {} ({})", indent, n.name, n.file_path)?;
         }

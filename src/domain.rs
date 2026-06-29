@@ -296,6 +296,22 @@ pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
         || is_test_path(file_path)
 }
 
+/// Authoritative test predicate for a graph node: trust the AST-level `nodes.is_test`
+/// flag first, falling back to the [`is_test_symbol`] name/path heuristic for rows
+/// that don't carry it. The flag (set by the parser for `#[cfg(test)] mod tests` /
+/// `#[test]` / `@Test` / ...) catches inline unit tests with descriptive snake_case
+/// names in a `src/` file that the heuristic MISSES; the heuristic still catches
+/// integration tests in `tests/`, `test_`-prefixed names, and any node whose
+/// `is_test` projection predates a surface.
+///
+/// Single source so every caller-/callee-partitioning surface (callgraph, trace,
+/// `show` references) classifies tests identically — mirrors `classify_impact`'s
+/// rule (`graph::impact`) and prevents the is_test "sibling-hole" drift the v0.79.1
+/// audit traced across impact/callgraph/trace/show.
+pub fn is_test_node(is_test_flag: bool, name: &str, file_path: &str) -> bool {
+    is_test_flag || is_test_symbol(name, file_path)
+}
+
 /// True for a search/similarity candidate that every result surface skips as
 /// non-real output: a file-level `<module>` placeholder, an `<external>` stub,
 /// or a test symbol. Single source for the triad otherwise reimplemented in
@@ -664,6 +680,20 @@ mod tests {
         // is_test_symbol still honors the name heuristic on a non-test path.
         assert!(is_test_symbol("test_login", "src/auth.rs"));
         assert!(!is_test_symbol("login", "src/auth.rs"));
+    }
+
+    #[test]
+    fn is_test_node_trusts_flag_then_heuristic() {
+        // The AST flag catches the heuristic-invisible inline unit test
+        // (descriptive snake_case name, src/ path) — the v0.79.1 audit case.
+        assert!(is_test_node(true, "two_node_cycle_is_detected", "src/graph/cycles.rs"));
+        // Flag off + heuristic off ⇒ production.
+        assert!(!is_test_node(false, "two_node_cycle_is_detected", "src/graph/cycles.rs"));
+        // Heuristic still classifies when the flag is absent (legacy / unprojected rows).
+        assert!(is_test_node(false, "test_login", "src/auth.rs"));
+        assert!(is_test_node(false, "anything", "tests/integration.rs"));
+        // Genuine production caller stays production under both signals.
+        assert!(!is_test_node(false, "real_caller", "src/lib.rs"));
     }
 
     #[test]

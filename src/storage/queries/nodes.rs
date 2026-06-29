@@ -378,19 +378,25 @@ pub fn get_nodes_with_files_by_filters(
         }
         param_idx += types.len();
     }
+    // Escape LIKE wildcards in the user-supplied filter so a literal `_`/`%` (common
+    // in code identifiers like `get_node`) matches literally instead of as a single-
+    // char / any-run wildcard. Mirrors find_functions_by_fuzzy_name's escaping.
     if let Some(rt) = returns_filter {
-        conditions.push(format!("LOWER(n.return_type) LIKE ?{}", param_idx));
-        params.push(Box::new(format!("%{}%", rt.to_lowercase())));
+        conditions.push(format!("LOWER(n.return_type) LIKE ?{} ESCAPE '\\'", param_idx));
+        let escaped = rt.to_lowercase().replace('%', "\\%").replace('_', "\\_");
+        params.push(Box::new(format!("%{}%", escaped)));
         param_idx += 1;
     }
     if let Some(pt) = params_filter {
-        conditions.push(format!("LOWER(n.param_types) LIKE ?{}", param_idx));
-        params.push(Box::new(format!("%{}%", pt.to_lowercase())));
+        conditions.push(format!("LOWER(n.param_types) LIKE ?{} ESCAPE '\\'", param_idx));
+        let escaped = pt.to_lowercase().replace('%', "\\%").replace('_', "\\_");
+        params.push(Box::new(format!("%{}%", escaped)));
         param_idx += 1;
     }
     if let Some(nf) = name_filter {
-        conditions.push(format!("LOWER(n.name) LIKE ?{}", param_idx));
-        params.push(Box::new(format!("%{}%", nf.to_lowercase())));
+        conditions.push(format!("LOWER(n.name) LIKE ?{} ESCAPE '\\'", param_idx));
+        let escaped = nf.to_lowercase().replace('%', "\\%").replace('_', "\\_");
+        params.push(Box::new(format!("%{}%", escaped)));
         let _ = param_idx;
     }
 

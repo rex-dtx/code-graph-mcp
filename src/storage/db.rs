@@ -1184,7 +1184,10 @@ mod tests {
         }
         let migrated = Database::open(&mig_path).unwrap();
 
-        for table in ["files", "nodes", "edges"] {
+        // `meta` (migrate_v6_to_v7) and `pending_unresolved_calls` (migrate_v7_to_v8)
+        // are created by both create_tables_sql and a migrate_vN — include them so a
+        // future column drift on either is caught, not just files/nodes/edges.
+        for table in ["files", "nodes", "edges", "meta", "pending_unresolved_calls"] {
             assert_eq!(
                 columns(fresh.conn(), table), columns(migrated.conn(), table),
                 "table `{table}`: fresh create_tables_sql schema diverges from the \

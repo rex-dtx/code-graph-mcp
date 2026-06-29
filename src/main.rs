@@ -462,7 +462,31 @@ fn run_serve() -> Result<()> {
             continue;
         }
 
-        match server.handle_message(&buf) {
+        // Isolate per-request panics: a single handler panic must not tear down the
+        // long-lived stdio session. catch_unwind converts it to a JSON-RPC internal
+        // error (request id unknown post-unwind) so the loop continues. No
+        // currently-reachable panic on the request path — defense-in-depth.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            server.handle_message(&buf)
+        })) {
+            Ok(r) => r,
+            Err(panic) => {
+                let msg = panic.downcast_ref::<&str>().map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "handler panicked".to_string());
+                tracing::error!("Panic handling message: {}", msg);
+                Ok(Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": code_graph_mcp::mcp::protocol::JSONRPC_INTERNAL_ERROR,
+                        "message": format!("Internal error (panic): {}", msg)
+                    }
+                }).to_string()))
+            }
+        };
+
+        match result {
             Ok(Some(response)) => {
                 let mut out = stdout_shared.lock().unwrap();
                 writeln!(out, "{}", response)?;

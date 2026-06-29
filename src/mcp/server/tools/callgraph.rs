@@ -186,8 +186,11 @@ impl McpServer {
         compact: bool,
         include_tests: bool,
     ) -> Result<serde_json::Value> {
+        // Authoritative AST flag first, name heuristic as fallback — so inline
+        // `#[cfg(test)]` unit tests (descriptive names the heuristic misses) don't
+        // leak into the default caller/callee view. Shared with impact/trace/show.
         let is_test = |n: &&crate::graph::query::CallGraphNode| {
-            is_test_symbol(&n.name, &n.file_path)
+            crate::domain::is_test_node(n.is_test, &n.name, &n.file_path)
         };
         let mut seen_nodes = std::collections::HashSet::new();
         let all_nodes: Vec<serde_json::Value> = results.nodes.iter()
