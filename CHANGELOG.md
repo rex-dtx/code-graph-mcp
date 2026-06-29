@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.81.0 — `outcome`: does retrieval actually get used?
+
+A new read-only `code-graph-mcp outcome` reads your Claude Code session transcripts and
+measures whether the code-graph results the model retrieved were *adopted* — a later Read/Edit
+landed on a file the tool returned — rather than just counting how often the tools were called.
+It also reports a rank-aware field-MRR for the ranked search tools, so a ranking change can be
+judged on real adoption instead of a synthetic oracle. Read-only; no index rebuild, no schema change.
+
+### Added
+- **`code-graph-mcp outcome [--project <path>] [--since <days>] [--json] [--emit-labels <path>]`.**
+  Pairs each model-initiated code-graph call — MCP `tool_use` *and* CLI-via-Bash
+  `code-graph-mcp <subcmd>` — with the files it returned, then scores adoption (a subsequent
+  Read/Edit on a returned, previously-untouched file) plus a dual field-MRR (adopted-only vs
+  all-ranked) for the ranked search tools. `--emit-labels` writes `(query → adopted-file, rank)`
+  rows for offline ranking evaluation. Anchors on real `tool_use` only; a small-N guard flags
+  results below 20 calls as low-confidence.
+
 ## v0.80.3 — test/prod caller accuracy across callgraph, trace, show & get_ast_node
 
 The graph surfaces now trust the AST-level `is_test` flag (not just a name heuristic)
