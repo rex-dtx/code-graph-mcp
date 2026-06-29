@@ -285,7 +285,7 @@ function runDiagnostics() {
 
 const STATUS_ICONS = { ok: '\u2705', warn: '\u26a0\ufe0f', error: '\u274c', skip: '\u2796' };
 
-function formatReport(results) {
+function formatReport(results, { checkOnly = false } = {}) {
   const pluginVersion = getPluginVersion();
   const lines = [`\ud83d\udd0d code-graph doctor v${pluginVersion}`, ''];
 
@@ -302,7 +302,15 @@ function formatReport(results) {
     lines.push('  All checks passed.');
   } else {
     const fixable = issues.filter(r => r.fixId);
-    lines.push(`  ${issues.length} issue(s) found.${fixable.length > 0 ? ' Fixing...' : ''}`);
+    // `--check-only` is read-only (it never reaches runRepairs), so it must not
+    // claim "Fixing..." — that contradicts the documented contract and alarms
+    // the user into thinking their settings.json/MEMORY.md was just rewritten.
+    const suffix = fixable.length === 0
+      ? ''
+      : checkOnly
+        ? ' Run without --check-only to fix.'
+        : ' Fixing...';
+    lines.push(`  ${issues.length} issue(s) found.${suffix}`);
   }
 
   return lines.join('\n');
@@ -526,7 +534,7 @@ function runRepairs(results) {
 
 function runDoctor(opts = {}) {
   const results = runDiagnostics();
-  console.log(formatReport(results));
+  console.log(formatReport(results, { checkOnly: opts.checkOnly }));
 
   const issues = results.filter(r => r.status === 'warn' || r.status === 'error');
 

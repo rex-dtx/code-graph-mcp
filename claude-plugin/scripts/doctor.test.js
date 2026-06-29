@@ -48,6 +48,22 @@ test('formatReport shows issue count when problems exist', () => {
   assert.ok(output.includes('issue'));
 });
 
+test('formatReport: --check-only never says "Fixing..." (it does not repair)', () => {
+  const results = [
+    { name: 'Hook coverage', status: 'warn', detail: 'missing', fixId: 'hooks' },
+  ];
+  // Default (repair mode) announces the fix.
+  assert.ok(formatReport(results).includes('Fixing...'),
+    'repair mode should announce Fixing...');
+  // --check-only is read-only: it must NOT claim to fix, and should point the
+  // user at the repair command instead.
+  const checkOnly = formatReport(results, { checkOnly: true });
+  assert.ok(!checkOnly.includes('Fixing...'),
+    `--check-only must not say "Fixing..."; got: ${checkOnly}`);
+  assert.ok(checkOnly.includes('--check-only'),
+    `--check-only should hint how to fix; got: ${checkOnly}`);
+});
+
 test('formatReport shows all-clear when no problems', () => {
   const results = [
     { name: 'Binary version', status: 'ok', detail: 'v0.7.16' },
