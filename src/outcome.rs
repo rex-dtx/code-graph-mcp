@@ -245,6 +245,74 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
     out
 }
 
+pub const MIN_N: usize = 20;
+
+#[derive(Debug, Default)]
+pub struct OutcomeSummary {
+    pub transcripts: usize,
+    pub sessions: usize,
+    pub cg_calls: usize,
+    pub unresolved: usize,
+    pub unparseable: usize,
+    pub adopted: usize,
+    pub adoption_rate: f64,
+    pub ranked_calls: usize,
+    pub ranked_adopted: usize,
+    pub field_mrr_adopted: f64,
+    pub field_mrr_all: f64,
+    pub rank_histogram: std::collections::BTreeMap<usize, usize>,
+    pub by_tool: std::collections::BTreeMap<String, (usize, usize)>, // tool -> (calls, adopted)
+    pub low_confidence: bool,
+}
+
+pub fn aggregate(
+    calls: &[CallOutcome],
+    transcripts: usize,
+    sessions: usize,
+    unresolved: usize,
+    unparseable: usize,
+) -> OutcomeSummary {
+    let mut s = OutcomeSummary {
+        transcripts,
+        sessions,
+        unresolved,
+        unparseable,
+        cg_calls: calls.len(),
+        ..Default::default()
+    };
+    let mut rr_adopted_sum = 0.0f64;
+    let mut rr_all_sum = 0.0f64;
+    for c in calls {
+        let e = s.by_tool.entry(c.tool.clone()).or_insert((0, 0));
+        e.0 += 1;
+        if c.adopted {
+            s.adopted += 1;
+            e.1 += 1;
+            if let Some(r) = c.adopted_rank {
+                *s.rank_histogram.entry(r).or_insert(0) += 1;
+            }
+        }
+        if c.ranked {
+            s.ranked_calls += 1;
+            let rr = if c.adopted {
+                c.adopted_rank.map(|r| 1.0 / (r as f64 + 1.0)).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            rr_all_sum += rr;
+            if c.adopted {
+                s.ranked_adopted += 1;
+                rr_adopted_sum += rr;
+            }
+        }
+    }
+    s.adoption_rate = if s.cg_calls > 0 { s.adopted as f64 / s.cg_calls as f64 } else { 0.0 };
+    s.field_mrr_adopted = if s.ranked_adopted > 0 { rr_adopted_sum / s.ranked_adopted as f64 } else { 0.0 };
+    s.field_mrr_all = if s.ranked_calls > 0 { rr_all_sum / s.ranked_calls as f64 } else { 0.0 };
+    s.low_confidence = s.cg_calls < MIN_N;
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +527,38 @@ mod tests {
         let p = parse_transcript(&format!("{bash}\n"));
         assert_eq!(p.events.len(), 1);
         assert!(matches!(&p.events[0], Event::RawGrep));
+    }
+
+    // ── aggregate / OutcomeSummary helpers ───────────────────────────────────
+
+    fn co(tool: &str, ranked: bool, adopted: bool, rank: Option<usize>) -> CallOutcome {
+        CallOutcome { tool: tool.into(), query: "q".into(), returned_files: vec![], adopted, adopted_rank: rank, ranked }
+    }
+
+    #[test]
+    fn mrr_reported_two_ways() {
+        let calls = vec![
+            co("semantic_code_search", true, true, Some(0)),  // rr = 1.0
+            co("semantic_code_search", true, true, Some(2)),  // rr = 1/3
+            co("semantic_code_search", true, false, None),    // rr = 0 for _all only
+        ];
+        let s = aggregate(&calls, 1, 1, 0, 0);
+        assert_eq!(s.cg_calls, 3);
+        assert_eq!(s.adopted, 2);
+        // adopted-only: mean(1.0, 0.333) = 0.667
+        assert!((s.field_mrr_adopted - 0.6667).abs() < 0.001);
+        // all ranked: mean(1.0, 0.333, 0.0) = 0.444
+        assert!((s.field_mrr_all - 0.4444).abs() < 0.001);
+        assert!(s.low_confidence); // 3 < MIN_N
+    }
+
+    #[test]
+    fn structural_tools_excluded_from_mrr_but_counted_in_adoption() {
+        let calls = vec![co("get_call_graph", false, true, None)];
+        let s = aggregate(&calls, 1, 1, 0, 0);
+        assert_eq!(s.adopted, 1);
+        assert_eq!(s.ranked_calls, 0);
+        assert_eq!(s.field_mrr_adopted, 0.0); // no ranked calls → 0, not NaN
     }
 
     #[test]
