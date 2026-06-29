@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.80.2 — downgrade-safe index open (no index rebuild)
+
+A version-mismatch index open is now directional: an older binary never wipes an
+index built by a newer one. Runtime-only — no `INDEX_VERSION` bump, upgrades still
+rebuild as before.
+
+### Fixed
+- **An older code-graph binary can no longer wipe a newer index.** The
+  `application_id` (`INDEX_VERSION`) check in `Database::open` was symmetric, so a
+  stale server on an older binary would `DELETE` an index a current binary had just
+  built — and the two then cleared each other on every open, leaving it stuck at 0
+  nodes (the version "ping-pong", seen after a plugin update + dev rebuild when an
+  old MCP server process lingers). The check is now directional: only an *upgrade*
+  (stored `<` binary) wipes-and-rebuilds on an indexer open; a *downgrade* (stored
+  `>` binary) leaves the data and `application_id` intact, flags the index stale,
+  and warns on indexer/server-startup opens. Readers were already non-destructive.
+  A deliberate permanent downgrade still rebuilds via `rm .code-graph/index.db*`.
+
 ## v0.80.1 — statusline + release-tooling robustness
 
 Follow-up fixes from the v0.80.0 audit's remaining cluster (no index rebuild).
