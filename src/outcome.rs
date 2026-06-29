@@ -388,8 +388,28 @@ pub fn cmd_outcome(project_root: &std::path::Path, args: OutcomeArgs) -> Result<
     Ok(())
 }
 
-/// Stub — Task 7 replaces this with the real body that writes JSONL label rows.
-pub fn emit_labels(_calls: &[CallOutcome], _path: &str) -> Result<()> { Ok(()) }
+/// Append one JSONL row per cg call: the phase-2 replay dataset. Only calls that
+/// adopted a returned file carry a usable (query → adopted_file) relevance label,
+/// but every call is emitted so non-adoption is visible too.
+pub fn emit_labels(calls: &[CallOutcome], path: &str) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    for c in calls {
+        let adopted_file = if c.adopted {
+            c.adopted_rank.and_then(|r| c.returned_files.get(r)).cloned()
+        } else { None };
+        let row = serde_json::json!({
+            "tool": c.tool,
+            "query": c.query,
+            "returned_files": c.returned_files,
+            "adopted": c.adopted,
+            "adopted_rank": c.adopted_rank,
+            "adopted_file": adopted_file,
+        });
+        writeln!(f, "{}", serde_json::to_string(&row)?)?;
+    }
+    Ok(())
+}
 
 fn render_human(s: &OutcomeSummary, target: &std::path::Path) {
     println!("Outcome (retrieval adoption)  \u{2014}  project: {}", target.display());
@@ -701,5 +721,23 @@ mod tests {
         assert_eq!(summary.adopted, 1);
         assert_eq!(calls.len(), 1);
         assert!(calls[0].adopted);
+    }
+
+    #[test]
+    fn emit_labels_writes_jsonl_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("labels.jsonl");
+        let calls = vec![CallOutcome {
+            tool: "semantic_code_search".into(), query: "login".into(),
+            returned_files: vec!["src/a.rs".into(), "src/b.rs".into()],
+            adopted: true, adopted_rank: Some(1), ranked: true,
+        }];
+        emit_labels(&calls, path.to_str().unwrap()).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let row: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["query"], "login");
+        assert_eq!(row["adopted_rank"], 1);
+        assert_eq!(row["adopted"], true);
+        assert_eq!(row["adopted_file"], "src/b.rs");
     }
 }
