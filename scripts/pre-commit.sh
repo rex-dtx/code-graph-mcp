@@ -85,15 +85,23 @@ fi
 rs_staged=$(echo "$staged_files" | grep -c '\.rs$' || true)
 cargo_staged=$(echo "$staged_files" | grep -c 'Cargo\.\(toml\|lock\)' || true)
 if [ "$rs_staged" -gt 0 ] || [ "$cargo_staged" -gt 0 ]; then
+  # Strip the GIT_* env git exports into this hook before running cargo: tests that
+  # shell out to `git` for fixtures (src/snapshot/tests.rs init_git_fixture) would
+  # otherwise inherit the parent repo's GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE and
+  # operate on THIS repo's index instead of their tempdir — `git add .` records a
+  # fixture's src/lib.rs into the real index ("invalid object … for src/lib.rs")
+  # and the fixture commit is empty (false "expected non-empty source commit").
+  git_clean=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX)
+
   echo "Running cargo check..."
-  if ! cargo check --quiet 2>&1; then
+  if ! "${git_clean[@]}" cargo check --quiet 2>&1; then
     echo "❌ cargo check failed"
     exit 1
   fi
   echo "✓ cargo check passed"
 
   echo "Running cargo test..."
-  if ! cargo test --quiet 2>&1; then
+  if ! "${git_clean[@]}" cargo test --quiet 2>&1; then
     echo "❌ cargo test failed"
     exit 1
   fi
