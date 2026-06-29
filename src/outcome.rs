@@ -185,6 +185,26 @@ fn tool_result_text(content: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// If a Bash command invokes `code-graph-mcp <query-subcommand>`, return the
+/// canonical query name (via cli::canonical_query_cmd). Scans whitespace tokens so
+/// COMPOUND commands (`cd x && code-graph-mcp callgraph Y`) are detected, and
+/// matches both the bare binary and a path-suffixed form
+/// (`./target/release/code-graph-mcp`). Housekeeping subcommands (stats/serve/…)
+/// return None (canonical_query_cmd yields None for them).
+fn detect_cli_cg_call(cmd: &str) -> Option<&'static str> {
+    let toks: Vec<&str> = cmd.split_whitespace().collect();
+    for (i, t) in toks.iter().enumerate() {
+        if *t == "code-graph-mcp" || t.ends_with("/code-graph-mcp") {
+            if let Some(sub) = toks.get(i + 1) {
+                if let Some(canon) = crate::cli::canonical_query_cmd(sub) {
+                    return Some(canon);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_transcript(content: &str) -> ParsedTranscript {
     use std::collections::HashMap;
     // Pass 1: tool_use_id -> result payload text.
@@ -237,7 +257,17 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
                 }
             } else if name == "Bash" {
                 let cmd = input.get("command").and_then(|x| x.as_str()).unwrap_or("");
-                if cmd.contains("grep ") || cmd.contains("rg ") {
+                if let Some(canon) = detect_cli_cg_call(cmd) {
+                    let tool = format!("{canon}_cli");
+                    let ranked = is_ranked_tool(&tool);
+                    match results.get(id) {
+                        None => out.unresolved += 1,
+                        Some(stdout) => {
+                            let returned = extract_returned_from_cli(stdout, ranked);
+                            out.events.push(Event::CgCall { tool, query: String::new(), returned });
+                        }
+                    }
+                } else if cmd.contains("grep ") || cmd.contains("rg ") {
                     out.events.push(Event::RawGrep);
                 }
             }
@@ -789,6 +819,47 @@ mod tests {
         let p = parse_transcript(&format!("{bash}\n"));
         assert_eq!(p.events.len(), 1);
         assert!(matches!(&p.events[0], Event::RawGrep));
+    }
+
+    #[test]
+    fn parse_detects_cli_callgraph_as_cgcall_not_rawgrep() {
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"code-graph-mcp callgraph Foo"}}]}}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b1","content":[{"type":"text","text":"src/foo.rs:10  fn Foo"}]}]}}"#;
+        let p = parse_transcript(&format!("{call}\n{result}\n"));
+        assert_eq!(p.events.len(), 1);
+        match &p.events[0] {
+            Event::CgCall { tool, returned, .. } => {
+                assert_eq!(tool, "callgraph_cli");
+                assert_eq!(returned[0].file_path, "src/foo.rs");
+                assert_eq!(returned[0].rank, None); // structural
+            }
+            _ => panic!("expected CgCall, got RawGrep/Other"),
+        }
+    }
+
+    #[test]
+    fn parse_detects_cli_search_ranked_and_compound() {
+        // compound command (cd && code-graph-mcp search) + ranked search_cli
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cd backend && code-graph-mcp search \"login\""}}]}}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b2","content":[{"type":"text","text":"h3 a  src/a.rs:1-2\nh3 b  src/b.rs:3-4"}]}]}}"#;
+        let p = parse_transcript(&format!("{call}\n{result}\n"));
+        match &p.events[0] {
+            Event::CgCall { tool, returned, .. } => {
+                assert_eq!(tool, "search_cli");
+                assert_eq!(returned[0].rank, Some(0));
+                assert_eq!(returned[1].rank, Some(1));
+            }
+            _ => panic!("expected search_cli CgCall"),
+        }
+    }
+
+    #[test]
+    fn parse_raw_grep_still_rawgrep_and_housekeeping_ignored() {
+        let raw = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"g1","name":"Bash","input":{"command":"grep -rn foo src/"}}]}}"#;
+        let house = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"s1","name":"Bash","input":{"command":"code-graph-mcp stats"}}]}}"#;
+        let p = parse_transcript(&format!("{raw}\n{house}\n"));
+        assert!(matches!(&p.events[0], Event::RawGrep));            // raw grep unchanged
+        assert!(p.events.iter().all(|e| !matches!(e, Event::CgCall { .. }))); // stats = housekeeping, not a cg call
     }
 
     // ── aggregate / OutcomeSummary helpers ───────────────────────────────────
