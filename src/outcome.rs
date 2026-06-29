@@ -23,10 +23,11 @@ pub fn is_ranked_tool(base: &str) -> bool {
 }
 
 /// Encode an absolute project path to its Claude Code transcript-dir slug:
-/// every `/` and `.` becomes `-` (mirrors `claude-plugin/scripts/adopt.js`
-/// `memoryDir`). Verified by the integration test reading daagu's real dir.
+/// every non-alphanumeric character becomes `-` (so `/`, `_`, `.` all map to `-`;
+/// existing hyphens are preserved). Verified against the real `~/.claude/projects/`
+/// directory names (`/mnt/data_ssd/...` → `-mnt-data-ssd-...`).
 pub fn project_slug(abs_path: &str) -> String {
-    abs_path.chars().map(|c| if c == '/' || c == '.' { '-' } else { c }).collect()
+    abs_path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
 pub fn transcript_dir(target: &Path, home: &Path) -> PathBuf {
@@ -467,9 +468,13 @@ mod tests {
     }
 
     #[test]
-    fn slug_replaces_slash_and_dot() {
+    fn slug_replaces_non_alphanumeric_with_dash() {
+        // underscore must become a dash (matches the real ~/.claude/projects/ dir name)
         assert_eq!(project_slug("/mnt/data_ssd/dev/projects/code-graph-mcp"),
-                   "-mnt-data_ssd-dev-projects-code-graph-mcp");
+                   "-mnt-data-ssd-dev-projects-code-graph-mcp");
+        assert_eq!(project_slug("/mnt/data_ssd/dev/projects/daagu"),
+                   "-mnt-data-ssd-dev-projects-daagu");
+        // dots also become dashes; existing hyphens are preserved
         assert_eq!(project_slug("/home/sds/.claude/x"), "-home-sds--claude-x");
     }
 
