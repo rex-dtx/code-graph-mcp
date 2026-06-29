@@ -231,7 +231,7 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
             if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
                 if let (Some(id), Some(text)) = (
                     b.get("tool_use_id").and_then(|x| x.as_str()),
-                    b.get("content").and_then(|c| tool_result_text(c)),
+                    b.get("content").and_then(tool_result_text),
                 ) {
                     results.insert(id.to_string(), text);
                 }
