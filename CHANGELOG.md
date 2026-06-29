@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.82.1 — accurate `reindex` help, read-only `doctor --check-only`
+
+Two user-facing message corrections. No behavior change, no index rebuild, no schema change.
+
+### Fixed
+- **`reindex` help no longer claims "Reset index".** Plain `reindex` (without `--from-snapshot`)
+  runs an incremental refresh via `cmd_incremental_index` — it does not drop the index; only
+  `--from-snapshot` does, and `rebuild-index` is the unconditional rebuild. The main help and the
+  clap `about` (`reindex --help`) overstated it as "Reset index", which would mislead a user
+  trying to recover a stale index into thinking a no-op incremental pass had rebuilt it. Both now
+  describe the incremental behavior and point at `rebuild-index` for a full rebuild.
+- **`doctor --check-only` no longer prints "Fixing...".** `--check-only` is read-only (it never
+  reaches the repair path), but `formatReport` appended "Fixing..." whenever fixable issues
+  existed — so `doctor --check-only` announced a fix while changing nothing, contradicting its
+  documented "report issues without changing anything" contract and implying `settings.json` /
+  `MEMORY.md` had just been rewritten. The report now reads "Run without --check-only to fix." in
+  check-only mode.
+
 ## v0.82.0 — cwd-relative CLI paths, prune-safe plugin updates, bounded dev disk
 
 Three independent changes: relative CLI path arguments now resolve against your working
