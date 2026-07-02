@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.84.1 — Plugin MCP auto-upgrades a non-project stub when the cwd becomes a project
+
+The plugin's MCP launcher serves a 0-tool stub in a non-project cwd (no `.git`/manifest
+— e.g. the `/tmp` headless calls that never use code-graph), which avoids a throwaway
+index and an empty tool catalog. That verdict was latched for the launcher's lifetime:
+opening Claude Code in a bare directory and *then* `git init`-ing / scaffolding it left
+the MCP server stuck at `connected · no tools` (and no statusline, no index) until a full
+restart. The stub now re-checks and upgrades itself in place. Launcher logic only — no
+index or schema change.
+
+### Fixed
+- **Non-project MCP stub now upgrades in place.** The non-project stub advertises
+  `tools.listChanged`, polls the cwd, and when it becomes a real project (with no local
+  code-graph server) it spawns the real binary, proxies the live JSON-RPC connection to
+  it, and emits `notifications/tools/list_changed` so the client re-fetches the now-real
+  tool list — no Claude Code restart required. Genuinely non-project `/tmp` callers never
+  satisfy the upgrade condition, so they stay as cheap as before (no binary spawn, no
+  index created). A persistently unresolvable binary is retried a bounded number of times,
+  then logs a one-time restart hint. The stub logic moved to `mcp-stub.js` with unit
+  coverage of the handoff, queue-during-handoff, failure-fallback, and poller paths.
+
 ## v0.84.0 — Compound-grep inject: grep-response gate + callgraph widening
 
 The PostToolUse compound-grep inject now fires only when it adds something the model
