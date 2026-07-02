@@ -128,6 +128,16 @@ pub(super) fn extract_go_inheritance(type_spec: &tree_sitter::Node, source: &str
                     Some(e) if e.kind() == "type_elem" => e,
                     _ => continue,
                 };
+                // `type_elem` is `sep1(_type, '|')`: a genuine embedded interface is
+                // ONE type per element (a single child), but a Go 1.18 type-SET
+                // constraint (`Signed | Unsigned`) is a union with >1 child — that
+                // is NOT embedding, so skip it (else we'd emit a bogus `inherits`
+                // to the first union term and drop the rest). A `~int` approximation
+                // element has one `negated_type` child that go_embedded_type_name
+                // drops, so it is already safe.
+                if elem.named_child_count() != 1 {
+                    continue;
+                }
                 if let Some(ty) = elem.named_child(0) {
                     if let Some(p) = go_embedded_type_name(&ty, source) {
                         parents.push(p);
@@ -150,22 +160,21 @@ pub(super) fn extract_go_inheritance(type_spec: &tree_sitter::Node, source: &str
         .collect()
 }
 
-/// Resolve an embedded type node to its simple type name: `type_identifier` → its
-/// text; `pointer_type` (`*Base`) → the inner type name; `qualified_type`
-/// (`pkg.Type`) → the `name` tail (`Type`), matching Go reference handling
-/// ([[extract_go_type_reference]]) which binds qualified types on their simple tail.
+/// Resolve an embedded type node to its simple type name, stripping wrappers:
+/// `type_identifier` → its text; `qualified_type` (`pkg.Type`) → the `name` tail
+/// (`Type`), matching Go reference handling ([[extract_go_type_reference]]) which
+/// binds qualified types on their simple tail; `pointer_type` (`*Base`) → the
+/// inner type; `generic_type` (`Base[int]`) → the generic's base name (`type`
+/// field), ignoring type arguments. Recurses so combos like `*pkg.Base[T]` resolve
+/// to `Base`; recursion is bounded (each arm strips one wrapper toward a leaf).
 fn go_embedded_type_name<'a>(ty: &tree_sitter::Node, source: &'a str) -> Option<&'a str> {
     match ty.kind() {
         "type_identifier" => Some(node_text(ty, source)),
         "qualified_type" => ty.child_by_field_name("name").map(|n| node_text(&n, source)),
-        // In tree-sitter-go an embedded `*Base` may surface either as a
-        // `pointer_type` wrapper or with the `*` as an anonymous token and the
-        // `type` field pointing straight at the inner type — handle the wrapper.
-        "pointer_type" => ty.named_child(0).and_then(|inner| match inner.kind() {
-            "type_identifier" => Some(node_text(&inner, source)),
-            "qualified_type" => inner.child_by_field_name("name").map(|n| node_text(&n, source)),
-            _ => None,
-        }),
+        // tree-sitter-go may also elide `*` to an anonymous token with `type`
+        // pointing straight at the inner type — that path hits the arms above.
+        "pointer_type" => ty.named_child(0).and_then(|inner| go_embedded_type_name(&inner, source)),
+        "generic_type" => ty.child_by_field_name("type").and_then(|inner| go_embedded_type_name(&inner, source)),
         _ => None,
     }
 }

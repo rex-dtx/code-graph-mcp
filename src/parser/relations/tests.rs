@@ -1314,6 +1314,34 @@ fn test_go_normal_field_not_inheritance() {
         "Go: a normal named field (f Foo) must produce no inherits, got: {:?}", inh);
 }
 
+#[test]
+fn test_go_interface_typeset_not_inheritance() {
+    // Go 1.18 type-set constraint: `interface { Signed | Unsigned }` is a UNION
+    // (one type_elem with >1 child), NOT embedding — must emit no inherits edge.
+    // A genuine embedded interface is one type_elem per parent (1 child each).
+    let inh = go_inherits("package p\ntype Number interface {\n\tSigned | Unsigned\n}\n");
+    assert!(inh.is_empty(),
+        "Go: a type-set union constraint must not be inheritance, got: {:?}", inh);
+    // ~int approximation element is also a constraint, not embedding.
+    let inh2 = go_inherits("package p\ntype I interface {\n\t~int\n}\n");
+    assert!(inh2.is_empty(), "Go: ~int approximation must not be inheritance, got: {:?}", inh2);
+    // Sanity: genuine multi-parent embedding still works (regression guard).
+    let inh3 = go_inherits("package p\ntype RW interface {\n\tReader\n\tWriter\n}\n");
+    assert!(inh3.contains(&("RW".into(), "Reader".into())) && inh3.contains(&("RW".into(), "Writer".into())),
+        "Go: genuine interface embedding must still emit inherits, got: {:?}", inh3);
+}
+
+#[test]
+fn test_go_generic_embedding() {
+    // Embedded generic types bind on the generic's base name.
+    let s = go_inherits("package p\ntype Sub struct {\n\tBase[int]\n}\n");
+    assert!(s.contains(&("Sub".into(), "Base".into())),
+        "Go: embedded generic struct field Base[int] should emit inherits Sub->Base, got: {:?}", s);
+    let i = go_inherits("package p\ntype X interface {\n\tContainer[int]\n}\n");
+    assert!(i.contains(&("X".into(), "Container".into())),
+        "Go: embedded generic interface Container[int] should emit inherits X->Container, got: {:?}", i);
+}
+
 // --- Dart mixins (`with M`) → inherits (mixin application injects methods) ---
 
 #[test]
