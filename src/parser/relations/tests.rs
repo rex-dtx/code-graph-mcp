@@ -1346,6 +1346,68 @@ fn test_extract_dart_mixin_only() {
         "Dart: mixin target must be the bare name, not `with M`, got: {:?}", inh);
 }
 
+// --- C++ base classes → inherits (C++ has no separate interface concept) ---
+
+fn cpp_inherits(code: &str) -> Vec<(String, String)> {
+    extract_relations(code, "cpp").unwrap().iter()
+        .filter(|r| r.relation == REL_INHERITS)
+        .map(|r| (r.source_name.clone(), r.target_name.clone()))
+        .collect()
+}
+
+#[test]
+fn test_extract_cpp_single_inheritance() {
+    let inh = cpp_inherits("class Animal {};\nclass Dog : public Animal {};\n");
+    assert!(inh.contains(&("Dog".into(), "Animal".into())),
+        "C++: `class Dog : public Animal` should emit inherits Dog->Animal, got: {:?}", inh);
+}
+
+#[test]
+fn test_extract_cpp_multiple_inheritance() {
+    // Access specifiers (public/private/protected) are skipped; every base is inherits.
+    let inh = cpp_inherits("class D : public A, private B, protected C {};\n");
+    for base in ["A", "B", "C"] {
+        assert!(inh.contains(&("D".into(), base.into())),
+            "C++: multiple inheritance missing D->{}, got: {:?}", base, inh);
+    }
+}
+
+#[test]
+fn test_extract_cpp_struct_inheritance() {
+    // struct default inheritance has no access_specifier node.
+    let inh = cpp_inherits("struct Base {};\nstruct S : Base {};\n");
+    assert!(inh.contains(&("S".into(), "Base".into())),
+        "C++: `struct S : Base` should emit inherits S->Base, got: {:?}", inh);
+}
+
+#[test]
+fn test_extract_cpp_qualified_and_template_base() {
+    // Qualified (ns::Base) binds on the name tail; template base (Tmpl<int>) on the template name.
+    let inh = cpp_inherits("class T : public ns::Base {};\nclass U : public Tmpl<int> {};\n");
+    assert!(inh.contains(&("T".into(), "Base".into())),
+        "C++: qualified base should bind T->Base, got: {:?}", inh);
+    assert!(inh.contains(&("U".into(), "Tmpl".into())),
+        "C++: template base should bind U->Tmpl, got: {:?}", inh);
+}
+
+#[test]
+fn test_cpp_no_base_no_inheritance() {
+    let inh = cpp_inherits("struct Point { int x; int y; };\nclass Empty {};\n");
+    assert!(inh.is_empty(),
+        "C++: a class/struct with no base clause must produce no inherits, got: {:?}", inh);
+}
+
+#[test]
+fn test_c_struct_no_inheritance() {
+    // Pure C has no inheritance concept; a C struct never carries a base clause.
+    let inh: Vec<(String, String)> = extract_relations("struct Point { int x; int y; };\n", "c")
+        .unwrap().iter()
+        .filter(|r| r.relation == REL_INHERITS)
+        .map(|r| (r.source_name.clone(), r.target_name.clone()))
+        .collect();
+    assert!(inh.is_empty(), "C: no inheritance possible, got: {:?}", inh);
+}
+
 // --- Tier 2 calls + imports smoke tests (Phase C audit) ---
 
 #[test]

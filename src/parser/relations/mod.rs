@@ -68,7 +68,7 @@ use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_
 use typescript::{extract_ts_type_reference, extract_js_value_reference};
 use python::{extract_python_type_reference, extract_python_value_reference};
 use go::{extract_go_type_reference, extract_go_value_reference, extract_go_inheritance};
-use cpp::extract_cpp_value_reference;
+use cpp::{extract_cpp_value_reference, extract_cpp_inheritance};
 use java::extract_java_type_reference;
 use dart::{extract_dart_imports, extract_dart_call_from_selector};
 
@@ -974,6 +974,16 @@ fn walk_for_relations(
 
                 // Check for implements (TS/JS/Java)
                 extract_implements(&node, source, cls, results);
+            }
+        }
+
+        // C++: base classes → inherits (C++ has no separate interface concept, so
+        // every base — public/private/protected — is an inherits parent). C
+        // structs and plain C++ aggregates have no base_class_clause → nothing
+        // emitted, so no language gate is needed.
+        "class_specifier" | "struct_specifier" => {
+            for rel in extract_cpp_inheritance(&node, source) {
+                results.push(rel);
             }
         }
 

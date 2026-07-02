@@ -14,7 +14,61 @@
 use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
-use crate::domain::REL_REFERENCES;
+use crate::domain::{REL_REFERENCES, REL_INHERITS};
+
+/// C++ base classes → `inherits` edges. Called on a `class_specifier` /
+/// `struct_specifier`. C++ has no separate interface concept, so every base is
+/// an inherits parent regardless of access (`public`/`private`/`protected`
+/// `access_specifier` nodes are skipped). Bases surface as `type_identifier`,
+/// `qualified_identifier` (`ns::Base` → bind on the `name` tail), or
+/// `template_type` (`Tmpl<int>` → the template `name`). A class/struct with no
+/// `base_class_clause` — all of C, and plain C++ aggregates — yields nothing, so
+/// this needs no language gate (C `struct_specifier` never carries a base clause).
+pub(super) fn extract_cpp_inheritance(node: &tree_sitter::Node, source: &str) -> Vec<ParsedRelation> {
+    let class_name = match node.child_by_field_name("name") {
+        Some(n) => node_text(&n, source),
+        None => return Vec::new(),
+    };
+    if class_name.is_empty() {
+        return Vec::new();
+    }
+    // base_class_clause is not a named field — scan the class's named children.
+    let clause = (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i))
+        .find(|c| c.kind() == "base_class_clause");
+    let clause = match clause {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for i in 0..clause.named_child_count() {
+        let base = match clause.named_child(i) {
+            Some(b) => b,
+            None => continue,
+        };
+        let name = match base.kind() {
+            "type_identifier" => Some(node_text(&base, source)),
+            // ns::Base → the `name` tail; Tmpl<int> → the template `name`.
+            "qualified_identifier" | "template_type" => {
+                base.child_by_field_name("name").map(|n| node_text(&n, source))
+            }
+            // access_specifier / virtual / anything else: not a base type name.
+            _ => None,
+        };
+        if let Some(name) = name {
+            if !name.is_empty() {
+                out.push(ParsedRelation {
+                    source_name: class_name.to_string(),
+                    target_name: name.to_string(),
+                    relation: REL_INHERITS.into(),
+                    metadata: None,
+                    source_language: String::new(),
+                });
+            }
+        }
+    }
+    out
+}
 
 /// Emit a `references` edge for a bare C/C++ `identifier` used as a function value.
 /// Self-exclusion is structural: a call's callee is the `function` field of a

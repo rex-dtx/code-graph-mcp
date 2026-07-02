@@ -7,7 +7,7 @@ A high-performance code knowledge graph server implementing the [Model Context P
 - **Multi-language parsing** — Tree-sitter AST extraction across tiers of depth:
   - **Full** (calls + imports + inheritance + HTTP routes + test markers): TypeScript/TSX, JavaScript, Go, Python, Rust, Java
   - **Smoke-tested** (calls + imports + inheritance): C#, Kotlin, Ruby, PHP, Swift, Dart
-  - **Limited** (functions + calls + `#include` imports + gtest test markers; `Class::method` scope qualification deferred): C, C++
+  - **Limited** (functions + calls + `#include` imports + gtest test markers + C++ base-class inheritance; `Class::method` scope qualification deferred): C, C++
   - **Scripting**: Bash (functions + commands + `source`/`.` imports), Markdown (headings)
   - **File-FTS only** (no AST symbol extraction): HTML, CSS, JSON
 - **Semantic code search** — Hybrid BM25 full-text + vector semantic search with Reciprocal Rank Fusion (RRF), powered by sqlite-vec
@@ -301,7 +301,7 @@ Available when installed as a Claude Code plugin:
 |----------|-----------|-------------------|
 | TypeScript | .ts, .tsx | calls, imports, exports, inherits, implements, routes_to |
 | JavaScript | .js, .jsx, .mjs, .cjs | calls, imports, exports, inherits, routes_to |
-| Go | .go | calls, imports, routes_to |
+| Go | .go | calls, imports, inherits, routes_to |
 | Python | .py, .pyi | calls, imports, inherits, routes_to |
 | Rust | .rs | calls, imports, inherits, implements |
 | Java | .java | calls, imports, inherits, implements |
@@ -310,7 +310,7 @@ Available when installed as a Claude Code plugin:
 | Ruby | .rb | calls, imports, inherits |
 | PHP | .php | calls, imports, inherits, implements |
 | Swift | .swift | calls, imports, inherits |
-| Dart | .dart | calls, imports, implements |
+| Dart | .dart | calls, imports, inherits, implements |
 | C | .c, .h | calls, imports |
 | C++ | .cpp, .cc, .cxx, .hpp | calls, imports, inherits |
 | HTML | .html, .htm | structural parsing |
