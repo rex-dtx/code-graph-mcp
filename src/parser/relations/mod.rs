@@ -67,7 +67,7 @@ use routes::{extract_route_pattern, extract_python_route};
 use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference, extract_rust_value_reference};
 use typescript::{extract_ts_type_reference, extract_js_value_reference};
 use python::{extract_python_type_reference, extract_python_value_reference};
-use go::{extract_go_type_reference, extract_go_value_reference};
+use go::{extract_go_type_reference, extract_go_value_reference, extract_go_inheritance};
 use cpp::extract_cpp_value_reference;
 use java::extract_java_type_reference;
 use dart::{extract_dart_imports, extract_dart_call_from_selector};
@@ -1044,6 +1044,16 @@ fn walk_for_relations(
                         });
                     }
                 }
+            }
+        }
+
+        // Go: struct/interface embedding → inherits (method promotion / interface
+        // composition — Go's idiomatic "is-a"). Gated on Go because `type_spec` is
+        // a Go-grammar node; the guard keeps any other grammar's same-named node
+        // from being misread.
+        "type_spec" if language == "go" => {
+            for rel in extract_go_inheritance(&node, source) {
+                results.push(rel);
             }
         }
 

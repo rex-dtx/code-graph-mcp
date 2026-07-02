@@ -31,7 +31,7 @@
 use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
-use crate::domain::{REL_REFERENCES, GO_TYPE_REFERENCE_NOISE};
+use crate::domain::{REL_REFERENCES, REL_INHERITS, GO_TYPE_REFERENCE_NOISE};
 
 /// Emit a `references` edge for a `type_identifier` used in type position. Skips
 /// the cases already covered by another edge (or that aren't usages) so the
@@ -73,6 +73,101 @@ pub(super) fn extract_go_type_reference(
         metadata: None,
         source_language: String::new(),
     })
+}
+
+/// Go struct/interface embedding → `inherits` edges. Embedding is Go's idiomatic
+/// "is-a": an embedded struct/interface promotes its methods (and fields) onto
+/// the embedder — the closest static analog to inheritance. Called on the
+/// `type_spec` node (`type <Name> struct{…}` / `type <Name> interface{…}`). Maps:
+///   - struct embedding    `type Dog struct { Animal }`   → Dog inherits Animal
+///   - pointer embedding    `type Sub struct { *Base }`    → Sub inherits Base
+///   - qualified embedding  `type S struct { sync.Mutex }` → S   inherits Mutex
+///   - interface embedding  `type RW interface { Reader }` → RW  inherits Reader
+///
+/// A NORMAL named field (`f Foo`) is has-a, not embedding — distinguished
+/// structurally: an embedded `field_declaration` has NO `name` field. Interface
+/// METHODS are `method_elem`; only embedded interfaces (`type_elem`) compose.
+pub(super) fn extract_go_inheritance(type_spec: &tree_sitter::Node, source: &str) -> Vec<ParsedRelation> {
+    let type_name = match type_spec.child_by_field_name("name") {
+        Some(n) => node_text(&n, source),
+        None => return Vec::new(),
+    };
+    let body = match type_spec.child_by_field_name("type") {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    if type_name.is_empty() {
+        return Vec::new();
+    }
+    let mut parents: Vec<&str> = Vec::new();
+    match body.kind() {
+        "struct_type" => {
+            // struct_type → field_declaration_list → field_declaration*
+            if let Some(list) = body.named_child(0).filter(|n| n.kind() == "field_declaration_list") {
+                for i in 0..list.named_child_count() {
+                    let field = match list.named_child(i) {
+                        Some(f) if f.kind() == "field_declaration" => f,
+                        _ => continue,
+                    };
+                    // Named field (`f Foo`) is has-a, not embedding.
+                    if field.child_by_field_name("name").is_some() {
+                        continue;
+                    }
+                    if let Some(ty) = field.child_by_field_name("type") {
+                        if let Some(p) = go_embedded_type_name(&ty, source) {
+                            parents.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        "interface_type" => {
+            for i in 0..body.named_child_count() {
+                let elem = match body.named_child(i) {
+                    // `type_elem` = embedded interface; `method_elem` = a method (skip).
+                    Some(e) if e.kind() == "type_elem" => e,
+                    _ => continue,
+                };
+                if let Some(ty) = elem.named_child(0) {
+                    if let Some(p) = go_embedded_type_name(&ty, source) {
+                        parents.push(p);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    parents
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| ParsedRelation {
+            source_name: type_name.to_string(),
+            target_name: p.to_string(),
+            relation: REL_INHERITS.into(),
+            metadata: None,
+            source_language: String::new(),
+        })
+        .collect()
+}
+
+/// Resolve an embedded type node to its simple type name: `type_identifier` → its
+/// text; `pointer_type` (`*Base`) → the inner type name; `qualified_type`
+/// (`pkg.Type`) → the `name` tail (`Type`), matching Go reference handling
+/// ([[extract_go_type_reference]]) which binds qualified types on their simple tail.
+fn go_embedded_type_name<'a>(ty: &tree_sitter::Node, source: &'a str) -> Option<&'a str> {
+    match ty.kind() {
+        "type_identifier" => Some(node_text(ty, source)),
+        "qualified_type" => ty.child_by_field_name("name").map(|n| node_text(&n, source)),
+        // In tree-sitter-go an embedded `*Base` may surface either as a
+        // `pointer_type` wrapper or with the `*` as an anonymous token and the
+        // `type` field pointing straight at the inner type — handle the wrapper.
+        "pointer_type" => ty.named_child(0).and_then(|inner| match inner.kind() {
+            "type_identifier" => Some(node_text(&inner, source)),
+            "qualified_type" => inner.child_by_field_name("name").map(|n| node_text(&n, source)),
+            _ => None,
+        }),
+        _ => None,
+    }
 }
 
 /// Emit a `references` edge for a Go `identifier` used as a function VALUE — a

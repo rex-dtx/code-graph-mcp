@@ -1260,6 +1260,92 @@ fn test_extract_ruby_inheritance() {
         "Ruby: missing BaseService, got: {:?}", inherits);
 }
 
+// --- Go struct/interface embedding → inherits (method promotion / iface composition) ---
+
+fn go_inherits(code: &str) -> Vec<(String, String)> {
+    extract_relations(code, "go").unwrap().iter()
+        .filter(|r| r.relation == REL_INHERITS)
+        .map(|r| (r.source_name.clone(), r.target_name.clone()))
+        .collect()
+}
+
+#[test]
+fn test_extract_go_struct_embedding() {
+    // Embedded field (no field name) is Go's idiomatic "inheritance" (method
+    // promotion); a normal named field is NOT.
+    let code = "package p\ntype Animal struct{}\ntype Dog struct {\n\tAnimal\n\tName string\n}\n";
+    let inh = go_inherits(code);
+    assert!(inh.contains(&("Dog".into(), "Animal".into())),
+        "Go: struct embedding should emit inherits Dog->Animal, got: {:?}", inh);
+    assert!(!inh.iter().any(|(_, t)| t == "Name" || t == "string"),
+        "Go: normal named field must not be inheritance, got: {:?}", inh);
+}
+
+#[test]
+fn test_extract_go_interface_embedding() {
+    // Embedded interfaces (type_elem) compose; methods (method_elem) do not.
+    let code = "package p\ntype Reader interface{ Read() }\ntype Writer interface{ Write() }\ntype RW interface {\n\tReader\n\tWriter\n\tClose() error\n}\n";
+    let inh = go_inherits(code);
+    assert!(inh.contains(&("RW".into(), "Reader".into())),
+        "Go: interface embedding should emit inherits RW->Reader, got: {:?}", inh);
+    assert!(inh.contains(&("RW".into(), "Writer".into())),
+        "Go: interface embedding should emit inherits RW->Writer, got: {:?}", inh);
+    assert!(!inh.iter().any(|(_, t)| t == "Close" || t == "error"),
+        "Go: interface method must not be inheritance, got: {:?}", inh);
+}
+
+#[test]
+fn test_extract_go_pointer_and_qualified_embedding() {
+    // Pointer embedding (*Base) and qualified embedding (pkg.Type) both promote
+    // methods; bind on the simple type name (Base / Mutex).
+    let code = "package p\ntype Base struct{}\ntype Sub struct {\n\t*Base\n\tsync.Mutex\n}\n";
+    let inh = go_inherits(code);
+    assert!(inh.contains(&("Sub".into(), "Base".into())),
+        "Go: pointer embedding should emit inherits Sub->Base, got: {:?}", inh);
+    assert!(inh.contains(&("Sub".into(), "Mutex".into())),
+        "Go: qualified embedding should emit inherits Sub->Mutex, got: {:?}", inh);
+}
+
+#[test]
+fn test_go_normal_field_not_inheritance() {
+    let code = "package p\ntype Foo struct{}\ntype S struct {\n\tf Foo\n}\n";
+    let inh = go_inherits(code);
+    assert!(inh.is_empty(),
+        "Go: a normal named field (f Foo) must produce no inherits, got: {:?}", inh);
+}
+
+// --- Dart mixins (`with M`) → inherits (mixin application injects methods) ---
+
+#[test]
+fn test_extract_dart_mixin() {
+    let code = "class Base {}\nmixin M {}\nmixin N {}\nclass C extends Base with M, N {}\n";
+    let inh: Vec<(String, String)> = extract_relations(code, "dart").unwrap().iter()
+        .filter(|r| r.relation == REL_INHERITS)
+        .map(|r| (r.source_name.clone(), r.target_name.clone()))
+        .collect();
+    assert!(inh.contains(&("C".into(), "Base".into())),
+        "Dart: extends should emit inherits C->Base, got: {:?}", inh);
+    assert!(inh.contains(&("C".into(), "M".into())),
+        "Dart: mixin M should emit inherits C->M, got: {:?}", inh);
+    assert!(inh.contains(&("C".into(), "N".into())),
+        "Dart: mixin N should emit inherits C->N, got: {:?}", inh);
+}
+
+#[test]
+fn test_extract_dart_mixin_only() {
+    // No `extends`: the mixin must still bind to the bare mixin name, never the
+    // malformed `"with M"` the text-clean fallback used to produce.
+    let code = "mixin M {}\nclass C with M {}\n";
+    let inh: Vec<String> = extract_relations(code, "dart").unwrap().iter()
+        .filter(|r| r.relation == REL_INHERITS)
+        .map(|r| r.target_name.clone())
+        .collect();
+    assert!(inh.contains(&"M".to_string()),
+        "Dart: `with M` should emit inherits C->M, got: {:?}", inh);
+    assert!(!inh.iter().any(|t| t.contains("with")),
+        "Dart: mixin target must be the bare name, not `with M`, got: {:?}", inh);
+}
+
 // --- Tier 2 calls + imports smoke tests (Phase C audit) ---
 
 #[test]

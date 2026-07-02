@@ -49,11 +49,29 @@ pub(super) fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Ve
             "superclass" => {
                 // Java: superclass -> type_identifier
                 // Ruby: superclass -> constant (e.g., `< ApplicationController`)
+                // Dart: superclass -> type_identifier (extends) + optional `mixins`
                 for k in 0..child.named_child_count() {
                     if let Some(inner) = child.named_child(k) {
-                        if inner.kind() == "type_identifier" || inner.kind() == "identifier"
-                            || inner.kind() == "dotted_name" || inner.kind() == "constant" || inner.kind() == "scope_resolution" {
-                            parents.push(node_text(&inner, source).to_string());
+                        match inner.kind() {
+                            "type_identifier" | "identifier" | "dotted_name"
+                            | "constant" | "scope_resolution" => {
+                                parents.push(node_text(&inner, source).to_string());
+                            }
+                            // Dart: `class C extends Base with M, N` — mixin
+                            // application injects each mixin's methods into the
+                            // class, so treat each mixin as an inherited parent.
+                            // (Without this, a `with`-only class fell through to
+                            // the text-clean fallback below and produced "with M".)
+                            "mixins" => {
+                                for m in 0..inner.named_child_count() {
+                                    if let Some(mix) = inner.named_child(m) {
+                                        if matches!(mix.kind(), "type_identifier" | "identifier") {
+                                            parents.push(node_text(&mix, source).to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
