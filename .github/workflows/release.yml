@@ -279,27 +279,41 @@ jobs:
         shell: bash
         run: |
           set -eu
-          # `npm install -g` EXITS 0 even when a platform optionalDependency
-          # (@sdsrs/code-graph-<os>-<arch>) has not propagated to the registry yet —
-          # npm silently skips an unresolvable optional dep ("added 1 package"
-          # instead of 2). So the npm exit code is NOT a reliable signal: the binary
-          # can be missing after a "successful" install (v0.66.0 ubuntu smoke). Gate
-          # the retry on the binary actually RESOLVING to the expected version, not on
-          # npm's exit code, so the backoff actually covers optional-dep propagation.
+          # Post-publish smoke races npm registry propagation in TWO independent ways,
+          # neither caught by npm's exit code, both of which the retry must tolerate:
+          #
+          #  (1) MAIN-package metadata lag -> `npm install @sdsrs/code-graph@X` fails with
+          #      `ETARGET / No matching version` because the CDN edge this runner hit has
+          #      not listed version X in the packument yet (v0.82.1 ubuntu smoke). npm
+          #      then CACHES that stale packument locally (~/.npm, Cache-Control max-age
+          #      ~minutes), so a NAIVE retry re-reads the stale cache and keeps returning
+          #      ETARGET for the whole window even after the edge propagates. Fix: every
+          #      registry read below uses --prefer-online to force revalidation instead
+          #      of serving the stale cached packument.
+          #  (2) PLATFORM optionalDependency lag -> once the main package resolves,
+          #      `npm install -g` still EXITS 0 while silently skipping an unresolved
+          #      @sdsrs/code-graph-<os>-<arch> ("added 1 package" not 2), so the binary
+          #      is missing after a "successful" install (v0.66.0 ubuntu smoke). Fix:
+          #      gate success on the binary RESOLVING to the expected version, never on
+          #      npm's exit code.
           expected="code-graph-mcp ${VERSION}"
-          for attempt in 1 2 3 4 5; do
-            echo "Install attempt $attempt of 5..."
-            npm install -g "@sdsrs/code-graph@${VERSION}" || true
-            if actual=$(code-graph-mcp --version 2>/dev/null) && [ "$actual" = "$expected" ]; then
-              echo "Install + binary resolved on attempt $attempt: $actual"
-              break
+          for attempt in 1 2 3 4 5 6; do
+            echo "Install attempt $attempt of 6..."
+            if ! npm view --prefer-online "@sdsrs/code-graph@${VERSION}" version >/dev/null 2>&1; then
+              echo "Main package @sdsrs/code-graph@${VERSION} not visible on registry yet (ETARGET) — metadata still propagating."
+            else
+              npm install -g --prefer-online "@sdsrs/code-graph@${VERSION}" || true
+              if actual=$(code-graph-mcp --version 2>/dev/null) && [ "$actual" = "$expected" ]; then
+                echo "Install + binary resolved on attempt $attempt: $actual"
+                break
+              fi
+              echo "Main package resolved but binary not runnable (got '${actual:-<none>}', want '$expected') — platform optional-dep still propagating."
             fi
-            echo "Binary not resolvable yet (got '${actual:-<none>}', want '$expected') — platform package likely still propagating."
-            if [ "$attempt" = "5" ]; then
-              echo "::error::@sdsrs/code-graph@${VERSION} did not yield a working binary after 5 attempts (platform optional-dep never resolved)"
+            if [ "$attempt" = "6" ]; then
+              echo "::error::@sdsrs/code-graph@${VERSION} did not yield a working binary after 6 attempts (registry propagation exceeded retry window). Recover with: gh run rerun <run-id> --failed"
               exit 1
             fi
-            sleep $((attempt * 15))
+            sleep $((attempt * 20))
           done
 
       - name: Verify --version matches tag
