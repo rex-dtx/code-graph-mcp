@@ -62,6 +62,115 @@ function findFoldableGrepSegment(cmd) {
   return null;
 }
 
+// Callgraph is the marginal-value inject (cross-file caller tree the grep can't
+// return); the grep/show echo modes measured redundant (2026-06-26 audit: 0
+// CONSUMED). Prior gate required the WHOLE grep pattern to be one identifier, so
+// an alternation / multi-symbol grep (`markSuperseded|created_at`, `foo|bar_baz`)
+// fell to the echo. These bounds widen it: extract the identifier tokens and try
+// callgraph on each until one has real edges. Cheap — callgraph is ~30ms/call.
+const MAX_CALLGRAPH_SYMBOLS = 3;
+const MIN_MULTI_SYMBOL_LEN = 3;
+
+/**
+ * Identifier tokens from a grep pattern, as callgraph candidates. A lone
+ * identifier returns [itself] (any length — exact prior behavior). A multi-token
+ * / regex pattern (alternation, word-boundaries, char classes) is stripped of
+ * backslash escapes FIRST — so `\bdate` yields `date`, not `bdate` (the letter
+ * after `\b`/`\d`/`\w` is a regex metachar, not part of the symbol) — then its
+ * identifier tokens are collected: <3-char noise dropped, deduped, capped. Order
+ * preserved so the FIRST alternand (usually the primary symbol) is tried first.
+ * runCallgraphAnswer self-filters non-symbols (returns `hits` only with real
+ * edges), so a junk token just costs one ~30ms no-hits call.
+ * @param {string} rawPattern
+ * @returns {string[]}
+ */
+function extractCallgraphSymbols(rawPattern) {
+  if (typeof rawPattern !== 'string' || !rawPattern) return [];
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(rawPattern)) return [rawPattern];
+  const cleaned = rawPattern.replace(/\\[A-Za-z]/g, ' ');
+  const seen = new Set();
+  const out = [];
+  for (const m of cleaned.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
+    const tok = m[0];
+    if (tok.length < MIN_MULTI_SYMBOL_LEN) continue;
+    if (seen.has(tok)) continue;
+    seen.add(tok);
+    out.push(tok);
+    if (out.length >= MAX_CALLGRAPH_SYMBOLS) break;
+  }
+  return out;
+}
+
+/**
+ * The command's actual stdout, from the PostToolUse payload. VERIFIED against the
+ * Claude Code runtime (v2.1.198 binary): the hook input carries `tool_response`,
+ * and the Bash result is the OBJECT `{stdout, stderr, interrupted, ...}` — so
+ * `tool_response.stdout` is the real, load-bearing path. (The published hooks doc
+ * says a top-level `tool_output` string, which the runtime does NOT emit — checked
+ * first only for forward-compat if a future version adopts the documented name.)
+ * `tool_response` as a bare string / `.output` are extra defensive fallbacks. null
+ * when no output field is present → the gate can't confirm redundancy → it injects
+ * (pre-gate behavior, no regression on any unhandled shape).
+ * @returns {string|null}
+ */
+function extractGrepOutput(input) {
+  if (!input || typeof input !== 'object') return null;
+  if (typeof input.tool_output === 'string') return input.tool_output;  // doc-stated, forward-compat
+  const tr = input.tool_response;
+  if (typeof tr === 'string') return tr;
+  if (tr && typeof tr === 'object') {
+    if (typeof tr.stdout === 'string') return tr.stdout;  // ← real runtime shape (Bash result obj)
+    if (typeof tr.output === 'string') return tr.output;
+  }
+  return null;
+}
+
+// A stdout line that looks like a grep HIT, as opposed to a sibling `echo`/prose
+// line. grep prints one of: `path:content` (-H), `path:line:content` (-rn),
+// `line:content` (-n on a single named file — NO path prefix), or a bare `path`
+// (-l). Recognizing all four is what lets the gate skip a real hit in ANY of these
+// formats (the compound greps the model actually runs use all of them) while still
+// NOT counting `echo "find Sym" && grep Sym wrongpath/` (grep MISSED → only the echo
+// prose lands, which matches none of these shapes), so the additive grep-empty inject
+// stays reachable and measurable post-ship.
+const GREP_HIT_LINE = /(?:^|\s)[^\s:]*[/.][^\s:]*:|^\s*\d+:/;  // path:… OR linenum: (single-file -n)
+const BARE_PATH_LINE = /^\S*[/.]\S+$/;                        // grep -l: a lone path, no spaces
+// GREP_HIT_LINE has two `[^\s:]*` stars before a required `:`, so a long line that
+// carries `/` or `.` but NO colon backtracks O(n²) (~33s on a 400KB line). grep's
+// hit marker (`path:` / `NN:`) is always at the START of the line, so testing only a
+// bounded prefix is faithful AND caps the scan — untrusted grep stdout on a blocking
+// hook must not stall.
+const HIT_SHAPE_SCAN_MAX = 256;
+
+/**
+ * Did the command's own output already surface the grepped symbol? The inject is
+ * redundant exactly then — the model has the hits in front of it (2026-07-03 audit:
+ * 18/18 injects 0 CONSUMED, all on greps that already hit). Two guards keep this from
+ * over-suppressing the additive (grep-missed) case: (1) only GREP-HIT-SHAPED lines
+ * count — a sibling `echo "…Sym…"` prose line does NOT (fixes the common
+ * `echo <Symbol> && grep <Symbol>` shape); (2) the identifier is matched as a WHOLE
+ * WORD, so a `date` alternand isn't swallowed by `update`/`validate`. When unsure it
+ * returns false → the caller injects (safe side: tax, never a wrong/missing answer).
+ * Uses the same identifier tokenization as the callgraph path.
+ * @returns {boolean} true only when a grep hit for the symbol is CONFIRMED in output.
+ */
+function grepFoundPattern(output, rawPattern) {
+  if (typeof output !== 'string' || !output) return false;
+  const ids = extractCallgraphSymbols(rawPattern);
+  if (ids.length === 0) return false;
+  // ids are pure `[A-Za-z_]\w*` tokens (no regex metachars) → safe to embed in \b…\b.
+  const wordRes = ids.map((id) => new RegExp(`\\b${id}\\b`));
+  return output.split('\n').some((line) => {
+    // Decide hit-shape from a bounded prefix (ReDoS guard — see HIT_SHAPE_SCAN_MAX).
+    // A `-l` bare path is short, so a line longer than the cap is never one.
+    const head = line.length > HIT_SHAPE_SCAN_MAX ? line.slice(0, HIT_SHAPE_SCAN_MAX) : line;
+    const hitShaped = GREP_HIT_LINE.test(head)
+      || (line.length <= HIT_SHAPE_SCAN_MAX && BARE_PATH_LINE.test(line));
+    if (!hitShaped) return false;
+    return wordRes.some((re) => re.test(line));  // \b…\b is linear — safe on the full line
+  });
+}
+
 // Short header so the model recognizes this as cg's parallel structural view of
 // the grep it just ran (the grep already executed; this is additive context).
 const INJECT_HEADER = '[code-graph] AST-aware view of your grep (ran alongside):';
@@ -156,23 +265,31 @@ function runMain() {
   const { segment, block } = found;
   // Run the answer exactly like the deny path.
   const rawPattern = pickBlockPattern(segment);
+  // Grep-response gate (2026-07-03 audit: 18/18 injects were 0 CONSUMED because they
+  // re-stated hits the model already had). If the command's OWN output already
+  // surfaced the grepped symbol, the inject is redundant → skip it, saving the
+  // ~1KB context tax. Only a grep that found NOTHING (or an unreadable output —
+  // no regression on older CC) proceeds: then cg's structural answer (the real
+  // location / cross-file callers a failed grep never showed) is genuinely additive.
+  if (grepFoundPattern(extractGrepOutput(input), rawPattern)) return;
   const pattern = translateBreToRg(segment, rawPattern);
   const searchPath = sanitizeSearchPath(extractSearchPath(segment));
   let answer = { status: 'unavailable' };
   let answeredMode = block.mode;
 
-  // PREFER the cross-file caller/callee tree when the grep targets a single clean
-  // identifier — that is the marginal signal a raw grep can't return (2026-06-26
-  // inject audit: 13 events / 0 CONSUMED because the grep-echo just re-stated the
-  // model's own hits). runCallgraphAnswer returns `hits` ONLY when the symbol has
-  // real edges; a leaf/absent symbol degrades to the show/grep echo below.
-  const symbol = (typeof rawPattern === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(rawPattern))
-    ? rawPattern : null;
-  if (symbol) {
+  // PREFER the cross-file caller/callee tree — the marginal signal a raw grep can't
+  // return (2026-06-26 inject audit: 13 events / 0 CONSUMED because the grep-echo
+  // just re-stated the model's own hits). Try every identifier the pattern
+  // carries (alternation / multi-symbol grep), not just a lone-identifier pattern,
+  // stopping at the first symbol with real edges. runCallgraphAnswer returns `hits`
+  // ONLY when the symbol has edges → a leaf/absent symbol self-filters to the
+  // show/grep echo below.
+  for (const symbol of extractCallgraphSymbols(rawPattern)) {
     const cg = runCallgraphAnswer({ cwd: root, symbol });
     if (cg.status === 'hits') {
       answer = cg;
       answeredMode = 'callgraph';
+      break;
     }
   }
 
@@ -209,6 +326,9 @@ if (require.main === module) {
 
 module.exports = {
   findFoldableGrepSegment,
+  extractCallgraphSymbols,
+  extractGrepOutput,
+  grepFoundPattern,
   buildInjectText,
   isSilenced,
   isInjectDisabled,

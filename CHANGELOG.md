@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.84.0 — Compound-grep inject: grep-response gate + callgraph widening
+
+The PostToolUse compound-grep inject now fires only when it adds something the model
+does not already have. Injects were consistently ignored when they re-stated hits the
+model's own grep had already surfaced; the hook now reads the executed command's output
+and suppresses the redundant inject, keeping it for the case where the grep found
+nothing (cg's structural answer is then genuinely new). Hook logic only — no index or
+schema change.
+
+### Changed
+- **grep-response gate on the compound-grep inject.** `post-grep-inject` reads the
+  executed command's stdout (`tool_response.stdout`) and skips the AST inject when the
+  grep already surfaced the searched symbol, recognizing the common grep hit formats
+  (`path:content`, `path:line:content`, single-file `line:content`, and `grep -l` bare
+  path). It injects only when the grep found nothing, or the output is unreadable (no
+  regression). The hit-shape scan is bounded to a line prefix so untrusted, unbounded
+  grep stdout on the blocking hook cannot stall. Opt out with `CODE_GRAPH_NO_INJECT=1`.
+
+### Added
+- **Callgraph inject for multi-symbol grep patterns.** An alternation / multi-identifier
+  grep (e.g. `foo|bar`) now resolves its identifier tokens and injects the cross-file
+  callgraph for the first one with real edges, instead of falling back to the redundant
+  grep echo.
+- **`inject_by_mode` in `stats`.** `code-graph-mcp stats` (text and `--json`) now breaks
+  inject events down by payload mode (callgraph / grep / show), so the high-value
+  callgraph share is directly visible.
+
 ## v0.83.0 — Go, Dart & C++ inheritance extraction
 
 Inheritance edges are now extracted for three more languages, closing a long-standing

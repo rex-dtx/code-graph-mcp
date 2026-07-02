@@ -1344,6 +1344,16 @@ pub struct RecommendationSummary {
     /// counter — like observe/use it is NOT a tool-call recommendation, so it stays
     /// out of `total`/`by_action`. Surfaced in stats so the feature isn't dark.
     pub live_impact: u64,
+    /// Per-mode breakdown of PostToolUse inject events (mode:"callgraph"|"grep"|"show").
+    /// A SUB-breakdown of the `inject` count in `by_action` (NOT double-counted; an
+    /// inject event still lands in total/by_action once). callgraph is the only inject
+    /// mode with marginal value over the model's own grep — it carries the cross-file
+    /// caller tree; grep/show echo the hits the model already saw (2026-06-26 audit:
+    /// 0 CONSUMED). Surfaced so the callgraph-vs-echo mix is directly readable — the
+    /// lever is raising callgraph's share (widening its eligibility). Injects recorded
+    /// without a `mode` (pre-v0.75) are absent from every bucket, so the map may sum to
+    /// less than `by_action["inject"]`.
+    pub inject_by_mode: std::collections::BTreeMap<String, u64>,
     /// Of `deny_answered` (cg delivered a grep answer in-place), how many were
     /// IMMEDIATELY followed by ANY grep/read event. Computed in append
     /// (chronological) order; a single-user-sequential approximation (truly
@@ -1476,6 +1486,11 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                 // inject is recorded only when it actually delivered hits, so it is
                 // always answered; no unanswered counter (unlike deny). It still
                 // lands in total/by_action via the generic map above.
+                // Sub-breakdown by payload mode (best-effort: pre-v0.75 injects have
+                // no `mode` → uncounted here, still counted in by_action["inject"]).
+                if let Some(mode) = v.get("mode").and_then(|x| x.as_str()) {
+                    *s.inject_by_mode.entry(mode.to_string()).or_insert(0) += 1;
+                }
                 if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
                     armed = true;
                     armed_pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
@@ -1622,6 +1637,10 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                     .collect::<serde_json::Map<String, serde_json::Value>>(),
                 "by_hook": recs.by_hook.iter().map(|(k, v)| (k.clone(), serde_json::json!(v)))
                     .collect::<serde_json::Map<String, serde_json::Value>>(),
+                // Sub-breakdown of by_action["inject"] by payload mode. callgraph =
+                // the marginal-value cross-file tree; grep/show = redundant echo.
+                "inject_by_mode": recs.inject_by_mode.iter().map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
                 "cg_tool_calls": summary.total_tool_calls(),
                 "cli_uses": recs.cli_uses,
                 "deny_answered": recs.deny_answered,
@@ -1731,6 +1750,19 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             let actions: Vec<String> = recs.by_action.iter().map(|(k, v)| format!("{v} {k}")).collect();
             let ratio = summary.total_tool_calls() as f64 / recs.total as f64;
             println!("Recommendations: {} emitted ({})", recs.total, actions.join(", "));
+            // Inject payload mix. callgraph is the only mode with marginal value over
+            // the model's own grep (cross-file tree); grep/show echo hits it already
+            // saw (2026-06-26 audit: 0 CONSUMED). Lead with the callgraph share — the
+            // lever is raising it. Modes may sum below by_action.inject (pre-v0.75
+            // injects carry no mode).
+            if !recs.inject_by_mode.is_empty() {
+                let modes: Vec<String> = recs.inject_by_mode.iter().map(|(k, v)| format!("{v} {k}")).collect();
+                let inj_total: u64 = recs.inject_by_mode.values().sum();
+                let cg = recs.inject_by_mode.get("callgraph").copied().unwrap_or(0);
+                let cg_pct = if inj_total > 0 { (cg as f64 / inj_total as f64 * 100.0).round() as u64 } else { 0 };
+                println!("Inject payloads: {} by mode ({}) — callgraph (cross-file, high-value) = {cg_pct}%",
+                    inj_total, modes.join(", "));
+            }
             if recs.deny_answered + recs.deny_unanswered > 0 {
                 // answered:true denies satisfy the need in-place — read their
                 // conversion separately or the funnel under-reports the feature.
@@ -6359,6 +6391,30 @@ mod tests {
         assert_eq!(s.sustained_after_answer, 1, "I3→I4: different pattern, cg also answered = drill-down");
         assert_eq!(s.observe, 1, "I2");
         assert_eq!(s.cli_uses, 1, "I5");
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_inject_by_mode() {
+        // The inject payload has a `mode` (callgraph | grep | show). callgraph is the
+        // marginal-value cross-file tree; grep/show echo the model's own hits (audit:
+        // 0 CONSUMED). `inject_by_mode` breaks the mix down so the callgraph share is
+        // directly readable — it is a SUB-breakdown of the inject events, so the total
+        // inject count in by_action stays authoritative (not double-counted).
+        let content = "\
+{\"ts\":\"t1\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"a\",\"mode\":\"callgraph\"}
+{\"ts\":\"t2\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"b\",\"mode\":\"grep\"}
+{\"ts\":\"t3\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"c\",\"mode\":\"callgraph\"}
+{\"ts\":\"t4\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"d\",\"mode\":\"show\"}
+{\"ts\":\"t5\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"e\"}
+";
+        let s = aggregate_recommendations_jsonl(content);
+        assert_eq!(s.by_action.get("inject"), Some(&5), "all 5 are inject events");
+        assert_eq!(s.inject_by_mode.get("callgraph"), Some(&2), "t1,t3");
+        assert_eq!(s.inject_by_mode.get("grep"), Some(&1), "t2");
+        assert_eq!(s.inject_by_mode.get("show"), Some(&1), "t4");
+        // t5 has no `mode` field → not counted in any mode bucket; the mode map sums
+        // to 4 while by_action.inject stays 5 (mode is best-effort metadata).
+        assert_eq!(s.inject_by_mode.values().sum::<u64>(), 4, "t5 (no mode) is uncounted");
     }
 
     #[test]

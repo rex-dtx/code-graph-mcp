@@ -9,11 +9,162 @@ const { cgTmpDir } = require('./tmp-dir');
 
 const {
   findFoldableGrepSegment,
+  extractCallgraphSymbols,
+  extractGrepOutput,
+  grepFoundPattern,
   isSilenced,
   isInjectDisabled,
   buildInjectText,
   commandHash,
 } = require('./post-grep-inject');
+
+// ── grep-response gate ──────────────────────────────────────────────
+// 2026-07-03 audit: 18/18 injects were 0 CONSUMED — they re-stated hits the model
+// already had in its OWN grep output. PostToolUse hands the hook the command's
+// actual output (tool_response); skip the inject when the grep already surfaced the
+// symbol (redundant), inject only when it found nothing (cg's structural answer is
+// then genuinely additive: "it's actually here / who calls it").
+
+test('extractGrepOutput: reads top-level tool_output string (doc-stated shape; forward-compat)', () => {
+  assert.equal(extractGrepOutput({ tool_output: 'src/a.rs:1 hit' }), 'src/a.rs:1 hit');
+});
+
+test('extractGrepOutput: reads tool_response.stdout (VERIFIED real CC runtime shape — Bash result obj)', () => {
+  // CC v2.1.198 binary: hook input = {tool_response:{stdout,stderr,interrupted,...}}.
+  // This is the load-bearing path the gate actually fires on in production.
+  assert.equal(extractGrepOutput({ tool_response: { stdout: 'src/a.rs:1 hit' } }), 'src/a.rs:1 hit');
+});
+
+test('extractGrepOutput: defensive fallback — tool_response as a bare string', () => {
+  assert.equal(extractGrepOutput({ tool_response: 'raw output' }), 'raw output');
+});
+
+test('extractGrepOutput: defensive fallback — tool_response.output field', () => {
+  assert.equal(extractGrepOutput({ tool_response: { output: 'out text' } }), 'out text');
+});
+
+test('extractGrepOutput: absent output → null (unknown, caller injects — no regression)', () => {
+  assert.equal(extractGrepOutput({}), null);
+  assert.equal(extractGrepOutput({ tool_response: {} }), null);
+  assert.equal(extractGrepOutput(null), null);
+});
+
+test('grepFoundPattern: output line containing the symbol → true (grep hit)', () => {
+  assert.equal(grepFoundPattern('src/foo.rs:7  fn EmbeddingModel()', 'EmbeddingModel'), true);
+});
+
+test('grepFoundPattern: no line contains the symbol → false (grep found nothing)', () => {
+  // e.g. `echo "===" && grep Sym f` where grep matched nothing — only the echo lands.
+  assert.equal(grepFoundPattern('===\n', 'EmbeddingModel'), false);
+});
+
+test('grepFoundPattern: alternation — ANY alternand present → true', () => {
+  assert.equal(grepFoundPattern('src/x.rs:3 created_at', 'markSuperseded|created_at'), true);
+});
+
+test('grepFoundPattern: null / empty output or pattern → false', () => {
+  assert.equal(grepFoundPattern(null, 'Sym'), false);
+  assert.equal(grepFoundPattern('', 'Sym'), false);
+  assert.equal(grepFoundPattern('anything', ''), false);
+  assert.equal(grepFoundPattern('anything', null), false);
+});
+
+test('grepFoundPattern: sibling echo mentions the symbol but grep MISSED → false (no hit-shaped line)', () => {
+  // `echo "search for EmbeddingModel" && grep EmbeddingModel wrongpath/` where grep
+  // found nothing → stdout is just the echo prose. Must NOT count as a hit, or the
+  // additive grep-empty inject is unreachable for this common shape (review MEDIUM).
+  assert.equal(grepFoundPattern('search for EmbeddingModel', 'EmbeddingModel'), false);
+  assert.equal(grepFoundPattern('=== callers of EmbeddingModel ===', 'EmbeddingModel'), false);
+});
+
+test('grepFoundPattern: identifier matched as a WHOLE WORD, not a substring', () => {
+  // `date` must not be swallowed by `update`/`validate` on a real hit line (review LOW#2).
+  assert.equal(grepFoundPattern('src/x.rs:3  updated the row and validated it', 'TaskState|date'), false);
+  // …but a genuine whole-word hit on a hit-shaped line still counts.
+  assert.equal(grepFoundPattern('src/x.rs:3  const date = now()', 'TaskState|date'), true);
+});
+
+test('grepFoundPattern: bare path line (grep -l output) with the symbol → true', () => {
+  assert.equal(grepFoundPattern('src/getVocabulary.rs', 'getVocabulary'), true);
+});
+
+test('grepFoundPattern: single-file `grep -n` linenum:content hit (no path prefix) → true', () => {
+  // Real shape from a compound `grep -n Sym onefile.mjs` — the hit line is
+  // `2:import { parseGitHubUrl }` with NO path token. Must still count as a hit.
+  assert.equal(grepFoundPattern('2:import { parseGitHubUrl } from "../x.mjs";', 'parseGitHubUrl'), true);
+});
+
+test('grepFoundPattern: long colon-free line does NOT ReDoS (bounded prefix scan)', () => {
+  // GREP_HIT_LINE's two `[^\s:]*` stars backtrack O(n²) on a long line carrying `/`.`
+  // but no colon (~33s on 400KB pre-fix). The prefix cap must keep it O(1)/line.
+  const huge = '/x.'.repeat(200000) + ' EmbeddingModel';  // ~600KB, has /. but no colon
+  const t0 = process.hrtime.bigint();
+  const r = grepFoundPattern(huge, 'EmbeddingModel');
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.ok(ms < 200, `grepFoundPattern took ${ms.toFixed(0)}ms on a 600KB line — ReDoS regressed`);
+  // Not a grep-hit-shaped line (no colon in the prefix, too long for a bare path) → false.
+  assert.equal(r, false);
+});
+
+test('grepFoundPattern: symbol present only in prose (no path token on the line) → false', () => {
+  // Defends the hit-line requirement: a plain content line without a path:col prefix
+  // (e.g. a `grep` on a single unnamed file, or non-grep sibling output) → inject
+  // (safe over-inject) rather than a false-skip.
+  assert.equal(grepFoundPattern('the EmbeddingModel struct is here', 'EmbeddingModel'), false);
+});
+
+// ── extractCallgraphSymbols ─────────────────────────────────────────
+// Widen callgraph eligibility: an alternation / multi-symbol grep pattern
+// used to fall to the redundant grep-echo because the WHOLE pattern wasn't a lone
+// identifier. Extract the identifier tokens (callgraph self-filters non-symbols).
+
+test('extractCallgraphSymbols: a lone identifier → [itself] (prior behavior)', () => {
+  assert.deepEqual(extractCallgraphSymbols('markSuperseded'), ['markSuperseded']);
+});
+
+test('extractCallgraphSymbols: a lone SHORT identifier is preserved (no length filter on the fast path)', () => {
+  // The <3-char length filter applies ONLY to multi-token extraction; a grep for
+  // a lone 2-char symbol must still get its callgraph, exactly as before.
+  assert.deepEqual(extractCallgraphSymbols('ok'), ['ok']);
+});
+
+test('extractCallgraphSymbols: alternation → each identifier in order', () => {
+  assert.deepEqual(
+    extractCallgraphSymbols('markSuperseded|created_at'),
+    ['markSuperseded', 'created_at']);
+});
+
+test('extractCallgraphSymbols: strips regex escapes so `\\bdate` yields `date`, not `bdate`', () => {
+  // The letter after \b/\d/\w is a regex metachar, not part of the symbol.
+  assert.deepEqual(
+    extractCallgraphSymbols('markSuperseded|\\bdate:|created_at'),
+    ['markSuperseded', 'date', 'created_at']);
+});
+
+test('extractCallgraphSymbols: drops <3-char noise tokens in multi mode', () => {
+  // `a|bb|ccc` → only `ccc` survives (a=1, bb=2 filtered).
+  assert.deepEqual(extractCallgraphSymbols('a|bb|ccc'), ['ccc']);
+});
+
+test('extractCallgraphSymbols: dedups repeated tokens, order-preserving', () => {
+  assert.deepEqual(extractCallgraphSymbols('foo|bar|foo'), ['foo', 'bar']);
+});
+
+test('extractCallgraphSymbols: caps attempts at 3', () => {
+  assert.deepEqual(
+    extractCallgraphSymbols('aaa|bbb|ccc|ddd|eee'),
+    ['aaa', 'bbb', 'ccc']);
+});
+
+test('extractCallgraphSymbols: non-string / empty → []', () => {
+  assert.deepEqual(extractCallgraphSymbols(null), []);
+  assert.deepEqual(extractCallgraphSymbols(''), []);
+  assert.deepEqual(extractCallgraphSymbols(undefined), []);
+});
+
+test('extractCallgraphSymbols: pattern with no identifier token → []', () => {
+  assert.deepEqual(extractCallgraphSymbols('\\d+\\.\\d+'), []);
+});
 
 // ── Pure logic: findFoldableGrepSegment ─────────────────────────────
 // Reuses splitTopLevelSegments + classifyBlock from pre-grep-guide. The FIRST
@@ -135,10 +286,15 @@ function e2eFixture(stubBody) {
   return { dir, stub };
 }
 
-function runHook(cmd, fixture, extraEnv = {}, cwdOverride) {
+function runHook(cmd, fixture, extraEnv = {}, cwdOverride, toolOutput) {
+  const payload = { tool_input: { command: cmd } };
+  // Drive the REAL CC runtime shape (verified against the v2.1.198 binary): the Bash
+  // result reaches the hook as `tool_response.stdout`. Absent → unknown → the gate
+  // injects (pre-gate behavior; no regression).
+  if (toolOutput !== undefined) payload.tool_response = { stdout: toolOutput };
   return spawnSync(process.execPath, [path.join(__dirname, 'post-grep-inject.js')], {
     cwd: cwdOverride || fixture.dir,
-    input: JSON.stringify({ tool_input: { command: cmd } }),
+    input: JSON.stringify(payload),
     encoding: 'utf8',
     env: {
       ...process.env,
@@ -246,6 +402,108 @@ test('e2e: per-command cooldown — verbatim re-run within window injects only o
     assert.notEqual(r1.stdout.trim(), '', 'first run injects');
     const r2 = runHook(cmd, fixture);
     assert.equal(r2.stdout.trim(), '', 'second run within cooldown is silent');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: alternation grep `Alpha|Beta` → callgraph mode when a symbol has edges', () => {
+  // The whole pattern is not a lone identifier, but the FIRST alternand resolves
+  // to a symbol with cross-file edges → callgraph payload, not the grep echo.
+  const uniq = `AltCg${Date.now()}`;
+  const fixture = e2eFixture(
+    // stub: argv = [node, stub, subcmd, sym/pattern, ...]. callgraph → edge-bearing
+    // tree; anything else (grep) → a plain hit line.
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.stdout.write(arg + '\\n  \\u2190 called by: someCaller (src/x.rs:3)\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/foo.rs:7  fn ' + arg + '()\\n');`);
+  const cmd = `echo "x" && grep "${uniq}|OtherSym" src/`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, /Cross-file call graph/,
+      'a resolving alternand must produce the callgraph payload, not the grep echo');
+    assert.match(out.hookSpecificOutput.additionalContext, /called by: someCaller/);
+    const recs = fs.readFileSync(
+      path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const rec = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(rec.action, 'inject');
+    assert.equal(rec.mode, 'callgraph', 'inject rec must record mode:callgraph');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: alternation grep, no symbol has edges → falls back to grep echo (grep mode)', () => {
+  // callgraph returns exit 1 (no node) for every alternand → the grep-echo path
+  // still delivers, mode:grep. Guards that widening never LOSES the echo fallback.
+  const uniq = `AltEcho${Date.now()}`;
+  const fixture = e2eFixture(
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.exit(1); }\n` +
+    `process.stdout.write('src/foo.rs:7  fn matched()\\n');`);
+  const cmd = `echo "x" && grep "${uniq}|OtherSym" src/`;
+  try {
+    const res = runHook(cmd, fixture);
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, /AST-aware view of your grep/);
+    const recs = fs.readFileSync(
+      path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const rec = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(rec.mode, 'grep');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: grep-response gate — grep ALREADY showed the symbol → skip inject (redundant)', () => {
+  // The model's own grep output contains the symbol → inject would re-state hits it
+  // already has (the 18/18-CONSUMED=0 case). Even though the stub WOULD answer, the
+  // gate suppresses the redundant inject.
+  const uniq = `GateHit${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
+  const cmd = `echo "x" && grep "${uniq}" src/`;
+  const grepOutput = `src/real.rs:42  fn ${uniq}() {  // the model's own grep already found it`;
+  try {
+    const res = runHook(cmd, fixture, {}, undefined, grepOutput);
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout.trim(), '', 'a grep that already surfaced the symbol must NOT trigger a redundant inject');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: grep-response gate — grep found NOTHING → inject (cg answer is additive)', () => {
+  // The grep produced no hit for the symbol (dialect/scope miss) → cg's structural
+  // answer is genuinely new info → inject fires.
+  const uniq = `GateMiss${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
+  const cmd = `echo "===" && grep "${uniq}" src/`;
+  const grepOutput = `===\n`; // only the echo landed; grep matched nothing
+  try {
+    const res = runHook(cmd, fixture, {}, undefined, grepOutput);
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, new RegExp(uniq),
+      'a grep that found nothing must still get the additive cg answer');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e: grep-response gate — absent output field → inject (no regression on unknown)', () => {
+  // No tool_response (older CC, or unreadable) → the gate can't confirm redundancy →
+  // it injects, exactly as before the gate existed.
+  const uniq = `GateUnknown${Date.now()}`;
+  const fixture = e2eFixture(`process.stdout.write('src/foo.rs:7  fn ' + process.argv[3] + '()\\n');`);
+  const cmd = `echo "x" && grep "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture); // no toolOutput arg
+    assert.equal(res.status, 0);
+    const out = JSON.parse(res.stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, new RegExp(uniq));
   } finally {
     cleanupFixture(fixture, cmd);
   }
