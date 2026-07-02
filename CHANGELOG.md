@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.83.0 — Go, Dart & C++ inheritance extraction
+
+Inheritance edges are now extracted for three more languages, closing a long-standing
+per-language parity gap (Go and Dart were documented as supporting inheritance but did
+not fully extract it; C++ produced none). Upgrading rebuilds the index once
+(`INDEX_VERSION` 31→34).
+
+### Added
+- **Go struct & interface embedding → `inherits`.** `type Dog struct { Animal }` now
+  records `Dog inherits Animal` (embedding is Go's idiomatic method promotion), and
+  interface composition (`type ReadWriter interface { Reader; Writer }`) records
+  `ReadWriter inherits Reader`/`Writer`. Pointer (`*Base`), qualified (`pkg.Type`), and
+  generic (`Base[int]`) embedded types all bind on the base type name. Go previously
+  produced no inheritance edges at all. A normal named field (`f Foo`) stays has-a.
+- **Dart mixins → `inherits`.** `class C extends Base with M, N` now records
+  `C inherits M` and `C inherits N` (mixin application injects the mixin's methods),
+  alongside the existing `extends`/`implements` edges. A `with`-only class no longer
+  emits a malformed target.
+- **C++ base classes → `inherits`.** `class Dog : public Animal, private Trackable`
+  now records `Dog inherits Animal` and `Dog inherits Trackable`. Multiple, `struct`,
+  qualified (`ns::Base`), and template (`Tmpl<int>`) bases are all handled; access
+  specifiers (`public`/`private`/`protected`) are ignored since C++ has no separate
+  interface concept. C has no inheritance and is unchanged.
+
+### Fixed
+- **Go 1.18 generics no longer confuse inheritance extraction.** An interface type-set
+  constraint (`interface { Signed | Unsigned }`) is no longer misread as embedding — it
+  previously emitted a bogus `inherits` edge to the first union term. Embedded generic
+  types (`struct { Base[int] }`, `interface { Container[T] }`) are now extracted instead
+  of silently dropped.
+
 ## v0.82.1 — accurate `reindex` help, read-only `doctor --check-only`
 
 Two user-facing message corrections. No behavior change, no index rebuild, no schema change.
