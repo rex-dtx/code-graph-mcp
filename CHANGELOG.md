@@ -11,6 +11,19 @@
   dedup now keys on `(qualified_name, file_path)`, so `Animal.render` and
   `Widget.render` stay distinct. Top-level symbols (whose `qualified_name` equals their
   `name`) still collapse feature-gated duplicates as before. No schema or index change.
+- **`overview` / `module_overview` now qualify class/impl members by their owner.** Once
+  the dedup above stopped dropping same-named methods, they surfaced as indistinguishable
+  bare rows (two `render`s). Any symbol whose `qualified_name` differs from its bare
+  `name` now renders as `Owner.member` in the text outline and the inactive-symbol
+  summary. This is repo-wide and LLM-visible, not TS-only: it also covers Rust/Python
+  impl & associated functions (`ToolRegistry.new`, `EmbeddingModel.load`,
+  `McpServer.tool_project_map`), which are stored as `function` nodes with a dotted
+  `qualified_name` — so a real module overview relabels every such row. It disambiguates
+  same-named members (two classes each with `render()`, or many `new`s) and matches what
+  `show` already prints. Structured output (CLI `overview --json`, MCP `active_exports` /
+  `hot_paths`, compact) also gains an additive `qualified_name` field, emitted only when
+  it differs from `name`; the `name` field itself stays a bare identifier for existing
+  consumers, and top-level functions/consts are unchanged.
 
 ## v0.85.5 — `overview` surfaces TS/JS methods; case-insensitive `direction`/`relation`
 

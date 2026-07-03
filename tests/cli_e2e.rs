@@ -2273,6 +2273,40 @@ fn test_cli_overview_compact() {
     assert!(!stdout.contains("×)"), "compact should not show caller counts");
 }
 
+// Regression: two exported classes in one file that share a method name must be
+// distinguishable in output. `overview --json` carries a `qualified_name`
+// (Animal.render / Widget.render) so they don't both surface as a bare `render`.
+#[test]
+fn test_cli_overview_json_disambiguates_same_named_methods() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("widgets.ts"), r#"
+export class Animal {
+    render(): string { return "animal"; }
+}
+
+export class Widget {
+    render(): string { return "widget"; }
+}
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&project, &["overview", "src/", "--json"]);
+    assert_eq!(code, 0, "overview --json should succeed; stderr={stderr:?}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("overview --json must be valid JSON ({e}); got: {stdout:?}"));
+    let qns: Vec<&str> = parsed.as_array().expect("overview --json is an array")
+        .iter()
+        .filter_map(|e| e.get("qualified_name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(qns.contains(&"Animal.render"), "Animal.render disambiguated: {qns:?} in {stdout}");
+    assert!(qns.contains(&"Widget.render"), "Widget.render disambiguated: {qns:?} in {stdout}");
+}
+
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection; the
 // empty-path guard (test_cli_overview_empty_path_errors) is preserved in the
 // handler since clap accepts an empty-string positional.

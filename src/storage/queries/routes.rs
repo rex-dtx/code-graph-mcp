@@ -147,6 +147,20 @@ pub struct ModuleExport {
     pub qualified_name: String,
 }
 
+impl ModuleExport {
+    /// Name to show in human- or LLM-facing output: the qualified name
+    /// (`Class.method`) for class members, else the bare `name`. Disambiguates
+    /// same-named methods of different classes in one file, which the bare-`name`
+    /// rendering otherwise printed as identical, indistinguishable rows.
+    pub fn display_name(&self) -> &str {
+        if self.qualified_name != self.name {
+            &self.qualified_name
+        } else {
+            &self.name
+        }
+    }
+}
+
 /// Get all exported symbols from files under a directory prefix.
 /// For JS/TS, uses explicit `exports` edges. For other languages (Rust, Go, Python, etc.),
 /// falls back to returning all named top-level symbols (functions, structs, classes, etc.).
@@ -380,6 +394,24 @@ mod tests {
         assert!(render_qns.contains(&"Animal.render".to_string()), "Animal.render present: {render_qns:?}");
         assert!(render_qns.contains(&"Widget.render".to_string()), "Widget.render present: {render_qns:?}");
         assert_eq!(render_qns.len(), 2, "both same-named methods kept, not deduped: {render_qns:?}");
+    }
+
+    #[test]
+    fn test_module_export_display_name_qualifies_methods_only() {
+        let method = ModuleExport {
+            node_id: 1, name: "render".into(), node_type: "method".into(),
+            signature: None, file_path: "a.ts".into(), caller_count: 0,
+            start_line: 1, end_line: 2, qualified_name: "Widget.render".into(),
+        };
+        // Members show `Class.method` so two same-named methods stay distinct.
+        assert_eq!(method.display_name(), "Widget.render");
+        let top_level = ModuleExport {
+            node_id: 2, name: "helper".into(), node_type: "function".into(),
+            signature: None, file_path: "a.ts".into(), caller_count: 0,
+            start_line: 3, end_line: 4, qualified_name: "helper".into(),
+        };
+        // Top-level symbols (qualified_name == name) render bare, no redundant prefix.
+        assert_eq!(top_level.display_name(), "helper");
     }
 
     /// Regression: `get_module_exports` must return a deterministic, relevance-

@@ -4133,7 +4133,7 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
         let results: Vec<serde_json::Value> = exports
             .iter()
             .map(|e| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "name": e.name,
                     "type": e.node_type,
                     "file": e.file_path,
@@ -4141,7 +4141,13 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
                     "caller_count": e.caller_count,
                     "start_line": e.start_line,
                     "end_line": e.end_line,
-                })
+                });
+                // Disambiguate same-named methods of different classes (parity with
+                // MCP module_overview active_exports). Present only when it adds info.
+                if e.qualified_name != e.name {
+                    obj["qualified_name"] = serde_json::json!(e.qualified_name);
+                }
+                obj
             })
             .collect();
         writeln!(stdout, "{}", serde_json::to_string(&results)?)?;
@@ -4170,7 +4176,7 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
             };
             if compact {
                 writeln!(stdout, "  L{}-{}  {}  {}{}",
-                    s.start_line, s.end_line, s.node_type, s.name, callers)?;
+                    s.start_line, s.end_line, s.node_type, s.display_name(), callers)?;
             } else {
                 let sig = s.signature.as_deref().unwrap_or("");
                 let sig_display = if sig.is_empty() {
@@ -4179,7 +4185,7 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
                     format!("  {}", sig.lines().next().unwrap_or("").trim())
                 };
                 writeln!(stdout, "  L{}-{}  {}  {}{}{}",
-                    s.start_line, s.end_line, s.node_type, s.name, callers, sig_display)?;
+                    s.start_line, s.end_line, s.node_type, s.display_name(), callers, sig_display)?;
             }
         }
         return Ok(());
@@ -4198,11 +4204,11 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
                 .iter()
                 .map(|s| {
                     if compact {
-                        s.name.clone()
+                        s.display_name().to_string()
                     } else if s.caller_count > 0 {
-                        format!("{} ({}×)", s.name, s.caller_count)
+                        format!("{} ({}×)", s.display_name(), s.caller_count)
                     } else {
-                        s.name.clone()
+                        s.display_name().to_string()
                     }
                 })
                 .collect();

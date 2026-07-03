@@ -99,12 +99,18 @@ impl McpServer {
         hot_candidates.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
         let hot_paths: Vec<serde_json::Value> = hot_candidates.iter()
             .take(5)
-            .map(|e| json!({
-                "name": e.name,
-                "type": e.node_type,
-                "file": e.file_path,
-                "caller_count": e.caller_count,
-            }))
+            .map(|e| {
+                let mut obj = json!({
+                    "name": e.name,
+                    "type": e.node_type,
+                    "file": e.file_path,
+                    "caller_count": e.caller_count,
+                });
+                if e.qualified_name != e.name {
+                    obj["qualified_name"] = json!(e.qualified_name);
+                }
+                obj
+            })
             .collect();
 
         // Active exports get full detail; inactive ones are summarized by type.
@@ -114,22 +120,32 @@ impl McpServer {
         active_sorted.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
         let active_exports: Vec<serde_json::Value> = active_sorted.iter()
             .take(MAX_ACTIVE)
-            .map(|e| json!({
-                "node_id": e.node_id,
-                "name": e.name,
-                "type": e.node_type,
-                "file": e.file_path,
-                "caller_count": e.caller_count,
-                "signature": e.signature,
-                "start_line": e.start_line,
-                "end_line": e.end_line,
-            }))
+            .map(|e| {
+                let mut obj = json!({
+                    "node_id": e.node_id,
+                    "name": e.name,
+                    "type": e.node_type,
+                    "file": e.file_path,
+                    "caller_count": e.caller_count,
+                    "signature": e.signature,
+                    "start_line": e.start_line,
+                    "end_line": e.end_line,
+                });
+                // Disambiguate same-named methods of different classes (parity with
+                // CLI `overview --json`). Present only when it adds info.
+                if e.qualified_name != e.name {
+                    obj["qualified_name"] = json!(e.qualified_name);
+                }
+                obj
+            })
             .collect();
 
         // Compact summary for inactive symbols — just counts by type
         let mut inactive_by_type: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
         for e in &inactive {
-            inactive_by_type.entry(e.node_type.as_str()).or_default().push(e.name.as_str());
+            // Show `Class.method` for members so two same-named methods of different
+            // classes don't both surface as a bare, indistinguishable `render`.
+            inactive_by_type.entry(e.node_type.as_str()).or_default().push(e.display_name());
         }
         let inactive_summary: Vec<serde_json::Value> = inactive_by_type.iter()
             .map(|(typ, names)| {
@@ -247,13 +263,20 @@ impl McpServer {
         // Field name `caller_count` matches the non-compact envelope and the
         // CLI `overview --json` output (parity across surfaces).
         let active: Vec<serde_json::Value> = full["active_exports"].as_array()
-            .map(|arr| arr.iter().map(|e| json!({
-                "node_id": e["node_id"],
-                "name": e["name"],
-                "type": e["type"],
-                "file": e["file"],
-                "caller_count": e["caller_count"],
-            })).collect())
+            .map(|arr| arr.iter().map(|e| {
+                let mut obj = json!({
+                    "node_id": e["node_id"],
+                    "name": e["name"],
+                    "type": e["type"],
+                    "file": e["file"],
+                    "caller_count": e["caller_count"],
+                });
+                // Forward the method disambiguator when the full envelope carries it.
+                if let Some(qn) = e.get("qualified_name") {
+                    obj["qualified_name"] = qn.clone();
+                }
+                obj
+            }).collect())
             .unwrap_or_default();
 
         let inactive_count: usize = full["inactive_summary"].as_array()
