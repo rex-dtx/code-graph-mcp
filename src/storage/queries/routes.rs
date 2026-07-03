@@ -141,6 +141,10 @@ pub struct ModuleExport {
     pub caller_count: i64,
     pub start_line: i64,
     pub end_line: i64,
+    /// COALESCE(qualified_name, name): `Class.method` for members, bare `name`
+    /// for top-level symbols. Used as the dedup key so same-named methods of
+    /// different classes in one file don't collide.
+    pub qualified_name: String,
 }
 
 /// Get all exported symbols from files under a directory prefix.
@@ -173,7 +177,8 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     let sql = format!(
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
                 COALESCE(cc.cnt, 0) as caller_count,
-                n.start_line, n.end_line
+                n.start_line, n.end_line,
+                COALESCE(n.qualified_name, n.name) as qname
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          LEFT JOIN (
@@ -236,15 +241,20 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
             caller_count: row.get(5)?,
             start_line: row.get(6)?,
             end_line: row.get(7)?,
+            qualified_name: row.get(8)?,
         })
     })?;
     let all: Vec<ModuleExport> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
 
-    // Deduplicate by (name, file_path) — keeps highest caller_count.
-    // Handles feature-gated duplicates (e.g. #[cfg(feature)] producing two nodes for same symbol).
+    // Deduplicate by (qualified_name, file_path) — keeps highest caller_count.
+    // Keyed on qualified_name (not bare name) so two exported classes' same-named
+    // methods in one file (`Animal.render` vs `Widget.render`) stay distinct instead
+    // of collapsing to one — the (name, file_path) key silently dropped one of them.
+    // For top-level symbols qualified_name == name (COALESCE fallback), so cfg-gated
+    // duplicates (#[cfg(feature)] emitting two same-name nodes) still collapse to one.
     let mut best: HashMap<(String, String), ModuleExport> = HashMap::with_capacity(all.len());
     for export in all {
-        let key = (export.name.clone(), export.file_path.clone());
+        let key = (export.qualified_name.clone(), export.file_path.clone());
         best.entry(key)
             .and_modify(|existing| {
                 if export.caller_count > existing.caller_count {
@@ -257,19 +267,20 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     // the SQL `ORDER BY caller_count DESC` and made `overview` / `module_overview`
     // print the same symbols in a different order on every run (same bug class as
     // the call-graph merge). Re-establish a deterministic TOTAL order: caller_count
-    // DESC (the relevance the SQL intended), then (file_path, start_line, name).
-    // `name` is the final key BECAUSE (file_path, start_line) alone is NOT unique —
-    // e.g. cfg-gated or macro-generated symbols can share a start_line in one file;
-    // without `name` those ties keep the random HashMap order. (The dedup key above
-    // is (name, file_path), so name closes the order.) file/line/name are all
-    // source-derived, so the order is stable across index rebuilds (unlike node_id).
+    // DESC (the relevance the SQL intended), then (file_path, start_line, qualified_name).
+    // `qualified_name` is the final key BECAUSE (file_path, start_line) alone is NOT
+    // unique — e.g. macro-generated symbols can share a start_line in one file;
+    // without it those ties keep the random HashMap order. It's also the dedup key,
+    // so (file_path, qualified_name) is unique and the order is TOTAL. file/line/
+    // qualified_name are all source-derived, so the order is stable across index
+    // rebuilds (unlike node_id).
     let mut result: Vec<ModuleExport> = best.into_values().collect();
     result.sort_by(|a, b| {
         b.caller_count
             .cmp(&a.caller_count)
             .then_with(|| a.file_path.cmp(&b.file_path))
             .then_with(|| a.start_line.cmp(&b.start_line))
-            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.qualified_name.cmp(&b.qualified_name))
     });
     Ok(result)
 }
@@ -339,6 +350,36 @@ mod tests {
         assert!(names.contains(&"speak".to_string()), "method of exported class shown: {names:?}");
         assert!(!names.contains(&"Helper".to_string()), "non-exported class hidden: {names:?}");
         assert!(!names.contains(&"secret".to_string()), "method of non-exported class hidden: {names:?}");
+    }
+
+    /// Regression: two exported classes in one file that share a method name
+    /// (`Animal.render` / `Widget.render`) must BOTH surface. The dedup key was
+    /// (name, file_path) — which collapsed them to a single `render` — and now keys
+    /// on (qualified_name, file_path). Guards the R11 method-surfacing edge.
+    #[test]
+    fn test_get_module_exports_dedup_distinguishes_same_named_methods() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/widgets.ts', 'h1', 0, 'typescript', 0)", []).unwrap();
+        // Two exported classes, each with its own render() method (same name, distinct qn).
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Animal', 'Animal', 1, 5, 'class Animal {}')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'render', 'Animal.render', 2, 3, 'render() {}')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Widget', 'Widget', 6, 10, 'class Widget {}')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'render', 'Widget.render', 7, 8, 'render() {}')", []).unwrap();
+        // Module node (id 5) exports BOTH classes.
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'module', 'widgets', 'widgets', 0, 0, '')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (5, 1, 'exports')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (5, 3, 'exports')", []).unwrap();
+
+        let render_qns: Vec<String> = get_module_exports(conn, "src/widgets")
+            .unwrap()
+            .iter()
+            .filter(|e| e.name == "render")
+            .map(|e| e.qualified_name.clone())
+            .collect();
+        assert!(render_qns.contains(&"Animal.render".to_string()), "Animal.render present: {render_qns:?}");
+        assert!(render_qns.contains(&"Widget.render".to_string()), "Widget.render present: {render_qns:?}");
+        assert_eq!(render_qns.len(), 2, "both same-named methods kept, not deduped: {render_qns:?}");
     }
 
     /// Regression: `get_module_exports` must return a deterministic, relevance-

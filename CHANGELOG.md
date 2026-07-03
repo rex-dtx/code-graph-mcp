@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **`overview` / `module_overview`: two exported classes in one file no longer hide
+  each other's same-named method.** v0.85.5 started surfacing methods of exported
+  classes, but `get_module_exports` deduped on `(name, file_path)` — so if a
+  TypeScript/JavaScript file exported two classes that each defined, say, `render()`,
+  the two `render` methods collided and only one appeared in the module summary. The
+  dedup now keys on `(qualified_name, file_path)`, so `Animal.render` and
+  `Widget.render` stay distinct. Top-level symbols (whose `qualified_name` equals their
+  `name`) still collapse feature-gated duplicates as before. No schema or index change.
+
 ## v0.85.5 — `overview` surfaces TS/JS methods; case-insensitive `direction`/`relation`
 
 Two dogfooding fixes, no schema or index change.
