@@ -2413,6 +2413,68 @@ fn test_cli_deps_unknown_flag_errors() {
     assert_eq!(code, 2, "unknown flag must error under clap");
 }
 
+#[test]
+fn test_cli_deps_directory_points_to_overview() {
+    // Regression: `deps <dir>` reported "File not found" (is_file() is false for a
+    // directory) — misleading, since the directory plainly exists. It must instead
+    // say it's a directory and point at `overview`.
+    let project = setup_indexed_project(); // contains a src/ directory
+    let (_out, err, code) = run_cli(&project, &["deps", "src"]);
+    assert_ne!(code, 0, "deps on a directory is an error");
+    assert!(err.contains("directory"),
+        "deps on a directory must say it's a directory; got stderr={err:?}");
+    assert!(err.contains("overview"),
+        "deps on a directory must point at `overview`; got stderr={err:?}");
+    // --json must still honor the empty-contract: a JSON object with a dir error.
+    let (out, _err, code2) = run_cli(&project, &["deps", "src", "--json"]);
+    assert_ne!(code2, 0);
+    let v: serde_json::Value = serde_json::from_str(out.trim())
+        .expect("deps --json on a directory must emit valid JSON");
+    assert!(v["error"].as_str().unwrap_or("").to_lowercase().contains("director"),
+        "deps --json directory error should mention directory; got {v:?}");
+}
+
+/// A project with a call chain `top`/`side` → `middle` → `bottom`, so `middle`
+/// lies on the shortest paths (top→bottom, side→bottom) and is a real betweenness
+/// chokepoint. Used to prove `centrality --limit 0` surfaces it instead of falsely
+/// claiming the graph has none.
+fn setup_centrality_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("chain.ts"), r#"
+export function bottom(): number { return 1; }
+export function middle(): number { return bottom(); }
+export function top(): number { return middle(); }
+export function side(): number { return middle(); }
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+#[test]
+fn test_cli_centrality_limit_zero_not_misleading() {
+    // Regression: `centrality --limit 0` returned an empty ranking and printed
+    // "No chokepoints found (graph has no multi-hop call paths)", falsely blaming
+    // the graph when the user merely asked for zero rows. --limit 0 must clamp to 1
+    // (mirrors cmd_callgraph's depth.max(1)).
+    let project = setup_centrality_project();
+    // Sanity: a real chokepoint exists, so limit 1 lists it on stdout.
+    let (out1, _err1, code1) = run_cli(&project, &["centrality", "--limit", "1"]);
+    assert_eq!(code1, 0);
+    assert!(out1.contains("chokepoint"),
+        "fixture must surface a chokepoint at limit 1; got {out1:?}");
+    // With a chokepoint present, limit 0 must NOT claim there are none.
+    let (out0, err0, code0) = run_cli(&project, &["centrality", "--limit", "0"]);
+    assert_eq!(code0, 0);
+    assert!(!err0.contains("no multi-hop call paths"),
+        "centrality --limit 0 must not claim the graph has no chokepoints; stderr={err0:?}");
+    assert_eq!(out0, out1, "--limit 0 must be clamped to 1 (identical output to --limit 1)");
+}
+
 // ============================================================
 // ast-search
 // ============================================================

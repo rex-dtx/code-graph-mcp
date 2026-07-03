@@ -4814,7 +4814,13 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
             }
             return Ok(());
         }
-        let file_exists = project_root.join(file_path).is_file();
+        let abs_path = project_root.join(file_path);
+        let file_exists = abs_path.is_file();
+        // A directory reaches here too (get_import_tree finds no file-node, the
+        // barrel scan can't read it). Distinguish it from a genuinely missing path
+        // so the error points at `overview` instead of the misleading "File not
+        // found" (the directory plainly exists).
+        let is_dir = !file_exists && abs_path.is_dir();
         if json_mode {
             let result = serde_json::json!({
                 "file": file_path,
@@ -4822,6 +4828,8 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
                 "depended_by": [],
                 "error": if file_exists {
                     "No tracked dependencies (not a barrel/import file)"
+                } else if is_dir {
+                    "Path is a directory (deps analyzes a single file; try overview)"
                 } else {
                     "File not found"
                 },
@@ -4831,6 +4839,12 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
         if file_exists {
             anyhow::bail!(
                 "[code-graph] No tracked dependencies for: {} (not a barrel/import file \u{2014} try `code-graph-mcp overview {}` or Read directly)",
+                file_path,
+                file_path
+            );
+        } else if is_dir {
+            anyhow::bail!(
+                "[code-graph] {} is a directory \u{2014} `deps` analyzes a single file. Try `code-graph-mcp overview {}` for a directory, or pass a file path.",
                 file_path,
                 file_path
             );
@@ -5602,6 +5616,11 @@ pub struct CentralityArgs {
 /// traffic. CLI-only; not exposed as an MCP tool.
 pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
     let CentralityArgs { limit, include_tests, json: json_mode } = args;
+    // Clamp to >=1 (mirrors cmd_callgraph's depth.max(1)): --limit 0 would return
+    // an empty ranking and trip the "No chokepoints found (graph has no multi-hop
+    // call paths)" branch below — a message that falsely blames the graph when the
+    // user merely asked for zero rows.
+    let limit = limit.max(1);
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
