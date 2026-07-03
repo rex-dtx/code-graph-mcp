@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
-use std::collections::HashMap;
 
 use crate::domain::REL_CALLS;
 
@@ -198,12 +197,15 @@ fn query_direction(
     //
     // Truncation ordering: when a hot function (e.g. `conn` in this repo with
     // 51 callers + 72 test) saturates CALL_GRAPH_ROW_LIMIT at depth=3, the
-    // pre-LIMIT sort is `depth ASC, caller_count DESC` so high-connectivity
-    // subtrees survive the truncation. Without the secondary key, alphabetical
-    // / id-order ties would silently drop the most-relevant subtree. The
-    // `caller_count` LEFT JOIN is a single non-correlated GROUP BY scan over
-    // edges (idx_edges_target_rel covers the predicate); rowcount is bounded
-    // by node count, not edge count.
+    // pre-LIMIT sort is `depth ASC, caller_count DESC, node_id ASC` so
+    // high-connectivity subtrees survive the truncation. `caller_count DESC` keeps
+    // the most-relevant subtree; the `node_id ASC` tail is a UNIQUE tiebreaker so a
+    // band of equal-caller_count siblings truncates deterministically instead of
+    // dropping a query-plan-dependent subset (without it, alphabetical / id-order
+    // ties would silently drop an arbitrary part of the most-relevant band). The
+    // `caller_count` LEFT JOIN is a single non-correlated GROUP BY scan over edges
+    // (idx_edges_target_rel covers the predicate); rowcount is bounded by node
+    // count, not edge count.
     let sql = format!(
         "WITH RECURSIVE call_graph(node_id, name, type, depth, visited, parent_id) AS (
             SELECT n.id, n.name, n.type, 0, CAST(n.id AS TEXT), NULL
@@ -239,7 +241,7 @@ fn query_direction(
             JOIN files f ON f.id = n.file_id
             LEFT JOIN caller_counts cc ON cc.node_id = cg.node_id
         ) WHERE rn = 1
-        ORDER BY depth ASC, caller_count DESC
+        ORDER BY depth ASC, caller_count DESC, node_id ASC
         LIMIT {row_limit}",
         row_limit = CALL_GRAPH_ROW_LIMIT,
     );
@@ -348,28 +350,28 @@ pub fn count_suppressed_into(
     Ok(count as usize)
 }
 
-/// Merge callee and caller results, deduplicating by (node_id, direction) and keeping the entry
-/// with minimum depth (preserving its `parent_id` so the renderer can build a tree).
-fn merge_results(callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Vec<CallGraphNode> {
-    let mut by_key: HashMap<(i64, Direction), CallGraphNode> = HashMap::new();
-
-    for node in callees.into_iter().chain(callers) {
-        let key = (node.node_id, node.direction);
-        match by_key.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                if node.depth < e.get().depth {
-                    e.insert(node);
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(node);
-            }
-        }
-    }
-
-    let mut results: Vec<CallGraphNode> = by_key.into_values().collect();
-    results.sort_by_key(|n| n.depth);
-    results
+/// Merge callee and caller results into one deterministic, relevance-ordered list.
+///
+/// Each input is already deduped by `node_id` (the SQL
+/// `ROW_NUMBER() OVER (PARTITION BY node_id ...) WHERE rn = 1`) and ordered by
+/// `(depth ASC, caller_count DESC, node_id ASC)` — its relevance order. The two
+/// inputs carry disjoint `Direction` values and each is node_id-unique, so the
+/// `(node_id, direction)` key is globally unique across the concatenation: there
+/// is nothing to collapse. A node reachable both as a callee and a caller (e.g.
+/// mutual recursion A→B, B→A) is intentionally kept once per direction so it shows
+/// in both sections. We concatenate and STABLE-sort by depth, which preserves each
+/// direction's relevance order within every depth band.
+///
+/// This must NOT round-trip through a `HashMap`: `HashMap::into_values()` iterates
+/// in the map's per-instance random-seed order, so a stable-sort-by-depth
+/// afterward left same-depth ties in a different order on every call. That made
+/// the DEFAULT `callgraph <symbol>` (direction=both, both CLI and MCP) print the
+/// same caller/callee set in a different order on every run, and left the JSON
+/// `results[]` order unstable — defeating diff/reproducibility.
+fn merge_results(mut callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Vec<CallGraphNode> {
+    callees.extend(callers);
+    callees.sort_by_key(|n| n.depth);
+    callees
 }
 
 #[cfg(test)]
@@ -769,5 +771,103 @@ mod tests {
         assert!(!n2.contains(&"Y"), "extracted floor drops the inferred edge; got {n2:?}");
         assert_eq!(at_extracted.suppressed_ambiguous, 1,
             "the inferred edge counts as suppressed at the extracted floor");
+    }
+
+    /// Regression: `direction="both"` output MUST be deterministic and preserve
+    /// each direction's relevance order. `merge_results` previously collected
+    /// `HashMap::into_values()`, whose per-instance random seed reordered
+    /// same-depth ties — so the DEFAULT `callgraph <symbol>` (direction=both, both
+    /// CLI and MCP) printed the same caller/callee SET in a different order on
+    /// every run, and the JSON `results[]` order was unstable, defeating
+    /// diff/repro. Here S has depth-1 callers K5>K4>K3>K2>K1 by caller_count; the
+    /// merged output must list them in that caller_count-DESC order (equivalently:
+    /// exactly the deterministic order the SQL already produces per direction).
+    #[test]
+    fn test_both_direction_deterministic_and_relevance_ordered() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: Some("typescript".into()),
+        }).unwrap();
+
+        let s = insert_node(conn, &node("S", fid)).unwrap();
+        // Five callers of S, each given a distinct caller_count (K_i has i extra
+        // callers) so the relevance order within depth 1 is unambiguous:
+        // K5(5) > K4(4) > K3(3) > K2(2) > K1(1).
+        let mut callers = Vec::new();
+        for i in 1..=5 {
+            let k = insert_node(conn, &node(&format!("K{i}"), fid)).unwrap();
+            insert_edge(conn, k, s, REL_CALLS, None).unwrap(); // K_i calls S
+            for j in 0..i {
+                let ext = insert_node(conn, &node(&format!("ext_{i}_{j}"), fid)).unwrap();
+                insert_edge(conn, ext, k, REL_CALLS, None).unwrap(); // boost caller_count(K_i)
+            }
+            callers.push(format!("K{i}"));
+        }
+        // S also calls two callees so the merge exercises both directions.
+        let m1 = insert_node(conn, &node("M1", fid)).unwrap();
+        let m2 = insert_node(conn, &node("M2", fid)).unwrap();
+        insert_edge(conn, s, m1, REL_CALLS, None).unwrap();
+        insert_edge(conn, s, m2, REL_CALLS, None).unwrap();
+
+        let full_order = |r: &CallGraphResult| -> Vec<(String, &'static str, i32)> {
+            r.nodes.iter().map(|n| (n.name.clone(), n.direction.as_str(), n.depth)).collect()
+        };
+
+        let run1 = get_call_graph(conn, "S", "both", 1, None).unwrap();
+        let run2 = get_call_graph(conn, "S", "both", 1, None).unwrap();
+
+        // Determinism: two identical queries → identical node order.
+        assert_eq!(full_order(&run1), full_order(&run2),
+            "direction=both must be deterministic across calls");
+
+        // Relevance preserved through merge: depth-1 callers in caller_count-DESC order.
+        let got: Vec<&str> = run1.nodes.iter()
+            .filter(|n| n.depth == 1 && matches!(n.direction, Direction::Callers))
+            .map(|n| n.name.as_str())
+            .collect();
+        let expected: Vec<&str> = vec!["K5", "K4", "K3", "K2", "K1"];
+        assert_eq!(got, expected,
+            "depth-1 callers must keep caller_count-DESC relevance order through merge; got {got:?}");
+    }
+
+    /// The final SQL sort carries a unique `node_id ASC` tiebreaker after
+    /// `(depth ASC, caller_count DESC)`. A band of equal-caller_count siblings
+    /// therefore returns in a specified, stable order — without it, the
+    /// `LIMIT CALL_GRAPH_ROW_LIMIT` truncation on a wide fan-out could drop an
+    /// arbitrary, query-plan-dependent subset (the same silent-truncation class
+    /// the `caller_count DESC` key already guards for the primary sort). Here S
+    /// calls four callees all with caller_count 1 (a full tie); they must come
+    /// back in node_id-ascending order.
+    #[test]
+    fn test_tie_band_orders_by_node_id() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: Some("typescript".into()),
+        }).unwrap();
+        let s = insert_node(conn, &node("S", fid)).unwrap();
+        // Insert out of alphabetical order to prove node_id (insertion order), not
+        // name, is the tiebreaker; each is called only by S → caller_count == 1.
+        for name in ["Z", "A", "M", "B"] {
+            let c = insert_node(conn, &node(name, fid)).unwrap();
+            insert_edge(conn, s, c, REL_CALLS, None).unwrap();
+        }
+
+        let result = get_call_graph(conn, "S", "callees", 1, None).unwrap();
+        let ids: Vec<i64> = result.nodes.iter()
+            .filter(|n| n.depth == 1)
+            .map(|n| n.node_id)
+            .collect();
+        let mut ascending = ids.clone();
+        ascending.sort_unstable();
+        assert_eq!(ids, ascending,
+            "equal-caller_count callees must be ordered by node_id ASC; got {ids:?}");
     }
 }
