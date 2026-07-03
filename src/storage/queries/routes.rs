@@ -151,7 +151,18 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     let escaped_prefix = dir_prefix.replace('%', "\\%").replace('_', "\\_");
     let prefix_pattern = format!("{}%", escaped_prefix);
 
-    // Phase 1: Try explicit exports (JS/TS)
+    // Per-file export semantics (decided per file, NOT globally over the prefix):
+    //   - a file that declares explicit exports (ESM `export` → REL_EXPORTS edges)
+    //     contributes ONLY its exported symbols (surface the public API);
+    //   - a file with no export edges at all (Python / Rust / Go / CommonJS / …)
+    //     contributes every named top-level symbol.
+    // The former shape ran these as two GLOBAL phases and returned as soon as any
+    // ESM export existed under the prefix — silently dropping every
+    // non-export-language file in the same tree (`overview src` / MCP
+    // `module_overview` hid all Python/Rust/Go source next to a `.ts` file).
+    // The `?3 = REL_EXPORTS` set of export-bearing files is computed once
+    // (uncorrelated NOT IN), so this stays a single scan.
+    //
     // Filter n.is_test=0 — AST-level flag catches inline `#[cfg(test)] mod tests`
     // whose names don't match the name-heuristic in is_test_symbol.
     // Caller count subquery uses domain helpers to filter source-side test edges
@@ -159,47 +170,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     // impact (see feedback_test_classifier_dual_sources for the full inventory).
     let prod_join = crate::domain::prod_source_join_sql("e2");
     let prod_where = crate::domain::PROD_SOURCE_FILTER_AND;
-    let sql_exports = format!(
-        "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
-                COALESCE(cc.cnt, 0) as caller_count,
-                n.start_line, n.end_line
-         FROM nodes n
-         JOIN files f ON f.id = n.file_id
-         JOIN edges e ON e.target_id = n.id AND e.relation = ?1
-         LEFT JOIN (
-             SELECT e2.target_id, COUNT(*) as cnt
-             FROM edges e2
-             {prod_join}
-             WHERE e2.relation = ?3
-               AND {prod_where}
-             GROUP BY e2.target_id
-         ) cc ON cc.target_id = n.id
-         WHERE f.path LIKE ?2 ESCAPE '\\'
-           AND n.is_test = 0
-         ORDER BY caller_count DESC"
-    );
-    let mut stmt = conn.prepare(&sql_exports)?;
-    let rows = stmt.query_map(rusqlite::params![REL_EXPORTS, &prefix_pattern, REL_CALLS], |row| {
-        Ok(ModuleExport {
-            node_id: row.get(0)?,
-            name: row.get(1)?,
-            node_type: row.get(2)?,
-            signature: row.get(3)?,
-            file_path: row.get(4)?,
-            caller_count: row.get(5)?,
-            start_line: row.get(6)?,
-            end_line: row.get(7)?,
-        })
-    })?;
-    let results: Vec<ModuleExport> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-
-    if !results.is_empty() {
-        return Ok(results);
-    }
-
-    // Phase 2: Fallback for non-JS/TS — all named top-level symbols in matching files.
-    // Caller count subquery filters source-side test edges (see Phase 1 comment).
-    let sql_fallback = format!(
+    let sql = format!(
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
                 COALESCE(cc.cnt, 0) as caller_count,
                 n.start_line, n.end_line
@@ -217,10 +188,22 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
            AND n.type != 'module'
            AND n.name != '<module>'
            AND n.is_test = 0
+           AND (
+               EXISTS (
+                   SELECT 1 FROM edges ex
+                   WHERE ex.target_id = n.id AND ex.relation = ?3
+               )
+               OR n.file_id NOT IN (
+                   SELECT en.file_id
+                   FROM edges ex2
+                   JOIN nodes en ON en.id = ex2.target_id
+                   WHERE ex2.relation = ?3
+               )
+           )
          ORDER BY caller_count DESC"
     );
-    let mut stmt2 = conn.prepare(&sql_fallback)?;
-    let rows2 = stmt2.query_map(rusqlite::params![&prefix_pattern, REL_CALLS], |row| {
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![&prefix_pattern, REL_CALLS, REL_EXPORTS], |row| {
         Ok(ModuleExport {
             node_id: row.get(0)?,
             name: row.get(1)?,
@@ -232,7 +215,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
             end_line: row.get(7)?,
         })
     })?;
-    let all: Vec<ModuleExport> = rows2.collect::<std::result::Result<Vec<_>, _>>()?;
+    let all: Vec<ModuleExport> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
 
     // Deduplicate by (name, file_path) — keeps highest caller_count.
     // Handles feature-gated duplicates (e.g. #[cfg(feature)] producing two nodes for same symbol).
@@ -320,6 +303,94 @@ mod tests {
         assert!(
             !names.contains(&"arrays_are_homogeneous"),
             "is_test=1 node leaked into module exports: {:?}", names,
+        );
+    }
+
+    #[test]
+    fn test_get_module_exports_mixed_language_no_drop() {
+        // Regression: a directory mixing an ESM file (explicit `export` →
+        // REL_EXPORTS edges) with a non-export-language file (Python/Rust/…, no
+        // export edges) must show symbols from BOTH files. The former global
+        // two-phase form returned as soon as Phase 1 (any ESM export under the
+        // prefix) found something, silently dropping every non-export-language
+        // file in the same tree — so `overview src` / MCP `module_overview` hid
+        // all Python/Rust/Go source whenever a sibling .ts file had exports.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        // ESM file with an explicit export
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
+             VALUES ('src/a.ts', 'h1', 0, 'typescript', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'function', 'tsExported', 'tsExported', 1, 5, 'export function tsExported(){}', 0)",
+            [],
+        ).unwrap(); // node 1
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'module', '<module>', '<module>', 0, 0, '', 0)",
+            [],
+        ).unwrap(); // node 2 (module source of the export edge)
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (2, 1, 'exports')", []).unwrap();
+        // Python file with NO export edges (Python has no `export` concept)
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
+             VALUES ('src/b.py', 'h2', 0, 'python', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (2, 'function', 'py_func', 'py_func', 1, 5, 'def py_func(): pass', 0)",
+            [],
+        ).unwrap(); // node 3
+
+        let exports = get_module_exports(conn, "src/").unwrap();
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"tsExported"), "ESM export missing: {:?}", names);
+        assert!(
+            names.contains(&"py_func"),
+            "non-export-language symbol dropped in mixed-language dir: {:?}", names,
+        );
+    }
+
+    #[test]
+    fn test_get_module_exports_hides_nonexported_in_esm_file() {
+        // Intent preserved: within a file that DOES declare exports, a
+        // non-exported internal symbol stays hidden (the overview surfaces the
+        // public API of ESM files, not their internals). Guards against the
+        // per-file fix over-widening ESM files to all top-level symbols.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
+             VALUES ('src/a.ts', 'h1', 0, 'typescript', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'function', 'publicApi', 'publicApi', 1, 5, 'export function publicApi(){}', 0)",
+            [],
+        ).unwrap(); // node 1 (exported)
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'function', 'internalHelper', 'internalHelper', 7, 9, 'function internalHelper(){}', 0)",
+            [],
+        ).unwrap(); // node 2 (NOT exported)
+        conn.execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
+             VALUES (1, 'module', '<module>', '<module>', 0, 0, '', 0)",
+            [],
+        ).unwrap(); // node 3 (module)
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (3, 1, 'exports')", []).unwrap();
+
+        let exports = get_module_exports(conn, "src/a.ts").unwrap();
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"publicApi"), "exported symbol missing: {:?}", names);
+        assert!(
+            !names.contains(&"internalHelper"),
+            "non-exported internal symbol leaked from an ESM file: {:?}", names,
         );
     }
 
