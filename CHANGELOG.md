@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.85.2 — Deterministic `overview` and `map`
+
+`overview` / `module_overview` and `map` / `project_map` printed the same results in
+a different order on every run — the same HashMap-ordering class as v0.85.1's
+call-graph fix, in two more surfaces. A whole-project `overview .` also listed the
+synthetic `<external>` import pseudo-symbols. All bug fixes; no schema/index change.
+
+### Fixed
+- **`overview` / `module_overview` output is deterministic.** `get_module_exports`
+  deduped through a HashMap and returned `into_values()`, discarding the SQL
+  `ORDER BY caller_count DESC` — so the same directory printed its symbols shuffled
+  every run. It now sorts by a total order (caller_count DESC, file, line, name), and
+  excludes the synthetic `<external>` pseudo-file (unresolved imports like `numpy` /
+  `std::io::Write`, which are not project symbols and, all sharing
+  caller_count=0/file/line, made `overview .` non-deterministic even under the tuple
+  sort).
+- **`map` / `project_map` output is deterministic.** Modules and dependencies were
+  sorted by a single key (function count / import count) with no tiebreaker, so
+  equal-count entries shuffled every run; the module list also came from a HashMap.
+  Sorting now carries unique tiebreakers (path; (from, to)), and every LIMIT-bounded
+  section (hot functions, key symbols, entry points) gained a unique `ORDER BY` tail
+  so truncation drops a deterministic subset.
+
 ## v0.85.1 — Deterministic `callgraph`, clearer degenerate-input errors
 
 `callgraph <symbol>` (the default `--direction both`, on both the CLI and the MCP tool)
