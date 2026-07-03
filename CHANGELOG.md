@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **`surprising` / `report` no longer surface the synthetic `<module>` scope node.** A
+  top-level call is attributed to a `<module>` pseudo-node, which is not an actionable
+  symbol — `project_map`, `dead_code`, and `module_exports` all exclude it, but
+  `surprising_connections` did not, so a `<module> → target` coupling could show up in the
+  `surprising` list and the `report` summary (both call it). It is now filtered there too,
+  matching the sibling queries. Query-only; no schema or index change.
+
 ## v0.85.6 — `overview` / `show` output: owner-qualified members, no doubled signature parens
 
 Three dogfooding output-quality fixes; no schema or index change.

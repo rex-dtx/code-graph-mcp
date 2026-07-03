@@ -166,7 +166,8 @@ pub fn surprising_connections(
          JOIN files tf ON tf.id = nt.file_id \
          WHERE e.relation IN (?1, ?2) \
            AND sf.id != tf.id \
-           AND sf.path != '<external>' AND tf.path != '<external>'{test_filter}"
+           AND sf.path != '<external>' AND tf.path != '<external>' \
+           AND ns.name != '<module>' AND nt.name != '<module>'{test_filter}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![REL_CALLS, REL_REFERENCES], |row| {
@@ -235,6 +236,24 @@ mod tests {
             "edge to a test symbol is excluded by default");
         assert_eq!(surprising_connections(conn, true, 10).unwrap().len(), 1,
             "included with include_tests");
+    }
+
+    #[test]
+    fn surprising_connections_excludes_module_scope_nodes() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/a.py','h1',0,'python',0)", []).unwrap();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('lib/b.py','h2',0,'python',0)", []).unwrap();
+        // A top-level call is attributed to the synthetic `<module>` scope node
+        // (feedback_top_level_call_scope). It is not an actionable symbol, and
+        // project_map / dead_code / module_exports all filter `<module>` — surprising
+        // must too, or `<module> → target` leaks into the coupling-review output.
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (1,'module','<module>',0,0,'',0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (2,'function','targetB',1,2,'',0)", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (1,2,'calls','inferred')", []).unwrap();
+
+        assert!(surprising_connections(conn, false, 10).unwrap().is_empty(),
+            "a coupling whose source is the synthetic <module> scope node must be excluded");
     }
 
     fn inp(src: &str, sf: &str, tgt: &str, tf: &str, conf: &str) -> SurpriseInput {
