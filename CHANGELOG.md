@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.85.6 — `overview` / `show` output: owner-qualified members, no doubled signature parens
+
+Three dogfooding output-quality fixes; no schema or index change.
 
 ### Fixed
 - **`overview` / `module_overview`: two exported classes in one file no longer hide
