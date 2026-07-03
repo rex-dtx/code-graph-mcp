@@ -488,12 +488,14 @@ fn format_node_compact(node: &queries::NodeResult, file_path: &str) -> String {
     out.push('-');
     out.push_str(&node.end_line.to_string());
 
-    // signature parts
+    // signature parts. param_types is stored ALREADY parenthesized ("(a, b)") by the
+    // parser — verified every non-empty param_types starts with '(' and ends with ')'
+    // — so append it verbatim. Wrapping it in another pair printed "((a, b))" (and
+    // "(())" for no-arg fns) in `show` / `search` / `ast_search` output.
     if let Some(ref params) = node.param_types {
         if !params.is_empty() {
-            out.push_str("  (");
+            out.push_str("  ");
             out.push_str(params);
-            out.push(')');
         }
     }
     if let Some(ref ret) = node.return_type {
@@ -6824,7 +6826,10 @@ mod tests {
             context_string: None,
             name_tokens: None,
             return_type: Some("Result<Value>".into()),
-            param_types: Some("name: &str, value: i64".into()),
+            // Mirror how the parser stores it: ALREADY parenthesized. The old fixture
+            // used a bare "name: &str, value: i64" (no parens), which never exercised
+            // the real shape and hid the "((...))" double-wrap bug.
+            param_types: Some("(name: &str, value: i64)".into()),
             is_test: false,
         };
         let formatted = format_node_compact(&node, "src/lib.rs");
@@ -6832,6 +6837,9 @@ mod tests {
         assert!(formatted.contains("src/lib.rs:10-20"));
         assert!(formatted.contains("(name: &str, value: i64)"));
         assert!(formatted.contains("-> Result<Value>"));
+        // Guard the fix: param_types already carries its parens, so the formatter must
+        // not add a second pair.
+        assert!(!formatted.contains("(("), "must not double-wrap params: {formatted}");
     }
 
     #[test]

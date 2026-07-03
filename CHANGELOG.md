@@ -24,6 +24,14 @@
   `hot_paths`, compact) also gains an additive `qualified_name` field, emitted only when
   it differs from `name`; the `name` field itself stays a bare identifier for existing
   consumers, and top-level functions/consts are unchanged.
+- **`show` / `search` / `ast_search` no longer double-wrap function signatures.** The
+  human output rendered `fn foo  loc  ((a, b)) -> R` — and `(())` for no-arg functions —
+  because `format_node_compact` wrapped `param_types` in parentheses even though the
+  parser already stores it parenthesized (structurally: it is the `parameters` node's
+  text, which includes its delimiters). It now appends the stored value verbatim, so the
+  signature reads `(a, b) -> R`. `--json` was already correct and is unchanged. The unit
+  test's fixture had used a paren-less `param_types` that never matched real parser output
+  and so hid the bug; it now mirrors the parser and guards against re-introducing it.
 
 ## v0.85.5 — `overview` surfaces TS/JS methods; case-insensitive `direction`/`relation`
 
