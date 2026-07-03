@@ -3664,6 +3664,23 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
         );
     }
 
+    // Bare invocation (no positional files AND no --stdin) has no input to work
+    // from — the run then prints "0 test file(s) to re-run", indistinguishable
+    // from a genuine "nothing is affected" result and easy to misread as "no
+    // tests needed" when the real cause is a forgotten argument. `affected` takes
+    // an explicit file list by design (it does NOT auto-diff git), so point the
+    // user at the intended pipe. Stderr only: stdout keeps its same-shape (empty)
+    // output/JSON envelope. Gated on `!args.stdin` so a real empty pipe (clean
+    // `git diff`) stays silent — that path used --stdin correctly, just found no
+    // changes.
+    if args.files.is_empty() && !args.stdin {
+        eprintln!(
+            "[code-graph] No files given — nothing to analyze. Pass changed files as \
+             arguments, or pipe them from git:\n  \
+             git diff --name-only HEAD | code-graph-mcp affected --stdin"
+        );
+    }
+
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 

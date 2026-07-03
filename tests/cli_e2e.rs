@@ -199,6 +199,47 @@ fn test_cli_affected_not_indexed_json_envelope() {
 }
 
 #[test]
+fn test_cli_affected_bare_invocation_hints() {
+    // Misleading-feedback guard: a bare `affected` (no positional files, no
+    // --stdin) has no input, so it prints "0 test file(s) to re-run" — which a
+    // user who simply forgot the argument could read as "no tests needed". The
+    // command does not auto-diff git, so it must point at the intended pipe.
+    // stdout stays unchanged; the guidance goes to stderr.
+    let project = setup_affected_project();
+    let (stdout, stderr, code) = run_cli(&project, &["affected"]);
+    assert_eq!(code, 0, "bare affected should exit 0; stdout: {stdout}");
+    assert!(
+        stderr.contains("No files given") && stderr.contains("--stdin"),
+        "bare affected must hint at how to supply input; stderr: {stderr}"
+    );
+    // stdout still reports the empty result (shape unchanged).
+    assert!(stdout.contains("0 test file(s) to re-run"), "stdout: {stdout}");
+}
+
+#[test]
+fn test_cli_affected_empty_stdin_pipe_stays_silent() {
+    // Gating check: an explicit --stdin pipe that happens to be empty (a clean
+    // `git diff`) used the command correctly and found no changes — it must NOT
+    // get the "No files given" hint (that would be wrong/annoying for a working
+    // pipe). Only the bare no-input invocation is hinted.
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+    let project = setup_affected_project();
+    let mut child = Command::new(binary_path())
+        .current_dir(project.path())
+        .args(["affected", "--stdin"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"").unwrap(); // empty pipe
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("No files given"),
+        "empty --stdin pipe must stay silent (it was used correctly); stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_cli_affected_stdin_matches_positional() {
     let project = setup_affected_project();
     // Pipe the path via stdin instead of positional.
