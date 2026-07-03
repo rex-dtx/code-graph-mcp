@@ -9,6 +9,13 @@
   `surprising_connections` did not, so a `<module> → target` coupling could show up in the
   `surprising` list and the `report` summary (both call it). It is now filtered there too,
   matching the sibling queries. Query-only; no schema or index change.
+- **`show --impact` now discloses filtered test callers.** `show --impact` reported
+  prod-only `direct_callers` / `transitive_callers` but not how many test callers were
+  excluded from the risk count, while MCP `get_ast_node`, `callgraph`, and `project_map`
+  all disclose their test-caller counts. It now emits `test_callers_filtered` in the
+  `--json` impact object (exact parity with `get_ast_node`) and a `(N test callers
+  excluded from the risk count)` line in the text output. Data was already correct — this
+  closes a CLI/MCP disclosure gap.
 
 ## v0.85.6 — `overview` / `show` output: owner-qualified members, no doubled signature parens
 

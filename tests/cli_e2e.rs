@@ -2169,6 +2169,41 @@ fn test_cli_show_json() {
     assert!(arr[0]["code_content"].is_string(), "should include code_content field");
 }
 
+// Regression: `show --impact --json` must disclose how many test callers were
+// excluded from the prod risk count (`test_callers_filtered`), matching MCP
+// get_ast_node's impact object. Without it a CLI consumer sees direct_callers but
+// not that N test callers also exercise the symbol.
+#[test]
+fn test_cli_show_impact_discloses_filtered_test_callers() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("math.ts"), r#"
+export function addNumbers(a: number, b: number): number {
+    return a + b;
+}
+"#).unwrap();
+    // `.test.ts` → is_test; its call to addNumbers is a test caller (excluded from
+    // the prod risk count, but counted in test_callers_filtered).
+    std::fs::write(src.join("math.test.ts"), r#"
+import { addNumbers } from './math';
+test('adds', () => {
+    addNumbers(1, 2);
+});
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&project, &["show", "addNumbers", "--impact", "--json"]);
+    assert_eq!(code, 0, "show --impact --json should succeed; stderr={stderr:?}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let impact = &parsed[0]["impact"];
+    assert!(impact["test_callers_filtered"].as_u64().unwrap_or(0) >= 1,
+        "show --impact --json must disclose filtered test callers (parity with MCP get_ast_node): got {impact}");
+}
+
 // clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection. The
 // optional positional is gated on --node-id in the handler (exit-1 Usage when both
 // absent), and the three --refs spellings stay accepted via hidden clap aliases.

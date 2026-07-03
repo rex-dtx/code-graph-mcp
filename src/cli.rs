@@ -4440,6 +4440,12 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                     "affected_files": cls.affected_files,
                     "affected_routes": cls.route_callers.len(),
                 });
+                // Disclose how many test callers were excluded from the prod risk count
+                // (parity with MCP get_ast_node's impact.test_callers_filtered, and with
+                // callgraph's test_callers_hidden / project_map's test_caller_count).
+                if cls.test_count > 0 {
+                    obj["impact"]["test_callers_filtered"] = serde_json::json!(cls.test_count);
+                }
             }
             obj
         }).collect();
@@ -4499,6 +4505,9 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             writeln!(stdout, "  Impact: {} — {} direct, {} transitive, {} files, {} routes",
                 cls.risk_level, cls.prod_callers.iter().filter(|c| c.depth == 1).count(),
                 cls.prod_callers.iter().filter(|c| c.depth > 1).count(), cls.affected_files, cls.route_callers.len())?;
+            if cls.test_count > 0 {
+                writeln!(stdout, "  ({} test callers excluded from the risk count)", cls.test_count)?;
+            }
         }
     }
 
