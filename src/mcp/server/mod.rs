@@ -2490,6 +2490,48 @@ function handleLogin(req: Request) {
     }
 
     #[test]
+    fn test_semantic_search_unknown_language_rejected() {
+        // Parity with CLI `search` and the node_type guard: an unknown language
+        // must return an error the caller can act on, not silently empty results.
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("app.ts"), "function handler() { return 1; }").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+
+        let req = tool_call_json("semantic_code_search", json!({
+            "query": "handler",
+            "language": "pyton"
+        }));
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(parsed["result"]["isError"].as_bool().unwrap_or(false),
+            "unknown language must be an error result; got: {text}");
+        assert!(text.contains("Unknown language filter") && text.contains("pyton"),
+            "error text must name the bad language and valid set; got: {text}");
+    }
+
+    #[test]
+    fn test_semantic_search_language_case_insensitive() {
+        // Guards the load-bearing canonicalization: the MCP downstream language
+        // filter is case-SENSITIVE (`nwf.language != Some(lang)`), so a mixed-case
+        // language works ONLY because canonical_language normalizes the input.
+        // Without it (validate then pass raw), "TypeScript" would silently return
+        // no results while "typescript" works — all other tests still green.
+        let project_dir = TempDir::new().unwrap();
+        std::fs::write(project_dir.path().join("app.ts"), "function handler() { return 1; }").unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+        let ask = |lang: &str| {
+            let req = tool_call_json("semantic_code_search", json!({ "query": "handler", "language": lang }));
+            let resp = server.handle_message(&req).unwrap();
+            search_results(&parse_tool_result(&resp)).len()
+        };
+        let lower = ask("typescript");
+        assert!(lower > 0, "sanity: lowercase 'typescript' must return the .ts match");
+        assert_eq!(ask("TypeScript"), lower, "mixed-case must match lowercase (canonicalized)");
+        assert_eq!(ask("TYPESCRIPT"), lower, "upper-case must match lowercase (canonicalized)");
+    }
+
+    #[test]
     fn test_semantic_search_node_type_filter() {
         let project_dir = TempDir::new().unwrap();
         std::fs::write(project_dir.path().join("mix.ts"), r#"

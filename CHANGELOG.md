@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.85.3 — Deterministic `grep`; `--language` validation; CLI consistency
+
+`grep` printed the same matches in a different file order on every run — the same
+determinism class as v0.85.1/.2, but a different root cause (ripgrep's parallel walk,
+not a HashMap). Alongside it, a batch of CLI/MCP correctness fixes surfaced by
+dogfooding. All bug fixes; no schema or index change.
+
+### Fixed
+- **`grep` output is deterministic and globally path-sorted.** ripgrep parallelizes
+  the file walk and emits results in worker-completion order, so the same `grep`
+  (`-l` / `-c` / default / `--json`) shuffled file order on every run — observed as a
+  distinct output on nearly every run — defeating diffs, caching, and trust. The
+  collected result set is now sorted by path (and line) in every mode. Sorting in
+  post-processing rather than via `rg --sort path` keeps ripgrep parallel (faster),
+  folds the supplement (git-tracked-but-unwalked files) and multi-path input into a
+  true global order, and imposes no minimum ripgrep version.
+- **`search --language` / `semantic_code_search` reject an unknown language.** An
+  unknown or mistyped language (`--language pyton`) was silently swallowed and
+  reported as a too-narrow filter ("Broaden or clear the filter"), implying the value
+  was valid. It now fails at entry — `Unknown language filter: 'X'. Valid: …` —
+  mirroring the existing `--node-type` guard, on both the CLI and the MCP tool.
+  Normalizing to the canonical language also fixes the MCP tool's case-sensitive
+  match, so `language="Rust"` now works.
+- **`similar --limit` is accepted** as an alias of `--top-k`, so the `--limit`
+  learned from `search` / `ast-search` / `centrality` no longer hits a cryptic
+  "unexpected argument" on `similar`.
+- **`trace` prints a clean not-found message.** A no-match route reported the
+  double-prefixed `Error: [code-graph] No routes matching`; it now uses the same
+  clean `[code-graph] …` + exit 1 as `refs` / `impact` / `show`.
+
 ## v0.85.2 — Deterministic `overview` and `map`
 
 `overview` / `module_overview` and `map` / `project_map` printed the same results in

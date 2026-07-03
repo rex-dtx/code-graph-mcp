@@ -545,6 +545,38 @@ fn test_cli_search_filter_removed_all_explains_why() {
 }
 
 #[test]
+fn test_cli_search_unknown_language_rejected() {
+    // Regression: an unknown/mistyped --language must fail loudly at entry (parity
+    // with --node-type), naming the bad value and the valid set — NOT be silently
+    // swallowed and reported as a too-narrow "removed by the active filter" (which
+    // wrongly implies the language is valid but the query too specific).
+    let project = setup_indexed_project();
+    let (_stdout, stderr, code) =
+        run_cli(&project, &["search", "validateToken", "--language", "pyton"]);
+    assert_ne!(code, 0, "unknown language must exit nonzero; stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Unknown language filter") && stderr.contains("pyton"),
+        "stderr must name the bad language and list the valid set; got: {stderr:?}"
+    );
+}
+
+#[test]
+fn test_cli_search_language_case_insensitive() {
+    // A known language in mixed case must be accepted (not rejected by the new
+    // entry validation) and still match. NOTE: the CLI's downstream filter was
+    // already `eq_ignore_ascii_case`, so this does not by itself guard the
+    // validation change — it guards that `canonical_language` stays
+    // case-insensitive. The load-bearing case-normalization is on the MCP side
+    // (mcp::server::tests::test_semantic_search_language_case_insensitive), whose
+    // downstream filter is case-sensitive.
+    let project = setup_indexed_project();
+    let (stdout, _stderr, code) =
+        run_cli(&project, &["search", "validate", "--language", "TypeScript"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("validateToken"));
+}
+
+#[test]
 fn test_cli_search_compact() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["search", "validate", "--compact"]);
@@ -989,6 +1021,51 @@ fn test_cli_grep_files_with_matches() {
     // no match → exit 1, like grep.
     let (_, _, code2) = run_cli(&project, &["grep", "-l", "zzz_nothing"]);
     assert_eq!(code2, 1);
+}
+
+#[test]
+fn test_cli_grep_deterministic_sorted_order() {
+    // Regression: ripgrep parallelizes the file walk and emitted results in
+    // worker-completion order, so multi-file grep shuffled every run (observed up
+    // to 8/8 distinct). `--sort path` must force a stable ascending-path order.
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // Files whose creation order deliberately differs from sorted order, all
+    // sharing one unique token so only these files match.
+    let names = [
+        "zebra.txt", "mango.txt", "apple.txt", "kiwi.txt",
+        "cherry.txt", "lime.txt", "banana.txt", "orange.txt",
+    ];
+    for n in names {
+        std::fs::write(project.path().join(n), "GREPSORTMARKER\n").unwrap();
+    }
+    let (stdout, _, code) = run_cli(&project, &["grep", "-l", "GREPSORTMARKER"]);
+    assert_eq!(code, 0);
+    let got: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    let mut want = got.clone();
+    want.sort_unstable();
+    assert_eq!(got, want, "grep -l output must be ascending-path sorted; got: {got:?}");
+    // Multi-path input passed in NON-sorted arg order must still come back globally
+    // sorted. (rg's `--sort path` only orders within each root and preserves arg-group
+    // order, so this case guards that we post-sort the merged result set instead.)
+    let (mp_out, _, mp_code) = run_cli(
+        &project,
+        &["grep", "-l", "GREPSORTMARKER", "zebra.txt", "apple.txt", "mango.txt"],
+    );
+    assert_eq!(mp_code, 0);
+    let mp: Vec<&str> = mp_out.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        mp,
+        vec!["apple.txt", "mango.txt", "zebra.txt"],
+        "multi-path grep -l must be globally sorted, not arg order; got: {mp:?}"
+    );
+    // Byte-identical across repeated runs (the determinism guarantee).
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..6 {
+        let (s, _, _) = run_cli(&project, &["grep", "-l", "GREPSORTMARKER"]);
+        seen.insert(s);
+    }
+    assert_eq!(seen.len(), 1, "grep -l must be byte-identical across runs; got {} distinct", seen.len());
 }
 
 #[test]
@@ -3154,6 +3231,39 @@ fn test_cli_json_empty_trace() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .expect("trace --json must output valid JSON even on no-match");
     assert!(v.is_object(), "JSON trace error should output JSON object");
+}
+
+#[test]
+fn test_cli_trace_no_route_clean_error() {
+    // Regression: a no-match route must report the clean `[code-graph] …` stderr +
+    // exit 1 used by refs/impact/show — NOT anyhow's double-prefixed
+    // `Error: [code-graph] No routes matching`.
+    let project = setup_indexed_project();
+    let (_stdout, stderr, code) = run_cli(&project, &["trace", "/api/definitely-nope"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("[code-graph] No routes matching"),
+        "stderr must carry the house-style prefix; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Error: [code-graph]"),
+        "must not double-prefix with anyhow's `Error:`; got: {stderr:?}"
+    );
+}
+
+#[test]
+fn test_cli_similar_accepts_limit_alias() {
+    // Regression: `similar --limit N` must be accepted as an alias of `--top-k`,
+    // not rejected by clap with a cryptic "unexpected argument '--limit'" (exit 2).
+    // Parses to results (embed build) or the no-vector notice (no-embed build) —
+    // both exit 0 — so the guard is: NOT a clap parse error.
+    let project = setup_indexed_project();
+    let (_stdout, stderr, code) = run_cli(&project, &["similar", "validateToken", "--limit", "3"]);
+    assert_ne!(code, 2, "clap must accept --limit as an alias; stderr: {stderr:?}");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--limit must not be an unexpected argument; stderr: {stderr:?}"
+    );
 }
 
 #[test]

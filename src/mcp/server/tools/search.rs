@@ -16,7 +16,6 @@ impl McpServer {
         let top_k = args["top_k"].as_u64()
             .or_else(|| args["limit"].as_u64())
             .unwrap_or(20).clamp(1, 100) as i64;
-        let language_filter = args["language"].as_str();
         let node_type_filter = args["node_type"].as_str();
         let compact = args["compact"].as_bool().unwrap_or(false);
 
@@ -30,6 +29,21 @@ impl McpServer {
                 ));
             }
         }
+
+        // Validate `language` up-front and normalize to canonical case: an unknown
+        // language matches no stored `language` field and would silently return an
+        // empty result. Canonicalizing also accepts mixed-case input, since the
+        // downstream filter is an exact match. Parity with node_type above and CLI.
+        let language_filter = match args["language"].as_str() {
+            Some(lf) => Some(crate::utils::config::canonical_language(lf).ok_or_else(|| {
+                anyhow!(
+                    "Unknown language filter: '{}'. Valid: {}",
+                    lf,
+                    crate::utils::config::SUPPORTED_LANGUAGES.join(", ")
+                )
+            })?),
+            None => None,
+        };
 
         // Query quality factor: penalize vague/short queries so relevance scores
         // reflect actual match quality, not just relative rank position.

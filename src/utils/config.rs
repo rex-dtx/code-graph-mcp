@@ -12,6 +12,20 @@ pub const SUPPORTED_LANGUAGES: &[&str] = &[
     "dart", "markdown", "bash", "json",
 ];
 
+/// Resolve a user-supplied `--language` / `language` filter to its canonical
+/// form — the exact string `detect_language` stores — matching case-insensitively.
+/// Returns `None` for anything not in `SUPPORTED_LANGUAGES`, so callers can reject
+/// an unknown/mistyped language at entry (parity with `domain::normalize_type_filter`
+/// for `--node-type`) instead of silently filtering every result away and reporting
+/// it as a too-narrow filter. Normalizing to canonical case also lets downstream
+/// exact-match comparisons accept mixed-case input (e.g. `"Rust"`).
+pub fn canonical_language(input: &str) -> Option<&'static str> {
+    SUPPORTED_LANGUAGES
+        .iter()
+        .copied()
+        .find(|l| l.eq_ignore_ascii_case(input))
+}
+
 pub fn detect_language(path: &str) -> Option<&'static str> {
     let p = std::path::Path::new(path);
     // file_stem() returns None for paths without a filename component;
@@ -114,6 +128,27 @@ mod tests {
         assert_eq!(detect_language(".gitignore"), None);
         assert_eq!(detect_language("file.test.ts"), Some("typescript"));
         assert_eq!(detect_language("path/to/no_ext"), None);
+    }
+
+    #[test]
+    fn test_canonical_language_normalizes_and_rejects() {
+        // Known languages resolve to canonical form, case-insensitively.
+        assert_eq!(canonical_language("rust"), Some("rust"));
+        assert_eq!(canonical_language("Rust"), Some("rust"));
+        assert_eq!(canonical_language("TYPESCRIPT"), Some("typescript"));
+        assert_eq!(canonical_language("cpp"), Some("cpp"));
+        // Unknown / mistyped languages are rejected so callers bail at entry
+        // instead of silently filtering every result away.
+        assert_eq!(canonical_language("pyton"), None);
+        assert_eq!(canonical_language("c++"), None);
+        assert_eq!(canonical_language(""), None);
+        // Every SUPPORTED_LANGUAGES entry round-trips through the validator, so a
+        // canonical name is never rejected. (The SUPPORTED_LANGUAGES ⇄ detect_language
+        // drift guard is `parser::lang_config::every_supported_language_has_consistent_config`,
+        // not this loop — this only checks the const → validator direction.)
+        for lang in SUPPORTED_LANGUAGES {
+            assert_eq!(canonical_language(lang), Some(*lang));
+        }
     }
 
     #[test]

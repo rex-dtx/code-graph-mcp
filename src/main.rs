@@ -351,7 +351,7 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
     println!("    --compact           Compact output (search, callgraph, map, overview, deps, refs)");
-    println!("    --limit N           Limit results (search, ast-search default: 20; centrality default: 15)");
+    println!("    --limit N           Limit results (search/ast-search default: 20; centrality default: 15; similar default: 5, alias of --top-k)");
     println!("    --language <lang>   Filter by language (search)");
     println!("    --node-type <type>  Filter by node type (search)");
     println!("    --type <type>       Filter by node type: fn, class, struct, enum, trait, ...");

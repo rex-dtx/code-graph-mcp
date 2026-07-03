@@ -2163,6 +2163,15 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     }
 
     let mut rg_cmd = Command::new("rg");
+    // Determinism note: ripgrep parallelizes the walk and emits files in
+    // worker-completion order, so the same grep shuffled every run (observed up to
+    // 8/8 distinct) — the determinism class fixed for the graph commands in v0.85.x.
+    // We do NOT use `rg --sort path`: it only orders WITHIN each traversal root and
+    // preserves the given order of top-level path args, so the supplement (explicit
+    // trailing file args, below) and multi-path input would stay unsorted; it also
+    // disables rg's parallelism and requires rg >= 11. Instead each mode below sorts
+    // the collected result set by path — a true global ascending order that keeps rg
+    // parallel and imposes no rg version floor.
     if files_with_matches {
         // -l: plain one-path-per-line output (rg stops at the first match per
         // file); context flags are meaningless here, like grep, and ignored.
@@ -2307,11 +2316,12 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // -l mode: rg already printed one path per line; relativize and pass through.
     if files_with_matches {
         let root_str = project_root.to_string_lossy().into_owned();
-        let files: Vec<String> = String::from_utf8_lossy(&rg_output.stdout)
+        let mut files: Vec<String> = String::from_utf8_lossy(&rg_output.stdout)
             .lines()
             .filter(|l| !l.is_empty())
             .map(|l| relativize_path(l, &root_str).to_string())
             .collect();
+        files.sort(); // global ascending-path order (walk + supplement + multi-path)
         if files.is_empty() {
             if json_mode {
                 println!("[]");
@@ -2343,7 +2353,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // pass through. No AST annotation (like -l); the count is exhaustive.
     if count_mode {
         let root_str = project_root.to_string_lossy().into_owned();
-        let counts: Vec<(String, u64)> = String::from_utf8_lossy(&rg_output.stdout)
+        let mut counts: Vec<(String, u64)> = String::from_utf8_lossy(&rg_output.stdout)
             .lines()
             .filter(|l| !l.is_empty())
             .filter_map(|l| {
@@ -2351,6 +2361,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                 Some((relativize_path(path, &root_str).to_string(), n.trim().parse().ok()?))
             })
             .collect();
+        counts.sort_by(|a, b| a.0.cmp(&b.0)); // global ascending-path order
         if counts.is_empty() {
             if json_mode {
                 println!("[]");
@@ -2382,7 +2393,12 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     }
 
     // Parse rg JSON output into matches
-    let matches = parse_rg_json(&rg_output.stdout, project_root);
+    let mut matches = parse_rg_json(&rg_output.stdout, project_root);
+    // Global ascending order by (path, line). rg already emits a file's lines in
+    // order (sequential scan), so this only reorders ACROSS files (supplement /
+    // multi-path); context lines carry their own line number and stay adjacent to
+    // their match. Stable sort keeps any same-(file,line) records in input order.
+    matches.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
     if matches.is_empty() {
         if json_mode {
             println!("[]");
@@ -2739,7 +2755,6 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
 
     let json_mode = args.json;
     let compact = args.compact;
-    let language_filter = args.language.as_deref();
     let node_type_filter = args.node_type.as_deref();
     let limit: i64 = args.limit.unwrap_or(20).clamp(1, 100);
 
@@ -2753,6 +2768,21 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
             );
         }
     }
+
+    // Validate --language up-front and normalize to canonical case: an unknown
+    // language matches no node's stored `language` field and would otherwise be
+    // reported as a too-narrow filter ("Broaden or clear") rather than a bad value.
+    // Parity with --node-type above and MCP semantic_code_search.
+    let language_filter = match args.language.as_deref() {
+        Some(lf) => Some(crate::utils::config::canonical_language(lf).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown language filter: '{}'. Valid: {}",
+                lf,
+                crate::utils::config::SUPPORTED_LANGUAGES.join(", ")
+            )
+        })?),
+        None => None,
+    };
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -4588,7 +4618,11 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         if json_mode {
             println!("{}", serde_json::json!({"handlers": [], "message": format!("No routes matching: {}", route_path)}));
         }
-        anyhow::bail!("[code-graph] No routes matching: {}", route_path);
+        // Match the refs/impact/show not-found pattern (clean `[code-graph] …` on
+        // stderr + exit 1) instead of `anyhow::bail!`, which main renders as the
+        // double-prefixed `Error: [code-graph] No routes matching`.
+        eprintln!("[code-graph] No routes matching: {}", route_path);
+        std::process::exit(1);
     }
 
     let mut stdout = std::io::stdout().lock();
@@ -4950,8 +4984,12 @@ pub struct SimilarArgs {
     #[arg(long = "node-id")]
     pub node_id: Option<i64>,
     // clamp(1,100) stays in the handler; clap parse-errors (exit 2) on non-numeric.
-    /// Number of results (default: 5, max: 100)
-    #[arg(long = "top-k")]
+    // `--limit` is a hidden alias so users who learned `--limit` from search /
+    // ast-search / centrality don't hit a cryptic "unexpected argument" (mirrors
+    // SearchArgs, where `--top-k` aliases `--limit`, and MCP semantic_code_search,
+    // which accepts both `top_k` and `limit`).
+    /// Number of results (default: 5, max: 100); alias: --limit
+    #[arg(long = "top-k", alias = "limit")]
     pub top_k: Option<i64>,
     /// Max cosine distance (default: 0.8)
     #[arg(long = "max-distance")]
