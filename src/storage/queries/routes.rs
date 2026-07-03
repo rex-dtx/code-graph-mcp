@@ -188,6 +188,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
            AND n.type != 'module'
            AND n.name != '<module>'
            AND n.is_test = 0
+           AND f.path != '<external>'
            AND (
                EXISTS (
                    SELECT 1 FROM edges ex
@@ -230,7 +231,25 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
             })
             .or_insert(export);
     }
-    Ok(best.into_values().collect())
+    // `HashMap::into_values()` iterates in a per-run-random order, which discarded
+    // the SQL `ORDER BY caller_count DESC` and made `overview` / `module_overview`
+    // print the same symbols in a different order on every run (same bug class as
+    // the call-graph merge). Re-establish a deterministic TOTAL order: caller_count
+    // DESC (the relevance the SQL intended), then (file_path, start_line, name).
+    // `name` is the final key BECAUSE (file_path, start_line) alone is NOT unique —
+    // e.g. cfg-gated or macro-generated symbols can share a start_line in one file;
+    // without `name` those ties keep the random HashMap order. (The dedup key above
+    // is (name, file_path), so name closes the order.) file/line/name are all
+    // source-derived, so the order is stable across index rebuilds (unlike node_id).
+    let mut result: Vec<ModuleExport> = best.into_values().collect();
+    result.sort_by(|a, b| {
+        b.caller_count
+            .cmp(&a.caller_count)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -270,6 +289,76 @@ mod tests {
         let exports = get_module_exports(conn, "src/auth/").unwrap();
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "validateUser");
+    }
+
+    /// Regression: `get_module_exports` must return a deterministic, relevance-
+    /// ordered list. It dedups through a HashMap and previously returned
+    /// `best.into_values().collect()`, whose per-run-random iteration order
+    /// discarded the SQL `ORDER BY caller_count DESC` — so `overview` /
+    /// `module_overview` printed the same symbols shuffled on every call. Order is
+    /// now caller_count DESC, then (file_path, start_line). Here beta and gamma tie
+    /// on caller_count (2) and must be broken by start_line (beta L20 < gamma L30).
+    #[test]
+    fn test_get_module_exports_deterministic_order() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        // Target file has NO export edges → every top-level symbol is contributed.
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/target.py', 'h1', 0, 'python', 0)", []).unwrap();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/callers.py', 'h2', 0, 'python', 0)", []).unwrap();
+        for (name, line) in [("alpha", 10), ("beta", 20), ("gamma", 30), ("delta", 40), ("epsilon", 50)] {
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', ?1, ?1, ?2, ?2, '')",
+                rusqlite::params![name, line],
+            ).unwrap();
+        }
+        // Prod caller nodes in a second file (node ids 6..=13).
+        for i in 0..8 {
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', ?1, ?1, ?2, ?2, '')",
+                rusqlite::params![format!("c{i}"), 100 + i],
+            ).unwrap();
+        }
+        // caller_count: alpha=3, beta=2, gamma=2, delta=1, epsilon=0 (targets 1..=5).
+        for (src, tgt) in [(6, 1), (7, 1), (8, 1), (9, 2), (10, 2), (11, 3), (12, 3), (13, 4)] {
+            conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'calls')", rusqlite::params![src, tgt]).unwrap();
+        }
+
+        let run1: Vec<String> = get_module_exports(conn, "src/target").unwrap().iter().map(|e| e.name.clone()).collect();
+        let run2: Vec<String> = get_module_exports(conn, "src/target").unwrap().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(run1, run2, "two calls must return an identical order (was HashMap-shuffled)");
+        assert_eq!(run1, vec!["alpha", "beta", "gamma", "delta", "epsilon"],
+            "order must be caller_count DESC then (file, start_line): beta(2,L20) before gamma(2,L30)");
+    }
+
+    /// Regression (adversarial-review finding): the synthetic `<external>`
+    /// pseudo-file holds unresolved import targets (`numpy`, `std::io::Write`, …),
+    /// NOT project symbols. They all share caller_count=0 / file='<external>' /
+    /// start_line=0, so under the sort's `(caller_count, file_path, start_line)`
+    /// prefix they all tied and `overview .` (empty prefix → `LIKE '%'` matches
+    /// `<external>`) shuffled them every run. `get_project_map` already excludes
+    /// `<external>`; `get_module_exports` now does too — so they neither appear nor
+    /// destabilize the whole-project view.
+    #[test]
+    fn test_get_module_exports_excludes_external_pseudo_file() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/app.py', 'h1', 0, 'python', 0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'run', 'run', 5, 9, '')", []).unwrap();
+        // Synthetic <external> pseudo-file: several unresolved imports, all at
+        // caller_count 0 / start_line 0 — the cluster that used to shuffle.
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('<external>', 'h2', 0, 'python', 0)", []).unwrap();
+        for name in ["numpy", "collections", "os", "sys"] {
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'external_module', ?1, ?1, 0, 0, '')",
+                rusqlite::params![name],
+            ).unwrap();
+        }
+        // Whole-project view (empty prefix → LIKE '%' matches every file).
+        let exports = get_module_exports(conn, "").unwrap();
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"run"), "real project symbol must be present; got {names:?}");
+        assert!(exports.iter().all(|e| e.file_path != "<external>"),
+            "<external> pseudo-symbols must be excluded from overview; got {names:?}");
     }
 
     #[test]

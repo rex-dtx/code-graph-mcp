@@ -116,7 +116,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
                AND f.path NOT LIKE 'benches/%' \
                AND f.path NOT LIKE '%_test.%' \
              GROUP BY n.id \
-             ORDER BY cnt DESC \
+             ORDER BY cnt DESC, n.name, f.path \
              LIMIT 200";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_CALLS], |row| {
@@ -138,7 +138,8 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              JOIN nodes n ON n.id = e.target_id \
              JOIN files f ON f.id = n.file_id \
              WHERE e.relation = ?1 AND n.name != '<module>' \
-               AND f.path != '<external>'";
+               AND f.path != '<external>' \
+             ORDER BY n.name, f.path";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_EXPORTS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -165,7 +166,10 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
             key_symbols: dir_symbols.remove(dir).unwrap_or_default(),
         }
     }).collect();
-    modules.sort_by_key(|m| std::cmp::Reverse(m.functions));
+    // `dir_files.keys()` iterates a HashMap (random per run) and `functions` ties
+    // heavily (many modules share a count), so sorting by function count alone left
+    // equal-count modules shuffled every run. Add `path` as a unique tiebreaker.
+    modules.sort_by(|a, b| b.functions.cmp(&a.functions).then_with(|| a.path.cmp(&b.path)));
 
     // 3. Cross-module dependencies (C3: use REL_IMPORTS constant)
     let mut dep_map: HashMap<(String, String), usize> = HashMap::new();
@@ -199,7 +203,14 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     let mut deps: Vec<ModuleDep> = dep_map.into_iter()
         .map(|((from, to), count)| ModuleDep { from, to, import_count: count })
         .collect();
-    deps.sort_by_key(|d| std::cmp::Reverse(d.import_count));
+    // `dep_map.into_iter()` is HashMap-random and `import_count` ties, so sorting by
+    // count alone shuffled equal-count edges every run. Add (from, to) — a unique
+    // tiebreaker — so the Dependencies section is stable.
+    deps.sort_by(|a, b| {
+        b.import_count.cmp(&a.import_count)
+            .then_with(|| a.from.cmp(&b.from))
+            .then_with(|| a.to.cmp(&b.to))
+    });
 
     // 4. HTTP entry points (C3: use REL_ROUTES_TO constant)
     let mut entry_points = Vec::new();
@@ -209,6 +220,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              JOIN nodes sn ON sn.id = e.source_id \
              JOIN files sf ON sf.id = sn.file_id \
              WHERE e.relation = ?1 \
+             ORDER BY sf.path, sn.name, e.metadata \
              LIMIT 20";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_ROUTES_TO], |row| {
@@ -237,6 +249,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              JOIN files f ON f.id = n.file_id \
              WHERE n.name = 'main' AND n.type = 'function' \
                AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = n.id AND e.relation = ?1) \
+             ORDER BY f.path \
              LIMIT 5";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_CALLS], |row| {
@@ -275,7 +288,7 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
                AND f.path NOT LIKE '%_test.%' \
              GROUP BY n.name, n.type, f.path \
              HAVING prod_cnt > 0 \
-             ORDER BY prod_cnt DESC \
+             ORDER BY prod_cnt DESC, n.name, n.type, f.path \
              LIMIT 15"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -325,5 +338,47 @@ mod tests {
         // The external import must not surface as an internal dependency.
         assert!(deps.iter().all(|d| d.to != "<root>" && d.from != "<root>"),
             "external import must not surface as a <root> dependency");
+    }
+
+    /// Regression: `get_project_map` module + dependency ordering must be
+    /// deterministic. `modules` was built from `dir_files.keys()` (HashMap) and
+    /// sorted by function count alone; `deps` from `dep_map.into_iter()` +
+    /// import_count alone — so equal-count modules/deps shuffled every run (`map`
+    /// printed its module list in a different order each time). Unique tiebreakers
+    /// (path; (from, to)) now make both stable.
+    #[test]
+    fn test_project_map_deterministic_order() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        // Five single-function modules → all tie on function count (1); ordering
+        // must fall to the path tiebreaker.
+        for (fid, dir) in [(1, "src/mod_a"), (2, "src/mod_b"), (3, "src/mod_c"), (4, "src/mod_d"), (5, "src/mod_e")] {
+            conn.execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES (?1, ?2, 0, 'python', 0)",
+                rusqlite::params![format!("{dir}/x.py"), format!("h{fid}")],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (?1, 'function', ?2, ?2, 1, 3, '')",
+                rusqlite::params![fid, format!("f{fid}")],
+            ).unwrap();
+        }
+        // mod_a and mod_b both import mod_e → two deps tying on import_count (1).
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (1, 5, 'imports')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (2, 5, 'imports')", []).unwrap();
+
+        let (m1, d1, _, _) = get_project_map(conn).unwrap();
+        let (m2, d2, _, _) = get_project_map(conn).unwrap();
+
+        let mpaths = |ms: &[ModuleStats]| ms.iter().map(|m| m.path.clone()).collect::<Vec<String>>();
+        assert_eq!(mpaths(&m1), mpaths(&m2), "module order must be deterministic across calls");
+        assert_eq!(mpaths(&m1), vec!["src/mod_a", "src/mod_b", "src/mod_c", "src/mod_d", "src/mod_e"],
+            "equal-function-count modules must be tie-broken by path ASC");
+
+        let dpairs = |ds: &[ModuleDep]| ds.iter().map(|d| (d.from.clone(), d.to.clone())).collect::<Vec<(String, String)>>();
+        assert_eq!(dpairs(&d1), dpairs(&d2), "dep order must be deterministic across calls");
+        assert_eq!(dpairs(&d1), vec![
+            ("src/mod_a".to_string(), "src/mod_e".to_string()),
+            ("src/mod_b".to_string(), "src/mod_e".to_string()),
+        ], "equal-import-count deps must be tie-broken by (from, to)");
     }
 }
