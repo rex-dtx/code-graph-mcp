@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.85.4 — `doctor` exit code reflects what it couldn't fix
+
+`code-graph-mcp doctor` exited 1 even after repairing every issue it found, so a
+successful auto-repair looked like a failure to `doctor && …` chains and self-heal
+automation. A bug fix; no schema or index change.
+
+### Fixed
+- **`doctor` exits 0 after a fully-successful repair.** The exit code keyed off
+  issues *found* (`issueCount > 0`) instead of issues left *unresolved*, so a run
+  that fixed everything ("N/N addressed") still exited 1 — breaking `doctor && …`
+  and any self-heal automation that reads a nonzero exit as failure. It now exits 0
+  when every found issue was resolved, and 1 only when something could not be fixed.
+  `--check-only` is unchanged (still exits nonzero if any issue exists). The same
+  exit logic lived in two entry points (the `doctor.js` CLI and the `lifecycle.js
+  doctor` dispatch); both were fixed. The `hooks-invalid` repair now re-scans after
+  `install()` and reports success only if the paths are actually clean, so a repair
+  that cannot restore missing plugin scripts stays exit 1 instead of falsely
+  reporting healthy.
+
 ## v0.85.3 — Deterministic `grep`; `--language` validation; CLI consistency
 
 `grep` printed the same matches in a different file order on every run — the same

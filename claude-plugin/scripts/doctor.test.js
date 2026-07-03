@@ -165,3 +165,51 @@ test('detectEmbedModel reads model_available from `health-check --json`; probe f
   // no binary → null
   assert.equal(detectEmbedModel(null), null);
 });
+
+test('unresolvedCount: repair mode exits 0 iff every found issue was fixed', () => {
+  const { unresolvedCount } = require('./doctor');
+  // Clean run — nothing found.
+  assert.equal(unresolvedCount({ checkOnly: false, issueCount: 0, fixed: 0 }), 0);
+  // Repair fixed everything ("N/N addressed") → 0, so `doctor && …` and
+  // self-heal automation don't read a successful repair as failure. This is
+  // the regression this contract guards: previously exited 1 on any issue found.
+  assert.equal(unresolvedCount({ checkOnly: false, issueCount: 3, fixed: 3 }), 0);
+  // Partial repair → the remainder is unresolved (nonzero → exit 1).
+  assert.equal(unresolvedCount({ checkOnly: false, issueCount: 3, fixed: 1 }), 2);
+  // Advisory-only issue with no working auto-repair (fixed stays 0) → unresolved.
+  assert.equal(unresolvedCount({ checkOnly: false, issueCount: 1, fixed: 0 }), 1);
+});
+
+test('unresolvedCount: --check-only reports every found issue (never repairs)', () => {
+  const { unresolvedCount } = require('./doctor');
+  // check-only performs no repair, so fixed is 0; a found issue must still
+  // surface as unresolved (exit 1) — check mode reports cleanliness.
+  assert.equal(unresolvedCount({ checkOnly: true, issueCount: 2, fixed: 0 }), 2);
+  assert.equal(unresolvedCount({ checkOnly: true, issueCount: 0, fixed: 0 }), 0);
+});
+
+test('runRepairs: hooks-invalid counts fixed only when the post-install re-scan is clean', () => {
+  // hooks-invalid is raised only after diagnosis already ran install()+re-scan
+  // and paths were STILL broken. The repair arm must re-verify, else it reports
+  // a false exit 0 ("healthy") while the hooks stay broken. Stub the lifecycle
+  // deps runRepairs pulls via require('./lifecycle') on the shared cached export
+  // object; restore in finally so no other test sees the stubs.
+  const { runRepairs } = require('./doctor');
+  const lc = require('./lifecycle');
+  const orig = { install: lc.install, scan: lc.scanForBrokenPaths, relic: lc.isStaleRelicContext };
+  const hooksInvalid = [{ name: 'Hooks', status: 'warn', fixId: 'hooks-invalid' }];
+  try {
+    lc.isStaleRelicContext = () => false;   // not a relic → repair proceeds
+    lc.install = () => {};                    // install() that cannot restore the paths
+    // Re-scan still broken → must NOT count as fixed (old code did fixed++ blindly).
+    lc.scanForBrokenPaths = () => [{ type: 'hook', event: 'PreToolUse:Edit', path: '/gone.js' }];
+    assert.equal(runRepairs(hooksInvalid), 0, 'still-broken after install must not count as fixed');
+    // Re-scan clean → the repair took effect → counts as fixed.
+    lc.scanForBrokenPaths = () => [];
+    assert.equal(runRepairs(hooksInvalid), 1, 'verified-clean after install counts as fixed');
+  } finally {
+    lc.install = orig.install;
+    lc.scanForBrokenPaths = orig.scan;
+    lc.isStaleRelicContext = orig.relic;
+  }
+});

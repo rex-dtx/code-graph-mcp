@@ -496,10 +496,21 @@ function runRepairs(results) {
       case 'hooks-invalid': {
         console.log('\n  Repairing hooks...');
         if (relicRepairGuard()) break;
-        const { install } = require('./lifecycle');
+        const { install, scanForBrokenPaths } = require('./lifecycle');
         install();
-        console.log('  \u2705 Hooks repaired \u2014 restart Claude Code to apply');
-        fixed++;
+        // Diagnosis already ran install()+re-scan and the paths were STILL
+        // broken (that `repaired:false` is what raised hooks-invalid). Verify
+        // this second attempt actually cleared them before counting it fixed \u2014
+        // a blind fixed++ here would let doctor exit 0 ("healthy") while the
+        // hook paths stay broken.
+        const remaining = scanForBrokenPaths();
+        if (remaining.length === 0) {
+          console.log('  \u2705 Hooks repaired \u2014 restart Claude Code to apply');
+          fixed++;
+        } else {
+          console.log(`  \u274c ${remaining.length} hook path(s) still invalid \u2014 plugin scripts may be missing.`);
+          console.log('     Reinstall: npm install -g @sdsrs/code-graph  (or re-run the plugin installer)');
+        }
         break;
       }
 
@@ -532,25 +543,43 @@ function runRepairs(results) {
 
 // ── Main ──────────────────────────────────────────────────
 
+// Exit status for a doctor run reflects what remains BROKEN, not what was found:
+//   --check-only → every found issue is unresolved (report cleanliness, no repair).
+//   repair mode  → issueCount minus what runRepairs resolved. A run that fixes
+//                  everything ("N/N addressed") reports 0 so `doctor && …` and
+//                  self-heal automation don't read a successful repair as a
+//                  failure. runRepairs counts an issue fixed only when its repair
+//                  reports success — and the hooks arm re-scans after install() to
+//                  confirm, so a still-broken re-scan is NOT counted (stays
+//                  unresolved → exit 1). An issue with no working repair
+//                  (schema-mismatch is advisory only) likewise keeps this > 0.
+function unresolvedCount({ checkOnly, issueCount, fixed }) {
+  return checkOnly ? issueCount : issueCount - fixed;
+}
+
 function runDoctor(opts = {}) {
   const results = runDiagnostics();
   console.log(formatReport(results, { checkOnly: opts.checkOnly }));
 
   const issues = results.filter(r => r.status === 'warn' || r.status === 'error');
 
+  let fixed = 0;
   if (issues.length > 0 && !opts.checkOnly) {
-    const fixed = runRepairs(results);
+    fixed = runRepairs(results);
     console.log(`\n  ${fixed}/${issues.length} issue(s) addressed.`);
   }
 
-  return { results, issueCount: issues.length };
+  const unresolved = unresolvedCount({
+    checkOnly: opts.checkOnly, issueCount: issues.length, fixed,
+  });
+  return { results, issueCount: issues.length, unresolved };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, detectEmbedModel, devBuildCommand };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, detectEmbedModel, devBuildCommand };
 
 if (require.main === module) {
   const args = process.argv.slice(2);
   const checkOnly = args.includes('--check-only');
-  const { issueCount } = runDoctor({ checkOnly });
-  process.exit(issueCount > 0 ? 1 : 0);
+  const { unresolved } = runDoctor({ checkOnly });
+  process.exit(unresolved > 0 ? 1 : 0);
 }

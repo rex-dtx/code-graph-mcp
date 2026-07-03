@@ -983,8 +983,10 @@ if (require.main === module) {
   } else if (cmd === 'doctor') {
     const { runDoctor } = require('./doctor');
     const checkOnly = process.argv.includes('--check-only');
-    const { issueCount } = runDoctor({ checkOnly });
-    process.exit(issueCount > 0 ? 1 : 0);
+    // Exit on issues that remain UNRESOLVED after repair, not issues found —
+    // a run that fixes everything exits 0. See unresolvedCount in doctor.js.
+    const { unresolved } = runDoctor({ checkOnly });
+    process.exit(unresolved > 0 ? 1 : 0);
   } else if (cmd === 'verify-hooks-fire') {
     // v0.67.0 — Layer-A firing self-test. Spawned detached by session-init
     // (off the SessionStart budget); writes a small state file the next
