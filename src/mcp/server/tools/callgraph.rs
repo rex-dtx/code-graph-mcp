@@ -90,17 +90,16 @@ impl McpServer {
         let function_name = nonblank(args["symbol_name"].as_str())
             .or_else(|| nonblank(args["function_name"].as_str()))
             .ok_or_else(|| anyhow!("symbol_name or route_path is required"))?;
-        let direction = args["direction"].as_str().unwrap_or("both");
-        // Validate enum at tool entry. Without this, a bogus direction first hit
-        // the ambiguity check (which echoes the bad value back) — only after the
-        // user disambiguated with file_path would the underlying graph layer
-        // reject it. Two errors for one mistake.
-        if !matches!(direction, "callers" | "callees" | "both") {
-            return Err(anyhow!(
-                "direction must be one of: callers, callees, both (got '{}')",
-                direction
-            ));
-        }
+        let direction_raw = args["direction"].as_str().unwrap_or("both");
+        // Validate + case-normalize enum at tool entry. Without this, a bogus
+        // direction first hit the ambiguity check (which echoes the bad value
+        // back) — only after the user disambiguated with file_path would the
+        // underlying graph layer reject it. Two errors for one mistake.
+        // normalize_call_direction canonicalizes case so `direction:"Both"` is
+        // accepted like the other enum filters.
+        let direction = crate::domain::normalize_call_direction(direction_raw).ok_or_else(|| {
+            anyhow!("direction must be one of: callers, callees, both (got '{}')", direction_raw)
+        })?;
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         // Empty file_path is identical to absent — without this the
         // disambiguation/fuzzy path treats Some("") as "filter by this exact

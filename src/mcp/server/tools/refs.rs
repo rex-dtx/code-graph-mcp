@@ -14,7 +14,7 @@ impl McpServer {
         // Empty file_path => no filter (treat like missing). Otherwise we'd
         // get "Symbol 'x' not found in file ''" which is a useless error.
         let file_path = args["file_path"].as_str().filter(|s| !s.is_empty());
-        let relation = args["relation"].as_str().unwrap_or("all");
+        let relation_raw = args["relation"].as_str().unwrap_or("all");
         let compact = args["compact"].as_bool().unwrap_or(false);
         // Default true preserves the "every usage site" contract for rename audits
         // (tests must be renamed too). Pass false for "production callers only".
@@ -24,17 +24,16 @@ impl McpServer {
             return Err(anyhow!("symbol_name or node_id is required"));
         }
 
-        // Validate relation at tool entry — before index refresh AND before symbol
-        // resolution. Otherwise a bogus relation surfaces only after a (possibly
-        // failing) symbol lookup, so a typo'd relation on an absent symbol reports
-        // "not found" and hides the real mistake. The exhaustive match below still
-        // maps the validated value to a filter constant. feedback-enum-validate-at-entry.
-        if !matches!(relation, "calls" | "imports" | "inherits" | "implements" | "references" | "all") {
-            return Err(anyhow!(
-                "Unknown relation filter: '{}'. Valid: calls, imports, inherits, implements, references, all",
-                relation
-            ));
-        }
+        // Validate + case-normalize relation at tool entry — before index refresh
+        // AND before symbol resolution. Otherwise a bogus relation surfaces only
+        // after a (possibly failing) symbol lookup, so a typo'd relation on an
+        // absent symbol reports "not found" and hides the real mistake.
+        // normalize_relation canonicalizes case (so relation:"CALLS" is accepted
+        // like the other enum filters); the exhaustive match below maps the
+        // canonical value to a filter constant. feedback-enum-validate-at-entry.
+        let relation = crate::domain::normalize_relation(relation_raw).ok_or_else(|| {
+            anyhow!("Unknown relation filter: '{}'. Valid: calls, imports, inherits, implements, references, all", relation_raw)
+        })?;
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;

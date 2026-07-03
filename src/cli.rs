@@ -3165,10 +3165,8 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         anyhow::bail!("Usage: code-graph-mcp callgraph <symbol> [--direction callers|callees|both] [--depth N] [--file <path>] [--json]");
     }
 
-    let direction = args.direction.as_str();
-    if !matches!(direction, "callers" | "callees" | "both") {
-        anyhow::bail!("--direction must be one of: callers, callees, both");
-    }
+    let direction = crate::domain::normalize_call_direction(args.direction.as_str())
+        .ok_or_else(|| anyhow::anyhow!("--direction must be one of: callers, callees, both"))?;
     let depth: i32 = args.depth.max(1);
     let json_mode = args.json;
     let compact = args.compact;
@@ -4811,10 +4809,8 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
     let file_path_owned = normalize_user_path(project_root, raw_file_path)?;
     let file_path = file_path_owned.as_str();
 
-    let direction = args.direction.as_str();
-    if !matches!(direction, "outgoing" | "incoming" | "both") {
-        anyhow::bail!("--direction must be one of: outgoing, incoming, both");
-    }
+    let direction = crate::domain::normalize_dep_direction(args.direction.as_str())
+        .ok_or_else(|| anyhow::anyhow!("--direction must be one of: outgoing, incoming, both"))?;
     let depth: i32 = args.depth.clamp(1, 10);
     let json_mode = args.json;
     let compact = args.compact;
@@ -5217,18 +5213,20 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         None => None,
     };
     let explicit_file = explicit_file_owned.as_deref();
-    let relation = args.relation.as_deref();
-    // Validate --relation at command entry — before opening the index and before
-    // symbol resolution — so a nonexistent symbol with a bad --relation reports the
-    // relation error, not "symbol not found". feedback-enum-validate-at-entry.
-    if let Some(r) = relation {
-        if !matches!(r, "calls" | "imports" | "inherits" | "implements" | "references" | "all") {
-            anyhow::bail!(
+    // Validate + case-normalize --relation at command entry — before opening the
+    // index and before symbol resolution — so a nonexistent symbol with a bad
+    // --relation reports the relation error, not "symbol not found".
+    // normalize_relation canonicalizes case. feedback-enum-validate-at-entry.
+    let relation: Option<&'static str> = match args.relation.as_deref() {
+        None => None,
+        Some(r) => match crate::domain::normalize_relation(r) {
+            Some(rel) => Some(rel),
+            None => anyhow::bail!(
                 "--relation must be one of: calls, imports, inherits, implements, references, all (got '{}')",
                 r
-            );
-        }
-    }
+            ),
+        },
+    };
     // Validate --min-confidence at entry (before index open), mirroring --relation,
     // so a typo'd tier errors loudly instead of silently passing all rows.
     let min_confidence: Option<&'static str> = match args.min_confidence.as_deref() {

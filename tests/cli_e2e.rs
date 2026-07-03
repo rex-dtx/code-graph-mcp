@@ -1381,6 +1381,28 @@ fn test_cli_callgraph_invalid_direction_errors_early() {
         "stderr should explain the valid set; got: {stderr:?}");
 }
 
+/// R10: enum filters accept case variants (parity with --node-type / --min-confidence
+/// / --language, which already normalize case). Valid UPPERCASE must be accepted, and
+/// cross-vocab must still be rejected case-insensitively.
+#[test]
+fn test_cli_enum_filters_accept_case_variants() {
+    let project = setup_indexed_project();
+    // Uppercase valid direction → accepted (not the case-sensitive rejection).
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "validateToken", "--direction", "BOTH"]);
+    assert_eq!(code, 0, "uppercase --direction BOTH should be accepted; stderr={stderr:?}");
+    assert!(!stderr.contains("--direction must be one of"),
+        "BOTH must not hit the case-sensitive rejection; got: {stderr:?}");
+    // Uppercase valid relation → accepted.
+    let (_, stderr, _) = run_cli(&project, &["refs", "validateToken", "--relation", "CALLS"]);
+    assert!(!stderr.contains("--relation must be one of"),
+        "CALLS must not hit the case-sensitive rejection; got: {stderr:?}");
+    // Cross-vocab is STILL rejected, case-insensitively (a deps word on callgraph).
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "validateToken", "--direction", "OUTGOING"]);
+    assert_eq!(code, 1, "cross-vocab --direction OUTGOING must still error; stderr={stderr:?}");
+    assert!(stderr.contains("--direction must be one of: callers, callees, both"),
+        "cross-vocab must still be rejected; got: {stderr:?}");
+}
+
 #[test]
 fn test_cli_callgraph_json() {
     let project = setup_indexed_project();

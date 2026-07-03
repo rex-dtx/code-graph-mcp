@@ -200,6 +200,28 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
                    JOIN nodes en ON en.id = ex2.target_id
                    WHERE ex2.relation = ?3
                )
+               -- Methods of an exported class are public API too, but ESM emits an
+               -- export edge only for the class, never its methods — so in an
+               -- export-bearing (TS/JS) file they were dropped from overview /
+               -- module_overview, while Python/Rust/Go methods (files with no export
+               -- edges → the NOT IN branch above) showed. Include n when an exported
+               -- node in the SAME file owns it by qualified_name (`<owner>.<n.name>`,
+               -- exact so no LIKE-escaping of `_`/`%`). In practice only class members
+               -- get a dotted qualified_name (top-level symbols are bare), so this is
+               -- methods of exported classes. Kept LAST and file-bounded (cls filtered
+               -- by file_id + qualified_name, hitting idx_nodes_file, before the export
+               -- check) so this correlated lookup fires only for the few non-exported
+               -- rows in export-bearing files — never for no-export (Python/Rust/Go)
+               -- files, which the cheap materialized NOT IN branch short-circuits first.
+               OR EXISTS (
+                   SELECT 1 FROM nodes cls
+                   WHERE cls.file_id = n.file_id
+                     AND n.qualified_name = cls.qualified_name || '.' || n.name
+                     AND EXISTS (
+                         SELECT 1 FROM edges ex4
+                         WHERE ex4.target_id = cls.id AND ex4.relation = ?3
+                     )
+               )
            )
          ORDER BY caller_count DESC"
     );
@@ -289,6 +311,34 @@ mod tests {
         let exports = get_module_exports(conn, "src/auth/").unwrap();
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "validateUser");
+    }
+
+    /// Regression: in an export-bearing (TS/JS) file, methods of an EXPORTED class
+    /// must surface too — ESM emits an export edge only for the class, so the old
+    /// "show only export-edge targets" rule dropped every method from overview /
+    /// module_overview (while Python/Rust methods showed). A method of a
+    /// NON-exported class must stay hidden (not public API).
+    #[test]
+    fn test_get_module_exports_includes_methods_of_exported_class() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/models.ts', 'h1', 0, 'typescript', 0)", []).unwrap();
+        // Exported class Animal (id 1) + its method speak (id 2, qn 'Animal.speak').
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Animal', 'Animal', 1, 5, 'class Animal {}')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'speak', 'Animal.speak', 2, 3, 'speak() {}')", []).unwrap();
+        // Module node (id 3) exports the class (edge module -> Animal).
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'module', 'models', 'models', 0, 0, '')", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (3, 1, 'exports')", []).unwrap();
+        // Non-exported internal class Helper (id 4) + its method secret (id 5).
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Helper', 'Helper', 6, 8, 'class Helper {}')", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'secret', 'Helper.secret', 7, 7, 'secret() {}')", []).unwrap();
+
+        let names: Vec<String> = get_module_exports(conn, "src/models")
+            .unwrap().iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&"Animal".to_string()), "exported class shown: {names:?}");
+        assert!(names.contains(&"speak".to_string()), "method of exported class shown: {names:?}");
+        assert!(!names.contains(&"Helper".to_string()), "non-exported class hidden: {names:?}");
+        assert!(!names.contains(&"secret".to_string()), "method of non-exported class hidden: {names:?}");
     }
 
     /// Regression: `get_module_exports` must return a deterministic, relevance-

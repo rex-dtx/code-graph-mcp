@@ -11,13 +11,10 @@ impl McpServer {
         // path shape — stops a bogus value from being silently swallowed into the
         // `dependencies_unavailable` field (directory paths / include_deps:false
         // never reached the old gated check). feedback-enum-validate-at-entry.
-        let deps_direction = args.get("deps_direction").and_then(|v| v.as_str()).unwrap_or("both");
-        if !matches!(deps_direction, "outgoing" | "incoming" | "both") {
-            return Err(anyhow!(
-                "deps_direction must be one of: outgoing, incoming, both (got '{}')",
-                deps_direction
-            ));
-        }
+        let deps_direction_raw = args.get("deps_direction").and_then(|v| v.as_str()).unwrap_or("both");
+        let deps_direction = crate::domain::normalize_dep_direction(deps_direction_raw).ok_or_else(|| {
+            anyhow!("deps_direction must be one of: outgoing, incoming, both (got '{}')", deps_direction_raw)
+        })?;
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;

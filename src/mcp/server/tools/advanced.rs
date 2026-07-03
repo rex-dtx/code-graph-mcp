@@ -156,15 +156,12 @@ impl McpServer {
         let file_path = args["file_path"].as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("file_path is required (relative to project root)"))?;
-        let direction = args.get("direction")
+        let direction_raw = args.get("direction")
             .and_then(|v| v.as_str())
             .unwrap_or("both");
-        if !matches!(direction, "outgoing" | "incoming" | "both") {
-            return Err(anyhow!(
-                "direction must be one of: outgoing, incoming, both (got '{}')",
-                direction
-            ));
-        }
+        let direction = crate::domain::normalize_dep_direction(direction_raw).ok_or_else(|| {
+            anyhow!("direction must be one of: outgoing, incoming, both (got '{}')", direction_raw)
+        })?;
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;

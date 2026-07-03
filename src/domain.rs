@@ -82,6 +82,45 @@ pub fn normalize_confidence(input: &str) -> Option<&'static str> {
     }
 }
 
+// Enum filters shared by the CLI and MCP surfaces. Each canonicalizes case (so
+// `--direction BOTH` / MCP `direction:"Both"` are accepted like every other enum
+// filter — `--node-type`, `--min-confidence`, `--language` already normalize case;
+// `direction`/`relation` were the two that still matched case-sensitively inline)
+// and returns None for an unknown value so callers error loudly at entry.
+
+/// Canonicalize a call-graph `--direction` / `direction` (callers|callees|both).
+pub fn normalize_call_direction(input: &str) -> Option<&'static str> {
+    match input.to_lowercase().as_str() {
+        "callers" => Some("callers"),
+        "callees" => Some("callees"),
+        "both" => Some("both"),
+        _ => None,
+    }
+}
+
+/// Canonicalize a dependency `--direction` / `direction` (outgoing|incoming|both).
+pub fn normalize_dep_direction(input: &str) -> Option<&'static str> {
+    match input.to_lowercase().as_str() {
+        "outgoing" => Some("outgoing"),
+        "incoming" => Some("incoming"),
+        "both" => Some("both"),
+        _ => None,
+    }
+}
+
+/// Canonicalize a `--relation` / `relation` filter for find_references.
+pub fn normalize_relation(input: &str) -> Option<&'static str> {
+    match input.to_lowercase().as_str() {
+        "calls" => Some("calls"),
+        "imports" => Some("imports"),
+        "inherits" => Some("inherits"),
+        "implements" => Some("implements"),
+        "references" => Some("references"),
+        "all" => Some("all"),
+        _ => None,
+    }
+}
+
 // -- Index version --
 // Bump this when parser/indexer logic changes in a way that produces different
 // nodes or edges for the same source files. The server will detect a mismatch
@@ -603,6 +642,28 @@ mod tests {
             ignores.iter().any(|p| p == "claude-plugin/"),
             "claude-plugin/ must be ignored — hook handlers are invoked from settings.json shell, not JS imports"
         );
+    }
+
+    /// The shared enum normalizers accept case variants (parity with
+    /// normalize_confidence / normalize_type_filter / canonical_language) and
+    /// each rejects the OTHER direction vocabulary + bogus values.
+    #[test]
+    fn test_enum_normalizers_case_insensitive_and_vocab_scoped() {
+        // call direction: callers|callees|both
+        assert_eq!(normalize_call_direction("both"), Some("both"));
+        assert_eq!(normalize_call_direction("BOTH"), Some("both"));
+        assert_eq!(normalize_call_direction("Callers"), Some("callers"));
+        assert_eq!(normalize_call_direction("outgoing"), None, "deps vocab rejected");
+        assert_eq!(normalize_call_direction("bogus"), None);
+        // dep direction: outgoing|incoming|both
+        assert_eq!(normalize_dep_direction("INCOMING"), Some("incoming"));
+        assert_eq!(normalize_dep_direction("both"), Some("both"));
+        assert_eq!(normalize_dep_direction("callers"), None, "callgraph vocab rejected");
+        // relation: calls|imports|inherits|implements|references|all
+        assert_eq!(normalize_relation("CALLS"), Some("calls"));
+        assert_eq!(normalize_relation("Implements"), Some("implements"));
+        assert_eq!(normalize_relation("all"), Some("all"));
+        assert_eq!(normalize_relation("bogus"), None);
     }
 
     /// `is_test_symbol` must classify Criterion bench files as harness so

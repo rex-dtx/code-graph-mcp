@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.85.5 — `overview` surfaces TS/JS methods; case-insensitive `direction`/`relation`
+
+Two dogfooding fixes, no schema or index change.
+
+### Fixed
+- **`overview` / `module_overview` now list methods of exported classes.** For a
+  TypeScript/JavaScript file, `get_module_exports` contributed only symbols with their
+  own `export` edge — but ESM emits an export edge for a class, never its methods, so
+  every method of an exported class was dropped from the module summary, while
+  Python/Rust/Go methods (files with no export edges) showed. Methods of an exported
+  class are public API too and now appear. Non-exported classes' methods stay hidden,
+  and files with no exports are byte-for-byte unchanged; the added lookup is kept off
+  the hot path — it runs only for the few non-exported rows in export-bearing files —
+  so pure Python/Rust/Go repos see no query slowdown.
+- **`--direction` / `--relation` (CLI and MCP) accept case variants.** `--direction BOTH`
+  or `relation: "CALLS"` were rejected as invalid while the sibling filters
+  (`--node-type`, `--min-confidence`, `--language`) already accepted any case. All three
+  now normalize through a shared canonicalizer, so case no longer matters; cross-vocabulary
+  values (a `deps` word on `callgraph`, or vice versa) and unknown values are still
+  rejected loudly.
+
 ## v0.85.4 — `doctor` exit code reflects what it couldn't fix
 
 `code-graph-mcp doctor` exited 1 even after repairing every issue it found, so a
