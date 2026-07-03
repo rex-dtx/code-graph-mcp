@@ -1719,15 +1719,18 @@ fn test_cli_impact_folds_ambiguous_callers_but_discloses() {
     // New default (v0.76): impact folds the ambiguous by-name caller fan-out out
     // of the risk count, but DISCLOSES the excluded count so a folded real caller
     // never silently under-states risk (unlike callgraph, an ambiguous caller may
-    // be a true dependency). Fixture: `save` is defined in two files, so any edge
-    // into it is classified ambiguous; `run` calls the imported db.save.
+    // be a true dependency). Fixture: `save` is defined in two files and `run`
+    // calls it WITHOUT importing either def, so the by-name edge is genuinely
+    // ambiguous (2 tied candidates). (An explicit `from db import save` would
+    // corroborate the binding → `inferred`, NOT folded — that path is covered by
+    // resolve::confidence::classify_import_corroborated_duplicate_stays_visible.)
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("db.py"), "def save(r):\n    return True\n").unwrap();
     std::fs::write(src.join("cache.py"), "def save(i):\n    return True\n").unwrap();
     std::fs::write(src.join("app.py"),
-        "from db import save\n\ndef run():\n    return save({\"id\": 1})\n").unwrap();
+        "def run():\n    return save({\"id\": 1})\n").unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -1770,9 +1773,11 @@ fn test_cli_impact_discloses_transitive_ambiguous_callers() {
     std::fs::write(src.join("a.py"),
         "from core import uniq_target\n\ndef amb():\n    return uniq_target()\n").unwrap();
     std::fs::write(src.join("a2.py"), "def amb():\n    return 2\n").unwrap();
-    // `caller_b` calls amb — a TRANSITIVE caller folded because amb is ambiguous.
+    // `caller_b` calls amb bare (no import) — a TRANSITIVE caller folded because
+    // amb is ambiguous. (Importing amb here would corroborate the edge → inferred,
+    // so it would no longer be folded; keep it un-imported to exercise the fold.)
     std::fs::write(src.join("b.py"),
-        "from a import amb\n\ndef caller_b():\n    return amb()\n").unwrap();
+        "def caller_b():\n    return amb()\n").unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();

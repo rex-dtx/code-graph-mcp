@@ -402,10 +402,28 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
 /// edge becomes `ambiguous` when a duplicate-named sibling is later added (and
 /// back when it is removed). Returns the number of edges downgraded.
 pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
-    use crate::domain::{CONF_AMBIGUOUS, CONF_INFERRED, REL_CALLS, REL_REFERENCES};
+    use crate::domain::{CONF_AMBIGUOUS, CONF_INFERRED, REL_CALLS, REL_REFERENCES, REL_IMPORTS};
     let downgraded = db.conn().execute(
         "UPDATE edges
-         SET confidence = CASE WHEN namecount.cnt > 1 THEN ?3 ELSE ?4 END
+         SET confidence = CASE
+                 WHEN namecount.cnt > 1
+                      -- ... UNLESS the caller's file explicitly imports THIS exact
+                      -- target. An import binds the bare name to one node, so the
+                      -- edge is import-resolved (v0.59 bind_calls_to_imported_targets),
+                      -- not a bare-name guess among same-name siblings. Without this
+                      -- exception the precise binding is relabeled `ambiguous` and
+                      -- hidden by the confidence floor, so callgraph/impact show NO
+                      -- callee for a call the resolver bound exactly — for any name
+                      -- defined in >=2 same-language files (process/handler/run/init).
+                      -- Mirrors the corroboration test in prune_import_contradicted_call_edges.
+                      AND NOT EXISTS (
+                          SELECT 1 FROM edges ie
+                          JOIN nodes imp_src ON imp_src.id = ie.source_id
+                          WHERE ie.relation = ?5
+                            AND imp_src.file_id = src.file_id
+                            AND ie.target_id = tgt.id
+                      )
+                 THEN ?3 ELSE ?4 END
          FROM nodes AS src, nodes AS tgt, files AS tf,
               (SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
                FROM nodes n JOIN files f ON f.id = n.file_id
@@ -417,7 +435,7 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
            AND edges.relation IN (?1, ?2)
            AND namecount.nm = tgt.name
            AND namecount.lang IS tf.language",
-        rusqlite::params![REL_CALLS, REL_REFERENCES, CONF_AMBIGUOUS, CONF_INFERRED],
+        rusqlite::params![REL_CALLS, REL_REFERENCES, CONF_AMBIGUOUS, CONF_INFERRED, REL_IMPORTS],
     )?;
     Ok(downgraded)
 }
@@ -639,6 +657,51 @@ mod tests {
             assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "ambiguous", "cross-file duplicate name → ambiguous");
             assert_eq!(conf_of(conn, g, h, REL_IMPORTS), "extracted", "imports stays extracted cross-file");
             assert_eq!(conf_of(conn, i, j, REL_REFERENCES), "inferred", "cross-file unique reference → inferred");
+        }
+
+        /// Import-corroboration: a cross-file call whose target NAME is duplicated
+        /// (so name-count alone → `ambiguous`) but whose caller file explicitly
+        /// imports THAT exact target must classify as `inferred`, not `ambiguous`.
+        /// The import binds the bare name to one node, so the edge is
+        /// import-resolved (v0.59), not a bare-name guess — relabeling it
+        /// `ambiguous` would hide it under the confidence floor and callgraph/impact
+        /// would show no callee for a precisely-bound call. Extremely common in
+        /// JS/TS (any name defined in ≥2 files: process / handler / run / init).
+        #[test]
+        fn classify_import_corroborated_duplicate_stays_visible() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("c.db")).unwrap();
+            let conn = db.conn();
+            let f_main = file(conn, "src/main.ts", "typescript");
+            let f_helpers = file(conn, "src/helpers.ts", "typescript");
+            let f_other = file(conn, "src/other.ts", "typescript");
+
+            // run (main) calls process, resolver-bound to helpers.process
+            let run = insert_node(conn, &node("run", f_main)).unwrap();
+            let proc_helpers = insert_node(conn, &node("process", f_helpers)).unwrap();
+            insert_node(conn, &node("process", f_other)).unwrap(); // duplicate same-lang name
+            insert_edge(conn, run, proc_helpers, REL_CALLS, None).unwrap();
+            // main's module imports process FROM helpers (the disambiguating edge)
+            let mod_main = insert_node(conn, &node("<module>", f_main)).unwrap();
+            insert_edge(conn, mod_main, proc_helpers, REL_IMPORTS, None).unwrap();
+
+            classify_edge_confidence(&db).unwrap();
+            assert_eq!(
+                conf_of(conn, run, proc_helpers, REL_CALLS), "inferred",
+                "import-corroborated call to a duplicate-named target must be inferred, not ambiguous",
+            );
+
+            // Control: a call to the OTHER (non-imported) duplicate stays ambiguous.
+            let caller2 = insert_node(conn, &node("caller2", f_helpers)).unwrap();
+            let proc_other = conn.query_row(
+                "SELECT id FROM nodes WHERE name='process' AND file_id=?1",
+                [f_other], |r| r.get::<_, i64>(0)).unwrap();
+            insert_edge(conn, caller2, proc_other, REL_CALLS, None).unwrap();
+            classify_edge_confidence(&db).unwrap();
+            assert_eq!(
+                conf_of(conn, caller2, proc_other, REL_CALLS), "ambiguous",
+                "call to a duplicate-named target with no corroborating import stays ambiguous",
+            );
         }
 
         /// Idempotency: removing the duplicate flips ambiguous→inferred on re-run;

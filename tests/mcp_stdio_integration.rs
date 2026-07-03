@@ -105,11 +105,14 @@ fn setup_ambiguous_fanout_project() -> TempDir {
     std::fs::write(src.join("main.rs"),
         "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n").unwrap();
 
-    // Python: ambiguous caller fan-out.
+    // Python: ambiguous caller fan-out. `run` calls `save` WITHOUT importing
+    // either def, so the by-name edge is genuinely ambiguous (2 tied candidates).
+    // An explicit `from db import save` would corroborate the binding → inferred,
+    // not folded (resolve::confidence::classify_import_corroborated_duplicate_stays_visible).
     std::fs::write(src.join("db.py"), "def save(r):\n    return True\n").unwrap();
     std::fs::write(src.join("cache.py"), "def save(i):\n    return True\n").unwrap();
     std::fs::write(src.join("app.py"),
-        "from db import save\n\ndef run():\n    return save({\"id\": 1})\n").unwrap();
+        "def run():\n    return save({\"id\": 1})\n").unwrap();
 
     // Project marker so the spawned server serves the full catalog.
     std::fs::write(project.path().join("Cargo.toml"),
