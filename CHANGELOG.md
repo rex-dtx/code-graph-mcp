@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.85.1 — Deterministic `callgraph`, clearer degenerate-input errors
+
+`callgraph <symbol>` (the default `--direction both`, on both the CLI and the MCP tool)
+printed the same caller/callee set in a different order on every run, because the merge
+step iterated a `HashMap`. Two smaller CLI commands blamed the graph for a degenerate
+argument. All three are bug fixes with no schema or index change.
+
+### Fixed
+- **`callgraph` output is deterministic across runs.** The `direction=both` merge
+  collected `HashMap::into_values()` (per-instance random iteration order) and then sorted
+  by depth only, so same-depth callers/callees came back shuffled on every invocation — the
+  same query produced a different order each time (CLI text and MCP `results[]` alike),
+  defeating diff and reproducibility. The merge now preserves each direction's existing
+  `(depth, caller_count DESC, node_id)` relevance order, and the call-graph SQL gained a
+  unique `node_id` tiebreaker so the row-limit truncation on a wide fan-out drops a
+  deterministic subset. The caller set is unchanged; only the order is now stable.
+  Query-time only — no `INDEX_VERSION` bump.
+- **`centrality --limit 0` no longer claims the graph has no chokepoints.** `--limit 0`
+  returned an empty ranking and printed "No chokepoints found (graph has no multi-hop call
+  paths)", blaming the graph for a user-supplied zero. `--limit` now clamps to 1 (matching
+  `callgraph --depth`), so `--limit 0` yields the top chokepoint.
+- **`deps <dir>` points at `overview` instead of "File not found".** Passing a directory
+  hit the missing-file branch (`is_file()` is false for a directory that plainly exists).
+  It now reports that the path is a directory and suggests `overview`, in both the text and
+  `--json` error paths.
+
 ## v0.85.0 — Surfaces stop hiding real results (mixed-language overview, import-resolved calls, `affected` input)
 
 Three independent surfaces were silently dropping results a user had every reason to
