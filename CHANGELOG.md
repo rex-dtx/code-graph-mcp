@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.85.0 — Surfaces stop hiding real results (mixed-language overview, import-resolved calls, `affected` input)
+
+Three independent surfaces were silently dropping results a user had every reason to
+expect. `overview` on a directory hid every non-export-language file whenever a sibling
+had ESM `export`s; `callgraph`/`impact` hid a cross-file call that an explicit import had
+already resolved, for any function name defined in two or more files; and a bare
+`affected` printed "0 tests to re-run" when the real cause was a forgotten argument. None
+reproduced on this repo's own dogfood layout, which is why they survived. The
+call-visibility fix reclassifies existing edges, so it bumps `INDEX_VERSION` (34 → 35) —
+existing indexes rebuild once on upgrade.
+
+### Fixed
+- **`overview` / `module_overview` show every file in a mixed-language directory.**
+  `get_module_exports` ran a global two-phase fallback: explicit ESM `export` edges first,
+  all-top-level-symbols only if that returned nothing. A directory mixing a `.ts` file
+  (with `export`s) and `.py`/`.rs`/`.go` files therefore surfaced only the TypeScript and
+  silently dropped every non-export-language sibling — even though those symbols were
+  indexed and findable via `search`/`show`. The decision is now made per file: a file that
+  declares exports contributes its exports (the public-API view is preserved); a file with
+  none contributes every top-level symbol. The export-bearing file set is computed once, so
+  it stays a single scan.
+- **Import-resolved cross-file calls stay visible in `callgraph` / `impact`.** When a file
+  explicitly imports a symbol (`import { process } from './helpers'`), a call to it is
+  bound to that exact definition — but the confidence classifier then relabeled the edge
+  `ambiguous` purely because the name `process` also existed in another file, and the v0.76
+  confidence floor hid it by default. So `callgraph`/`impact` showed no callee/caller for a
+  call the resolver had pinned exactly, for any name defined in ≥2 files
+  (`process`/`handler`/`run`/`init`/`save`/…). An edge whose target is imported by the
+  caller's file is now `inferred` (visible by default), while genuine bare-name fan-out
+  with no corroborating import stays `ambiguous`. On this repo the rebuild reclassifies 173
+  of 328 previously-`ambiguous` edges to `inferred`; 155 genuinely ambiguous ones stay
+  hidden — no over-promotion.
+- **`affected` with no input explains itself.** `affected` takes an explicit changed-file
+  list (positional or `--stdin`); it does not auto-diff git. A bare invocation had no input
+  and printed "0 test file(s) to re-run" — indistinguishable from "nothing is affected" and
+  easy to misread as "no tests needed". It now prints a stderr hint pointing at the intended
+  pipe (`git diff --name-only HEAD | code-graph-mcp affected --stdin`); stdout and exit code
+  are unchanged, and a correctly-used empty `--stdin` pipe stays silent.
+
+### Migration
+- `INDEX_VERSION` 34 → 35 (call-edge confidence reclassification). Existing indexes rebuild
+  automatically on first use after upgrade; no action required.
+
 ## v0.84.1 — Plugin MCP auto-upgrades a non-project stub when the cwd becomes a project
 
 The plugin's MCP launcher serves a 0-tool stub in a non-project cwd (no `.git`/manifest
