@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.85.7 — output polish: `surprising`/`report` drop `<module>`; `show --impact` discloses test callers
+
+Two low-severity dogfooding output fixes; no schema or index change.
 
 ### Fixed
 - **`surprising` / `report` no longer surface the synthetic `<module>` scope node.** A
