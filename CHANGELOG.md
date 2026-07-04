@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.85.8 — auto-update: check on session start; close the release-publish throttle race
+
+The auto-updater now re-checks on every session start / reload, and no longer
+latches a stale "up to date" answer when a check races just ahead of a release.
+Plugin-only (`claude-plugin/scripts`); no schema or index change.
+
+### Changed
+- **A session start / reload now forces an immediate update check.** The
+  SessionStart hook already spawned a background check, but it went through the
+  6h throttle — so a recently-throttled check silently skipped, and a freshly
+  opened session would not pick up an available update. A session start /
+  resume / clear / reload now forces the check, bypassing the soft throttle down
+  to a 2-minute anti-hammer floor (GitHub rate-limit backoff still wins).
+  Automatic mid-session compaction keeps the gentle background cadence. The
+  update installs in the background and activates on the *next* session (Claude
+  Code loads plugin hooks at startup).
+
+### Fixed
+- **A release that publishes seconds after an update check is no longer hidden
+  for 6 hours.** The flat 6h throttle latched the stale "up to date" answer when
+  a check raced just ahead of a release (observed live: v0.85.7 published 8s
+  after a check pinned v0.85.6, so every session reopen for the next 6h
+  re-reported "up to date"). An "up to date" result is now re-verified on a
+  30-minute cadence, bounding the blind window; a pending update keeps the 6h
+  interval and rate-limiting keeps its 24h backoff.
+
 ## v0.85.7 — output polish: `surprising`/`report` drop `<module>`; `show --impact` discloses test callers
 
 Two low-severity dogfooding output fixes; no schema or index change.
