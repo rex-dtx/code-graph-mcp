@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const os = require('os');
-const { launchBackgroundAutoUpdate, syncLifecycleConfig, ensureIndexFresh, indexNeedsRevalidation, verifyBinary, computeQuietHooks, shouldInjectMap, shouldInjectRecentImpact, recentImpactWorthShowing, filterSourceFiles, parseGitStatusPaths, formatRecentImpact } = require('./session-init');
+const { launchBackgroundAutoUpdate, isHighIntentSource, syncLifecycleConfig, ensureIndexFresh, indexNeedsRevalidation, verifyBinary, computeQuietHooks, shouldInjectMap, shouldInjectRecentImpact, recentImpactWorthShowing, filterSourceFiles, parseGitStatusPaths, formatRecentImpact } = require('./session-init');
 
 // Write an executable stub named `code-graph-mcp` that emits `json` to stdout on
 // `health-check` and exits with `exitCode`. Mirrors how the real binary behaves:
@@ -119,6 +119,28 @@ test('launchBackgroundAutoUpdate spawns detached silent updater', () => {
   assert.equal(calls[0].options.stdio, 'ignore');
   assert.equal(calls[0].options.env.CODE_GRAPH_AUTO_UPDATE_SILENT, '1');
   assert.equal(calls[0].unrefCalled, true);
+});
+
+test('launchBackgroundAutoUpdate forwards --force only when asked (session-start bypass)', () => {
+  const calls = [];
+  const capture = (_command, args) => {
+    calls.push({ args });
+    return { unref() {} };
+  };
+
+  launchBackgroundAutoUpdate(capture, {}, { force: true });
+  assert.deepEqual(calls[0].args.slice(1), ['check', '--silent', '--force']);
+
+  launchBackgroundAutoUpdate(capture, {}); // default → no --force
+  assert.deepEqual(calls[1].args.slice(1), ['check', '--silent']);
+});
+
+test('isHighIntentSource forces on session start/resume/clear but not automatic compaction', () => {
+  assert.equal(isHighIntentSource('startup'), true);
+  assert.equal(isHighIntentSource('resume'), true);
+  assert.equal(isHighIntentSource('clear'), true);
+  assert.equal(isHighIntentSource(undefined), true); // direct call / unknown → high intent
+  assert.equal(isHighIntentSource('compact'), false); // frequent + automatic → gentle cadence
 });
 
 const { consistencyCheck, runSessionInit } = require('./session-init');

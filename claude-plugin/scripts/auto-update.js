@@ -33,7 +33,9 @@ function commandExists(cmd) {
 const GITHUB_REPO = 'sdsrss/code-graph-mcp';
 const STATE_FILE = path.join(CACHE_DIR, 'update-state.json');
 const BINARY_CACHE_DIR = path.join(CACHE_DIR, 'bin');
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h
+const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h — steady-state re-check
+const UP_TO_DATE_RECHECK_MS = 30 * 60 * 1000;        // 30min — re-verify an "up to date" result (release-race guard)
+const SESSION_START_MIN_GAP_MS = 2 * 60 * 1000;      // 2min — anti-hammer floor for forced (session-start) checks
 const RATE_LIMIT_INTERVAL_MS = 24 * 60 * 60 * 1000;  // 24h if rate-limited
 const FETCH_TIMEOUT_MS = 3000;
 
@@ -43,6 +45,13 @@ function isSilentMode(argv = process.argv.slice(2), env = process.env) {
 
 function isInstallMissingMode(argv = process.argv.slice(2)) {
   return argv.includes('--install-missing');
+}
+
+// High-intent trigger (session start / explicit reload) → bypass the soft
+// throttle so an available update is picked up immediately, not on the next
+// 6h/30min tick. Passed by session-init's launchBackgroundAutoUpdate.
+function isForceMode(argv = process.argv.slice(2)) {
+  return argv.includes('--force');
 }
 
 // ── Platform → GitHub release asset name mapping ──────────
@@ -74,10 +83,25 @@ function saveState(state) {
 
 // ── Throttle ───────────────────────────────────────────────
 
-function shouldCheck(state) {
+// Whether to hit GitHub now. Keyed to the previous check's outcome, with a force
+// override for high-intent triggers (session start / explicit reload). Ordering:
+//   1. rate-limit backoff (24h) wins over everything — never push more requests
+//      into a GitHub 403.
+//   2. force → only the short SESSION_START_MIN_GAP_MS floor applies, so opening
+//      a new session re-checks immediately while a crash/reopen loop still can't
+//      hammer the API.
+//   3. otherwise → an "up to date" result is re-verified on a short cadence
+//      (UP_TO_DATE_RECHECK_MS). This is the release-publish race guard: a version
+//      can go live seconds AFTER a check that said "up to date", and the plain 6h
+//      interval left it invisible for the full 6h (observed live — v0.85.7
+//      published 8s after a check pinned v0.85.6). A pending-but-unfinished update
+//      keeps the 6h steady-state interval.
+function shouldCheck(state, { force = false } = {}) {
   if (!state.lastCheck) return true;
   const elapsed = Date.now() - new Date(state.lastCheck).getTime();
-  const interval = state.rateLimited ? RATE_LIMIT_INTERVAL_MS : CHECK_INTERVAL_MS;
+  if (state.rateLimited) return elapsed >= RATE_LIMIT_INTERVAL_MS;
+  if (force) return elapsed >= SESSION_START_MIN_GAP_MS;
+  const interval = state.updateAvailable === false ? UP_TO_DATE_RECHECK_MS : CHECK_INTERVAL_MS;
   return elapsed >= interval;
 }
 
@@ -472,7 +496,7 @@ async function selfHealStaleBinary(latest, { needsUpdate = cachedBinaryNeedsUpda
   return await download(latest);
 }
 
-async function checkForUpdate({ installMissing = false } = {}) {
+async function checkForUpdate({ installMissing = false, force = false } = {}) {
   try {
     // Skip in dev mode — unless the launcher explicitly requested a missing-
     // binary install, in which case we MUST proceed regardless of mode (the
@@ -491,7 +515,7 @@ async function checkForUpdate({ installMissing = false } = {}) {
     // fetch + self-heal path below.
     const binaryMissing = !fs.existsSync(cachedBinaryPath());
     const binaryStale = cachedBinaryStaleVsState(state);
-    if (!binaryMissing && !binaryStale && !shouldCheck(state)) {
+    if (!binaryMissing && !binaryStale && !shouldCheck(state, { force })) {
       if (state.installedVersion !== installedVersion) {
         saveState({ ...state, installedVersion });
       }
@@ -567,9 +591,9 @@ async function checkForUpdate({ installMissing = false } = {}) {
 }
 
 module.exports = {
-  checkForUpdate, commandExists, isDevMode, readState, compareVersions,
+  checkForUpdate, commandExists, isDevMode, readState, compareVersions, shouldCheck,
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
-  isSilentMode, isInstallMissingMode,
+  isSilentMode, isInstallMissingMode, isForceMode,
   requestJson, parseLatestRelease, fetchLatestRelease,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
   selfHealStaleBinary,
@@ -583,12 +607,13 @@ if (require.main === module) {
     const cmd = argv.find(arg => !arg.startsWith('--')) || 'check';
     const silent = isSilentMode(argv);
     const installMissing = isInstallMissingMode(argv);
+    const force = isForceMode(argv);
     if (cmd === 'status') {
       const state = readState();
       console.log(JSON.stringify(state, null, 2));
     } else {
       if (!silent) console.log('Checking for updates...');
-      const result = await checkForUpdate({ installMissing });
+      const result = await checkForUpdate({ installMissing, force });
       if (silent) return;
       if (result && result.updated) {
         console.log(`Updated: v${result.from} → v${result.to} (binary: ${result.binaryUpdated ? 'yes' : 'no'})`);

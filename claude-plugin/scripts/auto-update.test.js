@@ -20,6 +20,7 @@ const {
   selfHealStaleBinary,
   isInstallMissingMode,
   isSilentMode,
+  shouldCheck,
 } = require('./auto-update');
 
 function mkDir(t, prefix) {
@@ -178,6 +179,45 @@ test('cachedBinaryStaleVsState bypasses throttle only for a present-but-stale bi
   // missing binary → false here (the separate binaryMissing bypass handles it)
   fs.rmSync(binaryPath);
   assert.equal(cachedBinaryStaleVsState({ latestVersion: '0.45.1' }, { binaryPath }), false);
+});
+
+test('shouldCheck re-verifies an up-to-date state on a short cadence (release-publish race)', () => {
+  const minsAgo = (m) => new Date(Date.now() - m * 60 * 1000).toISOString();
+
+  // never checked → always check
+  assert.equal(shouldCheck({}), true);
+
+  // Bug repro: the last check reported "up to date" (updateAvailable:false) and a
+  // release published moments later. 45min on, the plain 6h throttle kept the
+  // stale answer latched (every session reopen re-reported up-to-date); the short
+  // up-to-date cadence must allow a re-check so the new release is discovered.
+  assert.equal(shouldCheck({ lastCheck: minsAgo(45), updateAvailable: false }), true);
+
+  // within the short window → still throttled (don't hammer the API every call)
+  assert.equal(shouldCheck({ lastCheck: minsAgo(10), updateAvailable: false }), false);
+
+  // a pending-but-unfinished update keeps the 6h steady-state interval
+  assert.equal(shouldCheck({ lastCheck: minsAgo(45), updateAvailable: true }), false);
+
+  // rate-limit backoff (24h) wins even over the up-to-date short cadence
+  assert.equal(shouldCheck({ lastCheck: minsAgo(120), updateAvailable: false, rateLimited: true }), false);
+});
+
+test('shouldCheck lets a forced (session-start) check bypass the soft throttle', () => {
+  const minsAgo = (m) => new Date(Date.now() - m * 60 * 1000).toISOString();
+
+  // A new session / explicit reload is a strong "get me latest" signal: a forced
+  // check runs even inside the 30min up-to-date window (contrast the non-forced
+  // call on the same state, which stays throttled).
+  assert.equal(shouldCheck({ lastCheck: minsAgo(10), updateAvailable: false }, { force: true }), true);
+  assert.equal(shouldCheck({ lastCheck: minsAgo(10), updateAvailable: false }), false);
+
+  // ...but a short anti-hammer floor still applies, so a crash/reopen loop can't
+  // pound the GitHub API on every restart.
+  assert.equal(shouldCheck({ lastCheck: minsAgo(0.5), updateAvailable: false }, { force: true }), false);
+
+  // Rate-limit backoff wins even over force — never push more requests into a 403.
+  assert.equal(shouldCheck({ lastCheck: minsAgo(60), updateAvailable: false, rateLimited: true }, { force: true }), false);
 });
 
 test('selfHealStaleBinary wires the stale-binary check to a download (the v0.45.x glue)', async () => {

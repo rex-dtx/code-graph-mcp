@@ -166,9 +166,14 @@ function formatRecentImpact(changed, affected, dependentCap = 6) {
   return lines.join('\n');
 }
 
-function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
+function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env, { force = false } = {}) {
   try {
-    const child = spawnFn(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check', '--silent'], {
+    const args = [path.join(__dirname, 'auto-update.js'), 'check', '--silent'];
+    // A session start / reload forces an immediate check (bypasses the soft
+    // throttle down to auto-update.js's short anti-hammer floor + rate-limit
+    // backoff), so an available update is picked up now rather than on the next tick.
+    if (force) args.push('--force');
+    const child = spawnFn(process.execPath, args, {
       detached: true,
       stdio: 'ignore',
       env: { ...env, CODE_GRAPH_AUTO_UPDATE_SILENT: '1' },
@@ -178,6 +183,14 @@ function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env) {
   } catch {
     return false;
   }
+}
+
+// A session start / resume / clear / explicit reload is a strong "I'm here, get
+// me the latest" signal → force an immediate update check. Automatic mid-session
+// compaction is not high-intent, so it keeps auto-update.js's gentle background
+// cadence. Unknown source (direct calls / tests) is treated as high-intent.
+function isHighIntentSource(source) {
+  return source !== 'compact';
 }
 
 function syncLifecycleConfig() {
@@ -509,7 +522,7 @@ function runSessionInit({ source } = {}) {
   // Verify binary availability — catch issues early with actionable diagnostics
   const binaryCheck = verifyBinary();
 
-  const autoUpdateLaunched = launchBackgroundAutoUpdate();
+  const autoUpdateLaunched = launchBackgroundAutoUpdate(spawn, process.env, { force: isHighIntentSource(source) });
   const indexFreshness = binaryCheck.available ? ensureIndexFresh() : 'skipped';
 
   // 上下文感知默认：插件模式下首次 SessionStart 自动安装（创建/注入 CLAUDE.md 块 +
@@ -752,6 +765,7 @@ function detectHookDark() {
 
 module.exports = {
   launchBackgroundAutoUpdate,
+  isHighIntentSource,
   syncLifecycleConfig,
   ensureIndexFresh,
   indexNeedsRevalidation,
