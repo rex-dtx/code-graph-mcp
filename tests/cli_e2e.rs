@@ -1069,6 +1069,42 @@ fn test_cli_grep_deterministic_sorted_order() {
 }
 
 #[test]
+fn test_cli_grep_dedup_overlapping_paths() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // A file passed twice — or overlapping dir args like `grep pat . src` — makes
+    // rg scan it once per path instance and emit every match twice; the global
+    // sort then makes the duplicates adjacent. Each mode must collapse the
+    // exact-identical rows so an accidental path overlap doesn't double the output
+    // (and its AST arrows / token cost). Real grep/rg duplicate here; this
+    // AST-context grep deliberately deduplicates.
+
+    // Content mode: the doubled-path run must equal the single-path run byte-for-byte
+    // (same sorted+deduped set, same AST arrows).
+    let (single, _, c1) = run_cli(&project, &["grep", "validateToken", "src/auth.ts"]);
+    assert_eq!(c1, 0);
+    let (double, _, c2) =
+        run_cli(&project, &["grep", "validateToken", "src/auth.ts", "src/auth.ts"]);
+    assert_eq!(c2, 0);
+    assert_eq!(double, single,
+        "duplicate path arg must not double content-mode output; got:\n{double}");
+    assert!(double.contains("validateToken"));
+
+    // -l mode: overlapping dir args must list each matching file exactly once.
+    let (l_out, _, cl) = run_cli(&project, &["grep", "-l", "validateToken", "src", "src"]);
+    assert_eq!(cl, 0);
+    assert_eq!(l_out.matches("src/auth.ts").count(), 1,
+        "-l must list a file once under overlapping paths, got: {l_out}");
+
+    // -c mode: a duplicate path must not emit two `path:N` rows for one file.
+    let (c_out, _, cc) =
+        run_cli(&project, &["grep", "-c", "validateToken", "src/api.ts", "src/api.ts"]);
+    assert_eq!(cc, 0);
+    assert_eq!(c_out.matches("src/api.ts:").count(), 1,
+        "-c must emit one row per file under duplicate paths, got: {c_out}");
+}
+
+#[test]
 fn test_cli_grep_files_with_matches_json() {
     if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();

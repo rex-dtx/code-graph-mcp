@@ -2324,6 +2324,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             .map(|l| relativize_path(l, &root_str).to_string())
             .collect();
         files.sort(); // global ascending-path order (walk + supplement + multi-path)
+        files.dedup(); // overlapping/repeated path args can list one file twice
         if files.is_empty() {
             if json_mode {
                 println!("[]");
@@ -2364,6 +2365,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             })
             .collect();
         counts.sort_by(|a, b| a.0.cmp(&b.0)); // global ascending-path order
+        // Overlapping/repeated path args make rg emit a file's `path:N` line once
+        // per instance (identical count each); keep a single row per file.
+        counts.dedup_by(|a, b| a.0 == b.0);
         if counts.is_empty() {
             if json_mode {
                 println!("[]");
@@ -2401,6 +2405,15 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // multi-path); context lines carry their own line number and stay adjacent to
     // their match. Stable sort keeps any same-(file,line) records in input order.
     matches.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+    // Overlapping or repeated path args (`grep pat . src/parser`, or the same
+    // file passed twice) make rg scan a file more than once and emit identical
+    // records; the global sort above makes those duplicates adjacent. Collapse
+    // exact-identical rows so an accidental path overlap doesn't double every
+    // match line (and its AST arrow / token cost). Done before the per-file cap
+    // tally below so the count isn't inflated by the duplicates.
+    matches.dedup_by(|a, b| {
+        a.file == b.file && a.line == b.line && a.is_context == b.is_context && a.text == b.text
+    });
     if matches.is_empty() {
         if json_mode {
             println!("[]");
