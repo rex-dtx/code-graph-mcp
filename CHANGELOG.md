@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.85.9 — grep: de-duplicate output when path arguments overlap
+
+`grep` no longer prints a match more than once when a file is reachable through
+more than one path argument (`grep pat . src`, or the same file passed twice).
+CLI-only (`src/cli.rs`); no schema or index change.
+
+### Fixed
+- **Overlapping or repeated `grep` path arguments no longer double the output.**
+  ripgrep scans each path argument independently, so `grep pat . src/parser`
+  emitted every match under `src/parser/` twice, and the v0.85.3 determinism sort
+  made the duplicates adjacent. Content mode doubled each match line and its `→`
+  AST annotation, `-l` listed the file twice, and `-c` printed two `path:N` rows
+  for one file. All three modes now collapse exact-duplicate rows after the global
+  sort (the `-c` count stays correct — one row per file). Real grep/ripgrep
+  duplicate here; this AST-context grep de-duplicates to match what an agent
+  passing overlapping scopes expects.
+
 ## v0.85.8 — auto-update: check on session start; close the release-publish throttle race
 
 The auto-updater now re-checks on every session start / reload, and no longer
