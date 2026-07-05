@@ -1,0 +1,36 @@
+{"query": "run_full_index", "query_class": "exact_id", "gold_names": ["run_full_index"], "expects_confident": true, "note": "verbatim unique symbol; must stay high-confidence bare array"}
+{"query": "weighted_rrf_fusion", "query_class": "exact_id", "gold_names": ["weighted_rrf_fusion"], "expects_confident": true, "note": "verbatim unique symbol"}
+{"query": "lock_or_recover", "query_class": "exact_id", "gold_names": ["lock_or_recover"], "expects_confident": true, "note": "verbatim unique symbol"}
+{"query": "normalize_user_path", "query_class": "exact_id", "gold_names": ["normalize_user_path"], "expects_confident": true, "note": "verbatim unique symbol"}
+{"query": "find_cycles", "query_class": "exact_id", "gold_names": ["find_cycles"], "expects_confident": true, "note": "verbatim unique symbol"}
+{"query": "l2_normalize", "query_class": "exact_id", "gold_names": ["l2_normalize"], "expects_confident": true, "note": "verbatim unique symbol"}
+{"query": "compute_reading_order", "query_class": "exact_id", "gold_names": ["compute_reading_order"], "expects_confident": true, "note": "verbatim unique symbol"}
+{"query": "insert node into the database", "query_class": "code_vocab", "gold_names": ["insert_node"], "expects_confident": true, "note": "code words overlapping an identifier; FTS should hit"}
+{"query": "recursive call graph callers of a function", "query_class": "code_vocab", "gold_names": ["get_call_graph"], "expects_confident": true, "note": "code vocab; identifier tokens present"}
+{"query": "incremental index update", "query_class": "code_vocab", "gold_names": ["run_incremental_index"], "expects_confident": true, "note": "code vocab"}
+{"query": "classify edge confidence tiers", "query_class": "code_vocab", "gold_names": ["classify_edge_confidence"], "expects_confident": true, "note": "code vocab"}
+{"query": "build context string for embedding", "query_class": "code_vocab", "gold_names": ["build_context_string"], "expects_confident": true, "note": "code vocab"}
+{"query": "extract relations from the parse tree", "query_class": "code_vocab", "gold_names": ["extract_relations"], "expects_confident": true, "note": "code vocab"}
+{"query": "get nodes by name", "query_class": "code_vocab", "gold_names": ["get_nodes_by_name"], "expects_confident": true, "note": "code vocab; near-verbatim"}
+{"query": "parse source code into an abstract syntax tree", "query_class": "good_nl", "gold_names": ["parse_code", "parse_tree"], "expects_confident": true, "note": "NL description of a real concept with a clear target"}
+{"query": "fuse full-text and vector search results by rank", "query_class": "good_nl", "gold_names": ["weighted_rrf_fusion"], "expects_confident": true, "note": "NL for RRF fusion"}
+{"query": "recursively find who calls a given function", "query_class": "good_nl", "gold_names": ["get_call_graph"], "expects_confident": true, "note": "NL for call graph"}
+{"query": "detect circular import dependencies between modules", "query_class": "good_nl", "gold_names": ["find_cycles"], "expects_confident": true, "note": "NL for cycle detection"}
+{"query": "load the embedding model and encode text into vectors", "query_class": "good_nl", "gold_names": ["load", "build_context_string"], "expects_confident": true, "note": "NL for embedding load/encode"}
+{"query": "normalize a user supplied file path to prevent directory traversal", "query_class": "good_nl", "gold_names": ["normalize_user_path"], "expects_confident": true, "note": "NL for path normalization"}
+{"query": "acquire a database lock and recover from a stale lock", "query_class": "good_nl", "gold_names": ["lock_or_recover"], "expects_confident": true, "note": "NL for lock recovery"}
+{"query": "run an incremental update of the index after a file changes", "query_class": "good_nl", "gold_names": ["run_incremental_index", "ensure_file_indexed"], "expects_confident": true, "note": "NL for incremental indexing"}
+{"query": "verify the integrity of a downloaded snapshot before installing", "query_class": "good_nl", "gold_names": ["try_install", "read_meta"], "expects_confident": true, "note": "NL for snapshot integrity"}
+{"query": "normalize an embedding vector to unit length", "query_class": "good_nl", "gold_names": ["l2_normalize"], "expects_confident": true, "note": "NL for l2 normalization"}
+{"query": "compute a good order to read files to understand a module", "query_class": "good_nl", "gold_names": ["compute_reading_order"], "expects_confident": true, "note": "NL for reading order"}
+{"query": "handle errors gracefully and report them", "query_class": "ambiguous_nl", "gold_names": [], "expects_confident": null, "note": "vague; no crisp target — no confidence assertion"}
+{"query": "process and transform the incoming data", "query_class": "ambiguous_nl", "gold_names": [], "expects_confident": null, "note": "vague"}
+{"query": "manage the application state over time", "query_class": "ambiguous_nl", "gold_names": [], "expects_confident": null, "note": "vague"}
+{"query": "clean up temporary resources when shutting down", "query_class": "ambiguous_nl", "gold_names": [], "expects_confident": null, "note": "vague"}
+{"query": "check whether the input value is valid", "query_class": "ambiguous_nl", "gold_names": [], "expects_confident": null, "note": "vague; may weakly hit is_valid-style helpers"}
+{"query": "gardening tomato watering schedule for spring", "query_class": "nonsense", "gold_names": [], "expects_confident": false, "note": "semantically empty for a code index; must be LOW confidence"}
+{"query": "purple monkey dishwasher elephant symphony", "query_class": "nonsense", "gold_names": [], "expects_confident": false, "note": "nonsense; must be LOW confidence"}
+{"query": "the quick brown fox jumps over the lazy dog", "query_class": "nonsense", "gold_names": [], "expects_confident": false, "note": "pangram; must be LOW confidence"}
+{"query": "recipe for chocolate chip cookies baking in the oven", "query_class": "nonsense", "gold_names": [], "expects_confident": false, "note": "nonsense; must be LOW confidence"}
+{"query": "guitar chord progression blues improvisation", "query_class": "nonsense", "gold_names": [], "expects_confident": false, "note": "nonsense; must be LOW confidence"}
+{"query": "mountain hiking trail backpack at sunrise", "query_class": "nonsense", "gold_names": [], "expects_confident": false, "note": "nonsense; must be LOW confidence"}

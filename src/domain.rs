@@ -175,8 +175,11 @@ pub const CONF_SPARSITY_P3: f64 = 0.8;
 /// Source-intersection: low FTS∩vec overlap in the top-k → less confidence.
 pub const CONF_INTERSECTION_MIN_RATIO: f64 = 0.2;
 pub const CONF_INTERSECTION_PENALTY: f64 = 0.75;
-/// Below this match_confidence, surface a "results are largely vector noise" warning.
-pub const CONF_WARNING_THRESHOLD: f64 = 0.5;
+// (match_confidence is surfaced as a raw query-shape signal; the low_confidence
+// warning fires on a text-anchor mechanic, not a match_confidence threshold —
+// see src/mcp/server/tools/search.rs VECTOR_ONLY_WARNING. A prior
+// CONF_WARNING_THRESHOLD=0.5 was removed: the calibration bench showed no signal
+// separates good NL from nonsense, so a threshold warning was ~all false alarms.)
 /// Name-match boost: +per-match, capped, for symbols whose name contains query terms.
 pub const NAME_BOOST_PER_MATCH: f64 = 0.3;
 pub const NAME_BOOST_CAP: f64 = 2.0;

@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.89.0 — semantic-search confidence warning fires on an honest signal
+
+The `low_confidence_warning` on `semantic_code_search` was a false alarm on the
+tool's primary use case. This release retriggers it on a signal we can actually
+trust, backed by a new regression-tracked calibration benchmark. No
+`INDEX_VERSION` change (query-time only).
+
+### Changed
+- **`low_confidence_warning` now fires only when a result set has no text anchor
+  (vector-only), not on a `match_confidence` threshold.** A new calibration bench
+  (`scripts/embedding_benchmark/eval_confidence.py`, 36-query corpus over 5 classes)
+  measured that `match_confidence` pins at ≈0.45 for essentially every multi-word
+  natural-language query — good and nonsense alike (`OR-fallback 0.6 × intersection
+  0.75`) — and that **no available signal separates a good NL query from nonsense**:
+  `match_confidence` (good−nonsense = 0.023), RRF relevance, and raw top-1 vector
+  cosine (0.016, with full overlap — the good query "normalize a user supplied file
+  path" scored the global-minimum cosine, below every nonsense query). The old
+  `match_confidence < 0.5` trigger therefore fired on **100% of good NL queries**
+  (which retrieve relevant results 82% of the time in the corpus), telling the caller
+  the results were "largely vector-similarity noise" — false, and it pushed the model
+  to distrust correct answers. The warning now fires only when FTS returns no hits at
+  all (results ranked by vector similarity alone — the one case where that claim is
+  literally true), and its wording states the mechanic without claiming the results are
+  wrong. Bench impact: good-NL false-alarm rate 100% → 0%, overall calibration accuracy
+  0.484 → 0.871, exact-identifier and code-vocabulary queries unchanged (0% warned).
+  `match_confidence` is still returned as a rough query-shape signal; the removed
+  `CONF_WARNING_THRESHOLD` constant is gone.
+- **New `CODE_GRAPH_EMIT_CONFIDENCE` env seam (internal, off by default).** When set,
+  `serve` emits a `[CONF_PROBE]` line per search to stderr (`match_confidence`, raw top
+  cosine, FTS/vector hit counts) so the calibration bench can measure signals the JSON
+  response does not expose. No effect on the response contract.
+
 ## v0.88.0 — correctness fixes: call resolution, JSON-RPC errors, search confidence
 
 Three correctness fixes surfaced by end-to-end QA. One `INDEX_VERSION` bump

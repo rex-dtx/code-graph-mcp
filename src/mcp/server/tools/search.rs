@@ -186,6 +186,40 @@ impl McpServer {
             c
         };
 
+        // Measurement seam (env-gated, stderr-only — NO response-contract change): emit
+        // the raw top-1 vector cosine alongside the final match_confidence so the
+        // confidence-calibration bench can test whether raw cosine separates good-NL
+        // from nonsense queries (the RRF `relevance` score does not — it is rank-fused
+        // and discards similarity magnitude). Default behavior is untouched: nothing is
+        // emitted unless CODE_GRAPH_EMIT_CONFIDENCE is set. vec_search is KNN-ordered
+        // (nearest first), so its head carries the top raw cosine (1.0 - distance).
+        // See scripts/embedding_benchmark/eval_confidence.py.
+        if std::env::var_os("CODE_GRAPH_EMIT_CONFIDENCE").is_some() {
+            let top_cosine = vec_search.first().map(|r| r.score).unwrap_or(f64::NAN);
+            eprintln!(
+                "[CONF_PROBE] q={:?} match_confidence={:.4} top_cosine={:.4} fts_hits={} vec_hits={} or_fallback={}",
+                query, match_confidence, top_cosine, fts_search.len(), vec_search.len(), fts_or_fallback
+            );
+        }
+
+        // Low-confidence warning trigger (consumed by the compressed path and
+        // finalize_search_results below). Fires ONLY when the result set has no text
+        // anchor at all — FTS returned nothing, so the ranking is vector similarity
+        // alone, the one case where "vector-similarity only" is literally true.
+        //
+        // It deliberately does NOT use the match_confidence<0.5 threshold: the
+        // confidence-calibration bench (scripts/embedding_benchmark/eval_confidence.py)
+        // measured that match_confidence pins ~0.45 for essentially every multi-word
+        // natural-language query, good and nonsense alike (OR-fallback 0.6 ×
+        // intersection 0.75), and that neither match_confidence, RRF relevance, nor raw
+        // top-1 vector cosine separates a good NL query from nonsense on this index.
+        // The old threshold therefore warned on 100% of good NL queries (which retrieve
+        // relevant results 82% of the time) — a false alarm that pushed callers to
+        // distrust correct results. fts-empty is the honest, mechanically-trustworthy
+        // trigger. (FTS-only degradation — vector channel down — is surfaced separately
+        // as a `note` in finalize_search_results.)
+        let vector_only_no_anchor = fts_search.is_empty() && !vec_search.is_empty();
+
         // Batch-fetch all candidate nodes with file info (single query instead of N+1)
         let candidate_ids: Vec<i64> = fused.iter().map(|r| r.node_id).collect();
         let nodes_with_files = queries::get_nodes_with_files_by_ids(self.db.conn(), &candidate_ids)?;
@@ -402,10 +436,9 @@ impl McpServer {
                     ("compressed_directories", items)
                 }
             };
-            // match_confidence reflects FTS/vector agreement and coverage.
-            // Low values mean results are likely noise (especially vector-only hits
-            // for unknown queries), so surface it to the caller so they can skip
-            // acting on the list when it's untrustworthy. `has_exact_name_match`
+            // match_confidence (FTS/vector agreement + coverage) is always surfaced as a
+            // rough query-shape signal. The warning is separate and fires only when the
+            // ranking has no text anchor (see vector_only_no_anchor); `has_exact_name_match`
             // (hoisted above) exempts precise single-identifier queries.
             let mut out = json!({
                 "mode": mode,
@@ -415,10 +448,9 @@ impl McpServer {
                 "vector_available": vector_available,
                 "results": compact
             });
-            if match_confidence < crate::domain::CONF_WARNING_THRESHOLD && !has_exact_name_match {
+            if vector_only_no_anchor && !has_exact_name_match {
                 if let Some(obj) = out.as_object_mut() {
-                    obj.insert("low_confidence_warning".into(),
-                        json!(low_confidence_warning_msg(match_confidence)));
+                    obj.insert("low_confidence_warning".into(), json!(VECTOR_ONLY_WARNING));
                 }
             }
             return Ok(out);
@@ -458,35 +490,41 @@ impl McpServer {
         }
 
         // Shape the response: a confident hybrid result stays a bare array (the
-        // unchanged happy-path contract); a degraded (FTS-only) OR low-confidence
-        // result wraps in an object carrying the signal so the caller doesn't
-        // silently trust noise. Mirrors the warning the compressed path emits above.
-        Ok(finalize_search_results(results, match_confidence, has_exact_name_match, vector_available))
+        // unchanged happy-path contract); a degraded (FTS-only) OR text-anchorless
+        // (vector-only) result wraps in an object carrying the signal so the caller
+        // doesn't silently trust it. Mirrors the warning the compressed path emits above.
+        Ok(finalize_search_results(results, match_confidence, vector_only_no_anchor, has_exact_name_match, vector_available))
     }
 }
 
-/// The low-confidence noise warning surfaced on any semantic-search path whose
-/// `match_confidence` fell below [`crate::domain::CONF_WARNING_THRESHOLD`]. Shared
-/// by the compressed (large-result) and bare-array (small-result) returns so the
-/// two never drift.
-fn low_confidence_warning_msg(match_confidence: f64) -> String {
-    format!(
-        "match_confidence={:.2} (< 0.5): FTS found few or no text matches — results are largely vector-similarity noise. Refine the query with concrete identifiers, or use ast_search with type/returns/params filters.",
-        match_confidence
-    )
-}
+/// Notice attached when a semantic-search result set has NO text anchor — FTS
+/// returned nothing, so the ranking is vector similarity alone, the one condition
+/// where "vector-similarity only" is literally true. Shared by the compressed
+/// (large-result) and bare-array (small-result) returns so the two never drift.
+///
+/// It is deliberately NOT keyed on a match_confidence threshold: the calibration
+/// bench (scripts/embedding_benchmark/eval_confidence.py) refuted match_confidence,
+/// RRF relevance, AND raw top-1 cosine as separators of good-NL from nonsense, so
+/// the old `<0.5` trigger warned on ~every natural-language query (100% of good NL
+/// in the corpus) while they returned relevant results. The message states the
+/// mechanic and explicitly does not claim the results are wrong.
+const VECTOR_ONLY_WARNING: &str = "No exact text matches — results are ranked by vector similarity alone (no keyword anchor). Vague or natural-language queries often land here yet still return relevant symbols, so judge by the results; if they miss, add a concrete identifier or use ast_search with type/returns/params filters.";
 
 /// Pick the response shape for an uncompressed semantic-search result set.
 ///
 /// - vector unavailable → object with the FTS-only degradation `note`.
-/// - low confidence (and not an exact-identifier hit) → object with
-///   `match_confidence` + `low_confidence_warning`, so a vague/nonsense query that
-///   returns only a handful of candidates no longer slips through as a bare list
-///   with no signal its hits are vector-similarity noise (the gap this closes).
-/// - otherwise → a bare array (the unchanged confident-hybrid contract).
+/// - vector-only (no FTS anchor, and not an exact-identifier hit) → object with
+///   `match_confidence` + `low_confidence_warning`, so a query whose ranking rests
+///   on vector similarity alone no longer slips through as a bare list with no
+///   signal (the gap this closes).
+/// - otherwise → a bare array (the unchanged confident-hybrid contract). Note this
+///   now includes low-`match_confidence` results that DO have a text anchor: those
+///   are overwhelmingly good natural-language queries, and the warning no longer
+///   fires on them (see [`VECTOR_ONLY_WARNING`]).
 fn finalize_search_results(
     results: Vec<serde_json::Value>,
     match_confidence: f64,
+    vector_only: bool,
     has_exact_name_match: bool,
     vector_available: bool,
 ) -> serde_json::Value {
@@ -498,12 +536,12 @@ fn finalize_search_results(
             "note": "Embedding model not loaded — results are FTS5-only (reduced semantic recall). The model auto-downloads in the background on first use; retry shortly, or run `code-graph-mcp doctor` to check status."
         });
     }
-    if match_confidence < crate::domain::CONF_WARNING_THRESHOLD && !has_exact_name_match {
+    if vector_only && !has_exact_name_match {
         return json!({
             "results": results,
             "search_mode": "hybrid",
             "match_confidence": (match_confidence * 100.0).round() / 100.0,
-            "low_confidence_warning": low_confidence_warning_msg(match_confidence),
+            "low_confidence_warning": VECTOR_ONLY_WARNING,
         });
     }
     json!(results)
@@ -518,37 +556,46 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_bare_path_now_carries_the_noise_warning() {
-        // The gap: a low-confidence result set small enough to skip compression used
-        // to return a bare array with NO warning — only the compressed path warned.
-        let out = finalize_search_results(dummy_results(), 0.30, false, true);
-        assert!(out.is_object(), "low-confidence hybrid result must wrap in an object");
+    fn vector_only_result_carries_the_warning() {
+        // The one honest trigger: no text anchor (fts empty → vector-only ranking).
+        let out = finalize_search_results(dummy_results(), 0.30, true, false, true);
+        assert!(out.is_object(), "vector-only result must wrap in an object");
         assert_eq!(out["match_confidence"], 0.3);
-        assert!(out["low_confidence_warning"].as_str().unwrap().contains("vector-similarity noise"));
+        assert!(out["low_confidence_warning"].as_str().unwrap().contains("vector similarity alone"));
         assert!(out["results"].is_array());
+    }
+
+    #[test]
+    fn low_confidence_with_text_anchor_no_longer_warns() {
+        // The fix: a low match_confidence (0.45 — the pin for good NL queries) that HAS
+        // a text anchor (vector_only=false) stays a bare array with no warning. The old
+        // match_confidence<0.5 trigger warned here — on 100% of good NL queries — even
+        // though they retrieve relevant results (bench: eval_confidence.py).
+        let out = finalize_search_results(dummy_results(), 0.45, false, false, true);
+        assert!(out.is_array(), "low-confidence result WITH a text anchor must stay a bare array");
     }
 
     #[test]
     fn confident_hybrid_stays_a_bare_array() {
         // Contract unchanged for confident results: still a bare array, no wrapper.
-        let out = finalize_search_results(dummy_results(), 0.85, false, true);
+        let out = finalize_search_results(dummy_results(), 0.85, false, false, true);
         assert!(out.is_array(), "confident hybrid result must stay a bare array");
     }
 
     #[test]
     fn exact_name_match_is_exempt_from_the_warning() {
-        // A precise single-identifier hit is trustworthy even at low FTS breadth —
-        // stays a bare array despite low match_confidence.
-        let out = finalize_search_results(dummy_results(), 0.20, true, true);
+        // A precise single-identifier hit is trustworthy even with no FTS breadth —
+        // stays a bare array despite being vector-only.
+        let out = finalize_search_results(dummy_results(), 0.20, true, true, true);
         assert!(out.is_array(), "exact-name match must stay a bare array (warning exempt)");
     }
 
     #[test]
     fn vector_unavailable_reports_fts_only_degradation() {
-        let out = finalize_search_results(dummy_results(), 0.90, false, false);
+        let out = finalize_search_results(dummy_results(), 0.90, false, false, false);
         assert_eq!(out["search_mode"], "fts_only");
         assert_eq!(out["vector_available"], false);
         assert!(out.get("low_confidence_warning").is_none(),
-            "FTS-only degradation is a separate signal from the low-confidence warning");
+            "FTS-only degradation is a separate signal from the vector-only warning");
     }
 }
