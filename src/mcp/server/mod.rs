@@ -938,6 +938,18 @@ impl McpServer {
                 // can never nuke live vectors. Independent of embed-model: the vec table exists in
                 // all builds and reap is a cheap anti-join + point deletes.
                 let reaped = crate::storage::queries::reap_orphan_vectors(db.conn())?;
+                // Same-dim model-swap guard BEFORE seeding (ordering matters): if the model
+                // changed, drop the stale cache + node_vectors now so the seed below cannot
+                // repopulate the cache with OLD-model embeddings that a matching-but-stale
+                // fingerprint would then treat as valid. No-op when unchanged / first run.
+                // best-effort — a failed check must not abort the rest of the repair.
+                #[cfg(feature = "embed-model")]
+                if let Err(e) = crate::storage::queries::ensure_embedding_cache_valid(
+                    db.conn(),
+                    EmbeddingModel::MODEL_CONTENT_BLAKE3,
+                ) {
+                    tracing::warn!("[embed-cache] startup validity check failed (continuing): {}", e);
+                }
                 // Seed the content-hash cache from existing vectors (once) so an already-embedded
                 // index reuses on its NEXT version bump instead of paying one more full re-embed.
                 let seeded = crate::storage::queries::seed_embedding_cache_from_vectors(db.conn())?;

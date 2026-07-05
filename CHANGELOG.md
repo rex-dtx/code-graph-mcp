@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — vector-layer race + cache-fingerprint parity fast-follow
+
+A post-v0.86.0 code review surfaced two latent concurrency/parity defects the shipped tests
+missed. Neither corrupts data under normal single-model operation; both undermine invariants
+v0.86.0 claimed, and the fixes are cheap.
+
+### Fixed
+- **Orphan reap / cache GC can no longer delete a live entry under concurrency.**
+  `reap_orphan_vectors` and `gc_embedding_cache` enumerated stale rows in autocommit, then
+  deleted inside a *deferred* transaction whose write snapshot is taken only at the first
+  delete — a window in which a concurrent writer could insert a node that reuses an enumerated
+  orphan's rowid (`nodes.id` is a plain `INTEGER PRIMARY KEY`, so rowids restart after a wipe)
+  and have its fresh vector deleted. Both now hold an `IMMEDIATE` write lock across
+  enumerate+delete, so the set cannot change under them.
+- **Every embed path now validates the model fingerprint before reusing the cache.**
+  The same-dim model-change guard previously ran only in the MCP backfill; CLI `rebuild-index`,
+  foreground indexing, and the incremental path reused `embedding_cache` unchecked, so a future
+  same-dim model swap could serve stale embeddings with no self-heal on a CLI-only install. The
+  guard now runs at the shared `embed_and_store_batch` chokepoint and before the startup cache
+  seed (the pre-work-check guard is retained so an all-already-embedded index still invalidates).
+- **Coverage counting propagates transient read errors instead of reporting 0%.**
+  `count_nodes_with_vectors` swallowed a `SQLITE_BUSY` on its coverage JOIN as a misleading
+  `0/total`; it now probes the table then propagates real errors (matching `count_unembedded_nodes`).
+
+No `INDEX_VERSION` or `SCHEMA_VERSION` change.
+
 ## v0.86.0 — embedding cache: skip re-embed on version bumps; vector-layer correctness
 
 Investigating a daagu `1% vec` statusline — the embedding backfill restarting from ~0% on

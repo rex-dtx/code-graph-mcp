@@ -25,6 +25,13 @@ pub type CachedVector = (i64, Vec<f32>);
 pub type UnembeddedNode = (i64, String);
 
 /// blake3 of the embedding input; the `embedding_cache` primary key.
+///
+/// INVARIANT: the hashed `context_string` must equal what is fed to `model.embed_batch`
+/// (see `embed_and_store_batch`) up to a CONSTANT transformation. The cache is sound only
+/// because equal content ⇒ equal embedding. If a query/document prefix is ever added at embed
+/// time (e5 / nomic-style `query:` / `passage:`), this key must cover the ACTUAL model input,
+/// and query embeddings must never read from this document cache — else a hit serves the wrong
+/// vector. The model itself is pinned via `ensure_embedding_cache_valid` (fingerprint), not here.
 pub fn cache_key(context_string: &str) -> [u8; 32] {
     *blake3::hash(context_string.as_bytes()).as_bytes()
 }
@@ -154,15 +161,29 @@ pub fn gc_embedding_cache(conn: &Connection) -> Result<usize> {
     if !has_cache_table(conn)? {
         return Ok(0);
     }
-    let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+    // Enumerate the live set and the stale keys WITHIN an IMMEDIATE (acquire-write-lock-now)
+    // transaction, for the same reason as reap_orphan_vectors: a DEFERRED txn takes its write
+    // snapshot only at the first DELETE, so a key enumerated as "stale" (no live node hashes to
+    // it) could be made live by a concurrent writer inserting a node with that content between
+    // enumerate and delete — and we would then delete a now-valid cache entry, forcing a needless
+    // re-embed on its next reuse. Holding the write lock across enumerate+delete serializes
+    // against that writer. Lower impact than the reap (a re-embed, not a dropped live vector), but
+    // the fix is identical and keeping them symmetric avoids a sibling-hole. blake3 is not a SQL
+    // function, so the live set must be built in Rust — hence enumerate-then-delete, not a set
+    // DELETE.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Empty-nodes valve (see reap_orphan_vectors): never prune against a mid-rebuild / version-
+    // bump wipe transient — that would delete the ENTIRE cache and turn the next rebuild back into
+    // a full re-embed. Read inside the txn so the check shares the delete's snapshot.
+    let node_count: i64 = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
     if node_count == 0 {
-        return Ok(0);
+        return Ok(0); // tx rolls back on drop; nothing was written
     }
     // Live content hashes (stream context_strings; retain only the 32-byte hashes).
     let mut live: HashSet<[u8; 32]> = HashSet::new();
     {
         let mut stmt =
-            conn.prepare("SELECT context_string FROM nodes WHERE context_string IS NOT NULL")?;
+            tx.prepare("SELECT context_string FROM nodes WHERE context_string IS NOT NULL")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         for ctx in rows {
             live.insert(cache_key(&ctx?));
@@ -170,7 +191,7 @@ pub fn gc_embedding_cache(conn: &Connection) -> Result<usize> {
     }
     // Collect stale cache keys (not live, or malformed length).
     let stale: Vec<Vec<u8>> = {
-        let mut stmt = conn.prepare("SELECT context_hash FROM embedding_cache")?;
+        let mut stmt = tx.prepare("SELECT context_hash FROM embedding_cache")?;
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
         let mut stale = Vec::new();
         for h in rows {
@@ -189,10 +210,9 @@ pub fn gc_embedding_cache(conn: &Connection) -> Result<usize> {
     if stale.is_empty() {
         return Ok(0);
     }
-    let tx = conn.unchecked_transaction()?;
     {
         let mut del =
-            conn.prepare_cached("DELETE FROM embedding_cache WHERE context_hash = ?1")?;
+            tx.prepare_cached("DELETE FROM embedding_cache WHERE context_hash = ?1")?;
         for h in &stale {
             del.execute([h])?;
         }

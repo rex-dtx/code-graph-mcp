@@ -148,18 +148,28 @@ pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM nodes WHERE context_string IS NOT NULL", [], |r| r.get(0)
     )?;
+    // Probe for the vec table explicitly so its ABSENCE (embed-model disabled) returns 0 coverage,
+    // while a genuine read error on the count below (e.g. SQLITE_BUSY under writer contention —
+    // the JOIN is more contention-prone than the old flat count) PROPAGATES as Err instead of
+    // masquerading as a misleading `0/total`. Mirrors count_unembedded_nodes; a blanket
+    // `.unwrap_or(0)` on the JOIN would swallow that transient as "nothing embedded".
+    let has_vectors_table: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
+        [], |r| r.get(0),
+    )?;
+    if has_vectors_table == 0 {
+        return Ok((0, total));
+    }
     // Count embeddable nodes that actually HAVE a vector — NOT raw COUNT(*) FROM node_vectors.
     // The raw count includes orphans (vectors whose node was deleted; see reap_orphan_vectors)
     // and can EXCEED `total`, producing >100% coverage and — the real hazard — a FALSE
     // "complete" when orphan count masks genuinely unembedded nodes (numerator >= denominator
     // while N embeddable nodes still have no vector, so semantic search silently misses them).
-    // The inner join to nodes drops orphans and caps the numerator at `total`. Mirrors the
-    // complement of count_unembedded_nodes. Returns 0 when the vec table is absent (embed-model
-    // disabled) via unwrap_or — the join errors on the missing table, same as before.
+    // The inner join to nodes drops orphans and caps the numerator at `total`.
     let with_vectors: i64 = conn.query_row(
         "SELECT COUNT(*) FROM nodes n JOIN node_vectors nv ON nv.node_id = n.id \
          WHERE n.context_string IS NOT NULL", [], |r| r.get(0)
-    ).unwrap_or(0);
+    )?;
     Ok((with_vectors, total))
 }
 
@@ -206,21 +216,33 @@ pub fn reap_orphan_vectors(conn: &Connection) -> Result<usize> {
     if has_vectors_table == 0 {
         return Ok(0);
     }
-    // Safety: never sweep against an EMPTY `nodes` table. An empty nodes set is far more
-    // likely a transient (mid-rebuild / INDEX_VERSION-bump wipe window, where nodes are
-    // DELETEd then repopulated) than a real zero-symbol project — and sweeping then would see
-    // EVERY vector as an "orphan" and delete the whole vector index, forcing a full re-embed
-    // (the exact "从 1% 重建" cost this hardening exists to avoid). If nodes is genuinely empty
-    // there is no legitimate vector to keep anyway, so skipping is free. This is the DB-always-
-    // usable invariant: a reap can only ever shrink toward the correct set, never nuke a live one.
-    let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+    // Open an IMMEDIATE (acquire-the-write-lock-now) transaction and enumerate the orphans
+    // WITHIN it, so the anti-join is read on the SAME snapshot the point-deletes run against.
+    // A DEFERRED txn (rusqlite's `unchecked_transaction`) — or the prior autocommit enumerate —
+    // takes its write snapshot only at the first DELETE, leaving a window between "enumerate as
+    // orphan" and "delete" where a concurrent writer (the foreground indexer / another
+    // connection) could insert a node that REUSES a just-enumerated orphan's rowid and give it a
+    // vector; `nodes.id` is a plain INTEGER PRIMARY KEY, so after a wipe rowids restart at 1 and
+    // can land on a surviving race-orphan's id. This reap would then point-delete that now-LIVE
+    // node's vector — a search gap until the backfill re-embeds it. IMMEDIATE holds the write
+    // lock across enumerate+delete, so a racing writer either committed before our snapshot (its
+    // node is seen as live, never enumerated as an orphan) or is serialized after us. vec0 still
+    // requires point deletes by primary key, so the enumerate-then-delete shape is unchanged.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Safety: never sweep against an EMPTY `nodes` table. An empty nodes set is far more likely a
+    // transient (mid-rebuild / INDEX_VERSION-bump wipe window) than a real zero-symbol project —
+    // sweeping then would see EVERY vector as an "orphan" and delete the whole index, forcing a
+    // full re-embed (the "从 1% 重建" cost this hardening avoids). Read inside the txn so the
+    // check shares the delete's snapshot. If nodes is genuinely empty there is no legitimate
+    // vector to keep anyway, so skipping is free.
+    let node_count: i64 = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
     if node_count == 0 {
-        return Ok(0);
+        return Ok(0); // tx rolls back on drop; nothing was written
     }
     // Enumerate orphan node_ids first (collect before mutating), then delete by primary key —
     // the only vec0-safe delete form. Anti-join against nodes finds vectors with no live node.
     let orphan_ids: Vec<i64> = {
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT node_id FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)"
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
@@ -229,9 +251,8 @@ pub fn reap_orphan_vectors(conn: &Connection) -> Result<usize> {
     if orphan_ids.is_empty() {
         return Ok(0);
     }
-    let tx = conn.unchecked_transaction()?;
     {
-        let mut del = conn.prepare_cached("DELETE FROM node_vectors WHERE node_id = ?1")?;
+        let mut del = tx.prepare_cached("DELETE FROM node_vectors WHERE node_id = ?1")?;
         for id in &orphan_ids {
             del.execute(rusqlite::params![id])?;
         }

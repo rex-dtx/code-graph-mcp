@@ -28,6 +28,23 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
 
     let t0 = std::time::Instant::now();
 
+    // Same-dim model-swap guard AT THE CHOKEPOINT. Every embed path funnels through this function
+    // (foreground Phase 3 / index_files, CLI rebuild-index / reindex, incremental / context, and
+    // the background backfill), so validating the model's content fingerprint HERE — before the
+    // cache read below — closes the parity gap where only the MCP backfill checked it. Without
+    // this, a CLI `rebuild-index` after a same-dim model change (invisible to the vec-table dim
+    // check) would reuse STALE old-model embeddings from the cache with NO self-heal on a
+    // CLI-only deployment. Drops stale cache + node_vectors on a real change; a no-op meta compare
+    // when unchanged / first run. (The backfill ALSO checks before its work-loop, so an
+    // all-already-embedded index still invalidates when zero nodes route through here.)
+    #[cfg(feature = "embed-model")]
+    if let Err(e) = crate::storage::queries::ensure_embedding_cache_valid(
+        db.conn(),
+        EmbeddingModel::MODEL_CONTENT_BLAKE3,
+    ) {
+        tracing::warn!("[embed-cache] validity check failed (continuing): {}", e);
+    }
+
     // Reuse embeddings for unchanged content instead of re-running the model — this is what
     // turns a rebuild "从 1% 重建" into a byte copy. partition_by_cache splits into cache HITS
     // (already computed in a prior generation / seeded from surviving vectors, copied straight
