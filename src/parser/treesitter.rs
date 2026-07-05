@@ -726,6 +726,35 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
                     param_types: sig_info.param_types,
                     is_test: false,
                 });
+            } else if !matches!(value.kind(), "function_expression" | "function")
+                && node.parent().map(|p| p.kind()) == Some("export_statement")
+            {
+                // Top-level `export const/let X = <value>` — a config constant, a
+                // route/config table, or a widely-imported singleton such as
+                // `const store = defineStore(...)`, `const logger = createLogger(...)`,
+                // or `const svc = new Service()`. Only EXPORTED top-level declarations
+                // are extracted: a local `const x = 5` inside a function body cannot be
+                // imported cross-file, so extracting it would be pure noise. Emitting
+                // the symbol lets `import { X } from './mod'` resolve to a real node and
+                // form a REL_IMPORTS edge — previously the import bound to the
+                // `<external>` sentinel and the dependency was invisible to
+                // tour/affected/impact/project_map (feedback_const_export_no_import_edge).
+                // Type "constant" mirrors the Rust `const_item`/`static_item` extraction
+                // (this is TS/JS reaching parity); function-valued consts are handled by
+                // the arrow branch above, never here.
+                out.push(ParsedNode {
+                    node_type: "constant".into(),
+                    name: name.clone(),
+                    qualified_name: Some(name),
+                    start_line: child.start_position().row as u32 + 1,
+                    end_line: child.end_position().row as u32 + 1,
+                    code_content: truncate_code_content(node_text(&child, source)).into_owned(),
+                    signature: None,
+                    doc_comment: get_preceding_comment(node, source),
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                });
             }
         }
     }
@@ -1507,5 +1536,47 @@ const NAMES: &[&str] = &["a", "b"];
 
         let db_path = nodes.iter().find(|n| n.name == "DB_PATH").unwrap();
         assert_eq!(db_path.node_type, "constant");
+    }
+
+    #[test]
+    fn test_parse_typescript_exported_consts() {
+        // Top-level `export const X = <value>` becomes a `constant` node so a
+        // cross-file `import { X }` resolves to it and forms a REL_IMPORTS edge
+        // (INDEX_VERSION 39, feedback_const_export_no_import_edge). Arrow-valued
+        // consts stay `function`; non-exported consts — top-level OR function-local —
+        // are NOT extracted: they can't be imported cross-file, so a node would be
+        // pure noise.
+        let code = r#"
+export const API_URL = "https://example.com";
+export const DEFAULT_CONFIG = {
+    timeout: 5000,
+    retries: 3,
+};
+export const authStore = createStore({ url: API_URL });
+export const buildUrl = (p: string) => API_URL + p;
+export function handler() { return 1; }
+
+const NOT_EXPORTED = 42;
+
+function scope() {
+    const localOnly = 7;
+    return localOnly;
+}
+"#;
+        let nodes = parse_code(code, "typescript").unwrap();
+        let by = |n: &str| nodes.iter().find(|x| x.name == n);
+
+        // Value literals, objects, and call-result singletons → `constant`.
+        assert_eq!(by("API_URL").expect("exported value const").node_type, "constant");
+        assert_eq!(by("DEFAULT_CONFIG").expect("multi-line object const").node_type, "constant");
+        assert_eq!(by("authStore").expect("singleton const").node_type, "constant");
+
+        // Arrow-valued const and plain function stay `function` (unchanged).
+        assert_eq!(by("buildUrl").expect("arrow const").node_type, "function");
+        assert_eq!(by("handler").expect("export function").node_type, "function");
+
+        // Non-exported consts are never extracted (can't be imported → noise).
+        assert!(by("NOT_EXPORTED").is_none(), "non-exported top-level const must not be a symbol");
+        assert!(by("localOnly").is_none(), "function-local const must not be a symbol");
     }
 }

@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.90.0 — TS/JS exported value constants are now graphed
+
+`INDEX_VERSION` 38 → 39 (existing indexes rebuild on next open).
+
+### Added
+- **Top-level `export const/let X = <value>` in TS/JS/TSX is now extracted as a
+  `constant` symbol.** Previously only arrow-function consts (`export const f = () =>
+  {}`) became nodes; a value const — a config literal (`export const API_URL = "…"`),
+  a route/config table, or a widely-imported singleton (`export const store =
+  defineStore(…)`, `const logger = createLogger(…)`, `const svc = new Service()`) — was
+  not a symbol, so `import { X } from './mod'` bound to the `<external>` sentinel and
+  the cross-module dependency was **invisible** to `tour`, `affected`, `impact`, and
+  `project_map`. The import now resolves to the real node and forms a `REL_IMPORTS`
+  edge. A measurement across four TS/JS projects found 66 module dependencies that
+  existed *only* through such value-const imports and were therefore entirely absent
+  from the graph. This brings TS/JS to parity with the existing Rust
+  `const`/`static` extraction.
+
+  Scope and safeguards: only **exported, top-level** declarations are extracted — a
+  function-local `const x = 5` cannot be imported cross-file, so it is deliberately not
+  a symbol (no noise). Arrow/function-valued consts are unchanged (stay `function`). An
+  exported-but-unused constant is reported by `dead-code` as *exported-unused* (the
+  softer category, same as a `pub` Rust item), never as a hard orphan; one-line consts
+  fall below the default `min-lines` and are not reported at all. This release is
+  scoped to TS/JS/TSX — Go package-level `const`/`var`, Python module constants, and
+  Java `static final` fields have different import idioms and are not addressed here.
+
 ## v0.89.0 — semantic-search confidence warning fires on an honest signal
 
 The `low_confidence_warning` on `semantic_code_search` was a false alarm on the

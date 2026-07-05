@@ -417,6 +417,59 @@ export function run() { return process(); }
 }
 
 #[test]
+fn test_exported_const_value_forms_import_edge() {
+    // INDEX_VERSION 39: a top-level `export const X = <value>` is extracted as a
+    // `constant` node, so `import { X } from './config'` resolves to it and forms a
+    // REL_IMPORTS edge. Previously the const was not a symbol, so the import bound to
+    // the `<external>` sentinel and the cross-module dependency was invisible to
+    // tour/affected/impact/project_map (feedback_const_export_no_import_edge).
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+
+    fs::write(project_dir.path().join("src/config.ts"), r#"
+export const API_URL = "https://example.com";
+export const DEFAULT_CONFIG = { timeout: 5000, retries: 3 };
+
+const NOT_EXPORTED = 42;
+"#).unwrap();
+    fs::write(project_dir.path().join("src/api.ts"), r#"
+import { API_URL, DEFAULT_CONFIG } from './config';
+
+export function fetchData() { return API_URL + DEFAULT_CONFIG.timeout; }
+"#).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // The exported value const is a real `constant` node; the non-exported one is not.
+    let const_types: Vec<String> = db.conn().prepare(
+        "SELECT n.type FROM nodes n JOIN files f ON f.id = n.file_id
+         WHERE n.name = 'API_URL' AND f.path = 'src/config.ts'"
+    ).unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap()
+     .filter_map(Result::ok).collect();
+    assert_eq!(const_types, vec!["constant".to_string()],
+        "export const value must be extracted as exactly one `constant` node");
+
+    let not_exported: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM nodes WHERE name = 'NOT_EXPORTED'", [], |r| r.get(0)).unwrap();
+    assert_eq!(not_exported, 0, "a non-exported top-level const must not be extracted");
+
+    // `import { API_URL }` resolves to the const node in its defining file, not <external>.
+    let resolved_targets: Vec<String> = db.conn().prepare(
+        "SELECT tf.path FROM edges e
+         JOIN nodes tn ON tn.id = e.target_id
+         JOIN files tf ON tf.id = tn.file_id
+         WHERE e.relation = 'imports' AND tn.name = 'API_URL'"
+    ).unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap()
+     .filter_map(Result::ok).collect();
+    assert!(resolved_targets.iter().any(|p| p == "src/config.ts"),
+        "import {{ API_URL }} must resolve to the const in src/config.ts; got {:?}", resolved_targets);
+    assert!(!resolved_targets.iter().any(|p| p.contains("external")),
+        "import must NOT bind to the <external> sentinel; got {:?}", resolved_targets);
+}
+
+#[test]
 fn test_js_import_binds_call_over_path_proximity() {
     // Cycle 2 end-to-end (TS analog of test_import_binding_resolves_call_over_path_proximity):
     // once JS imports resolve via specifier, the Cycle-1 bind repoints the bare
