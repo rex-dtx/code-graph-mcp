@@ -254,15 +254,20 @@ fn extract_nodes(
                     Some("enum") => "enum",
                     _ => "class",
                 };
+                // Widen to the `decorated_definition` wrapper so a decorated Python
+                // class (`@dataclass class Config:`) retains its decorator in the
+                // extent/source (issue #31). No-op for non-Python classes and
+                // undecorated Python classes (extent == node).
+                let extent = python_decorated_extent(&node);
                 results.push(ParsedNode {
                     node_type: node_type_str.into(),
                     name: name.clone(),
                     qualified_name: Some(name.clone()),
-                    start_line: node.start_position().row as u32 + 1,
-                    end_line: node.end_position().row as u32 + 1,
-                    code_content: truncate_code_content(node_text(&node, source)).into_owned(),
+                    start_line: extent.start_position().row as u32 + 1,
+                    end_line: extent.end_position().row as u32 + 1,
+                    code_content: truncate_code_content(node_text(&extent, source)).into_owned(),
                     signature: None,
-                    doc_comment: get_preceding_comment(&node, source),
+                    doc_comment: get_preceding_comment(&extent, source),
                     return_type: None,
                     param_types: None,
                     is_test: node_is_test,
@@ -638,6 +643,23 @@ fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, sou
     }
 }
 
+/// Python wraps a decorated `def`/`class` in a `decorated_definition` node whose
+/// extent spans the decorator stack; the inner `function_definition` /
+/// `class_definition` starts at `def`/`class`. Binding a symbol to the inner node
+/// drops every decorator from its source and extent — losing the semantic payload
+/// of e.g. `@field_validator("lat", mode="before")`, the pydantic contract
+/// (issue #31). When a definition is the child of a `decorated_definition`, return
+/// that wrapper so `start_line` and `code_content` include the decorators; the
+/// decorator text also lets `find_dead_code` recognize framework-registered
+/// (edgeless) entry points. No-op for every other language: `decorated_definition`
+/// is a Python-only node kind, so a non-Python `def`/`class` returns itself.
+fn python_decorated_extent<'a>(node: &tree_sitter::Node<'a>) -> tree_sitter::Node<'a> {
+    match node.parent() {
+        Some(parent) if parent.kind() == "decorated_definition" => parent,
+        _ => *node,
+    }
+}
+
 fn extract_function_node(
     node: &tree_sitter::Node,
     source: &str,
@@ -649,17 +671,22 @@ fn extract_function_node(
         Some(cls) => Some(format!("{}.{}", cls, name)),
         None => Some(name.clone()),
     };
+    // Name/signature/params come from the inner definition; the extent (line span
+    // + stored source) widens to the enclosing `decorated_definition` so Python
+    // decorators are retained (issue #31). extent == node for undecorated defs and
+    // every non-Python language.
     let sig_info = extract_signature_info(node, source);
+    let extent = python_decorated_extent(node);
 
     Some(ParsedNode {
         node_type: node_type.into(),
         name,
         qualified_name,
-        start_line: node.start_position().row as u32 + 1,
-        end_line: node.end_position().row as u32 + 1,
-        code_content: truncate_code_content(node_text(node, source)).into_owned(),
+        start_line: extent.start_position().row as u32 + 1,
+        end_line: extent.end_position().row as u32 + 1,
+        code_content: truncate_code_content(node_text(&extent, source)).into_owned(),
         signature: sig_info.signature,
-        doc_comment: get_preceding_comment(node, source),
+        doc_comment: get_preceding_comment(&extent, source),
         return_type: sig_info.return_type,
         param_types: sig_info.param_types,
         is_test: false,
@@ -1350,6 +1377,86 @@ function Container() {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"fetch_data"), "got: {:?}", names);
         assert!(names.contains(&"get"), "got: {:?}", names);
+    }
+
+    /// Issue #31: `get_ast_node` stripped every decorator because the symbol was
+    /// bound to the inner tree-sitter `function_definition`/`class_definition`
+    /// (which starts at `def`/`class`) instead of the enclosing
+    /// `decorated_definition` wrapper that spans the decorator stack. For pydantic
+    /// v2 the decorator IS the contract (`@field_validator("lat", mode="before")`
+    /// carries the validated field + mode), so its loss blinds semantic search /
+    /// impact analysis. Extent (`start_line`) and `code_content` must include the
+    /// decorators for decorated functions, methods, async methods, and classes,
+    /// while name/signature still come from the inner definition.
+    #[test]
+    fn test_parse_python_decorated_extent_includes_decorators() {
+        let code = r#"from pydantic import BaseModel, field_validator, computed_field
+
+
+class Demo(BaseModel):
+    lat: str
+
+    @field_validator("lat", mode="before")
+    @classmethod
+    def pre_validate(cls, v):
+        return str(v)
+
+    @computed_field
+    @property
+    def label(self) -> str:
+        return "x"
+
+    @staticmethod
+    async def refresh(self):
+        return None
+
+
+@app.route("/health")
+def health():
+    return "ok"
+
+
+@dataclass
+class Config:
+    x: int
+"#;
+        let nodes = parse_code(code, "python").unwrap();
+        let by_name = |n: &str| -> &ParsedNode {
+            nodes.iter().find(|x| x.name == n)
+                .unwrap_or_else(|| panic!("{n} not extracted; got: {:?}",
+                    nodes.iter().map(|x| &x.name).collect::<Vec<_>>()))
+        };
+
+        // Decorated classmethod: full decorator stack + start at first decorator.
+        let pv = by_name("pre_validate");
+        assert!(pv.code_content.contains("@field_validator(\"lat\", mode=\"before\")"),
+            "code_content must include the pydantic decorator (issue #31); got: {:?}", pv.code_content);
+        assert!(pv.code_content.contains("@classmethod"),
+            "code_content must include the FULL decorator stack; got: {:?}", pv.code_content);
+        assert_eq!(pv.start_line, 7,
+            "start_line must point at the first decorator, not `def`; got: {}", pv.start_line);
+        assert_eq!(pv.node_type, "method");
+
+        // @property method (issue #31 secondary): decorator retained.
+        let label = by_name("label");
+        assert!(label.code_content.contains("@property"),
+            "property decorator must be retained; got: {:?}", label.code_content);
+
+        // Decorated async staticmethod.
+        let refresh = by_name("refresh");
+        assert!(refresh.code_content.contains("@staticmethod"),
+            "async method decorator must be retained; got: {:?}", refresh.code_content);
+
+        // Top-level decorated function.
+        let health = by_name("health");
+        assert!(health.code_content.contains("@app.route(\"/health\")"),
+            "top-level function decorator must be retained; got: {:?}", health.code_content);
+
+        // Decorated class.
+        let config = by_name("Config");
+        assert!(config.code_content.contains("@dataclass"),
+            "class decorator must be retained; got: {:?}", config.code_content);
+        assert_eq!(config.node_type, "class");
     }
 
     #[test]

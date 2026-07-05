@@ -88,6 +88,32 @@ pub fn find_dead_code(
         "(n.end_line - n.start_line + 1) >= :min_lines".to_string(),
     ];
 
+    // Python framework-registered / attribute-accessed methods (pydantic
+    // validators & serializers, pytest fixtures, @property/@cached_property,
+    // @abstractmethod, @overload, NiceGUI handlers) are invoked DYNAMICALLY — the
+    // framework/runtime dispatches them, so they never carry an incoming `calls`
+    // edge even when fully live (a pydantic validator resolves to caller_count 0).
+    // That makes them edgeless by nature, the same guaranteed-false-positive class
+    // as the constructors/dunders excluded above, and the DOMINANT dead-code false
+    // positive on framework-heavy Python (issue #32). The decorator text sits at
+    // the head of code_content because the parser binds Python symbols to the
+    // enclosing `decorated_definition` wrapper (issue #31, INDEX_VERSION 36) and
+    // truncation only ever drops the tail — so an `@`-anchored substring probe is
+    // reliable. Built from the canonical PYTHON_FRAMEWORK_DECORATORS list; every
+    // entry is a literal `@<name>` with no quote characters, so interpolating them
+    // into the SQL is injection-safe. Bias is toward false-negatives (a genuinely
+    // dead decorated symbol may be missed) — the safe direction for this tool.
+    {
+        let decorator_probes = crate::domain::PYTHON_FRAMEWORK_DECORATORS
+            .iter()
+            .map(|d| format!("instr(n.code_content, '{d}') > 0"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        conditions.push(format!(
+            "NOT (f.language = 'python' AND n.type IN ('method', 'function') AND ({decorator_probes}))"
+        ));
+    }
+
     if !include_tests {
         conditions.push("n.is_test = 0".to_string());
     }
@@ -894,6 +920,75 @@ mod tests {
             "C++ destructor '~Beta' must NOT be reported dead; got: {names:?}");
         assert!(names.contains(&"compute_unused"),
             "a genuinely-dead regular method must still be reported; got: {names:?}");
+    }
+
+    /// Regression (issue #32 cause 1): Python methods/functions registered with a
+    /// framework decorator (pydantic `@field_validator`/`@model_validator`/
+    /// `@computed_field`, pytest `@fixture`, stdlib `@property`/`@abstractmethod`/
+    /// `@overload`, NiceGUI handlers) are invoked dynamically by the framework /
+    /// runtime, so they never carry an incoming `calls` edge even when fully live —
+    /// the dominant dead-code false positive on framework-heavy Python (~83 of 86
+    /// orphans in the reporter's pydantic+NiceGUI codebase). Now that the parser
+    /// stores the decorator stack in `code_content` (issue #31,
+    /// `decorated_definition` binding), such methods are excluded by an @-anchored
+    /// decorator probe. A plain edgeless method must STILL be reported (no
+    /// over-suppression), matching the tool's genuine-dead-code contract.
+    #[test]
+    fn test_find_dead_code_excludes_python_framework_decorated() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        // Single file so the same-file instr probe cannot coincidentally rescue
+        // anything — every method below is genuinely edgeless. Their only
+        // distinguishing feature vs a flagged plain method is the decorator stack
+        // stored at the head of code_content (exactly as the parser now emits it).
+        let fid = upsert_file(conn, &FileRecord {
+            path: "src/models.py".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("python".into()),
+        }).unwrap();
+
+        let decorated = [
+            ("pre_validate",
+             "@field_validator(\"lat\", mode=\"before\")\n@classmethod\ndef pre_validate(cls, v):\n    return str(v)"),
+            ("check_after",
+             "@model_validator(mode=\"after\")\ndef check_after(self):\n    return self"),
+            ("label",
+             "@computed_field\n@property\ndef label(self) -> str:\n    return \"lbl\""),
+            ("area",
+             "@property\ndef area(self):\n    return self.w * self.h"),
+            ("shape",
+             "@abstractmethod\ndef shape(self):\n    raise NotImplementedError"),
+            ("db_conn",
+             "@pytest.fixture\ndef db_conn():\n    return connect_db()"),
+        ];
+        for (i, (name, code)) in decorated.iter().enumerate() {
+            insert_node(conn, &NodeRecord {
+                file_id: fid, node_type: "method".into(), name: (*name).into(),
+                qualified_name: None, start_line: (i as i64) * 10 + 1, end_line: (i as i64) * 10 + 4,
+                code_content: (*code).into(), signature: None, doc_comment: None,
+                context_string: None, name_tokens: None, return_type: None,
+                param_types: None, is_test: false,
+            }).unwrap();
+        }
+
+        // A genuinely-dead PLAIN method (no decorator) — must still be reported.
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "method".into(), name: "compute_unused".into(),
+            qualified_name: None, start_line: 200, end_line: 204,
+            code_content: "def compute_unused(self):\n    a = 1\n    b = 2\n    return a + b".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let names: Vec<String> = find_dead_code(conn, None, None, false, 1, 100)
+            .unwrap().into_iter().map(|r| r.name).collect();
+
+        for (name, _) in &decorated {
+            assert!(!names.contains(&name.to_string()),
+                "framework-decorated method '{name}' must NOT be reported dead (issue #32 cause 1); got: {names:?}");
+        }
+        assert!(names.contains(&"compute_unused".to_string()),
+            "a plain edgeless method must still be reported (no over-suppression); got: {names:?}");
     }
 
     /// Regression: markdown headings (h1..h6) are document structure, never

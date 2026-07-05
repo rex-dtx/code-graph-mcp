@@ -669,3 +669,145 @@ fn express_route_with_imported_handler_produces_routes_to_edge() {
         );
     }
 }
+
+/// Incoming `calls` edge count to the node whose `qualified_name` == `qn`.
+fn incoming_calls_by_qualified_name(db: &Database, qn: &str) -> i64 {
+    db.conn().query_row(
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id = e.target_id
+         WHERE e.relation = 'calls' AND t.qualified_name = ?",
+        [qn],
+        |r| r.get(0),
+    ).unwrap()
+}
+
+/// Issue #32 cause 2: a Python receiver whose type is fixed by a single local
+/// constructor assignment (`writer = DataWriter()`) resolves `writer.write()` to
+/// THAT class's method — even though `write` is defined on three sibling classes.
+/// Before the fix the ambiguous by-name fan-out was dropped, orphaning all three.
+#[test]
+fn python_receiver_type_resolves_to_constructor_type() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "writers.py", r#"
+class DataWriter:
+    def write(self, id, items):
+        return len(items)
+
+class ProfileWriter:
+    def write(self, id, items):
+        return None
+
+class ScenarioWriter:
+    def write(self, id, items):
+        return None
+
+def save(id, conflicts):
+    writer = DataWriter()
+    writer.write(id, conflicts)
+"#);
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    assert_eq!(
+        incoming_calls_by_qualified_name(&db, "DataWriter.write"), 1,
+        "save() must resolve `writer.write()` to DataWriter.write (writer = DataWriter())"
+    );
+    assert_eq!(
+        incoming_calls_by_qualified_name(&db, "ProfileWriter.write"), 0,
+        "ProfileWriter.write must NOT receive a false cross-type edge"
+    );
+    assert_eq!(
+        incoming_calls_by_qualified_name(&db, "ScenarioWriter.write"), 0,
+        "ScenarioWriter.write must NOT receive a false cross-type edge"
+    );
+    // The precise resolution also unblocks callgraph/impact: the caller is visible.
+    let callers = callers_of(&db, "write");
+    assert!(
+        callers.iter().any(|c| c.contains("save")),
+        "save must be a caller of the resolved write method; got: {:?}", callers
+    );
+}
+
+/// Regression guard for the cause-2 fix: when the receiver's inferred type does
+/// NOT declare the method because it's INHERITED from a base class, rtype
+/// filtering finds no same-type candidate and must FALL THROUGH to the default
+/// bare resolution so the inherited call still resolves — the fix must add
+/// precision, never drop an edge the bare path would have made.
+#[test]
+fn python_receiver_type_inherited_method_still_resolves() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "models.py", r#"
+class Base:
+    def process(self, x):
+        return x + 1
+
+class Derived(Base):
+    pass
+
+def run(x):
+    d = Derived()
+    d.process(x)
+"#);
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    // Derived has no own `process`; it's inherited from Base. rtype=Derived
+    // filters to empty and falls through to the unique bare match Base.process.
+    assert_eq!(
+        incoming_calls_by_qualified_name(&db, "Base.process"), 1,
+        "inherited d.process() must fall through to Base.process, not drop"
+    );
+    let callers = callers_of(&db, "process");
+    assert!(
+        callers.iter().any(|c| c.contains("run")),
+        "run must be a caller of the inherited process method; got: {:?}", callers
+    );
+}
+
+/// Issue #32 cause 2 (parameter-annotation extension): a receiver that is a
+/// function parameter with an explicit class annotation (`def save(writer:
+/// DataWriter)`) resolves `writer.write()` to that class's method among sibling
+/// classes sharing the method name — no local constructor assignment needed.
+#[test]
+fn python_receiver_type_from_parameter_annotation_resolves() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "writers.py", r#"
+class DataWriter:
+    def write(self, id, items):
+        return len(items)
+
+class ProfileWriter:
+    def write(self, id, items):
+        return None
+
+class ScenarioWriter:
+    def write(self, id, items):
+        return None
+
+def save(writer: DataWriter, id, conflicts):
+    writer.write(id, conflicts)
+"#);
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    assert_eq!(
+        incoming_calls_by_qualified_name(&db, "DataWriter.write"), 1,
+        "param-annotated `writer: DataWriter` must resolve writer.write() to DataWriter.write"
+    );
+    assert_eq!(
+        incoming_calls_by_qualified_name(&db, "ProfileWriter.write"), 0,
+        "ProfileWriter.write must NOT receive a false cross-type edge"
+    );
+    assert_eq!(
+        incoming_calls_by_qualified_name(&db, "ScenarioWriter.write"), 0,
+        "ScenarioWriter.write must NOT receive a false cross-type edge"
+    );
+}

@@ -257,3 +257,194 @@ fn collect_py_idents(
         }
     }
 }
+
+/// Issue #32 cause 2 — bounded single-assignment receiver type propagation.
+/// For a Python call `recv.method(...)` whose receiver `recv` is a plain local
+/// variable, infer its type from a SINGLE unambiguous constructor assignment
+/// `recv = ClassName(...)` in the nearest enclosing function body (or the module
+/// for top-level code) and return `ClassName`. The mod.rs call arm stamps it as
+/// `{"q":"rtype","v":"ClassName"}` so Phase-2 resolution can pick
+/// `ClassName.method` out of N same-named methods (via `self_filter_candidates`),
+/// instead of dropping the whole by-name fan-out as ambiguous — the exact drop
+/// that reported live pydantic-style receiver methods as dead code.
+///
+/// Deliberately conservative — returns None (→ unchanged bare resolution) unless
+/// the type is provably fixed, so it can NEVER emit a wrong-type edge. Priority:
+/// a SINGLE local `recv = ClassName(...)` constructor assignment wins (a local
+/// (re)assignment is the receiver's real type at the call, overriding any
+/// parameter annotation); with NO local assignment, an explicit parameter
+/// annotation `def f(recv: ClassName)` of the enclosing function is used; a
+/// receiver with >1 assignment is possibly mixed-type and stays unknown (None).
+/// Both sources require the callee shape `identifier.method()` (not `self`/`cls`,
+/// not a chain / attribute receiver) and an upper-case-initial simple class name
+/// (builtins like `str` and non-simple annotations fall back to bare).
+///
+/// A wrong guess still can't create a bad edge: a bogus type simply fails
+/// `self_filter_candidates` (no `Type.method` node) and drops, exactly as today.
+pub(super) fn infer_python_call_receiver_type(
+    call_node: &tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
+    let function = call_node.child_by_field_name("function")?;
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    if object.kind() != "identifier" {
+        return None;
+    }
+    let recv = node_text(&object, source);
+    // `self`/`cls` are not local-variable receivers; leave them to bare
+    // resolution (Python does not currently emit a Self qualifier).
+    if recv.is_empty() || recv == "self" || recv == "cls" {
+        return None;
+    }
+
+    let scope = nearest_py_scope(call_node)?;
+    let scan_root = if scope.kind() == "function_definition" {
+        scope.child_by_field_name("body")?
+    } else {
+        scope
+    };
+    let mut rhs_nodes: Vec<tree_sitter::Node> = Vec::new();
+    collect_py_recv_assignment_rhs(&scan_root, recv, source, &mut rhs_nodes, 0);
+    match rhs_nodes.len() {
+        // A single local `recv = ClassName(...)` fixes the type (and a local
+        // reassignment correctly overrides any stale parameter annotation).
+        1 => py_constructor_type_name(&rhs_nodes[0], source),
+        // No local (re)assignment → fall back to an explicit parameter annotation
+        // of the enclosing function. Module-level receivers have no parameters.
+        0 if scope.kind() == "function_definition" => {
+            py_param_annotation_type(&scope, recv, source)
+        }
+        // >1 assignment → possibly reassigned to different types → unknown.
+        _ => None,
+    }
+}
+
+/// Nearest enclosing scope node — a `function_definition` or the `module` root.
+/// Callers derive the statement block via the `body` field to scan assignments,
+/// or read `parameters` for annotation lookup. Bounded upward walk.
+fn nearest_py_scope<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+    let mut cur = node.parent();
+    let mut depth = 0;
+    while let Some(n) = cur {
+        if depth > MAX_SUBTREE_DEPTH {
+            return None;
+        }
+        if matches!(n.kind(), "function_definition" | "module") {
+            return Some(n);
+        }
+        cur = n.parent();
+        depth += 1;
+    }
+    None
+}
+
+/// Resolve `recv`'s type from a parameter annotation of `func`
+/// (`def f(recv: ClassName, ...)` or `def f(recv: ClassName = default)`). Returns
+/// the annotated class name via `py_annotation_type_name` (upper-case-initial
+/// simple identifier only). Only the nearest enclosing function's own parameters
+/// are consulted — a closure-captured outer param falls back to bare resolution.
+fn py_param_annotation_type(func: &tree_sitter::Node, recv: &str, source: &str) -> Option<String> {
+    let params = func.child_by_field_name("parameters")?;
+    for i in 0..params.named_child_count() {
+        let p = match params.named_child(i) {
+            Some(p) => p,
+            None => continue,
+        };
+        // `def f(w: T)` → `typed_parameter` (name = first identifier child, no
+        // field); `def f(w: T = d)` → `typed_default_parameter` (name field).
+        let (name_node, type_node) = match p.kind() {
+            "typed_parameter" => {
+                let name = (0..p.named_child_count())
+                    .filter_map(|j| p.named_child(j))
+                    .find(|c| c.kind() == "identifier");
+                (name, p.child_by_field_name("type"))
+            }
+            "typed_default_parameter" => {
+                (p.child_by_field_name("name"), p.child_by_field_name("type"))
+            }
+            _ => continue,
+        };
+        if let (Some(name), Some(ty)) = (name_node, type_node) {
+            if node_text(&name, source) == recv {
+                return py_annotation_type_name(&ty, source);
+            }
+        }
+    }
+    None
+}
+
+/// Extract a simple upper-case-initial class name from a `type` annotation node.
+/// tree-sitter-python wraps the annotation in a `type` node; only a bare
+/// `identifier` annotation (`w: DataWriter`) is used — generics (`List[T]`),
+/// dotted (`mod.T`), and string forward-refs are left to bare resolution.
+fn py_annotation_type_name(ty: &tree_sitter::Node, source: &str) -> Option<String> {
+    let inner = if ty.kind() == "type" {
+        ty.named_child(0)?
+    } else {
+        *ty
+    };
+    if inner.kind() == "identifier" {
+        let name = node_text(&inner, source);
+        if name.chars().next()?.is_uppercase() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Collect the RHS node of every `recv = <rhs>` plain assignment in a scope,
+/// recursing into nested blocks (if/for/while/with/try) but NOT into nested
+/// `function_definition`/`class_definition` — a same-named variable there is a
+/// different binding. Augmented assignments (`recv += x`) are intentionally not
+/// collected (they don't (re)bind the type).
+fn collect_py_recv_assignment_rhs<'a>(
+    node: &tree_sitter::Node<'a>,
+    recv: &str,
+    source: &str,
+    out: &mut Vec<tree_sitter::Node<'a>>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if node.kind() == "assignment" {
+        if let Some(left) = node.child_by_field_name("left") {
+            if left.kind() == "identifier" && node_text(&left, source) == recv {
+                if let Some(right) = node.child_by_field_name("right") {
+                    out.push(right);
+                }
+            }
+        }
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if matches!(child.kind(), "function_definition" | "class_definition") {
+                continue;
+            }
+            collect_py_recv_assignment_rhs(&child, recv, source, out, depth + 1);
+        }
+    }
+}
+
+/// If `rhs` is a direct constructor call `ClassName(...)` — a `call` whose
+/// `function` is a plain `identifier` with an upper-case initial — return
+/// `ClassName`. Rejects `mod.Class()` (attribute callee), lower-case factory
+/// functions, and non-call RHS so the inferred type is a plausible class.
+fn py_constructor_type_name(rhs: &tree_sitter::Node, source: &str) -> Option<String> {
+    if rhs.kind() != "call" {
+        return None;
+    }
+    let function = rhs.child_by_field_name("function")?;
+    if function.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&function, source);
+    if name.chars().next()?.is_uppercase() {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}

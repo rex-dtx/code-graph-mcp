@@ -25,6 +25,11 @@ pub(super) enum CalleeMeta {
     Path(Vec<String>),
     SelfType(String),
     SelfRecv(String),
+    /// `recv.method()` where `recv`'s type is fixed by a single local constructor
+    /// assignment (`recv = ClassName(...)`). Payload is the inferred type name.
+    /// Resolves identically to `SelfType` — restrict candidates to that type's
+    /// methods (issue #32 cause 2, Python).
+    RecvType(String),
     Receiver(String),
     Chain,
 }
@@ -49,6 +54,7 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
         }
         "self" => v.get("v")?.as_str().map(|t| CalleeMeta::SelfRecv(t.to_string())),
         "stype" => v.get("v")?.as_str().map(|t| CalleeMeta::SelfType(t.to_string())),
+        "rtype" => v.get("v")?.as_str().map(|t| CalleeMeta::RecvType(t.to_string())),
         "recv" => v.get("v")?.as_str().map(|r| CalleeMeta::Receiver(r.to_string())),
         _ => None,
     }
@@ -566,6 +572,13 @@ mod tests {
     fn parse_metadata_recv() {
         let m = parse_callee_metadata(Some(r#"{"q":"recv","v":"path"}"#)).unwrap();
         assert!(matches!(m, CalleeMeta::Receiver(ref r) if r == "path"));
+    }
+
+    #[test]
+    fn parse_metadata_recv_type() {
+        // Python receiver-type qualifier (issue #32 cause 2).
+        let m = parse_callee_metadata(Some(r#"{"q":"rtype","v":"DataWriter"}"#)).unwrap();
+        assert!(matches!(m, CalleeMeta::RecvType(ref t) if t == "DataWriter"));
     }
 
     #[test]

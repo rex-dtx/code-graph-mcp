@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.87.0 — Python indexing accuracy: decorators, framework dead-code, receiver-type resolution
+
+Fixes two reported Python-indexer issues (GitHub #31, #32) with one `INDEX_VERSION` bump
+(35 → 37; existing indexes rebuild on next open).
+
+### Fixed
+- **Decorators are no longer stripped from Python symbols (#31).** `get_ast_node` bound each
+  `def`/`class` to the inner tree-sitter node, so its `start_line` / `code_content` began at
+  `def`/`class` and dropped the whole decorator stack. For Pydantic v2 the decorator *is* the
+  contract — `@field_validator("lat", mode="before")` carries the validated field and mode — so
+  semantic search and impact analysis were blind to it (a plain `@property` was also stripped).
+  Symbols now bind to the enclosing `decorated_definition` wrapper (functions, methods, async
+  methods, and classes), so the extent and stored source include the full decorator stack;
+  name / signature still come from the inner definition.
+- **Framework-decorated methods are no longer false-positive dead code (#32, dominant cause).**
+  Methods registered or accessed via a decorator — pydantic `@field_validator` / `@model_validator`
+  / `@computed_field` / serializers, pytest `@fixture`, stdlib `@property` / `@cached_property` /
+  `@abstractmethod` / `@overload`, NiceGUI `@ui.refreshable` / `@ui.page` — are dispatched
+  dynamically, so they carry no static call edge and were reported as orphans (≈83 of 86 in the
+  reporter's pydantic + NiceGUI codebase). `find_dead_code` now excludes them (single SQL source,
+  CLI + MCP), the same class as constructors and dunder methods. Enabled by #31 placing the
+  decorator text into `code_content`.
+
+### Added
+- **Python receiver-type call resolution (#32, second cause).** A call `recv.method()` whose
+  receiver type is fixed by a single local `recv = ClassName(...)` constructor assignment — or by
+  an explicit parameter annotation `def f(recv: ClassName)` — now resolves to `ClassName.method`
+  instead of dropping the ambiguous by-name fan-out when the method name is shared across classes
+  (`writer.write()` with `write` defined on three classes previously orphaned all three).
+  Conservative by construction: only a provably-single assignment / explicit annotation infers a
+  type, and an inherited or mis-inferred method falls through to the existing bare resolution — so
+  it adds precision without ever creating a false cross-type edge. Brings to Python the
+  type-qualified receiver resolution PR #19 shipped for Rust.
+
+`INDEX_VERSION` 35 → 37 — existing indexes rebuild on next open. No `SCHEMA_VERSION` change.
+
 ## v0.86.1 — vector-layer race + cache-fingerprint parity fast-follow
 
 A post-v0.86.0 code review surfaced two latent concurrency/parity defects the shipped tests

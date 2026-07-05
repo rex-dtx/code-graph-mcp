@@ -1949,6 +1949,159 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
 }
 
 #[test]
+fn test_python_receiver_type_propagation_from_ctor_assignment() {
+    // Issue #32 cause 2: `recv.method()` whose receiver is fixed by a single
+    // local `recv = ClassName(...)` constructor assignment carries an rtype
+    // qualifier so Phase-2 resolution binds it to ClassName.method instead of
+    // dropping the ambiguous by-name fan-out (write defined on N classes).
+    let code = r#"
+class DataWriter:
+    def write(self, x):
+        return x
+
+def save(x):
+    writer = DataWriter()
+    writer.write(x)
+"#;
+    let relations = extract_relations(code, "python").unwrap();
+    let call = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "write")
+        .expect("missing call to write");
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"rtype","v":"DataWriter"}"#),
+        "writer.write() with `writer = DataWriter()` must carry rtype=DataWriter"
+    );
+    // The constructor call itself is a bare identifier call — no rtype.
+    let ctor = relations.iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "DataWriter")
+        .expect("missing constructor call DataWriter");
+    assert_eq!(ctor.metadata, None, "DataWriter() constructor call stays bare");
+}
+
+#[test]
+fn test_python_receiver_type_not_inferred_when_ambiguous_or_unknown() {
+    // Reassignment to a different type, a parameter receiver, self.method(), and
+    // a lower-case factory RHS must ALL stay metadata=None (bare) so a wrong-type
+    // edge is never emitted — the inference only fires on a provably-single
+    // constructor assignment.
+    let code = r#"
+class A:
+    def run(self):
+        return 1
+
+class B:
+    def run(self):
+        return 2
+
+def reassigned(flag):
+    w = A()
+    w = B()
+    w.run()
+
+def from_param(w):
+    w.run()
+
+def lower_factory():
+    w = make_thing()
+    w.run()
+
+class Holder:
+    def caller(self):
+        self.run()
+    def run(self):
+        return 0
+"#;
+    let relations = extract_relations(code, "python").unwrap();
+    let runs: Vec<_> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.target_name == "run")
+        .collect();
+    assert!(!runs.is_empty(), "expected some run() calls to be extracted");
+    for r in &runs {
+        assert_eq!(
+            r.metadata, None,
+            "ambiguous/unknown receiver must stay bare (source={}); got {:?}",
+            r.source_name, r.metadata
+        );
+    }
+}
+
+#[test]
+fn test_python_receiver_type_from_parameter_annotation() {
+    // Issue #32 cause 2 extension: a receiver that is a parameter with an
+    // explicit class annotation (`def f(w: DataWriter)`) carries the rtype
+    // qualifier just like a local constructor assignment — the annotation is an
+    // explicit, reliable type. Default-valued annotated params work too.
+    let code = r#"
+class DataWriter:
+    def write(self, x):
+        return x
+
+def save(writer: DataWriter, x):
+    writer.write(x)
+
+def save_default(writer: DataWriter = None):
+    writer.write(1)
+"#;
+    let relations = extract_relations(code, "python").unwrap();
+    let writes: Vec<_> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.target_name == "write")
+        .collect();
+    assert_eq!(writes.len(), 2, "expected two write() calls; got {:?}", writes.iter().map(|r| &r.source_name).collect::<Vec<_>>());
+    for w in &writes {
+        assert_eq!(
+            w.metadata.as_deref(),
+            Some(r#"{"q":"rtype","v":"DataWriter"}"#),
+            "param-annotated receiver `writer: DataWriter` must carry rtype=DataWriter (source={})",
+            w.source_name
+        );
+    }
+}
+
+#[test]
+fn test_python_receiver_type_param_annotation_negatives() {
+    // Un-annotated param, a builtin/lower-case annotation, and a param shadowed by
+    // a later local reassignment must all stay bare (no wrong-type edge).
+    let code = r#"
+class A:
+    def run(self):
+        return 1
+
+class B:
+    def run(self):
+        return 2
+
+def no_annotation(w):
+    w.run()
+
+def builtin_annotation(w: str):
+    w.run()
+
+def reassigned(w: A):
+    w = B()
+    w.run()
+"#;
+    let relations = extract_relations(code, "python").unwrap();
+    let runs: Vec<_> = relations.iter()
+        .filter(|r| r.relation == REL_CALLS && r.target_name == "run")
+        .collect();
+    assert!(!runs.is_empty(), "expected some run() calls");
+    for r in &runs {
+        // `reassigned` has one local `w = B()` → that's the cause-2 ctor path, so
+        // it legitimately carries rtype=B (the local reassignment wins, not the
+        // stale param annotation A). The other two must be bare.
+        if r.source_name.contains("reassigned") {
+            assert_eq!(r.metadata.as_deref(), Some(r#"{"q":"rtype","v":"B"}"#),
+                "local reassignment `w = B()` overrides the param annotation");
+        } else {
+            assert_eq!(r.metadata, None,
+                "un-annotated / builtin-annotated receiver must stay bare (source={}); got {:?}",
+                r.source_name, r.metadata);
+        }
+    }
+}
+
+#[test]
 fn test_rust_type_usage_emits_references_edge() {
     let src = r#"
 struct AppConfig {

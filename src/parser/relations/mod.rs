@@ -66,7 +66,7 @@ use exports::extract_export_names;
 use routes::{extract_route_pattern, extract_python_route};
 use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference, extract_rust_value_reference};
 use typescript::{extract_ts_type_reference, extract_js_value_reference};
-use python::{extract_python_type_reference, extract_python_value_reference};
+use python::{extract_python_type_reference, extract_python_value_reference, infer_python_call_receiver_type};
 use go::{extract_go_type_reference, extract_go_value_reference, extract_go_inheritance};
 use cpp::{extract_cpp_value_reference, extract_cpp_inheritance};
 use java::extract_java_type_reference;
@@ -692,11 +692,21 @@ fn walk_for_relations(
             // bash/js `<module>` fallback.
             let scope = active_scope.unwrap_or("<module>");
             if let Some(callee) = helpers::extract_callee_name(&node, source) {
+                // Receiver-type propagation (issue #32 cause 2): when the call is
+                // `recv.method()` and `recv`'s type is fixed by a single local
+                // `recv = ClassName(...)` constructor assignment, stamp
+                // `{"q":"rtype","v":"ClassName"}` so Phase-2 resolution binds it to
+                // `ClassName.method` (self_filter_candidates) instead of dropping
+                // the ambiguous by-name fan-out across every same-named method.
+                // Falls back to the bare, metadata-less form (unchanged behavior)
+                // whenever the type can't be proven — never emits a wrong-type edge.
+                let metadata = infer_python_call_receiver_type(&node, source)
+                    .map(|ty| format!(r#"{{"q":"rtype","v":"{}"}}"#, ty));
                 results.push(ParsedRelation {
                     source_name: scope.to_string(),
                     target_name: callee,
                     relation: REL_CALLS.into(),
-                    metadata: None,
+                    metadata,
                     source_language: String::new(),
                 });
             }

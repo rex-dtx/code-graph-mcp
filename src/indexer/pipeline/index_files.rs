@@ -789,6 +789,51 @@ pub(super) fn index_files(
                             }
                             continue;
                         }
+                        Some(CalleeMeta::RecvType(recv_type)) => {
+                            // Python receiver with a locally-inferred constructor
+                            // type (issue #32 cause 2). Restrict same-language
+                            // candidates to that type's OWN methods
+                            // (self_filter_candidates → qualified_name LIKE
+                            // 'Type.%'). When the type declares the method
+                            // directly → bind precisely, disambiguating same-named
+                            // methods on sibling classes (the whole point: pick
+                            // DataWriter.write out of {DataWriter,Profile,Scenario}
+                            // .write). When it does NOT — an INHERITED method
+                            // (`Base.method` reached via a `Derived()` receiver) or
+                            // a mis-inferred type — the filter is empty and we DO
+                            // NOT continue: control falls through to the default
+                            // bare resolution below. That keeps rtype strictly
+                            // ADDITIVE precision — it can pick the right target
+                            // among duplicates but can never DROP an edge the bare
+                            // path would have resolved. (Contrast SelfRecv/SelfType,
+                            // which drop on empty: a Rust `self.m()` whose `m` isn't
+                            // on the impl type is a compile error, not an inherited
+                            // hit, so there is nothing to fall back to.)
+                            let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                            let same_lang: Vec<i64> = all
+                                .iter()
+                                .filter(|id| matches!(
+                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                    Some(l) if l == pf.language.as_str()
+                                ))
+                                .copied()
+                                .collect();
+                            let filtered = self_filter_candidates(&recv_type, &same_lang, db)?;
+                            if !filtered.is_empty() {
+                                for &src_id in &source_ids {
+                                    for &tgt_id in &filtered {
+                                        if src_id != tgt_id
+                                            && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())?
+                                        {
+                                            total_edges_created += 1;
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            // filtered empty → fall through to default resolution
+                            // (inherited method / unique bare match / pending buffer).
+                        }
                         Some(CalleeMeta::Path(segments)) => {
                             let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
                             // Same-file candidates take precedence per the bare-name
