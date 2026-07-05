@@ -1694,14 +1694,12 @@ impl McpServer {
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
         let req: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(req) => req,
-            Err(e) => {
-                let resp = JsonRpcResponse::error(
-                    None,
-                    super::protocol::JSONRPC_PARSE_ERROR,
-                    format!("Parse error: {}", e),
-                );
-                return Ok(Some(serde_json::to_string(&resp)?));
-            }
+            // Deserialization failed. Fall back to a loose re-parse so we can tell
+            // genuinely-invalid JSON (-32700 Parse error) apart from valid JSON
+            // that just isn't a conforming Request object (-32600 Invalid Request),
+            // and recover the id for response correlation. The happy path stays a
+            // single allocation-free from_str; the Value re-parse only runs on error.
+            Err(fast_err) => return self.reject_unparsable(line, fast_err),
         };
 
         // Per JSON-RPC 2.0, notifications (no id) must never receive a response
@@ -1735,6 +1733,68 @@ impl McpServer {
         };
 
         Ok(Some(serde_json::to_string(&response)?))
+    }
+
+    /// Build the correct JSON-RPC error reply for a `line` that failed to
+    /// deserialize into a [`JsonRpcRequest`]. Distinguishes malformed JSON
+    /// (`-32700` Parse error) from valid JSON that is not a conforming Request
+    /// object (`-32600` Invalid Request), and echoes the request `id` when one
+    /// can be recovered so a client can still correlate the failure to its call
+    /// (JSON-RPC 2.0 §5). A malformed message with no `id` member is treated as
+    /// a Notification and receives no reply, matching the spec rule that
+    /// Notifications are never answered.
+    fn reject_unparsable(
+        &self,
+        line: &str,
+        fast_err: serde_json::Error,
+    ) -> Result<Option<String>> {
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                // Genuinely invalid JSON: nothing to correlate, id is null.
+                let resp = JsonRpcResponse::error(
+                    None,
+                    super::protocol::JSONRPC_PARSE_ERROR,
+                    format!("Parse error: {}", fast_err),
+                );
+                return Ok(Some(serde_json::to_string(&resp)?));
+            }
+        };
+
+        // Top-level arrays (JSON-RPC batches, which this server does not support)
+        // and bare scalars can never be a single Request object. A client that
+        // sent one is still waiting for a reply, so answer with Invalid Request
+        // (id null) rather than hanging it or leaking a serde type error.
+        if !value.is_object() {
+            let detail = if value.is_array() {
+                "batch requests are not supported"
+            } else {
+                "expected a JSON-RPC request object"
+            };
+            let resp = JsonRpcResponse::error(
+                None,
+                super::protocol::JSONRPC_INVALID_REQUEST,
+                format!("Invalid Request: {}", detail),
+            );
+            return Ok(Some(serde_json::to_string(&resp)?));
+        }
+
+        // Valid JSON object that isn't a conforming Request (missing/mistyped
+        // `method`, wrong `jsonrpc` type, …). No `id` member marks a (malformed)
+        // Notification — never answered. Otherwise echo a recoverable id.
+        if value.get("id").is_none() {
+            return Ok(None);
+        }
+        let recovered_id = match value.get("id") {
+            Some(id) if id.is_number() || id.is_string() => Some(id.clone()),
+            _ => None,
+        };
+        let resp = JsonRpcResponse::error(
+            recovered_id,
+            super::protocol::JSONRPC_INVALID_REQUEST,
+            format!("Invalid Request: {}", fast_err),
+        );
+        Ok(Some(serde_json::to_string(&resp)?))
     }
 
     fn handle_initialize(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
@@ -2450,6 +2510,55 @@ function handleLogin(req: Request) {
         assert!(parsed["error"].is_object());
         assert_eq!(parsed["error"]["code"], -32700);
         assert!(parsed["error"]["message"].as_str().unwrap().contains("Parse error"));
+    }
+
+    #[test]
+    fn test_missing_method_is_invalid_request_not_parse_error() {
+        // Valid JSON, but not a conforming Request (no `method`). Per JSON-RPC
+        // 2.0 this is -32600 Invalid Request, not -32700 Parse error, and the id
+        // must be echoed so the client can correlate the failure to its call.
+        let server = McpServer::new_test();
+        let resp = server
+            .handle_message(r#"{"jsonrpc":"2.0","id":4}"#)
+            .unwrap()
+            .expect("a request with an id must receive a reply");
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(parsed["error"]["code"], -32600);
+        assert_eq!(parsed["id"], 4);
+    }
+
+    #[test]
+    fn test_missing_jsonrpc_is_invalid_request_with_id() {
+        let server = McpServer::new_test();
+        let resp = server
+            .handle_message(r#"{"id":"call-9","method":"tools/list"}"#)
+            .unwrap()
+            .expect("a request with an id must receive a reply");
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(parsed["error"]["code"], -32600);
+        assert_eq!(parsed["id"], "call-9"); // string id echoed verbatim
+    }
+
+    #[test]
+    fn test_batch_request_rejected_cleanly() {
+        // Batch (array) requests are unsupported; a client sending one is waiting,
+        // so it must get an Invalid Request reply, not silence or a serde leak.
+        let server = McpServer::new_test();
+        let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]"#;
+        let resp = server.handle_message(batch).unwrap().expect("must reply");
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(parsed["error"]["code"], -32600);
+        assert!(parsed["error"]["message"].as_str().unwrap().contains("batch"));
+    }
+
+    #[test]
+    fn test_malformed_notification_returns_none() {
+        // No `id` member → a (malformed) Notification. Even though it fails to
+        // deserialize (no `method`), the server must not reply — nobody is
+        // listening for a response to a notification.
+        let server = McpServer::new_test();
+        let resp = server.handle_message(r#"{"jsonrpc":"2.0"}"#).unwrap();
+        assert!(resp.is_none(), "malformed notifications must never receive a response");
     }
 
     #[test]

@@ -317,6 +317,18 @@ impl McpServer {
         lock_or_recover(&self.metrics, "metrics")
             .record_search(results.len(), query_quality, vec_search.is_empty());
 
+        // Exact-identifier exemption for the low-confidence warning: when the query
+        // is a single identifier that appears verbatim as a candidate symbol name,
+        // retrieval is precise regardless of the FTS breadth heuristics. Computed
+        // once here so BOTH the compressed and the bare-array return paths gate the
+        // noise warning identically (previously only the compressed path had it).
+        let has_exact_name_match = candidates.iter().take(5).any(|c| {
+            c.node.name.to_lowercase() == query_trimmed
+                || c.node.qualified_name.as_deref()
+                    .map(|q| q.to_lowercase() == query_trimmed)
+                    .unwrap_or(false)
+        });
+
         // Context Sandbox: compress only if results likely exceed token threshold.
         // Skip compression when compact=true — compact results are already token-efficient
         // (~85% smaller than full results) and contain fields (relevance, signature)
@@ -393,17 +405,8 @@ impl McpServer {
             // match_confidence reflects FTS/vector agreement and coverage.
             // Low values mean results are likely noise (especially vector-only hits
             // for unknown queries), so surface it to the caller so they can skip
-            // acting on the list when it's untrustworthy.
-            //
-            // Exact-identifier exemption: when the query is a single identifier that
-            // appears verbatim as a candidate symbol name, the retrieval is precise
-            // regardless of the FTS breadth heuristics — skip the warning.
-            let has_exact_name_match = candidates.iter().take(5).any(|c| {
-                c.node.name.to_lowercase() == query_trimmed
-                    || c.node.qualified_name.as_deref()
-                        .map(|q| q.to_lowercase() == query_trimmed)
-                        .unwrap_or(false)
-            });
+            // acting on the list when it's untrustworthy. `has_exact_name_match`
+            // (hoisted above) exempts precise single-identifier queries.
             let mut out = json!({
                 "mode": mode,
                 "message": "Results exceeded token limit. Use get_ast_node(node_id) to expand individual symbols.",
@@ -414,10 +417,8 @@ impl McpServer {
             });
             if match_confidence < crate::domain::CONF_WARNING_THRESHOLD && !has_exact_name_match {
                 if let Some(obj) = out.as_object_mut() {
-                    obj.insert("low_confidence_warning".into(), json!(format!(
-                        "match_confidence={:.2} (< 0.5): FTS found few or no text matches — results are largely vector-similarity noise. Refine the query with concrete identifiers, or use ast_search with type/returns/params filters.",
-                        match_confidence
-                    )));
+                    obj.insert("low_confidence_warning".into(),
+                        json!(low_confidence_warning_msg(match_confidence)));
                 }
             }
             return Ok(out);
@@ -456,18 +457,98 @@ impl McpServer {
             }));
         }
 
-        // Hybrid path stays a bare array (unchanged contract). When the vector channel
-        // was unavailable, wrap in an object carrying the degradation signal so the
-        // caller knows recall is FTS5-only rather than silently trusting it.
-        if vector_available {
-            Ok(json!(results))
-        } else {
-            Ok(json!({
-                "results": results,
-                "search_mode": "fts_only",
-                "vector_available": false,
-                "note": "Embedding model not loaded — results are FTS5-only (reduced semantic recall). The model auto-downloads in the background on first use; retry shortly, or run `code-graph-mcp doctor` to check status."
-            }))
-        }
+        // Shape the response: a confident hybrid result stays a bare array (the
+        // unchanged happy-path contract); a degraded (FTS-only) OR low-confidence
+        // result wraps in an object carrying the signal so the caller doesn't
+        // silently trust noise. Mirrors the warning the compressed path emits above.
+        Ok(finalize_search_results(results, match_confidence, has_exact_name_match, vector_available))
+    }
+}
+
+/// The low-confidence noise warning surfaced on any semantic-search path whose
+/// `match_confidence` fell below [`crate::domain::CONF_WARNING_THRESHOLD`]. Shared
+/// by the compressed (large-result) and bare-array (small-result) returns so the
+/// two never drift.
+fn low_confidence_warning_msg(match_confidence: f64) -> String {
+    format!(
+        "match_confidence={:.2} (< 0.5): FTS found few or no text matches — results are largely vector-similarity noise. Refine the query with concrete identifiers, or use ast_search with type/returns/params filters.",
+        match_confidence
+    )
+}
+
+/// Pick the response shape for an uncompressed semantic-search result set.
+///
+/// - vector unavailable → object with the FTS-only degradation `note`.
+/// - low confidence (and not an exact-identifier hit) → object with
+///   `match_confidence` + `low_confidence_warning`, so a vague/nonsense query that
+///   returns only a handful of candidates no longer slips through as a bare list
+///   with no signal its hits are vector-similarity noise (the gap this closes).
+/// - otherwise → a bare array (the unchanged confident-hybrid contract).
+fn finalize_search_results(
+    results: Vec<serde_json::Value>,
+    match_confidence: f64,
+    has_exact_name_match: bool,
+    vector_available: bool,
+) -> serde_json::Value {
+    if !vector_available {
+        return json!({
+            "results": results,
+            "search_mode": "fts_only",
+            "vector_available": false,
+            "note": "Embedding model not loaded — results are FTS5-only (reduced semantic recall). The model auto-downloads in the background on first use; retry shortly, or run `code-graph-mcp doctor` to check status."
+        });
+    }
+    if match_confidence < crate::domain::CONF_WARNING_THRESHOLD && !has_exact_name_match {
+        return json!({
+            "results": results,
+            "search_mode": "hybrid",
+            "match_confidence": (match_confidence * 100.0).round() / 100.0,
+            "low_confidence_warning": low_confidence_warning_msg(match_confidence),
+        });
+    }
+    json!(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_results() -> Vec<serde_json::Value> {
+        vec![json!({"node_id": 1, "name": "foo", "relevance": 0.4})]
+    }
+
+    #[test]
+    fn low_confidence_bare_path_now_carries_the_noise_warning() {
+        // The gap: a low-confidence result set small enough to skip compression used
+        // to return a bare array with NO warning — only the compressed path warned.
+        let out = finalize_search_results(dummy_results(), 0.30, false, true);
+        assert!(out.is_object(), "low-confidence hybrid result must wrap in an object");
+        assert_eq!(out["match_confidence"], 0.3);
+        assert!(out["low_confidence_warning"].as_str().unwrap().contains("vector-similarity noise"));
+        assert!(out["results"].is_array());
+    }
+
+    #[test]
+    fn confident_hybrid_stays_a_bare_array() {
+        // Contract unchanged for confident results: still a bare array, no wrapper.
+        let out = finalize_search_results(dummy_results(), 0.85, false, true);
+        assert!(out.is_array(), "confident hybrid result must stay a bare array");
+    }
+
+    #[test]
+    fn exact_name_match_is_exempt_from_the_warning() {
+        // A precise single-identifier hit is trustworthy even at low FTS breadth —
+        // stays a bare array despite low match_confidence.
+        let out = finalize_search_results(dummy_results(), 0.20, true, true);
+        assert!(out.is_array(), "exact-name match must stay a bare array (warning exempt)");
+    }
+
+    #[test]
+    fn vector_unavailable_reports_fts_only_degradation() {
+        let out = finalize_search_results(dummy_results(), 0.90, false, false);
+        assert_eq!(out["search_mode"], "fts_only");
+        assert_eq!(out["vector_available"], false);
+        assert!(out.get("low_confidence_warning").is_none(),
+            "FTS-only degradation is a separate signal from the low-confidence warning");
     }
 }

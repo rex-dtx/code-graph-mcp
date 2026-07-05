@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.88.0 — correctness fixes: call resolution, JSON-RPC errors, search confidence
+
+Three correctness fixes surfaced by end-to-end QA. One `INDEX_VERSION` bump
+(37 → 38; existing indexes rebuild on next open).
+
+### Fixed
+- **Receiver-typed call resolution no longer wildcard-matches sibling types
+  (`INDEX_VERSION` 38).** `filter_method_ids` gated method candidates with a raw
+  `qualified_name LIKE 'Type.%'`, so a receiver/impl type name containing a `_` or `%`
+  — legal identifiers like `my_widget` or `Foo_Bar` — was matched as a SQL wildcard:
+  `w = My_Widget(); w.run()` also bound `MyXWidget.run` (the `_` matched `X`), forging a
+  false cross-type call edge. The type name is now escaped (`… ESCAPE '\'`), so the
+  type-restricted resolution paths — Rust `self.method()` (SelfType) and Python
+  constructor-inferred `recv.method()` (rtype) — bind only to the genuine type's method.
+  Existing indexes carry the rare stale edge until rebuilt.
+- **Malformed JSON-RPC requests now return the spec-correct error.** A message that
+  parsed as JSON but was not a conforming Request (missing `method` or `jsonrpc`)
+  returned `-32700 Parse error` — the code reserved for invalid JSON — and dropped the
+  request `id`. It now returns `-32600 Invalid Request` and echoes the recoverable `id`
+  so a client can correlate the failure; a JSON-RPC batch array is rejected cleanly
+  (`-32600`, "batch requests are not supported") instead of leaking a serde type error;
+  and a malformed message with no `id` (a notification) correctly receives no reply.
+  Well-formed requests are unaffected — the diagnosis only runs on a deserialization
+  failure, keeping the happy path a single allocation-free parse.
+- **`semantic_code_search` surfaces its confidence signal on every result size.** The
+  `match_confidence` value and the `low_confidence_warning` (which flags queries whose
+  hits are largely vector-similarity noise) were attached only to the compressed
+  response returned for large result sets; a low-confidence query small enough to skip
+  compression returned a bare array with no confidence signal at all. Both paths now
+  route through a shared `finalize_search_results` helper, so the caller can judge
+  trustworthiness regardless of result count. A confident hybrid result still returns a
+  bare array (unchanged contract) and an exact-identifier match stays exempt from the
+  warning.
+
 ## v0.87.1 — steering doc ↔ CLI alignment guard (tests + internal)
 
 No runtime behavior change. Adds a test that keeps the plugin's tool-steering

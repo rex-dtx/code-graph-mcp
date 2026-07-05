@@ -622,14 +622,20 @@ pub fn filter_method_ids(
     if node_ids.is_empty() {
         return Ok(kept);
     }
+    // Escape LIKE metacharacters in the type name so a literal `_`/`%` (legal in
+    // identifiers like `my_widget` or `Foo_Bar`) matches exactly instead of as a
+    // wildcard that would also capture a sibling type's methods (`Data_X` else
+    // matching `DataYX.run`). `.` is not a LIKE metacharacter. The `None => %.%`
+    // gate keeps its intentional wildcards. Mirrors nodes.rs return/param/name
+    // filters and lesson #1533.
     let like = match of_type {
-        Some(t) => format!("{t}.%"),
+        Some(t) => format!("{}.%", t.replace('%', "\\%").replace('_', "\\_")),
         None => "%.%".to_string(),
     };
     for chunk in node_ids.chunks(MAX_IN_PARAMS) {
         let placeholders = make_placeholders(1, chunk.len());
         let sql = format!(
-            "SELECT id FROM nodes WHERE id IN ({}) AND qualified_name LIKE ?{}",
+            "SELECT id FROM nodes WHERE id IN ({}) AND qualified_name LIKE ?{} ESCAPE '\\'",
             placeholders,
             chunk.len() + 1
         );
@@ -867,6 +873,35 @@ mod tests {
         assert!(filter_method_ids(conn, &all_ids, Some("Other")).unwrap().is_empty());
         assert!(filter_method_ids(conn, &[], None).unwrap().is_empty());
         assert!(get_node_qualified_names_by_ids(conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_filter_method_ids_escapes_like_wildcards() {
+        // `of_type` is a receiver/impl type name lifted from source, which may
+        // legally contain `_` (Python `class my_widget:`, a Rust `Foo_Bar`
+        // struct, …). SQLite LIKE treats `_` as a single-char wildcard, so an
+        // unescaped `Data_X.%` pattern also matches `DataYX.run` and would bind a
+        // call to a sibling type's method. The type gate must match literally.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "src/w.py".into(), blake3_hash: "h".into(),
+            last_modified: 1, language: Some("python".into()),
+        }).unwrap();
+        let mk = |name: &str, qn: &str, line: i64| NodeRecord {
+            file_id: fid, node_type: "function".into(), name: name.into(),
+            qualified_name: Some(qn.into()), start_line: line, end_line: line,
+            code_content: String::new(), signature: None, doc_comment: None,
+            context_string: None, name_tokens: None, return_type: None,
+            param_types: None, is_test: false,
+        };
+        let target = insert_node(conn, &mk("run", "Data_X.run", 1)).unwrap();
+        let _sibling = insert_node(conn, &mk("run", "DataYX.run", 2)).unwrap();
+
+        // `Data_X` must keep ONLY Data_X.run — the `_` is a literal, not a
+        // wildcard that also captures DataYX.run.
+        let kept = filter_method_ids(conn, &[target, _sibling], Some("Data_X")).unwrap();
+        assert_eq!(kept, vec![target], "type filter must treat `_` literally, not as a LIKE wildcard");
     }
 
     #[test]
