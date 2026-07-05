@@ -27,8 +27,50 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
     }
 
     let t0 = std::time::Instant::now();
-    let texts: Vec<&str> = context_updates.iter().map(|(_, ctx)| ctx.as_str()).collect();
-    let ids: Vec<i64> = context_updates.iter().map(|(id, _)| *id).collect();
+
+    // Reuse embeddings for unchanged content instead of re-running the model — this is what
+    // turns a rebuild "从 1% 重建" into a byte copy. partition_by_cache splits into cache HITS
+    // (already computed in a prior generation / seeded from surviving vectors, copied straight
+    // in) and MISSES (embedded below). Centralised HERE so EVERY embed path reuses: foreground
+    // Phase 3 (index_files), CLI rebuild-index, repair, and the background backfill all funnel
+    // through this function.
+    let (cached, to_embed) =
+        crate::storage::queries::partition_by_cache(db.conn(), context_updates)?;
+    let reused = cached.len();
+    let mut embedded_ids: Vec<i64> = Vec::with_capacity(context_updates.len());
+    if !cached.is_empty() {
+        // insert_node_vectors_batch carries the orphan-race existence guard, so a hit for a
+        // node deleted since the chunk was fetched is silently skipped (no orphan).
+        let tx = db.conn().unchecked_transaction()?;
+        insert_node_vectors_batch(db.conn(), &cached)?;
+        tx.commit()?;
+        embedded_ids.extend(cached.iter().map(|(id, _)| *id));
+    }
+    if to_embed.is_empty() {
+        if reused > 0 {
+            tracing::info!("[embed] {} nodes reused from cache in {:.1}s",
+                reused, t0.elapsed().as_secs_f64());
+        }
+        return Ok(embedded_ids);
+    }
+
+    let texts: Vec<&str> = to_embed.iter().map(|(_, ctx)| ctx.as_str()).collect();
+    let ids: Vec<i64> = to_embed.iter().map(|(id, _)| *id).collect();
+    // Index context by node_id so both store paths can key content-hash cache entries. Every
+    // freshly-computed embedding is also written to embedding_cache, so a later full rebuild
+    // reuses it by content instead of re-running the model.
+    let ctx_by_id: std::collections::HashMap<i64, &str> =
+        to_embed.iter().map(|(id, ctx)| (*id, ctx.as_str())).collect();
+    let cache_entries_for = |vectors: &[(i64, Vec<f32>)]| -> Vec<([u8; 32], Vec<f32>)> {
+        vectors
+            .iter()
+            .filter_map(|(id, emb)| {
+                ctx_by_id
+                    .get(id)
+                    .map(|ctx| (crate::storage::queries::cache_key(ctx), emb.clone()))
+            })
+            .collect()
+    };
 
     let embeddings = match model.embed_batch(&texts) {
         Ok(embs) => embs,
@@ -48,33 +90,36 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
             let vectors: Vec<(i64, Vec<f32>)> = ids.iter().zip(embs)
                 .filter_map(|(&id, emb)| emb.map(|e| (id, e)))
                 .collect();
-            let embedded_ids: Vec<i64> = vectors.iter().map(|(id, _)| *id).collect();
             if !vectors.is_empty() {
+                let cache_entries = cache_entries_for(&vectors);
                 let tx = db.conn().unchecked_transaction()?;
                 insert_node_vectors_batch(db.conn(), &vectors)?;
+                crate::storage::queries::cache_put_embeddings(db.conn(), &cache_entries)?;
                 tx.commit()?;
             }
-            tracing::info!("[embed] {}/{} nodes (sequential fallback) in {:.1}s",
-                embedded_ids.len(), context_updates.len(), t0.elapsed().as_secs_f64());
+            embedded_ids.extend(vectors.iter().map(|(id, _)| *id));
+            tracing::info!("[embed] {} embedded + {} reused (sequential fallback) in {:.1}s",
+                vectors.len(), reused, t0.elapsed().as_secs_f64());
             return Ok(embedded_ids);
         }
     };
 
     let vectors: Vec<(i64, Vec<f32>)> = ids.into_iter().zip(embeddings).collect();
-    let embedded_ids: Vec<i64> = vectors.iter().map(|(id, _)| *id).collect();
     let t_embed = t0.elapsed();
 
     if !vectors.is_empty() {
+        let cache_entries = cache_entries_for(&vectors);
         let tx = db.conn().unchecked_transaction()?;
         insert_node_vectors_batch(db.conn(), &vectors)?;
+        crate::storage::queries::cache_put_embeddings(db.conn(), &cache_entries)?;
         tx.commit()?;
     }
+    embedded_ids.extend(vectors.iter().map(|(id, _)| *id));
 
-    tracing::info!("[embed] {} nodes in {:.1}s (embed {:.1}s, store {:.1}s)",
-        embedded_ids.len(),
+    tracing::info!("[embed] {} embedded + {} reused in {:.1}s (embed {:.1}s)",
+        vectors.len(), reused,
         t0.elapsed().as_secs_f64(),
         t_embed.as_secs_f64(),
-        (t0.elapsed() - t_embed).as_secs_f64(),
     );
     Ok(embedded_ids)
 }

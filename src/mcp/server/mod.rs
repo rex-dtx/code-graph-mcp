@@ -923,7 +923,7 @@ impl McpServer {
         }
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         std::thread::spawn(move || {
-            let outcome = (|| -> Result<(usize, usize)> {
+            let outcome = (|| -> Result<(usize, usize, usize, usize)> {
                 let db = Database::open_with_vec(&db_path)?;
                 #[cfg(feature = "embed-model")]
                 let model = EmbeddingModel::load().ok().flatten();
@@ -938,13 +938,21 @@ impl McpServer {
                 // can never nuke live vectors. Independent of embed-model: the vec table exists in
                 // all builds and reap is a cheap anti-join + point deletes.
                 let reaped = crate::storage::queries::reap_orphan_vectors(db.conn())?;
-                Ok((repaired, reaped))
+                // Seed the content-hash cache from existing vectors (once) so an already-embedded
+                // index reuses on its NEXT version bump instead of paying one more full re-embed.
+                let seeded = crate::storage::queries::seed_embedding_cache_from_vectors(db.conn())?;
+                // Bound the cache to live nodes (prune entries whose content no longer exists).
+                // Same empty-nodes safety valve as the reap, so a mid-rebuild window can't wipe
+                // the reuse cache.
+                let pruned = crate::storage::queries::gc_embedding_cache(db.conn())?;
+                Ok((repaired, reaped, seeded, pruned))
             })();
             match outcome {
-                Ok((0, 0)) => {}
-                Ok((repaired, reaped)) => tracing::info!(
-                    "[startup-repair] Rebuilt {} NULL context_string rows; reaped {} orphan vectors",
-                    repaired, reaped
+                Ok((0, 0, 0, 0)) => {}
+                Ok((repaired, reaped, seeded, pruned)) => tracing::info!(
+                    "[startup-repair] Rebuilt {} NULL context_string rows; reaped {} orphan vectors; \
+                     seeded {} cache entries; pruned {} stale",
+                    repaired, reaped, seeded, pruned
                 ),
                 Err(e) => tracing::warn!("[startup-repair] Failed: {}", e),
             }
@@ -1125,6 +1133,17 @@ impl McpServer {
             return Ok(BackfillOutcome::Drained);
         }
 
+        // Same-dim model-swap safety: if the embedding model's content fingerprint changed
+        // since these vectors/cache were written, they are stale (a same-dim weight change is
+        // invisible to the vec-table dim check). Clear both so every node re-embeds with the
+        // new model. Cheap once-per-run meta compare; best-effort — never block embedding.
+        #[cfg(feature = "embed-model")]
+        if let Err(e) =
+            queries::ensure_embedding_cache_valid(db.conn(), EmbeddingModel::MODEL_CONTENT_BLAKE3)
+        {
+            tracing::warn!("[embed-cache] validity check failed (continuing): {}", e);
+        }
+
         const EMBED_BATCH: usize = 32;
         let mut total_embedded = 0usize;
         let t0 = std::time::Instant::now();
@@ -1143,7 +1162,8 @@ impl McpServer {
                 break;
             }
             let chunk_len = chunk.len();
-            // embed_and_store_batch manages its own transaction internally.
+            // embed_and_store_batch reuses cached embeddings for unchanged content (a byte copy,
+            // no inference) and embeds the rest, managing its own transaction + cache writes.
             let embedded_ids = embed_and_store_batch(&db, &model, &chunk)?;
             total_embedded += embedded_ids.len();
             if embedded_ids.len() < chunk_len {
@@ -1157,7 +1177,7 @@ impl McpServer {
         }
 
         if total_embedded > 0 {
-            tracing::info!("[embed-bg] Complete: {} nodes in {:.1}s",
+            tracing::info!("[embed-bg] Complete: {} nodes now embedded (some may be cache reuse) in {:.1}s",
                 total_embedded, t0.elapsed().as_secs_f64());
         }
         if !failed.is_empty() {

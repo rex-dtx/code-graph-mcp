@@ -330,7 +330,12 @@ pub fn create_vec_tables_sql() -> String {
 
         CREATE TRIGGER IF NOT EXISTS nodes_vectors_ad AFTER DELETE ON nodes BEGIN
             DELETE FROM node_vectors WHERE node_id = old.id;
-        END;",
+        END;
+
+        CREATE TABLE IF NOT EXISTS embedding_cache (
+            context_hash BLOB PRIMARY KEY,
+            embedding    BLOB NOT NULL
+        ) WITHOUT ROWID;",
         dim = crate::domain::EMBEDDING_DIM,
     )
 }

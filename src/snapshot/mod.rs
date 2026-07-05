@@ -46,6 +46,10 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
         if !include_vec {
             conn.execute_batch("DROP TABLE IF EXISTS node_vectors;")?;
         }
+        // Never ship the content-hash embedding_cache: it is a LOCAL reuse cache (rebuilt on
+        // demand and tied to this machine's model fingerprint), so it only bloats the artifact
+        // (~1x the vectors) and a recipient with a different model would drop it on open anyway.
+        conn.execute_batch("DROP TABLE IF EXISTS embedding_cache;")?;
 
         // Best-effort git commit hash; empty string if not a git repo.
         // Silence stderr so non-repo callers (snapshot CLI on a non-git dir,

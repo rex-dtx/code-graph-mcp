@@ -457,9 +457,12 @@ If you see this repeatedly, another code-graph server of a different version is 
                     dim, current
                 );
                 // Atomically drop + recreate so a mid-statement failure can't
-                // leave the DB with no vec0 table at all.
+                // leave the DB with no vec0 table at all. embedding_cache is dropped
+                // alongside: its cached vectors were computed at the OLD dim and are
+                // invalid for the new model, exactly like node_vectors. create_vec_tables_sql
+                // recreates both.
                 let tx = conn.unchecked_transaction()?;
-                tx.execute_batch("DROP TABLE IF EXISTS node_vectors;")?;
+                tx.execute_batch("DROP TABLE IF EXISTS node_vectors; DROP TABLE IF EXISTS embedding_cache;")?;
                 tx.execute_batch(&schema::create_vec_tables_sql())?;
                 tx.commit()?;
             }
@@ -594,6 +597,55 @@ mod tests {
             0, "version-mismatch sweep must clear nodes");
         assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(),
             0, "AFTER DELETE trigger must reap the wiped node's vector — no orphan survives a version bump");
+    }
+
+    #[test]
+    fn version_bump_preserves_embedding_cache_for_reuse() {
+        // C's core invariant: the content-hash embedding_cache SURVIVES the INDEX_VERSION-bump
+        // wipe (which only DELETEs nodes/edges/files), so a rebuild reuses embeddings for
+        // unchanged content by content hash instead of re-running the model — turning the
+        // "从 1% 重建" full re-embed into a byte copy.
+        use crate::storage::queries::{
+            cache_key, cache_put_embeddings, insert_node, insert_node_vector, partition_by_cache,
+            upsert_file, FileRecord, NodeRecord,
+        };
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let emb: Vec<f32> = vec![0.25; crate::domain::EMBEDDING_DIM];
+        let mk = |conn: &rusqlite::Connection, hash: &str| -> i64 {
+            let fid = upsert_file(conn, &FileRecord {
+                path: "a.rs".into(), blake3_hash: hash.into(), last_modified: 0, language: None,
+            }).unwrap();
+            insert_node(conn, &NodeRecord {
+                file_id: fid, node_type: "function".into(), name: "f".into(),
+                qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
+                signature: None, doc_comment: None, context_string: Some("ctx-A".into()),
+                name_tokens: None, return_type: None, param_types: None, is_test: false,
+            }).unwrap()
+        };
+        {
+            let db = Database::open_with_vec(&db_path).unwrap();
+            let conn = db.conn();
+            let nid = mk(conn, "h1");
+            insert_node_vector(conn, nid, &emb).unwrap();
+            cache_put_embeddings(conn, &[(cache_key("ctx-A"), emb.clone())]).unwrap();
+            conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1).unwrap();
+        }
+        // Reopen (indexer) → version mismatch → wipe.
+        let db = Database::open_with_vec(&db_path).unwrap();
+        let conn = db.conn();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0, "wipe clears nodes");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0, "trigger reaped the wiped node's vector");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1, "embedding_cache SURVIVES the version-bump wipe (that is what enables reuse)");
+        // Rebuild: a new node (new id) with the same content is a cache HIT — reused, no model.
+        let new_nid = mk(conn, "h2");
+        let (hits, misses) = partition_by_cache(conn, &[(new_nid, "ctx-A".into())]).unwrap();
+        assert_eq!(hits.len(), 1, "unchanged content reuses the cached embedding across the bump");
+        assert_eq!(hits[0].1, emb, "reused embedding is byte-identical");
+        assert!(misses.is_empty(), "nothing left to re-embed");
     }
 
     #[test]
