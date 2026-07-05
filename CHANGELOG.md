@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.87.1 — steering doc ↔ CLI alignment guard (tests + internal)
+
+No runtime behavior change. Adds a test that keeps the plugin's tool-steering
+surfaces honest against the live CLI, closing a latent doc-drift gap.
+
+### Internal
+- **Steering doc ↔ CLI alignment test (`tests/doc_cli_alignment.rs`).** The three
+  steering "sync faces" — the `.claude/plugin_code_graph_mcp.md` detail doc, the MCP
+  `instructions` string, and the generated `CLAUDE.md` managed block (all three
+  project-type variants) — are now asserted, via clap introspection
+  (`XxxArgs::command()`, recursive into `snapshot` subcommands), to reference only
+  real subcommands and real flags, with per-command flag attribution. Previously the
+  block was only snapshot-guarded (`steering_block_drift_check` byte-compares the
+  `generic` render; `adopt.test.js` matches variant-row literals) and the detail doc /
+  `instructions` had no guard at all — a CLI flag rename or a hand-edit typo could
+  silently stale them. Includes a meta-test proving the checker rejects fabricated
+  commands, fabricated flags, and flags attributed to the wrong command. This is the
+  first CLI-validity coverage for the web/frontend variant rows (`trace` / `refs`).
+- The MCP `instructions` strings were hoisted from a function-local `const` in
+  `handle_initialize` to module-level `pub const INSTRUCTIONS_{NOISY,QUIET}` so the
+  test can scan them; the value is byte-identical and the ≤1500-byte compile-time
+  budget assert moved with them.
+
 ## v0.87.0 — Python indexing accuracy: decorators, framework dead-code, receiver-type resolution
 
 Fixes two reported Python-indexer issues (GitHub #31, #32) with one `INDEX_VERSION` bump

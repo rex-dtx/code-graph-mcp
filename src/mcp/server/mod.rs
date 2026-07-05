@@ -10,6 +10,41 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// MCP `instructions` field (quiet variant) returned by `initialize` when
+/// `CODE_GRAPH_QUIET_HOOKS=1` — a one-line pointer to the full decision table.
+///
+/// Module-level `pub const` (not function-local) so `tests/doc_cli_alignment.rs`
+/// can scan every `` `code-graph-mcp <cmd> [--flags]` `` token in it against the
+/// real clap surface. This string + the `.claude/plugin_code_graph_mcp.md` detail
+/// doc are the two steering "sync faces" that (unlike the CLAUDE.md managed block)
+/// have no generator↔mirror byte check — see [`project_claude_md_steering`].
+pub const INSTRUCTIONS_QUIET: &str = "code-graph-mcp ready. See CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`.";
+
+/// MCP `instructions` field (default/noisy variant). v0.49: CLI form leads. In
+/// Claude Code the MCP tools are deferred (a ToolSearch load must precede the
+/// first call) while Bash is always live — the only conversions observed on real
+/// coding nights (2026-06-12) were CLI invocations seconds after a deny. Trigger
+/// phrases keep the literal questions first (routing memo). Drift-checked against
+/// the live clap CLI by `tests/doc_cli_alignment.rs`.
+pub const INSTRUCTIONS_NOISY: &str = concat!(
+    "Code Graph MCP \u{2014} project indexed. Fastest path is the CLI via Bash (no tool loading): ",
+    "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; \"impact of X?\" or before editing a fn \u{2192} `code-graph-mcp impact X`; ",
+    "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; text search with AST context \u{2192} `code-graph-mcp grep \"pat\" [paths]` (-i/-w/-F/-l, -c count, -t <lang>/-g <glob> scope, -A/-B/-C ctx, -M col-cap; grep exits).\n",
+    "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, semantic_code_search for concept search without an exact symbol.\n",
+    "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
+    "Still Grep for exact strings/regex; still Read files you will edit.\n",
+    "Diagnostics: `code-graph-mcp health-check`.\n",
+    "Full decision table: CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
+);
+
+// Compile-time guard: calibrated from observed Claude Code truncation at ~2048
+// bytes; 1500 leaves ~25% margin. Future edits that blow the budget fail
+// `cargo check` instead of silently getting truncated.
+const _: () = assert!(
+    INSTRUCTIONS_NOISY.len() <= 1500,
+    "MCP noisy instructions exceed 1500-byte budget; Claude Code will truncate."
+);
+
 /// Check if a process with the given PID is alive (used by non-Unix lock fallback).
 /// On non-Unix platforms, conservatively assumes the process is alive to prevent dual-primary.
 #[cfg(not(unix))]
@@ -1707,33 +1742,7 @@ impl McpServer {
         // rules live in the project's .claude/plugin_code_graph_mcp.md (the
         // CLAUDE.md managed block points to it; auto-installed on plugin SessionStart).
         let quiet = std::env::var("CODE_GRAPH_QUIET_HOOKS").ok().as_deref() == Some("1");
-        let instructions = if quiet {
-            "code-graph-mcp ready. See CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md for tool decision table (run `code-graph-mcp adopt` if missing). CLI: `code-graph-mcp --help`."
-        } else {
-            // v0.49: CLI form leads. In Claude Code the MCP tools are deferred
-            // (a ToolSearch load must precede the first call) while Bash is
-            // always live — the only conversions observed on real coding
-            // nights (2026-06-12) were CLI invocations seconds after a deny.
-            // Trigger phrases keep the literal questions first (routing memo).
-            const NOISY: &str = concat!(
-                "Code Graph MCP \u{2014} project indexed. Fastest path is the CLI via Bash (no tool loading): ",
-                "\"who calls X?\" \u{2192} `code-graph-mcp callgraph X`; \"impact of X?\" or before editing a fn \u{2192} `code-graph-mcp impact X`; ",
-                "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; text search with AST context \u{2192} `code-graph-mcp grep \"pat\" [paths]` (-i/-w/-F/-l, -c count, -t <lang>/-g <glob> scope, -A/-B/-C ctx, -M col-cap; grep exits).\n",
-                "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, semantic_code_search for concept search without an exact symbol.\n",
-                "Repo-wide AST index (LSP only handles open files; we don't). Replaces multi-round Grep+Read for structural queries.\n",
-                "Still Grep for exact strings/regex; still Read files you will edit.\n",
-                "Diagnostics: `code-graph-mcp health-check`.\n",
-                "Full decision table: CLAUDE.md \u{2192} .claude/plugin_code_graph_mcp.md (run `code-graph-mcp adopt` if missing)."
-            );
-            // Compile-time guard: calibrated from observed Claude Code truncation
-            // at ~2048 bytes; 1500 leaves ~25% margin. Future edits that blow the
-            // budget fail `cargo check` instead of silently getting truncated.
-            const _: () = assert!(
-                NOISY.len() <= 1500,
-                "MCP noisy instructions exceed 1500-byte budget; Claude Code will truncate."
-            );
-            NOISY
-        };
+        let instructions = if quiet { INSTRUCTIONS_QUIET } else { INSTRUCTIONS_NOISY };
         JsonRpcResponse::success(id, json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
