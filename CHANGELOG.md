@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.86.0 — embedding cache: skip re-embed on version bumps; vector-layer correctness
+
+Investigating a daagu `1% vec` statusline — the embedding backfill restarting from ~0% on
+every `INDEX_VERSION` bump — surfaced three vector-layer defects plus the root-cause fix.
+`% vec` is embedding-backfill coverage, not AST re-indexing; it restarts because a version
+bump wipes nodes and re-embeds. This release makes that correct, observable, and — via a
+content-hash cache — no longer a full re-embed.
+
+### Added
+- **Content-hash embedding cache (`embedding_cache`) reuses embeddings across rebuilds.**
+  Embeddings are keyed by `blake3(context_string)` in a table that survives the version-bump
+  wipe, so a rebuild with unchanged content is a byte copy instead of minutes of candle
+  re-inference. Every embed path (foreground indexing, `rebuild-index`, the background
+  backfill) reuses through it, and an existing index is seeded from its current vectors on
+  startup so the very next bump reuses. Created idempotently — no schema-version bump, no
+  migration, downgrade-safe. On daagu's ~14.5k embeddings a bump now reuses 14485/14510 with
+  zero model calls.
+
+### Fixed
+- **Orphan vectors from the async backfill race no longer accumulate.** The backfill computes
+  embeddings on a separate connection over a seconds-long window; if a node was deleted
+  meanwhile, a late vector insert created a permanent orphan (vec0 has no FK, and the delete
+  trigger only reaps a matching-node delete — orphans are sticky). Guarded at the insert site;
+  existing orphans are swept by a startup reap.
+- **Embedding coverage can no longer exceed 100% or falsely report "complete".**
+  `count_nodes_with_vectors` counted raw `node_vectors` rows (including orphans), inflating the
+  numerator past the embeddable total and masking genuinely unembedded nodes. It now counts
+  embeddable nodes that actually have a vector, so CLI and MCP status agree and `complete` means
+  all-embeddable-embedded.
+- **A same-dim embedding-model change now invalidates stale vectors.** The model content
+  fingerprint is tracked; on a change the cache and `node_vectors` rebuild (previously a
+  same-dim weight swap left stale vectors that the dim check missed).
+
+No `INDEX_VERSION` or `SCHEMA_VERSION` change; existing indexes are cleaned and seeded on the
+next server start.
+
 ## v0.85.9 — grep: de-duplicate output when path arguments overlap
 
 `grep` no longer prints a match more than once when a file is reachable through
