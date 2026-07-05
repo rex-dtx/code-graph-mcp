@@ -561,6 +561,42 @@ mod tests {
     }
 
     #[test]
+    fn version_bump_wipe_reaps_all_vectors_via_trigger() {
+        // Core self-healing invariant behind the "从 1% 重建" analysis: on an INDEX_VERSION
+        // bump the indexer open wipes nodes/edges/files, and the `nodes_vectors_ad` AFTER
+        // DELETE trigger must reap EVERY wiped node's vector. SQLite disables the truncate
+        // optimization when a table carries triggers, so the no-WHERE `DELETE FROM nodes`
+        // fires per-row — proving the wipe itself creates NO orphans (daagu's 157 came from
+        // the async backfill race, now guarded in insert_node_vectors_batch, not from here).
+        use crate::storage::queries::{upsert_file, FileRecord, insert_node, NodeRecord, insert_node_vector};
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        {
+            let db = Database::open_with_vec(&db_path).unwrap();
+            let conn = db.conn();
+            let fid = upsert_file(conn, &FileRecord {
+                path: "a.rs".into(), blake3_hash: "h".into(), last_modified: 0, language: None,
+            }).unwrap();
+            let nid = insert_node(conn, &NodeRecord {
+                file_id: fid, node_type: "function".into(), name: "f".into(),
+                qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
+                signature: None, doc_comment: None, context_string: Some("ctx".into()),
+                name_tokens: None, return_type: None, param_types: None, is_test: false,
+            }).unwrap();
+            insert_node_vector(conn, nid, &vec![0.0f32; crate::domain::EMBEDDING_DIM]).unwrap();
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            // Stamp an older generation so the next indexer open triggers the wipe.
+            conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1).unwrap();
+        }
+        // Reopen (indexer, revalidate=true) → version mismatch → wipe.
+        let db = Database::open_with_vec(&db_path).unwrap();
+        assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0, "version-mismatch sweep must clear nodes");
+        assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0, "AFTER DELETE trigger must reap the wiped node's vector — no orphan survives a version bump");
+    }
+
+    #[test]
     fn test_nondestructive_open_preserves_data_on_version_mismatch() {
         // A READER open (health-check, grep, …) must NOT wipe an index built by a
         // different INDEX_VERSION — that was the daagu failure: a statusline poll

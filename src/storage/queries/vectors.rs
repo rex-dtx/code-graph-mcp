@@ -17,6 +17,9 @@ pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)])
         return Ok(());
     }
     // vec0 virtual tables do not support INSERT OR REPLACE, so delete first.
+    let mut exists_stmt = conn.prepare_cached(
+        "SELECT 1 FROM nodes WHERE id = ?1"
+    )?;
     let mut del_stmt = conn.prepare_cached(
         "DELETE FROM node_vectors WHERE node_id = ?1"
     )?;
@@ -24,6 +27,18 @@ pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)])
         "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)"
     )?;
     for (node_id, embedding) in vectors {
+        // Race guard: the background backfill snapshots node_ids, then spends a seconds-long
+        // candle-inference window (embed.rs) before reaching this store, on a SEPARATE
+        // connection from the server's incremental/version-bump deletes. If the node was
+        // deleted in that window, its `nodes_vectors_ad` AFTER DELETE trigger already reaped
+        // any vector; a late INSERT here would create a PERMANENT orphan (vec0 has no FK, and
+        // the trigger never fires again for a node that is already gone) — this is exactly how
+        // daagu accumulated 157 orphans at rowids past the live range. Skip vanished nodes;
+        // SQLite serializes writers so the set can't shrink under this batch once it holds the
+        // write lock, and reap_orphan_vectors backstops the residual first-row window.
+        if !exists_stmt.exists(rusqlite::params![node_id])? {
+            continue;
+        }
         let bytes: &[u8] = bytemuck::cast_slice(embedding);
         del_stmt.execute(rusqlite::params![node_id])?;
         ins_stmt.execute(rusqlite::params![node_id, bytes])?;
@@ -133,9 +148,17 @@ pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM nodes WHERE context_string IS NOT NULL", [], |r| r.get(0)
     )?;
-    // node_vectors table may not exist when embed-model feature is disabled; return 0 in that case
+    // Count embeddable nodes that actually HAVE a vector — NOT raw COUNT(*) FROM node_vectors.
+    // The raw count includes orphans (vectors whose node was deleted; see reap_orphan_vectors)
+    // and can EXCEED `total`, producing >100% coverage and — the real hazard — a FALSE
+    // "complete" when orphan count masks genuinely unembedded nodes (numerator >= denominator
+    // while N embeddable nodes still have no vector, so semantic search silently misses them).
+    // The inner join to nodes drops orphans and caps the numerator at `total`. Mirrors the
+    // complement of count_unembedded_nodes. Returns 0 when the vec table is absent (embed-model
+    // disabled) via unwrap_or — the join errors on the missing table, same as before.
     let with_vectors: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0)
+        "SELECT COUNT(*) FROM nodes n JOIN node_vectors nv ON nv.node_id = n.id \
+         WHERE n.context_string IS NOT NULL", [], |r| r.get(0)
     ).unwrap_or(0);
     Ok((with_vectors, total))
 }
@@ -168,6 +191,55 @@ pub fn count_unembedded_nodes(conn: &Connection) -> Result<i64> {
     Ok(n)
 }
 
+/// Delete vectors whose `node_id` no longer exists in `nodes` (orphans). vec0 is a virtual
+/// table with no foreign key, and the `nodes_vectors_ad` AFTER DELETE trigger only reaps a
+/// vector when its MATCHING node is deleted — a vector inserted for an already-deleted node
+/// (the backfill race, now guarded in [`insert_node_vectors_batch`]) or one predating that
+/// guard is never reaped and accumulates across index generations (daagu carried 157 at
+/// rowids far past the live node range). Returns the count removed. Cheap: one anti-join
+/// enumerate + point deletes. No-op (Ok(0)) when the vec table is absent (embed-model off).
+pub fn reap_orphan_vectors(conn: &Connection) -> Result<usize> {
+    let has_vectors_table: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
+        [], |r| r.get(0),
+    )?;
+    if has_vectors_table == 0 {
+        return Ok(0);
+    }
+    // Safety: never sweep against an EMPTY `nodes` table. An empty nodes set is far more
+    // likely a transient (mid-rebuild / INDEX_VERSION-bump wipe window, where nodes are
+    // DELETEd then repopulated) than a real zero-symbol project — and sweeping then would see
+    // EVERY vector as an "orphan" and delete the whole vector index, forcing a full re-embed
+    // (the exact "从 1% 重建" cost this hardening exists to avoid). If nodes is genuinely empty
+    // there is no legitimate vector to keep anyway, so skipping is free. This is the DB-always-
+    // usable invariant: a reap can only ever shrink toward the correct set, never nuke a live one.
+    let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+    if node_count == 0 {
+        return Ok(0);
+    }
+    // Enumerate orphan node_ids first (collect before mutating), then delete by primary key —
+    // the only vec0-safe delete form. Anti-join against nodes finds vectors with no live node.
+    let orphan_ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT node_id FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)"
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if orphan_ids.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut del = conn.prepare_cached("DELETE FROM node_vectors WHERE node_id = ?1")?;
+        for id in &orphan_ids {
+            del.execute(rusqlite::params![id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(orphan_ids.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,8 +254,14 @@ mod tests {
         // BOTH a direct node delete AND an FK-cascade delete (file removal): SQLite
         // fires a child table's AFTER DELETE trigger on FK cascade even with
         // recursive_triggers off (production: foreign_keys=ON, recursive_triggers
-        // unset). So no orphan is ever created — this guards that invariant against a
-        // future change to the trigger, the delete path, or the pragmas.
+        // unset). So no orphan arises from a delete that HAS a matching node — this
+        // guards that invariant against a future change to the trigger, the delete
+        // path, or the pragmas. SCOPE: this covers only sequential deletes of a live
+        // node. It does NOT cover the async-backfill race — a vector INSERTed for a
+        // node deleted during the seconds-long inference window — which the trigger
+        // cannot catch because the node is already gone. That path is guarded at the
+        // insert site (see backfill_late_insert_for_deleted_node_creates_no_orphan)
+        // and backstopped by reap_orphan_vectors_removes_strays_keeps_live.
         use super::super::files::delete_files_by_paths;
         use super::super::nodes::delete_nodes_by_file;
         let (db, _tmp) = test_db();
@@ -330,6 +408,123 @@ mod tests {
 
         // Excluding every unembedded node → empty, the backfill loop's termination signal.
         assert!(get_unembedded_nodes_excluding(conn, 10, &[a, b, c]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn backfill_late_insert_for_deleted_node_creates_no_orphan() {
+        // Reproduces daagu's 157 orphan vectors (rowids 109220+, far past the live node
+        // range). The background backfill snapshots node_ids, spends SECONDS in candle
+        // inference (embed.rs), then inserts vectors on a SEPARATE connection. If the node
+        // was deleted (incremental reindex / version-bump wipe) during that window, its
+        // AFTER DELETE trigger already fired with no vector present — so this late insert
+        // must NOT resurrect a PERMANENT orphan (vec0 has no FK; nothing reaps a vector
+        // whose matching node is already gone). Guarded by the node-existence check in
+        // insert_node_vectors_batch.
+        use super::super::nodes::delete_nodes_by_file;
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "a.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let nid = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "f".into(),
+            qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
+            signature: None, doc_comment: None, context_string: Some("ctx".into()),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // Node deleted mid-inference (its file changed) — trigger fires, no vector yet.
+        delete_nodes_by_file(conn, fid).unwrap();
+        // Late backfill write for the now-dead node_id.
+        insert_node_vectors_batch(conn, &[(nid, vec![0.0f32; crate::domain::EMBEDDING_DIM])]).unwrap();
+        let vec_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0)).unwrap();
+        assert_eq!(vec_count, 0, "late insert for a deleted node must not create an orphan vector");
+    }
+
+    #[test]
+    fn reap_orphan_vectors_removes_strays_keeps_live() {
+        // The sweep backstop: any orphan that slips past the insert guard (or predates it,
+        // like daagu's accumulated 157) must be reapable. Verify it deletes strays and
+        // leaves a live node's vector untouched.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "a.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let live = insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "f".into(),
+            qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
+            signature: None, doc_comment: None, context_string: Some("ctx".into()),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        insert_node_vector(conn, live, &vec![0.1f32; crate::domain::EMBEDDING_DIM]).unwrap();
+        // Inject two orphans directly (bypass the insert guard) at high ids, like real residue.
+        for id in [90001i64, 90002i64] {
+            conn.execute(
+                "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![id, bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])],
+            ).unwrap();
+        }
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        let reaped = reap_orphan_vectors(conn).unwrap();
+        assert_eq!(reaped, 2, "both orphans reaped");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
+            "only the live node's vector remains");
+        // Idempotent: a second sweep with no orphans reaps nothing.
+        assert_eq!(reap_orphan_vectors(conn).unwrap(), 0, "sweep is idempotent");
+    }
+
+    #[test]
+    fn reap_orphan_vectors_skips_empty_nodes_table() {
+        // DB-availability invariant: an empty `nodes` table is a mid-rebuild / version-bump
+        // wipe transient, NOT a signal to delete every vector. reap must no-op then, so a
+        // transient empty window can never nuke a live vector index and force a full re-embed.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        for id in [1i64, 2, 3] {
+            conn.execute(
+                "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![id, bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])],
+            ).unwrap();
+        }
+        assert_eq!(reap_orphan_vectors(conn).unwrap(), 0, "must not sweep against empty nodes");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(), 3,
+            "all vectors preserved during the transient empty-nodes window");
+    }
+
+    #[test]
+    fn coverage_count_excludes_orphans_and_cannot_exceed_total() {
+        // count_nodes_with_vectors must count embeddable nodes that HAVE a vector, not raw
+        // node_vectors rows: orphans otherwise inflate the numerator past the denominator →
+        // >100% coverage AND a FALSE "complete" that masks genuinely unembedded nodes.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "a.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        let mk = |name: &str| insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: name.into(),
+            qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
+            signature: None, doc_comment: None, context_string: Some("ctx".into()),
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        mk("a");
+        mk("b");
+        // Three orphan vectors (node_ids that don't exist) — more than the 2 embeddable nodes.
+        for id in [90001i64, 90002i64, 90003i64] {
+            conn.execute(
+                "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![id, bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])],
+            ).unwrap();
+        }
+        let (with_vectors, total) = count_nodes_with_vectors(conn).unwrap();
+        assert_eq!(total, 2, "two embeddable nodes");
+        assert!(with_vectors <= total,
+            "numerator {with_vectors} must not exceed embeddable total {total} (orphans excluded)");
+        assert_eq!(with_vectors, 0, "no real node embedded yet — orphans must not count as coverage");
     }
 
     #[test]

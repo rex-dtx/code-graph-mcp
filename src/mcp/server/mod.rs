@@ -923,17 +923,29 @@ impl McpServer {
         }
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         std::thread::spawn(move || {
-            let repair = (|| -> Result<usize> {
+            let outcome = (|| -> Result<(usize, usize)> {
                 let db = Database::open_with_vec(&db_path)?;
                 #[cfg(feature = "embed-model")]
                 let model = EmbeddingModel::load().ok().flatten();
                 #[cfg(not(feature = "embed-model"))]
                 let model: Option<EmbeddingModel> = None;
-                crate::indexer::pipeline::repair_null_context_strings(&db, model.as_ref())
+                let repaired = crate::indexer::pipeline::repair_null_context_strings(&db, model.as_ref())?;
+                // Sweep orphan vectors (vectors whose node was deleted) accumulated across index
+                // generations — the backfill-race residue now prevented at the insert site, plus
+                // any predating that guard (daagu carried 157 at rowids past the live range). Runs
+                // here because the startup index has already populated `nodes`; reap_orphan_vectors
+                // additionally no-ops on an empty nodes table, so a transient mid-rebuild window
+                // can never nuke live vectors. Independent of embed-model: the vec table exists in
+                // all builds and reap is a cheap anti-join + point deletes.
+                let reaped = crate::storage::queries::reap_orphan_vectors(db.conn())?;
+                Ok((repaired, reaped))
             })();
-            match repair {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("[startup-repair] Rebuilt {} NULL context_string rows", n),
+            match outcome {
+                Ok((0, 0)) => {}
+                Ok((repaired, reaped)) => tracing::info!(
+                    "[startup-repair] Rebuilt {} NULL context_string rows; reaped {} orphan vectors",
+                    repaired, reaped
+                ),
                 Err(e) => tracing::warn!("[startup-repair] Failed: {}", e),
             }
         });

@@ -55,5 +55,5 @@ pub use search::fts5_search_with_tests;
 pub use vectors::{
     count_nodes_with_vectors, count_unembedded_nodes, delete_node_vectors_batch,
     get_node_embedding, get_unembedded_nodes, get_unembedded_nodes_excluding, insert_node_vector,
-    insert_node_vectors_batch, vector_search,
+    insert_node_vectors_batch, reap_orphan_vectors, vector_search,
 };
