@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — vector-layer race + cache-fingerprint parity fast-follow
+## v0.86.1 — vector-layer race + cache-fingerprint parity fast-follow
 
 A post-v0.86.0 code review surfaced two latent concurrency/parity defects the shipped tests
 missed. Neither corrupts data under normal single-model operation; both undermine invariants
