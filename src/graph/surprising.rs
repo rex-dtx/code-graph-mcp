@@ -151,11 +151,20 @@ pub fn surprising_connections(
     top_n: usize,
 ) -> Result<Vec<SurprisingConnection>> {
     use crate::domain::{REL_CALLS, REL_REFERENCES};
-    // No user input in `test_filter` (trusted literal) → no injection.
+    // No user input in `test_filter` (helper emits a fixed GLOB literal) → no
+    // injection. Uses the full is_test_node predicate, not the raw `is_test` flag:
+    // an integration test `def test_foo()` in `tests/` has is_test=0 (the parser
+    // only flags AST-level markers) yet a `test_foo → foo` call is the *expected*
+    // coupling, not a surprising one. Applied symmetrically to source and target
+    // (mirrors the existing `<external>`/`<module>` symmetric guards on ns/nt).
     let test_filter = if include_tests {
-        ""
+        String::new()
     } else {
-        " AND ns.is_test = 0 AND nt.is_test = 0"
+        format!(
+            " AND NOT {} AND NOT {}",
+            crate::domain::is_test_node_sql("ns", "sf"),
+            crate::domain::is_test_node_sql("nt", "tf")
+        )
     };
     let sql = format!(
         "SELECT ns.name, sf.path, nt.name, tf.path, e.relation, e.confidence \
@@ -234,6 +243,29 @@ mod tests {
 
         assert!(surprising_connections(conn, false, 10).unwrap().is_empty(),
             "edge to a test symbol is excluded by default");
+        assert_eq!(surprising_connections(conn, true, 10).unwrap().len(), 1,
+            "included with include_tests");
+    }
+
+    /// Sibling-hole guard: the parser sets `is_test=1` only for AST-level markers
+    /// (`#[cfg(test)]`, `@Test`, …), so the MOST COMMON test shape — an integration
+    /// test `def test_foo()` in a `tests/` file — carries is_test=0. The raw
+    /// `ns.is_test = 0 AND nt.is_test = 0` filter let that `test_foo → foo` edge leak
+    /// in as a "surprising" coupling (it is the expected coupling). Now excluded via
+    /// the name/path heuristic. Asserts both the `test_`-name leg and the `tests/`-path
+    /// leg, source-side and target-side.
+    #[test]
+    fn surprising_connections_excludes_name_path_tests_without_flag() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('tests/test_api.py','h1',0,'python',0)", []).unwrap();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/api.py','h2',0,'python',0)", []).unwrap();
+        // Source: test_-named, is_test flag NOT set (0) — the sibling-hole case.
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (1,'function','test_signup',1,2,'',0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (2,'function','handle_signup',1,2,'',0)", []).unwrap();
+        conn.execute("INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (1,2,'calls','inferred')", []).unwrap();
+        assert!(surprising_connections(conn, false, 10).unwrap().is_empty(),
+            "test_-named source (is_test=0) in tests/ must be excluded by default");
         assert_eq!(surprising_connections(conn, true, 10).unwrap().len(), 1,
             "included with include_tests");
     }

@@ -2111,3 +2111,55 @@ mod tests {
             && !callers.contains(&"another_descriptive_check"),
         "inline unit tests leaked into the default call graph: {callers:?}");
 }
+
+/// Regression (real-user QA): C++ classes declared in a `.h` header (the most common
+/// C++ layout — declaration in `.h`, definition in `.cpp`) were invisible. `.h` is
+/// C-vs-C++ ambiguous by extension so it was parsed as C, whose grammar can't extract
+/// `class` — the class SYMBOLS and their base-class `inherits` edges never existed
+/// (overview/callgraph/dead-code/find_references were blind to them). A `.h` with C++
+/// markers now parses as C++. Also guards the sibling bug this exposed: a class with
+/// an INLINE constructor (`Circle(double){}`) produces a `method Circle` node sharing
+/// the class name, and the `inherits` edge must attach ONLY to the class node.
+#[test]
+fn test_cpp_header_classes_and_single_inherits_edge() {
+    use code_graph_mcp::indexer::pipeline::run_full_index;
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("shape.h"), r#"#pragma once
+class Shape {
+public:
+    virtual double area() const = 0;
+};
+class Circle : public Shape {
+    double r;
+public:
+    Circle(double radius) : r(radius) {}
+    double area() const override;
+};
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    run_full_index(&db, project.path(), None, None).unwrap();
+
+    // Classes from the .h header are extracted (were dropped when .h parsed as C).
+    let types_of = |name: &str| -> Vec<String> {
+        get_nodes_by_name(db.conn(), name).unwrap().iter().map(|n| n.node_type.clone()).collect()
+    };
+    let shape_types = types_of("Shape");
+    assert!(shape_types.iter().any(|t| t == "class"),
+        "Shape class must be extracted from the .h header; got node types: {shape_types:?}");
+    let circle_types = types_of("Circle");
+    assert!(circle_types.iter().any(|t| t == "class"),
+        "Circle class must be extracted from the .h header; got node types: {circle_types:?}");
+
+    // Exactly ONE inherits edge — from the CLASS node, never the inline-constructor
+    // `method Circle` that shares the name.
+    let inherits: Vec<(String, String)> = db.conn().prepare(
+        "SELECT s.type, t.name FROM edges e \
+         JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id \
+         WHERE e.relation = 'inherits'").unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap()
+        .map(|r| r.unwrap()).collect();
+    assert_eq!(inherits, vec![("class".to_string(), "Shape".to_string())],
+        "exactly one inherits edge from the class node (not the constructor method); got: {inherits:?}");
+}

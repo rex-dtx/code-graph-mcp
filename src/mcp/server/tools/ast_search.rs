@@ -49,6 +49,12 @@ impl McpServer {
             sorted.into_iter()
                 .filter(|nwf| {
                     let n = &nwf.node;
+                    // Skip <module>/<external> placeholders and test symbols, consistent
+                    // with semantic_code_search/find_similar_code (is_skippable_result).
+                    // ast_search previously leaked these into structural results.
+                    if crate::domain::is_skippable_result(&n.node_type, &n.name, &nwf.file_path) {
+                        return false;
+                    }
                     if let Some(tf) = type_filter {
                         let types = normalize_type_filter_mcp(tf);
                         if !types.contains(&n.node_type) {

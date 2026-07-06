@@ -411,6 +411,21 @@ impl McpServer {
                     " ({} result(s) suppressed by ignore_paths; pass ignore_paths:[] to see them.)",
                     ignored_count
                 ));
+            } else if min_lines > 1 {
+                // Guard the false-clean: candidates may exist but sit below min_lines.
+                // Probe at min_lines=1 (same path/type/ignore scope) so the caller (an
+                // LLM) knows the "clean" result is threshold-limited, with the count.
+                let hidden = queries::find_dead_code(
+                    self.db.conn(), path, node_type, include_tests, 1, 200,
+                )?
+                .into_iter()
+                .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
+                .count();
+                if hidden > 0 {
+                    summary.push_str(&format!(
+                        " ({hidden} shorter symbol(s) are below the min_lines={min_lines} threshold; pass min_lines:1 to include them.)"
+                    ));
+                }
             }
             return Ok(json!({
                 "results": [],

@@ -318,6 +318,7 @@ fn print_help() {
     println!("    affected [files...] Changed files → test files to re-run (--stdin, --depth, --json)");
     println!("    show <symbol>       Show symbol details (code, type, signature)");
     println!("    map                 Project architecture map (modules, deps, entry points)");
+    println!("    tour [path]         Dependency-ordered reading order (where to start reading a repo/subtree)");
     println!("    overview <path>     Module overview (symbols grouped by file and type)");
     println!("    deps <file>         File-level dependency graph");
     println!("    trace <route>       Trace HTTP route → handler → downstream calls");

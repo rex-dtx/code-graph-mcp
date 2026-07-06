@@ -40,7 +40,7 @@ use crate::storage::queries::{
     update_context_strings_batch, upsert_file,
     FileRecord, NodeRecord, NodeResult,
 };
-use crate::domain::{REL_CALLS, REL_IMPORTS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_REFERENCES, max_file_size, is_cross_file_call_noise};
+use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_REFERENCES, max_file_size, is_cross_file_call_noise};
 use crate::utils::config::detect_language;
 
 use super::{IndexResult, IndexStats, ProgressFn};
@@ -49,6 +49,24 @@ use super::embed::embed_and_store_batch;
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
 use super::js_modules::{resolve_js_module_targets, resolve_js_specifier_path, resolve_php_include_path};
 use super::resolve::{bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
+
+/// Heuristic: does a `.h` header contain C++-specific constructs? `.h` is C-vs-C++
+/// ambiguous by extension (detect_language maps it to C), and the C grammar cannot
+/// extract `class`/`namespace` symbols — so a C++ class in a `.h` header is silently
+/// dropped. When any of these markers is present the header is parsed as C++ instead.
+/// The markers are C++-only (`::`, access specifiers, `class`/`namespace`/`template`)
+/// so a pure-C header stays C; a false positive is low-harm because the C++ grammar
+/// is a near-superset of C and still extracts C functions/structs/#includes.
+fn looks_like_cpp_header(source: &str) -> bool {
+    source.contains("::")
+        || source.contains("public:")
+        || source.contains("private:")
+        || source.contains("protected:")
+        || source.contains("class ")
+        || source.contains("namespace ")
+        || source.contains("template<")
+        || source.contains("template <")
+}
 
 /// Batch size for streaming indexing. Each batch processes Phase 1+2
 /// then drops heavyweight data (ASTs, source strings) before the next batch.
@@ -202,6 +220,10 @@ pub(super) fn index_files(
         // qualified scope_name (`Class.method`) against class-based-language
         // method nodes, whose bare `name` is just `method`.
         node_qualified_names: Vec<Option<String>>,
+        // Node types parallel to node_ids/node_names. Needed so inherits/implements
+        // source resolution can reject a same-named function/method (a C++ inline
+        // constructor shares its class's name) — only a type node can be a supertype.
+        node_types: Vec<String>,
     }
 
     // Process files in batches — each batch does Phase 1 + Phase 2
@@ -212,7 +234,7 @@ pub(super) fn index_files(
         let pre_parsed: Vec<FilePreParsed> = batch
             .par_iter()
             .filter_map(|rel_path| {
-                let language = match detect_language(rel_path) {
+                let mut language = match detect_language(rel_path) {
                     Some(l) => l,
                     None => {
                         skipped_language.fetch_add(1, AtomicOrdering::Relaxed);
@@ -238,6 +260,17 @@ pub(super) fn index_files(
                         return None;
                     }
                 };
+
+                // `.h` is C-vs-C++ ambiguous by extension, so detect_language maps it
+                // to C. But the C grammar can't parse `class`/`namespace`, so C++ classes
+                // declared in a `.h` header (the MOST common C++ layout) — and their
+                // base-class `inherits` edges — were silently dropped. When the header's
+                // content actually contains C++ constructs, parse it as C++ so those
+                // symbols are captured. Gated on markers so a pure-C header stays C;
+                // false positives are low-harm (the C++ grammar is a near-superset of C).
+                if language == "c" && rel_path.ends_with(".h") && looks_like_cpp_header(&source) {
+                    language = "cpp";
+                }
 
                 let hash = match hashes.get(rel_path.as_str()) {
                     Some(h) => h.clone(),
@@ -315,6 +348,7 @@ pub(super) fn index_files(
             let mut node_ids = Vec::new();
             let mut node_names = Vec::new();
             let mut node_qualified_names: Vec<Option<String>> = Vec::new();
+            let mut node_types: Vec<String> = Vec::new();
 
             let module_node_id = insert_node_cached(db.conn(), &NodeRecord {
                 file_id,
@@ -336,6 +370,7 @@ pub(super) fn index_files(
             node_names.push("<module>".into());
             // <module> resolves by its bare name; no qualified form.
             node_qualified_names.push(None);
+            node_types.push("module".into());
             total_nodes_created += 1;
 
             for pn in &pp.parsed_nodes {
@@ -359,6 +394,7 @@ pub(super) fn index_files(
                 node_ids.push(node_id);
                 node_names.push(pn.name.clone());
                 node_qualified_names.push(pn.qualified_name.clone());
+                node_types.push(pn.node_type.clone());
                 total_nodes_created += 1;
             }
 
@@ -371,6 +407,7 @@ pub(super) fn index_files(
                 node_ids,
                 node_names,
                 node_qualified_names,
+                node_types,
             });
         }
 
@@ -463,11 +500,22 @@ pub(super) fn index_files(
                 // intra-class method-to-method edge is silently dropped.
                 // Bare-scope sources (Rust impl, Go receivers, free functions)
                 // still match on `name`.
+                // inherits/implements describe a TYPE's supertype, so their source
+                // must be a class/struct/interface/enum/trait — never a function or
+                // method that merely shares the type's name. A C++ inline constructor
+                // (`Widget(int){}`) produces a `method Widget` node alongside `class
+                // Widget`; without this both matched `source_name == "Widget"` and the
+                // constructor got a bogus `inherits` edge. Blacklist fn/method (rather
+                // than whitelist type kinds) so no language's type node is missed.
+                let type_source_only =
+                    rel.relation == REL_INHERITS || rel.relation == REL_IMPLEMENTS;
                 let mut source_ids = (0..pf.node_ids.len())
                     .filter(|&i| {
-                        pf.node_names[i] == rel.source_name
+                        (pf.node_names[i] == rel.source_name
                             || pf.node_qualified_names[i].as_deref()
-                                == Some(rel.source_name.as_str())
+                                == Some(rel.source_name.as_str()))
+                            && (!type_source_only
+                                || !matches!(pf.node_types[i].as_str(), "function" | "method"))
                     })
                     .map(|i| pf.node_ids[i])
                     .collect::<Vec<_>>();
@@ -1358,4 +1406,28 @@ pub(super) fn index_files(
         edges_created: total_edges_created,
         stats,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_cpp_header;
+
+    #[test]
+    fn cpp_header_detection_upgrades_only_real_cpp() {
+        // C++ markers → parse the `.h` as C++ (so class symbols aren't dropped).
+        assert!(looks_like_cpp_header("class Shape {\npublic:\n  void f();\n};"));
+        assert!(looks_like_cpp_header("struct S { int x; };\nnamespace ns { int g(); }"));
+        assert!(looks_like_cpp_header("template<typename T> T id(T x);"));
+        assert!(looks_like_cpp_header("template <class T> struct Box {};"));
+        assert!(looks_like_cpp_header("int Foo::bar() { return 1; }")); // scope resolution
+        assert!(looks_like_cpp_header("class Widget {\nprivate:\n  int id;\n};"));
+        assert!(looks_like_cpp_header("class Base {\nprotected:\n  int n;\n};"));
+
+        // Pure C headers have none of these → stay C (no over-eager upgrade).
+        assert!(!looks_like_cpp_header(
+            "#ifndef FOO_H\n#define FOO_H\nint add(int a, int b);\nstruct Point { int x; int y; };\n#endif"
+        ));
+        assert!(!looks_like_cpp_header("typedef struct { int fd; } handle_t;\nvoid close_handle(handle_t*);"));
+        assert!(!looks_like_cpp_header("#define MAX(a,b) ((a)>(b)?(a):(b))\nextern int errno;"));
+    }
 }

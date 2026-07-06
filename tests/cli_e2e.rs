@@ -347,7 +347,7 @@ fn test_cli_migrated_help_has_no_internal_notes() {
     let internal_tokens = ["audit #", "clap-migrat", "resolved_format", "plan §", "issue #"];
     for cmd in [
         "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
-        "map", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
+        "map", "tour", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
         "snapshot", "callgraph", "impact", "show", "refs", "similar",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
@@ -359,6 +359,34 @@ fn test_cli_migrated_help_has_no_internal_notes() {
                 "{cmd} --help leaked internal note {tok:?}; full help:\n{stdout}"
             );
         }
+    }
+}
+
+// Regression guard: the top-level `print_help()` (in main.rs) is a hand-maintained
+// string that can silently drift from the `fn main` dispatch match. `tour` shipped
+// as a first-class command (own clap `--help`, JSON output, a dispatch arm, and an
+// entry in doc_cli_alignment::clap_commands) yet was never added to the COMMANDS
+// list, so `code-graph-mcp --help` never mentioned it — undiscoverable. This asserts
+// every user-facing subcommand appears in the top-level help. Keep the list in sync
+// with the match arms in `fn main`; MCP-name aliases (get_call_graph, project_map, …)
+// are intentionally not listed and excluded here.
+#[test]
+fn test_cli_top_level_help_lists_all_commands() {
+    let project = TempDir::new().unwrap();
+    let (stdout, _, code) = run_cli(&project, &["--help"]);
+    assert_eq!(code, 0, "--help should exit 0");
+    for cmd in [
+        "serve", "grep", "search", "ast-search", "callgraph", "impact", "affected",
+        "show", "map", "tour", "overview", "deps", "trace", "similar", "refs",
+        "dead-code", "centrality", "cycles", "surprising", "report", "incremental-index",
+        "rebuild-index", "reindex", "health-check", "doctor", "benchmark", "stats",
+        "outcome", "adopt", "unadopt", "snapshot",
+    ] {
+        assert!(
+            stdout.contains(&format!("\n    {cmd} ")),
+            "`code-graph-mcp --help` COMMANDS list is missing `{cmd}` — print_help() in \
+             main.rs drifted from the dispatch. Full help:\n{stdout}"
+        );
     }
 }
 
@@ -2540,6 +2568,45 @@ fn test_cli_dead_code_node_type_alias_matches_type() {
         "--type fn and --node-type fn must yield identical results");
 }
 
+// Regression (real-user QA): at the default `--min-lines 3`, `dead-code` printed a
+// bare "No dead code found." even when short (<3-line) orphans existed — a
+// false-clean signal, worst for the primary consumer (an LLM that won't think to
+// widen the threshold). The empty message must now name that shorter symbols are
+// hidden and how to see them. Real indexed project (not a fixture) so it drives the
+// actual find_dead_code producer.
+#[test]
+fn test_cli_dead_code_hints_at_symbols_below_min_lines() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // `orphan1` is a 2-line dead function (below default min-lines 3). `used` has a
+    // caller so it isn't dead; no function is BOTH >=3 lines AND dead, so the default
+    // run is empty and must take the hint path (not the non-empty listing path).
+    std::fs::write(src.join("m.py"),
+        "def orphan1():\n    return 1\n\ndef used():\n    return 2\n\ndef caller():\n    return used()\n").unwrap();
+    // Index via the library (like setup_indexed_project) — a bare TempDir has no
+    // `.git`, and the `incremental-index` CLI skips indexing without a git anchor.
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    // Default min-lines 3: the short orphan is hidden → must HINT, not false-clean.
+    let (_, stderr, code) = run_cli(&project, &["dead-code"]);
+    assert_eq!(code, 0, "empty dead-code exits 0; stderr={stderr}");
+    assert!(
+        stderr.contains("below the threshold") && stderr.contains("--min-lines 1"),
+        "empty dead-code at default min-lines must hint at hidden short symbols; got: {stderr}"
+    );
+
+    // At min-lines 1 the short orphan surfaces (proving the hint wasn't crying wolf).
+    let (stdout1, _, code1) = run_cli(&project, &["dead-code", "--min-lines", "1"]);
+    assert_eq!(code1, 0);
+    assert!(stdout1.contains("orphan1"),
+        "min-lines 1 must surface the short orphan; got: {stdout1}");
+}
+
 // Regression: empty `--json` overview must keep stdout clean (`[]`) and avoid the
 // anyhow `Error:` stderr prefix. Exit code stays 1 because the requested path
 // matched nothing — mirrors `show --json` / `trace --json` empty contracts.
@@ -2699,6 +2766,47 @@ fn test_cli_ast_search_class_filter() {
     assert!(stdout.contains("Logger"), "should find Logger class");
 }
 
+// Regression (real-user QA): ast-search leaked the <module>/<external> placeholder
+// nodes and test symbols into structural results — `ast-search <extern-name>` printed
+// an `<external>:0-0` stub and a `<module>` file node alongside the real symbol, and
+// `ast-search --type function` listed test_ functions — unlike `search`/`similar`.
+// Both the query path and the filter-only path now skip the triad.
+#[test]
+fn test_cli_ast_search_excludes_module_external_and_test() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    // real_fn imports an external module (distinctlibxyz → <external> node); the file
+    // itself yields a <module> node; the tests/ file adds a test_ function whose NAME
+    // contains the query term so FTS surfaces it (and it must be filtered as a test).
+    std::fs::write(src.join("m.py"),
+        "import distinctlibxyz\n\ndef real_fn():\n    return distinctlibxyz.go()\n").unwrap();
+    std::fs::write(project.path().join("tests/test_m.py"),
+        "def test_distinctlibxyz_marker():\n    assert real_fn() is not None\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    // Query path: searching the external name must NOT surface <external>/<module>/test.
+    let (stdout, _, code) = run_cli(&project, &["ast-search", "distinctlibxyz"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("real_fn"), "the real symbol must appear; got: {stdout}");
+    assert!(!stdout.contains("<external>") && !stdout.contains("<module>"),
+        "ast-search must not leak <module>/<external> placeholder nodes; got: {stdout}");
+    assert!(!stdout.contains("test_distinctlibxyz_marker"),
+        "ast-search must not leak test symbols (query path); got: {stdout}");
+
+    // Filter-only path: --type function must exclude the test_ function too.
+    let (stdout2, _, code2) = run_cli(&project, &["ast-search", "--type", "function"]);
+    assert_eq!(code2, 0);
+    assert!(stdout2.contains("real_fn"), "prod fn must appear under --type function; got: {stdout2}");
+    assert!(!stdout2.contains("test_distinctlibxyz_marker"),
+        "ast-search --type function must exclude test_ functions; got: {stdout2}");
+}
+
 #[test]
 fn test_cli_ast_search_invalid_type() {
     // Regression: --type INVALID used to print a stderr warning and exit 0
@@ -2771,6 +2879,11 @@ fn test_cli_trace_no_routes() {
     let (_, stderr, code) = run_cli(&project, &["trace", "/api/login"]);
     assert_eq!(code, 1);
     assert!(stderr.contains("No routes matching"), "should report no routes found");
+    // Empty trace must disclose the framework-coverage limit (a Rust/Java project has
+    // real routes the extractor never sees) so a bare miss doesn't read as "no such
+    // route". Mirrors the richer MCP trace message.
+    assert!(stderr.contains("not yet extracted") && stderr.contains("Flask"),
+        "empty trace must disclose which frameworks route-extraction covers; got: {stderr}");
 }
 
 #[test]

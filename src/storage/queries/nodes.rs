@@ -400,6 +400,16 @@ pub fn get_nodes_with_files_by_filters(
         let _ = param_idx;
     }
 
+    // Always exclude the <module>/<external> placeholder nodes and test symbols:
+    // ast_search (the only caller) must not surface graph internals or tests among
+    // structural results, matching is_skippable_result on the FTS/query path and the
+    // search/similar surfaces. These literals carry no bind params, so they don't
+    // disturb the ?N indices assigned above. `is_test_node_sql` covers the stored
+    // flag AND the name/path heuristic (a superset of is_skippable_result's check).
+    conditions.push("NOT (n.type = 'module' AND n.name = '<module>')".to_string());
+    conditions.push("f.path != '<external>'".to_string());
+    conditions.push(format!("NOT {}", crate::domain::is_test_node_sql("n", "f")));
+
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
@@ -1171,6 +1181,53 @@ mod tests {
             "real_hot (1 prod caller) must rank above fake_hot (4 test/bench callers); \
              got positions real={} fake={}",
             real_pos, fake_pos,
+        );
+    }
+
+    /// Regression (real-user QA): ast_search's filter-only path (this fn) leaked the
+    /// <module>/<external> placeholder nodes and test symbols into structural results
+    /// — an `<external>:0-0` stub and `<module>` file nodes surfaced alongside real
+    /// symbols, unlike search/similar. Now always excluded here, covering all three
+    /// legs: the `<module>` placeholder, the `<external>` path, and tests via both the
+    /// name/path heuristic AND the stored is_test flag.
+    #[test]
+    fn test_get_nodes_with_files_by_filters_excludes_module_external_test() {
+        let (db, _tmp) = test_db();
+        let src = upsert_file(db.conn(), &FileRecord {
+            path: "src/lib.rs".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+        let ext = upsert_file(db.conn(), &FileRecord {
+            path: "<external>".into(), blake3_hash: "h2".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+        let tests = upsert_file(db.conn(), &FileRecord {
+            path: "tests/mod_test.rs".into(), blake3_hash: "h3".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+        let mk = |file_id: i64, name: &str, ty: &str, is_test: bool| {
+            insert_node(db.conn(), &NodeRecord {
+                file_id, node_type: ty.into(), name: name.into(),
+                qualified_name: None, start_line: 1, end_line: 1,
+                code_content: String::new(), signature: None,
+                doc_comment: None, context_string: None, name_tokens: None,
+                return_type: None, param_types: None, is_test,
+            }).unwrap()
+        };
+        mk(src, "module_loader", "function", false);     // the ONLY keeper
+        mk(src, "<module>", "module", false);            // <module> placeholder
+        mk(ext, "modulejs", "external_module", false);   // <external> stub (path leg)
+        mk(tests, "test_module_helper", "function", false); // test_ name + tests/ path
+        mk(src, "InlineModuleTest", "function", true);   // AST is_test flag leg
+
+        // name LIKE %module% matches ALL five; only the prod fn must survive.
+        let r = get_nodes_with_files_by_filters(
+            db.conn(), None, None, None, Some("module"), 20,
+        ).unwrap();
+        let names: Vec<&str> = r.iter().map(|nwf| nwf.node.name.as_str()).collect();
+        assert_eq!(
+            names, vec!["module_loader"],
+            "only the real prod symbol survives; <module>/<external>/test excluded, got: {names:?}"
         );
     }
 

@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.91.0 — C++ header classes are graphed; test symbols stop leaking into dead-code / ast_search / surprising
+
+`INDEX_VERSION` 39 → 40 (existing indexes rebuild on next open).
+
+A QA-sweep batch: one new extraction capability plus a set of correctness fixes for
+surfaces that were misclassifying test symbols or leaking graph-internal nodes.
+
+### Added
+- **C++ classes declared in a `.h` header are now extracted.** `.h` is C-vs-C++
+  ambiguous by extension, so it was parsed as C — whose grammar can't parse `class`/
+  `namespace`. In the most common C++ layout (declaration in `.h`, definition in
+  `.cpp`) that meant the header's class **symbols never existed as nodes**, and their
+  base-class `inherits` edges were never emitted; `overview`/`callgraph`/`dead-code`/
+  `find_references` were blind to them. A `.h` whose content contains C++ markers
+  (`::`, `public:`/`private:`/`protected:`, `class `, `namespace `, `template<`) is now
+  parsed as C++. Gated on those markers so a pure-C header (`#define`/`#ifndef`/plain
+  `struct`) still parses as C; a false positive is low-harm because the C++ grammar is a
+  near-superset of C. `detect_language` itself is unchanged (path-only; the upgrade
+  happens at the parse point where source is available).
+
+### Fixed
+- **`dead-code` and `surprising` no longer misclassify integration tests.** Both
+  filtered tests by the raw AST `is_test` flag only, which the parser sets for
+  `#[cfg(test)]`/`@Test`/gtest markers — but **not** for the most common test shape, a
+  `def test_foo()` / `.test.ts` file whose test-ness is name/path-based. So `dead-code`
+  reported pytest tests as orphans (inviting deletion of a live test) and `surprising`
+  flagged a `test_foo → foo` call as an "unexpected coupling". Both now apply the full
+  `is_test_node` predicate (a new `domain::is_test_node_sql` GLOB helper mirroring
+  `is_test_symbol`) so they classify tests exactly like `callgraph`/`show`/`centrality`.
+- **`ast_search` no longer leaks `<module>`/`<external>` placeholder nodes or test
+  symbols into results.** Both the CLI (`ast-search`) and MCP (`ast_search`) surfaces —
+  and both the FTS-query and filter-only paths — skipped the `is_skippable_result`
+  triad that `search`/`similar` apply, so `ast-search <extern-name>` returned an
+  `<external>:0-0` stub and `<module>` file nodes next to real symbols, and
+  `ast-search --type function` listed test functions. Now filtered on every path.
+- **A C++ class's inline constructor no longer receives a bogus `inherits` edge.** A
+  class with an inline constructor (`Circle(double){}`) produces a `method Circle` node
+  sharing the class name; the relation-source resolver matched an `inherits`/`implements`
+  relation to *all* same-named nodes, so `Circle inherits Shape` attached to both the
+  class and the constructor method. Inheritance sources are now restricted to type
+  nodes (a `function`/`method` can never be a supertype).
+- **`tour` now appears in `code-graph-mcp --help`.** The command (dependency-ordered
+  reading order) shipped with its own `--help`, JSON output, and a dispatch arm, but was
+  never listed in the top-level command help — it was undiscoverable.
+
+### Changed
+- **`dead-code` no longer reports a false-clean "No dead code found" when candidates sit
+  below `--min-lines`.** At the default `min-lines` 3, a shorter dead function was
+  silently hidden and the message read as "clean" — misleading, especially for an LLM
+  caller that won't think to widen the threshold. The empty message (CLI stderr + MCP
+  `summary`) now names how many shorter symbols the threshold hid and how to see them,
+  probing at `min_lines=1` so the hint fires only when it actually hid something.
+- **CLI `trace` discloses its route-framework coverage on an empty result.** Route
+  extraction covers Express/Connect (JS/TS), Go `net/http`, and Flask/FastAPI (Python)
+  only; a Rust (axum/actix) or Java (Spring) project has real routes the extractor never
+  sees, so a bare "No routes matching" read as "no such route". The CLI message now
+  mirrors the MCP trace path's framework-coverage note.
+
 ## v0.90.0 — TS/JS exported value constants are now graphed
 
 `INDEX_VERSION` 38 → 39 (existing indexes rebuild on next open).

@@ -3028,6 +3028,13 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
             .into_iter()
             .filter(|nwf| {
                 let n = &nwf.node;
+                // Skip <module>/<external> placeholders and test symbols, consistent
+                // with `search`/`similar` (domain::is_skippable_result). ast-search
+                // previously leaked these into structural results — an `<external>:0-0`
+                // stub and `<module>` file nodes alongside real symbols.
+                if crate::domain::is_skippable_result(&n.node_type, &n.name, &nwf.file_path) {
+                    return false;
+                }
                 if let Some(tf) = type_filter {
                     let normalized = normalize_type_filter(tf);
                     if !normalized.iter().any(|t| n.node_type == *t) {
@@ -4643,13 +4650,23 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     }
 
     if rows.is_empty() {
+        // Disclose the framework-coverage limit (mirrors the MCP trace path's
+        // richer message): route extraction is implemented for Express/Connect
+        // (JS/TS/TSX), Go net/http, and Flask/FastAPI (Python) only — a Rust
+        // (axum/actix) or Java (Spring) project has real routes the extractor
+        // never sees, so a bare "no match" reads as "no such route" and misleads.
+        let hint = "route extraction covers Express/Connect (JS/TS), Go net/http, and Flask/FastAPI (Python); \
+                    Rust and Java web frameworks are not yet extracted";
         if json_mode {
-            println!("{}", serde_json::json!({"handlers": [], "message": format!("No routes matching: {}", route_path)}));
+            println!("{}", serde_json::json!({
+                "handlers": [],
+                "message": format!("No routes matching: {} ({})", route_path, hint),
+            }));
         }
         // Match the refs/impact/show not-found pattern (clean `[code-graph] …` on
         // stderr + exit 1) instead of `anyhow::bail!`, which main renders as the
         // double-prefixed `Error: [code-graph] No routes matching`.
-        eprintln!("[code-graph] No routes matching: {}", route_path);
+        eprintln!("[code-graph] No routes matching: {}\n  Note: {}.", route_path, hint);
         std::process::exit(1);
     }
 
@@ -5570,7 +5587,26 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
                 ignored,
             );
         } else {
-            eprintln!("[code-graph] No dead code found.");
+            // A bare "No dead code found." is a false-clean when candidates exist but
+            // sit below --min-lines — and the primary consumer is an LLM that won't
+            // think to widen the threshold. Probe at min_lines=1 (same path/type/ignore
+            // scope) so the hint fires ONLY when the threshold actually hid something,
+            // with the real count. Skipped when min_lines==1 (nothing to hide).
+            let hidden = if min_lines > 1 {
+                queries::find_dead_code(conn, path_filter, type_filter, include_tests, 1, 200)?
+                    .into_iter()
+                    .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
+                    .count()
+            } else {
+                0
+            };
+            if hidden > 0 {
+                eprintln!(
+                    "[code-graph] No dead code found at \u{2265}{min_lines} lines ({hidden} shorter symbol(s) below the threshold; rerun with --min-lines 1 to include them)."
+                );
+            } else {
+                eprintln!("[code-graph] No dead code found.");
+            }
         }
         return Ok(());
     }

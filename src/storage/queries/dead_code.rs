@@ -115,7 +115,13 @@ pub fn find_dead_code(
     }
 
     if !include_tests {
-        conditions.push("n.is_test = 0".to_string());
+        // Not just the raw `n.is_test` flag: the parser only sets that for AST-level
+        // markers (`#[cfg(test)]`, `@Test`, …), so a plain integration test
+        // `def test_foo()` in `tests/` carries is_test=0 and would be reported as
+        // dead code — inviting deletion of a live test. Mirror the query-time
+        // `is_test_node` predicate (flag OR name/path heuristic) so dead-code
+        // classifies tests exactly like callgraph/show/centrality do.
+        conditions.push(format!("NOT {}", crate::domain::is_test_node_sql("n", "f")));
     }
 
     // Track how many type filter placeholders we need
@@ -496,6 +502,52 @@ mod tests {
         let big_names: Vec<&str> = results_big.iter().map(|r| r.name.as_str()).collect();
         assert!(big_names.contains(&"orphan_fn"), "orphan_fn (20 lines) should pass min_lines=18");
         assert!(!big_names.contains(&"exported_unused"), "exported_unused (15 lines) should fail min_lines=18");
+    }
+
+    /// Sibling-hole guard (real-user QA): the parser sets `is_test=1` only for
+    /// AST-level markers (`#[cfg(test)]`, `@Test`, …), so a plain integration test
+    /// `def test_foo()` in `tests/` carries is_test=0. The old `n.is_test = 0` filter
+    /// let it through as an ORPHAN — inviting an agent/user to delete a live test.
+    /// Now excluded via the full `is_test_node` name/path heuristic. Covers the
+    /// `test_`-name leg AND the `tests/`-path leg with the flag OFF.
+    #[test]
+    fn test_find_dead_code_excludes_heuristic_tests_without_flag() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = upsert_file(conn, &FileRecord {
+            path: "tests/test_api.py".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("python".into()),
+        }).unwrap();
+        // test_-prefixed name, is_test flag NOT set — the pytest integration-test shape.
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "test_signup".into(),
+            qualified_name: None, start_line: 1, end_line: 6,
+            code_content: "def test_signup():\n    assert handle_signup() == 'ok'".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // A NON-test-named helper living in the same tests/ file: excluded by the
+        // path leg (a fixture/helper in a test file is still test-harness code).
+        insert_node(conn, &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "make_fixture".into(),
+            qualified_name: None, start_line: 8, end_line: 13,
+            code_content: "def make_fixture():\n    return {}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let names: Vec<String> = find_dead_code(conn, None, None, false, 1, 100)
+            .unwrap().into_iter().map(|r| r.name).collect();
+        assert!(!names.contains(&"test_signup".to_string()),
+            "test_-named fn (is_test=0) in tests/ must NOT be reported dead by default, got: {names:?}");
+        assert!(!names.contains(&"make_fixture".to_string()),
+            "helper in a tests/ file must NOT be reported dead by default (path heuristic), got: {names:?}");
+
+        // include_tests=true surfaces them again (the flag is symmetric).
+        let with_tests: Vec<String> = find_dead_code(conn, None, None, true, 1, 100)
+            .unwrap().into_iter().map(|r| r.name).collect();
+        assert!(with_tests.contains(&"test_signup".to_string()),
+            "include_tests=true must surface the test fn, got: {with_tests:?}");
     }
 
     #[test]
