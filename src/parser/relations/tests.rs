@@ -30,6 +30,46 @@ fn test_extract_php_include_imports() {
 }
 
 #[test]
+fn test_extract_ts_reexport_from_barrel() {
+    // A barrel/index re-export `export { X, Y } from './mod'` is a DEPENDENCY on
+    // './mod'. Emit a REL_IMPORTS edge per re-exported name, stamped with the same
+    // js_module metadata a regular named import carries, so Phase-2 resolves each to
+    // the source file. Before INDEX_VERSION 41 these produced ZERO edges — barrel
+    // files were invisible to deps/affected/impact/cycles/tour and find-references.
+    let code = "\
+        export { API_URL, host } from './constants';\n\
+        export { callApi as call } from './consumer';\n\
+        export const LOCAL = 1;\n\
+        export function localFn() { return 1; }\n";
+    let rels = extract_relations(code, "typescript").unwrap();
+
+    let reexports: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_IMPORTS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(reexports.contains(&"API_URL"), "re-export → import 'API_URL'; got: {:?}", reexports);
+    assert!(reexports.contains(&"host"), "re-export → import 'host'; got: {:?}", reexports);
+    // A renamed re-export resolves on the SOURCE name (callApi), not the alias (call).
+    assert!(reexports.contains(&"callApi"), "renamed re-export uses source name 'callApi'; got: {:?}", reexports);
+    assert!(!reexports.contains(&"call"), "the alias must not be the dependency target; got: {:?}", reexports);
+
+    // The js_module specifier is stamped so Phase-2 resolves to the concrete file.
+    let api = rels.iter()
+        .find(|r| r.relation == REL_IMPORTS && r.target_name == "API_URL")
+        .expect("API_URL re-export edge");
+    assert!(api.metadata.as_deref().unwrap_or("").contains("./constants"),
+        "re-export import carries js_module metadata; got: {:?}", api.metadata);
+
+    // Declaration exports in the same file still emit REL_EXPORTS (path unchanged).
+    let exports: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_EXPORTS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(exports.contains(&"LOCAL"), "declaration const export still works; got: {:?}", exports);
+    assert!(exports.contains(&"localFn"), "function export still works; got: {:?}", exports);
+}
+
+#[test]
 fn test_extract_flask_route_methods_kwarg() {
     // Flask `@app.route('/x', methods=['POST'])` must derive the HTTP method from
     // the `methods=` kwarg, not default to "ANY" (which breaks `trace 'POST /x'`

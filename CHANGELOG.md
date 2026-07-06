@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.92.0 — TS/JS destructuring exports and barrel re-exports are now graphed
+
+`INDEX_VERSION` 40 → 41 (existing indexes rebuild on next open).
+
+Two TS/JS extraction gaps found by QA, both breaking cross-module dependency
+resolution for extremely common patterns (Redux/React destructured exports and
+`index.ts` barrel files).
+
+### Fixed
+- **Destructuring exports now extract one symbol per bound name.** `export const {
+  host, port } = getConfig()` and `export const [a, b] = getPair()` were captured as a
+  *single* `constant` node named after the literal pattern text (`{ host, port }`) —
+  not a valid identifier, so `import { host }` dangled to the `<external>` sentinel and
+  the destructured symbols were unusable by name and invisible to `show`/`callgraph`/
+  `find-references`. The v0.90.0 const-export import-edge fix silently missed every
+  destructuring form. Each bound name is now its own `constant` node, so the import
+  edge resolves. Common in the wild: Redux `export const { actions, reducer } = slice`,
+  React `export const { Provider } = createContext()`, RTK Query hook exports. Renamed
+  `{ key: local }` binds the local name; defaults (`{ x = 1 }`), rest (`{ ...r }` /
+  `[...r]`), and nested patterns recurse to leaf identifiers.
+- **Barrel re-exports now create dependency edges.** `export { X, Y } from './mod'` (the
+  `index.ts` barrel pattern) produced **zero** graph edges — the file had no tracked
+  dependency, so `deps` showed nothing, `find-references` missed it, and `affected`/
+  `impact`/`cycles`/`tour` could not traverse *through* it. Each re-exported name now
+  emits a `REL_IMPORTS` dependency edge stamped with the same `js_module` specifier a
+  regular `import { X } from './mod'` carries, so Phase-2 resolves it to the source
+  file. (`export * from './mod'` wildcards stay module-level-unresolved — a shared
+  limitation with namespace imports `import * as ns`.)
+
 ## v0.91.0 — C++ header classes are graphed; test symbols stop leaking into dead-code / ast_search / surprising
 
 `INDEX_VERSION` 39 → 40 (existing indexes rebuild on next open).

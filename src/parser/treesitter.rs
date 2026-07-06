@@ -693,6 +693,50 @@ fn extract_function_node(
     })
 }
 
+/// Collect the local binding identifiers introduced by a destructuring pattern
+/// (`object_pattern` / `array_pattern`) on the left of a `const`/`let` declaration.
+/// Each bound name is an independently-importable symbol, so
+/// `export const { host, port } = getConfig()` yields `host` and `port` rather than
+/// the literal pattern text `{ host, port }`. Renamed `{ key: local }` binds `local`
+/// (the exported name); defaults (`{ x = 1 }` / `[x = 1]`), rest (`{ ...r }` /
+/// `[...r]`), and nested patterns recurse to their leaf identifiers. Mirrors the
+/// require-destructuring walk in relations/mod.rs (which keys on the export/key side
+/// for CJS import edges; extraction wants the local binding, i.e. the value side).
+fn collect_binding_names(pattern: &tree_sitter::Node, source: &str, out: &mut Vec<String>) {
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let t = node_text(pattern, source);
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+        // `{ key: local }` — the VALUE side is the local binding that gets exported.
+        "pair_pattern" => {
+            if let Some(v) = pattern.child_by_field_name("value") {
+                collect_binding_names(&v, source, out);
+            }
+        }
+        // `{ x = default }` / `[x = default]` — the LEFT side is the binding.
+        "object_assignment_pattern" | "assignment_pattern" => {
+            if let Some(l) = pattern
+                .child_by_field_name("left")
+                .or_else(|| pattern.named_child(0))
+            {
+                collect_binding_names(&l, source, out);
+            }
+        }
+        // Containers + rest: recurse into every named child.
+        "object_pattern" | "array_pattern" | "rest_pattern" => {
+            for i in 0..pattern.named_child_count() {
+                if let Some(c) = pattern.named_child(i) {
+                    collect_binding_names(&c, source, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNode> {
     // lexical_declaration -> variable_declarator -> arrow_function
     // A single declaration may contain multiple arrow functions: const a = () => {}, b = () => {};
@@ -703,10 +747,11 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
             None => continue,
         };
         if child.kind() == "variable_declarator" {
-            let name = match get_child_by_field(&child, "name", source) {
+            let name_node = match child.child_by_field_name("name") {
                 Some(n) => n,
                 None => continue,
             };
+            let name = node_text(&name_node, source).to_string();
             let value = match child.child_by_field_name("value") {
                 Some(v) => v,
                 None => continue,
@@ -742,19 +787,38 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
                 // Type "constant" mirrors the Rust `const_item`/`static_item` extraction
                 // (this is TS/JS reaching parity); function-valued consts are handled by
                 // the arrow branch above, never here.
-                out.push(ParsedNode {
-                    node_type: "constant".into(),
-                    name: name.clone(),
-                    qualified_name: Some(name),
-                    start_line: child.start_position().row as u32 + 1,
-                    end_line: child.end_position().row as u32 + 1,
-                    code_content: truncate_code_content(node_text(&child, source)).into_owned(),
-                    signature: None,
-                    doc_comment: get_preceding_comment(node, source),
-                    return_type: None,
-                    param_types: None,
-                    is_test: false,
-                });
+                //
+                // A destructuring export binds MULTIPLE names: `export const { host,
+                // port } = getConfig()` / `export const [a, b] = getPair()`. The
+                // declarator's `name` field is then an object/array pattern whose text
+                // is the literal `{ host, port }` — not a valid identifier, and no
+                // consumer can `import { host }` against it (the import dangles to the
+                // `<external>` sentinel). Emit one constant per bound name so each is
+                // an importable symbol. Common in the wild: Redux `export const {
+                // actions, reducer } = slice`, React `export const { Provider } =
+                // createContext()`. A plain identifier yields the single name unchanged.
+                let names: Vec<String> = if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
+                    let mut v = Vec::new();
+                    collect_binding_names(&name_node, source, &mut v);
+                    v
+                } else {
+                    vec![name.clone()]
+                };
+                for nm in names {
+                    out.push(ParsedNode {
+                        node_type: "constant".into(),
+                        name: nm.clone(),
+                        qualified_name: Some(nm),
+                        start_line: child.start_position().row as u32 + 1,
+                        end_line: child.end_position().row as u32 + 1,
+                        code_content: truncate_code_content(node_text(&child, source)).into_owned(),
+                        signature: None,
+                        doc_comment: get_preceding_comment(node, source),
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    });
+                }
             }
         }
     }
@@ -1578,5 +1642,48 @@ function scope() {
         // Non-exported consts are never extracted (can't be imported → noise).
         assert!(by("NOT_EXPORTED").is_none(), "non-exported top-level const must not be a symbol");
         assert!(by("localOnly").is_none(), "function-local const must not be a symbol");
+    }
+
+    #[test]
+    fn test_parse_typescript_destructuring_exports() {
+        // A destructuring export binds MULTIPLE importable names. Before INDEX_VERSION
+        // 41 the declarator's pattern text (`{ host, port }`) became a single garbage
+        // node — no valid identifier, so `import { host }` dangled to `<external>`.
+        // Now one `constant` node is emitted per bound name (Redux `export const {
+        // actions, reducer } = slice`, React `export const { Provider } = createContext()`).
+        let code = r#"
+export const { host, port } = getConfig();
+export const [first, second] = getPair();
+export const { renamedFrom: localName } = getObj();
+export const { withDefault = 10 } = getObj();
+export const { keep, ...theRest } = getObj();
+export const SIMPLE = 1;
+
+const { notExported } = getObj();
+"#;
+        let nodes = parse_code(code, "typescript").unwrap();
+        let by = |n: &str| nodes.iter().find(|x| x.name == n);
+
+        // Object-shorthand and array bindings each become their own constant.
+        for name in ["host", "port", "first", "second", "keep", "theRest"] {
+            let n = by(name).unwrap_or_else(|| panic!("destructured binding `{name}` should be a constant node"));
+            assert_eq!(n.node_type, "constant", "binding `{name}` should be a constant");
+        }
+
+        // Renamed `{ renamedFrom: localName }` binds the LOCAL name (the exported one),
+        // not the source property key.
+        assert!(by("localName").is_some(), "renamed destructure binds the local name");
+        assert!(by("renamedFrom").is_none(), "the source key is not a binding");
+
+        // Default `{ withDefault = 10 }` binds `withDefault`.
+        assert!(by("withDefault").is_some(), "default-valued destructure binds the name");
+
+        // The literal pattern text must NEVER become a node name.
+        assert!(by("{ host, port }").is_none(), "pattern text must not be a symbol name");
+        assert!(by("[first, second]").is_none(), "array pattern text must not be a symbol name");
+
+        // Plain identifier export still works; non-exported destructure is not extracted.
+        assert_eq!(by("SIMPLE").expect("plain const").node_type, "constant");
+        assert!(by("notExported").is_none(), "non-exported destructure must not be a symbol");
     }
 }
