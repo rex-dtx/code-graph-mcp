@@ -211,11 +211,39 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
             continue; // still unresolvable — leave buffered
         }
 
-        let refined = if candidates.len() > 1 {
+        // Apply the SAME callee-qualifier filtering Phase 2 does (index_files.rs
+        // match on parse_callee_metadata) before binding. The sweep used to resolve
+        // purely by bare name + same-language, ignoring the stored qualifier — so a
+        // buffered `w.write()` (receiver type DataWriter) drained by a later pass
+        // bound to EVERY same-language `write`, wiring false callers that persisted
+        // until rebuild-index (H1, silent incremental graph corruption). Filtering
+        // is strictly ADDITIVE: when the type/path qualifier matches ≥1 candidate we
+        // bind exactly those; when it matches none we fall back to the bare set, so
+        // no edge the bare path would have produced is ever dropped (dead-code stays
+        // precise). Only shapes that can actually reach the buffer need handling —
+        // bare (None), rtype (Python), JS receiver — but self/stype/path are filtered
+        // too for parity should a future Phase-2 change route them here.
+        let resolved: Vec<i64> = match parse_callee_metadata(row.metadata.as_deref()) {
+            Some(CalleeMeta::RecvType(t))
+            | Some(CalleeMeta::SelfType(t))
+            | Some(CalleeMeta::SelfRecv(t)) => {
+                let filtered = self_filter_candidates(&t, &candidates, db)?;
+                if filtered.is_empty() { candidates } else { filtered }
+            }
+            Some(CalleeMeta::Path(segments)) => {
+                let filtered = path_filter_candidates(&segments, &candidates, &node_id_to_path, db)?;
+                if filtered.is_empty() { candidates } else { filtered }
+            }
+            // Bare / chain / JS receiver: Phase 2's default chain resolves these by
+            // bare name too, so the existing behavior already matches.
+            _ => candidates,
+        };
+
+        let refined = if resolved.len() > 1 {
             let source_path = source_id_to_path.get(&row.source_id).cloned().unwrap_or_default();
-            refine_ambiguous_targets(&candidates, &source_path, &node_id_to_path)
+            refine_ambiguous_targets(&resolved, &source_path, &node_id_to_path)
         } else {
-            candidates
+            resolved
         };
 
         for tgt_id in &refined {
@@ -592,6 +620,96 @@ mod tests {
         // Other relations also use metadata; resolver should skip non-call shapes.
         assert!(parse_callee_metadata(Some(r#"{"method":"GET","path":"/api"}"#)).is_none());
         assert!(parse_callee_metadata(Some(r#"{"python_module":"foo","is_module_import":false}"#)).is_none());
+    }
+
+    mod pending_qualifier {
+        use super::*;
+        use crate::domain::REL_CALLS;
+        use crate::storage::db::Database;
+        use crate::storage::queries::{
+            insert_node, insert_pending_unresolved_call, list_pending_unresolved_calls,
+            upsert_file, FileRecord, NodeRecord,
+        };
+        use tempfile::TempDir;
+
+        fn pyfile(conn: &rusqlite::Connection, path: &str) -> i64 {
+            upsert_file(conn, &FileRecord {
+                path: path.into(), blake3_hash: format!("h-{path}"),
+                last_modified: 1, language: Some("python".into()),
+            }).unwrap()
+        }
+        fn method(conn: &rusqlite::Connection, name: &str, qname: Option<&str>, file_id: i64) -> i64 {
+            insert_node(conn, &NodeRecord {
+                file_id, node_type: "function".into(), name: name.into(),
+                qualified_name: qname.map(String::from), start_line: 1, end_line: 3,
+                code_content: format!("def {name}(self): pass"), signature: None,
+                doc_comment: None, context_string: None, name_tokens: None,
+                return_type: None, param_types: None, is_test: false,
+            }).unwrap()
+        }
+        fn call_targets(conn: &rusqlite::Connection, src: i64) -> Vec<i64> {
+            let mut stmt = conn.prepare(
+                "SELECT target_id FROM edges WHERE source_id=?1 AND relation=?2 ORDER BY target_id"
+            ).unwrap();
+            stmt.query_map(rusqlite::params![src, REL_CALLS], |r| r.get::<_, i64>(0))
+                .unwrap().map(Result::unwrap).collect()
+        }
+
+        /// H1 regression: the pending-call sweep must apply the SAME callee-qualifier
+        /// filtering Phase 2 does. A buffered Python `w.write()` whose receiver type
+        /// was inferred as `DataWriter` (rtype qualifier) must bind ONLY to
+        /// `DataWriter.write`, never to a same-named `Profile.write` on a sibling
+        /// class. The old sweep ignored the qualifier and bound by bare name → it
+        /// wired the wrong same-name sibling as a false caller, persisting until
+        /// rebuild-index (silent incremental graph corruption).
+        #[test]
+        fn pending_sweep_applies_recv_type_qualifier() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("p.db")).unwrap();
+            let conn = db.conn();
+            let f_app = pyfile(conn, "app.py");
+            let f_writer = pyfile(conn, "writer.py");
+            let f_other = pyfile(conn, "other.py");
+
+            let run = method(conn, "run", None, f_app);
+            let dw_write = method(conn, "write", Some("DataWriter.write"), f_writer);
+            let pf_write = method(conn, "write", Some("Profile.write"), f_other);
+
+            // `w = DataWriter(); w.write()` buffered while no `write` was indexed yet.
+            insert_pending_unresolved_call(
+                conn, run, "write", "python", Some(r#"{"q":"rtype","v":"DataWriter"}"#),
+            ).unwrap();
+
+            let added = resolve_pending_calls(&db).unwrap();
+            let targets = call_targets(conn, run);
+
+            assert_eq!(added, 1, "exactly one edge should bind (DataWriter.write); got {added}");
+            assert_eq!(targets, vec![dw_write],
+                "rtype qualifier must bind DataWriter.write only");
+            assert!(!targets.contains(&pf_write),
+                "must NOT wire the wrong same-name sibling Profile.write");
+            assert_eq!(list_pending_unresolved_calls(conn).unwrap().len(), 0,
+                "the resolved pending row must be drained");
+        }
+
+        /// Bare (no-qualifier) pending calls keep the existing behavior: a unique
+        /// same-language target still resolves. Negative control — proves the
+        /// qualifier gate doesn't break the common bare path.
+        #[test]
+        fn pending_sweep_bare_call_still_resolves() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("p.db")).unwrap();
+            let conn = db.conn();
+            let f_app = pyfile(conn, "app.py");
+            let f_util = pyfile(conn, "util.py");
+            let run = method(conn, "run", None, f_app);
+            let helper = method(conn, "helper", None, f_util);
+            insert_pending_unresolved_call(conn, run, "helper", "python", None).unwrap();
+
+            let added = resolve_pending_calls(&db).unwrap();
+            assert_eq!(added, 1, "bare unique call must still resolve");
+            assert_eq!(call_targets(conn, run), vec![helper]);
+        }
     }
 
     mod confidence {
