@@ -155,29 +155,33 @@ jobs:
           done
 
       - name: Package model files
-        # Pinned to a specific HuggingFace commit (cso #2) instead of the
-        # mutable `main` ref — without this, `main` moving (or HF account
-        # compromise) silently changes the bundled model and the downstream
-        # tarball sha256 would only validate the bundle against itself, not
-        # against a known-good upstream. --fail makes curl exit non-zero on
-        # HTTP 4xx/5xx so a 404 HTML page can't masquerade as model.safetensors.
-        # Content pins below verify the downloaded bytes against known-good
-        # hashes of the pinned revision, so even a compromised HF response (or
-        # a silent revision bump in this file) fails the release instead of
-        # shipping different weights. When HF_REVISION changes, recompute all
-        # three sha256s AND bump MODEL_CONTENT_BLAKE3 in src/embedding/model.rs
-        # (the client-side verifier) in the same commit — clients reject any
-        # models.tar.gz whose model.safetensors doesn't match that constant.
+        # Model weights are mirrored as assets on this repo's own stable
+        # `model-assets-v1` release — a byte-for-byte copy of
+        # sentence-transformers/all-MiniLM-L6-v2 @ HF revision
+        # c9745ed1d9f207416be6d2e6f8de32d1f16199bf — so the release pipeline
+        # never depends on a live HuggingFace download at publish time. HF
+        # migrated this model to Xet storage, whose anonymous CDN fetch started
+        # returning 403 AccessDenied and broke v0.96.0's first publish; a
+        # GitHub-hosted mirror removes that third-party dependency entirely
+        # (GitHub runners always reach GitHub). --fail makes curl exit non-zero
+        # on HTTP 4xx/5xx so an error page can't masquerade as model.safetensors.
+        # The content pins below verify the downloaded bytes against known-good
+        # hashes, so a swapped or corrupted mirror asset fails the release
+        # instead of shipping different weights. To change the model: re-cut the
+        # `model-assets-v1` release assets, recompute all three sha256s here, AND
+        # bump MODEL_CONTENT_BLAKE3 in src/embedding/model.rs (the client-side
+        # verifier) in the same commit — clients reject any models.tar.gz whose
+        # model.safetensors doesn't match that constant.
         run: |
           mkdir -p models-pkg
-          HF_REVISION=c9745ed1d9f207416be6d2e6f8de32d1f16199bf
+          MODEL_BASE="https://github.com/${{ github.repository }}/releases/download/model-assets-v1"
           for f in model.safetensors tokenizer.json config.json; do
-            # --retry: a transient HF 5xx must not fail the release. Mirrors the
-            # smoke-verify model fetch. Combined with the publish-after-assets
-            # ordering below, a HF blip now fails BEFORE npm publish (no half-
-            # release shipping a version whose models.tar.gz 404s → FTS5-only).
+            # --retry: a transient GitHub 5xx must not fail the release. Combined
+            # with the publish-after-assets ordering below, a fetch blip fails
+            # BEFORE npm publish (no half-release shipping a version whose
+            # models.tar.gz 404s → FTS5-only).
             curl -L --fail --retry 3 --retry-delay 2 -o models-pkg/$f \
-              "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/$HF_REVISION/$f"
+              "$MODEL_BASE/$f"
           done
           sha256sum -c - <<'PINS'
           53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db  models-pkg/model.safetensors
