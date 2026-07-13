@@ -24,7 +24,8 @@
   "files": [
     "bin/cli.js",
     "README.md",
-    "claude-plugin"
+    "claude-plugin",
+    "!claude-plugin/**/*.test.js"
   ],
   "scripts": {
     "build": "cargo build --release --no-default-features && node scripts/copy-binary.js",
