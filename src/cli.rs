@@ -6398,6 +6398,45 @@ mod tests {
         );
     }
 
+    /// META⑤ drift-guard: `deps` confines file reads to the project root via
+    /// canonicalize. This asserts an out-of-root symlink yields NO leaked
+    /// content on EVERY read path `deps` uses for a given file. Step 1 audit
+    /// (cli.rs cmd_deps, 4945-5111) found `scan_barrel_patterns` is the SOLE
+    /// content-reader reachable from `deps`: `get_import_tree` only queries the
+    /// DB, and the MCP twin `tool_dependency_graph`
+    /// (src/mcp/server/tools/advanced.rs) never reads file contents at all —
+    /// no barrel fallback exists on the MCP side. `read_source_context`
+    /// (cli.rs:4626) has the same guard shape but is a `cmd_show`/`cmd_similar`
+    /// helper, not reachable from `deps` for a given `file_path`, so it is not
+    /// a `deps` sibling and is out of scope here. This test therefore documents
+    /// the single-reader finding and pins `scan_barrel_patterns` as that sole
+    /// path, so the confinement can't be fixed on one path and silently left
+    /// open on a newly-added sibling later.
+    /// Negative control: remove the `canonical.starts_with(&root_canonical)`
+    /// guard in `scan_barrel_patterns` and this returns `Some(...)` → fails.
+    #[test]
+    #[cfg(unix)]
+    fn deps_read_paths_all_refuse_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let outside = tmp.path().parent().unwrap().join("secret-deps-drift-guard.ts");
+        std::fs::write(&outside, "import { s } from './secret-source';\n").unwrap();
+        let link = root.join("link.ts");
+        symlink(&outside, &link).unwrap();
+
+        // Sole read path deps uses for file contents: the barrel-scan fallback.
+        // Must refuse the escape and must never surface the outside content.
+        let result = scan_barrel_patterns(root, "link.ts");
+        assert!(
+            result.is_none(),
+            "deps' sole content-read path (scan_barrel_patterns) followed a \
+             symlink escaping the project root: {result:?}",
+        );
+
+        let _ = std::fs::remove_file(&outside);
+    }
+
     #[test]
     fn test_no_embed_flag_parses_on_index_commands() {
         // `--no-embed` is the published fast-path opt-out: structure-first index,
