@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.94.0 — audit-driven correctness & supply-chain hardening (P0 + P1)
+
+Thirteen fixes from the v0.93.1 architecture audit (`docs/AUDIT-2026-07-13.md`),
+tracked in `docs/OPTIMIZATION-ROADMAP.md`. Every fix ships with a regression test
+that fails on the pre-fix code. **`INDEX_VERSION` 41 → 46** — existing indexes
+auto-rebuild on first open (parser/resolution output changed). `SCHEMA_VERSION`
+unchanged (9).
+
+### Fixed — graph correctness (indexes rebuild)
+- **Incremental indexing no longer silently corrupts the call graph.** The
+  pending-call sweep (`resolve_pending_calls`, run on watcher / branch-switch /
+  incremental passes) resolved buffered calls by bare name only, ignoring the
+  callee qualifier Phase 2 applies. A Python `w.write()` whose receiver type was
+  inferred as `DataWriter` bound to *every* same-language `write` — false callers
+  that persisted until `rebuild-index`. The sweep now applies the same qualifier
+  filtering (additive: precise when the qualifier matches, bare fallback otherwise).
+- **Qualifier-resolved call edges stay visible.** `classify_edge_confidence`
+  downgraded `self.method()` / `Alpha::foo()` calls to `ambiguous` (hidden by the
+  default confidence floor) whenever the bare name was duplicated, even though the
+  edge was precisely resolved by a type/path qualifier. They now keep `inferred`.
+- **Java `import` statements are extracted.** `import_declaration` was matched only
+  for Swift, so every Java project had zero import edges, no `<external>` nodes, and
+  imported classes false-flagged as dead-code — contradicting the documented Java
+  Full tier. Now emits `imports` to the imported type (wildcard imports skipped).
+- **PHP top-level calls attribute to `<module>`.** A bare `greetPhp();` at script
+  top level was dropped (the arm required an enclosing scope), so the callee looked
+  dead. Matches the python/ruby/bash `<module>` fallback.
+- **C/C++ `#include "own.h"` resolves to the indexed header.** The include emitted
+  only a bare stem, so it fell to `<external>` and local header dependencies were
+  invisible to deps/cycles/affected. Now binds to the header file's `<module>`,
+  mirroring PHP/JS require resolution.
+
+### Fixed — robustness, ranking & CLI
+- **A 10 MB+ multi-byte (CJK) MCP request no longer kills the session.** The serve
+  read loop's `read_line` UTF-8-validated a `take`-truncated buffer and propagated
+  the error outside the per-request `catch_unwind`, tearing down the whole stdio
+  session — a single-request DoS. Now reads raw bytes + lossy-decodes.
+- **RRF fusion no longer flips adjacent ranks on negative vector scores.** sqlite-vec
+  L2 distance yields scores in `[-1, 1]`; a negative score produced an unbounded
+  blend term. The numerator is now clamped (non-negative scores unchanged).
+- **`deps` refuses symlinks that escape the project root.** The barrel-pattern
+  scanner followed a symlink out of the repo with no confinement — a restricted
+  file-read oracle. Now canonicalizes + confines like `read_source_context`.
+- **Project-root resolution matches the JS hooks.** When cwd sat below a stray
+  nested `.code-graph` under the real indexed `.git` root, the CLI resolved to the
+  stray index while the hooks used the root — a split-brain double-DB. The CLI now
+  prefers the indexed `.git` root.
+
+### Fixed — supply chain, storage & dev/CI
+- **Snapshot install fails closed with no integrity sidecar.** With no
+  `CODE_GRAPH_SNAPSHOT_PIN`, a snapshot whose `.blake3` sidecar 404'd / was blocked /
+  downgraded was installed *unverified*. It is now refused (escape hatches: a pin, or
+  the publisher serving the sidecar).
+- **A pre-v3 database no longer bricks after a crash mid-migration.** The v2→v3
+  migration's `INSERT ... SELECT *` failed with "5 columns but 6 values" when a crash
+  left `user_version` behind a schema that already had `edges.confidence`, with no
+  self-heal. It now names the 5 columns explicitly and converges on re-run.
+- **pre-commit JS tests no longer leak `GIT_*` into git fixtures** (dev-only; the
+  v0.80.3 fix's sibling hole in the JS section).
+- **CI runs every plugin `*.test.js`.** The curated list had drifted to silently
+  miss four passing test files; CI now globs all of them minus two documented
+  exclusions, so new test files are never skipped.
+
 ## v0.93.1 — `stats` no longer panics on a broken pipe
 
 No `INDEX_VERSION` / `SCHEMA_VERSION` change — this is a CLI output-path bugfix
