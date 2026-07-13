@@ -1142,6 +1142,13 @@ pub struct ToolAgg {
     pub total_ms: u64,
     pub err: u64,
     pub max_ms: u64,
+    /// Sum of per-session `err_kinds` maps (ErrKind::as_str() → count). Empty for
+    /// tools whose errors all predate the err_kinds field. `sum(err_kinds) <= err`;
+    /// the gap is pre-feature sessions that logged `err` without a breakdown.
+    pub err_kinds: HashMap<String, u64>,
+    /// First non-empty `other_sample` seen across sessions — one representative
+    /// message for the catch-all `other` bucket, so it is self-explaining.
+    pub other_sample: Option<String>,
 }
 
 /// Summary produced by `aggregate_usage_jsonl` — drives both human + JSON output.
@@ -1260,13 +1267,28 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
         if let Some(tools_obj) = rec.get("tools").and_then(|v| v.as_object()) {
             for (name, s) in tools_obj {
                 let agg = summary.tools.entry(name.clone()).or_insert(ToolAgg {
-                    n: 0, total_ms: 0, err: 0, max_ms: 0,
+                    n: 0, total_ms: 0, err: 0, max_ms: 0, err_kinds: HashMap::new(),
+                    other_sample: None,
                 });
                 agg.n += s.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
                 agg.total_ms += s.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 agg.err += s.get("err").and_then(|v| v.as_u64()).unwrap_or(0);
                 let m = s.get("max_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 if m > agg.max_ms { agg.max_ms = m; }
+                // Merge the per-session err_kinds breakdown (additive; absent on
+                // pre-feature rows, so `sum(err_kinds)` may trail `err`).
+                if let Some(ek) = s.get("err_kinds").and_then(|v| v.as_object()) {
+                    for (kind, cnt) in ek {
+                        *agg.err_kinds.entry(kind.clone()).or_insert(0) +=
+                            cnt.as_u64().unwrap_or(0);
+                    }
+                }
+                // First `other_sample` wins — one representative message is enough.
+                if agg.other_sample.is_none() {
+                    if let Some(sample) = s.get("other_sample").and_then(|v| v.as_str()) {
+                        agg.other_sample = Some(sample.to_string());
+                    }
+                }
             }
         }
         if let Some(s) = rec.get("search") {
@@ -1600,9 +1622,17 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     if json_mode {
         let tools_json: serde_json::Map<String, serde_json::Value> = summary.tools.iter().map(|(name, a)| {
             let avg = a.total_ms.checked_div(a.n).unwrap_or(0);
-            (name.clone(), serde_json::json!({
+            let mut o = serde_json::json!({
                 "n": a.n, "total_ms": a.total_ms, "avg_ms": avg, "err": a.err, "max_ms": a.max_ms,
-            }))
+            });
+            // Additive: only present when the tool logged a classified error.
+            if !a.err_kinds.is_empty() {
+                o["err_kinds"] = serde_json::json!(a.err_kinds);
+            }
+            if let Some(sample) = &a.other_sample {
+                o["other_sample"] = serde_json::json!(sample);
+            }
+            (name.clone(), o)
         }).collect();
         let avg_q = if summary.search_queries > 0 {
             summary.search_quality_weighted_sum / summary.search_queries as f64
@@ -1726,6 +1756,39 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             }
             if any_legacy {
                 println!("  † not in the current tools/list surface (folded/hidden; from older sessions)");
+            }
+        }
+
+        // Error-kind breakdown: turn the opaque `err` column into actionable
+        // buckets. `not_found` = benign name-miss (model guessed a symbol name);
+        // `other` = unclassified — a large `other` is the real signal to chase
+        // (expand ErrKind::classify in metrics.rs). A gap between `err` and the
+        // sum of kinds is pre-feature sessions (shown as `unrecorded`).
+        let mut err_tools: Vec<(&String, &ToolAgg)> =
+            summary.tools.iter().filter(|(_, a)| a.err > 0).collect();
+        if !err_tools.is_empty() {
+            err_tools.sort_by_key(|(_, a)| std::cmp::Reverse(a.err));
+            println!();
+            println!("Error kinds (per tool, most errors first — large `other` = unclassified, investigate):");
+            for (name, agg) in &err_tools {
+                let mut kinds: Vec<(&String, &u64)> = agg.err_kinds.iter().collect();
+                kinds.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+                let classified: u64 = agg.err_kinds.values().sum();
+                let mut parts: Vec<String> =
+                    kinds.iter().map(|(k, c)| format!("{} {}", k, c)).collect();
+                if agg.err > classified {
+                    parts.push(format!("unrecorded {}", agg.err - classified));
+                }
+                let label = if !crate::domain::LIVE_MCP_TOOLS.contains(&name.as_str()) {
+                    format!("{name} †")
+                } else {
+                    name.to_string()
+                };
+                println!("  {:<26} {} err = {}", label, agg.err, parts.join(" · "));
+                // Surface the sampled `other` message so the bucket self-explains.
+                if let Some(sample) = &agg.other_sample {
+                    println!("  {:<26}   ↳ other e.g. {:?}", "", sample);
+                }
             }
         }
 
@@ -6931,6 +6994,27 @@ mod tests {
         let s = aggregate_usage_jsonl(content, None);
         assert_eq!(s.sessions, 1);
         assert_eq!(s.parse_errors, 1);
+    }
+
+    #[test]
+    fn test_aggregate_usage_merges_err_kinds_and_tracks_unrecorded_gap() {
+        // Shapes mirror metrics.rs `build_record`: err_kinds is an object nested
+        // in the tool entry, emitted only when non-empty. Session 3 predates the
+        // field (err but no err_kinds) so it must land in the `err`-vs-classified
+        // gap, not vanish.
+        let s1 = r#"{"ts":"2026-07-01T00:00:00Z","v":"0.90.0","tools":{"get_call_graph":{"n":5,"ms":500,"err":2,"max_ms":200,"err_kinds":{"other":1,"not_found":1}}}}"#;
+        let s2 = r#"{"ts":"2026-07-02T00:00:00Z","v":"0.90.0","tools":{"get_call_graph":{"n":3,"ms":300,"err":2,"max_ms":150,"err_kinds":{"other":2}}}}"#;
+        let s3 = r#"{"ts":"2026-06-01T00:00:00Z","v":"0.60.0","tools":{"get_call_graph":{"n":1,"ms":90,"err":1,"max_ms":90}}}"#;
+        let content = format!("{s1}\n{s2}\n{s3}\n");
+        let s = aggregate_usage_jsonl(&content, None);
+        let cg = s.tools.get("get_call_graph").expect("get_call_graph aggregated");
+        assert_eq!(cg.n, 9);
+        assert_eq!(cg.err, 5, "err sums across all sessions incl. the pre-err_kinds one");
+        assert_eq!(cg.err_kinds.get("other").copied(), Some(3));
+        assert_eq!(cg.err_kinds.get("not_found").copied(), Some(1));
+        let classified: u64 = cg.err_kinds.values().sum();
+        assert_eq!(classified, 4);
+        assert_eq!(cg.err - classified, 1, "the pre-feature session is the unrecorded remainder");
     }
 
     #[test]

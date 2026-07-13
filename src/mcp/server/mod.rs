@@ -2065,9 +2065,10 @@ impl McpServer {
             _ => Err(anyhow!("Unknown tool: {}", name)),
         };
         let elapsed = start.elapsed();
-        let err_kind = result.as_ref().err().map(|e| ErrKind::classify(&e.to_string()));
+        let err_msg = result.as_ref().err().map(|e| e.to_string());
+        let err_kind = err_msg.as_deref().map(ErrKind::classify);
         lock_or_recover(&self.metrics, "metrics")
-            .record_tool_call(name, elapsed.as_millis() as u64, err_kind);
+            .record_tool_call(name, elapsed.as_millis() as u64, err_kind, err_msg.as_deref());
         if elapsed.as_millis() > 100 {
             tracing::info!("[tool] {} completed in {:.1}s", name, elapsed.as_secs_f64());
         } else {

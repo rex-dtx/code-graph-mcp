@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.93.0 — grep-hook stops denying when it can't answer; `stats` error telemetry is now classifiable
+
+No `INDEX_VERSION` change — this batch touches the PreToolUse grep hook and usage
+telemetry only, not extraction, so existing indexes are unaffected.
+
+Two dogfood-driven changes: one removes a friction case in the grep-redirect hook,
+the other makes the `stats` error column actionable instead of an opaque count.
+
+### Changed
+- **The `grep`-redirect hook now allows the raw grep through when `code-graph-mcp`
+  cannot answer.** When `pre-grep-guide` intercepted a symbol-search `grep`/`rg` on
+  indexed source but the inline `code-graph-mcp grep` came back `unavailable` (binary
+  ran but failed) or `no-binary` (binary not found), it still emitted a *static* deny —
+  blocking the grep while handing the model **nothing**. For a compound command
+  (`grep … ; python3 …`) that also dropped the tail, so the whole command half-ran.
+  A no-value deny is pure friction that teaches the `CODE_GRAPH_NO_BLOCK_GREP` bypass
+  (a dogfood project's only non-converting denies were exactly this). Now, when the
+  hook cannot deliver a real answer, it **allows the raw grep** so the command runs
+  intact (mirroring the existing `no-hits` fallthrough); the event is still logged with
+  a `fallthrough` reason so the conversion funnel keeps its `no-hits`/`unavailable`/
+  `no-binary` split. Denies are now emitted **only when the AST answer actually has
+  hits**. Setting `CODE_GRAPH_NO_ANSWER_IN_DENY=1` still forces the old static deny.
+
+### Added
+- **`stats` now breaks the per-tool `err` count down by kind.** The error column was a
+  single opaque number, so a tool showing a 32% error rate was indistinguishable
+  between a real bug and benign model name-misses. `stats` now prints an *Error kinds*
+  section (`not_found` / `bad_param` / `ambiguous` / `timeout` / `empty_input` / `fk` /
+  `other`) per tool, most-errors-first, plus an `unrecorded` remainder for pre-feature
+  sessions that logged `err` without a breakdown. (`err_kinds` was already persisted to
+  `usage.jsonl`; only the display was missing.)
+- **New `bad_param` error bucket splits parameter-validation errors out of `other`.**
+  Invalid-value errors (`direction must be one of …`, `min_confidence must be one of …`,
+  mutually-exclusive params, unknown relation filter) previously all fell into the
+  catch-all `other` bucket — which is why `other` dominated `get_call_graph`'s errors.
+  They now classify as `bad_param` (a wrong *value*), distinct from `empty_input` (a
+  *missing* required param, which now also captures `… is required`). A high `bad_param`
+  count is a signal that a tool's schema/description should make its valid values
+  clearer, not that the tool is broken.
+- **The `other` bucket now carries one representative message.** Because `other` is the
+  residual catch-all, `stats` samples the first `other`-classified error string per tool
+  (`↳ other e.g. "…"`) so an unexpected error is self-describing instead of requiring a
+  source dive. Local-only diagnostic (`usage.jsonl` is gitignored).
+
 ## v0.92.0 — TS/JS destructuring exports and barrel re-exports are now graphed
 
 `INDEX_VERSION` 40 → 41 (existing indexes rebuild on next open).

@@ -26,8 +26,13 @@ pub enum ErrKind {
     Ambiguous,
     /// SQLite FOREIGN KEY violation — DB state inconsistent. Rare; indicates bug.
     FkConstraint,
-    /// Missing/empty required input (empty query, missing params).
+    /// Missing/empty required input (empty query, missing required param).
     EmptyInput,
+    /// Invalid parameter VALUE — bad enum ("must be one of"), a mutually-exclusive
+    /// combination, or an unknown filter. Distinct from EmptyInput (missing) and
+    /// Other (truly unexpected). A high count is a model-misuse signal: the tool
+    /// schema/description should make the valid values clearer.
+    BadParam,
     /// Unclassified — expand classify() if this bucket grows.
     Other,
 }
@@ -48,8 +53,16 @@ impl ErrKind {
             || err_msg.contains("not found in the index")
         {
             Self::NotFound
+        } else if err_msg.contains("must be one of")
+            || err_msg.contains("mutually exclusive")
+            || err_msg.contains("Unknown relation filter")
+        {
+            // Invalid parameter VALUE (bad enum / bad combination). Kept ahead of
+            // EmptyInput so a wrong value isn't mistaken for a missing one.
+            Self::BadParam
         } else if err_msg.contains("must not be empty")
             || err_msg.contains("Must pass")
+            || err_msg.contains("is required") // missing required param
             // NOTE: classify() only runs on MCP tool-call errors (handle_tool in
             // server/mod.rs). MCP handlers emit "must not be empty"/"Must pass"; the
             // CLI's "Usage:" errors go anyhow→main()→exit, never through here. So the
@@ -70,6 +83,7 @@ impl ErrKind {
             Self::Ambiguous => "ambiguous",
             Self::FkConstraint => "fk",
             Self::EmptyInput => "empty_input",
+            Self::BadParam => "bad_param",
             Self::Other => "other",
         }
     }
@@ -83,6 +97,11 @@ pub struct ToolStats {
     pub max_ms: u64,
     /// Breakdown of `errors` by ErrKind::as_str(). Empty when `errors == 0`.
     pub err_kinds: HashMap<String, u64>,
+    /// One representative message for the catch-all `other` bucket (first-wins,
+    /// first line, truncated). `None` until an `Other`-classified error occurs.
+    /// Makes a large `other` count self-explaining in `stats` — classified kinds
+    /// (not_found/ambiguous/…) are self-descriptive by name and get no sample.
+    pub other_sample: Option<String>,
 }
 
 /// Aggregated search metrics for the session.
@@ -134,20 +153,38 @@ impl SessionMetrics {
         }
     }
 
-    /// Record a tool invocation. `err_kind = None` means success.
-    pub fn record_tool_call(&mut self, name: &str, elapsed_ms: u64, err_kind: Option<ErrKind>) {
+    /// Record a tool invocation. `err_kind = None` means success. `err_msg` is
+    /// the raw error string (used only to sample the `other` bucket; pass `None`
+    /// on success or when no message is available).
+    pub fn record_tool_call(
+        &mut self,
+        name: &str,
+        elapsed_ms: u64,
+        err_kind: Option<ErrKind>,
+        err_msg: Option<&str>,
+    ) {
         let stats = self.tools.entry(name.to_string()).or_insert(ToolStats {
             count: 0,
             total_ms: 0,
             errors: 0,
             max_ms: 0,
             err_kinds: HashMap::new(),
+            other_sample: None,
         });
         stats.count += 1;
         stats.total_ms += elapsed_ms;
         if let Some(kind) = err_kind {
             stats.errors += 1;
             *stats.err_kinds.entry(kind.as_str().into()).or_insert(0) += 1;
+            // Sample the catch-all `other` bucket (first-wins) so a large `other`
+            // count is self-explaining in `stats` without re-deriving it from
+            // source. First line only, truncated — usage.jsonl is local + gitignored.
+            if kind == ErrKind::Other && stats.other_sample.is_none() {
+                if let Some(msg) = err_msg {
+                    let line = msg.lines().next().unwrap_or(msg);
+                    stats.other_sample = Some(line.chars().take(160).collect());
+                }
+            }
         }
         if elapsed_ms > stats.max_ms {
             stats.max_ms = elapsed_ms;
@@ -216,6 +253,10 @@ impl SessionMetrics {
             });
             if !stats.err_kinds.is_empty() {
                 obj["err_kinds"] = serde_json::json!(stats.err_kinds);
+            }
+            // Additive — present only when an `other`-bucket error was sampled.
+            if let Some(sample) = &stats.other_sample {
+                obj["other_sample"] = serde_json::json!(sample);
             }
             (name.clone(), obj)
         }).collect();
@@ -494,7 +535,7 @@ not json
     #[test]
     fn test_record_tool_call_basic() {
         let mut m = SessionMetrics::new();
-        m.record_tool_call("semantic_code_search", 150, None);
+        m.record_tool_call("semantic_code_search", 150, None, None);
         assert!(!m.is_empty());
         let stats = m.tools.get("semantic_code_search").unwrap();
         assert_eq!(stats.count, 1);
@@ -506,9 +547,9 @@ not json
     #[test]
     fn test_record_tool_call_accumulates() {
         let mut m = SessionMetrics::new();
-        m.record_tool_call("get_call_graph", 100, None);
-        m.record_tool_call("get_call_graph", 200, Some(ErrKind::Other));
-        m.record_tool_call("get_call_graph", 50, None);
+        m.record_tool_call("get_call_graph", 100, None, None);
+        m.record_tool_call("get_call_graph", 200, Some(ErrKind::Other), None);
+        m.record_tool_call("get_call_graph", 50, None, None);
         let stats = m.tools.get("get_call_graph").unwrap();
         assert_eq!(stats.count, 3);
         assert_eq!(stats.total_ms, 350);
@@ -556,8 +597,8 @@ not json
         let usage_path = dir.path().join("usage.jsonl");
 
         let mut m = SessionMetrics::new();
-        m.record_tool_call("semantic_code_search", 150, None);
-        m.record_tool_call("get_call_graph", 200, Some(ErrKind::Other));
+        m.record_tool_call("semantic_code_search", 150, None, None);
+        m.record_tool_call("get_call_graph", 200, Some(ErrKind::Other), None);
         m.record_search(3, 0.85, false);
         m.record_index(50, 200, true, 1500);
         m.flush(&usage_path, "0.5.26");
@@ -593,11 +634,11 @@ not json
         let usage_path = dir.path().join("usage.jsonl");
 
         let mut m1 = SessionMetrics::new();
-        m1.record_tool_call("project_map", 100, None);
+        m1.record_tool_call("project_map", 100, None, None);
         m1.flush(&usage_path, "0.5.26");
 
         let mut m2 = SessionMetrics::new();
-        m2.record_tool_call("get_call_graph", 200, None);
+        m2.record_tool_call("get_call_graph", 200, None, None);
         m2.flush(&usage_path, "0.5.26");
 
         let content = std::fs::read_to_string(&usage_path).unwrap();
@@ -642,7 +683,7 @@ not json
         assert!(size_before > 1_048_576);
 
         let mut m = SessionMetrics::new();
-        m.record_tool_call("test", 10, None);
+        m.record_tool_call("test", 10, None, None);
         m.flush(&usage_path, "0.5.26");
 
         let size_after = std::fs::metadata(&usage_path).unwrap().len();
@@ -693,7 +734,7 @@ not json
     #[test]
     fn build_record_tags_dogfood_when_flagged() {
         let mut m = SessionMetrics::new();
-        m.record_tool_call("get_call_graph", 5, None);
+        m.record_tool_call("get_call_graph", 5, None, None);
         // No env/FS — build_record takes the flag directly (race-free).
         let plain = m.build_record("0.0.0", false);
         assert!(plain.get("dogfood").is_none(), "no dogfood field when not flagged");
@@ -721,7 +762,7 @@ not json
         let usage_path = dir.path().join("usage.jsonl");
 
         let mut m = SessionMetrics::new();
-        m.record_tool_call("test", 10, None);
+        m.record_tool_call("test", 10, None, None);
         m.record_search(5, 0.8, false);
         m.record_search(3, 0.6, true);
         m.flush(&usage_path, "0.5.26");
@@ -764,6 +805,11 @@ not json
         );
         assert_eq!(ErrKind::classify("query must not be empty"), EmptyInput);
         assert_eq!(ErrKind::classify("Must pass confirm: true to rebuild index"), EmptyInput);
+        assert_eq!(ErrKind::classify("symbol_name or route_path is required"), EmptyInput);
+        assert_eq!(
+            ErrKind::classify("direction must be one of: callers, callees, both (got 'x')"),
+            BadParam,
+        );
         assert_eq!(ErrKind::classify("Unknown tool: nonexistent_tool"), Other);
     }
 
@@ -773,12 +819,12 @@ not json
         let usage_path = dir.path().join("usage.jsonl");
 
         let mut m = SessionMetrics::new();
-        m.record_tool_call("get_ast_node", 100, Some(ErrKind::Ambiguous));
-        m.record_tool_call("get_ast_node", 120, Some(ErrKind::Ambiguous));
-        m.record_tool_call("get_ast_node", 90, Some(ErrKind::NotFound));
-        m.record_tool_call("get_ast_node", 80, None); // success
+        m.record_tool_call("get_ast_node", 100, Some(ErrKind::Ambiguous), None);
+        m.record_tool_call("get_ast_node", 120, Some(ErrKind::Ambiguous), None);
+        m.record_tool_call("get_ast_node", 90, Some(ErrKind::NotFound), None);
+        m.record_tool_call("get_ast_node", 80, None, None); // success
         // Tool with no errors — err_kinds must be omitted from output.
-        m.record_tool_call("project_map", 2000, None);
+        m.record_tool_call("project_map", 2000, None, None);
         m.flush(&usage_path, "test");
 
         let content = std::fs::read_to_string(&usage_path).unwrap();
@@ -790,5 +836,60 @@ not json
         assert!(rec["tools"]["project_map"]["err_kinds"].is_null(),
             "err_kinds must not appear for success-only tool, got: {}",
             rec["tools"]["project_map"]);
+    }
+
+    #[test]
+    fn test_other_sample_captures_first_unclassified_message() {
+        let dir = TempDir::new().unwrap();
+        let usage_path = dir.path().join("usage.jsonl");
+
+        let mut m = SessionMetrics::new();
+        // First `other` message wins; a later one must NOT overwrite it. These are
+        // genuinely-unclassified strings (no classify() keyword) — the residual the
+        // sample is meant to surface after not_found/bad_param/etc. are split out.
+        m.record_tool_call("get_call_graph", 5, Some(ErrKind::Other),
+            Some("internal error: call graph query failed unexpectedly"));
+        m.record_tool_call("get_call_graph", 6, Some(ErrKind::Other),
+            Some("some later unexpected failure"));
+        // A classified (non-other) error must NOT produce a sample.
+        m.record_tool_call("get_ast_node", 7, Some(ErrKind::NotFound),
+            Some("Symbol 'zzz' not found in index."));
+        m.flush(&usage_path, "test");
+
+        let rec: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&usage_path).unwrap().trim()).unwrap();
+        assert_eq!(
+            rec["tools"]["get_call_graph"]["other_sample"],
+            "internal error: call graph query failed unexpectedly",
+            "first `other` message is sampled, later ones do not overwrite it");
+        assert!(rec["tools"]["get_ast_node"]["other_sample"].is_null(),
+            "a not_found error must not populate other_sample (classified kinds are self-describing)");
+    }
+
+    #[test]
+    fn test_get_call_graph_param_validation_classifies_out_of_other() {
+        // The get_call_graph `other` bucket was dominated by param-validation
+        // errors (usage.jsonl showed other:32 vs not_found:7). These VERBATIM
+        // handler strings (src/mcp/server/tools/callgraph.rs) now split out of
+        // `other`: bad VALUE → BadParam, missing param → EmptyInput. A residual
+        // `other` after this is a genuinely-unexpected error worth chasing.
+        use ErrKind::*;
+        // Invalid value / bad combination → BadParam.
+        assert_eq!(
+            ErrKind::classify("direction must be one of: callers, callees, both (got 'up')"),
+            BadParam);
+        assert_eq!(
+            ErrKind::classify("min_confidence must be one of: extracted, inferred, ambiguous (got 'high')"),
+            BadParam);
+        assert_eq!(
+            ErrKind::classify("symbol_name and route_path are mutually exclusive — pass exactly one"),
+            BadParam);
+        assert_eq!(
+            ErrKind::classify("Unknown relation filter: 'x'. Valid: calls, imports, inherits, implements, references, all"),
+            BadParam);
+        // Missing required param → EmptyInput (not a wrong value).
+        assert_eq!(
+            ErrKind::classify("symbol_name or route_path is required"),
+            EmptyInput);
     }
 }
