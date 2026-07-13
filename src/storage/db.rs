@@ -964,6 +964,37 @@ mod tests {
         assert!(version >= 8, "version must have advanced to at least 8");
     }
 
+    /// M3: a crash between a mid-sequence migration commit and the final
+    /// user_version stamp leaves user_version=2 while `edges` already carries the
+    /// extra columns a later migration added (v9's `confidence` → 6 columns). The
+    /// v2→v3 migration used `INSERT INTO edges_new SELECT *`, which then failed
+    /// with "5 columns but 6 values" — and because is_corruption_error didn't
+    /// match, the DB was PERMANENTLY unopenable (no self-heal). Explicit column
+    /// names make the re-run forward-compatible; the sequence must converge to
+    /// the current schema instead of bricking.
+    #[test]
+    fn v2_migration_survives_schema_ahead_of_stamped_version() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        {
+            // Full v9 schema (6-column edges incl. `confidence`) but user_version
+            // stamped at 2 — exactly the partial-crash state that bricked the DB.
+            // The v2→v3 `INSERT ... SELECT *` arity mismatch (5-col target vs 6-col
+            // source) fires on the empty table too, so no fixture rows are needed.
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            c.execute_batch(&schema::create_tables_sql()).unwrap();
+            c.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        // Must open cleanly (re-run migrations from v2), not brick.
+        let db = Database::open(&db_path).unwrap();
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION,
+            "a v2-stamped DB whose edges already has extra columns must migrate to current, not brick");
+    }
+
     /// v8 → v9 adds `edges.confidence`. Critical: a real upgrade keeps the
     /// existing `edges` table, so `CREATE TABLE IF NOT EXISTS` is a no-op and the
     /// column must arrive via ALTER. Without the migration an upgraded user's DB

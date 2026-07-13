@@ -200,7 +200,14 @@ pub fn migrate_v2_to_v3(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             relation    TEXT NOT NULL,
             metadata    TEXT
         );
-        INSERT INTO edges_new SELECT * FROM edges;
+        -- Explicit column list (NOT `SELECT *`): if a crash left user_version at 2
+        -- while a later migration had already added `edges.confidence` (6 columns),
+        -- `SELECT *` fed 6 values into this 5-column table and failed with
+        -- '5 columns but 6 values' — a permanent brick that is_corruption_error
+        -- didn't match, so no self-heal fired. Naming the 5 v2 columns makes the
+        -- re-run forward-compatible with any extra columns (M3).
+        INSERT INTO edges_new (id, source_id, target_id, relation, metadata)
+            SELECT id, source_id, target_id, relation, metadata FROM edges;
         DROP TABLE edges;
         ALTER TABLE edges_new RENAME TO edges;
         CREATE UNIQUE INDEX idx_edges_unique ON edges(source_id, target_id, relation, COALESCE(metadata, ''));
