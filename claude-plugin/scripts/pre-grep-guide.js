@@ -66,8 +66,11 @@ const VERB_STRIP = new RegExp(`^\\s*(?:env\\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\
 // entities/migrations/tasks/jobs/workers/features/modules/api/web. Generic
 // terms like `core`/`utils`/`shared`/`common`/`types` deliberately omitted —
 // they appear in too many non-code contexts to be precise enough.
+// v0.96 — added `skills` (Claude Code plugin / agent monorepos keep source
+// under `skills/<name>/…`, e.g. `skills/moa/scripts/moa.py`); a grep there was
+// invisible to the hook so it could never scope the answer to the real target.
 const SRC_PREFIXES =
-  'src|tests|lib|libs|scripts|claude-plugin|tools|pkg|cmd|internal|app|apps|components?|server|client|crates|packages|backend|frontend|services|models|domain|controllers|views|handlers|middleware|routes|repositories|entities|migrations|tasks|jobs|workers|features|modules|api|web';
+  'src|tests|lib|libs|scripts|skills|claude-plugin|tools|pkg|cmd|internal|app|apps|components?|server|client|crates|packages|backend|frontend|services|models|domain|controllers|views|handlers|middleware|routes|repositories|entities|migrations|tasks|jobs|workers|features|modules|api|web';
 const SRC_PATH = new RegExp(`(?:^|\\s|["'])(${SRC_PREFIXES})/`);
 // Anchored variant for whole-token matching in extractSearchPath.
 const SRC_PATH_TOKEN = new RegExp(`^(?:\\./)?(${SRC_PREFIXES})/`);
@@ -87,6 +90,41 @@ const CONFIG_TARGET_ONLY = new RegExp(`(?:^|\\s)[^\\s|<>]*\\.(?:${NON_SOURCE_EXT
 // Global + trailing-lookahead variant for the strip: lookahead (not consume) so adjacent
 // data-file tokens both match; global so every one is peeled before the SRC_PATH re-check.
 const CONFIG_TARGET_STRIP = new RegExp(`(?:^|\\s)[^\\s|<>]*\\.(?:${NON_SOURCE_EXTS})(?=\\s|$)`, 'gi');
+
+// v0.96 — the grep's OWN args end at the first top-level shell separator
+// (`;` `|` `&` `>` `<` newline). Everything after is a DIFFERENT command whose
+// paths/flags/patterns must NOT be attributed to the grep. This closes a sibling
+// hole: countNamedPaths stopped at the separator in v0.70, but the SRC_PATH gate
+// in shouldHint, extractSearchPath, extractPatterns, and classifyBlock's flag
+// checks all still scanned the WHOLE compound command. Real 2026-07-13 miss:
+// `grep -n "VERSION" skills/moa/scripts/moa.py | head; …; python3 … scripts/bump-version.sh`
+// — `skills/` was not an allowed prefix, so the gate/searchPath skipped the real
+// target and latched onto `scripts/bump-version.sh` in the tail, then presented a
+// confidently WRONG "already ran for you" answer for a file the user never grepped.
+// Quote-aware (POSIX): a separator inside quotes is literal; inside DOUBLE quotes a
+// backslash escapes the next char (so `\"` does not close) — mirrors
+// splitTopLevelSegments so both share one notion of "quote-terminating vs escaped".
+function firstShellClause(cmd) {
+  if (!cmd || typeof cmd !== 'string') return cmd;
+  let quote = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (quote) {
+      if (quote === '"' && c === '\\' && i + 1 < cmd.length) { i++; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    // Control operators END the grep's argument list → truncate. NOT redirects
+    // (`>` `<`): `2>&1`, `>out`, and process substitution `-f <(cat pats) src/`
+    // all keep grep path args AFTER them, so a redirect is not a boundary. NOT a
+    // single background `&` either (it collides with `2>&1`/`&>` and a
+    // backgrounded grep's args still precede it). `&&`/`||` DO terminate.
+    if (c === ';' || c === '|' || c === '\n') return cmd.slice(0, i);
+    if (c === '&' && cmd[i + 1] === '&') return cmd.slice(0, i);
+  }
+  return cmd;
+}
 
 // v0.71 — `git grep --cached`/`--staged` searches the STAGED index, and a treeish
 // ref (`git grep "X" HEAD~3 -- src/`, `git grep "X" main -- src/`) searches another
@@ -123,10 +161,13 @@ function shouldHint(cmd) {
   if (PIPE_INTO_GREP.test(cmd)) return false;      // `cargo test | grep FAILED` is output filter
   if (!GREP_HEAD.test(cmd)) return false;          // not a search command
   if (isRevisionScopedGitGrep(cmd)) return false;  // v0.71 — git grep --cached/treeish: scope cg can't honor
-  if (!SRC_PATH.test(cmd)) return false;           // not against indexed source tree
+  // v0.96 — the source-path gate must see ONLY the grep's own args, not a path in
+  // a non-grep tail (`grep X skills/a.py; wc scripts/b` must not fire on scripts/b).
+  const clause = firstShellClause(cmd);
+  if (!SRC_PATH.test(clause)) return false;         // not against indexed source tree
   // If a config file appears AND no source path remains after stripping it, skip.
-  if (CONFIG_TARGET_ONLY.test(cmd)) {
-    const stripped = cmd.replace(CONFIG_TARGET_STRIP, ' ');
+  if (CONFIG_TARGET_ONLY.test(clause)) {
+    const stripped = clause.replace(CONFIG_TARGET_STRIP, ' ');
     if (!SRC_PATH.test(stripped)) return false;
   }
   return true;
@@ -164,8 +205,10 @@ const MARKER_ONLY =
 // symbol-shaped target".
 function extractPatterns(cmd) {
   if (!cmd || typeof cmd !== 'string') return [];
+  // v0.96 — only the grep's own clause; a quoted string in a compound tail
+  // (`; echo "SomeWord"`) is not a grep pattern and must not be screened.
   // Strip leading verb + env/assignment prefix (kept in sync with GREP_HEAD)
-  const stripped = cmd.replace(VERB_STRIP, '');
+  const stripped = firstShellClause(cmd).replace(VERB_STRIP, '');
   // Collect every quoted argument — first one is the pattern in standard grep
   // usage; subsequent ones (e.g. `-e "second"`) are also patterns or filter
   // expressions and worth screening too.
@@ -193,12 +236,16 @@ function extractDeclSymbols(patterns) {
 ///   null                   — hint tier (marker scans, unquoted, unanswerable flags)
 function classifyBlock(cmd) {
   if (!shouldHint(cmd)) return null;              // narrower than hint
-  if (UNANSWERABLE_FLAGS.test(cmd)) return null;  // intent the answer can't honor
-  if (MARKER_ONLY.test(cmd)) return null;         // bare TODO/FIXME — no cg equivalent
-  const patterns = extractPatterns(cmd);
+  // v0.96 — every flag/pattern check below must see the grep's OWN clause, not a
+  // tail command's flags (`grep X src/a.py; grep -v Y src/b.py` — the tail's -v
+  // must not disqualify the answerable head grep).
+  const clause = firstShellClause(cmd);
+  if (UNANSWERABLE_FLAGS.test(clause)) return null;  // intent the answer can't honor
+  if (MARKER_ONLY.test(clause)) return null;         // bare TODO/FIXME — no cg equivalent
+  const patterns = extractPatterns(clause);
   if (patterns.length === 0) return null;         // unquoted pattern — conservative, hint
   if (!patterns.some(p => IDENTIFIER_LIKE.test(p))) return null;
-  if (CONTEXT_FLAG.test(cmd)) {
+  if (CONTEXT_FLAG.test(clause)) {
     const symbols = extractDeclSymbols(patterns);
     if (symbols.length === 0) return null;        // context read without named decls
     return { mode: 'show', symbols: symbols.slice(0, 3) };
@@ -208,7 +255,7 @@ function classifyBlock(cmd) {
   // first-path-only answer (the rest silently dropped) — an incomplete substitute that
   // rationally teaches CODE_GRAPH_NO_BLOCK_GREP bypass. Downgrade to hint: the model's complete
   // grep runs and the hint still nudges. (show mode above is symbol-scoped, not path → unaffected.)
-  if (countNamedPaths(cmd, patterns) >= 2) return null;
+  if (countNamedPaths(clause, patterns) >= 2) return null;
   return { mode: 'grep' };
 }
 
@@ -308,6 +355,11 @@ function extractUnansweredTail(cmd) {
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
     if (quote) {
+      // v0.96 — same POSIX escape rule the rest of the quote-parser family uses
+      // (firstShellClause / splitTopLevelSegments): inside DOUBLE quotes `\"` does
+      // not close, so a `;`/`&&` inside a `grep "a\";b" …` pattern stays literal
+      // and the re-issue NOTE isn't garbled by splitting mid-pattern.
+      if (quote === '"' && c === '\\' && i + 1 < cmd.length) { i++; continue; }
       if (c === quote) quote = null;
       continue;
     }
@@ -337,7 +389,10 @@ function appendUnansweredTailNote(lines, tail) {
 // the inline answer can scope its search the same way the raw grep would have.
 function extractSearchPath(cmd) {
   if (!cmd || typeof cmd !== 'string') return undefined;
-  for (const raw of cmd.split(/\s+/)) {
+  // v0.96 — scope to the grep's own clause so the answer is never scoped to a
+  // path in a non-grep tail (the file the user actually grepped is the only one
+  // the "already ran for you" answer may claim to have searched).
+  for (const raw of firstShellClause(cmd).split(/\s+/)) {
     const token = raw.replace(/^["']|["']$/g, '');
     if (!token || token.startsWith('-')) continue;
     if (token.includes('..')) return undefined; // traversal — don't scope, don't guess
@@ -356,17 +411,12 @@ function extractSearchPath(cmd) {
 function countNamedPaths(cmd, patterns) {
   if (!cmd || typeof cmd !== 'string') return 0;
   const pats = new Set(patterns || []);
-  // Only the grep's OWN path args count. Stop at the first top-level command separator so a
-  // path in a compound tail (`grep X src/a.py | sed … src/b.py`) is NOT mistaken for a second
-  // grep target — that would wrongly downgrade a complete single-file grep to a hint.
-  let seg = cmd.replace(VERB_STRIP, '');
-  let quote = null;
-  for (let i = 0; i < seg.length; i++) {
-    const c = seg[i];
-    if (quote) { if (c === quote) quote = null; continue; }
-    if (c === '"' || c === "'") { quote = c; continue; }
-    if (c === ';' || c === '|' || c === '&' || c === '>' || c === '<' || c === '\n') { seg = seg.slice(0, i); break; }
-  }
+  // Only the grep's OWN path args count. firstShellClause stops at the first
+  // top-level separator so a path in a compound tail (`grep X src/a.py | sed …
+  // src/b.py`) is NOT mistaken for a second grep target — that would wrongly
+  // downgrade a complete single-file grep to a hint. (v0.96 — was an inline scan;
+  // now shares the ONE clause definition with shouldHint/extractSearchPath.)
+  const seg = firstShellClause(cmd).replace(VERB_STRIP, '');
   let n = 0;
   for (const raw of seg.split(/\s+/)) {
     const tok = raw.replace(/^["']|["']$/g, '');
@@ -776,6 +826,7 @@ module.exports = {
   shouldBlock,
   classifyBlock,         // v0.49 — intent-aware block tiers
   splitTopLevelSegments, // compound-grep — quote-aware top-level segment splitter (PostToolUse reuse)
+  firstShellClause,      // v0.96 — grep's own clause (up to first top-level separator)
   extractDeclSymbols,    // v0.49 — show-mode symbol extraction
   translateBreToRg,      // v0.49 — BRE→rust-regex dialect bridge
   buildShowDenyReason,   // v0.49 — show-mode deny copy

@@ -6,6 +6,7 @@ const {
   shouldBlock,
   classifyBlock,
   splitTopLevelSegments,
+  firstShellClause,
   countNamedPaths,
   extractDeclSymbols,
   translateBreToRg,
@@ -849,6 +850,107 @@ test('pickBlockPattern: skips non-identifier, picks identifier from -e args', ()
 
 test('pickBlockPattern: no identifier-like pattern → undefined', () => {
   assert.equal(pickBlockPattern('grep -rn "no ident here" src/'), undefined);
+});
+
+// ════════════════════════════════════════════════════════════════════
+// v0.96 — grep-clause scoping: classification must see ONLY the grep's own
+// args, never a path/flag/pattern in a non-grep compound tail. Regression for
+// the 2026-07-13 mis-answer: `grep "VERSION" skills/moa/scripts/moa.py | head;
+// …; python3 … scripts/bump-version.sh` denied with a cg answer for
+// scripts/bump-version.sh — a file the user never grepped.
+// ════════════════════════════════════════════════════════════════════
+
+test('firstShellClause: truncates at the first top-level separator', () => {
+  assert.equal(firstShellClause('grep -n "X" src/a.rs; wc scripts/b.sh'), 'grep -n "X" src/a.rs');
+  assert.equal(firstShellClause('grep -n "X" src/a.rs | head'), 'grep -n "X" src/a.rs ');
+  assert.equal(firstShellClause('grep -n "X" src/a.rs && cargo test'), 'grep -n "X" src/a.rs ');
+});
+
+test('firstShellClause: a separator inside quotes is literal (not a cut point)', () => {
+  assert.equal(firstShellClause('grep -n "a;b|c" src/'), 'grep -n "a;b|c" src/');
+  assert.equal(firstShellClause("grep -n 'a && b' src/"), "grep -n 'a && b' src/");
+});
+
+test('firstShellClause: escaped quote inside double quotes does not close (lesson #9656)', () => {
+  // `\"` must not terminate the quote, so the `;` after it stays inside the string.
+  assert.equal(firstShellClause('grep -n "a\\";b" src/'), 'grep -n "a\\";b" src/');
+});
+
+test('firstShellClause: no separator / empty / non-string', () => {
+  assert.equal(firstShellClause('grep -n "X" src/'), 'grep -n "X" src/');
+  assert.equal(firstShellClause(''), '');
+  assert.equal(firstShellClause(null), null);
+});
+
+test('firstShellClause: redirects are NOT clause boundaries (grep path follows them)', () => {
+  // A redirect (`>` `<`, incl. `2>&1` and process substitution) keeps the grep's
+  // path args after it — truncating there would silently blind the hook.
+  assert.equal(firstShellClause('grep -rn "FooBar" 2>&1 src/'), 'grep -rn "FooBar" 2>&1 src/');
+  assert.equal(firstShellClause('grep -f <(cat pats) src/storage/'), 'grep -f <(cat pats) src/storage/');
+  assert.equal(firstShellClause('grep -rn "X" src/ >/tmp/out'), 'grep -rn "X" src/ >/tmp/out');
+});
+
+test('firstShellClause: a single background & is not a boundary; && is', () => {
+  assert.equal(firstShellClause('grep -rn "X" src/ &'), 'grep -rn "X" src/ &');
+  assert.equal(firstShellClause('grep -rn "X" src/a.rs && wc src/b.rs'), 'grep -rn "X" src/a.rs ');
+});
+
+test('v0.96 REGRESSION guard: redirect-before-path grep still fires + scopes to its path', () => {
+  // `grep -rn "FooBar" 2>&1 src/` — path sits AFTER the redirect. Must not go dark.
+  assert.equal(shouldHint('grep -rn "FooBar" 2>&1 src/'), true);
+  assert.equal(extractSearchPath('grep -rn "FooBar" 2>&1 src/'), 'src/');
+  assert.deepEqual(classifyBlock('grep -rn "FooBar" 2>&1 src/'), { mode: 'grep' });
+});
+
+test('v0.96: extractUnansweredTail handles an escaped quote inside the grep pattern (lesson #9656)', () => {
+  // `\"` must not close the quote, so the in-pattern `;` is literal and the real
+  // `; sed …` tail (not a fragment of the pattern) is what gets flagged.
+  assert.equal(
+    extractUnansweredTail('grep -n "a\\";b" src/foo.rs; sed -n 1,5p src/foo.rs'),
+    'sed -n 1,5p src/foo.rs');
+});
+
+test('v0.96 BUG: grep target NOT allowlisted + tail path IS → hook stays silent (no wrong answer)', () => {
+  // The grep searches skills/moa/scripts/moa.py; the ONLY allowlisted path
+  // (scripts/bump-version.sh) is in a non-grep tail. Pre-fix the SRC_PATH gate
+  // scanned the whole command and fired, then answered the tail's file.
+  const cmd = 'grep -n "VERSION\\|version" skills/moa/scripts/moa.py | head -5; echo ---; wc -l scripts/bump-version.sh';
+  // With skills/ now allowlisted this specific grep IS a source search — but the
+  // answer must scope to the grep's OWN file, never the tail's.
+  assert.equal(extractSearchPath(cmd), 'skills/moa/scripts/moa.py');
+  assert.notEqual(extractSearchPath(cmd), 'scripts/bump-version.sh');
+});
+
+test('v0.96 BUG: unrecognized grep target + tail src path → shouldHint false (grep clause has no src path)', () => {
+  // docs/ is deliberately NOT allowlisted; a scripts/ path in the tail must not
+  // make the hook fire on a docs/ grep.
+  const cmd = 'grep -n "someThing" docs/notes.txt; wc -l scripts/build.sh';
+  assert.equal(shouldHint(cmd), false);
+  assert.equal(extractSearchPath(cmd), undefined);
+});
+
+test('v0.96: legit single-file grep with a compound tail scopes to the GREP file, not the tail file', () => {
+  // Both paths are allowlisted src files — the answer must claim the grep's file.
+  const cmd = 'grep -n "EmbeddingModel" src/a.rs; cat src/b.rs';
+  assert.equal(shouldHint(cmd), true);
+  assert.deepEqual(classifyBlock(cmd), { mode: 'grep' });
+  assert.equal(extractSearchPath(cmd), 'src/a.rs');   // NOT src/b.rs
+});
+
+test('v0.96: a tail grep flag (-v) must not disqualify the answerable head grep', () => {
+  // `-v` (invert) is UNANSWERABLE, but only in the TAIL — the head grep is answerable.
+  const cmd = 'grep -n "EmbeddingModel" src/a.rs; grep -v "X" src/b.rs';
+  assert.deepEqual(classifyBlock(cmd), { mode: 'grep' });
+});
+
+test('v0.96: skills/ is now an allowlisted source prefix (plugin/agent monorepos)', () => {
+  assert.equal(shouldHint('grep -rn "MoaMember" skills/moa/scripts/'), true);
+  assert.equal(extractSearchPath('grep -n "fn run" skills/moa/foo.py'), 'skills/moa/foo.py');
+});
+
+test('v0.96: extractPatterns ignores a quoted string in a compound tail', () => {
+  // The tail's "TailPattern" is not a grep pattern → must not be screened.
+  assert.deepEqual(extractPatterns('grep -n "HeadPattern" src/a.rs; echo "TailPattern"'), ['HeadPattern']);
 });
 
 // ── v0.47.0 deny-with-answer: message builders + env gate ───────────
