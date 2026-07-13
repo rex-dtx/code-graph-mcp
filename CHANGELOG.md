@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.96.0 — grep-guard answers the file you actually grepped
+
+### Fixed — compound-command clause scoping in the grep guard
+- **The `grep` PreToolUse guard could deny a grep and hand back an AST answer for a
+  *different* file than the one grepped.** When a grep's own path argument was not on the
+  source-prefix allowlist but a later, non-grep part of the same compound command named an
+  allowlisted path, the hook scanned the whole command string: it fired on the tail's path
+  and scoped its "already ran for you" answer to that tail file. Real miss (2026-07-13):
+  `grep -n "VERSION" skills/moa/scripts/moa.py | head; …; python3 … scripts/bump-version.sh`
+  denied with a `code-graph-mcp grep "VERSION" scripts/bump-version.sh` answer — a file the
+  user never searched. Classification now scopes to the grep's **own clause** (up to the
+  first top-level control operator — `;`/`|`/`&&`/`||`/newline, quote-aware) via a shared
+  `firstShellClause` helper: `shouldHint`'s source-path gate, `extractSearchPath`,
+  `extractPatterns`, and `classifyBlock`'s flag checks all stop at the separator, matching
+  the scope guard `countNamedPaths` already had (v0.70). A source path — or a
+  `-v`/`--exclude` flag — in a non-grep tail no longer makes the hook fire or mis-scope its
+  answer. Redirects (`>` `<`, incl. `2>&1` and process substitution `-f <(cat pats) src/`)
+  are **not** treated as boundaries — grep path args legitimately follow them — so a
+  `grep -rn "X" 2>&1 src/` still fires and scopes to `src/`.
+- **Quote-parser family unified.** `firstShellClause`, `countNamedPaths`, and
+  `extractUnansweredTail` now all honor the POSIX rule that inside double quotes `\"` does
+  not close the string, so a `grep "a\";b" src/foo.rs; sed …` no longer garbles the
+  "re-issue the tail" NOTE by splitting inside the pattern.
+- **`skills/` is now a recognized source-prefix.** Claude Code plugin / agent monorepos
+  keep source under `skills/<name>/…`; a grep there was previously invisible to the guard,
+  so it could never be scoped to the real target.
+
+### Changed — steering-doc / CLI-help accuracy (LLM-visible metadata)
+- **The detail-doc CLI cheatsheet now spells out each enum flag's full valid-value set**,
+  so a refinement flag no longer has to be probed by tripping a `--X must be one of: …`
+  error first: `--relation ∈ calls|imports|inherits|implements|references|all`,
+  `--min-confidence ∈ extracted|inferred|ambiguous` (shared by callgraph/impact/trace), and
+  `impact --change-type ∈ signature|behavior|remove` (default `behavior`). Values are
+  guarded against drift by `tests/doc_cli_alignment.rs`.
+- **`adopt` / `unadopt` `--help` (and the top-level command list) no longer claim they write
+  a `MEMORY.md` sentinel.** Since v0.74 adopt installs a managed block into the project
+  `CLAUDE.md` plus the `.claude/plugin_code_graph_mcp.md` detail doc (the memory-dir path was
+  removed); the Rust CLI help text still described the old MEMORY.md behavior. Corrected to
+  describe the CLAUDE.md managed block + detail doc.
+
 ## v0.95.1 — MCP rebuild_index atomicity (P2 L6)
 
 ### Fixed — MCP rebuild atomicity (P2 L6)
