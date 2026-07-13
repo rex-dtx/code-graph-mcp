@@ -4856,8 +4856,16 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
 /// Used by `cmd_deps` as a fallback when the graph has no tracked edges for
 /// a file (e.g. Rust `mod.rs` barrels that only contain `pub mod X;`).
 fn scan_barrel_patterns(project_root: &Path, file_path: &str) -> Option<Vec<(usize, String)>> {
-    let full = project_root.join(file_path);
-    let content = std::fs::read_to_string(&full).ok()?;
+    // Resolve symlinks and confine to the project root before reading. This
+    // function echoes import/export lines from a caller-supplied path, so an
+    // in-repo symlink pointing outside the root would turn `deps` into a
+    // restricted file-read oracle. Mirrors read_source_context's guard (M2).
+    let canonical = project_root.join(file_path).canonicalize().ok()?;
+    let root_canonical = project_root.canonicalize().ok()?;
+    if !canonical.starts_with(&root_canonical) {
+        return None;
+    }
+    let content = std::fs::read_to_string(&canonical).ok()?;
     let lang = crate::utils::config::detect_language(file_path);
     let mut hits = Vec::new();
     for (idx, line) in content.lines().enumerate().take(1000) {
@@ -6390,6 +6398,35 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M2: `deps` barrel-pattern scanning must not follow a symlink that escapes
+    /// the project root. The scanner reads a caller-supplied path and echoes its
+    /// import/export lines; an in-repo symlink to an outside file would turn it
+    /// into a restricted file-read oracle. Mirrors read_source_context's guard.
+    #[test]
+    #[cfg(unix)]
+    fn scan_barrel_patterns_refuses_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.ts");
+        std::fs::write(&secret, "import { KEY } from './creds';\nexport { KEY } from './creds';\n").unwrap();
+        let link = root.path().join("link.ts");
+        symlink(&secret, &link).unwrap();
+
+        assert!(
+            scan_barrel_patterns(root.path(), "link.ts").is_none(),
+            "scan_barrel_patterns must not follow a symlink escaping the project root",
+        );
+
+        // Positive control: an in-root barrel file with the same shape IS scanned.
+        std::fs::write(root.path().join("real.ts"), "import { A } from './a';\n").unwrap();
+        let ok = scan_barrel_patterns(root.path(), "real.ts");
+        assert!(
+            ok.as_ref().is_some_and(|h| !h.is_empty()),
+            "an in-root barrel file must still be scanned; got: {ok:?}",
+        );
+    }
 
     #[test]
     fn test_no_embed_flag_parses_on_index_commands() {
