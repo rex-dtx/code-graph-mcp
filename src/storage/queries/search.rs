@@ -182,13 +182,17 @@ pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Re
            AND n.type != 'module'
          ORDER BY
            CASE WHEN n.name = ?2 THEN 0
-                WHEN n.name LIKE ?2 || '%' THEN 1
+                WHEN n.name LIKE ?4 || '%' ESCAPE '\\' THEN 1
                 ELSE 2
            END,
            LENGTH(n.name)
          LIMIT 10";
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![pattern, partial_name, token_pattern], |row| {
+    // ?2 is the raw name for the exact-equality bucket (`=` treats %/_ literally);
+    // ?4 is the %/_-escaped form for the prefix-LIKE bucket, so a query containing
+    // a wildcard char cannot mis-bucket names via the ordering LIKE (matches the
+    // WHERE clause, which already escapes). Ordering-only fix; result set unchanged.
+    let rows = stmt.query_map(rusqlite::params![pattern, partial_name, token_pattern, escaped], |row| {
         Ok(NameCandidate {
             name: row.get(0)?,
             file_path: row.get(1)?,
@@ -290,6 +294,43 @@ mod tests {
         let results = fts5_search(db.conn(), "authentication token", 5).unwrap().nodes;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validateToken");
+    }
+
+    // L8: the ORDER BY prefix-LIKE bucket must escape %/_ so a wildcard in the query
+    // cannot promote a name that only coincidentally matches under wildcard semantics
+    // above a name that is a genuine literal prefix. Ordering-only; the result set is
+    // identical either way (both names contain the literal query substring "a_c").
+    #[test]
+    fn test_fuzzy_name_order_by_escapes_wildcards() {
+        let (db, _tmp) = test_db();
+        let fid = upsert_file(db.conn(), &FileRecord {
+            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
+        }).unwrap();
+        // "abca_c": NOT a literal "a_c" prefix, but the raw (unescaped) ORDER BY LIKE
+        // 'a_c%' matches it because `_` acts as a wildcard over the leading "abc".
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "abca_c".into(),
+            qualified_name: None, start_line: 1, end_line: 2, code_content: "x".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+        // "a_cLongerName": a genuine literal "a_c" prefix, deliberately longer so that
+        // if both land in the same bucket the length tiebreak puts it LAST.
+        insert_node(db.conn(), &NodeRecord {
+            file_id: fid, node_type: "function".into(), name: "a_cLongerName".into(),
+            qualified_name: None, start_line: 3, end_line: 4, code_content: "x".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let results = find_functions_by_fuzzy_name(db.conn(), "a_c").unwrap();
+        let names: Vec<&str> = results.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"abca_c") && names.contains(&"a_cLongerName"),
+            "both literal-substring matches must be returned, got {names:?}");
+        // Escaped: the genuine literal prefix ranks first (bucket 1 vs bucket 2).
+        // Pre-fix (raw ?2): both land in bucket 1, length tiebreak surfaces "abca_c".
+        assert_eq!(results[0].name, "a_cLongerName",
+            "genuine literal prefix must outrank a wildcard-coincidental match, got {names:?}");
     }
 
     #[test]
