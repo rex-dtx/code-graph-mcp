@@ -919,6 +919,37 @@ fn walk_for_relations(
             }
         }
 
+        // Java: import p.B; import java.util.List; import static x.Y.z;
+        // AST: import_declaration -> scoped_identifier(scope, name) | identifier,
+        //      optional trailing `.asterisk` for on-demand imports.
+        // Target = the LAST segment (the imported type / static member), mirroring
+        // Kotlin's qualified_identifier handling. A wildcard import (`java.util.*`)
+        // names no single symbol → skip (never emit the package segment or `*`).
+        "import_declaration" if config.name == "java" => {
+            let is_wildcard = (0..node.child_count())
+                .any(|i| node.child(i).is_some_and(|c| c.kind() == "asterisk"));
+            if !is_wildcard {
+                let target = node.named_child(0).and_then(|first| match first.kind() {
+                    "scoped_identifier" => first
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, source).to_string()),
+                    "identifier" => Some(node_text(&first, source).to_string()),
+                    _ => None,
+                });
+                if let Some(name) = target {
+                    if !name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: "<module>".into(),
+                            target_name: name,
+                            relation: REL_IMPORTS.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
         // Dart: import 'dart:async'; import 'package:foo/bar.dart';
         "import_or_export" if config.name == "dart" => {
             extract_dart_imports(&node, source, results);

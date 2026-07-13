@@ -30,6 +30,37 @@ fn test_extract_php_include_imports() {
 }
 
 #[test]
+fn test_extract_java_imports() {
+    // Java `import p.B;` / `import java.util.List;` must produce REL_IMPORTS edges
+    // to the last (imported-type) segment. Before this fix Java matched no import
+    // arm — `import_declaration` was gated to swift — so Java import edges were 0:
+    // `<external>` nodes were missing, import-aware call resolution was dead for
+    // Java, and imported classes were false-reported as dead-code. This violated
+    // the CLAUDE.md "Java Full-tier includes imports" claim. INDEX_VERSION 42→43.
+    let code = "\
+package com.example.app;\n\
+import p.B;\n\
+import java.util.List;\n\
+import java.util.*;\n\
+import static org.junit.Assert.assertEquals;\n\
+class App { }\n";
+    let rels = extract_relations(code, "java").unwrap();
+    let imports: Vec<&str> = rels.iter()
+        .filter(|r| r.relation == REL_IMPORTS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(imports.contains(&"B"), "import p.B → 'B'; got: {:?}", imports);
+    assert!(imports.contains(&"List"), "import java.util.List → 'List'; got: {:?}", imports);
+    assert!(imports.contains(&"assertEquals"),
+        "static import → last segment 'assertEquals'; got: {:?}", imports);
+    // A wildcard on-demand import names no single symbol → emit nothing (in
+    // particular never the package segment `util` or a bare `*`).
+    assert!(!imports.contains(&"util"),
+        "wildcard import must not emit the package segment; got: {:?}", imports);
+    assert!(!imports.contains(&"*"), "wildcard '*' must not be emitted; got: {:?}", imports);
+}
+
+#[test]
 fn test_extract_ts_reexport_from_barrel() {
     // A barrel/index re-export `export { X, Y } from './mod'` is a DEPENDENCY on
     // './mod'. Emit a REL_IMPORTS edge per re-exported name, stamped with the same
