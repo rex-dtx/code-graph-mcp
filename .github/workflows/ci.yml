@@ -110,11 +110,10 @@ jobs:
         with:
           node-version: 20
       - name: Plugin lifecycle tests
-        # Note: this curated list is not the full set of *.test.js under
-        # claude-plugin/scripts/ — only tests verified to pass in CI without
-        # local dev setup. hooks.test.js / pre-edit-guide.test.js were added
-        # in v0.31.2 after the matcher-regression bug; future additions
-        # should be vetted locally first, not blind-globbed.
+        # As of M10 this globs ALL *.test.js (see the run: step) minus two
+        # documented exclusions, so new test files are never silently skipped.
+        # The historical notes below record why each once-curated file is CI-safe
+        # and — crucially — why the two excluded files are NOT; keep them.
         # pre-grep-guide.test.js + cg-answer.test.js added in v0.47.0
         # (deny-with-answer); vetted locally — node-only, stub binary via
         # _CG_ANSWER_BINARY, tmpdir fixtures, no cargo build required.
@@ -169,7 +168,18 @@ jobs:
         # env; under default per-file parallelism that cross-process state races and
         # cg-answer's binary-resolution test flakes intermittently. Serial is
         # deterministic and the suite is fast (~15s).
-        run: node --test --test-concurrency=1 claude-plugin/scripts/lifecycle.test.js claude-plugin/scripts/lifecycle.e2e.test.js claude-plugin/scripts/auto-update.test.js claude-plugin/scripts/session-init.test.js claude-plugin/scripts/statusline.test.js claude-plugin/scripts/hooks.test.js claude-plugin/scripts/pre-edit-guide.test.js claude-plugin/scripts/covering-tests.test.js claude-plugin/scripts/pre-grep-guide.test.js claude-plugin/scripts/cg-answer.test.js claude-plugin/scripts/doctor.test.js claude-plugin/scripts/pr-impact-comment.test.js claude-plugin/scripts/adopt.test.js claude-plugin/scripts/claude-config.test.js claude-plugin/scripts/find-binary.test.js claude-plugin/scripts/incremental-index.test.js claude-plugin/scripts/pre-read-guide.test.js claude-plugin/scripts/project-detect.test.js claude-plugin/scripts/recommendation-log.test.js claude-plugin/scripts/tmp-dir.test.js claude-plugin/scripts/user-prompt-context.test.js claude-plugin/scripts/version-utils.test.js scripts/release-smoke.test.js scripts/sync-versions.test.js
+        run: |
+          # Glob EVERY *.test.js under claude-plugin/scripts/ and scripts/, minus
+          # the two below that can't run on a bare CI checkout. Globbing (not a
+          # hand-maintained allowlist) means a NEW test file is picked up
+          # automatically — the old curated list had silently drifted to miss
+          # hook-fire / mcp-stub / post-grep-inject / statusline-composite (M10).
+          # A new file that genuinely needs a built binary / network fails LOUDLY
+          # here; add it to the exclusion grep with a reason rather than dropping
+          # back to an allowlist that misses files silently.
+          files=$(ls claude-plugin/scripts/*.test.js scripts/*.test.js \
+            | grep -vE '(^|/)(install-e2e|mcp-launcher)\.test\.js$')
+          node --test --test-concurrency=1 $files
 
   # Supply-chain CVE scan over Cargo.lock (376 transitive deps including the
   # Candle ML stack). cargo-audit reads RustSec advisories and exits non-zero
