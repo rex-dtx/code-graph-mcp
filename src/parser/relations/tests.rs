@@ -30,6 +30,27 @@ fn test_extract_php_include_imports() {
 }
 
 #[test]
+fn test_php_top_level_call_attributes_to_module() {
+    // A PHP call outside any function/method (top-level script) must attribute to
+    // <module>, mirroring the python/ruby/bash arms — otherwise the callee has no
+    // incoming edge and is false-reported as dead-code. Before this fix the PHP
+    // call arm required Some(active_scope), silently dropping every top-level
+    // call. INDEX_VERSION 44→45.
+    let code = "<?php\n\
+        function greetPhp() { return 1; }\n\
+        greetPhp();\n";
+    let rels = extract_relations(code, "php").unwrap();
+    let has_edge = rels.iter().any(|r|
+        r.relation == crate::domain::REL_CALLS
+            && r.target_name == "greetPhp"
+            && r.source_name == "<module>");
+    assert!(has_edge,
+        "top-level greetPhp() must produce a <module> → greetPhp call edge; got calls: {:?}",
+        rels.iter().filter(|r| r.relation == crate::domain::REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
 fn test_extract_java_imports() {
     // Java `import p.B;` / `import java.util.List;` must produce REL_IMPORTS edges
     // to the last (imported-type) segment. Before this fix Java matched no import

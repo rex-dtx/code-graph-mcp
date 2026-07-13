@@ -778,7 +778,13 @@ fn walk_for_relations(
         "function_call_expression" | "member_call_expression" | "scoped_call_expression"
             if config.name == "php" =>
         {
-            if let Some(scope) = active_scope {
+            // Top-level calls (outside any function/method) attribute to `<module>`
+            // rather than being dropped, mirroring the python/ruby/bash arms — a
+            // function invoked only at the top level (`greetPhp();`) would otherwise
+            // have no incoming edge and be false-reported as dead. Undefined callees
+            // drop at Phase-2 same-language resolution.
+            {
+                let scope = active_scope.unwrap_or("<module>");
                 // All three PHP call types have a `name` child for the method/function name
                 // For scoped_call_expression, there are multiple `name` children; the second is the method
                 let callee = if kind == "scoped_call_expression" {
