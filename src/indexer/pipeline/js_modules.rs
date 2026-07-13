@@ -129,6 +129,46 @@ pub(super) fn resolve_php_include_path(
     None
 }
 
+/// Resolve a C/C++ `#include "path"` to a concrete indexed file. Local includes
+/// carry an explicit header extension (`.h/.hpp/.hxx/.hh`), so — unlike PHP — no
+/// extensionless probing is needed: a directory-relative join + repo-root-relative
+/// fallback, each an exact `file_set` membership check. System includes
+/// (`<stdio.h>`, already stripped of brackets) won't be in the set → None (the
+/// caller then falls back to `<external>` resolution).
+pub(super) fn resolve_c_include_path(
+    include_path: &str,
+    importer_rel_path: &str,
+    file_set: &HashSet<String>,
+) -> Option<String> {
+    let rel = include_path.trim_start_matches("./");
+    if rel.is_empty() {
+        return None;
+    }
+    // 1. Relative to the including file's directory (`#include "sibling.h"`).
+    let importer_dir = match importer_rel_path.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    };
+    let joined = if importer_dir.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{}/{}", importer_dir, rel)
+    };
+    if let Some(base) = normalize_rel_path(&joined) {
+        if file_set.contains(&base) {
+            return Some(base);
+        }
+    }
+    // 2. Relative to the repo root (`#include "src/common/widget.h"` from an
+    //    include root), for projects that pass `-I.`.
+    if let Some(base) = normalize_rel_path(rel) {
+        if file_set.contains(&base) {
+            return Some(base);
+        }
+    }
+    None
+}
+
 /// Normalize a repo-relative path, collapsing `.` and `..` segments. Returns
 /// None if it escapes the repo root (a leading `..` with nothing to pop), which
 /// cannot correspond to an indexed file.

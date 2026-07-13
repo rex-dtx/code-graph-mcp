@@ -62,6 +62,49 @@ fn edge_coverage_per_language_baseline() {
 }
 
 #[test]
+fn c_include_resolves_to_indexed_header_module() {
+    // A C/C++ `#include "widget.h"` must resolve to the indexed header's <module>
+    // node (an IMPORTS edge), mirroring PHP require / JS require. Before the fix
+    // the include emitted only a bare stem with NO path metadata, so it fell to
+    // `<external>/widget` and deps/cycles/affected/project_map under-reported the
+    // local header dependency (M6). INDEX_VERSION 45→46.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("widget.h"), "int widget_add(int a, int b);\n").unwrap();
+    std::fs::write(
+        src.join("widget.cpp"),
+        "#include \"widget.h\"\nint widget_add(int a, int b) { return a + b; }\n",
+    ).unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let conn = db.conn();
+    let module_id = |path: &str| -> i64 {
+        conn.query_row(
+            "SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id
+             WHERE n.name = '<module>' AND f.path = ?1",
+            [path], |r| r.get::<_, i64>(0),
+        ).unwrap_or(-1)
+    };
+    let cpp_mod = module_id("src/widget.cpp");
+    let h_mod = module_id("src/widget.h");
+    assert!(cpp_mod > 0 && h_mod > 0, "both <module> nodes must exist (cpp={cpp_mod}, h={h_mod})");
+
+    let has_edge: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM edges WHERE source_id=?1 AND target_id=?2 AND relation='imports')",
+        [cpp_mod, h_mod], |r| r.get(0),
+    ).unwrap();
+    assert!(
+        has_edge,
+        "widget.cpp #include \"widget.h\" must produce an IMPORTS edge to widget.h's <module>",
+    );
+}
+
+#[test]
 fn edge_coverage_intra_class_method_call_resolves() {
     // Guards the method→sibling-method drop class (method_call_edge_drops, fixed v16).
     // Scope per-file so a Rust same-file call cannot mask a TS/Python OO regression.

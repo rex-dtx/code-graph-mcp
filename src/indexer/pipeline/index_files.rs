@@ -47,7 +47,7 @@ use super::{IndexResult, IndexStats, ProgressFn};
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
-use super::js_modules::{resolve_js_module_targets, resolve_js_specifier_path, resolve_php_include_path};
+use super::js_modules::{resolve_c_include_path, resolve_js_module_targets, resolve_js_specifier_path, resolve_php_include_path};
 use super::resolve::{bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
 
 /// Heuristic: does a `.h` header contain C++-specific constructs? `.h` is C-vs-C++
@@ -644,6 +644,49 @@ pub(super) fn index_files(
                                     resolve_php_include_path(inc, &pf.rel_path, &all_file_paths)
                                 {
                                     // Bind to the resolved file's <module> node.
+                                    let module_targets: Vec<i64> = name_to_ids
+                                        .get("<module>")
+                                        .map(|ids| {
+                                            ids.iter()
+                                                .copied()
+                                                .filter(|id| {
+                                                    node_id_to_path.get(id).map(|p| p == &file).unwrap_or(false)
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    if !module_targets.is_empty() {
+                                        for &src_id in &source_ids {
+                                            for &tgt_id in &module_targets {
+                                                if src_id != tgt_id
+                                                    && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                    total_edges_created += 1;
+                                                }
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                                // Unindexed include → fall through to default.
+                            }
+                        }
+                    }
+                }
+
+                // C/C++ file includes: the parser stamps `{"c_include":"<path>"}`
+                // on the import edge (`#include "widget.h"`). Resolve the path
+                // against the importer's directory (and repo root) to a concrete
+                // header, then bind to that file's <module> node so deps/cycles/
+                // affected/project_map see the local header dependency. System
+                // headers (`<stdio.h>`) / unindexed paths return None → fall
+                // through to default (`<external>`) resolution (M6).
+                if rel.relation == REL_IMPORTS {
+                    if let Some(ref meta_str) = rel.metadata {
+                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                            if let Some(inc) = meta.get("c_include").and_then(|v| v.as_str()) {
+                                if let Some(file) =
+                                    resolve_c_include_path(inc, &pf.rel_path, &all_file_paths)
+                                {
                                     let module_targets: Vec<i64> = name_to_ids
                                         .get("<module>")
                                         .map(|ids| {

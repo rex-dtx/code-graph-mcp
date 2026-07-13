@@ -1231,11 +1231,17 @@ fn walk_for_relations(
                         .trim_end_matches(".hh")
                         .trim_end_matches(".h");
                     if !stem.is_empty() {
+                        // Stamp the raw include path so Phase 2 can resolve it to
+                        // the concrete indexed header's <module> node (mirrors the
+                        // PHP `php_include` / JS `js_module` specifiers). target_name
+                        // stays the bare stem for the name-based fallback when the
+                        // path doesn't resolve to an indexed file (system headers).
+                        let metadata = Some(serde_json::json!({ "c_include": unquoted }).to_string());
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: stem.to_string(),
                             relation: REL_IMPORTS.into(),
-                            metadata: None,
+                            metadata,
                             source_language: String::new(),
                         });
                     }
