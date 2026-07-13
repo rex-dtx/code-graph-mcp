@@ -457,6 +457,17 @@ pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
                             AND imp_src.file_id = src.file_id
                             AND ie.target_id = tgt.id
                       )
+                      -- ... and UNLESS the edge was resolved by a TYPE/PATH callee
+                      -- qualifier (self / stype / rtype / path). Those bind the call
+                      -- by a structural signal (the receiver's impl type, or the
+                      -- module path), not by a bare-name guess among same-name
+                      -- siblings — so a duplicate bare name must not relabel them
+                      -- `ambiguous` and hide them under the confidence floor (M1).
+                      -- `chain` / `recv` are NOT exempt: they resolve by method
+                      -- uniqueness or fall back to bare, so a duplicate name there is
+                      -- genuinely ambiguous. NULL metadata (bare) also stays eligible.
+                      AND (json_extract(edges.metadata, '$.q') IS NULL
+                           OR json_extract(edges.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'path'))
                  THEN ?3 ELSE ?4 END
          FROM nodes AS src, nodes AS tgt, files AS tf,
               (SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
@@ -833,6 +844,58 @@ mod tests {
                 conf_of(conn, caller2, proc_other, REL_CALLS), "ambiguous",
                 "call to a duplicate-named target with no corroborating import stays ambiguous",
             );
+        }
+
+        /// M1: a cross-file call resolved by a TYPE/PATH qualifier (self / stype /
+        /// rtype / path) is a precise structural binding, not a bare-name guess —
+        /// so it must NOT be downgraded to `ambiguous` (and hidden by the default
+        /// confidence floor) just because the bare name is duplicated among
+        /// same-language nodes. Only import-corroborated edges were exempt before;
+        /// qualifier-resolved edges had no equivalent, so `impl Database`
+        /// cross-file `self.method()` calls (and Rust `Alpha::foo()` path calls)
+        /// vanished from the default callgraph/impact. Mirrors the import exemption.
+        #[test]
+        fn classify_exempts_qualifier_resolved_edge_from_ambiguous() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("c.db")).unwrap();
+            let conn = db.conn();
+            let f1 = file(conn, "src/a.rs", "rust");
+            let f2 = file(conn, "src/b.rs", "rust");
+            let f3 = file(conn, "src/c.rs", "rust");
+
+            // E calls `validate`, resolved by a self-type qualifier to b.rs::validate.
+            let e = insert_node(conn, &node("E", f1)).unwrap();
+            let v_target = insert_node(conn, &node("validate", f2)).unwrap();
+            insert_node(conn, &node("validate", f3)).unwrap(); // same-lang duplicate name
+            insert_edge(conn, e, v_target, REL_CALLS, Some(r#"{"q":"stype","v":"Alpha"}"#)).unwrap();
+
+            // Control: a BARE call to the same duplicate-named target stays ambiguous.
+            let g = insert_node(conn, &node("G", f1)).unwrap();
+            insert_edge(conn, g, v_target, REL_CALLS, None).unwrap();
+
+            classify_edge_confidence(&db).unwrap();
+            assert_eq!(conf_of(conn, e, v_target, REL_CALLS), "inferred",
+                "a stype-qualifier-resolved edge to a duplicate-named target must stay inferred, not ambiguous");
+            assert_eq!(conf_of(conn, g, v_target, REL_CALLS), "ambiguous",
+                "a bare call to the same duplicate-named target stays ambiguous (control)");
+        }
+
+        /// A `path`-qualifier edge (Rust `crate::a::foo()`) gets the same exemption.
+        #[test]
+        fn classify_exempts_path_qualifier_edge() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("c.db")).unwrap();
+            let conn = db.conn();
+            let f1 = file(conn, "src/a.rs", "rust");
+            let f2 = file(conn, "src/b.rs", "rust");
+            let f3 = file(conn, "src/c.rs", "rust");
+            let e = insert_node(conn, &node("E", f1)).unwrap();
+            let t = insert_node(conn, &node("foo", f2)).unwrap();
+            insert_node(conn, &node("foo", f3)).unwrap();
+            insert_edge(conn, e, t, REL_CALLS, Some(r#"{"q":"path","v":"b"}"#)).unwrap();
+            classify_edge_confidence(&db).unwrap();
+            assert_eq!(conf_of(conn, e, t, REL_CALLS), "inferred",
+                "path-qualifier-resolved edge must stay inferred despite the duplicate name");
         }
 
         /// Idempotency: removing the duplicate flips ambiguous→inferred on re-run;
