@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.93.1 — `stats` no longer panics on a broken pipe
+
+No `INDEX_VERSION` / `SCHEMA_VERSION` change — this is a CLI output-path bugfix
+only; existing indexes are unaffected.
+
+### Fixed
+- **`code-graph-mcp stats | head` (or piping into a pager quit early) no longer
+  crashes with SIGABRT.** `stats` wrote its table through 36 raw `println!` calls;
+  because Rust's stdout is line-buffered, once the reader hangs up the pipe the next
+  flush hit `EPIPE` and `println!` **panicked**, aborting the process with exit 134
+  and a `failed printing to stdout: Broken pipe` message. Every other subcommand
+  already routes stdout through a fallible path — `grep` in particular handles the
+  broken pipe silently (`Err(BrokenPipe) => exit 0`), the contract locked by
+  `test_cli_grep_sigpipe_graceful`. `stats` now mirrors that contract via a `sout!`
+  macro, so an early-closing reader exits 0 cleanly instead of panicking. Found by
+  an autonomous loop-testing QA pass over v0.93.0.
+
 ## v0.93.0 — grep-hook stops denying when it can't answer; `stats` error telemetry is now classifiable
 
 No `INDEX_VERSION` change — this batch touches the PreToolUse grep hook and usage
