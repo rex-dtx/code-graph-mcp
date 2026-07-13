@@ -49,10 +49,16 @@ pub fn weighted_rrf_fusion(
     let fts_max = fts_results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
     let vec_max = vec_results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
 
+    // Clamp the numerator to >= 0 before normalizing. A vector score can be
+    // negative (vec0 L2 distance → score = 1 - dist ∈ [-1, 1]); `score / max`
+    // against a small positive max then yields a blend far below -blend_scale,
+    // breaking the "blend ∈ [0, blend_scale·weight]" bound the no-rank-flip proof
+    // depends on. Clamping keeps a negative-similarity item's blend at 0 (it rides
+    // on its RRF rank) instead of subtracting an unbounded amount (M4).
     for (rank, r) in fts_results.iter().enumerate() {
         let rrf = fts_weight / (k as f64 + rank as f64 + 1.0);
         let blend = if fts_max > 0.0 {
-            blend_scale * fts_weight * (r.score / fts_max)
+            blend_scale * fts_weight * (r.score.max(0.0) / fts_max)
         } else {
             0.0
         };
@@ -61,7 +67,7 @@ pub fn weighted_rrf_fusion(
     for (rank, r) in vec_results.iter().enumerate() {
         let rrf = vec_weight / (k as f64 + rank as f64 + 1.0);
         let blend = if vec_max > 0.0 {
-            blend_scale * vec_weight * (r.score / vec_max)
+            blend_scale * vec_weight * (r.score.max(0.0) / vec_max)
         } else {
             0.0
         };
@@ -294,6 +300,29 @@ mod tests {
             observed_gap >= pure_rrf_gap,
             "Blending should preserve or widen rank-0/rank-1 gap when raw scores agree with rank, got {} vs RRF-only {}",
             observed_gap, pure_rrf_gap
+        );
+    }
+
+    /// M4: a NEGATIVE raw score (vec0 L2 distance yields score = 1 - dist ∈
+    /// [-1, 1]) must not produce an unbounded blend that flips adjacent ranks.
+    /// Normalizing `score / max` against a small positive vec_max let a
+    /// strongly-negative score at a BETTER rank subtract a blend far larger than
+    /// the adjacent RRF gap, overtaking the lower-ranked item. Clamping the
+    /// numerator to >= 0 keeps blend within [0, blend_scale·weight] as the proof
+    /// requires.
+    #[test]
+    fn test_blend_negative_vector_score_cannot_flip_rank() {
+        let fts: Vec<SearchResult> = vec![];
+        let vec = vec![
+            SearchResult { node_id: 1, score: -1.0 }, // rank 0, most-negative similarity
+            SearchResult { node_id: 2, score: 0.02 }, // rank 1, small positive = vec_max
+        ];
+        // Pre-fix: node 1's blend = blend_scale·(-1/0.02) = -50·blend_scale, which
+        // dwarfs the ~1/992 adjacent gap → node 2 (rank 1) wins. Post-fix node 1 holds.
+        let fused = weighted_rrf_fusion(&fts, &vec, 30, 5, 1.0, 1.0);
+        assert_eq!(
+            fused[0].node_id, 1,
+            "rank-0 must win: a negative similarity must not yield an unbounded negative blend",
         );
     }
 
