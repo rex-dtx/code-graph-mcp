@@ -106,6 +106,57 @@ fn c_include_resolves_to_indexed_header_module() {
 }
 
 #[test]
+fn import_extraction_parity_across_full_languages() {
+    // META②: every full-extraction language must emit a REL_IMPORTS edge for its
+    // canonical import form. walk_for_relations (src/parser/relations/mod.rs) has
+    // one arm per (language, relation); a silently missing arm is the H2/M5/M6
+    // sibling-hole class this test locks against. All six full-extraction
+    // languages are checked in one table so a future per-language addition (or
+    // regression) can't slip through unnoticed.
+    //
+    // None of the import targets below need a real importee file indexed: an
+    // import that doesn't resolve to a local file/symbol still produces a
+    // REL_IMPORTS edge to an `<external>/<name>` sentinel node (Phase 2b/2b-ext
+    // in src/indexer/pipeline/index_files.rs) — the same fallback the
+    // `c_include_resolves_to_indexed_header_module` test's C++ case would hit for
+    // a system header. So the plain canonical form is enough to prove the arm
+    // fires; no per-language importee scaffolding is required.
+    //
+    // Negative control: deleting a language's import arm in
+    // src/parser/relations/mod.rs (e.g. the Java `import_declaration` arm added
+    // by H2) makes exactly that row's assertion fail while the others stay green.
+    let cases: &[(&str, &str, &str)] = &[
+        ("typescript", "a.ts", "import { x } from './b';\n"),
+        ("javascript", "a.js", "const x = require('./b');\n"),
+        ("go", "a.go", "package main\nimport \"fmt\"\n"),
+        ("python", "a.py", "import os\n"),
+        ("rust", "a.rs", "use std::fmt;\n"),
+        ("java", "A.java", "import java.util.List;\n"),
+    ];
+
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for (_, file, source) in cases {
+        std::fs::write(src.join(file), source).unwrap();
+    }
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let by_lang = edge_counts(&db);
+    for (lang, file, source) in cases {
+        let imports = by_lang.get(*lang).and_then(|m| m.get("imports")).copied().unwrap_or(0);
+        assert!(
+            imports >= 1,
+            "{lang}: expected a REL_IMPORTS edge from {file} (`{source:?}`) but found none; edges_by_language={by_lang:?}"
+        );
+    }
+}
+
+#[test]
 fn edge_coverage_intra_class_method_call_resolves() {
     // Guards the method→sibling-method drop class (method_call_edge_drops, fixed v16).
     // Scope per-file so a Rust same-file call cannot mask a TS/Python OO regression.
