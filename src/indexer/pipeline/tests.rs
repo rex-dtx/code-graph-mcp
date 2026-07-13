@@ -299,6 +299,66 @@ function readJson(p) { return 2; }
 }
 
 #[test]
+fn test_prune_keeps_edge_when_caller_content_truncated() {
+    // L12: the import-contradiction prune reads sn.code_content to check for a
+    // qualified `.name(` call (the keep-guard). truncate_code_content caps content
+    // at 4096 and appends a "..." sentinel, so a qualified call beyond the cap is
+    // sliced off → instr=0 false negative → the real edge is false-pruned. The fix
+    // skips pruning when the caller's content is truncated (ends in the sentinel).
+    use crate::storage::queries::{insert_node, insert_edge, upsert_file, NodeRecord, FileRecord};
+    use crate::domain::{REL_CALLS, REL_IMPORTS};
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let conn = db.conn();
+
+    let mk_file = |path: &str| upsert_file(conn, &FileRecord {
+        path: path.into(), blake3_hash: path.into(), last_modified: 1, language: Some("python".into()),
+    }).unwrap();
+    let mk_fn = |file_id: i64, name: &str, code: &str| insert_node(conn, &NodeRecord {
+        file_id, node_type: "function".into(), name: name.into(),
+        qualified_name: None, start_line: 1, end_line: 2, code_content: code.into(),
+        signature: None, doc_comment: None, context_string: None,
+        name_tokens: None, return_type: None, param_types: None, is_test: false,
+    }).unwrap();
+
+    // Two same-name targets in different files (the ambiguity the prune arbitrates).
+    let f_a = mk_file("a.py");
+    let f_b = mk_file("b.py");
+    let save_a = mk_fn(f_a, "save", "def save(r):\n    return True\n");
+    let save_b = mk_fn(f_b, "save", "def save(i):\n    return True\n");
+
+    // Caller whose code_content is TRUNCATED (ends in the "..." sentinel) and does
+    // NOT literally contain ".save(" — the qualified call was sliced off by the cap.
+    let f_caller = mk_file("caller.py");
+    let run_trunc = mk_fn(f_caller, "run", "def run():\n    a_very_long_body_that_was_cut_off...");
+    // Caller file imports `save` bound to save_b (a DIFFERENT node than the call target).
+    insert_edge(conn, run_trunc, save_b, REL_IMPORTS, None).unwrap();
+    // The (import-contradicted) call edge run -> save_a we must NOT false-prune.
+    insert_edge(conn, run_trunc, save_a, REL_CALLS, None).unwrap();
+
+    // Control caller: identical contradiction but NON-truncated content → must still prune.
+    let f_caller2 = mk_file("caller2.py");
+    let run_ok = mk_fn(f_caller2, "run2", "def run2():\n    return helper()\n");
+    insert_edge(conn, run_ok, save_b, REL_IMPORTS, None).unwrap();
+    insert_edge(conn, run_ok, save_a, REL_CALLS, None).unwrap();
+
+    let removed = super::resolve::prune_import_contradicted_call_edges(&db).unwrap();
+
+    let edge_exists = |src: i64, tgt: i64| -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE source_id=?1 AND target_id=?2 AND relation=?3",
+            rusqlite::params![src, tgt, REL_CALLS],
+            |row| row.get::<_, i64>(0),
+        ).unwrap() > 0
+    };
+    assert!(edge_exists(run_trunc, save_a),
+        "truncated caller: the call edge must be KEPT (instr can't see beyond the 4096 cap)");
+    assert!(!edge_exists(run_ok, save_a),
+        "non-truncated caller: the genuinely import-contradicted edge must still be pruned");
+    assert_eq!(removed, 1, "exactly the non-truncated control edge is pruned");
+}
+
+#[test]
 fn test_import_binding_resolves_call_over_path_proximity() {
     // Import-aware call resolution: when a bare call's name matches same-name
     // defs in multiple files, an explicit `from X import name` in the caller's

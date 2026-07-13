@@ -394,6 +394,13 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
               -- it — biasing toward keeping edges (the safe direction). Verified by
               -- `test_cli_callgraph_prune_keeps_qualified_call_to_same_name`.
               AND instr(sn.code_content, '.' || tn.name || '(') = 0
+              -- ...but only trust that instr=0 when code_content was NOT truncated.
+              -- truncate_code_content (parser) caps at max_code_content_len (4096)
+              -- and appends a literal three-dot sentinel; a qualified .name( call
+              -- beyond the cap is sliced off, making instr a false negative that
+              -- false-prunes a real edge. Truncated (ends in the sentinel) -> keep
+              -- the edge (safe direction, same bias as the guard above). L12.
+              AND sn.code_content NOT LIKE '%...'
               -- caller's file imports the SAME name bound to a DIFFERENT node
               AND EXISTS (
                   SELECT 1 FROM edges ie
