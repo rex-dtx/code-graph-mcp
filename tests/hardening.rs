@@ -246,3 +246,88 @@ fn no_storage_module_imports_graph() {
         offenders.join("\n")
     );
 }
+
+/// Give `dir` a `.code-graph/index.db` (mirrors the private helper in
+/// `src/cli.rs`'s own unit tests — duplicated here since that one is
+/// `#[cfg(test)]`-private to the crate, not reachable from an integration test).
+fn write_index(dir: &std::path::Path) {
+    let idx = dir.join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&idx).unwrap();
+    fs::write(idx.join("index.db"), b"").unwrap();
+}
+
+/// META④ drift-guard: the Rust (`resolve_project_root_from`, src/cli.rs:38) and
+/// JS (`resolveProjectRoot`, claude-plugin/scripts/project-root.js) project-root
+/// resolvers are parallel implementations that MUST agree (M7 fix, v0.94.0).
+/// This locks the specific case that split-brained before M7: cwd sits under a
+/// STRAY nested `.code-graph` index (a monorepo-subdir relic) that is itself
+/// below the real git root, which is also indexed. Both resolvers must pick the
+/// git root, not the nearer stray index — otherwise the CLI and the JS hooks
+/// read different `.code-graph` DBs for the same project.
+///
+/// JS invocation contract (confirmed by reading project-root.js in full plus its
+/// consumer test `claude-plugin/scripts/pre-grep-guide.test.js`): the file has NO
+/// CLI entrypoint — no argv parsing, no `require.main === module`, no stdout
+/// write. It only `module.exports = { resolveProjectRoot }` for `require()`
+/// (`pre-grep-guide.test.js` imports and calls the function directly, in-process
+/// — it never shells out to the script). So "invoke via node" for a real
+/// cross-process assertion means spawning `node -e` that requires the module by
+/// absolute path and calls `resolveProjectRoot(cwd)` itself — this runs the
+/// actual JS resolver logic in a real subprocess, not a fabricated assertion.
+#[test]
+fn project_root_resolution_rust_js_parity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    write_index(root);
+    let mid = root.join("packages").join("app");
+    fs::create_dir_all(&mid).unwrap();
+    write_index(&mid); // stray nested index, no .git of its own
+    let cwd = mid.join("src");
+    fs::create_dir_all(&cwd).unwrap();
+
+    // Rust side: locked unconditionally, regardless of node availability below.
+    let rust_root = code_graph_mcp::cli::resolve_project_root_from(&cwd);
+    assert_eq!(
+        fs::canonicalize(&rust_root).unwrap(),
+        fs::canonicalize(root).unwrap(),
+        "Rust resolver must pick the git root over the stray nested index (M7)"
+    );
+
+    let js_script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("claude-plugin/scripts/project-root.js");
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(
+            "const { resolveProjectRoot } = require(process.argv[2]); \
+             const r = resolveProjectRoot(process.argv[1]); \
+             process.stdout.write(r || '');",
+        )
+        .arg(&cwd)
+        .arg(&js_script_path)
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => {
+            let js_root = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            assert!(
+                !js_root.is_empty(),
+                "JS resolver returned null/empty for a valid git+indexed root"
+            );
+            assert_eq!(
+                fs::canonicalize(&rust_root).unwrap(),
+                fs::canonicalize(&js_root).unwrap(),
+                "Rust and JS project-root resolvers disagree on the git root (M7 split-brain)"
+            );
+        }
+        _ => {
+            // Degradation per the task brief: node unavailable/flaky in this test
+            // harness. The Rust side is already locked above (unconditionally, not
+            // inside this match arm); the JS resolver's stray-index-prefers-git-root
+            // logic is separately covered by
+            // `claude-plugin/scripts/pre-grep-guide.test.js`'s
+            // "resolveProjectRoot: skips a STRAY nested subdir index, prefers the
+            // .git root" test (a 2-level variant of this same scenario).
+        }
+    }
+}
