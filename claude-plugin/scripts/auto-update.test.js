@@ -6,6 +6,23 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
+// Git plumbing env vars git(1) honors over cwd. A partial `git commit` runs the
+// pre-commit hook with these exported, so any `git` this suite shells out to for
+// its tempdir fixtures would operate on the REAL repo index instead of the
+// fixture. Strip them from THIS process (covers the raw `git clone` + the node
+// `-e` sub-spawns, which inherit env) and per-call in git() below (hermetic even
+// if a test sets one). Sibling of the v0.80.3 pre-commit.sh cargo-path fix (H4).
+const GIT_ENV_VARS = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+  'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_PREFIX',
+];
+for (const k of GIT_ENV_VARS) delete process.env[k];
+function cleanGitEnv() {
+  const e = { ...process.env };
+  for (const k of GIT_ENV_VARS) delete e[k];
+  return e;
+}
+
 const {
   commandExists,
   fetchLatestRelease,
@@ -331,8 +348,32 @@ const { refreshMarketplaceClone, downloadAndInstall } = require('./auto-update')
 
 function git(cwd, ...args) {
   return execGit('git', ['-C', cwd, '-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
-    { stdio: 'pipe', encoding: 'utf8' });
+    { stdio: 'pipe', encoding: 'utf8', env: cleanGitEnv() });
 }
+
+test('git fixtures ignore inherited GIT_* env (H4 hermeticity)', (t) => {
+  // A partial `git commit` runs the pre-commit hook with GIT_DIR / GIT_INDEX_FILE
+  // exported into the environment. Every `git` this suite shells out to for its
+  // tempdir fixtures would otherwise inherit them and mutate the REAL repo index
+  // instead — v0.80.3 was this exact class, but that fix cleaned only the cargo
+  // path in pre-commit.sh; this JS test section was the sibling hole (H4). The
+  // git() helper must strip GIT_* so fixtures stay hermetic however the suite is
+  // launched (hook, CI, or a direct `node --test`).
+  const root = mkDir(t, 'code-graph-h4-');
+  const bogus = path.join(root, 'bogus-gitdir');
+  const saved = process.env.GIT_DIR;
+  process.env.GIT_DIR = bogus;
+  t.after(() => { if (saved === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = saved; });
+
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  git(repo, 'init', '-q', '-b', 'main');
+
+  assert.ok(fs.existsSync(path.join(repo, '.git')),
+    'git init must create repo/.git, not honor the inherited GIT_DIR');
+  assert.ok(!fs.existsSync(bogus),
+    'the inherited GIT_DIR must be ignored (no repo created there)');
+});
 
 test('refreshMarketplaceClone fast-forwards a stale clone', (t) => {
   const root = mkDir(t, 'code-graph-mp-');
