@@ -418,12 +418,18 @@ fn verify_checksum_impl(url: &str, artifact: &Path, pin: Option<String>) -> Resu
         _ => String::new(),
     };
     if expected.is_empty() {
-        let msg = format!(
-            "warning: no integrity sidecar at {sidecar_url} — snapshot checksum NOT verified"
+        // No out-of-band pin AND no fetchable integrity sidecar → integrity cannot
+        // be established. Refuse rather than install unverified content: a network
+        // attacker, a 404'd/blocked sidecar, or an HTTPS-downgrade could otherwise
+        // hand us an arbitrary artifact over the origin-trusted path (M11 — this
+        // used to warn and fail OPEN). Escape hatches: an out-of-band
+        // CODE_GRAPH_SNAPSHOT_PIN, or the publisher serving the `.blake3` sidecar.
+        anyhow::bail!(
+            "snapshot integrity could not be verified: no checksum sidecar at \
+             {sidecar_url} and no CODE_GRAPH_SNAPSHOT_PIN set — refusing to install. \
+             Set CODE_GRAPH_SNAPSHOT_PIN=<blake3 hex> or ensure the publisher serves \
+             the .blake3 sidecar alongside the snapshot."
         );
-        tracing::warn!("{msg}");
-        eprintln!("{msg}");
-        return Ok(());
     }
     // Stream-hash the artifact (it is capped at MAX_COMPRESSED_BYTES).
     let actual = hash_artifact(artifact)?;
@@ -652,6 +658,27 @@ mod tests {
         assert!(
             format!("{err:#}").contains("CODE_GRAPH_SNAPSHOT_PIN"),
             "a malformed pin must name the env var: {err:?}"
+        );
+    }
+
+    // M11: with no out-of-band pin, a NETWORK snapshot whose integrity sidecar
+    // cannot be fetched (404 / network error / no .blake3 published) must be
+    // REFUSED, not installed unverified — otherwise a network attacker (or a
+    // blocked/downgraded sidecar fetch) hands us an arbitrary artifact. `.invalid`
+    // never resolves, so the sidecar fetch fails → empty → the fail-closed path.
+    #[test]
+    fn verify_checksum_no_pin_missing_sidecar_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let artifact = tmp.path().join("snap.db.zst");
+        std::fs::write(&artifact, b"unverifiable bytes").unwrap();
+        let r = verify_checksum_impl(
+            "https://sidecar-absent.invalid/snap.db.zst",
+            &artifact,
+            None,
+        );
+        assert!(
+            r.is_err(),
+            "a network snapshot with no fetchable integrity sidecar and no pin must be refused; got {r:?}",
         );
     }
 
