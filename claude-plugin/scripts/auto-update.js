@@ -3,6 +3,7 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
+const http = require('http');
 const crypto = require('crypto');
 const path = require('path');
 const os = require('os');
@@ -123,15 +124,34 @@ function compareVersions(a, b) {
 
 // ── GitHub API ─────────────────────────────────────────────
 
+/**
+ * Resolve the proxy URL to use for a target URL, honoring HTTPS_PROXY/HTTP_PROXY
+ * (and lowercase variants) plus NO_PROXY. Returns null when no proxy applies, so
+ * the direct path stays byte-identical for users without a proxy configured.
+ * @param {string} targetUrl
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string|null}
+ */
+function resolveProxy(targetUrl, env = process.env) {
+  let host;
+  try { host = new URL(targetUrl).hostname.toLowerCase(); } catch { return null; }
+  const noProxy = (env.NO_PROXY || env.no_proxy || '').trim();
+  if (noProxy === '*') return null;
+  for (const raw of noProxy.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)) {
+    const bare = raw.replace(/^\*?\./, ''); // ".github.com" / "*.github.com" → "github.com"
+    if (host === bare || host.endsWith('.' + bare)) return null;
+  }
+  const proxy = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
+  return proxy && proxy.trim() ? proxy.trim() : null;
+}
+
 function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const req = https.request(url, {
-      method: 'GET',
-      headers: {
-        'Accept': 'application/vnd.github+json',
-        'User-Agent': 'code-graph-auto-update/1.0',
-      },
-    }, (res) => {
+    const headers = {
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'code-graph-auto-update/1.0',
+    };
+    const onResponse = (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { body += chunk; });
@@ -142,8 +162,48 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
         }
         resolve({ statusCode: res.statusCode, body });
       });
-    });
+    };
 
+    const proxy = resolveProxy(url);
+    if (proxy) {
+      // Node's https module ignores *_PROXY env vars. curl-based binary downloads
+      // already honor the proxy; tunnel the release-metadata GET over an HTTP
+      // CONNECT to reach parity for users behind a corporate proxy.
+      let pu, target;
+      try { pu = new URL(proxy); target = new URL(url); }
+      catch { reject(new Error('invalid proxy or target URL')); return; }
+      const connectHeaders = {};
+      if (pu.username) {
+        const cred = `${decodeURIComponent(pu.username)}:${decodeURIComponent(pu.password)}`;
+        connectHeaders['Proxy-Authorization'] = 'Basic ' + Buffer.from(cred).toString('base64');
+      }
+      const connectReq = http.request({
+        host: pu.hostname,
+        port: pu.port || 80,
+        method: 'CONNECT',
+        path: `${target.hostname}:${target.port || 443}`,
+        headers: connectHeaders,
+      });
+      connectReq.on('connect', (res, socket) => {
+        if (res.statusCode !== 200) {
+          socket.destroy();
+          reject(new Error(`proxy CONNECT failed: ${res.statusCode}`));
+          return;
+        }
+        const req = https.request(url, {
+          method: 'GET', headers, socket, agent: false, servername: target.hostname,
+        }, onResponse);
+        req.setTimeout(timeoutMs, () => req.destroy(new Error('request timeout')));
+        req.on('error', reject);
+        req.end();
+      });
+      connectReq.setTimeout(timeoutMs, () => connectReq.destroy(new Error('proxy connect timeout')));
+      connectReq.on('error', reject);
+      connectReq.end();
+      return;
+    }
+
+    const req = https.request(url, { method: 'GET', headers }, onResponse);
     req.setTimeout(timeoutMs, () => req.destroy(new Error('request timeout')));
     req.on('error', reject);
     req.end();
@@ -594,7 +654,7 @@ module.exports = {
   checkForUpdate, commandExists, isDevMode, readState, compareVersions, shouldCheck,
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
   isSilentMode, isInstallMissingMode, isForceMode,
-  requestJson, parseLatestRelease, fetchLatestRelease,
+  requestJson, resolveProxy, parseLatestRelease, fetchLatestRelease,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
   selfHealStaleBinary,
   downloadAndInstall, refreshMarketplaceClone, marketplaceCloneDir,

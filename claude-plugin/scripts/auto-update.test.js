@@ -38,6 +38,7 @@ const {
   isInstallMissingMode,
   isSilentMode,
   shouldCheck,
+  resolveProxy,
 } = require('./auto-update');
 
 function mkDir(t, prefix) {
@@ -312,6 +313,29 @@ test('downloadBinary returns false when latest is null', async () => {
 });
 
 // ── Flag parsing ───────────────────────────────────────────
+
+test('resolveProxy honors *_PROXY env vars, precedence, and NO_PROXY (L14)', () => {
+  const U = 'https://api.github.com/repos/x/y/releases/latest';
+  // No proxy configured → null (direct path unchanged for the common case).
+  assert.equal(resolveProxy(U, {}), null);
+  // HTTPS_PROXY selected; lowercase variant also honored.
+  assert.equal(resolveProxy(U, { HTTPS_PROXY: 'http://p:8080' }), 'http://p:8080');
+  assert.equal(resolveProxy(U, { https_proxy: 'http://p:3128' }), 'http://p:3128');
+  // HTTP_PROXY is the fallback when no HTTPS_PROXY is present…
+  assert.equal(resolveProxy(U, { HTTP_PROXY: 'http://p:1' }), 'http://p:1');
+  // …but HTTPS_PROXY takes precedence over HTTP_PROXY.
+  assert.equal(resolveProxy(U, { HTTPS_PROXY: 'http://s:1', HTTP_PROXY: 'http://h:2' }), 'http://s:1');
+  // NO_PROXY: exact host, suffix (.github.com / *.github.com), and '*' all bypass.
+  assert.equal(resolveProxy(U, { HTTPS_PROXY: 'http://p:1', NO_PROXY: 'api.github.com' }), null);
+  assert.equal(resolveProxy(U, { HTTPS_PROXY: 'http://p:1', NO_PROXY: '.github.com' }), null);
+  assert.equal(resolveProxy(U, { HTTPS_PROXY: 'http://p:1', NO_PROXY: '*.github.com' }), null);
+  assert.equal(resolveProxy(U, { HTTPS_PROXY: 'http://p:1', no_proxy: '*' }), null);
+  // NO_PROXY for an unrelated host does NOT bypass.
+  assert.equal(resolveProxy(U, { HTTPS_PROXY: 'http://p:1', NO_PROXY: 'example.com' }), 'http://p:1');
+  // Blank proxy value and unparseable target both yield null (no crash).
+  assert.equal(resolveProxy(U, { HTTPS_PROXY: '   ' }), null);
+  assert.equal(resolveProxy('not a url', { HTTPS_PROXY: 'http://p:1' }), null);
+});
 
 test('isInstallMissingMode detects --install-missing in argv', () => {
   assert.equal(isInstallMissingMode(['--install-missing']), true);
