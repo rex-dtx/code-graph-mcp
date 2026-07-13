@@ -64,33 +64,18 @@ pub struct CallerWithRouteInfo {
     pub is_test: bool,
 }
 
-/// Get all callers of a symbol, annotating any that are HTTP route handlers.
-///
-/// `min_confidence_rank` gates which caller edges are followed (per
-/// `domain::confidence_rank`: extracted=2, inferred=1, ambiguous=0). Impact
-/// surfaces pass `inferred` to fold the ambiguous by-name fan-out out of the
-/// risk assessment; pass `0` (ambiguous) to traverse every caller edge (the
-/// historical behavior — used by callers that are not risk assessment, e.g.
-/// `show`).
-pub fn get_callers_with_route_info(
+/// Batch-fetch `routes_to` edge metadata for the given caller node ids
+/// (avoids N+1). Pure storage query — no graph dependency. The orchestration
+/// that combines this with the call graph lives in `crate::graph::routes`.
+pub fn fetch_route_metadata_map(
     conn: &Connection,
-    symbol_name: &str,
-    file_path: Option<&str>,
-    max_depth: i32,
-    min_confidence_rank: u8,
-) -> Result<Vec<CallerWithRouteInfo>> {
-    use crate::graph::query::get_call_graph_filtered;
+    caller_ids: &[i64],
+) -> Result<HashMap<i64, String>> {
     use crate::domain::REL_ROUTES_TO;
-
-    let callers = get_call_graph_filtered(conn, symbol_name, "callers", max_depth, file_path, min_confidence_rank)?;
-
-    if callers.nodes.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Batch fetch route metadata for all callers (avoids N+1 queries)
     let mut route_map: HashMap<i64, String> = HashMap::new();
-    let caller_ids: Vec<i64> = callers.nodes.iter().map(|c| c.node_id).collect();
+    if caller_ids.is_empty() {
+        return Ok(route_map);
+    }
     for chunk in caller_ids.chunks(MAX_IN_PARAMS) {
         let placeholders = make_placeholders(1, chunk.len());
         let sql = format!(
@@ -98,7 +83,8 @@ pub fn get_callers_with_route_info(
             placeholders,
             chunk.len() + 1
         );
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let mut params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
         let rel: &dyn rusqlite::types::ToSql = &REL_ROUTES_TO;
         params.push(rel);
         let mut stmt = conn.prepare(&sql)?;
@@ -112,21 +98,7 @@ pub fn get_callers_with_route_info(
             }
         }
     }
-
-    let results = callers
-        .nodes
-        .iter()
-        .map(|caller| CallerWithRouteInfo {
-            node_id: caller.node_id,
-            name: caller.name.clone(),
-            node_type: caller.node_type.clone(),
-            file_path: caller.file_path.clone(),
-            depth: caller.depth,
-            route_info: route_map.get(&caller.node_id).cloned(),
-            is_test: caller.is_test,
-        })
-        .collect();
-    Ok(results)
+    Ok(route_map)
 }
 
 // --- Module queries ---
@@ -303,25 +275,6 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
 mod tests {
     use super::*;
     use super::super::helpers::test_db;
-
-    #[test]
-    fn test_callers_with_routes() {
-        let (db, _tmp) = test_db();
-        let conn = db.conn();
-        // Insert test data: file -> handler node -> route edge, caller -> calls -> handler
-        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('test.ts', 'h1', 0, 'typescript', 0)", []).unwrap();
-        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'handler', 'handler', 1, 10, 'fn handler()')", []).unwrap();
-        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'caller', 'caller', 11, 20, 'fn caller()')", []).unwrap();
-        // caller (node 2) calls handler (node 1)
-        conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (2, 1, 'calls', NULL)", []).unwrap();
-        // caller (node 2) is also a route handler
-        conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (2, 2, 'routes_to', '{\"method\":\"GET\",\"path\":\"/api/test\"}')", []).unwrap();
-
-        let results = get_callers_with_route_info(db.conn(), "handler", None, 3, 0).unwrap();
-        assert!(!results.is_empty());
-        // Verify route info is attached to the caller that is a route handler
-        assert!(results.iter().any(|r| r.route_info.is_some()));
-    }
 
     #[test]
     fn test_get_module_exports() {

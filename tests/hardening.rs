@@ -208,3 +208,41 @@ fn test_repeated_indexing_is_idempotent() {
         nodes
     );
 }
+
+/// Layering drift-guard: the storage layer must never import from the graph
+/// layer — graph depends on storage, not the reverse. M9a moved the one
+/// offending orchestration (`get_callers_with_route_info`) up into
+/// `src/graph/routes.rs`. Re-introducing `use crate::graph` anywhere under
+/// src/storage/ recreates the cycle this test exists to forbid.
+#[test]
+fn no_storage_module_imports_graph() {
+    use std::fs;
+    use std::path::Path;
+    let mut offenders = Vec::new();
+    fn walk(dir: &Path, offenders: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, offenders);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let src = fs::read_to_string(&path).unwrap();
+                for (i, line) in src.lines().enumerate() {
+                    // Strip line/doc comments so a comment MENTIONING crate::graph
+                    // (e.g. "orchestration lives in `crate::graph::routes`") is not
+                    // a false offender — only real code imports count.
+                    let code = line.split("//").next().unwrap_or("");
+                    let t = code.trim_start();
+                    if t.starts_with("use crate::graph") || t.contains("crate::graph::") {
+                        offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    walk(Path::new("src/storage"), &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "storage must not import graph (cycle). Offenders:\n{}",
+        offenders.join("\n")
+    );
+}

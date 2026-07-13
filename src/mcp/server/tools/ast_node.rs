@@ -276,7 +276,7 @@ impl McpServer {
     /// struct / enum / trait / ...) with zero callers reports `risk_level: UNKNOWN`
     /// plus a warning, rather than a misleading LOW.
     pub(in crate::mcp::server) fn append_impact_summary(&self, result: &mut serde_json::Value, symbol_name: &str, file_path: &str, node_type: &str, min_confidence_rank: u8) -> Result<()> {
-        let callers = queries::get_callers_with_route_info(
+        let callers = crate::graph::routes::get_callers_with_route_info(
             self.db.conn(), symbol_name, Some(file_path), 3, min_confidence_rank
         )?;
         let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();

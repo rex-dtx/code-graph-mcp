@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
+use code_graph_mcp::graph::routes::get_callers_with_route_info;
 use code_graph_mcp::storage::db::Database;
 use code_graph_mcp::storage::queries;
 
@@ -110,7 +111,7 @@ fn edge_coverage_intra_class_method_call_resolves() {
     // Scope per-file so a Rust same-file call cannot mask a TS/Python OO regression.
     let (_p, db) = index_fixture();
     for file in ["src/svc.ts", "src/svc.py"] {
-        let callers = queries::get_callers_with_route_info(db.conn(), "helper", Some(file), 3, 0).unwrap();
+        let callers = get_callers_with_route_info(db.conn(), "helper", Some(file), 3, 0).unwrap();
         assert!(
             callers.iter().any(|c| c.name == "handle"),
             "intra-class call handle→helper must resolve in {file}; got {:?}",

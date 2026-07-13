@@ -3626,7 +3626,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
     }
 
-    let callers = queries::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
+    let callers = crate::graph::routes::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
     // Ambiguous callers folded out of the blast radius by the confidence floor,
     // counted across the whole returned frontier (seed direct + every kept
     // caller's pruned callers) so a TRANSITIVE ambiguous caller of a
@@ -4538,7 +4538,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // Shared prod/test partition + risk (graph::impact) — same source as
                 // `cmd_impact`/MCP get_ast_node. Trusts the AST `is_test` flag so inline
                 // `#[cfg(test)]` unit tests don't inflate the prod count / risk level.
-                let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
+                let callers = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
                 let is_function_like = crate::domain::is_function_node_type(&node.node_type);
                 let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
                 obj["impact"] = serde_json::json!({
@@ -4607,7 +4607,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             }
         }
         if include_impact {
-            let callers = queries::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
+            let callers = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
             let is_function_like = crate::domain::is_function_node_type(&node.node_type);
             let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
             writeln!(stdout, "  Impact: {} — {} direct, {} transitive, {} files, {} routes",

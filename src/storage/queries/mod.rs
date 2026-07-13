@@ -5,7 +5,7 @@
 //! Cross-submodule helpers live in `helpers` (placeholders, MAX_IN_PARAMS,
 //! generic `first_row`, test_db harness) and `nodes` (NODE_SELECT*, map_node_row).
 
-mod helpers;
+pub(crate) mod helpers;
 
 mod dead_code;
 mod edges;
@@ -14,7 +14,7 @@ mod files;
 mod imports;
 mod nodes;
 mod project_map;
-mod routes;
+pub(crate) mod routes;
 mod search;
 mod vectors;
 
@@ -51,7 +51,7 @@ pub use nodes::{
 pub use nodes::update_context_string;
 pub use project_map::{get_project_map, EntryPoint, HotFunction, ModuleDep, ModuleStats};
 pub use routes::{
-    find_routes_by_path, get_callers_with_route_info, get_module_exports, CallerWithRouteInfo,
+    fetch_route_metadata_map, find_routes_by_path, get_module_exports, CallerWithRouteInfo,
     ModuleExport, RouteMatch,
 };
 pub use search::{find_functions_by_fuzzy_name, fts5_search, FtsResult, NameCandidate};

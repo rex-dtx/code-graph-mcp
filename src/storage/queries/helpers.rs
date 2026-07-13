@@ -18,7 +18,7 @@ pub(super) fn make_placeholders(start: usize, count: usize) -> String {
 }
 
 #[cfg(test)]
-pub(super) fn test_db() -> (crate::storage::db::Database, tempfile::TempDir) {
+pub(crate) fn test_db() -> (crate::storage::db::Database, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = crate::storage::db::Database::open(&tmp.path().join("test.db")).unwrap();
     (db, tmp)
