@@ -322,6 +322,108 @@ pub fn find_dead_code(
     Ok(results)
 }
 
+/// One dead-code candidate, classified. `is_exported` distinguishes the
+/// "exported but unused" bucket from a plain orphan (via
+/// `domain::is_dead_code_exported`, the same classifier both surfaces used).
+pub struct DeadCodeItem {
+    pub name: String,
+    pub node_type: String,
+    pub file_path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub code_content: String,
+    pub is_exported: bool,
+}
+
+/// The single authoritative dead-code result both the CLI (`cmd_dead_code`) and
+/// MCP (`tool_find_dead_code`) format. Surfaces own their rendering; they must
+/// NOT recompute counts or the hidden-below-threshold probe. `items` preserves
+/// find_dead_code order (orphans and exported interleaved as returned); each
+/// surface can partition by `is_exported`.
+pub struct DeadCodeReport {
+    pub items: Vec<DeadCodeItem>,
+    pub orphan_count: usize,
+    pub exported_count: usize,
+    pub ignored_count: usize,
+    /// When the visible set is empty AND min_lines > 1, the count of candidates
+    /// that a min_lines=1 probe (same path/type/ignore scope) would surface —
+    /// so a "clean" result can disclose it was threshold-limited. 0 otherwise.
+    pub hidden_below_threshold: usize,
+}
+
+impl DeadCodeReport {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// Reject a type filter that normalizes to empty (a typo like `fucntion`),
+/// which would otherwise fall through to a literal `n.type = :x` match and
+/// return a false-clean zero rows. Same message both surfaces printed.
+pub fn validate_dead_code_type_filter(node_type: Option<&str>) -> Result<()> {
+    if let Some(tf) = node_type {
+        if crate::domain::normalize_type_filter(tf).is_empty() {
+            anyhow::bail!(
+                "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
+                tf
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Compute the classified, ignore-filtered dead-code report + hidden-probe.
+/// `ignore_prefixes` are path-prefix exclusions (caller owns defaulting).
+pub fn dead_code_report(
+    conn: &Connection,
+    path: Option<&str>,
+    node_type: Option<&str>,
+    include_tests: bool,
+    min_lines: u32,
+    ignore_prefixes: &[String],
+) -> Result<DeadCodeReport> {
+    let raw = find_dead_code(conn, path, node_type, include_tests, min_lines, 200)?;
+    let pre_count = raw.len();
+    let filtered: Vec<DeadCodeResult> = raw
+        .into_iter()
+        .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
+        .collect();
+    let ignored_count = pre_count - filtered.len();
+
+    // Byte-identical to the original CLI/MCP surfaces: both probe for
+    // threshold-hidden candidates ONLY when nothing is visible AND nothing was
+    // ignore-suppressed (the "No dead code found …" disclosure path). On any
+    // non-empty or partly-ignored result the field is never read, so the extra
+    // min_lines=1 query is skipped entirely — no wasted DB work on the common path.
+    let hidden_below_threshold = if filtered.is_empty() && ignored_count == 0 && min_lines > 1 {
+        find_dead_code(conn, path, node_type, include_tests, 1, 200)?
+            .into_iter()
+            .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
+            .count()
+    } else {
+        0
+    };
+
+    let mut items = Vec::with_capacity(filtered.len());
+    let (mut orphan_count, mut exported_count) = (0usize, 0usize);
+    for r in filtered {
+        let is_exported = crate::domain::is_dead_code_exported(
+            r.has_export_edge, &r.code_content, &r.file_path, &r.name,
+        );
+        if is_exported { exported_count += 1; } else { orphan_count += 1; }
+        items.push(DeadCodeItem {
+            name: r.name,
+            node_type: r.node_type,
+            file_path: r.file_path,
+            start_line: r.start_line,
+            end_line: r.end_line,
+            code_content: r.code_content,
+            is_exported,
+        });
+    }
+    Ok(DeadCodeReport { items, orphan_count, exported_count, ignored_count, hidden_below_threshold })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,5 +1189,91 @@ mod tests {
         }
         assert!(names.contains(&"dead_fn".to_string()),
             "a genuinely-dead function must still be reported; got: {names:?}");
+    }
+
+    // Fixture: one orphan fn (5 lines, unreferenced), one exported-unused, one
+    // short orphan (2 lines) that a min_lines=3 filter must hide, one ignored path.
+    //
+    // Deviation from the task brief's literal fixture: the brief put the
+    // ignore-filter probe fn at `benches/b.rs` with ignore=["benches/"], but
+    // `is_test_node_sql` (src/domain.rs) already globs `benches/*` as a TEST
+    // path — with include_tests=false (as used here) that node is excluded by
+    // the SQL query itself, before `dead_code_report`'s ignore_prefixes filter
+    // ever runs, so it never contributes to `ignored_count`. Using `vendor/`
+    // (not matched by any is_test_node_sql glob) instead exercises the actual
+    // ignore_prefixes filtering path the test is meant to cover.
+    fn seed_dead_code(conn: &rusqlite::Connection) {
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/a.rs', 'h1', 0, 'rust', 0)", []).unwrap();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('vendor/b.rs', 'h2', 0, 'rust', 0)", []).unwrap();
+        // long orphan (5 lines)
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'orphan_long', 'orphan_long', 1, 5, 'fn orphan_long() {}')", []).unwrap();
+        // short orphan (2 lines) — below min_lines=3
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'orphan_short', 'orphan_short', 7, 8, 'fn orphan_short() {}')", []).unwrap();
+        // orphan in an ignored path (vendor/)
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', 'vendor_fn', 'vendor_fn', 1, 6, 'fn vendor_fn() {}')", []).unwrap();
+    }
+
+    #[test]
+    fn dead_code_report_counts_and_hidden_probe() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        seed_dead_code(conn);
+        let ignore = vec!["vendor/".to_string()];
+        let rep = dead_code_report(conn, None, None, false, 3, &ignore).unwrap();
+        // orphan_long shows; orphan_short hidden by min_lines; vendor_fn ignored.
+        assert_eq!(rep.orphan_count, 1, "one long orphan visible");
+        assert_eq!(rep.exported_count, 0);
+        assert_eq!(rep.ignored_count, 1, "vendor_fn suppressed by ignore prefix");
+        assert_eq!(rep.hidden_below_threshold, 0, "probe suppressed while a candidate is visible — matches the surfaces, which disclose the threshold only when nothing shows");
+        assert_eq!(rep.items.len(), 1);
+        assert_eq!(rep.items[0].name, "orphan_long");
+    }
+
+    /// META⑥ drift-guard: the CLI and MCP dead-code surfaces must derive their
+    /// verdict from the SAME `dead_code_report`. This asserts the shared report is
+    /// the single source of truth for counts — the sibling-hole this locks is a
+    /// surface re-deriving classification/probe logic on its own and drifting.
+    /// Negative control: make either surface stop calling dead_code_report (e.g.
+    /// hard-code a count) and this fails.
+    #[test]
+    fn dead_code_report_is_single_source_for_both_surfaces() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        seed_dead_code(conn);
+        let ignore = vec!["vendor/".to_string()];
+        let rep = dead_code_report(conn, None, None, false, 3, &ignore).unwrap();
+        // The exact tuple both cmd_dead_code (CLI) and tool_find_dead_code (MCP)
+        // must format from — never recompute independently.
+        assert_eq!(
+            (rep.orphan_count, rep.exported_count, rep.ignored_count, rep.hidden_below_threshold, rep.items.len()),
+            (1, 0, 1, 0, 1)
+        );
+    }
+
+    /// The hidden-below-threshold probe fires ONLY when nothing is visible and
+    /// nothing was ignore-suppressed — the exact disclosure path both surfaces
+    /// take. Locks the gate so a refactor can't turn it into an always-on query.
+    #[test]
+    fn dead_code_report_hidden_probe_only_when_nothing_visible() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/c.rs', 'h1', 0, 'rust', 0)", []).unwrap();
+        // A single 2-line orphan and nothing else.
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'tiny', 'tiny', 1, 2, 'fn tiny() {}')", []).unwrap();
+        // min_lines=3 hides the 2-line orphan → visible empty, nothing ignored → probe discloses it.
+        let rep = dead_code_report(conn, None, None, false, 3, &[]).unwrap();
+        assert!(rep.is_empty());
+        assert_eq!(rep.hidden_below_threshold, 1);
+        // min_lines=1 → the orphan is itself visible; no separate probe.
+        let rep1 = dead_code_report(conn, None, None, false, 1, &[]).unwrap();
+        assert_eq!(rep1.items.len(), 1);
+        assert_eq!(rep1.hidden_below_threshold, 0);
+    }
+
+    #[test]
+    fn validate_dead_code_type_filter_rejects_typo() {
+        assert!(validate_dead_code_type_filter(Some("fucntion")).is_err());
+        assert!(validate_dead_code_type_filter(Some("fn")).is_ok());
+        assert!(validate_dead_code_type_filter(None).is_ok());
     }
 }

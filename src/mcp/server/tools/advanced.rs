@@ -363,14 +363,7 @@ impl McpServer {
         // Validate node_type up-front: an unknown alias normalizes to an empty Vec
         // and find_dead_code falls through to a literal `n.type = :x` match that
         // returns zero rows — a false-clean empty result. Mirror tool_ast_search.
-        if let Some(tf) = node_type {
-            if crate::domain::normalize_type_filter(tf).is_empty() {
-                return Err(anyhow!(
-                    "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
-                    tf
-                ));
-            }
-        }
+        crate::storage::queries::validate_dead_code_type_filter(node_type)?;
         let include_tests = args["include_tests"].as_bool().unwrap_or(false);
         let min_lines = args["min_lines"].as_u64().unwrap_or(3) as u32;
         let compact = args["compact"].as_bool().unwrap_or(true);
@@ -390,100 +383,71 @@ impl McpServer {
             self.ensure_indexed()?;
         }
 
-        let raw_results = queries::find_dead_code(
-            self.db.conn(),
-            path,
-            node_type,
-            include_tests,
-            min_lines,
-            200,
+        let report = crate::storage::queries::dead_code_report(
+            self.db.conn(), path, node_type, include_tests, min_lines, &ignore_prefixes,
         )?;
-        let pre_filter_count = raw_results.len();
-        let results: Vec<_> = raw_results.into_iter()
-            .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
-            .collect();
-        let ignored_count = pre_filter_count - results.len();
 
-        if results.is_empty() {
+        if report.is_empty() {
             let mut summary = "No dead code found with the given filters.".to_string();
-            if ignored_count > 0 {
+            if report.ignored_count > 0 {
                 summary.push_str(&format!(
                     " ({} result(s) suppressed by ignore_paths; pass ignore_paths:[] to see them.)",
-                    ignored_count
+                    report.ignored_count
                 ));
-            } else if min_lines > 1 {
-                // Guard the false-clean: candidates may exist but sit below min_lines.
-                // Probe at min_lines=1 (same path/type/ignore scope) so the caller (an
-                // LLM) knows the "clean" result is threshold-limited, with the count.
-                let hidden = queries::find_dead_code(
-                    self.db.conn(), path, node_type, include_tests, 1, 200,
-                )?
-                .into_iter()
-                .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
-                .count();
-                if hidden > 0 {
-                    summary.push_str(&format!(
-                        " ({hidden} shorter symbol(s) are below the min_lines={min_lines} threshold; pass min_lines:1 to include them.)"
-                    ));
-                }
+            } else if report.hidden_below_threshold > 0 {
+                summary.push_str(&format!(
+                    " ({} shorter symbol(s) are below the min_lines={min_lines} threshold; pass min_lines:1 to include them.)",
+                    report.hidden_below_threshold
+                ));
             }
             return Ok(json!({
                 "results": [],
                 "orphan_count": 0,
                 "exported_unused_count": 0,
-                "ignored_count": ignored_count,
+                "ignored_count": report.ignored_count,
                 "ignore_paths_applied": ignore_prefixes,
                 "ignore_paths_defaulted": ignore_was_defaulted,
                 "summary": summary,
             }));
         }
 
-        // Classify into orphans and exported-unused
         let mut orphan_items: Vec<serde_json::Value> = Vec::new();
         let mut exported_items: Vec<serde_json::Value> = Vec::new();
-
-        for r in &results {
-            let is_exported = crate::domain::is_dead_code_exported(
-                r.has_export_edge, &r.code_content, &r.file_path, &r.name);
-            let lines = r.end_line - r.start_line + 1;
+        for it in &report.items {
+            let lines = it.end_line - it.start_line + 1;
             let mut item = json!({
-                "name": r.name,
-                "type": r.node_type,
-                "file_path": r.file_path,
-                "start_line": r.start_line,
-                "end_line": r.end_line,
+                "name": it.name,
+                "type": it.node_type,
+                "file_path": it.file_path,
+                "start_line": it.start_line,
+                "end_line": it.end_line,
                 "lines": lines,
-                "category": if is_exported { "exported_unused" } else { "orphan" },
+                "category": if it.is_exported { "exported_unused" } else { "orphan" },
             });
             if !compact {
-                item["code"] = json!(r.code_content);
+                item["code"] = json!(it.code_content);
             }
-            if is_exported {
-                exported_items.push(item);
-            } else {
-                orphan_items.push(item);
-            }
+            if it.is_exported { exported_items.push(item); } else { orphan_items.push(item); }
         }
-
         let mut all_items = orphan_items.clone();
         all_items.extend(exported_items.iter().cloned());
 
         Ok(json!({
             "results": all_items,
-            "orphan_count": orphan_items.len(),
-            "exported_unused_count": exported_items.len(),
-            "ignored_count": ignored_count,
+            "orphan_count": report.orphan_count,
+            "exported_unused_count": report.exported_count,
+            "ignored_count": report.ignored_count,
             "ignore_paths_applied": ignore_prefixes,
             "ignore_paths_defaulted": ignore_was_defaulted,
             // "candidates" not "results": receiver-method calls and cross-file
             // const/type uses are not edge-tracked, so a flagged symbol may still
             // be used — the caller should verify before treating it as dead.
-            "summary": if ignored_count > 0 {
+            "summary": if report.ignored_count > 0 {
                 format!("Dead code: {} candidates ({} orphan, {} exported-unused); {} suppressed by ignore_paths (pass ignore_paths:[] to see them). Verify — receiver-method/cross-file uses aren't edge-tracked.",
-                    all_items.len(), orphan_items.len(), exported_items.len(), ignored_count)
+                    all_items.len(), report.orphan_count, report.exported_count, report.ignored_count)
             } else {
                 format!("Dead code: {} candidates ({} orphan, {} exported-unused). Verify — receiver-method/cross-file uses aren't edge-tracked.",
-                    all_items.len(), orphan_items.len(), exported_items.len())
+                    all_items.len(), report.orphan_count, report.exported_count)
             },
         }))
     }

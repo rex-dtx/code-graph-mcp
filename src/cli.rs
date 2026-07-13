@@ -5643,14 +5643,7 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     // empty Vec, and find_dead_code then falls through to a literal `n.type = :x`
     // match that returns zero rows — so a typo'd `--type fucntion` prints a
     // false-clean "No dead code found" with exit 0. Mirror the cmd_ast_search guard.
-    if let Some(tf) = type_filter {
-        if crate::domain::normalize_type_filter(tf).is_empty() {
-            anyhow::bail!(
-                "Unknown type filter: '{}'. Valid: fn, class, struct, enum, trait, type, const, var",
-                tf
-            );
-        }
-    }
+    queries::validate_dead_code_type_filter(type_filter)?;
     let compact = !no_compact;
 
     // --ignore <pref>: repeatable, prefix-match exclusion. --no-ignore disables defaults.
@@ -5665,81 +5658,43 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
+    let report = queries::dead_code_report(conn, path_filter, type_filter, include_tests, min_lines, &ignore_prefixes)?;
 
-    let raw = queries::find_dead_code(conn, path_filter, type_filter, include_tests, min_lines, 200)?;
-    let pre_count = raw.len();
-    let results: Vec<_> = raw.into_iter()
-        .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
-        .collect();
-    let ignored = pre_count - results.len();
-
-    if results.is_empty() {
+    if report.is_empty() {
         if json_mode {
             writeln!(std::io::stdout().lock(), "[]")?;
         }
-        if ignored > 0 {
+        if report.ignored_count > 0 {
             eprintln!(
                 "[code-graph] No dead code found after filtering; {} suppressed by --ignore (use --no-ignore to see them).",
-                ignored,
+                report.ignored_count,
+            );
+        } else if report.hidden_below_threshold > 0 {
+            eprintln!(
+                "[code-graph] No dead code found at \u{2265}{min_lines} lines ({} shorter symbol(s) below the threshold; rerun with --min-lines 1 to include them).",
+                report.hidden_below_threshold
             );
         } else {
-            // A bare "No dead code found." is a false-clean when candidates exist but
-            // sit below --min-lines — and the primary consumer is an LLM that won't
-            // think to widen the threshold. Probe at min_lines=1 (same path/type/ignore
-            // scope) so the hint fires ONLY when the threshold actually hid something,
-            // with the real count. Skipped when min_lines==1 (nothing to hide).
-            let hidden = if min_lines > 1 {
-                queries::find_dead_code(conn, path_filter, type_filter, include_tests, 1, 200)?
-                    .into_iter()
-                    .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
-                    .count()
-            } else {
-                0
-            };
-            if hidden > 0 {
-                eprintln!(
-                    "[code-graph] No dead code found at \u{2265}{min_lines} lines ({hidden} shorter symbol(s) below the threshold; rerun with --min-lines 1 to include them)."
-                );
-            } else {
-                eprintln!("[code-graph] No dead code found.");
-            }
+            eprintln!("[code-graph] No dead code found.");
         }
         return Ok(());
-    }
-
-    // Classify into orphans and exported-unused
-    let mut orphans: Vec<&queries::DeadCodeResult> = Vec::new();
-    let mut exported_unused: Vec<&queries::DeadCodeResult> = Vec::new();
-
-    for r in &results {
-        let is_exported = crate::domain::is_dead_code_exported(
-            r.has_export_edge, &r.code_content, &r.file_path, &r.name);
-        if is_exported {
-            exported_unused.push(r);
-        } else {
-            orphans.push(r);
-        }
     }
 
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
-        let items: Vec<serde_json::Value> = results.iter().map(|r| {
-            // Same classifier as the text path + MCP — the JSON path previously
-            // omitted the Go export leg, misfiling exported Go symbols as orphans.
-            let is_exported = crate::domain::is_dead_code_exported(
-                r.has_export_edge, &r.code_content, &r.file_path, &r.name);
+        let items: Vec<serde_json::Value> = report.items.iter().map(|it| {
             let mut obj = serde_json::json!({
-                "name": r.name,
-                "type": r.node_type,
-                "file_path": r.file_path,
-                "start_line": r.start_line,
-                "end_line": r.end_line,
-                "category": if is_exported { "exported_unused" } else { "orphan" },
-                "lines": r.end_line - r.start_line + 1,
+                "name": it.name,
+                "type": it.node_type,
+                "file_path": it.file_path,
+                "start_line": it.start_line,
+                "end_line": it.end_line,
+                "category": if it.is_exported { "exported_unused" } else { "orphan" },
+                "lines": it.end_line - it.start_line + 1,
             });
             if !compact {
-                obj["code"] = serde_json::json!(r.code_content);
+                obj["code"] = serde_json::json!(it.code_content);
             }
             obj
         }).collect();
@@ -5748,20 +5703,23 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     }
 
     writeln!(stdout, "Dead code: {} candidates ({} orphan, {} exported-unused)",
-        results.len(), orphans.len(), exported_unused.len())?;
+        report.items.len(), report.orphan_count, report.exported_count)?;
     writeln!(stdout, "(candidates to verify — receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked)\n")?;
+
+    let (orphans, exported_unused): (Vec<_>, Vec<_>) =
+        report.items.iter().partition(|it| !it.is_exported);
 
     if !orphans.is_empty() {
         writeln!(stdout, "ORPHAN ({}) — no tracked references, not exported", orphans.len())?;
-        for r in &orphans {
-            let lines = r.end_line - r.start_line + 1;
+        for it in &orphans {
+            let lines = it.end_line - it.start_line + 1;
             writeln!(stdout, "  {} {} {}:{} ({})",
-                r.node_type, r.name, r.file_path, r.start_line, plural(lines, "line"))?;
+                it.node_type, it.name, it.file_path, it.start_line, plural(lines, "line"))?;
             if !compact {
-                for line in r.code_content.lines().take(5) {
+                for line in it.code_content.lines().take(5) {
                     writeln!(stdout, "    {}", line)?;
                 }
-                if r.code_content.lines().count() > 5 {
+                if it.code_content.lines().count() > 5 {
                     writeln!(stdout, "    ...")?;
                 }
             }
@@ -5771,15 +5729,15 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     if !exported_unused.is_empty() {
         if !orphans.is_empty() { writeln!(stdout)?; }
         writeln!(stdout, "EXPORTED-UNUSED ({}) — exported/public, no tracked callers", exported_unused.len())?;
-        for r in &exported_unused {
-            let lines = r.end_line - r.start_line + 1;
+        for it in &exported_unused {
+            let lines = it.end_line - it.start_line + 1;
             writeln!(stdout, "  {} {} {}:{} ({})",
-                r.node_type, r.name, r.file_path, r.start_line, plural(lines, "line"))?;
+                it.node_type, it.name, it.file_path, it.start_line, plural(lines, "line"))?;
             if !compact {
-                for line in r.code_content.lines().take(5) {
+                for line in it.code_content.lines().take(5) {
                     writeln!(stdout, "    {}", line)?;
                 }
-                if r.code_content.lines().count() > 5 {
+                if it.code_content.lines().count() > 5 {
                     writeln!(stdout, "    ...")?;
                 }
             }

@@ -18,7 +18,10 @@ pub(crate) mod routes;
 mod search;
 mod vectors;
 
-pub use dead_code::{find_dead_code, DeadCodeResult};
+pub use dead_code::{
+    dead_code_report, find_dead_code, validate_dead_code_type_filter, DeadCodeItem, DeadCodeReport,
+    DeadCodeResult,
+};
 pub use embedding_cache::{
     cache_key, cache_put_embeddings, ensure_embedding_cache_valid, gc_embedding_cache,
     partition_by_cache, seed_embedding_cache_from_vectors,
