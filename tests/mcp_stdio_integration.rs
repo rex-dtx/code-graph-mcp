@@ -797,6 +797,101 @@ fn mcp_confidence_floor_disclosure_over_wire() {
         "min_confidence:\"ambiguous\" must count the ambiguous caller over the wire; got: {body}");
 }
 
+/// Read stdout lines until one carries JSON-RPC `id == id`, or the timeout /
+/// EOF is hit. Returns `None` on EOF (server closed stdout — i.e. the session
+/// died) or timeout, so callers can assert survival without panicking.
+fn read_json_id(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    id: i64,
+    timeout: Duration,
+) -> Option<Value> {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            return None;
+        }
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return None, // EOF: stdout closed → serve loop exited
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(t) {
+            if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
+                return Some(v);
+            }
+        }
+    }
+}
+
+/// H3 regression: a single oversized message whose byte length exceeds
+/// MAX_MESSAGE_SIZE (10 MiB) and whose truncation boundary lands in the middle
+/// of a multi-byte UTF-8 char must NOT tear down the long-lived serve session.
+///
+/// 10 MiB (10485760) is not a multiple of 3, so `take(MAX).read_line` over a
+/// stream of 3-byte CJP chars truncates mid-character. The old code used
+/// `read_line`, which UTF-8-validates: it returned `Err(InvalidData)`, and the
+/// `?` propagated OUTSIDE the per-request `catch_unwind`, killing the whole loop
+/// — a single 10 MB+ CJK request became a session-level DoS. The fix reads raw
+/// bytes (`read_until`) + lossily decodes, so the oversized line is rejected
+/// with a JSON-RPC error and the session survives to answer the next request.
+#[test]
+fn mcp_oversized_multibyte_message_does_not_kill_session() {
+    let project = setup_fixture_project();
+    let mut child = Command::new(binary_path())
+        .arg("serve")
+        .current_dir(project.path())
+        .env("CODE_GRAPH_DISABLE_MODEL_DOWNLOAD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp server");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut stdin = child.stdin.take().expect("stdin piped");
+
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#).unwrap();
+    stdin.flush().unwrap();
+    assert!(
+        read_json_id(&mut reader, 1, Duration::from_secs(15)).is_some(),
+        "initialize must respond before the oversized-message probe"
+    );
+
+    // 12 MB of a 3-byte CJK char, no embedded newline: forces the mid-character
+    // truncation at the 10 MiB `take` boundary. Tolerate EPIPE — under the OLD
+    // (buggy) binary the server dies mid-read and this write breaks; that broken
+    // pipe IS the failure the assertion below catches.
+    let big = "好".repeat(4_000_000);
+    let _ = stdin.write_all(big.as_bytes());
+    let _ = stdin.write_all(b"\n");
+    let _ = stdin.flush();
+
+    // The next VALID request must still be answered.
+    let _ = writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    );
+    let _ = stdin.flush();
+
+    let got = read_json_id(&mut reader, 2, Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let resp = got.expect(
+        "serve was killed by the oversized multibyte message: no id:2 response (H3 regression)",
+    );
+    let tools = resp["result"]["tools"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(
+        tools > 0,
+        "follow-up tools/list must return the catalog after the oversized message; got: {resp}"
+    );
+}
+
 /// Express-style route fixture whose handler makes an ambiguous by-name call, so
 /// the trace chain + one-hop downstream list both carry the `ambiguous` fan-out.
 fn setup_route_ambiguous_fanout_project() -> TempDir {

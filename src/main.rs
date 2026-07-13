@@ -431,29 +431,31 @@ fn run_serve() -> Result<()> {
 
     let stdin = io::stdin();
     let mut reader = stdin.lock();
-    let mut buf = String::new();
+    let mut byte_buf: Vec<u8> = Vec::new();
     const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
     loop {
-        buf.clear();
-        let n = reader.by_ref().take(MAX_MESSAGE_SIZE as u64).read_line(&mut buf)?;
+        byte_buf.clear();
+        // Read raw bytes, not `read_line`: when a message's 10 MiB `take` boundary
+        // splits a multi-byte UTF-8 char, `read_line`'s UTF-8 validation returns
+        // Err(InvalidData) and the `?` propagates OUTSIDE the per-request
+        // catch_unwind below — a single oversized CJK request would kill the whole
+        // long-lived session (H3). `read_until` + lossy decode tolerate it.
+        let n = reader.by_ref().take(MAX_MESSAGE_SIZE as u64).read_until(b'\n', &mut byte_buf)?;
         if n == 0 {
             break; // EOF
         }
-        if buf.trim().is_empty() {
-            continue;
-        }
-        if buf.len() >= MAX_MESSAGE_SIZE && !buf.ends_with('\n') {
-            let oversized_len = buf.len();
-            let needs_drain = !buf.ends_with('\n');
+        // Oversized: hit the `take` cap with no terminating newline. Drain the rest
+        // of the line, reject with a JSON-RPC error, and keep serving. Checked on
+        // the raw byte buffer before decoding to avoid a huge lossy allocation.
+        if byte_buf.len() >= MAX_MESSAGE_SIZE && byte_buf.last() != Some(&b'\n') {
+            let oversized_len = byte_buf.len();
             // Free the oversized buffer before draining to avoid 2x peak allocation
-            buf.clear();
-            buf.shrink_to(1024);
-            if needs_drain {
-                // Drain until newline (line-aware) without UTF-8 String allocation
-                let _ = reader.by_ref().take(MAX_MESSAGE_SIZE as u64)
-                    .read_until(b'\n', &mut Vec::new());
-            }
+            byte_buf.clear();
+            byte_buf.shrink_to(1024);
+            // Drain until newline (line-aware), discarding the bytes
+            let _ = reader.by_ref().take(MAX_MESSAGE_SIZE as u64)
+                .read_until(b'\n', &mut Vec::new());
             let err_resp = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": null,
@@ -467,6 +469,14 @@ fn run_serve() -> Result<()> {
                 writeln!(out, "{}", err_resp)?;
                 out.flush()?;
             }
+            continue;
+        }
+
+        // Lossily decode: a `take`-truncated or otherwise malformed multi-byte
+        // sequence becomes U+FFFD rather than killing the session (H3). Well-formed
+        // JSON-RPC lines are unaffected.
+        let buf = String::from_utf8_lossy(&byte_buf);
+        if buf.trim().is_empty() {
             continue;
         }
 
