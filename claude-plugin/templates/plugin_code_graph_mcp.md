@@ -119,10 +119,10 @@ code-graph-mcp ast-search "q" --type fn  # 结构化筛选
 code-graph-mcp map                       # 项目架构
 code-graph-mcp overview src/mcp/         # 模块总览
 code-graph-mcp callgraph SYMBOL          # 调用图
-code-graph-mcp impact SYMBOL             # 影响面
+code-graph-mcp impact SYMBOL             # 影响面（--change-type ∈ signature|behavior|remove，默认 behavior）
 code-graph-mcp show SYMBOL                # 节点详情
-code-graph-mcp refs SYMBOL --relation calls  # 引用筛选
-code-graph-mcp refs SYMBOL --min-confidence extracted  # 只看精确边（滤跨文件裸名 inferred/ambiguous）
+code-graph-mcp refs SYMBOL --relation calls  # --relation ∈ calls|imports|inherits|implements|references|all
+code-graph-mcp refs SYMBOL --min-confidence extracted  # ∈ extracted|inferred|ambiguous；extracted=只看精确边（callgraph/impact/trace 同款）
 code-graph-mcp centrality                 # 架构咽喉（betweenness 桥节点；补 map 的 caller_count）
 code-graph-mcp cycles                     # 循环导入依赖（文件级 import 环 / SCC）
 code-graph-mcp surprising                 # 可疑跨模块耦合（低置信 + 跨模块 + sole-bridge 打分）

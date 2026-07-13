@@ -231,8 +231,9 @@ fn main() -> Result<()> {
         Some("doctor") => {
             // doctor/adopt/unadopt are JS-dispatched and bypass clap, so `--help`
             // would otherwise RUN them — and doctor's default repairs rewrite
-            // ~/.claude/settings.json (adopt rewrites MEMORY.md). `--help`/`-h`
-            // must be side-effect-free, so intercept it before run_node_script.
+            // ~/.claude/settings.json (adopt rewrites the project CLAUDE.md managed
+            // block). `--help`/`-h` must be side-effect-free, so intercept it
+            // before run_node_script.
             if wants_subcommand_help(&args) {
                 print!(
                     "code-graph-mcp doctor \u{2014} diagnose and repair environment issues\n\n\
@@ -249,11 +250,12 @@ fn main() -> Result<()> {
         Some("adopt") => {
             if wants_subcommand_help(&args) {
                 print!(
-                    "code-graph-mcp adopt \u{2014} install the code-graph memory file + MEMORY.md sentinel\n\n\
+                    "code-graph-mcp adopt \u{2014} install the code-graph steering block into the project CLAUDE.md\n\n\
                      USAGE:\n    code-graph-mcp adopt\n\n\
-                     Writes plugin_code_graph_mcp.md and a sentinel block into this\n\
-                     project's ~/.claude memory so Claude Code auto-loads the decision\n\
-                     table. Run `code-graph-mcp unadopt` to remove it.\n"
+                     Writes a managed block into this project's CLAUDE.md plus the\n\
+                     .claude/plugin_code_graph_mcp.md detail doc, so Claude Code\n\
+                     auto-loads the decision table. Run `code-graph-mcp unadopt` to\n\
+                     remove it.\n"
                 );
                 Ok(())
             } else {
@@ -263,10 +265,11 @@ fn main() -> Result<()> {
         Some("unadopt") => {
             if wants_subcommand_help(&args) {
                 print!(
-                    "code-graph-mcp unadopt \u{2014} remove the code-graph memory file + sentinel\n\n\
+                    "code-graph-mcp unadopt \u{2014} remove the code-graph steering block + detail doc\n\n\
                      USAGE:\n    code-graph-mcp unadopt\n\n\
-                     Reverses `code-graph-mcp adopt`: deletes the memory file and the\n\
-                     MEMORY.md sentinel block. User content outside the sentinel is kept.\n"
+                     Reverses `code-graph-mcp adopt`: strips the managed block from\n\
+                     CLAUDE.md and deletes the .claude/plugin_code_graph_mcp.md detail\n\
+                     doc. Content outside the managed block is kept.\n"
                 );
                 Ok(())
             } else {
@@ -306,7 +309,7 @@ fn print_version() {
 /// True if a JS-dispatched subcommand was invoked with `--help`/`-h`. Skips
 /// argv[0] (binary) and argv[1] (subcommand name) so only the subcommand's own
 /// flags are inspected. Lets doctor/adopt/unadopt honor `--help` without running
-/// their side effects (settings.json / MEMORY.md rewrites).
+/// their side effects (settings.json / CLAUDE.md managed-block rewrites).
 fn wants_subcommand_help(args: &[String]) -> bool {
     args.iter().skip(2).any(|a| a == "--help" || a == "-h")
 }
@@ -352,8 +355,8 @@ fn print_help() {
     println!("    stats               Aggregate session metrics from .code-graph/usage.jsonl");
     println!("                        (which tools you used, search/index activity)");
     println!("    outcome             Retrieval adoption from session transcripts (field-MRR; read-only)");
-    println!("    adopt               Install plugin_code_graph_mcp.md memory + MEMORY.md sentinel");
-    println!("    unadopt             Remove the memory file + sentinel block");
+    println!("    adopt               Install the steering block into the project CLAUDE.md + detail doc");
+    println!("    unadopt             Remove the steering block + detail doc");
     println!("    snapshot create --out <path> [--include-embeddings] [--root <dir>] [--quiet]");
     println!("                        Build a portable graph snapshot. Auto zstd-compresses");
     println!("                        when --out ends in .db.zst; otherwise writes raw .db");
