@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.95.1 — MCP rebuild_index atomicity (P2 L6)
 
 ### Fixed — MCP rebuild atomicity (P2 L6)
 - **`rebuild_index` (MCP tool) is now atomic and failure-safe.** It cleared the live
