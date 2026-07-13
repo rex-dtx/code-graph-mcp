@@ -52,17 +52,22 @@ fn resolve_project_root_bounded(cwd: &Path, home: Option<&Path>) -> PathBuf {
     // `.git` root. Track the nearest indexed ancestor (the canonical root of an
     // already-indexed project) and the nearest `.git` root within that bound.
     let mut nearest_indexed: Option<PathBuf> = None;
+    let mut git_root_indexed: Option<PathBuf> = None;
     let mut nearest_git: Option<PathBuf> = None;
     let mut cursor = cwd.parent();
     while let Some(c) = cursor {
         if home == Some(c) {
             break; // an index/.git at-or-above home is an unrelated outer project
         }
-        if nearest_indexed.is_none() && c.join(CODE_GRAPH_DIR).join("index.db").exists() {
+        let c_indexed = c.join(CODE_GRAPH_DIR).join("index.db").exists();
+        if nearest_indexed.is_none() && c_indexed {
             nearest_indexed = Some(c.to_path_buf());
         }
         if c.join(".git").exists() {
             nearest_git = Some(c.to_path_buf());
+            if c_indexed {
+                git_root_indexed = Some(c.to_path_buf());
+            }
             break;
         }
         cursor = c.parent();
@@ -72,8 +77,15 @@ fn resolve_project_root_bounded(cwd: &Path, home: Option<&Path>) -> PathBuf {
     if cwd_has_index && nearest_indexed.is_none() {
         return cwd.to_path_buf();
     }
-    // 3. Prefer the indexed ancestor (canonical project index), then a `.git`
-    //    root, then cwd.
+    // 3. Prefer the indexed `.git` root — the canonical project root — over a
+    //    nearer STRAY indexed ancestor (a monorepo-subdir relic with no `.git`).
+    //    Returning the stray made the CLI read a different DB than the JS hooks
+    //    (which resolve to the indexed git root), a split-brain (M7). Mirrors
+    //    project-root.js: git_root_indexed → nearest indexed ancestor → a `.git`
+    //    root to index → cwd.
+    if let Some(g) = git_root_indexed {
+        return g;
+    }
     if let Some(idx) = nearest_indexed {
         return idx;
     }
@@ -6719,6 +6731,29 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         write_index(&sub);
         assert_eq!(resolve_project_root_from(&sub), root);
+    }
+
+    #[test]
+    fn resolve_project_root_stray_index_between_cwd_and_git_root_prefers_git_root() {
+        // 3-level monorepo: the real root has .git + index; an INTERMEDIATE subdir
+        // carries a STRAY index (no .git of its own); cwd is BELOW that stray. The
+        // nearest indexed ancestor is the stray, but the canonical project root is
+        // the indexed .git root — resolving must prefer it, matching the JS resolver
+        // (project-root.js). Otherwise the CLI reads the stray DB while the hooks
+        // read the root DB = split-brain (M7).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        write_index(root);
+        let mid = root.join("packages").join("app");
+        std::fs::create_dir_all(&mid).unwrap();
+        write_index(&mid); // stray nested index, no .git
+        let cwd = mid.join("src");
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert_eq!(
+            resolve_project_root_from(&cwd), root,
+            "cwd below a stray nested index must resolve to the indexed .git root, not the stray",
+        );
     }
 
     #[test]
