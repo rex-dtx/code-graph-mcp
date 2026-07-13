@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.95.0 — architecture lock-in (M8/M9a + drift-guards) & robustness sweep (P2)
+
+Continues the v0.93.1 audit remediation (`docs/OPTIMIZATION-ROADMAP.md`): the ARCH
+"lock-priority" milestone — dual-surface de-duplication, a layer-decoupling, and six
+parallel-path drift-guard tests — followed by nine low-risk P2 robustness fixes.
+Every change ships with a regression test that fails on the pre-fix code.
+**`INDEX_VERSION` 46 → 48** — existing indexes auto-rebuild on first open (call-edge
+pruning and `code_content` sanitization changed). `SCHEMA_VERSION` unchanged (9).
+
+### Architecture (behavior-preserving, byte-identical output)
+- **Dead-code analysis: a single `dead_code_report` drives both surfaces.** The CLI
+  (`cmd_dead_code`) and MCP (`tool_find_dead_code`) each carried a full copy of the
+  validate → find → ignore-filter → hidden-threshold-probe → classify orchestration,
+  already drifting in wording. Both now format the output of one shared report.
+- **Broke the storage→graph dependency cycle.** `get_callers_with_route_info` (the
+  repo's only reverse edge) moved up into `graph/routes.rs`, composing the graph
+  traversal with a pure-SQL `fetch_route_metadata_map` that stays in storage.
+- **Six parallel-path drift-guard tests.** One consistency test + a proven-RED
+  negative control per "sibling-hole" class (qualifier full-vs-incremental parity,
+  import extraction across languages, no bare `os.tmpdir()`, Rust↔JS project-root
+  parity, deps symlink-escape confinement, CLI↔MCP dead-code single-source).
+
+### Fixed — graph correctness (indexes rebuild)
+- **Call edges from large callers are no longer false-pruned.** The import-contradiction
+  prune trusts an `instr(code_content, '.name(')` guard, but `code_content` is capped
+  at 4096 bytes with a `...` sentinel, so a qualified call beyond the cap was sliced
+  off → the guard misfired → a real edge dropped. Truncated callers now keep the edge.
+- **Source NUL bytes no longer truncate FTS.** FTS5 tokenizes stored TEXT as a
+  C-string and stops at the first NUL, so a file with an embedded NUL (mis-detected
+  binary / generated blob) left everything after it unsearchable. Extracted
+  `code_content` now replaces NUL with a space; normal source is byte-identical.
+
+### Fixed — search & determinism
+- **RRF ranking is deterministic at exact score ties.** Fused scores were collected
+  from a per-instance-seeded `HashMap` then stable-sorted by score, so tied results —
+  and the `truncate(top_k)` cut straddling a tie — varied run to run. Ties now break
+  by ascending `node_id`.
+- **Fuzzy-name ordering escapes SQL wildcards.** The `find_functions_by_fuzzy_name`
+  ORDER BY prefix bucket used the raw query, so a `%`/`_` in the input mis-bucketed
+  names; it now uses the escaped form with `ESCAPE`. Result set unchanged.
+- **Corrected the vector-similarity label.** The score is `1 − L2_distance`
+  (`node_vectors` is a plain vec0 table), not cosine; comments and the debug probe
+  field were relabeled.
+
+### Fixed — robustness
+- **The MCP stdio session survives a poisoned stdout lock.** A background
+  notification write that panics while holding the shared stdout mutex poisoned it;
+  the main loop's writes (outside the per-request `catch_unwind`) then panicked and
+  tore down the long-lived session. Locks now recover the poisoned guard.
+- **auto-update honors `HTTP(S)_PROXY`.** The release-metadata fetch used a bare
+  `https.request` that ignores `*_PROXY` (binary downloads via curl already honored
+  it); it now tunnels over an HTTP `CONNECT` when a proxy applies (with `NO_PROXY`).
+- **CLI `rebuild-index`/`incremental-index` warn on a lock-holding server.** A running
+  MCP server holds `index.lock` for its lifetime; the CLI now detects this and warns
+  before racing its writes (best-effort, non-blocking, silenced by `--quiet`).
+
+### Build / packaging
+- **npm tarball excludes `*.test.js`.** 66 → 38 files, 777 KB → 384 KB unpacked; no
+  runtime surface change.
+
 ## v0.94.0 — audit-driven correctness & supply-chain hardening (P0 + P1)
 
 Thirteen fixes from the v0.93.1 architecture audit (`docs/AUDIT-2026-07-13.md`),
