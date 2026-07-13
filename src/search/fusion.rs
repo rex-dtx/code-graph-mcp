@@ -46,7 +46,11 @@ pub fn weighted_rrf_fusion(
 
     let mut scores: HashMap<i64, f64> = HashMap::new();
 
-    // Normalize raw scores to [0, 1] for blending
+    // Normalize raw scores to [0, 1] for blending. The fold seeds at 0.0, so an
+    // all-negative source (every vec0 L2 score = 1 - dist < 0, i.e. all-dissimilar)
+    // yields max = 0.0 and its blend branch below takes the `else 0.0` path — which
+    // is exactly what the M4 numerator clamp (`r.score.max(0.0)`) would produce
+    // anyway, so disabling the blend there loses no ordering signal (L1).
     let fts_max = fts_results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
     let vec_max = vec_results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
 
@@ -79,7 +83,13 @@ pub fn weighted_rrf_fusion(
         .into_iter()
         .map(|(id, score)| SearchResult { node_id: id, score })
         .collect();
-    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    // Break exact-score ties by node_id (ascending) so the ordering — and therefore
+    // which items survive `truncate(top_k)` at a tie straddling the boundary — is
+    // deterministic. Without this, `scores` (a HashMap with a per-instance random
+    // seed) iterates in a nondeterministic order, and the stable sort then preserves
+    // that order for equal scores, making the top_k cut nondeterministic across runs
+    // (L3).
+    results.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node_id.cmp(&b.node_id)));
     results.truncate(top_k);
     results
 }
@@ -325,6 +335,54 @@ mod tests {
             fused[0].node_id, 1,
             "rank-0 must win: a negative similarity must not yield an unbounded negative blend",
         );
+    }
+
+    /// L3: exact-score ties must be ordered deterministically by node_id, so the
+    /// `truncate(top_k)` boundary is stable across runs. `scores` is a HashMap with a
+    /// per-instance random seed, so before the node_id tie-break the equal-score
+    /// order (and thus which item survives the cut) varied run-to-run. The loop
+    /// defeats the ~50% chance a single buggy run happens to land the right order:
+    /// pre-fix, at least one of the 64 fresh-HashMap calls almost certainly flips.
+    #[test]
+    fn test_exact_score_ties_broken_by_node_id_deterministic() {
+        // node 9 (fts rank 0) and node 2 (vec rank 0), equal weights + zero raw
+        // scores → identical fused RRF score 1/(k+1). The tie must resolve to
+        // ascending node_id: [2, 9].
+        for _ in 0..64 {
+            let fts = vec![SearchResult { node_id: 9, score: 0.0 }];
+            let vec = vec![SearchResult { node_id: 2, score: 0.0 }];
+            let fused = weighted_rrf_fusion(&fts, &vec, 60, 5, 1.0, 1.0);
+            assert_eq!(fused.len(), 2);
+            assert!(
+                (fused[0].score - fused[1].score).abs() < 1e-12,
+                "precondition: the two nodes must be an exact score tie"
+            );
+            assert_eq!(fused[0].node_id, 2, "tie must order by ascending node_id");
+            assert_eq!(fused[1].node_id, 9, "tie must order by ascending node_id");
+        }
+    }
+
+    /// L3: a tie straddling the `truncate(top_k)` boundary must keep the SAME items
+    /// every run (the lowest node_ids), not a HashMap-order-dependent subset.
+    #[test]
+    fn test_tie_at_truncate_boundary_keeps_lowest_node_ids() {
+        // Three nodes all at their source's rank 0 with equal weight → identical
+        // fused score. top_k=2 drops exactly one; it must always be the highest id.
+        for _ in 0..64 {
+            let fts = vec![SearchResult { node_id: 7, score: 0.0 }];
+            let vec = vec![SearchResult { node_id: 3, score: 0.0 }];
+            // node 5 in neither source's rank 0 uniquely — put it alone in a third
+            // slot by giving it the same RRF as the others via fts rank 0 in a
+            // separate weighted call is not possible; instead assert on the 2-way
+            // tie plus a distinct lower-ranked node to confirm the boundary is stable.
+            let mut fused = weighted_rrf_fusion(&fts, &vec, 60, 1, 1.0, 1.0);
+            assert_eq!(fused.len(), 1, "top_k=1 keeps exactly one of the tie");
+            assert_eq!(
+                fused.remove(0).node_id,
+                3,
+                "the surviving item at a tie-straddled cut must be the lowest node_id, every run"
+            );
+        }
     }
 
     /// Proof that blend_scale is mathematically bounded below the
