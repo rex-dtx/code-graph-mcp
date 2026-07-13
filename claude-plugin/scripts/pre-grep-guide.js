@@ -570,6 +570,16 @@ function buildNoHitsFyi(pattern) {
   return `[code-graph] FYI: \`code-graph-mcp grep "${pattern}"\` found no matches — raw grep proceeding. (Regex-metachar patterns: \`code-graph-mcp grep -F\` searches literally.)`;
 }
 
+// v0.92 — cg was allowed to answer but the binary ran-and-failed ('unavailable')
+// or could not be found ('no-binary'). Like buildNoHitsFyi this is a breadcrumb
+// only (PreToolUse exit-0 stdout → debug log, never the model); the operative
+// effect at the call site is the ALLOW (no deny emitted) so the raw grep runs
+// intact instead of a static deny that would hand the model nothing.
+function buildUnavailableFyi(pattern, status) {
+  const why = status === 'no-binary' ? 'binary not found' : 'ran but failed';
+  return `[code-graph] FYI: \`code-graph-mcp grep "${pattern}"\` unavailable (${why}) — raw grep proceeding.`;
+}
+
 // --- Main execution (only when run directly) ---
 
 // Kill switch: matches user-prompt-context.js convention. =1 forces silence
@@ -687,9 +697,24 @@ function runMain() {
       }
     }
 
-    if (answer.status === 'no-hits') {
-      recordRecommendation(root, { hook: 'grep', action: 'hint', fallthrough: 'no-hits' });
-      process.stdout.write(buildNoHitsFyi(pattern) + '\n');
+    // v0.92 — cg was allowed to answer but couldn't deliver hits: 'no-hits'
+    // (regex-dialect miss ≠ proof of absence), 'unavailable' (binary ran but
+    // failed/timed out), or 'no-binary' (binary missing). In every case a static
+    // deny hands the model NOTHING — pure friction that teaches the
+    // CODE_GRAPH_NO_BLOCK_GREP bypass (ubuntu-sec 2026-07 dogfood: the only 2
+    // non-converting denies were `unavailable`, one a `def render` compound cmd
+    // that then half-ran — grep blocked, `; python3 …` tail dropped, no result).
+    // ALLOW the raw grep so the command runs intact; record the fallthrough
+    // reason so the funnel still tells no-hits / unavailable / no-binary apart.
+    // Exception: CODE_GRAPH_NO_ANSWER_IN_DENY=1 means the user opted into the
+    // static deny (the answer never ran → status stays the default 'unavailable')
+    // — that path falls through to the v0.46 static deny below.
+    if (answer.status !== 'hits' && !isAnswerDisabled()) {
+      recordRecommendation(root, { hook: 'grep', action: 'hint', fallthrough: answer.status });
+      process.stdout.write(
+        (answer.status === 'no-hits'
+          ? buildNoHitsFyi(pattern)
+          : buildUnavailableFyi(pattern, answer.status)) + '\n');
       return;
     }
 
@@ -769,6 +794,7 @@ module.exports = {
   buildBlockReason,
   buildBlockReasonWithAnswer,
   buildNoHitsFyi,
+  buildUnavailableFyi,   // v0.92 — allow-on-unavailable breadcrumb
   commandHash,
   isOnCooldown,
   markCooldown,

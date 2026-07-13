@@ -1127,24 +1127,25 @@ test('e2e: stub reports no matches → grep allowed with FYI + records fallthrou
   }
 });
 
-test('e2e: stub fails → static deny (v0.46 fallback) + records answered:false', () => {
+test('e2e: stub ran-and-failed → grep ALLOWED (no static deny) + records fallthrough:unavailable', () => {
+  // v0.92 — a binary that ran but failed (exit 3) can't answer, so a static deny
+  // would hand the model nothing (pure friction that teaches the bypass). ALLOW
+  // the raw grep instead; the funnel still distinguishes this from no-hits /
+  // no-binary via the `fallthrough` field on the recorded hint event.
   const uniq = `StubBoom${Date.now()}`;
   const fixture = e2eFixture(`process.exit(3);`);
   const cmd = `grep -rn "${uniq}" src/`;
   try {
     const res = runHook(cmd, fixture);
     assert.equal(res.status, 0);
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    // static reason, no embedded results
-    assert.match(out.hookSpecificOutput.permissionDecisionReason, /denied by code-graph hook/);
+    // No deny JSON — plain FYI text means the grep proceeds.
+    assert.throws(() => JSON.parse(res.stdout));
+    assert.match(res.stdout, /unavailable \(ran but failed\)/);
     const rec = JSON.parse(fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
-    assert.equal(rec.action, 'deny');
-    assert.equal(rec.answered, false);
-    // A binary that ran but failed (exit 3) is a runtime 'unavailable' — the
-    // funnel must NOT confuse this with a missing-binary ('no-binary') deny.
-    assert.equal(rec.reason, 'unavailable');
+    assert.equal(rec.action, 'hint');
+    // Runtime-fail must stay distinguishable from a missing-binary fallthrough.
+    assert.equal(rec.fallthrough, 'unavailable');
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1222,7 +1223,12 @@ test('e2e: compound `grep …; sed` → deny answers grep AND flags the unanswer
   }
 });
 
-test('e2e: compound cmd + answer failure → STATIC deny still flags tail + records tail:true', () => {
+test('e2e: compound cmd + answer failure → grep ALLOWED, whole command runs intact (no half-run tail drop)', () => {
+  // v0.92 — the marquee fix: when cg can't answer, a static deny used to block
+  // the grep AND drop the `&& cargo test` tail, leaving the model with nothing +
+  // a re-issue chore (ubuntu-sec: the `grep "def render" …; python3 …` case).
+  // Now the whole compound command is ALLOWED to run intact — no deny, no tail
+  // note, no half-run. Recorded as a hint/fallthrough so the funnel still sees it.
   const uniq = `StubTailBoom${Date.now()}`;
   const fixture = e2eFixture(`process.exit(3);`);
   const cmd = `grep -n "${uniq}" src/foo.rs && cargo test -q`;
@@ -1231,16 +1237,14 @@ test('e2e: compound cmd + answer failure → STATIC deny still flags tail + reco
     fsE2e.writeFileSync(pathE2e.join(fixture.dir, 'src', 'foo.rs'), 'fn x() {}\n');
     const res = runHook(cmd, fixture);
     assert.equal(res.status, 0);
-    const out = JSON.parse(res.stdout);
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    const reason = out.hookSpecificOutput.permissionDecisionReason;
-    assert.match(reason, /denied by code-graph hook/);  // static fallback path
-    assert.match(reason, /did NOT run/);
-    assert.match(reason, /cargo test -q/);
+    // No deny JSON — the whole compound command proceeds, tail included.
+    assert.throws(() => JSON.parse(res.stdout));
+    assert.match(res.stdout, /unavailable \(ran but failed\)/);
     const rec = JSON.parse(fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
-    assert.equal(rec.answered, false);
-    assert.equal(rec.tail, true);
+    assert.equal(rec.action, 'hint');
+    assert.equal(rec.fallthrough, 'unavailable');
+    assert.equal(rec.tail, undefined);   // nothing dropped → no tail flag
   } finally {
     cleanupFixture(fixture, cmd);
   }
@@ -1264,13 +1268,14 @@ test('e2e: simple (non-compound) denied grep → no tail field in the deny recor
   }
 });
 
-test('e2e: missing binary → static deny records reason:no-binary (flagship-dark, distinct from no-hits & unavailable)', () => {
-  // The whole point of the `reason` field: a deny that fell back because the
-  // binary could not be found ('no-binary') must be distinguishable in the log
-  // from one where the binary ran but had nothing useful. We can't make
-  // findBinary() return null in-repo (dev target/release is always there), so
-  // run the child with a `--require` shim that forces it null — and DON'T set
-  // _CG_ANSWER_BINARY (it would short-circuit before findBinary()).
+test('e2e: missing binary → grep ALLOWED (no static deny) records fallthrough:no-binary (distinct from no-hits & unavailable)', () => {
+  // v0.92 — when the binary can't be found the hook can't answer AND denying
+  // would block the user's only search tool, so it ALLOWS the raw grep. The
+  // `fallthrough` field still keeps a missing-binary case distinguishable in the
+  // funnel from no-hits / runtime-unavailable. We can't make findBinary() return
+  // null in-repo (dev target/release is always there), so run the child with a
+  // `--require` shim that forces it null — and DON'T set _CG_ANSWER_BINARY (it
+  // would short-circuit before findBinary()).
   const uniq = `StubGone${Date.now()}`;
   const fixture = e2eFixture(`process.stdout.write('unused\\n');`);
   const shim = pathE2e.join(fixture.dir, 'no-binary-shim.js');
@@ -1302,16 +1307,14 @@ Module.prototype.require = function (id) {
       },
     });
     assert.equal(res.status, 0);
-    const out = JSON.parse(res.stdout);
-    // Still a deny, still the static fallback copy (no embedded answer).
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny');
-    assert.match(out.hookSpecificOutput.permissionDecisionReason, /denied by code-graph hook/);
+    // No deny JSON — the raw grep proceeds; FYI names the missing-binary cause.
+    assert.throws(() => JSON.parse(res.stdout));
+    assert.match(res.stdout, /unavailable \(binary not found\)/);
     const rec = JSON.parse(fsE2e.readFileSync(
       pathE2e.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim());
-    assert.equal(rec.action, 'deny');
-    assert.equal(rec.answered, false);
-    assert.equal(rec.reason, 'no-binary',
-      'a missing-binary deny must be distinguishable from an unavailable (runtime-fail) deny');
+    assert.equal(rec.action, 'hint');
+    assert.equal(rec.fallthrough, 'no-binary',
+      'a missing-binary fallthrough must be distinguishable from an unavailable (runtime-fail) one');
   } finally {
     cleanupFixture(fixture, cmd);
   }
