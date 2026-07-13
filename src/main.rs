@@ -7,12 +7,22 @@ use std::sync::{Arc, Mutex};
 /// and `McpServer::send_notification` share a single, mutex-protected handle.
 struct SharedStdout(Arc<Mutex<io::Stdout>>);
 
+/// Lock the shared stdout, recovering from mutex poison. The handle is shared with
+/// background notification writes (the file watcher / startup tasks); if one panics
+/// while holding the lock, the mutex is poisoned and a plain `.lock().unwrap()` on
+/// the main loop's write paths (which sit OUTSIDE the per-request catch_unwind) would
+/// panic and tear down the long-lived stdio session (H3). A poisoned `Stdout` has no
+/// broken invariant, so recovering the guard is safe and keeps the session alive.
+fn lock_stdout(m: &Mutex<io::Stdout>) -> std::sync::MutexGuard<'_, io::Stdout> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Write for SharedStdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
+        lock_stdout(&self.0).write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.0.lock().unwrap().flush()
+        lock_stdout(&self.0).flush()
     }
 }
 
@@ -465,7 +475,7 @@ fn run_serve() -> Result<()> {
                 }
             });
             {
-                let mut out = stdout_shared.lock().unwrap();
+                let mut out = lock_stdout(&stdout_shared);
                 writeln!(out, "{}", err_resp)?;
                 out.flush()?;
             }
@@ -506,7 +516,7 @@ fn run_serve() -> Result<()> {
 
         match result {
             Ok(Some(response)) => {
-                let mut out = stdout_shared.lock().unwrap();
+                let mut out = lock_stdout(&stdout_shared);
                 writeln!(out, "{}", response)?;
                 out.flush()?;
             }
@@ -521,7 +531,7 @@ fn run_serve() -> Result<()> {
                         "message": format!("Internal error: {}", e)
                     }
                 });
-                let mut out = stdout_shared.lock().unwrap();
+                let mut out = lock_stdout(&stdout_shared);
                 writeln!(out, "{}", err_resp)?;
                 out.flush()?;
             }
@@ -633,4 +643,30 @@ fn levenshtein_small(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[n]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // L4: the shared stdout handle is written from background notification threads;
+    // if one panics while holding the lock, the mutex is poisoned and the main loop's
+    // write paths (outside the per-request catch_unwind) would panic on `.unwrap()`
+    // and kill the long-lived session. lock_stdout must recover the guard instead.
+    #[test]
+    fn lock_stdout_recovers_from_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(io::stdout()));
+        let m2 = Arc::clone(&m);
+        // Poison the mutex: a thread panics while holding the lock. join() swallows
+        // the panic so the test process survives.
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison the stdout mutex");
+        })
+        .join();
+        assert!(m.lock().is_err(), "mutex must be poisoned for this test to mean anything");
+        // The plain `.lock().unwrap()` the old code used would panic here; lock_stdout
+        // recovers the guard and returns normally.
+        let _guard = lock_stdout(&m);
+    }
 }
