@@ -2006,6 +2006,48 @@ fn test_cli_stats_help_exits_zero() {
 }
 
 #[test]
+fn test_cli_stats_sigpipe_graceful() {
+    // Regression: `stats | head` (early reader hangup) must NOT panic on EPIPE.
+    // Before the sout! macro, cmd_stats used raw println! which panics on a
+    // broken pipe -> SIGABRT (exit 134). Contract mirrors grep's
+    // test_cli_grep_sigpipe_graceful: silent, exit 0.
+    use std::io::Read;
+    let project = setup_indexed_project();
+    // Synthesize a usage.jsonl whose table is far larger than the 64 KiB pipe
+    // buffer (one row per tool) so the writer outlives the reader hangup and
+    // hits EPIPE mid-stream rather than fitting entirely in the buffer.
+    let mut line = String::from("{\"tools\":{");
+    for i in 0..3000 {
+        if i > 0 { line.push(','); }
+        line.push_str(&format!("\"qa_tool_{i:04}\":{{\"n\":1,\"ms\":1,\"err\":0,\"max_ms\":1}}"));
+    }
+    line.push_str("}}\n");
+    let cg = project.path().join(".code-graph");
+    std::fs::create_dir_all(&cg).unwrap();
+    std::fs::write(cg.join("usage.jsonl"), &line).unwrap();
+
+    let mut child = Command::new(binary_path())
+        .current_dir(project.path())
+        .args(["stats"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read a token amount, then hang up while the writer still has data.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = [0u8; 512];
+    let _ = stdout.read(&mut buf).unwrap();
+    drop(stdout);
+    let status = child.wait().unwrap();
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert!(!err.contains("panicked") && !err.contains("Broken pipe"),
+        "EPIPE must be handled silently like grep, got stderr: {err:?}");
+    assert_eq!(status.code(), Some(0),
+        "early reader hangup is not an error (was SIGABRT/134 before the fix); status={status:?}");
+}
+
+#[test]
 fn test_cli_stats_unknown_flag_errors() {
     // Flavor-B: clap rejects unknown flags (was: silently ignored).
     let project = setup_indexed_project();

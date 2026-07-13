@@ -1576,13 +1576,26 @@ fn plural(n: i64, singular: &str) -> String {
 /// Diagnostic: shows which tools you actually use + search/index activity.
 /// `--last N` limits to the most recent N sessions. `--json` emits structured output.
 pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
+    // Broken-pipe safety (mirrors grep's `test_cli_grep_sigpipe_graceful`
+    // contract): route every stdout write through this macro so an early-closing
+    // reader (`stats | head`, a `| less` the user quits) exits 0 silently instead
+    // of panicking on EPIPE the way raw `println!` does — that surfaced as a
+    // SIGABRT/134 crash with a `failed printing to stdout: Broken pipe` panic.
+    macro_rules! sout {
+        ($($a:tt)*) => {
+            if let Err(e) = writeln!(std::io::stdout(), $($a)*) {
+                if e.kind() == std::io::ErrorKind::BrokenPipe { grep_exit(0); }
+                return Err(e.into());
+            }
+        };
+    }
     let json_mode = args.json;
     let last_n = args.last;
 
     let usage_path = project_root.join(CODE_GRAPH_DIR).join("usage.jsonl");
     if !usage_path.exists() {
         if json_mode {
-            println!("{}", serde_json::json!({
+            sout!("{}", serde_json::json!({
                 "sessions": 0,
                 "tools": {},
                 "note": format!("no usage data at {}", usage_path.display()),
@@ -1612,7 +1625,7 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
 
     if summary.sessions == 0 {
         if json_mode {
-            println!("{}", serde_json::json!({"sessions": 0, "tools": {}}));
+            sout!("{}", serde_json::json!({"sessions": 0, "tools": {}}));
         } else {
             eprintln!("No sessions recorded.");
         }
@@ -1640,7 +1653,7 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         let full_avg = summary.full_index_ms_sum.checked_div(summary.full_index_count).unwrap_or(0);
         let mut sorted_versions: Vec<String> = summary.versions.iter().cloned().collect();
         sorted_versions.sort_by_key(|v| version_sort_key(v));
-        println!("{}", serde_json::json!({
+        sout!("{}", serde_json::json!({
             "sessions": summary.sessions,
             "parse_errors": summary.parse_errors,
             "versions": sorted_versions,
@@ -1723,26 +1736,26 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     } else {
         let mut versions: Vec<&str> = summary.versions.iter().map(|s| s.as_str()).collect();
         versions.sort_by_key(|v| version_sort_key(v));
-        println!("Sessions: {}   versions: {}   {} → {}",
+        sout!("Sessions: {}   versions: {}   {} → {}",
             summary.sessions,
             if versions.is_empty() { "-".into() } else { versions.join(",") },
             summary.first_ts.as_deref().unwrap_or("-"),
             summary.last_ts.as_deref().unwrap_or("-"),
         );
-        println!("Total tool calls: {}", summary.total_tool_calls());
+        sout!("Total tool calls: {}", summary.total_tool_calls());
         if summary.parse_errors > 0 {
-            println!("(warning: {} malformed line(s) skipped)", summary.parse_errors);
+            sout!("(warning: {} malformed line(s) skipped)", summary.parse_errors);
         }
-        println!();
+        sout!();
 
         let mut sorted: Vec<(&String, &ToolAgg)> = summary.tools.iter().collect();
         sorted.sort_by_key(|(_, a)| std::cmp::Reverse(a.n));
 
         if sorted.is_empty() {
-            println!("(no tool calls recorded)");
+            sout!("(no tool calls recorded)");
         } else {
-            println!("{:<28} {:>6} {:>10} {:>6} {:>8}", "Tool", "n", "avg_ms", "err", "max_ms");
-            println!("{}", "-".repeat(62));
+            sout!("{:<28} {:>6} {:>10} {:>6} {:>8}", "Tool", "n", "avg_ms", "err", "max_ms");
+            sout!("{}", "-".repeat(62));
             let mut any_legacy = false;
             for (name, agg) in &sorted {
                 let avg = agg.total_ms.checked_div(agg.n).unwrap_or(0);
@@ -1752,10 +1765,10 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 let legacy = !crate::domain::LIVE_MCP_TOOLS.contains(&name.as_str());
                 if legacy { any_legacy = true; }
                 let label = if legacy { format!("{name} †") } else { name.to_string() };
-                println!("{:<28} {:>6} {:>10} {:>6} {:>8}", label, agg.n, avg, agg.err, agg.max_ms);
+                sout!("{:<28} {:>6} {:>10} {:>6} {:>8}", label, agg.n, avg, agg.err, agg.max_ms);
             }
             if any_legacy {
-                println!("  † not in the current tools/list surface (folded/hidden; from older sessions)");
+                sout!("  † not in the current tools/list surface (folded/hidden; from older sessions)");
             }
         }
 
@@ -1768,8 +1781,8 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             summary.tools.iter().filter(|(_, a)| a.err > 0).collect();
         if !err_tools.is_empty() {
             err_tools.sort_by_key(|(_, a)| std::cmp::Reverse(a.err));
-            println!();
-            println!("Error kinds (per tool, most errors first — large `other` = unclassified, investigate):");
+            sout!();
+            sout!("Error kinds (per tool, most errors first — large `other` = unclassified, investigate):");
             for (name, agg) in &err_tools {
                 let mut kinds: Vec<(&String, &u64)> = agg.err_kinds.iter().collect();
                 kinds.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
@@ -1784,10 +1797,10 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 } else {
                     name.to_string()
                 };
-                println!("  {:<26} {} err = {}", label, agg.err, parts.join(" · "));
+                sout!("  {:<26} {} err = {}", label, agg.err, parts.join(" · "));
                 // Surface the sampled `other` message so the bucket self-explains.
                 if let Some(sample) = &agg.other_sample {
-                    println!("  {:<26}   ↳ other e.g. {:?}", "", sample);
+                    sout!("  {:<26}   ↳ other e.g. {:?}", "", sample);
                 }
             }
         }
@@ -1795,8 +1808,8 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         if summary.search_queries > 0 {
             let zero_pct = (summary.search_zero as f64 / summary.search_queries as f64 * 100.0).round() as u64;
             let avg_q = summary.search_quality_weighted_sum / summary.search_queries as f64;
-            println!();
-            println!("Search: {} queries, {} zero-result ({}%), hybrid/fts {}/{}, avg quality {:.2}",
+            sout!();
+            sout!("Search: {} queries, {} zero-result ({}%), hybrid/fts {}/{}, avg quality {:.2}",
                 summary.search_queries, summary.search_zero, zero_pct,
                 summary.search_hybrid, summary.search_fts_only, avg_q);
         }
@@ -1806,15 +1819,15 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 Some(avg) if summary.full_index_count > 0 => format!(" (avg {}ms)", avg),
                 _ => String::new(),
             };
-            println!("Index:  {} full{}, {} incremental, {} files indexed",
+            sout!("Index:  {} full{}, {} incremental, {} files indexed",
                 summary.full_index_count, full_part, summary.incr_count, summary.files_indexed);
         }
 
-        println!();
+        sout!();
         if recs.total > 0 {
             let actions: Vec<String> = recs.by_action.iter().map(|(k, v)| format!("{v} {k}")).collect();
             let ratio = summary.total_tool_calls() as f64 / recs.total as f64;
-            println!("Recommendations: {} emitted ({})", recs.total, actions.join(", "));
+            sout!("Recommendations: {} emitted ({})", recs.total, actions.join(", "));
             // Inject payload mix. callgraph is the only mode with marginal value over
             // the model's own grep (cross-file tree); grep/show echo hits it already
             // saw (2026-06-26 audit: 0 CONSUMED). Lead with the callgraph share — the
@@ -1825,17 +1838,17 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 let inj_total: u64 = recs.inject_by_mode.values().sum();
                 let cg = recs.inject_by_mode.get("callgraph").copied().unwrap_or(0);
                 let cg_pct = if inj_total > 0 { (cg as f64 / inj_total as f64 * 100.0).round() as u64 } else { 0 };
-                println!("Inject payloads: {} by mode ({}) — callgraph (cross-file, high-value) = {cg_pct}%",
+                sout!("Inject payloads: {} by mode ({}) — callgraph (cross-file, high-value) = {cg_pct}%",
                     inj_total, modes.join(", "));
             }
             if recs.deny_answered + recs.deny_unanswered > 0 {
                 // answered:true denies satisfy the need in-place — read their
                 // conversion separately or the funnel under-reports the feature.
-                println!("Denies: {} answered in-place, {} static",
+                sout!("Denies: {} answered in-place, {} static",
                     recs.deny_answered, recs.deny_unanswered);
             }
             if recs.cli_uses > 0 {
-                println!("CLI uses: {} model-initiated code-graph-mcp queries", recs.cli_uses);
+                sout!("CLI uses: {} model-initiated code-graph-mcp queries", recs.cli_uses);
             }
             // Outcome proxy ("search-decay"): of the answered denies (cg delivered
             // the grep result in-place), how often did the model immediately keep
@@ -1852,58 +1865,58 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 // and reads alarmingly high even when cg wins every step, so lead
                 // with fall-through and show the raw count correctly framed.
                 let ft_pct = (recs.fallthrough_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
-                println!("Fall-through after cg answer: {}/{} answered denies → inline answer didn't end the hunt (verbatim re-grep or a search cg couldn't satisfy) = {ft_pct}% (the real 'answer insufficient' rate; lower is better)",
+                sout!("Fall-through after cg answer: {}/{} answered denies → inline answer didn't end the hunt (verbatim re-grep or a search cg couldn't satisfy) = {ft_pct}% (the real 'answer insufficient' rate; lower is better)",
                     recs.fallthrough_after_answer, recs.deny_answered);
                 if recs.sustained_after_answer > 0 {
-                    println!("  ↳ drill-down sustained: {} follow-up search(es) cg also answered — cg kept up, not a miss",
+                    sout!("  ↳ drill-down sustained: {} follow-up search(es) cg also answered — cg kept up, not a miss",
                         recs.sustained_after_answer);
                 }
                 if recs.followup_inconclusive > 0 {
-                    println!("  ↳ inconclusive (excluded): {} follow-up(s) where cg found nothing (no-hits = a new query) or was unavailable — says nothing about the prior answer",
+                    sout!("  ↳ inconclusive (excluded): {} follow-up(s) where cg found nothing (no-hits = a new query) or was unavailable — says nothing about the prior answer",
                         recs.followup_inconclusive);
                 }
                 let raw_pct = (recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
-                println!("  ↳ any follow-up (raw): {}/{} = {raw_pct}% — incl. drill-down + file-reads; NOT a failure rate",
+                sout!("  ↳ any follow-up (raw): {}/{} = {raw_pct}% — incl. drill-down + file-reads; NOT a failure rate",
                     recs.researched_after_answer, recs.deny_answered);
             }
             if recs.observe > 0 {
-                println!("Tool observes: {} silent grep/read allows recorded (fan-out timeline)", recs.observe);
+                sout!("Tool observes: {} silent grep/read allows recorded (fan-out timeline)", recs.observe);
             }
             // Volume ratio (NOT a conversion rate): cg tool calls and hook
             // recommendations are independent populations, so this only signals
             // activity level. The real recommend→use conversion is the Deny→use /
             // Hint→use funnel printed below.
-            println!("Tool-call volume: {} cg calls / {} recommendations = {ratio:.2} (activity ratio, not conversion)",
+            sout!("Tool-call volume: {} cg calls / {} recommendations = {ratio:.2} (activity ratio, not conversion)",
                 summary.total_tool_calls(), recs.total);
         } else if rec_exists {
             // File present but empty: hooks are wired and recording, just no
             // recommendation has fired yet.
-            println!("Recommendations: 0 recorded (PreToolUse hooks active; conversion metric live, no data yet)");
+            sout!("Recommendations: 0 recorded (PreToolUse hooks active; conversion metric live, no data yet)");
         } else {
             // No file at all: the recording hooks are not active in this project
             // (e.g. a dev `.mcp.json` server with the marketplace plugin's
             // PreToolUse hooks disabled). Surface the dark state instead of
             // printing nothing — silence reads as "feature absent".
-            println!("Conversion metric: DARK — no recommendations.jsonl. PreToolUse hooks are not");
-            println!("  recording here, so recommend→use conversion cannot be measured in this project.");
+            sout!("Conversion metric: DARK — no recommendations.jsonl. PreToolUse hooks are not");
+            sout!("  recording here, so recommend→use conversion cannot be measured in this project.");
         }
         // v0.63 — SessionStart live-context injections. Printed outside the
         // total>0 branch (it's a separate counter): a session whose only event was
         // the SessionStart injection still surfaces it instead of reading dark.
         if recs.live_impact > 0 {
-            println!("Live-context: {} recent-change blast-radius injection(s) at SessionStart", recs.live_impact);
+            sout!("Live-context: {} recent-change blast-radius injection(s) at SessionStart", recs.live_impact);
         }
         // Per-session funnel: of sessions that saw a deny/hint, how many also called
         // a cg query tool. This is the deny→use attribution the aggregate ratio can't give.
         if summary.sessions_with_deny > 0 {
             let pct = (summary.sessions_with_deny_and_use as f64 / summary.sessions_with_deny as f64 * 100.0).round() as u64;
-            println!("Deny→use: {}/{} deny-sessions used cg = {}% (mcp {}, cli {})",
+            sout!("Deny→use: {}/{} deny-sessions used cg = {}% (mcp {}, cli {})",
                 summary.sessions_with_deny_and_use, summary.sessions_with_deny, pct,
                 summary.sessions_with_deny_and_cg, summary.sessions_with_deny_and_cli);
         }
         if summary.sessions_with_hint > 0 {
             let pct = (summary.sessions_with_hint_and_use as f64 / summary.sessions_with_hint as f64 * 100.0).round() as u64;
-            println!("Hint→use: {}/{} hint-sessions used cg = {}% (mcp {}, cli {})",
+            sout!("Hint→use: {}/{} hint-sessions used cg = {}% (mcp {}, cli {})",
                 summary.sessions_with_hint_and_use, summary.sessions_with_hint, pct,
                 summary.sessions_with_hint_and_cg, summary.sessions_with_hint_and_cli);
         }
