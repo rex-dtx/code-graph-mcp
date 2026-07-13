@@ -614,17 +614,31 @@ fn extract_children(
 }
 
 fn truncate_code_content(content: &str) -> Cow<'_, str> {
-    if content.len() <= max_code_content_len() {
-        Cow::Borrowed(content)
+    let max = max_code_content_len();
+    // Fast path unchanged for the common case: short content with no NUL bytes is
+    // borrowed as-is.
+    if content.len() <= max && !content.contains('\0') {
+        return Cow::Borrowed(content);
+    }
+    // Owned path. Strip NUL bytes first: the FTS5 tokenizer treats stored TEXT as a
+    // C-string and stops at the first NUL, so a source file with an embedded NUL
+    // (mis-detected binary / generated blob) would leave everything after it
+    // unsearchable. Replace with a space (same byte length) so the tail stays
+    // indexed. (L10)
+    let mut s = if content.contains('\0') {
+        content.replace('\0', " ")
     } else {
-        let mut end = max_code_content_len();
-        while end > 0 && !content.is_char_boundary(end) {
+        content.to_string()
+    };
+    if s.len() > max {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
             end -= 1;
         }
-        let mut truncated = content[..end].to_string();
-        truncated.push_str("...");
-        Cow::Owned(truncated)
+        s.truncate(end);
+        s.push_str("...");
     }
+    Cow::Owned(s)
 }
 
 fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, source: &str, is_test: bool) -> ParsedNode {
@@ -1194,6 +1208,20 @@ fn extract_dart_declaration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // L10: extracted code_content must not carry NUL bytes into FTS5 (the tokenizer
+    // treats stored TEXT as a C-string and stops at the first NUL → the tail is
+    // unsearchable). truncate_code_content is the single chokepoint every extraction
+    // site wraps node_text in, so testing it directly mirrors the real producer.
+    #[test]
+    fn test_truncate_code_content_strips_nul_bytes() {
+        let got = truncate_code_content("alpha\0betaGamma");
+        assert!(!got.contains('\0'), "NUL must be stripped, got {got:?}");
+        assert!(got.contains("betaGamma"), "text after the NUL must survive, got {got:?}");
+        assert_eq!(got, "alpha betaGamma");
+        // Non-NUL short content stays byte-identical on the borrow fast path.
+        assert!(matches!(truncate_code_content("plain code"), std::borrow::Cow::Borrowed("plain code")));
+    }
 
     #[test]
     fn test_parse_js_describe_it_marks_nested_as_test() {
