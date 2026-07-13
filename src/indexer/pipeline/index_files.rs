@@ -88,15 +88,20 @@ pub(super) fn index_files(
     delete_paths: &[String],
     progress: Option<ProgressFn>,
 ) -> Result<IndexResult> {
-    // SAFETY: unchecked_transaction is used because rusqlite's Transaction borrows
-    // &mut Connection, preventing other borrows during the transaction. Here we need
-    // both the transaction and read access via db.conn() (which returns &Connection
-    // to the same underlying connection). This is safe because:
-    // (1) db.conn() returns the same Connection the tx was opened on,
-    // (2) we never open nested transactions,
-    // (3) concurrent access (e.g. background embedding thread) uses separate
-    //     DB connections; safety relies on SQLite WAL mode + busy_timeout(5000),
-    //     not single-threadedness.
+    // Phase transactions use `db.savepoint(...)`, NOT `conn().unchecked_transaction()`,
+    // so this pipeline is atomic whether run standalone (CLI / incremental — a
+    // top-level SAVEPOINT auto-starts a transaction, RELEASE commits it) OR nested
+    // inside an enclosing transaction. The MCP `rebuild_index` tool wraps the whole
+    // DELETE-then-reindex in one outer transaction so external fresh-connection
+    // readers never observe the empty/partial mid-rebuild window and a failed rebuild
+    // rolls back to the old index; `unchecked_transaction` can't be used there because
+    // it always issues BEGIN, which errors inside an already-open transaction.
+    //
+    // Safety of the shared `&Connection` (savepoint borrows &Connection, we still read
+    // via db.conn() on the same handle): (1) db.conn() and the savepoint act on the
+    // same Connection; (2) concurrent access (e.g. background embedding thread) uses
+    // separate DB connections — safety relies on SQLite WAL mode + busy_timeout(5000),
+    // not single-threadedness.
 
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     let skipped_size = AtomicUsize::new(0);
@@ -119,7 +124,7 @@ pub(super) fn index_files(
     // Both directions need to round-trip through pending or the v0.18.2 fix
     // is only half-complete.
     if !delete_paths.is_empty() {
-        let tx = db.conn().unchecked_transaction()?;
+        let tx = db.savepoint("idx_delete")?;
 
         // Resolve file IDs once (delete_files_by_paths drops them) so we can
         // query inbound calls before cascade fires.
@@ -228,7 +233,7 @@ pub(super) fn index_files(
 
     // Process files in batches — each batch does Phase 1 + Phase 2
     for batch in files.chunks(BATCH_SIZE) {
-        let tx = db.conn().unchecked_transaction()?;
+        let tx = db.savepoint("idx_batch")?;
 
         // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
         let pre_parsed: Vec<FilePreParsed> = batch
@@ -1293,7 +1298,7 @@ pub(super) fn index_files(
 
     // Phase 3: Build context strings + embeddings (single transaction, lightweight)
     if !all_indexed.is_empty() {
-        let tx = db.conn().unchecked_transaction()?;
+        let tx = db.savepoint("idx_context")?;
         let all_node_ids: Vec<i64> = all_indexed.iter()
             .flat_map(|fi| fi.node_ids.iter().copied()).collect();
         let all_edges = get_edges_batch(db.conn(), &all_node_ids)?;

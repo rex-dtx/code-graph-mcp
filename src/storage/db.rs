@@ -401,6 +401,22 @@ If you see this repeatedly, another code-graph server of a different version is 
         &self.conn
     }
 
+    /// Open a nestable [`UncheckedSavepoint`] on this connection.
+    ///
+    /// `name` MUST be a caller-controlled static SQL identifier (never user
+    /// input) — it is interpolated into the SAVEPOINT/RELEASE/ROLLBACK
+    /// statements verbatim. Use this instead of `conn().unchecked_transaction()`
+    /// in code that may run either standalone (autocommit) or wrapped inside an
+    /// enclosing transaction: `unchecked_transaction` always issues `BEGIN`,
+    /// which errors when a transaction is already open, whereas a SAVEPOINT
+    /// auto-starts a transaction when standalone and nests when not. This lets
+    /// the full-index pipeline be wrapped atomically by `rebuild_index` without
+    /// changing its behavior when run directly.
+    pub fn savepoint(&self, name: &'static str) -> Result<UncheckedSavepoint<'_>> {
+        self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+        Ok(UncheckedSavepoint { conn: &self.conn, name, committed: false })
+    }
+
     pub fn vec_enabled(&self) -> bool {
         self.vec_enabled
     }
@@ -497,10 +513,98 @@ If you see this repeatedly, another code-graph server of a different version is 
     }
 }
 
+/// RAII SAVEPOINT guard usable through a shared `&Connection` (rusqlite's
+/// [`rusqlite::Connection::savepoint`] needs `&mut`). Rolls back to — and
+/// releases — the savepoint on drop unless [`UncheckedSavepoint::commit`]
+/// released it first, mirroring `Transaction`'s rollback-on-drop semantics.
+/// See [`Database::savepoint`] for why SAVEPOINT rather than BEGIN.
+#[must_use = "a savepoint rolls back unless committed"]
+pub struct UncheckedSavepoint<'c> {
+    conn: &'c Connection,
+    name: &'static str,
+    committed: bool,
+}
+
+impl UncheckedSavepoint<'_> {
+    /// Release the savepoint. Standalone, releasing the outermost savepoint
+    /// commits the transaction SQLite auto-started for it; nested, it merges the
+    /// savepoint's work into the enclosing transaction.
+    pub fn commit(mut self) -> Result<()> {
+        self.conn.execute_batch(&format!("RELEASE {}", self.name))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for UncheckedSavepoint<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best-effort, like Transaction's drop. ROLLBACK TO undoes to the
+            // savepoint but leaves the (possibly auto-started) transaction open;
+            // the RELEASE then closes it, so a standalone savepoint that rolled
+            // back commits an empty transaction (net: nothing persisted).
+            let _ = self
+                .conn
+                .execute_batch(&format!("ROLLBACK TO {n}; RELEASE {n}", n = self.name));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_savepoint_standalone_commit_and_rollback() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(&tmp.path().join("index.db")).unwrap();
+        db.conn().execute_batch("CREATE TABLE sp_t (x INTEGER);").unwrap();
+
+        // Standalone: a top-level SAVEPOINT auto-starts a transaction; RELEASE
+        // (commit) persists the row.
+        let sp = db.savepoint("s1").unwrap();
+        db.conn().execute("INSERT INTO sp_t VALUES (1)", []).unwrap();
+        sp.commit().unwrap();
+
+        // Drop without commit → ROLLBACK TO + RELEASE discards the row.
+        let sp = db.savepoint("s2").unwrap();
+        db.conn().execute("INSERT INTO sp_t VALUES (2)", []).unwrap();
+        drop(sp);
+
+        let rows: Vec<i64> = db.conn()
+            .prepare("SELECT x FROM sp_t ORDER BY x").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .map(|r| r.unwrap()).collect();
+        assert_eq!(rows, vec![1], "committed row kept, rolled-back row dropped");
+    }
+
+    #[test]
+    fn test_savepoint_nested_in_outer_transaction_discarded_on_rollback() {
+        // The rebuild_index atomicity guarantee at the mechanism level: a RELEASE'd
+        // inner savepoint whose enclosing transaction later ROLLS BACK leaves nothing
+        // behind — a rebuild that clears the index then fails restores the old index.
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(&tmp.path().join("index.db")).unwrap();
+        db.conn().execute_batch("CREATE TABLE sp_t (x INTEGER);").unwrap();
+        db.conn().execute("INSERT INTO sp_t VALUES (100)", []).unwrap(); // "old index"
+
+        {
+            let outer = db.conn().unchecked_transaction().unwrap();
+            db.conn().execute("DELETE FROM sp_t", []).unwrap(); // clear (part of outer)
+            let sp = db.savepoint("inner").unwrap();
+            db.conn().execute("INSERT INTO sp_t VALUES (200)", []).unwrap();
+            sp.commit().unwrap(); // released into the outer transaction
+            drop(outer); // no commit → ROLLBACK everything, incl. the released savepoint
+        }
+
+        let rows: Vec<i64> = db.conn()
+            .prepare("SELECT x FROM sp_t").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .map(|r| r.unwrap()).collect();
+        assert_eq!(rows, vec![100],
+            "old data restored; both the DELETE and the released savepoint rolled back");
+    }
 
     #[test]
     fn test_v7_records_embedding_dim_on_fresh_db() {

@@ -45,6 +45,50 @@ function handleLogin(req: Request) {
 }
 
 #[test]
+fn test_full_index_atomic_inside_outer_transaction() {
+    // L6: MCP rebuild_index wraps DELETE FROM files + run_full_index in ONE outer
+    // transaction so external readers never see the empty mid-rebuild window and a
+    // failed rebuild rolls back to the old index. That requires run_full_index's
+    // phase transactions to be nestable SAVEPOINTs, not `unchecked_transaction`
+    // (which issues BEGIN and errors "cannot start a transaction within a
+    // transaction" inside an open transaction). This test runs the exact rebuild
+    // shape; before the savepoint conversion it fails on the first nested BEGIN.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+    fs::write(project_dir.path().join("src/a.ts"), r#"
+function alpha(): number { return beta(); }
+function beta(): number { return 1; }
+"#).unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    // Seed an "old" index so the DELETE below actually clears prior state.
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert!(!get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty());
+
+    // Rewrite the source so the rebuild produces different symbols.
+    fs::write(project_dir.path().join("src/a.ts"), r#"
+function gamma(): number { return delta(); }
+function delta(): number { return 2; }
+"#).unwrap();
+
+    // Exactly what tool_rebuild_index does: one outer transaction around
+    // DELETE FROM files + run_full_index (its phase savepoints nest inside it).
+    let result = {
+        let tx = db.conn().unchecked_transaction().unwrap();
+        tx.execute("DELETE FROM files", []).unwrap();
+        let r = run_full_index(&db, project_dir.path(), None, None).unwrap();
+        tx.commit().unwrap();
+        r
+    };
+    assert!(result.nodes_created > 0);
+
+    // New symbols present, old ones gone — the rebuild committed atomically.
+    assert!(!get_nodes_by_name(db.conn(), "gamma").unwrap().is_empty(), "rebuilt node present");
+    assert!(get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty(), "old node cleared");
+}
+
+#[test]
 fn test_duplicate_inline_route_handlers_resolve_per_occurrence() {
     // Two inline handlers for the SAME method+path in one file (valid:
     // conditional / overloaded registration). Before the per-occurrence line

@@ -182,19 +182,33 @@ impl McpServer {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        // Clear all data in a single transaction (CASCADE handles nodes→edges)
-        {
-            let tx = self.db.conn().unchecked_transaction()?;
-            tx.execute("DELETE FROM files", [])?;
-            tx.commit()?;
-        }
-
         self.send_log("info", "Rebuilding index...");
         let progress_cb = |current: usize, total: usize| {
             self.send_progress("rebuild-index", current, total);
         };
-        // Skip inline embedding, background thread handles it
-        let result = run_full_index(&self.db, project_root, None, Some(&progress_cb))?;
+
+        // Atomic rebuild: the DELETE and the full re-index run inside ONE outer
+        // transaction. In WAL mode, external fresh-connection readers (a CLI `grep`,
+        // a secondary MCP instance) keep seeing the last committed — old, complete —
+        // index until this commits, never the empty/partial mid-rebuild window the
+        // old "DELETE-commit then rebuild in place" left open for the whole (multi-
+        // second) rebuild; and a failure ANYWHERE below rolls the DELETE back too,
+        // leaving the old index intact instead of wiped. run_full_index's phase
+        // transactions are SAVEPOINTs (see index_files), so they nest inside this
+        // BEGIN rather than erroring with "cannot start a transaction within a
+        // transaction". (The CLI's temp-file + atomic-rename swap can't be reused
+        // here: this server holds a persistent self.db connection whose fd would keep
+        // pointing at the old unlinked inode after a rename — see the snapshot-install
+        // inode-swap note in server/mod.rs. So we get atomicity from one transaction
+        // on the live connection instead.)
+        let result = {
+            let tx = self.db.conn().unchecked_transaction()?;
+            tx.execute("DELETE FROM files", [])?; // CASCADE handles nodes→edges
+            // Skip inline embedding; the background thread (spawned below) handles it.
+            let result = run_full_index(&self.db, project_root, None, Some(&progress_cb))?;
+            tx.commit()?;
+            result
+        };
 
         // Save indexing stats for observability
         *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats.clone();

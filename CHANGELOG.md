@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — MCP rebuild atomicity (P2 L6)
+- **`rebuild_index` (MCP tool) is now atomic and failure-safe.** It cleared the live
+  index with a committed `DELETE FROM files` and then rebuilt in place, so for the whole
+  (multi-second) rebuild an external fresh-connection reader — a CLI `grep`, a secondary
+  MCP instance — saw an empty/partial index, and a rebuild that failed after the DELETE
+  left no index at all. The DELETE and the full re-index now run inside one outer
+  transaction: WAL readers keep seeing the old, complete index until it commits, and any
+  failure rolls the DELETE back too, leaving the old index intact. (Unlike the CLI's
+  temp-file + atomic-rename swap — the server holds a persistent connection whose fd would
+  keep pointing at the old unlinked inode after a rename, so atomicity comes from one
+  transaction on the live connection instead.) The indexer's phase transactions became
+  nestable `SAVEPOINT`s (`Database::savepoint`) so they compose inside the outer
+  transaction; behavior is unchanged when the pipeline runs standalone (CLI / incremental).
+  `INDEX_VERSION`/`SCHEMA_VERSION` unchanged.
+
 ## v0.95.0 — architecture lock-in (M8/M9a + drift-guards) & robustness sweep (P2)
 
 Continues the v0.93.1 audit remediation (`docs/OPTIMIZATION-ROADMAP.md`): the ARCH
