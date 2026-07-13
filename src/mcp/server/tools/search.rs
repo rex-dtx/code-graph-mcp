@@ -187,18 +187,21 @@ impl McpServer {
         };
 
         // Measurement seam (env-gated, stderr-only — NO response-contract change): emit
-        // the raw top-1 vector cosine alongside the final match_confidence so the
-        // confidence-calibration bench can test whether raw cosine separates good-NL
-        // from nonsense queries (the RRF `relevance` score does not — it is rank-fused
-        // and discards similarity magnitude). Default behavior is untouched: nothing is
+        // the raw top-1 vector similarity alongside the final match_confidence so the
+        // confidence-calibration bench can test whether it separates good-NL from
+        // nonsense queries (the RRF `relevance` score does not — it is rank-fused and
+        // discards similarity magnitude). Default behavior is untouched: nothing is
         // emitted unless CODE_GRAPH_EMIT_CONFIDENCE is set. vec_search is KNN-ordered
-        // (nearest first), so its head carries the top raw cosine (1.0 - distance).
+        // (nearest first), so its head carries the top raw similarity `1.0 - distance`.
+        // NOTE: node_vectors is a plain vec0 table (no `distance=` metric) → sqlite-vec
+        // uses L2 distance, so this is `1.0 - L2_distance`, NOT cosine similarity. For
+        // L2-normalized embeddings it is order-equivalent to cosine but not equal to it.
         // See scripts/embedding_benchmark/eval_confidence.py.
         if std::env::var_os("CODE_GRAPH_EMIT_CONFIDENCE").is_some() {
-            let top_cosine = vec_search.first().map(|r| r.score).unwrap_or(f64::NAN);
+            let top_vec_score = vec_search.first().map(|r| r.score).unwrap_or(f64::NAN);
             eprintln!(
-                "[CONF_PROBE] q={:?} match_confidence={:.4} top_cosine={:.4} fts_hits={} vec_hits={} or_fallback={}",
-                query, match_confidence, top_cosine, fts_search.len(), vec_search.len(), fts_or_fallback
+                "[CONF_PROBE] q={:?} match_confidence={:.4} top_vec_score={:.4} fts_hits={} vec_hits={} or_fallback={}",
+                query, match_confidence, top_vec_score, fts_search.len(), vec_search.len(), fts_or_fallback
             );
         }
 
@@ -212,7 +215,7 @@ impl McpServer {
         // measured that match_confidence pins ~0.45 for essentially every multi-word
         // natural-language query, good and nonsense alike (OR-fallback 0.6 ×
         // intersection 0.75), and that neither match_confidence, RRF relevance, nor raw
-        // top-1 vector cosine separates a good NL query from nonsense on this index.
+        // top-1 vector similarity separates a good NL query from nonsense on this index.
         // The old threshold therefore warned on 100% of good NL queries (which retrieve
         // relevant results 82% of the time) — a false alarm that pushed callers to
         // distrust correct results. fts-empty is the honest, mechanically-trustworthy
@@ -504,7 +507,7 @@ impl McpServer {
 ///
 /// It is deliberately NOT keyed on a match_confidence threshold: the calibration
 /// bench (scripts/embedding_benchmark/eval_confidence.py) refuted match_confidence,
-/// RRF relevance, AND raw top-1 cosine as separators of good-NL from nonsense, so
+/// RRF relevance, AND raw top-1 vector similarity as separators of good-NL from nonsense, so
 /// the old `<0.5` trigger warned on ~every natural-language query (100% of good NL
 /// in the corpus) while they returned relevant results. The message states the
 /// mechanic and explicitly does not claim the results are wrong.

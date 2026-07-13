@@ -3,7 +3,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub node_id: i64,
-    /// Raw score from the source (BM25 for FTS, cosine similarity for vector).
+    /// Raw score from the source (BM25 for FTS, vector similarity `1 - L2_distance`
+    /// for vector — NOT cosine; order-equivalent to cosine for L2-normalized embeddings).
     /// Used for score blending in RRF when available (non-zero).
     pub score: f64,
 }
@@ -279,7 +280,7 @@ mod tests {
     ///
     /// Note: cross-source blend tie-breaking cannot work — per-source normalization
     /// maps each source's top-scoring item to blend=blend_scale regardless of raw
-    /// units, so FTS BM25 and vector cosine cannot be directly compared.
+    /// units, so FTS BM25 and vector similarity cannot be directly compared.
     #[test]
     fn test_blend_nudges_within_source() {
         // Same source, two items at adjacent ranks. The RRF gap at k=30 is tiny
