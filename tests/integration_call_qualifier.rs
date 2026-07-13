@@ -1,7 +1,7 @@
 //! End-to-end tests for the bare-name call qualifier resolver rules.
 //! See docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
 
-use code_graph_mcp::indexer::pipeline::run_full_index;
+use code_graph_mcp::indexer::pipeline::{run_full_index, run_incremental_index};
 use code_graph_mcp::storage::db::Database;
 use std::fs;
 use tempfile::TempDir;
@@ -809,5 +809,135 @@ def save(writer: DataWriter, id, conflicts):
     assert_eq!(
         incoming_calls_by_qualified_name(&db, "ScenarioWriter.write"), 0,
         "ScenarioWriter.write must NOT receive a false cross-type edge"
+    );
+}
+
+/// All resolved `calls` edges targeting a node named `persist_item`:
+/// (source_name, target_qualified_name, target_file, confidence), sorted so
+/// batch/iteration order never affects comparison.
+fn persist_item_call_edges(db: &Database) -> Vec<(String, String, String, String)> {
+    let mut stmt = db.conn().prepare(
+        "SELECT src.name, COALESCE(tgt.qualified_name, tgt.name), f.path, edges.confidence
+         FROM edges
+         JOIN nodes src ON src.id = edges.source_id
+         JOIN nodes tgt ON tgt.id = edges.target_id
+         JOIN files f ON f.id = tgt.file_id
+         WHERE edges.relation = 'calls' AND tgt.name = 'persist_item'"
+    ).unwrap();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    }).unwrap();
+    let mut edges: Vec<(String, String, String, String)> = rows.filter_map(Result::ok).collect();
+    edges.sort();
+    edges
+}
+
+/// META①: the callee-qualifier filtering in Phase 2 (`index_files.rs`'s match
+/// on `parse_callee_metadata`, e.g. the `CalleeMeta::RecvType` arm) and the
+/// incremental pending-sweep (`resolve.rs::resolve_pending_calls`) are
+/// PARALLEL, hand-maintained implementations of the same filtering rule
+/// (H1/M1, v0.94.0). This locks them: a qualified call must resolve to the
+/// same target, with the same confidence, whether the project was
+/// full-indexed in one shot, or built incrementally where the caller was
+/// indexed BEFORE its callee existed on disk at all.
+///
+/// The "before its callee existed" staging matters: when both files are
+/// visible in the SAME low-level indexing batch (true for both full index
+/// and a same-shot incremental add), Phase 2's own inline qualifier match
+/// resolves the call directly and `resolve_pending_calls` never runs on it —
+/// so that shape can't distinguish the two implementations. To actually
+/// exercise the pending-sweep, the caller must be indexed while NO
+/// same-language `persist_item` candidate exists yet (buffering the call into
+/// `pending_unresolved_calls` together with its `{"q":"rtype",...}`
+/// qualifier metadata); the callee is then added in a later incremental
+/// pass, which drains the buffer through `resolve_pending_calls`. (The
+/// target method is deliberately NOT named `write`/`get`/`insert`/etc. —
+/// those are in `CROSS_FILE_CALL_NOISE`, so with zero candidates in scope the
+/// default fallback in Phase 2 would drop the call as stdlib noise instead of
+/// buffering it, before ever reaching the pending-sweep this test targets.)
+///
+/// Fixture: two same-named methods (`persist_item`) on sibling classes
+/// (DataWriter, ProfileWriter) defined in ONE file; a caller whose receiver
+/// type is pinned to DataWriter by a local constructor assignment (Python
+/// `rtype` qualifier — same shape as
+/// `python_receiver_type_resolves_to_constructor_type` above). Correct
+/// resolution binds exactly one edge, to DataWriter.persist_item — not
+/// ProfileWriter.persist_item, and not both.
+///
+/// Negative control (see task-3 report): commenting out the qualifier-filter
+/// match arm (`Some(CalleeMeta::RecvType(t)) | Some(CalleeMeta::SelfType(t)) |
+/// Some(CalleeMeta::SelfRecv(t))`) in `resolve_pending_calls` makes the
+/// incremental side fall back to the bare same-language candidate set — both
+/// DataWriter.persist_item and ProfileWriter.persist_item live in the SAME
+/// file, so `refine_ambiguous_targets`'s path-prefix tiebreak can't separate
+/// them and BOTH edges get bound, diverging from the full-index result
+/// asserted here.
+#[test]
+fn qualifier_resolution_parity_full_vs_incremental() {
+    const CALLER_SRC: &str = r#"
+def save(id, conflicts):
+    writer = DataWriter()
+    writer.persist_item(id, conflicts)
+"#;
+    const WRITER_SRC: &str = r#"
+class DataWriter:
+    def persist_item(self, id, items):
+        return len(items)
+
+class ProfileWriter:
+    def persist_item(self, id, items):
+        return None
+"#;
+
+    // --- Full index: both files present from the start, indexed in one shot.
+    let full_tmp = TempDir::new().unwrap();
+    let full_root = full_tmp.path();
+    write(full_root, "caller.py", CALLER_SRC);
+    write(full_root, "writer.py", WRITER_SRC);
+    let full_db_path = full_root.join(".code-graph/graph.db");
+    fs::create_dir_all(full_db_path.parent().unwrap()).unwrap();
+    let full_db = Database::open(&full_db_path).unwrap();
+    run_full_index(&full_db, full_root, None, None).unwrap();
+    let full_edges = persist_item_call_edges(&full_db);
+
+    // --- Incremental: caller indexed FIRST, writer.py absent from disk — the
+    // rtype-qualified call has no same-language `persist_item` candidate at
+    // all yet, so Phase 2 buffers it in `pending_unresolved_calls`.
+    // writer.py is added in a SECOND incremental pass, which drains the
+    // buffer via `resolve_pending_calls`.
+    let incr_tmp = TempDir::new().unwrap();
+    let incr_root = incr_tmp.path();
+    write(incr_root, "caller.py", CALLER_SRC);
+    let incr_db_path = incr_root.join(".code-graph/graph.db");
+    fs::create_dir_all(incr_db_path.parent().unwrap()).unwrap();
+    let incr_db = Database::open(&incr_db_path).unwrap();
+    run_incremental_index(&incr_db, incr_root, None, None).unwrap();
+
+    write(incr_root, "writer.py", WRITER_SRC);
+    run_incremental_index(&incr_db, incr_root, None, None).unwrap();
+    let incr_edges = persist_item_call_edges(&incr_db);
+
+    assert_eq!(
+        full_edges, incr_edges,
+        "qualifier resolution diverged between full index and incremental pending-sweep: full={:?} incr={:?}",
+        full_edges, incr_edges
+    );
+    // Sanity: both sides actually resolved correctly (not vacuously equal
+    // because both dropped to zero edges, or both over-resolved to two).
+    assert_eq!(
+        full_edges,
+        vec![(
+            "save".to_string(),
+            "DataWriter.persist_item".to_string(),
+            "writer.py".to_string(),
+            "inferred".to_string(),
+        )],
+        "expected exactly one edge, save -> DataWriter.persist_item, confidence inferred; got {:?}",
+        full_edges
     );
 }
