@@ -655,8 +655,28 @@ fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Result<()> {
     embed_missing_nodes(db, quiet)
 }
 
+/// Warn (stderr) if another process holds the index lock. A running MCP server holds
+/// the flock for its whole lifetime, so a CLI rebuild/incremental now would race its
+/// writes. Best-effort and non-blocking — the run still proceeds (the user may have
+/// stopped the server or accept the risk); we only surface the hazard. Silenced by
+/// `quiet`. (P2 L7)
+fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
+        eprintln!(
+            "[code-graph] Warning: another process (likely a running MCP server) holds \
+             the index lock at {}. Indexing now may race its writes — stop the server \
+             first if results look inconsistent.",
+            code_graph_dir.join("index.lock").display()
+        );
+    }
+}
+
 pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -> Result<()> {
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
+    warn_if_index_locked(&project_root.join(CODE_GRAPH_DIR), quiet);
 
     // No existing DB → full index. Delegate to build_full_index_at so the
     // full-index + embed path is shared with rebuild-index (no drift).
@@ -745,6 +765,7 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     }
     let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
     let db_path = code_graph_dir.join("index.db");
+    warn_if_index_locked(&code_graph_dir, quiet);
 
     // Atomic rebuild: build the fresh index into a temp file in the SAME dir,
     // then rename it over index.db in one syscall. Concurrent readers (a second

@@ -134,6 +134,46 @@ fn release_index_lock(code_graph_dir: &Path) {
     let _ = std::fs::remove_file(code_graph_dir.join("index.lock"));
 }
 
+/// Non-destructively check whether ANOTHER process currently holds the index lock
+/// (`.code-graph/index.lock`). Used by CLI rebuild/incremental to warn before racing
+/// a running MCP server (which holds the flock for its whole lifetime). Best-effort:
+/// returns false whenever the state cannot be determined (no lock file, open error),
+/// so a false negative never blocks a legitimate CLI run.
+#[cfg(unix)]
+pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let lock_path = code_graph_dir.join("index.lock");
+    // Deliberately do NOT create the file: its absence means no server has ever
+    // locked here, i.e. free.
+    let file = match std::fs::OpenOptions::new().write(true).open(&lock_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Non-blocking probe: if we CAN take LOCK_EX, nobody holds it — unlock at once
+    // so we never disturb the real primary-acquisition path. If we can't, it's held.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        true
+    }
+}
+
+/// Non-unix fallback: the lock is PID-file based, so read the PID and check liveness.
+#[cfg(not(unix))]
+pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
+    let lock_path = code_graph_dir.join("index.lock");
+    match std::fs::read_to_string(&lock_path) {
+        Ok(content) => content
+            .trim()
+            .parse::<u32>()
+            .map(|pid| pid != std::process::id() && pid_is_alive(pid))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 use super::metrics::ErrKind;
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
@@ -2098,6 +2138,29 @@ mod tests {
     use super::*;
     use crate::storage::queries::{upsert_file, FileRecord};
     use tempfile::TempDir;
+
+    // L7: CLI rebuild/incremental warn before racing a running server. This guards the
+    // detector they rely on. flock is tied to the open file description, so a second
+    // open() is excluded even within this same process — no real subprocess needed.
+    #[cfg(unix)]
+    #[test]
+    fn test_other_process_holds_index_lock_detects_held_flock() {
+        use std::os::unix::io::AsRawFd;
+        let dir = TempDir::new().unwrap();
+        let cg = dir.path();
+        // No lock file → reads as free (never blocks a legitimate CLI run).
+        assert!(!other_process_holds_index_lock(cg));
+
+        let lock_path = cg.join("index.lock");
+        let holder = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(false).open(&lock_path).unwrap();
+        let rc = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the test must first acquire the lock");
+        assert!(other_process_holds_index_lock(cg), "a held flock must be detected");
+
+        drop(holder); // releases the flock
+        assert!(!other_process_holds_index_lock(cg), "a released lock must read as free");
+    }
 
     fn tool_call_json(tool_name: &str, args: serde_json::Value) -> String {
         json!({
