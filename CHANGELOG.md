@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.96.1 — `show` reports post-edit line numbers
+
+### Fixed — query-time freshness for the `show` command
+- **`code-graph-mcp show <symbol>` reported pre-edit line numbers after a file was edited
+  post-index.** `show` read `start_line`/`end_line` (and the stored body) straight from the
+  index with no freshness check, so a file edited since the last index made it print stale
+  boundaries — landing a follow-up `sed`/read off by the number of lines inserted or deleted
+  above the symbol. Its siblings already refreshed: the MCP `get_ast_node` tool via
+  `ensure_file_fresh_opt`, and CLI `grep` via its own lazy resync (v0.18.0) — `show` was the
+  gap. It now hash-compares each file the symbol resolves into, re-indexes the dirty ones via
+  `ensure_file_indexed`, and re-resolves before printing. Bounded (8-file budget, 250ms
+  busy-timeout); on write contention or a parse failure it keeps the stale-but-present node —
+  never worse than before. With `--file`, the named file is refreshed even when the symbol
+  does not resolve yet, so a symbol ADDED after the last index is picked up too. Symbol
+  resolution was factored into `resolve_show_nodes` to re-run cleanly after the resync.
+  Regression test: `test_cli_show_resyncs_after_edit`.
+
 ## v0.96.0 — grep-guard answers the file you actually grepped
 
 ### Fixed — compound-command clause scoping in the grep guard

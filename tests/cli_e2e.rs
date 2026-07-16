@@ -1249,6 +1249,36 @@ fn test_cli_grep_stale_marker_when_sync_budget_exhausted() {
         "JSON container must flag staleness, got: {json_out}");
 }
 
+/// `show` reads start_line/end_line straight from the index. Without query-time
+/// freshness (parity with `grep`'s lazy resync + the MCP tools' ensure_file_fresh_opt),
+/// an edit made after the last index leaves `show` reporting the pre-edit line
+/// numbers — the "sed to a `show` line and land off by the inserted-line count" bug.
+#[test]
+fn test_cli_show_resyncs_after_edit() {
+    let project = setup_indexed_project();
+    let start = |out: &str| -> i64 {
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        v.as_array().unwrap()[0]["start_line"].as_i64().unwrap()
+    };
+
+    // hashPassword is defined only in src/auth.ts (no cross-file refs), so the
+    // bare-name resolve is unambiguous.
+    let (out1, _, code1) = run_cli(&project, &["show", "hashPassword", "--json"]);
+    assert_eq!(code1, 0);
+    let start1 = start(&out1);
+
+    // Shift every symbol down by 5 lines.
+    let p = project.path().join("src/auth.ts");
+    let content = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, format!("// pad\n// pad\n// pad\n// pad\n// pad\n{content}")).unwrap();
+
+    let (out2, _, code2) = run_cli(&project, &["show", "hashPassword", "--json"]);
+    assert_eq!(code2, 0);
+    let start2 = start(&out2);
+    assert_eq!(start2, start1 + 5,
+        "show must report post-edit line numbers (lazy resync), got start1={start1} start2={start2}: {out2}");
+}
+
 fn has_git() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }

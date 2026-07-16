@@ -4387,6 +4387,59 @@ pub struct ShowArgs {
 
 /// Show symbol details (code, type, signature).
 /// CLI equivalent of MCP `get_ast_node`.
+/// Resolve a `show` positional symbol to its node(s), applying the shared
+/// `Class.method` base-name fallback. Factored out of `cmd_show` so it can be
+/// re-run after a query-time freshness resync without duplicating the fallback.
+fn resolve_show_nodes(
+    conn: &rusqlite::Connection,
+    symbol: &str,
+    file_filter: Option<&str>,
+) -> Result<Vec<queries::NodeResult>> {
+    let nodes = if let Some(fp) = file_filter {
+        let mut found: Vec<_> = queries::get_nodes_by_file_path(conn, fp)?
+            .into_iter()
+            .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
+            .collect();
+        // Same `Class.method` fallback as the name path: if exact match fails
+        // but the symbol has a dot, fall back to the base name within the file.
+        // Why: parsers populate qualified_name inconsistently across languages
+        // (Rust `impl` blocks: yes; free functions: no), so the literal-match
+        // filter above used to silently miss legitimate symbols.
+        if found.is_empty() && symbol.contains('.') {
+            if let Some(base_name) = symbol.rsplit('.').next() {
+                found = queries::get_nodes_by_file_path(conn, fp)?
+                    .into_iter()
+                    .filter(|n| n.name == base_name)
+                    .collect();
+            }
+        }
+        found
+    } else {
+        let mut found = queries::get_nodes_by_name(conn, symbol)?;
+        // `Class.method` fallback: when no node has the exact qualified name
+        // stored in DB, prefer nodes whose qualified_name matches; otherwise
+        // fall back to all nodes with the base name. Without this fallback,
+        // `show McpServer.lock_or_recover` was reporting "Symbol not found"
+        // even though `callgraph` resolves the same input via prefix-strip.
+        if found.is_empty() && symbol.contains('.') {
+            if let Some(base_name) = symbol.rsplit('.').next() {
+                let by_name = queries::get_nodes_by_name(conn, base_name)?;
+                let any_qualified = by_name.iter()
+                    .any(|n| n.qualified_name.as_deref() == Some(symbol));
+                if any_qualified {
+                    found = by_name.into_iter()
+                        .filter(|n| n.qualified_name.as_deref() == Some(symbol))
+                        .collect();
+                } else {
+                    found = by_name;
+                }
+            }
+        }
+        found
+    };
+    Ok(nodes)
+}
+
 pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
     let json_mode = args.json;
     let compact = args.compact;
@@ -4447,48 +4500,57 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 "Usage: code-graph-mcp show <symbol> [--node-id N] [--file <path>] [--refs] [--impact] [--context-lines N] [--compact] [--json]"
             ))?;
 
-        let nodes = if let Some(fp) = file_filter {
-            let mut found: Vec<_> = queries::get_nodes_by_file_path(conn, fp)?
-                .into_iter()
-                .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
-                .collect();
-            // Same `Class.method` fallback as the name path: if exact match fails
-            // but the symbol has a dot, fall back to the base name within the file.
-            // Why: parsers populate qualified_name inconsistently across languages
-            // (Rust `impl` blocks: yes; free functions: no), so the literal-match
-            // filter above used to silently miss legitimate symbols.
-            if found.is_empty() && symbol.contains('.') {
-                if let Some(base_name) = symbol.rsplit('.').next() {
-                    found = queries::get_nodes_by_file_path(conn, fp)?
-                        .into_iter()
-                        .filter(|n| n.name == base_name)
-                        .collect();
-                }
+        let mut nodes = resolve_show_nodes(conn, symbol, file_filter)?;
+
+        // Lazy query-time freshness (parity with `cmd_grep`'s resync and the MCP
+        // tools' `ensure_file_fresh_opt`): `show` prints start_line/end_line +
+        // code_content straight from the index, so a file edited after the last
+        // index would report pre-edit line numbers — the "sed to a `show` line and
+        // land off by the inserted-line count" bug. Hash-compare each file the
+        // symbol resolves into, re-index the dirty ones, then re-resolve. Bounded
+        // so a common name spanning many dirty files can't stall an interactive
+        // show; on write contention / parse failure we keep the (stale-but-present)
+        // node — exactly the pre-fix behavior, never worse.
+        let _ = conn.execute_batch("PRAGMA busy_timeout = 250;");
+        let mut files: Vec<String> = nodes
+            .iter()
+            .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
+            .collect();
+        // With --file, also refresh the named file when the symbol didn't resolve
+        // yet — an edit that ADDED the symbol post-index is then picked up too.
+        if let Some(fp) = file_filter {
+            files.push(fp.to_string());
+        }
+        files.sort();
+        files.dedup();
+        let mut any_changed = false;
+        let mut budget = 8usize;
+        for f in &files {
+            if budget == 0 {
+                break;
             }
-            found
-        } else {
-            let mut found = queries::get_nodes_by_name(conn, symbol)?;
-            // `Class.method` fallback: when no node has the exact qualified name
-            // stored in DB, prefer nodes whose qualified_name matches; otherwise
-            // fall back to all nodes with the base name. Without this fallback,
-            // `show McpServer.lock_or_recover` was reporting "Symbol not found"
-            // even though `callgraph` resolves the same input via prefix-strip.
-            if found.is_empty() && symbol.contains('.') {
-                if let Some(base_name) = symbol.rsplit('.').next() {
-                    let by_name = queries::get_nodes_by_name(conn, base_name)?;
-                    let any_qualified = by_name.iter()
-                        .any(|n| n.qualified_name.as_deref() == Some(symbol));
-                    if any_qualified {
-                        found = by_name.into_iter()
-                            .filter(|n| n.qualified_name.as_deref() == Some(symbol))
-                            .collect();
-                    } else {
-                        found = by_name;
-                    }
-                }
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT blake3_hash FROM files WHERE path = ?1",
+                    [f.as_str()],
+                    |r| r.get(0),
+                )
+                .ok();
+            let Some(stored_hash) = stored else { continue };
+            let abs = project_root.join(f);
+            if crate::indexer::merkle::hash_file(&abs).ok().as_deref() == Some(stored_hash.as_str()) {
+                continue;
             }
-            found
-        };
+            if let Ok(true) =
+                crate::indexer::pipeline::ensure_file_indexed(&ctx.db, project_root, f, None)
+            {
+                any_changed = true;
+                budget -= 1;
+            }
+        }
+        if any_changed {
+            nodes = resolve_show_nodes(conn, symbol, file_filter)?;
+        }
 
         if nodes.is_empty() {
             if json_mode { println!("[]"); }
