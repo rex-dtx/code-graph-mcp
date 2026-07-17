@@ -257,25 +257,20 @@ pub fn find_dead_code(
                                  OR instr(n3.code_content, n.name || '.') > 0
                                  OR instr(n3.code_content, n.name || '{{') > 0
                                  OR instr(n3.code_content, n.name || '}}') > 0
-                                 -- Truncation co-signal (mirrors the same-file probe
-                                 -- above): code_content is capped at 4096 bytes + a
-                                 -- trailing `...` sentinel, so a cross-file reference
-                                 -- sitting past the cap is invisible to the instr
-                                 -- checks. A node whose stored body is truncated
-                                 -- (sentinel present AND a >5-line gap between the
-                                 -- declared span and the stored newline count) may
-                                 -- carry the reference in its dropped tail — treat it
-                                 -- as a potential referencer (keep-bias, the safe
-                                 -- direction for an LLM-facing tool). Both signals are
-                                 -- required: the sentinel alone false-positives on
-                                 -- Python `def stub(): ...`, the gap alone on compact
-                                 -- fixtures with short content.
-                                 OR (
-                                     substr(n3.code_content, -3) = '...'
-                                     AND (n3.end_line - n3.start_line + 1)
-                                         - (length(n3.code_content) - length(replace(n3.code_content, char(10), '')))
-                                         > 5
-                                 )
+                                 -- NOTE: intentionally NO truncation keep-bias in the
+                                 -- CROSS-FILE probe. A name-independent `...`-sentinel
+                                 -- term (added v0.97.0, reverted v0.97.1) is satisfied
+                                 -- by ANY truncated node in ANY other file — and
+                                 -- code_content caps at 4096 bytes, so every real repo
+                                 -- has one — making this NOT EXISTS always true and
+                                 -- silently disabling cross-file dead-code detection
+                                 -- project-wide. The rare false-positive it guarded
+                                 -- against (a struct whose SOLE cross-file use sits
+                                 -- past the cap of an importing file) is accepted as a
+                                 -- documented limitation. The same-file probe above
+                                 -- KEEPS its truncation co-signal: there the truncated
+                                 -- node shares the candidate's file (high-correlation,
+                                 -- one-file blast radius), so it does not over-suppress.
                              )
                        )
                    )
@@ -879,17 +874,16 @@ mod tests {
             "OrphanConfig is referenced nowhere and must still be reported dead; got: {:?}", names);
     }
 
-    /// Regression: the CROSS-FILE probe for edgeless kinds (constant/struct/
-    /// enum/type_alias/interface/trait) must carry the same truncation co-signal
-    /// as the same-file probe. `code_content` is capped at 4096 bytes + a `...`
-    /// sentinel, so a struct's ONLY cross-file reference can sit in a referencing
-    /// function's dropped tail — invisible to the bare `instr` checks. Without the
-    /// co-signal such a live struct was reported dead (unsafe direction for an
-    /// LLM-facing tool: drives deletion of working code). A truncated cross-file
-    /// node must count as a potential referencer (keep-bias), mirroring the
-    /// same-file probe's semantics.
+    /// Regression (v0.97.1): the CROSS-FILE probe for edgeless kinds must NOT
+    /// carry a name-independent truncation keep-bias. v0.97.0 added one that was
+    /// satisfied by ANY truncated node in ANY other file (`code_content` caps at
+    /// 4096 bytes, so every real repo has one) — the `NOT EXISTS` then became
+    /// always-true and cross-file dead-code detection for constant/struct/enum/
+    /// type_alias/interface/trait was silently disabled project-wide. Here a
+    /// genuinely-dead struct sits alongside an UNRELATED truncated function (that
+    /// does not mention it); the struct must still be reported dead.
     #[test]
-    fn test_find_dead_code_cross_file_truncated_reference() {
+    fn test_find_dead_code_cross_file_unrelated_truncated_node_does_not_suppress() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
 
@@ -902,40 +896,37 @@ mod tests {
             language: Some("rust".into()),
         }).unwrap();
 
-        // Live struct (name len >= 5, no incoming edge). Its only cross-file use
-        // lives in wide_consumer's truncated tail, so no textual `instr` match.
+        // Genuinely-dead struct (name len >= 5, referenced nowhere).
         insert_node(conn, &NodeRecord {
-            file_id: domain_fid, node_type: "struct".into(), name: "TruncatedRefStruct".into(),
+            file_id: domain_fid, node_type: "struct".into(), name: "LonelyDeadStruct".into(),
             qualified_name: None, start_line: 1, end_line: 4,
-            code_content: "pub struct TruncatedRefStruct {\n    id: u32,\n}".into(),
+            code_content: "pub struct LonelyDeadStruct {\n    id: u32,\n}".into(),
             signature: None, doc_comment: None, context_string: None,
             name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
-        // Cross-file consumer whose stored body is TRUNCATED: declared 56 lines but
-        // code_content stores only the head + `...` sentinel (mimics
-        // truncate_code_content cutting at MAX_CODE_LEN). The reference to
-        // TruncatedRefStruct is in the cut-off tail — NOT present in stored content.
+        // An UNRELATED cross-file function whose stored body is TRUNCATED (declared
+        // 56 lines, code_content is head + `...` sentinel) and does NOT mention
+        // LonelyDeadStruct. Under the v0.97.0 bug this single truncated node kept
+        // every edgeless candidate alive; it must not suppress this one.
         insert_node(conn, &NodeRecord {
-            file_id: consumer_fid, node_type: "function".into(), name: "wide_consumer".into(),
+            file_id: consumer_fid, node_type: "function".into(), name: "wide_unrelated_function".into(),
             qualified_name: None, start_line: 5, end_line: 60, // 56 declared lines
-            code_content: "pub fn wide_consumer() {\n    let a = 1;\n    let b = 2;...".into(),
+            code_content: "pub fn wide_unrelated_function() {\n    let a = 1;\n    let b = 2;...".into(),
             signature: None, doc_comment: None, context_string: None,
             name_tokens: None, return_type: None, param_types: None, is_test: false,
         }).unwrap();
 
         let results = find_dead_code(conn, None, None, false, 1, 100).unwrap();
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-        assert!(!names.contains(&"TruncatedRefStruct"),
-            "TruncatedRefStruct's only cross-file reference is in wide_consumer's \
-             truncated tail; the cross-file probe's truncation co-signal must keep it \
-             from being reported dead; got: {:?}", names);
+        assert!(names.contains(&"LonelyDeadStruct"),
+            "LonelyDeadStruct is referenced nowhere; an unrelated truncated cross-file \
+             node must not suppress it (v0.97.0 over-suppression regression); got: {:?}", names);
     }
 
-    /// Negative control for the cross-file truncation co-signal: an edgeless
-    /// struct referenced NOWHERE, with no truncated cross-file node in play, must
-    /// STILL be reported dead. Guards that the co-signal fires only on genuinely
-    /// truncated nodes and did not become a blanket "never report edgeless kinds".
+    /// Negative control: an edgeless struct referenced NOWHERE, with no truncated
+    /// cross-file node in play, must STILL be reported dead — guards that the
+    /// cross-file probe did not become a blanket "never report edgeless kinds".
     #[test]
     fn test_find_dead_code_cross_file_untruncated_dead_struct_still_flagged() {
         let (db, _tmp) = test_db();
