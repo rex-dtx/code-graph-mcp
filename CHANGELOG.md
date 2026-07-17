@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — audit-v0971 fix batch (INDEX_VERSION 49→50)
+## v0.98.0 — audit-v0971 fix batch (INDEX_VERSION 49→50)
 
 Fixes every actionable finding from the 2026-07-17 full audit (docs/AUDIT-2026-07-17.md, local).
 
