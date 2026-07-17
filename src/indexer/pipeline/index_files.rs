@@ -109,6 +109,12 @@ pub(super) fn index_files(
     let skipped_read = AtomicUsize::new(0);
     let skipped_hash = AtomicUsize::new(0);
     let skipped_language = AtomicUsize::new(0);
+    // Files that parsed into a tree carrying tree-sitter ERROR node(s). Distinct
+    // from skipped_parse (a hard parse failure that drops the file entirely):
+    // tree-sitter's error recovery still returns a tree, so extraction proceeds
+    // best-effort but a grammar error cascade can silently drop symbols. Counting
+    // this makes that partial-extraction risk observable without any schema change.
+    let parse_error_files = AtomicUsize::new(0);
 
     let mut total_nodes_created = 0usize;
     let mut total_edges_created = 0usize;
@@ -297,6 +303,18 @@ pub(super) fn index_files(
                         return None;
                     }
                 };
+
+                // Tree-sitter recovers from syntax errors by inserting ERROR/MISSING
+                // nodes and still returning a tree, so parse "succeeds" but symbol
+                // extraction below runs over a damaged parse and can silently drop
+                // symbols. Surface it: warn once per file and count the pass total.
+                if tree.root_node().has_error() {
+                    tracing::warn!(
+                        "Syntax errors in {} — symbols may be incomplete (parsed with tree-sitter error recovery)",
+                        rel_path
+                    );
+                    parse_error_files.fetch_add(1, AtomicOrdering::Relaxed);
+                }
 
                 let last_modified = file_meta
                     .and_then(|m| m.modified().ok())
@@ -1445,6 +1463,7 @@ pub(super) fn index_files(
         files_skipped_read: skipped_read.load(AtomicOrdering::Relaxed),
         files_skipped_hash: skipped_hash.load(AtomicOrdering::Relaxed),
         files_skipped_language: skipped_language.load(AtomicOrdering::Relaxed),
+        files_with_parse_errors: parse_error_files.load(AtomicOrdering::Relaxed),
     };
 
     Ok(IndexResult {

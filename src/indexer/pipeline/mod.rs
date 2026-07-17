@@ -41,6 +41,11 @@ pub struct IndexStats {
     pub files_skipped_read: usize,
     pub files_skipped_hash: usize,
     pub files_skipped_language: usize,
+    /// Files that parsed into a tree carrying tree-sitter ERROR node(s). Unlike the
+    /// `files_skipped_*` counters, these files WERE indexed — tree-sitter recovers
+    /// from syntax errors and still yields a tree — but symbol extraction ran over a
+    /// damaged parse, so some symbols may be missing. Observability only.
+    pub files_with_parse_errors: usize,
 }
 
 pub struct IndexResult {

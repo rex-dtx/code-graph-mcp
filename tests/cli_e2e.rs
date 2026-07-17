@@ -3846,6 +3846,134 @@ fn test_cli_json_empty_similar_existing_symbol() {
 }
 
 #[test]
+fn test_cli_json_empty_impact() {
+    // impact on an unknown symbol emits the same {error,symbol} object the
+    // success path's consumer can parse (matches callgraph/trace/deps), exit 1.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["impact", "xyznonexistent", "--json"]);
+    assert_eq!(code, 1);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("impact --json must output valid JSON even on not-found");
+    assert!(v.is_object(), "JSON impact not-found should be an object; got: {stdout}");
+    assert_eq!(v["symbol"], "xyznonexistent", "envelope echoes the queried symbol");
+}
+
+#[test]
+fn test_cli_json_empty_ast_search() {
+    // ast-search with a no-match query is a healthy SUCCESS (exit 0); --json must
+    // still emit the same {results,count} envelope as the populated path.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["ast-search", "xyznonexistent", "--json"]);
+    assert_eq!(code, 0, "ast-search empty is a structural query success, not an error");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("ast-search --json must output valid JSON even on no-match");
+    assert!(v.is_object(), "ast-search --json empty should be the {{results,count}} envelope");
+    assert!(v["results"].is_array(), "envelope must include results array");
+    assert_eq!(v["count"], 0, "empty result count is 0");
+}
+
+#[test]
+fn test_cli_json_empty_centrality() {
+    // A single trivial file has no multi-hop call paths → no chokepoints. Empty
+    // centrality is a healthy success (exit 0) and --json must emit `[]`.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("solo.ts"), "export function alone(): number { return 1; }\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["centrality", "--json"]);
+    assert_eq!(code, 0, "no chokepoints is success, not an error");
+    assert_eq!(stdout.trim(), "[]", "empty centrality must emit [] per the JSON-empty contract");
+}
+
+#[test]
+fn test_cli_json_empty_map() {
+    // An empty project (no indexed source) still yields the same-shape map object
+    // envelope on stdout, not a bare bail to stderr.
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["map", "--json"]);
+    assert_eq!(code, 0, "map exits 0 even for an empty project");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("map --json must output valid JSON for an empty project");
+    assert!(v.is_object(), "map --json is an object envelope; got: {stdout}");
+    assert!(v["modules"].is_array(), "envelope must include modules array");
+    assert_eq!(v["modules"].as_array().unwrap().len(), 0, "empty project has no modules");
+    assert!(v["hot_functions"].is_array(), "envelope must include hot_functions array");
+}
+
+#[test]
+fn test_cli_json_empty_affected() {
+    // A changed file that isn't in the index exercises the empty blast-radius path:
+    // same-shape object with empty changed/tests/affected_files and the raw input
+    // echoed in not_indexed. Exits 0 (structural analysis, not a lookup).
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/nonexistent_file_xyz.rs", "--json"]);
+    assert_eq!(code, 0, "affected exits 0 even when no input file is indexed");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("affected --json must output valid JSON even when nothing is affected");
+    assert!(v.is_object(), "affected --json is an object envelope; got: {stdout}");
+    assert!(
+        v["changed"].is_array() && v["changed"].as_array().unwrap().is_empty(),
+        "no indexed changed files"
+    );
+    assert!(v["tests"].is_array(), "envelope must include tests array");
+    assert!(v["affected_files"].is_array(), "envelope must include affected_files array");
+    let not_indexed: Vec<&str> = v["not_indexed"]
+        .as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(not_indexed, ["src/nonexistent_file_xyz.rs"], "raw input echoed in not_indexed");
+}
+
+#[test]
+fn test_index_counts_parse_error_files() {
+    // Observability: a file whose tree-sitter parse recovers from a syntax error
+    // (ERROR/MISSING nodes, tree still returned) must be counted in
+    // stats.files_with_parse_errors — extraction proceeds best-effort but symbols
+    // may be dropped, so the count makes that risk visible without a schema change.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // Unterminated params + body and stray tokens force ERROR nodes in the tree.
+    std::fs::write(
+        src.join("broken.ts"),
+        "export function broken( { const x = ;;; @@@ return\n",
+    ).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    let result = code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    assert!(
+        result.stats.files_with_parse_errors >= 1,
+        "a syntax-error file must be counted; got {}",
+        result.stats.files_with_parse_errors
+    );
+}
+
+#[test]
+fn test_index_clean_project_zero_parse_errors() {
+    // Negative control: the all-clean TypeScript fixture must report zero files
+    // with parse errors (guards against the counter firing on valid syntax).
+    let project = setup_indexed_project();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    let result = code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(
+        result.stats.files_with_parse_errors, 0,
+        "clean fixture must report zero parse errors; got {}",
+        result.stats.files_with_parse_errors
+    );
+}
+
+#[test]
 fn test_cli_similar_node_id_missing_accurate_and_json() {
     // Regression: `similar --node-id <missing>` skipped existence validation, so a
     // missing id fell through to the embedded_count==0 guard and reported a

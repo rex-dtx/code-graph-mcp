@@ -604,6 +604,24 @@ fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
     Ok(())
 }
 
+/// Surface, on the CLI path, the count of files that parsed with tree-sitter
+/// ERROR nodes (symbols may be incomplete). Dual-writes `tracing::warn!` AND a
+/// stderr summary line: the CLI entry points install no tracing subscriber
+/// (feedback_tracing_invisible_in_cli), so the eprintln is what the user
+/// actually sees; the tracing line keeps it visible under a server/log setup.
+/// Silent when the count is zero. `quiet` suppresses only the stderr line, like
+/// the surrounding index summaries.
+fn warn_parse_errors(stats: &crate::indexer::pipeline::IndexStats, quiet: bool) {
+    let n = stats.files_with_parse_errors;
+    if n == 0 {
+        return;
+    }
+    tracing::warn!("{} file(s) parsed with syntax errors (symbols may be incomplete)", n);
+    if !quiet {
+        eprintln!("{} file(s) parsed with syntax errors (symbols may be incomplete)", n);
+    }
+}
+
 /// Build a fresh FULL index into an explicit `db_path` and embed it. The DB is
 /// opened and dropped within this call, so on return the WAL is checkpointed and
 /// `db_path` is self-contained — which lets `rebuild-index` build into a temp
@@ -623,6 +641,7 @@ fn build_full_index_at(db_path: &Path, project_root: &Path, quiet: bool, no_embe
             result.files_indexed, result.nodes_created, result.edges_created
         );
     }
+    warn_parse_errors(&result.stats, quiet);
     finish_embedding(&db, quiet, no_embed)?;
     Ok(())
 }
@@ -708,6 +727,7 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -
             );
         }
     }
+    warn_parse_errors(&stats.stats, quiet);
 
     finish_embedding(&db, quiet, no_embed)?;
     Ok(())
@@ -2189,6 +2209,8 @@ fn grep_exit(code: i32) -> ! {
 fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> Vec<String> {
     let mut ls = Command::new("git");
     ls.args(["ls-files", "-z"]).current_dir(project_root);
+    // `--` so a scope path that starts with `-` reaches git as a pathspec, not a flag.
+    ls.arg("--");
     for rel in scope_rels {
         ls.arg(rel);
     }
@@ -2209,6 +2231,8 @@ fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> V
     // The same walk the search performs (cwd-relative output).
     let mut rg_files = Command::new("rg");
     rg_files.arg("--files").current_dir(project_root);
+    // `--` so a scope path that starts with `-` reaches rg as a path, not a flag.
+    rg_files.arg("--");
     for rel in scope_rels {
         rg_files.arg(rel);
     }
