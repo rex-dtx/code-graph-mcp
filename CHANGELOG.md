@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased — audit-v0961 remediation batch (INDEX_VERSION 48→49)
+## v0.97.0 — audit-v0961 remediation batch (INDEX_VERSION 48→49)
 
 Fixes every actionable finding from the 2026-07-16 full audit (docs/AUDIT-2026-07-16.md, local).
+Also supersedes the unpublished v0.96.1 tag (its GitHub Release/npm publish was lost to a
+GitHub API outage; the `show` freshness fix ships here).
 
 ### Fixed — extraction (INDEX_VERSION 48→49; old indexes rebuild automatically)
 - **C# top-level statement calls were silently dropped** — a method invoked only from a
