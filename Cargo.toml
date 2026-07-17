@@ -77,7 +77,12 @@ opt-level = 2
 lto = true
 strip = true
 codegen-units = 1
-panic = "abort"
+# NOTE: do NOT set `panic = "abort"` here. The serve loop's per-request
+# `std::panic::catch_unwind` (src/main.rs:500) turns a handler panic into a
+# JSON-RPC -32603 and keeps the long-lived stdio session alive; `abort` tears
+# the whole process down before that catch can run, making the defense inert in
+# the shipped release binary (tests run under the dev/unwind profile, so an
+# abort setting would be false-green there). Default panic strategy = unwind.
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

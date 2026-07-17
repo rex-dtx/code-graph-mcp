@@ -466,9 +466,23 @@ fn run_serve() -> Result<()> {
             // Free the oversized buffer before draining to avoid 2x peak allocation
             byte_buf.clear();
             byte_buf.shrink_to(1024);
-            // Drain until newline (line-aware), discarding the bytes
-            let _ = reader.by_ref().take(MAX_MESSAGE_SIZE as u64)
-                .read_until(b'\n', &mut Vec::new());
+            // Drain until newline (line-aware), discarding the bytes. LOOP: a
+            // single `take(MAX)` only consumes one MAX-sized chunk, so a line
+            // larger than 2xMAX would leave a tail that gets misparsed as the
+            // next message. Keep reading MAX-sized chunks until the terminating
+            // newline is consumed or EOF is reached, so arbitrarily large lines
+            // are fully drained.
+            let mut sink: Vec<u8> = Vec::new();
+            loop {
+                sink.clear();
+                let drained = reader.by_ref().take(MAX_MESSAGE_SIZE as u64)
+                    .read_until(b'\n', &mut sink)
+                    .unwrap_or(0);
+                // EOF (nothing left) or we consumed through the newline → done.
+                if drained == 0 || sink.last() == Some(&b'\n') {
+                    break;
+                }
+            }
             let err_resp = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": null,
@@ -540,8 +554,22 @@ fn run_serve() -> Result<()> {
             }
         }
 
-        // Run startup indexing + auto-watch if triggered by notifications/initialized
-        server.run_startup_tasks();
+        // Run startup indexing + auto-watch if triggered by notifications/initialized.
+        // Isolated behind catch_unwind, mirroring the per-request guard above:
+        // run_startup_tasks holds the most panic-prone code (indexing, watcher
+        // spawn) yet executes every loop iteration OUTSIDE the request guard, so
+        // an unwinding panic here would tear down the long-lived session. These
+        // are background housekeeping tasks — on panic, log (dual-write) and keep
+        // serving; the in-flight request was already answered above.
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            server.run_startup_tasks();
+        })) {
+            let msg = panic.downcast_ref::<&str>().map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "startup task panicked".to_string());
+            eprintln!("[code-graph] Panic in startup tasks (continuing): {}", msg);
+            tracing::error!("Panic in startup tasks (continuing): {}", msg);
+        }
     }
 
     server.flush_metrics();

@@ -331,3 +331,45 @@ fn project_root_resolution_rust_js_parity() {
         }
     }
 }
+
+/// MED-1 drift-guard: the release profile must NOT set `panic = "abort"`.
+///
+/// `src/main.rs`'s per-request `std::panic::catch_unwind` (the H3 defense that
+/// turns a handler panic into a JSON-RPC -32603 and keeps the long-lived stdio
+/// session alive) is INERT under `panic = "abort"` — an abort tears the whole
+/// process down before the catch can run. The unit/integration suite compiles
+/// under the dev profile (unwind), so that defense is false-green in tests;
+/// only the shipped release binary would abort. This guard reads the real
+/// Cargo.toml at test time and fails if the release profile re-introduces the
+/// abort setting.
+#[test]
+fn release_profile_must_unwind_for_catch_unwind_defense() {
+    let manifest = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    )
+    .expect("read Cargo.toml");
+
+    // Slice out the [profile.release] section: from its header to the next
+    // top-level `[` table header (or EOF).
+    let header = "[profile.release]";
+    let start = manifest
+        .find(header)
+        .expect("Cargo.toml must have a [profile.release] section");
+    let after = &manifest[start + header.len()..];
+    let end = after.find("\n[").map(|i| i + 1).unwrap_or(after.len());
+    let section = &after[..end];
+
+    // No UNCOMMENTED `panic = "abort"` key in the section.
+    let offender = section.lines().find(|line| {
+        let code = line.split('#').next().unwrap_or(""); // strip TOML comments
+        let t = code.trim();
+        t.starts_with("panic") && t.contains("abort")
+    });
+    assert!(
+        offender.is_none(),
+        "[profile.release] must not set `panic = \"abort\"` — it makes the \
+         per-request catch_unwind in src/main.rs (session-survival defense) inert \
+         in release builds. Offending line: {:?}",
+        offender
+    );
+}

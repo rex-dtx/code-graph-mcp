@@ -892,6 +892,101 @@ fn mcp_oversized_multibyte_message_does_not_kill_session() {
     );
 }
 
+/// LOW-drain regression: a line LARGER than 2×MAX_MESSAGE_SIZE (10 MiB) must be
+/// FULLY drained after the oversized rejection. The old drain did a single
+/// `take(MAX).read_until('\n')`, which consumes at most one MAX-sized chunk — so
+/// the tail of a >2×MAX line was left in the stream and misparsed as a bogus
+/// next message, producing a SPURIOUS second error response and desyncing the
+/// stream. The fix loops the drain until the terminating newline (or EOF), so
+/// arbitrarily large lines are consumed whole: exactly ONE error response for
+/// the oversized line, and the following valid request is still answered.
+#[test]
+fn mcp_oversized_line_beyond_2x_max_drains_fully_no_spurious_error() {
+    let project = setup_fixture_project();
+    let mut child = Command::new(binary_path())
+        .arg("serve")
+        .current_dir(project.path())
+        .env("CODE_GRAPH_DISABLE_MODEL_DOWNLOAD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp server");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut stdin = child.stdin.take().expect("stdin piped");
+
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#).unwrap();
+    stdin.flush().unwrap();
+    assert!(
+        read_json_id(&mut reader, 1, Duration::from_secs(15)).is_some(),
+        "initialize must respond before the oversized-drain probe"
+    );
+
+    // 21 MiB single-byte line (> 2×MAX = 20 MiB), no embedded newline. Under the
+    // OLD single-shot drain, ~1 MiB of tail survives past the 2× MAX boundary and
+    // is misparsed as a second (invalid-JSON) message → a spurious parse error.
+    // ASCII byte on purpose: multibyte-truncation survival is the sibling test's
+    // concern; here we isolate the drain-length bug. Build with a repeated byte
+    // vec (no per-char string push). Tolerate EPIPE if a buggy build dies.
+    let big = vec![b'x'; 21 * 1024 * 1024];
+    let _ = stdin.write_all(&big);
+    let _ = stdin.write_all(b"\n");
+    let _ = stdin.flush();
+
+    // Valid follow-up request.
+    let _ = writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    );
+    let _ = stdin.flush();
+
+    // Read every line until the id:2 response (or timeout/EOF), counting how many
+    // carry a JSON-RPC `error`. The stream is ordered, so any spurious tail-parse
+    // error is emitted BEFORE the id:2 response. Exactly one error (the oversized
+    // reject) is expected; two means the >2×MAX tail leaked as a bogus message.
+    let mut error_count = 0usize;
+    let mut tools_ok = false;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(25) {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF: session died
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(t) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("error").is_some() {
+            error_count += 1;
+        }
+        if v.get("id").and_then(|i| i.as_i64()) == Some(2) {
+            tools_ok = v["result"]["tools"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        tools_ok,
+        "valid tools/list after a >2×MAX line must be answered (session survived and stream not desynced)"
+    );
+    assert_eq!(
+        error_count, 1,
+        "exactly ONE error response expected for the oversized line; {error_count} means the >2×MAX tail was misparsed as a spurious message (drain not looped)"
+    );
+}
+
 /// Express-style route fixture whose handler makes an ambiguous by-name call, so
 /// the trace chain + one-hop downstream list both carry the `ambiguous` fan-out.
 fn setup_route_ambiguous_fanout_project() -> TempDir {
