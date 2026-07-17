@@ -34,9 +34,9 @@ jobs:
           node-version: 20
 
       # Pinned toolchain for reproducibility (memory: feedback_ship_baseline_and_flakes).
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: pr-impact
 

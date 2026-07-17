@@ -18,6 +18,13 @@ on:
 permissions:
   contents: write
 
+# Serialize releases for the same ref so a tag-push run and a workflow_dispatch
+# re-run on the same tag don't race (both build + publish the same version).
+# cancel-in-progress: false — never abort an in-flight publish half-way.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build ${{ matrix.npm-pkg }}
