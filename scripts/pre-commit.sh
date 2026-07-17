@@ -61,6 +61,12 @@ if $version_staged; then
     [ -n "$dep" ] && report "optionalDependencies[$dep]" "$ver"
   done < <(git show :package.json | node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).optionalDependencies||{};for(const[k,v]of Object.entries(d))process.stdout.write(k+'\t'+v+'\n')")
 
+  # Cargo.lock's own code-graph-mcp package version. A `SYNC_VERSIONS_SKIP_BUILD=1`
+  # bump never re-runs cargo, so the lockfile can stay stale even when Cargo.toml is
+  # bumped — grab the `version =` line that follows the `name = "code-graph-mcp"`
+  # package entry from staged content and compare it against the reference.
+  report Cargo.lock "$(git show :Cargo.lock | awk '/^name = "code-graph-mcp"$/{f=1;next} f&&/^version = /{gsub(/version = "|"/,"");print;exit}')"
+
   if $mismatch; then
     echo ""
     echo "Fix: node scripts/sync-versions.js $ref"
