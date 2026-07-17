@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased — audit-v0971 fix batch (INDEX_VERSION 49→50)
+
+Fixes every actionable finding from the 2026-07-17 full audit (docs/AUDIT-2026-07-17.md, local).
+
+### Fixed — extraction (INDEX_VERSION 49→50; old indexes rebuild automatically)
+- **Constructor instantiations now produce `calls` edges for JS/TS/TSX (`new_expression`),
+  C# and PHP (`object_creation_expression`)** — previously these five languages emitted
+  ZERO edges for `new Foo()`, so a class only ever instantiated had no callers in
+  callgraph/impact and was a dead-code false positive. Sibling enumeration verified the
+  other languages were already covered (Java via type-reference `references`; Kotlin/
+  Swift/Python/Ruby constructor calls are plain call expressions; Rust struct
+  expressions; Go composite literals) and pinned Java's coverage with a matrix guard.
+- **C# local functions (`local_function_statement`) are now extracted as symbols** — the
+  default top-level `Program.cs` shape since .NET 6 declares functions this way, so the
+  v49 `<module>` caller edge finally has a resolvable target instead of dangling.
+- **Signature fields strip NUL bytes** (`return_type`/`param_types`/`signature`, feeding
+  `context_string`) — an embedded NUL made SQLite `LIKE` filters (`ast-search
+  returns=`/`params=`, fuzzy-name) silently miss everything after it (FTS was unaffected;
+  sibling of the v48 `code_content` / v49 `doc_comment` strips).
+- **The two residual `format!`-built edge-metadata sites (rtype, impl_method) now use
+  `serde_json`** — byte-identical for today's identifier-only inputs, hostile-name safe
+  (matches the v49 `serialize_callee_qualifier` migration).
+
+### Fixed — MCP compact contract
+- **`module_overview compact:true` no longer silently drops `dependencies`,
+  `dependencies_unavailable`, and `dead_code_unavailable`** — an agent requesting a
+  compact overview *with* deps got a complete-looking result that had lost the data it
+  asked for, with no disclosure. A source-scanning parity guard now asserts every
+  top-level key the tool sets is either forwarded by compact mode or explicitly listed
+  as deliberately compacted (third recurrence of this allowlist bug class).
+
+### Added — observability & guards
+- **Tree-sitter parse errors are now visible**: files whose syntax tree contains ERROR
+  recovery nodes (which silently drop all symbols after the error point) log a warning
+  and the index summary reports `N file(s) parsed with syntax errors (symbols may be
+  incomplete)` — previously this entire failure class had zero signal.
+- **CLI↔MCP freshness parity drift-guard** (`tests/freshness_parity.rs`): all nine
+  line-number-emitting CLI commands must call the shared resync path and all five
+  file-path MCP tools must call `ensure_file_fresh_opt` — with permanent negative
+  controls proving the guards fire on an omission.
+- **Five missing `--json` empty-contract tests** (impact / ast-search / centrality /
+  map / affected) — the commands already emitted same-shape JSON on empty input; the
+  regression guards now exist like the other fifteen.
+- **`sync-versions.js --check`**: read-only drift detection across all nine version
+  sites (exit 1 on drift); write mode unchanged.
+
+### Fixed — CLI hardening
+- `git ls-files` / `rg --files` supplement spawns now pass `--` before path arguments
+  (a `-`-prefixed path can no longer be misparsed as a flag).
+
+### CI
+- SHA-pinned the eight remaining floating third-party action refs in ci.yml /
+  pr-impact-review.yml (release.yml was already pinned) and added a `concurrency`
+  group to release.yml so a tag-push run and a `workflow_dispatch` re-run on the same
+  tag serialize instead of racing.
+
+### Docs
+- README known-limitations: Kotlin/Swift interface conformance is recorded as
+  `inherits` (single `: Type` grammar) so `implements`-filtered queries return empty
+  for those two languages; cross-file dead-code may false-positive a type whose only
+  cross-file reference sits beyond the 4096-byte stored-content cap (accepted, v0.97.1).
+
 ## v0.97.1 — fix dead-code over-suppression regression
 
 ### Fixed — cross-file dead-code detection restored

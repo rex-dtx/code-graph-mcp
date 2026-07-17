@@ -319,6 +319,10 @@ Available when installed as a Claude Code plugin:
 | CSS | .css | file-FTS only (no AST symbols) |
 | JSON | .json | file-FTS only (no AST symbols) |
 
+**Known limitations:**
+- **Kotlin/Swift interface conformance** is recorded as `inherits` (both use a single `: Type` grammar for base classes and protocols/interfaces), so `implements`-filtered queries return empty for these two languages.
+- **Cross-file dead-code detection** may false-positive a type whose only cross-file reference sits beyond the 4096-byte stored-content cap per node (documented accepted limitation, v0.97.1).
+
 ## Team-shared graph snapshot
 
 Skip the full local index for team members and CI runners by publishing a
