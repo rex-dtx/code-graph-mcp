@@ -184,6 +184,10 @@ fn wait_with_watchdog(
             }
             // Cap exceeded: send SIGTERM. Pid is still alive because cancel
             // is set immediately after wait_with_output returns.
+            // SAFETY: kill(2) is always safe to call — it cannot violate memory
+            // safety. `pid` is our own spawned child's id; SIGTERM (not SIGKILL)
+            // asks the slow/hung `gh` subprocess to exit and is a no-op if it
+            // already died. The cancel flag makes a recycled-PID race impossible.
             unsafe { libc::kill(pid, libc::SIGTERM); }
         });
         let result = child.wait_with_output().ok().filter(|o| o.status.success());
@@ -377,9 +381,12 @@ fn verify_checksum(url: &str, artifact: &Path) -> Result<()> {
 ///    developer's environment (a committed/PR file can't set it), so it holds
 ///    independent of the url host.
 /// 2. **`<url>.blake3` sidecar** (when no pin): hard-fail on mismatch. When no
-///    sidecar is published (a pre-checksum release), warn loudly and continue —
-///    integrity could not be established, but the download still went over
-///    authenticated HTTPS (`gh api` / origin remote).
+///    sidecar can be fetched (404 / network error / an unpublished checksum) and
+///    no pin is set, integrity cannot be established, so install is REFUSED —
+///    this fail-CLOSES (the M11 hardening; it used to warn and continue).
+///    Escape hatches: set `CODE_GRAPH_SNAPSHOT_PIN`, or have the publisher serve
+///    the `.blake3` sidecar. `file://` sources are the one exception — they are
+///    test/config-controlled and local, so they install without a sidecar (TOFU).
 fn verify_checksum_impl(url: &str, artifact: &Path, pin: Option<String>) -> Result<()> {
     if let Some(pin) = pin {
         let pin = pin.trim();

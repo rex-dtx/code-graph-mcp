@@ -5,7 +5,7 @@ A high-performance code knowledge graph server implementing the [Model Context P
 ## Features
 
 - **Multi-language parsing** — Tree-sitter AST extraction across tiers of depth:
-  - **Full** (calls + imports + inheritance + HTTP routes + test markers): TypeScript/TSX, JavaScript, Go, Python, Rust, Java
+  - **Full** (calls + imports + inheritance + test markers): TypeScript/TSX, JavaScript, Go, Python, Rust, Java. HTTP route extraction additionally covers TypeScript/TSX + JavaScript (Express/Connect), Go (`net/http`), and Python (Flask/FastAPI) only — Rust and Java web frameworks are not yet route-extracted
   - **Smoke-tested** (calls + imports + inheritance): C#, Kotlin, Ruby, PHP, Swift, Dart
   - **Limited** (functions + calls + `#include` imports + gtest test markers + C++ base-class inheritance; `Class::method` scope qualification deferred): C, C++
   - **Scripting**: Bash (functions + commands + `source`/`.` imports), Markdown (headings)
@@ -295,7 +295,7 @@ Available when installed as a Claude Code plugin:
 | `/status` | Show code-graph index status and embedding progress |
 | `/rebuild` | Force a full code-graph index rebuild |
 
-## Supported Languages (16)
+## Supported Languages (19)
 
 | Language | Extensions | Relations Extracted |
 |----------|-----------|-------------------|
@@ -313,8 +313,11 @@ Available when installed as a Claude Code plugin:
 | Dart | .dart | calls, imports, inherits, implements |
 | C | .c, .h | calls, imports |
 | C++ | .cpp, .cc, .cxx, .hpp | calls, imports, inherits |
-| HTML | .html, .htm | structural parsing |
-| CSS | .css | structural parsing |
+| Bash | .sh, .bash | functions, commands, `source`/`.` imports |
+| Markdown | .md, .mdx, .markdown | headings |
+| HTML | .html, .htm | file-FTS only (no AST symbols) |
+| CSS | .css | file-FTS only (no AST symbols) |
+| JSON | .json | file-FTS only (no AST symbols) |
 
 ## Team-shared graph snapshot
 
@@ -333,8 +336,32 @@ Skip the full local index for team members and CI runners by publishing a
 npx code-graph-mcp snapshot inspect ./code-graph-snapshot-<sha>.db.zst
 ```
 
-After setup, fresh clones automatically fetch the latest snapshot the
-first time the MCP server starts. No client-side configuration needed.
+After setup, the auto-fetch is **opt-in per consumer**: an untrusted repo could
+otherwise seed a misleading graph, so an unconfigured clone prints a hint and
+skips the install. Enable it with one of the trust signals below. These live in
+the *environment* (never in `.code-graph.toml`) so a committed/PR-injected config
+file cannot set them.
+
+| Environment variable | Effect |
+|----------------------|--------|
+| `CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN=1` | Trust the auto-detected GitHub-release snapshot for this repo's `origin` remote, allowing auto-install. |
+| `CODE_GRAPH_SNAPSHOT_PIN=<blake3 hex>` | Pin the expected artifact digest (64-char blake3 hex). When set it is the **sole** integrity authority — the download must match it, no network sidecar is consulted — and it also implicitly trusts the origin path. |
+| `CODE_GRAPH_SNAPSHOT_TRUST_URL=1` | Honor a `.code-graph.toml [snapshot] url` override (an arbitrary, non-origin URL). Off by default because a committed URL could redirect the graph to an attacker-chosen database. |
+
+Integrity **fail-closes**: with no pin set and no fetchable `<url>.blake3` sidecar,
+install is refused rather than accepting unverified content. Set a pin, or have
+the publisher serve the `.blake3` sidecar alongside the snapshot. (`file://`
+sources, used in tests, are exempt.)
+
+## Offline / air-gapped usage
+
+The optional embedding model (needed for vector semantic search) is downloaded
+lazily on first use. To control that in a restricted environment:
+
+| Environment variable | Effect |
+|----------------------|--------|
+| `CODE_GRAPH_MODEL_DIR=<dir>` | Load `model.safetensors` from `<dir>` instead of downloading (highest-priority lookup). If the file isn't there, it warns and falls back to the normal search paths. |
+| `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Disable the automatic background model download. An already-cached model is still loaded and used; the server otherwise stays in FTS5-only mode. |
 
 ## Storage
 

@@ -70,6 +70,8 @@ fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
         .ok()?;
 
     // Non-blocking flock: LOCK_EX | LOCK_NB — fails immediately if another process holds it
+    // SAFETY: `file` is an open File owned by this scope, so `as_raw_fd()` yields a
+    // valid, live fd for the duration of the call; flock has no other precondition.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         tracing::info!("Another instance holds the index lock — running in secondary (read-only) mode");
@@ -151,6 +153,8 @@ pub fn other_process_holds_index_lock(code_graph_dir: &Path) -> bool {
     };
     // Non-blocking probe: if we CAN take LOCK_EX, nobody holds it — unlock at once
     // so we never disturb the real primary-acquisition path. If we can't, it's held.
+    // SAFETY: `file` is an open File owned by this scope, so `as_raw_fd()` is a valid
+    // live fd; both flock calls act on that same fd before `file` is dropped.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
@@ -2154,6 +2158,8 @@ mod tests {
         let lock_path = cg.join("index.lock");
         let holder = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(false).open(&lock_path).unwrap();
+        // SAFETY: `holder` is an open File owned by this scope, so `as_raw_fd()` is a
+        // valid live fd for the flock call; `holder` is dropped below to release it.
         let rc = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(rc, 0, "the test must first acquire the lock");
         assert!(other_process_holds_index_lock(cg), "a held flock must be detected");

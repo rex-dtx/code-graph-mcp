@@ -1,5 +1,74 @@
 # Changelog
 
+## Unreleased — audit-v0961 remediation batch (INDEX_VERSION 48→49)
+
+Fixes every actionable finding from the 2026-07-16 full audit (docs/AUDIT-2026-07-16.md, local).
+
+### Fixed — extraction (INDEX_VERSION 48→49; old indexes rebuild automatically)
+- **C# top-level statement calls were silently dropped** — a method invoked only from a
+  top-level statement (the default `Program.cs` shape since .NET 6) had zero incoming
+  `calls` edges: missing callers in callgraph/impact and a dead-code false-positive
+  candidate. The `invocation_expression` arm now attributes such calls to `<module>`,
+  like the Python/Ruby/PHP/bash/JS siblings. Kotlin, Swift, and Dart got the same
+  fallback for library-level top-level calls (Rust/Go/Java/C remain intentionally
+  excluded — negative control pinned).
+- **Dart `mixin M {}` declarations produced no symbol node**, so `class D … with M`
+  inheritance edges were extracted but dropped at resolution (the v32 fix was
+  edge-only). `mixin_declaration` is now extracted as a class-kind node; `with`
+  inheritance survives end to end.
+- **Call-qualifier metadata is now real JSON** (`serde_json::json!` instead of a raw
+  `format!`) — byte-identical for today's identifier-only inputs, but a future
+  extractor feeding quotes/backslashes can no longer produce malformed rows that
+  would abort the confidence-classification UPDATE.
+- **`doc_comment` NUL bytes are stripped** (NUL→space) at the single assembly point —
+  an embedded NUL made FTS silently unable to search the rest of that comment
+  (the `code_content` path was already fixed in v48).
+- **Pending-call sweep: `Self::`/`self.`/path-qualified calls with an empty type filter
+  now bind nothing and drain** (Phase-2 parity). The previous bare-set fallback — the
+  exact false-sibling shape H1 fixed — was latent-only (unreachable from production
+  buffering) but documented as parity while behaving as its opposite.
+
+### Fixed — CLI freshness parity (sibling sweep of the v0.96.1 `show` fix)
+- **`refs`/`overview`/`search`/`ast-search`/`trace`/`similar`/`impact`/`dead-code` no
+  longer print stale line numbers after post-index edits.** All eight now run through a
+  shared resync orchestration (hash-compare displayed files, reindex dirty ones, re-run
+  the query once) with the same bounds as `show`: 8-file budget, 250 ms busy-timeout,
+  keep-stale on contention. The MCP surface already refreshed; the CLI surface — the one
+  the steering recommends — was the stale one.
+- **Partial freshness is now disclosed**: when the budget is exhausted or a resync fails,
+  a stderr note says how many files may still be stale instead of silently mixing fresh
+  and stale line numbers (`show` inherits this).
+
+### Fixed — server robustness
+- **The per-request panic defense is now real in release builds.** `[profile.release]`
+  set `panic = "abort"`, which made the serve loop's `catch_unwind` (turn a handler
+  panic into JSON-RPC `-32603`, keep the session alive) unreachable in the shipped
+  binary while dev-profile tests kept it green. The abort setting is removed (default
+  unwind) and a drift-guard test pins the profile. `run_startup_tasks()` — the most
+  panic-prone per-iteration code — is now wrapped in the same guard.
+- **Oversized-line drain is fully bounded**: a single line larger than 2× the 10 MiB
+  message cap used to leave a tail that was misparsed as the next message (one spurious
+  error response). The drain now loops until the terminating newline or EOF.
+
+### Fixed — storage correctness
+- **LIKE patterns now escape the backslash itself** (then `%`/`_`) via a shared
+  `escape_like()` used by all 9 sites — under `ESCAPE '\'`, a literal `\` in a query
+  acted as an escape character (`a\b` matched `ab`; a trailing `\` matched nothing).
+- **Dead-code cross-file reference probe honors content truncation**: a symbol whose
+  only cross-file reference sits beyond another node's 4096-byte `code_content` cap is
+  no longer reported dead (same keep-bias co-signal the same-file probe already had).
+
+### Docs / tooling
+- README language table corrected (19 languages incl. Bash/Markdown/JSON; HTML/CSS
+  consistently "file-FTS only"; HTTP-route claim scoped to TS/JS + Go + Python).
+- Snapshot trust controls (`CODE_GRAPH_SNAPSHOT_TRUST_URL` / `TRUST_ORIGIN` / `PIN`) and
+  offline model controls (`CODE_GRAPH_MODEL_DIR`, `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD`)
+  are now documented in the README; the stale pre-M11 "fail-open" doc comment on
+  `verify_checksum_impl` now describes the actual fail-closed behavior; all `unsafe`
+  blocks carry `// SAFETY:` comments.
+- pre-commit version guard now also checks Cargo.lock's own `code-graph-mcp` entry
+  (a `SYNC_VERSIONS_SKIP_BUILD=1` bump could leave it stale).
+
 ## v0.96.1 — `show` reports post-edit line numbers
 
 ### Fixed — query-time freshness for the `show` command
