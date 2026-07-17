@@ -61,6 +61,21 @@ fn serialize_callee_qualifier(q: &helpers::CalleeQualifier) -> Option<String> {
     }
 }
 
+/// Build the `{"q":"rtype","v":<ty>}` call-edge metadata (Python receiver-type
+/// inference). Uses serde_json so a type name containing `"`/`\` is escaped into
+/// valid JSON — byte-identical to the old `format!` form for the identifier-only
+/// inputs it actually receives. Mirrors `serialize_callee_qualifier`.
+fn serialize_rtype_metadata(ty: &str) -> String {
+    serde_json::json!({ "q": "rtype", "v": ty }).to_string()
+}
+
+/// Build the `{"q":"impl_method","v":<ty>}` implements-edge metadata (Rust trait
+/// impl method disambiguation). serde_json escapes `"`/`\` in the type name;
+/// byte-identical to the old `format!` form for identifier-only inputs.
+fn serialize_impl_method_metadata(ty: &str) -> String {
+    serde_json::json!({ "q": "impl_method", "v": ty }).to_string()
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -687,6 +702,132 @@ fn walk_for_relations(
             }
         }
 
+        // JS/TS/TSX: `new Foo()` / `new ns.Foo()` constructor instantiation →
+        // calls edge to the class (constructor) name. A `new_expression`'s callee
+        // is its `constructor` field, which never reaches the `call_expression`
+        // arm above, so a class that is only instantiated (never called as a
+        // `Foo.method()`) had NO incoming calls edge — invisible to
+        // callgraph/impact. The JS value-reference pass emits a `references` edge
+        // only in value positions (call arg, binding RHS, return, ...), NOT for a
+        // `new` constructor slot (parent is `new_expression`), so such a class was
+        // also edgeless and false-flagged dead-code. Mirrors the Rust
+        // `struct_expression` arm. Generic args (`new Foo<T>()`) are a separate
+        // `type_arguments` field, but a `<...>` tail is stripped defensively.
+        // Member form `new ns.Foo()` yields callee `Foo` with a Receiver("ns")
+        // qualifier when the receiver is a simple identifier — consistent with how
+        // member `call_expression`s are handled. Scope mirrors the call arm
+        // (`<module>` fallback at file top level).
+        "new_expression" if matches!(config.name, "javascript" | "typescript" | "tsx") => {
+            let scope = active_scope
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "<module>".to_string());
+            if let Some(ctor) = node.child_by_field_name("constructor") {
+                let callee: Option<(String, helpers::CalleeQualifier)> = match ctor.kind() {
+                    "identifier" => {
+                        let raw = node_text(&ctor, source);
+                        let name = raw.split('<').next().unwrap_or(raw).trim();
+                        (!name.is_empty())
+                            .then(|| (name.to_string(), helpers::CalleeQualifier::Bare))
+                    }
+                    "member_expression" => {
+                        ctor.child_by_field_name("property").and_then(|prop| {
+                            let raw = node_text(&prop, source);
+                            let name = raw.split('<').next().unwrap_or(raw).trim();
+                            if name.is_empty() {
+                                return None;
+                            }
+                            let qual = ctor
+                                .child_by_field_name("object")
+                                .filter(|o| o.kind() == "identifier")
+                                .map(|o| helpers::CalleeQualifier::Receiver(
+                                    node_text(&o, source).to_string()))
+                                .unwrap_or(helpers::CalleeQualifier::Bare);
+                            Some((name.to_string(), qual))
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some((name, qualifier)) = callee {
+                    results.push(ParsedRelation {
+                        source_name: scope,
+                        target_name: name,
+                        relation: REL_CALLS.into(),
+                        metadata: serialize_callee_qualifier(&qualifier),
+                        source_language: String::new(),
+                    });
+                }
+            }
+        }
+
+        // C#: `new Foo()` / `new Ns.Bar()` object creation → calls edge to the
+        // class (constructor) name. `object_creation_expression` is distinct from
+        // `invocation_expression` (handled below), and C# has no type-reference
+        // pass, so a class that is only instantiated had NO incoming edge and was
+        // false-flagged dead-code. Mirrors the JS `new_expression` arm; top-level
+        // `new` (C# 9 top-level program) attributes to `<module>` like the C#
+        // invocation arm. The class name is the `type` field: an `identifier`
+        // (`new Foo()`) or a `qualified_name` (`new Ns.Bar()` → its `name` field).
+        "object_creation_expression" if config.name == "csharp" => {
+            let scope = active_scope.unwrap_or("<module>");
+            if let Some(ty) = node.child_by_field_name("type") {
+                let raw = match ty.kind() {
+                    "qualified_name" => ty
+                        .child_by_field_name("name")
+                        .map(|n| node_text(&n, source)),
+                    _ => Some(node_text(&ty, source)),
+                };
+                if let Some(raw) = raw {
+                    let name = raw.split('<').next().unwrap_or(raw).trim();
+                    if !name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: scope.to_string(),
+                            target_name: name.to_string(),
+                            relation: REL_CALLS.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // PHP: `new Foo()` / `new Ns\Bar()` object creation → calls edge to the
+        // class (constructor) name. PHP has no type-reference pass, so a class only
+        // instantiated had NO incoming edge and was false-flagged dead-code.
+        // Mirrors the JS/C# arms. The type is a positional `name` or
+        // `qualified_name` child (no field); for a qualified name the class is the
+        // last `name` segment (namespace prefix lives under `namespace_name`).
+        // `new self()/static()/parent()` and `new $var()` are relative/dynamic —
+        // skipped (a `self`/`static`/`parent` edge is pure noise; a variable is not
+        // a class name).
+        "object_creation_expression" if config.name == "php" => {
+            let scope = active_scope.unwrap_or("<module>");
+            let type_node = (0..node.named_child_count())
+                .filter_map(|i| node.named_child(i))
+                .find(|c| matches!(c.kind(), "name" | "qualified_name"));
+            if let Some(ty) = type_node {
+                let name = if ty.kind() == "qualified_name" {
+                    (0..ty.named_child_count())
+                        .filter_map(|i| ty.named_child(i))
+                        .rfind(|c| c.kind() == "name")
+                        .map(|n| node_text(&n, source).to_string())
+                } else {
+                    Some(node_text(&ty, source).to_string())
+                };
+                if let Some(name) = name {
+                    if !name.is_empty() && !matches!(name.as_str(), "self" | "static" | "parent") {
+                        results.push(ParsedRelation {
+                            source_name: scope.to_string(),
+                            target_name: name,
+                            relation: REL_CALLS.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
         // Python: tree-sitter-python uses `call` (not `call_expression`) for every
         // function/method invocation. Without this branch all Python call edges
         // are silently dropped — README documents Python as Full tier, and
@@ -711,7 +852,7 @@ fn walk_for_relations(
                 // Falls back to the bare, metadata-less form (unchanged behavior)
                 // whenever the type can't be proven — never emits a wrong-type edge.
                 let metadata = infer_python_call_receiver_type(&node, source)
-                    .map(|ty| format!(r#"{{"q":"rtype","v":"{}"}}"#, ty));
+                    .map(|ty| serialize_rtype_metadata(&ty));
                 results.push(ParsedRelation {
                     source_name: scope.to_string(),
                     target_name: callee,
@@ -1075,10 +1216,7 @@ fn walk_for_relations(
                                             source_name: type_name.clone(),
                                             target_name: method_name.to_string(),
                                             relation: REL_IMPLEMENTS.into(),
-                                            metadata: Some(format!(
-                                                r#"{{"q":"impl_method","v":{}}}"#,
-                                                serde_json::Value::String(type_name.clone())
-                                            )),
+                                            metadata: Some(serialize_impl_method_metadata(&type_name)),
                                             source_language: String::new(),
                                         });
                                     }

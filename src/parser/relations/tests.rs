@@ -3427,3 +3427,144 @@ fn test_doc_comment_strips_nul_bytes() {
         "NUL must become a space with all other bytes unchanged; got: {doc:?}");
 }
 
+// --- v50: constructor-instantiation call edges (Task 1) ---
+// RED baseline (probe, pre-fix): JS/TS/TSX `new Foo()` produced ZERO edges;
+// C#/PHP `new Foo()` produced ZERO edges; only Java `new Foo()` emitted a
+// `references` edge (the type-reference pass). Adding a `calls` edge to the
+// constructor name makes an only-instantiated class visible to callgraph/impact
+// and non-dead.
+
+fn calls_of(rels: &[ParsedRelation]) -> Vec<(String, String)> {
+    rels.iter().filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.clone(), r.target_name.clone())).collect()
+}
+
+#[test]
+fn test_js_new_expression_creates_calls_edge() {
+    // Bare, member, generic, and top-level (<module>) forms.
+    let code = "function build() { const a = new Widget(); const b = new ns.Panel(); }\n\
+                const top = new Root();\n";
+    let rels = extract_relations(code, "javascript").unwrap();
+    let calls = calls_of(&rels);
+    assert!(calls.contains(&("build".into(), "Widget".into())),
+        "new Widget() → build→Widget calls edge; got {calls:?}");
+    assert!(calls.contains(&("build".into(), "Panel".into())),
+        "new ns.Panel() → build→Panel (member form, bare class name); got {calls:?}");
+    assert!(calls.contains(&("<module>".into(), "Root".into())),
+        "top-level new Root() → <module>→Root; got {calls:?}");
+    // Member form carries a Receiver qualifier consistent with member call_expressions.
+    let panel = rels.iter().find(|r| r.relation == REL_CALLS && r.target_name == "Panel").unwrap();
+    assert_eq!(panel.metadata.as_deref(), Some(r#"{"q":"recv","v":"ns"}"#),
+        "member new ns.Panel() carries recv=ns; got {:?}", panel.metadata);
+}
+
+#[test]
+fn test_ts_new_expression_creates_calls_edge_strips_generics() {
+    let code = "function build() { const a = new Store<State>(); const b = new mod.Cache(); }\n";
+    let rels = extract_relations(code, "typescript").unwrap();
+    let calls = calls_of(&rels);
+    assert!(calls.contains(&("build".into(), "Store".into())),
+        "new Store<State>() → build→Store (generic arg stripped); got {calls:?}");
+    assert!(calls.contains(&("build".into(), "Cache".into())),
+        "new mod.Cache() → build→Cache; got {calls:?}");
+}
+
+#[test]
+fn test_tsx_new_expression_creates_calls_edge() {
+    let code = "function build() { const a = new Model(); }\n";
+    let rels = extract_relations(code, "tsx").unwrap();
+    assert!(calls_of(&rels).contains(&("build".into(), "Model".into())),
+        "TSX new Model() → build→Model; got {:?}", calls_of(&rels));
+}
+
+#[test]
+fn test_csharp_object_creation_creates_calls_edge() {
+    // Bare and qualified forms; top-level new → <module>.
+    let code = "class App { void M() { var a = new Widget(); var b = new Ns.Panel(); } }\n";
+    let rels = extract_relations(code, "csharp").unwrap();
+    let calls = calls_of(&rels);
+    assert!(calls.contains(&("App.M".into(), "Widget".into())),
+        "C# new Widget() → App.M→Widget; got {calls:?}");
+    assert!(calls.contains(&("App.M".into(), "Panel".into())),
+        "C# new Ns.Panel() → App.M→Panel (qualified tail); got {calls:?}");
+}
+
+#[test]
+fn test_php_object_creation_creates_calls_edge() {
+    // Bare, namespaced, and the relative `self`/`static`/`parent` skips.
+    let code = "<?php\nfunction build() { $a = new Widget(); $b = new Ns\\Panel(); $c = new self(); }\n";
+    let rels = extract_relations(code, "php").unwrap();
+    let calls = calls_of(&rels);
+    assert!(calls.contains(&("build".into(), "Widget".into())),
+        "PHP new Widget() → build→Widget; got {calls:?}");
+    assert!(calls.contains(&("build".into(), "Panel".into())),
+        "PHP new Ns\\Panel() → build→Panel (last segment); got {calls:?}");
+    assert!(!calls.iter().any(|(_, t)| t == "self"),
+        "PHP new self() must NOT emit a `self` calls edge; got {calls:?}");
+}
+
+#[test]
+fn test_java_object_creation_covered_by_type_reference() {
+    // Matrix verdict: Java `new Foo()` is COVERED today via extract_java_type_reference
+    // (a `references` edge on the `new` type), so it is deliberately NOT extended to a
+    // calls edge in v50. This guards that the covering edge still exists.
+    let code = "class A { void m() { Foo x = new Foo(); } }\n";
+    let rels = extract_relations(code, "java").unwrap();
+    let refs: Vec<&str> = rels.iter().filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str()).collect();
+    assert!(refs.contains(&"Foo"),
+        "Java new Foo() must keep its references edge (dead-code-safe); got refs {refs:?}");
+}
+
+// --- v50: C# top-level local function extraction (Task 2) ---
+#[test]
+fn test_csharp_local_function_extracted_as_symbol() {
+    // RED baseline (probe, pre-fix): parse_code produced ZERO symbols for a
+    // top-level `void Greet(){}`, so the v49 <module>→Greet call edge dangled.
+    let code = "void Greet() { Log(); }\nGreet();\n";
+    let nodes = crate::parser::treesitter::parse_code(code, "csharp").unwrap();
+    let greet = nodes.iter().find(|n| n.name == "Greet")
+        .unwrap_or_else(|| panic!("C# top-level local fn Greet must be extracted; got {:?}",
+            nodes.iter().map(|n| (n.node_type.as_str(), n.name.as_str())).collect::<Vec<_>>()));
+    assert_eq!(greet.node_type, "function", "top-level local fn is function-kind");
+    // The <module>→Greet call edge (v49) now has a resolvable target node.
+    let rels = extract_relations(code, "csharp").unwrap();
+    assert!(calls_of(&rels).contains(&("<module>".into(), "Greet".into())),
+        "top-level Greet() → <module>→Greet edge present; got {:?}", calls_of(&rels));
+}
+
+// --- v50: edge-metadata serde_json migration (Task 3) ---
+#[test]
+fn test_rtype_and_impl_method_metadata_escape_hostile_names() {
+    // The two migrated metadata builders must produce valid JSON even for a name
+    // carrying `"` and `\` (serde_json escapes; the old format! form did not for
+    // rtype). Parse back and confirm the value round-trips exactly.
+    let hostile = r#"Ev"il\Type"#;
+    for built in [serialize_rtype_metadata(hostile), serialize_impl_method_metadata(hostile)] {
+        let v: serde_json::Value = serde_json::from_str(&built)
+            .unwrap_or_else(|e| panic!("metadata must be valid JSON, got {built:?}: {e}"));
+        assert_eq!(v["v"].as_str(), Some(hostile),
+            "hostile name must round-trip through the escaped JSON; got {built:?}");
+    }
+    // Byte-identical to the historic form for the identifier-only common case.
+    assert_eq!(serialize_rtype_metadata("DataWriter"), r#"{"q":"rtype","v":"DataWriter"}"#);
+    assert_eq!(serialize_impl_method_metadata("Db"), r#"{"q":"impl_method","v":"Db"}"#);
+}
+
+// --- v50: NUL strip on the signature triplet (Task 4) ---
+#[test]
+fn test_signature_fields_strip_nul_bytes() {
+    // A NUL inside a default-value string in the signature region must be
+    // stripped from param_types + signature (node_text is a raw byte slice, so it
+    // would otherwise carry the NUL → SQLite LIKE truncates at it). The
+    // context_string built downstream derives from these now-clean fields.
+    let code = "function f(x: string = \"a\0b\"): number { return 1; }\n";
+    let nodes = crate::parser::treesitter::parse_code(code, "typescript").unwrap();
+    let f = nodes.iter().find(|n| n.name == "f").expect("fn f extracted");
+    let params = f.param_types.clone().expect("f has params");
+    assert!(!params.contains('\0'), "param_types must be NUL-free; got {params:?}");
+    assert!(params.contains('b'), "bytes after the NUL must survive; got {params:?}");
+    if let Some(sig) = &f.signature {
+        assert!(!sig.contains('\0'), "signature must be NUL-free; got {sig:?}");
+    }
+}

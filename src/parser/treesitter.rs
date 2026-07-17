@@ -310,6 +310,23 @@ fn extract_nodes(
             }
         }
 
+        // C#: top-level local functions (C# 9+ top-level statements) and local
+        // functions nested in a method are `local_function_statement`, distinct
+        // from `method_declaration` (handled above). Without extraction the
+        // function has no symbol node, so a top-level `void Greet(){}` invoked via
+        // the v49 `<module>` call edge dangled unresolved and the function was
+        // invisible to callgraph/impact/dead-code. Extract as a function-kind node
+        // (method-kind when nested in a class body, matching the method_declaration
+        // arm's parent_class convention). name/params come from the
+        // `name`/`parameters` fields, which extract_signature_info already reads.
+        "local_function_statement" if config.name == "csharp" => {
+            let nt = if parent_class.is_some() { "method" } else { "function" };
+            if let Some(mut parsed) = extract_function_node(&node, source, nt, parent_class) {
+                parsed.is_test = node_is_test;
+                results.push(parsed);
+            }
+        }
+
         // Dart: method_signature wraps function_signature/constructor_signature/getter_signature
         // Extract the function name from the inner signature node
         "method_signature" if config.method_signature_kind.is_some() => {
@@ -660,6 +677,17 @@ fn truncate_code_content(content: &str) -> Cow<'_, str> {
     Cow::Owned(s)
 }
 
+/// Strip NUL bytes (→ space) from an optional signature-derived field
+/// (`return_type` / `param_types` / `signature`). SQLite stores TEXT as a
+/// C-string, so a stored NUL silently truncates a `LIKE` / substring match at the
+/// NUL — and the same fields flow into the context_string used for those probes.
+/// Same NUL→space convention as truncate_code_content / get_preceding_comment
+/// (byte-length preserving, all other bytes unchanged). Fast path: no allocation
+/// when the value is absent or NUL-free (the overwhelming common case).
+fn strip_nul_field(s: Option<String>) -> Option<String> {
+    s.map(|v| if v.contains('\0') { v.replace('\0', " ") } else { v })
+}
+
 fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, source: &str, is_test: bool) -> ParsedNode {
     ParsedNode {
         node_type: node_type.into(),
@@ -884,9 +912,9 @@ fn extract_signature_info(node: &tree_sitter::Node, source: &str) -> SignatureIn
     };
 
     SignatureInfo {
-        signature,
-        return_type: ret,
-        param_types: params,
+        signature: strip_nul_field(signature),
+        return_type: strip_nul_field(ret),
+        param_types: strip_nul_field(params),
     }
 }
 
@@ -908,9 +936,9 @@ fn extract_c_signature_info(node: &tree_sitter::Node, source: &str) -> Signature
     };
 
     SignatureInfo {
-        signature,
-        return_type: ret_type,
-        param_types: params,
+        signature: strip_nul_field(signature),
+        return_type: strip_nul_field(ret_type),
+        param_types: strip_nul_field(params),
     }
 }
 
@@ -1055,6 +1083,11 @@ fn extract_dart_method_signature(
                             None => r,
                         }
                     });
+                    // NUL→space so return_type/param_types/signature (and the
+                    // context_string built from them) stay SQLite-LIKE-searchable
+                    // — same convention as the extract_signature_info path.
+                    let params = strip_nul_field(params);
+                    let ret_with_args = strip_nul_field(ret_with_args);
                     let signature = match (&params, &ret_with_args) {
                         (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
                         (Some(p), None) => Some(p.clone()),
@@ -1080,8 +1113,8 @@ fn extract_dart_method_signature(
                         Some(cls) => Some(format!("{}.{}", cls, name)),
                         None => Some(name.clone()),
                     };
-                    let params = child.child_by_field_name("parameters")
-                        .map(|p| node_text(&p, source).to_string());
+                    let params = strip_nul_field(child.child_by_field_name("parameters")
+                        .map(|p| node_text(&p, source).to_string()));
                     return Some(ParsedNode {
                         node_type: "function".into(),
                         name,
@@ -1128,6 +1161,11 @@ fn extract_dart_top_level_function(
         .filter_map(|j| sig.named_child(j))
         .find(|c| matches!(c.kind(), "type_identifier" | "void_type" | "function_type"))
         .map(|r| node_text(&r, source).to_string());
+    // NUL→space (same convention as extract_signature_info) so the stored
+    // return_type/param_types/signature and the derived context_string stay
+    // SQLite-LIKE-searchable.
+    let params = strip_nul_field(params);
+    let ret = strip_nul_field(ret);
     let signature = match (&params, &ret) {
         (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
         (Some(p), None) => Some(p.clone()),
@@ -1187,6 +1225,11 @@ fn extract_dart_declaration(
                             None => r,
                         }
                     });
+                    // NUL→space so return_type/param_types/signature (and the
+                    // context_string built from them) stay SQLite-LIKE-searchable
+                    // — same convention as the extract_signature_info path.
+                    let params = strip_nul_field(params);
+                    let ret_with_args = strip_nul_field(ret_with_args);
                     let signature = match (&params, &ret_with_args) {
                         (Some(p), Some(r)) => Some(format!("{} -> {}", p, r)),
                         (Some(p), None) => Some(p.clone()),
@@ -1212,8 +1255,8 @@ fn extract_dart_declaration(
                         Some(cls) => Some(format!("{}.{}", cls, name)),
                         None => Some(name.clone()),
                     };
-                    let params = child.child_by_field_name("parameters")
-                        .map(|p| node_text(&p, source).to_string());
+                    let params = strip_nul_field(child.child_by_field_name("parameters")
+                        .map(|p| node_text(&p, source).to_string()));
                     return Some(ParsedNode {
                         node_type: "function".into(),
                         name,
