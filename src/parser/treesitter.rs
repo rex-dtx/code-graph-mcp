@@ -277,6 +277,25 @@ fn extract_nodes(
             }
         }
 
+        // Dart mixins: `mixin M {}` parses as `(mixin_declaration (mixin)
+        // (identifier) (class_body))` — the name is a POSITIONAL `identifier`
+        // child, not a `name:` field, so the class arm above (which reads the
+        // `name` field) misses it. Without a node for `M`, the `with M`
+        // inherits edge (emitted by relations/inherits.rs) drops at Phase-2
+        // same-language resolution because its target has no node to bind to.
+        // (`mixin class MC {}` is a `class_definition` with a `mixin` modifier
+        // and a real `name:` field — already handled by the class arm.)
+        "mixin_declaration" if config.name == "dart" => {
+            let name_node = (0..node.named_child_count())
+                .filter_map(|i| node.named_child(i))
+                .find(|c| c.kind() == "identifier");
+            if let Some(name) = name_node.map(|n| node_text(&n, source).to_string()) {
+                results.push(make_simple_node("class", name.clone(), &node, source, node_is_test));
+                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                return;
+            }
+        }
+
         // Methods: TS/JS (method_definition), Go/Java (method_declaration), Ruby (method, singleton_method)
         "method_definition" | "method_declaration" => {
             if let Some(mut parsed) = extract_function_node(&node, source, "method", parent_class) {
@@ -980,7 +999,18 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
         None
     } else {
         comments.reverse();
-        Some(comments.join("\n"))
+        let joined = comments.join("\n");
+        // Strip NUL bytes: doc_comment is stored as SQLite TEXT and fed to the
+        // FTS5 tokenizer, which treats it as a C-string and stops at the first
+        // NUL — everything after would be unsearchable. Replace with a space
+        // (same byte length, non-NUL bytes unchanged), matching the NUL→space
+        // policy in truncate_code_content (L10). Fast path: no allocation when
+        // the comment is NUL-free (the overwhelming common case).
+        if joined.contains('\0') {
+            Some(joined.replace('\0', " "))
+        } else {
+            Some(joined)
+        }
     }
 }
 

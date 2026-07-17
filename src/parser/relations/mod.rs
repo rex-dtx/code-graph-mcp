@@ -45,14 +45,19 @@ fn serialize_callee_qualifier(q: &helpers::CalleeQualifier) -> Option<String> {
     use helpers::CalleeQualifier::*;
     match q {
         Bare => None,
+        // Build via serde_json so source-derived payloads (`v`) are escaped
+        // correctly — a receiver/type/path segment containing `"` or `\` would
+        // otherwise produce malformed JSON that parse_callee_metadata / the
+        // json_extract SQL consumers silently reject. Key order matches the old
+        // format! output for the common identifier-only case.
         Path(segments) => {
             let v = segments.join("::");
-            Some(format!(r#"{{"q":"path","v":"{}"}}"#, v))
+            Some(serde_json::json!({ "q": "path", "v": v }).to_string())
         }
-        SelfType(t) => Some(format!(r#"{{"q":"stype","v":"{}"}}"#, t)),
-        SelfRecv(t) => Some(format!(r#"{{"q":"self","v":"{}"}}"#, t)),
-        Receiver(r) => Some(format!(r#"{{"q":"recv","v":"{}"}}"#, r)),
-        Chain => Some(r#"{"q":"chain"}"#.to_string()),
+        SelfType(t) => Some(serde_json::json!({ "q": "stype", "v": t }).to_string()),
+        SelfRecv(t) => Some(serde_json::json!({ "q": "self", "v": t }).to_string()),
+        Receiver(r) => Some(serde_json::json!({ "q": "recv", "v": r }).to_string()),
+        Chain => Some(serde_json::json!({ "q": "chain" }).to_string()),
     }
 }
 
@@ -611,14 +616,19 @@ fn walk_for_relations(
                 results.push(route_rel);
             }
 
-            // Call relation extraction. For JS/TS/TSX, fall back to `<module>`
-            // when the call sits at file top level (imports, init code) or
-            // inside an anonymous callback (test/describe/it, Array.map, etc.)
-            // so same-file edges can still resolve. Other languages keep the
-            // named-scope-only rule to avoid polluting their callgraphs.
+            // Call relation extraction. For JS/TS/TSX + Kotlin/Swift, fall back to
+            // `<module>` when the call sits at file top level (imports, init code)
+            // or inside an anonymous callback (test/describe/it, Array.map, etc.)
+            // so same-file edges can still resolve — Kotlin and Swift both allow
+            // executable statements at file top level (`main`-less scripts, global
+            // `val x = compute()`). Rust/Go/C also route through this
+            // `call_expression` arm but are deliberately excluded: their top-level
+            // omission is intentional (no bare top-level call statements in Rust/Go;
+            // C calls only appear inside functions), so leaving them at `None`
+            // keeps their callgraphs clean.
             let call_scope: Option<String> = match active_scope {
                 Some(s) => Some(s.to_string()),
-                None if matches!(config.name, "javascript" | "typescript" | "tsx") => {
+                None if matches!(config.name, "javascript" | "typescript" | "tsx" | "kotlin" | "swift") => {
                     Some("<module>".to_string())
                 }
                 None => None,
@@ -1173,27 +1183,32 @@ fn walk_for_relations(
 
         // C# method/function calls: invocation_expression (Console.WriteLine(...), Baz(), etc.)
         "invocation_expression" if config.name == "csharp" => {
-            if let Some(scope) = active_scope {
-                if let Some(func) = node.named_child(0) {
-                    let callee = match func.kind() {
-                        "identifier" => Some(node_text(&func, source).to_string()),
-                        "member_access_expression" => {
-                            // e.g. Console.WriteLine — extract "WriteLine"
-                            func.child_by_field_name("name")
-                                .map(|n| node_text(&n, source).to_string())
-                        }
-                        _ => None,
-                    };
-                    if let Some(name) = callee {
-                        if !name.is_empty() {
-                            results.push(ParsedRelation {
-                                source_name: scope.to_string(),
-                                target_name: name,
-                                relation: REL_CALLS.into(),
-                                metadata: None,
-                                source_language: String::new(),
-                            });
-                        }
+            // Top-level statement calls (C# 9+ top-level programs) and calls in
+            // field initializers outside any method attribute to `<module>`
+            // rather than being dropped, mirroring the php/python/ruby arms — a
+            // function invoked only from a top-level statement would otherwise
+            // have no incoming edge and be false-reported as dead. Undefined
+            // callees drop at Phase-2 same-language resolution.
+            let scope = active_scope.unwrap_or("<module>");
+            if let Some(func) = node.named_child(0) {
+                let callee = match func.kind() {
+                    "identifier" => Some(node_text(&func, source).to_string()),
+                    "member_access_expression" => {
+                        // e.g. Console.WriteLine — extract "WriteLine"
+                        func.child_by_field_name("name")
+                            .map(|n| node_text(&n, source).to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(name) = callee {
+                    if !name.is_empty() {
+                        results.push(ParsedRelation {
+                            source_name: scope.to_string(),
+                            target_name: name,
+                            relation: REL_CALLS.into(),
+                            metadata: None,
+                            source_language: String::new(),
+                        });
                     }
                 }
             }
@@ -1206,9 +1221,12 @@ fn walk_for_relations(
         // the callee is its preceding sibling. active_scope propagates down from
         // the enclosing function_body, so deeply-nested calls still attribute.
         "selector" if config.name == "dart" => {
-            if let Some(scope) = active_scope {
-                extract_dart_call_from_selector(&node, source, scope, results);
-            }
+            // Library-level (top-level) calls attribute to `<module>` rather than
+            // being dropped, mirroring the php/python/ruby/C# arms — a top-level
+            // `main()`-free Dart script's calls would otherwise have no incoming
+            // edge. Undefined callees drop at Phase-2 same-language resolution.
+            let scope = active_scope.unwrap_or("<module>");
+            extract_dart_call_from_selector(&node, source, scope, results);
         }
 
         // C/C++: `#include "foo.h"` → IMPORTS to "foo"

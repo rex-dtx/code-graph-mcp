@@ -3264,3 +3264,166 @@ fn test_h1_rust_primitive_head_path_does_not_emit_references_edge() {
         "a primitive-type-head path (`str::trim`) must NOT emit a references edge; got: {:?}",
         rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
 }
+
+
+// --- v49 audit fixes: top-level call `<module>` fallback parity (C#/Kotlin/Swift/Dart) ---
+
+#[test]
+fn test_csharp_top_level_call_attributes_to_module() {
+    // C# 9+ top-level statement calls (outside any method/type) must attribute to
+    // <module>, mirroring the php/python/ruby arms — otherwise a function invoked
+    // only from a top-level statement has no incoming edge and is false-reported
+    // as dead-code. Before this fix the C# invocation_expression arm required
+    // Some(active_scope), dropping every top-level call. INDEX_VERSION 48→49.
+    let code = "int Helper() { return 1; }\nHelper();\n";
+    let rels = extract_relations(code, "csharp").unwrap();
+    let has_edge = rels.iter().any(|r|
+        r.relation == REL_CALLS && r.target_name == "Helper" && r.source_name == "<module>");
+    assert!(has_edge,
+        "top-level Helper() must produce a <module> → Helper call edge; got calls: {:?}",
+        rels.iter().filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_kotlin_top_level_call_attributes_to_module() {
+    // Kotlin allows executable statements at file top level (script-style `main`-less
+    // init). A top-level call must attribute to <module>. Before v49 the generic
+    // call_expression fallback granted <module> only to js/ts/tsx.
+    let code = "fun helper(): Int { return 1 }\nval x = helper()\n";
+    let rels = extract_relations(code, "kotlin").unwrap();
+    let has_edge = rels.iter().any(|r|
+        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>");
+    assert!(has_edge,
+        "top-level helper() must produce a <module> → helper call edge; got calls: {:?}",
+        rels.iter().filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_swift_top_level_call_attributes_to_module() {
+    // Swift top-level code (main.swift / scripts) allows executable statements.
+    // A top-level call must attribute to <module>. Before v49 only js/ts/tsx got
+    // the generic call_expression <module> fallback.
+    let code = "func helper() -> Int { return 1 }\nlet x = helper()\n";
+    let rels = extract_relations(code, "swift").unwrap();
+    let has_edge = rels.iter().any(|r|
+        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>");
+    assert!(has_edge,
+        "top-level helper() must produce a <module> → helper call edge; got calls: {:?}",
+        rels.iter().filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_rust_go_top_level_calls_still_excluded_from_module_fallback() {
+    // Negative control: Rust/Go route through the same generic call_expression arm
+    // but their top-level call omission is INTENTIONAL — extending the <module>
+    // fallback to Kotlin/Swift must not leak into Rust/Go. (Rust has no bare
+    // top-level call statement; a const initializer call sits at item level with no
+    // enclosing fn — it must stay dropped, not attribute to <module>.)
+    let rust = "const X: i32 = compute();\nfn compute() -> i32 { 1 }\n";
+    let rels = extract_relations(rust, "rust").unwrap();
+    assert!(!rels.iter().any(|r|
+        r.relation == REL_CALLS && r.source_name == "<module>"),
+        "Rust top-level init calls must NOT attribute to <module>; got: {:?}",
+        rels.iter().filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+
+    let go = "package main\nvar x = compute()\nfunc compute() int { return 1 }\n";
+    let grels = extract_relations(go, "go").unwrap();
+    assert!(!grels.iter().any(|r|
+        r.relation == REL_CALLS && r.source_name == "<module>"),
+        "Go package-level init calls must NOT attribute to <module>; got: {:?}",
+        grels.iter().filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_dart_top_level_call_attributes_to_module() {
+    // A Dart library-level (top-level) call must attribute to <module>, mirroring
+    // the php/python/ruby/C# arms. Before v49 the Dart `selector` arm required
+    // Some(active_scope), dropping library-level calls.
+    let code = "int helper() => 1;\nfinal x = helper();\n";
+    let rels = extract_relations(code, "dart").unwrap();
+    let has_edge = rels.iter().any(|r|
+        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>");
+    assert!(has_edge,
+        "top-level helper() must produce a <module> → helper call edge; got calls: {:?}",
+        rels.iter().filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+// --- v49 audit fix: Dart `mixin M {}` extracted as a symbol node ---
+
+#[test]
+fn test_dart_mixin_declaration_extracted_as_node() {
+    // `mixin M {}` parses as (mixin_declaration (mixin) (identifier) (class_body))
+    // — the name is a POSITIONAL identifier child, not a `name:` field, so the
+    // class arm missed it. Without a node for the mixin, the `with M` inherits edge
+    // (emitted by relations/inherits.rs) drops at Phase-2 same-language resolution.
+    let code = "class Derived extends Base with MixinA {}\nmixin MixinA {}\nclass Base {}\n";
+    let nodes = crate::parser::treesitter::parse_code(code, "dart").unwrap();
+    let mixin = nodes.iter().find(|n| n.name == "MixinA");
+    assert!(mixin.is_some(),
+        "Dart `mixin MixinA` must be extracted as a symbol node named `MixinA`; got: {:?}",
+        nodes.iter().map(|n| (n.node_type.as_str(), n.name.as_str())).collect::<Vec<_>>());
+    // The name must be the bare identifier, never `mixin MixinA`.
+    assert_eq!(mixin.unwrap().name, "MixinA");
+    // And the inherits edge Derived→MixinA is still emitted (target now resolvable).
+    let rels = extract_relations(code, "dart").unwrap();
+    assert!(rels.iter().any(|r|
+        r.relation == REL_INHERITS && r.source_name == "Derived" && r.target_name == "MixinA"),
+        "inherits edge Derived→MixinA must be emitted; got inherits: {:?}",
+        rels.iter().filter(|r| r.relation == REL_INHERITS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+}
+
+// --- v49 audit fix: callee-qualifier metadata JSON built with serde_json (escaping) ---
+
+#[test]
+fn test_serialize_callee_qualifier_escapes_special_chars() {
+    use super::helpers::CalleeQualifier;
+    // A payload containing `"` and `\` must produce VALID JSON (escaped), not a
+    // malformed blob that parse_callee_metadata / json_extract silently reject.
+    let q = CalleeQualifier::Receiver("a\"b\\c".to_string());
+    let s = serialize_callee_qualifier(&q).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s)
+        .unwrap_or_else(|e| panic!("must be valid JSON; got {s:?}: {e}"));
+    assert_eq!(v.get("q").and_then(|x| x.as_str()), Some("recv"));
+    assert_eq!(v.get("v").and_then(|x| x.as_str()), Some("a\"b\\c"),
+        "the `v` payload must round-trip through JSON unescaping");
+    // Byte-identical to the old format! output for the common identifier-only case.
+    let plain = serialize_callee_qualifier(&CalleeQualifier::Receiver("foo".to_string())).unwrap();
+    assert_eq!(plain, r#"{"q":"recv","v":"foo"}"#,
+        "identifier-only payload must stay byte-identical to the pre-fix format");
+    let stype = serialize_callee_qualifier(&CalleeQualifier::SelfType("Db".to_string())).unwrap();
+    assert_eq!(stype, r#"{"q":"stype","v":"Db"}"#);
+    let path = serialize_callee_qualifier(
+        &CalleeQualifier::Path(vec!["a".into(), "b".into()])).unwrap();
+    assert_eq!(path, r#"{"q":"path","v":"a::b"}"#);
+    assert_eq!(serialize_callee_qualifier(&CalleeQualifier::Chain).unwrap(), r#"{"q":"chain"}"#);
+}
+
+// --- v49 audit fix: doc_comment NUL bytes stripped (FTS5 C-string truncation) ---
+
+#[test]
+fn test_doc_comment_strips_nul_bytes() {
+    // doc_comment is stored as SQLite TEXT and fed to FTS5, which stops at the first
+    // NUL — so a NUL inside a preceding comment would make everything after it
+    // unsearchable. Strip NUL→space (same policy as code_content since v48).
+    // Use a Rust block comment: its lexer scans to `*/` and keeps an embedded NUL
+    // inside the comment token (a line comment or a JS `/*` at stmt-start would be
+    // re-tokenized around the NUL and never reach get_preceding_comment intact).
+    let code = "/* a\0b */\nfn foo() -> i32 { 1 }\n";
+    let nodes = crate::parser::treesitter::parse_code(code, "rust").unwrap();
+    let foo = nodes.iter().find(|n| n.name == "foo")
+        .expect("fn foo must be extracted");
+    let doc = foo.doc_comment.clone().expect("foo must carry the preceding block comment");
+    assert!(!doc.contains('\0'),
+        "doc_comment must not contain NUL bytes; got: {doc:?}");
+    // The bytes around the NUL must remain (NUL→space, not truncated at the NUL).
+    assert_eq!(doc, "/* a b */",
+        "NUL must become a space with all other bytes unchanged; got: {doc:?}");
+}
+

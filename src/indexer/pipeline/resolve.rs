@@ -216,23 +216,36 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
         // purely by bare name + same-language, ignoring the stored qualifier — so a
         // buffered `w.write()` (receiver type DataWriter) drained by a later pass
         // bound to EVERY same-language `write`, wiring false callers that persisted
-        // until rebuild-index (H1, silent incremental graph corruption). Filtering
-        // is strictly ADDITIVE: when the type/path qualifier matches ≥1 candidate we
-        // bind exactly those; when it matches none we fall back to the bare set, so
-        // no edge the bare path would have produced is ever dropped (dead-code stays
-        // precise). Only shapes that can actually reach the buffer need handling —
-        // bare (None), rtype (Python), JS receiver — but self/stype/path are filtered
-        // too for parity should a future Phase-2 change route them here.
+        // until rebuild-index (H1, silent incremental graph corruption).
+        //
+        // Empty-filter behavior must match Phase 2 per qualifier shape, NOT a
+        // blanket bare-fallback:
+        //   - RecvType (Python locally-inferred receiver): ADDITIVE — an empty
+        //     filter is an inherited / mis-inferred method, so fall back to the
+        //     bare set (index_files.rs RecvType arm falls through to bare).
+        //   - SelfType / SelfRecv (Rust `Self::` / `self.`) and Path: STRUCTURAL —
+        //     an empty filter means no target matches the fixed qualifier and a
+        //     re-scan yields the same answer, so bind NOTHING and drain the row
+        //     (index_files.rs SelfRecv/SelfType/Path arms all drop on empty). A
+        //     bare fallback here would wire the very false same-name-sibling edges
+        //     the qualifier exists to exclude.
+        // Only bare (None), rtype (Python), and JS receiver can actually reach the
+        // buffer today; self/stype/path handling is latent parity should a future
+        // Phase-2 change route them here.
         let resolved: Vec<i64> = match parse_callee_metadata(row.metadata.as_deref()) {
-            Some(CalleeMeta::RecvType(t))
-            | Some(CalleeMeta::SelfType(t))
-            | Some(CalleeMeta::SelfRecv(t)) => {
+            Some(CalleeMeta::RecvType(t)) => {
                 let filtered = self_filter_candidates(&t, &candidates, db)?;
                 if filtered.is_empty() { candidates } else { filtered }
             }
+            Some(CalleeMeta::SelfType(t)) | Some(CalleeMeta::SelfRecv(t)) => {
+                let filtered = self_filter_candidates(&t, &candidates, db)?;
+                // Drop on empty (drain the row without binding), never bare-fall-back.
+                filtered
+            }
             Some(CalleeMeta::Path(segments)) => {
                 let filtered = path_filter_candidates(&segments, &candidates, &node_id_to_path, db)?;
-                if filtered.is_empty() { candidates } else { filtered }
+                // Drop on empty (drain the row without binding), never bare-fall-back.
+                filtered
             }
             // Bare / chain / JS receiver: Phase 2's default chain resolves these by
             // bare name too, so the existing behavior already matches.
@@ -727,6 +740,66 @@ mod tests {
             let added = resolve_pending_calls(&db).unwrap();
             assert_eq!(added, 1, "bare unique call must still resolve");
             assert_eq!(call_targets(conn, run), vec![helper]);
+        }
+
+        /// v49 audit fix: a Self/stype-qualified buffered call whose type filter
+        /// comes up empty must bind NOTHING and drain (mirroring Phase-2, which
+        /// drops SelfType/SelfRecv on empty), NOT fall back to the bare candidate
+        /// set. Before the fix the sweep bare-fell-back → it wired a false edge to
+        /// a same-name sibling on the wrong type. (This qualifier can't reach the
+        /// buffer in production today — latent parity — so the test buffers a
+        /// crafted row directly.)
+        #[test]
+        fn pending_sweep_self_type_empty_filter_binds_nothing() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("p.db")).unwrap();
+            let conn = db.conn();
+            let f_app = pyfile(conn, "app.py");
+            let f_other = pyfile(conn, "other.py");
+            let run = method(conn, "run", None, f_app);
+            // Only `Profile.write` exists — no `DataWriter.write`.
+            let _pf_write = method(conn, "write", Some("Profile.write"), f_other);
+
+            // Buffered `self.write()` whose impl type is DataWriter (stype). No
+            // DataWriter.write in the project → filter empty.
+            insert_pending_unresolved_call(
+                conn, run, "write", "python", Some(r#"{"q":"stype","v":"DataWriter"}"#),
+            ).unwrap();
+
+            let added = resolve_pending_calls(&db).unwrap();
+            assert_eq!(added, 0,
+                "empty stype filter must bind NOTHING (no bare fallback to Profile.write); got {added}");
+            assert!(call_targets(conn, run).is_empty(),
+                "no call edge may be created for an unmatched stype qualifier");
+            assert_eq!(list_pending_unresolved_calls(conn).unwrap().len(), 0,
+                "the row must be drained (dropped), never left buffered forever");
+        }
+
+        /// v49 audit fix: same parity for the Path qualifier — empty filter binds
+        /// nothing and drains, never bare-falls-back (Phase-2 drops Path on empty).
+        #[test]
+        fn pending_sweep_path_empty_filter_binds_nothing() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("p.db")).unwrap();
+            let conn = db.conn();
+            let f_app = pyfile(conn, "app.py");
+            let f_other = pyfile(conn, "other.py");
+            let run = method(conn, "run", None, f_app);
+            // A same-name `helper` exists, but on a file/qualified-name that does
+            // NOT match the `foo::bar` path segments → path filter empty.
+            let _helper = method(conn, "helper", Some("Unrelated.helper"), f_other);
+
+            insert_pending_unresolved_call(
+                conn, run, "helper", "python", Some(r#"{"q":"path","v":"foo::bar"}"#),
+            ).unwrap();
+
+            let added = resolve_pending_calls(&db).unwrap();
+            assert_eq!(added, 0,
+                "empty path filter must bind NOTHING (no bare fallback); got {added}");
+            assert!(call_targets(conn, run).is_empty(),
+                "no call edge may be created for an unmatched path qualifier");
+            assert_eq!(list_pending_unresolved_calls(conn).unwrap().len(), 0,
+                "the row must be drained (dropped), never left buffered forever");
         }
     }
 
