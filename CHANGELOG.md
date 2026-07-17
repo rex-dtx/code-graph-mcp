@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.98.1 — grep partial results on path errors
+
+### Fixed
+- **`grep` no longer discards partial results when ripgrep exits 2** — a multi-path
+  grep with one missing/unreadable path (`grep "pat" scripts parse -c` where `parse`
+  doesn't exist) printed nothing and exited 2, silently eating the matches rg had
+  already produced from the readable paths. GNU-grep parity now: matches from readable
+  paths print in all three output modes (default/-l/-c), the path error is surfaced on
+  stderr, and the exit code stays 2. Edge covered: `rg --json` emits a summary line
+  even with zero matches, so an error-only run (single bad path) is classified as
+  error (exit 2), not no-match (exit 1).
+
 ## v0.98.0 — audit-v0971 fix batch (INDEX_VERSION 49→50)
 
 Fixes every actionable finding from the 2026-07-17 full audit (docs/AUDIT-2026-07-17.md, local).
