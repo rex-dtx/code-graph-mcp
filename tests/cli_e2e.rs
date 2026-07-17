@@ -1279,6 +1279,177 @@ fn test_cli_show_resyncs_after_edit() {
         "show must report post-edit line numbers (lazy resync), got start1={start1} start2={start2}: {out2}");
 }
 
+// --- CLI freshness parity (MED-2): show/grep already resynced; refs/overview/
+// search/ast-search/trace/similar/impact/dead-code now share the same lazy
+// resync (refresh_files_if_stale). Each test uses CODE_GRAPH_RESYNC_BUDGET=0 as an
+// in-test negative control: budget 0 disables the reindex, reproducing the pre-fix
+// stale output — proving the resync (not some other effect) is what freshens the
+// line numbers. Direct e2e coverage: refs, overview, search, dead-code, impact +
+// the partial-disclosure path. trace (needs a route fixture) and similar (needs
+// embeddings, unreachable in the no-default build) ride the shared helper only.
+
+/// Pull the `start_line` of a named entry out of a JSON array of `{name,start_line,…}`.
+fn json_start_line(out: &str, name: &str) -> i64 {
+    let v: serde_json::Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|e| panic!("invalid json: {e}; raw: {out}"));
+    v.as_array().unwrap().iter()
+        .find(|e| e["name"] == name)
+        .unwrap_or_else(|| panic!("{name} not found in: {out}"))
+        ["start_line"].as_i64().unwrap()
+}
+
+fn prepend_pad(project: &TempDir, rel: &str, lines: usize) {
+    let p = project.path().join(rel);
+    let content = std::fs::read_to_string(&p).unwrap();
+    let pad = "// pad\n".repeat(lines);
+    std::fs::write(&p, format!("{pad}{content}")).unwrap();
+}
+
+#[test]
+fn test_cli_refs_resyncs_after_edit() {
+    let project = setup_indexed_project();
+    // handleLogin (src/api.ts) calls validateToken, so it is an incoming ref.
+    let ref_start = |out: &str| -> i64 {
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        v["references"].as_array().unwrap().iter()
+            .find(|r| r["name"] == "handleLogin")
+            .unwrap_or_else(|| panic!("handleLogin ref missing: {out}"))
+            ["start_line"].as_i64().unwrap()
+    };
+    let (out1, _, code1) = run_cli(&project, &["refs", "validateToken", "--json"]);
+    assert_eq!(code1, 0, "{out1}");
+    let s1 = ref_start(&out1);
+
+    prepend_pad(&project, "src/api.ts", 5);
+
+    // RED control: budget 0 → no resync → pre-edit line number.
+    let (red, _, _) = run_cli_env(&project, &["refs", "validateToken", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    assert_eq!(ref_start(&red), s1,
+        "budget 0 must stay stale (proves the resync is load-bearing): {red}");
+
+    // GREEN: default budget → post-edit line number.
+    let (out2, _, code2) = run_cli(&project, &["refs", "validateToken", "--json"]);
+    assert_eq!(code2, 0);
+    assert_eq!(ref_start(&out2), s1 + 5,
+        "refs must report post-edit line numbers (lazy resync): {out2}");
+}
+
+#[test]
+fn test_cli_overview_resyncs_after_edit() {
+    let project = setup_indexed_project();
+    let (out1, _, code1) = run_cli(&project, &["overview", "src", "--json"]);
+    assert_eq!(code1, 0, "{out1}");
+    let s1 = json_start_line(&out1, "hashPassword");
+
+    prepend_pad(&project, "src/auth.ts", 5);
+
+    let (red, _, _) = run_cli_env(&project, &["overview", "src", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    assert_eq!(json_start_line(&red, "hashPassword"), s1,
+        "budget 0 must stay stale: {red}");
+
+    let (out2, _, code2) = run_cli(&project, &["overview", "src", "--json"]);
+    assert_eq!(code2, 0);
+    assert_eq!(json_start_line(&out2, "hashPassword"), s1 + 5,
+        "overview must report post-edit line numbers: {out2}");
+}
+
+#[test]
+fn test_cli_search_resyncs_after_edit() {
+    let project = setup_indexed_project();
+    let (out1, _, code1) = run_cli(&project, &["search", "hashPassword", "--json"]);
+    assert_eq!(code1, 0, "{out1}");
+    let s1 = json_start_line(&out1, "hashPassword");
+
+    prepend_pad(&project, "src/auth.ts", 5);
+
+    let (red, _, _) = run_cli_env(&project, &["search", "hashPassword", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    assert_eq!(json_start_line(&red, "hashPassword"), s1,
+        "budget 0 must stay stale: {red}");
+
+    let (out2, _, code2) = run_cli(&project, &["search", "hashPassword", "--json"]);
+    assert_eq!(code2, 0);
+    assert_eq!(json_start_line(&out2, "hashPassword"), s1 + 5,
+        "search must report post-edit line numbers: {out2}");
+}
+
+#[test]
+fn test_cli_dead_code_resyncs_after_edit() {
+    let project = setup_indexed_project();
+    // hashPassword is exported and unused → an exported-unused candidate.
+    let (out1, _, code1) = run_cli(&project, &["dead-code", "--min-lines", "1", "--json"]);
+    assert_eq!(code1, 0, "{out1}");
+    let s1 = json_start_line(&out1, "hashPassword");
+
+    prepend_pad(&project, "src/auth.ts", 5);
+
+    let (red, _, _) = run_cli_env(&project, &["dead-code", "--min-lines", "1", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    assert_eq!(json_start_line(&red, "hashPassword"), s1,
+        "budget 0 must stay stale: {red}");
+
+    let (out2, _, code2) = run_cli(&project, &["dead-code", "--min-lines", "1", "--json"]);
+    assert_eq!(code2, 0);
+    assert_eq!(json_start_line(&out2, "hashPassword"), s1 + 5,
+        "dead-code must report post-edit line numbers: {out2}");
+}
+
+/// impact prints no line numbers, so freshness is observable as the caller SET:
+/// adding a second caller in an existing caller file must be picked up after resync.
+#[test]
+fn test_cli_impact_resyncs_after_edit() {
+    let project = setup_indexed_project();
+    let total = |out: &str| -> i64 {
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        v["total_callers"].as_i64().unwrap()
+    };
+    let (out1, _, code1) = run_cli(&project, &["impact", "validateToken", "--json"]);
+    assert_eq!(code1, 0, "{out1}");
+    assert_eq!(total(&out1), 1, "baseline: only handleLogin calls validateToken: {out1}");
+
+    // Append a second caller to src/api.ts (already a caller file → in the refresh set).
+    let p = project.path().join("src/api.ts");
+    let content = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, format!(
+        "{content}\nexport function handleRefresh(req: Request) {{\n    return validateToken(req.headers.authorization);\n}}\n"
+    )).unwrap();
+
+    let (red, _, _) = run_cli_env(&project, &["impact", "validateToken", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    assert_eq!(total(&red), 1, "budget 0 must stay stale (one caller): {red}");
+
+    let (out2, _, code2) = run_cli(&project, &["impact", "validateToken", "--json"]);
+    assert_eq!(code2, 0);
+    assert_eq!(total(&out2), 2,
+        "impact must reflect the added caller after resync: {out2}");
+}
+
+/// Partial refresh (budget exhausted) must disclose on stderr only, never in the
+/// stdout JSON contract; a fully-fresh run must stay silent.
+#[test]
+fn test_cli_resync_partial_discloses_on_stderr() {
+    let project = setup_indexed_project();
+    let (_, stderr_fresh, _) = run_cli(&project, &["overview", "src", "--json"]);
+    assert!(!stderr_fresh.contains("changed since indexing"),
+        "no disclosure when everything is fresh: {stderr_fresh:?}");
+
+    prepend_pad(&project, "src/auth.ts", 1);
+
+    let (stdout, stderr, code) = run_cli_env(&project, &["overview", "src", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    assert_eq!(code, 0);
+    assert!(stderr.contains("changed since indexing"),
+        "partial refresh must disclose on stderr: {stderr:?}");
+    assert!(stderr.contains("incremental-index"),
+        "disclosure must point at the fix: {stderr:?}");
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must stay clean JSON: {e}; raw: {stdout}"));
+    assert!(!stdout.contains("changed since indexing"),
+        "note must not pollute stdout: {stdout}");
+}
+
 fn has_git() -> bool {
     Command::new("git").arg("--version").output().is_ok()
 }

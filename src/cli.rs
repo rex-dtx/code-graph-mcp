@@ -2918,7 +2918,28 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     // via search_fetch_count); the unfiltered value stays (limit*4).max(20).
     let filtered = language_filter.is_some() || node_type_filter.is_some();
     let fetch_limit = crate::domain::search_fetch_count(limit, filtered);
-    let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
+    // FTS5 + file join, wrapped so a query-time freshness resync can re-run it
+    // against the refreshed index (parity with show/refs/… via refresh_files_if_stale).
+    let run_query = |conn: &rusqlite::Connection|
+        -> Result<(queries::FtsResult, Vec<queries::NodeWithFile>)> {
+        let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
+        let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
+        let nodes_with_files = queries::get_nodes_with_files_by_ids(conn, &node_ids)?;
+        Ok((fts_result, nodes_with_files))
+    };
+    let (mut fts_result, mut nodes_with_files) = run_query(conn)?;
+    // Re-index any matched file edited since indexing so start_line/end_line are
+    // post-edit, then re-run once. Bounded by the fetched pool (fetch_limit), not
+    // the whole index.
+    let files: Vec<String> = nodes_with_files.iter().map(|nwf| nwf.file_path.clone()).collect();
+    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    if outcome.any_changed {
+        let (f, n) = run_query(conn)?;
+        fts_result = f;
+        nodes_with_files = n;
+    }
+    outcome.disclose();
+
     if fts_result.nodes.is_empty() {
         if json_mode {
             println!("[]");
@@ -2938,9 +2959,6 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
         }
         return Ok(());
     }
-
-    let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
-    let nodes_with_files = queries::get_nodes_with_files_by_ids(conn, &node_ids)?;
 
     // Build id->NodeWithFile map preserving FTS rank order
     let nwf_map: std::collections::HashMap<i64, &queries::NodeWithFile> = nodes_with_files
@@ -3113,16 +3131,16 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    // Two paths: filter-only (direct SQL) vs query+filter (FTS5 then filter)
+    // Two paths: filter-only (direct SQL) vs query+filter (FTS5 then filter).
+    // Wrapped in a closure so a query-time freshness resync can re-run it against
+    // the refreshed index; the bool reports the fts-empty case (distinct message).
+    let run_query = |conn: &rusqlite::Connection|
+        -> Result<(Vec<queries::NodeWithFile>, bool)> {
     let results_with_files: Vec<queries::NodeWithFile> = if let Some(query) = query {
         // FTS5 search then filter in Rust
         let fts_result = queries::fts5_search(conn, query, (limit * 4) as i64)?;
         if fts_result.nodes.is_empty() {
-            if json_mode {
-                println!("{}", serde_json::json!({"results": [], "count": 0}));
-            }
-            eprintln!("[code-graph] No results for: {}", query);
-            return Ok(());
+            return Ok((Vec::new(), true));
         }
 
         let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
@@ -3187,6 +3205,28 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
             conn, type_refs, returns_filter, params_filter, None, limit,
         )?
     };
+    Ok((results_with_files, false))
+    };
+
+    let (mut results_with_files, mut fts_empty) = run_query(conn)?;
+    // Re-index any displayed file edited since indexing so start_line/end_line are
+    // post-edit, then re-run once (shared resync with show/refs/…).
+    let files: Vec<String> = results_with_files.iter().map(|nwf| nwf.file_path.clone()).collect();
+    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    if outcome.any_changed {
+        let (r, e) = run_query(conn)?;
+        results_with_files = r;
+        fts_empty = e;
+    }
+    outcome.disclose();
+
+    if fts_empty {
+        if json_mode {
+            println!("{}", serde_json::json!({"results": [], "count": 0}));
+        }
+        eprintln!("[code-graph] No results for: {}", query.unwrap_or_default());
+        return Ok(());
+    }
 
     if results_with_files.is_empty() {
         if json_mode {
@@ -3622,7 +3662,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let file_filter = explicit_file.or(resolved_file.as_deref());
 
     // Verify symbol exists before running impact analysis
-    let symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
+    let mut symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
     if symbol_nodes.is_empty() {
         if json_mode {
             println!("{}", serde_json::json!({"error": "Symbol not found", "symbol": symbol}));
@@ -3647,7 +3687,27 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
     }
 
-    let callers = crate::graph::routes::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
+    let mut callers = crate::graph::routes::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
+    // Query-time freshness (shared resync with show/refs/… via refresh_files_if_stale):
+    // re-index the symbol's own file(s) and its caller files so the blast radius
+    // reflects disk (a caller added/removed since indexing). impact prints no line
+    // numbers, so this refreshes the caller SET; re-run the caller query and re-fetch
+    // symbol_nodes when anything changed.
+    {
+        let mut files: Vec<String> = symbol_nodes
+            .iter()
+            .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
+            .collect();
+        for c in &callers {
+            files.push(c.file_path.clone());
+        }
+        let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+        if outcome.any_changed {
+            callers = crate::graph::routes::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
+            symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
+        }
+        outcome.disclose();
+    }
     // Ambiguous callers folded out of the blast radius by the confidence floor,
     // counted across the whole returned frontier (seed direct + every kept
     // caller's pruned callers) so a TRANSITIVE ambiguous caller of a
@@ -4237,12 +4297,23 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let exports = queries::get_module_exports(conn, path_prefix)?;
-
-    // Filter out test symbols (align with MCP module_overview behavior)
-    let exports: Vec<_> = exports.into_iter()
-        .filter(|e| !crate::domain::is_test_symbol(&e.name, &e.file_path))
-        .collect();
+    // Filter out test symbols (align with MCP module_overview behavior).
+    let run_query = |conn: &rusqlite::Connection| -> Result<Vec<queries::ModuleExport>> {
+        Ok(queries::get_module_exports(conn, path_prefix)?
+            .into_iter()
+            .filter(|e| !crate::domain::is_test_symbol(&e.name, &e.file_path))
+            .collect())
+    };
+    let mut exports = run_query(conn)?;
+    // Query-time freshness (shared resync with show/refs/…): re-index any displayed
+    // file edited since indexing so the printed L{start}-{end} ranges are post-edit,
+    // then re-run the query against the refreshed index.
+    let files: Vec<String> = exports.iter().map(|e| e.file_path.clone()).collect();
+    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    if outcome.any_changed {
+        exports = run_query(conn)?;
+    }
+    outcome.disclose();
 
     if exports.is_empty() {
         // JSON empty-result contract (feedback_cli_json_empty_contract):
@@ -4385,6 +4456,112 @@ pub struct ShowArgs {
     pub json: bool,
 }
 
+/// Outcome of a query-time freshness resync (`refresh_files_if_stale`) over the
+/// files a read command is about to print. Callers re-run their query when
+/// `any_changed` and call `disclose()` to honestly surface a partial refresh.
+#[derive(Default, Debug)]
+struct FreshOutcome {
+    /// At least one displayed file was dirty and successfully re-indexed → the
+    /// query must re-run so line numbers reflect the post-edit index.
+    any_changed: bool,
+    /// Dirty files re-indexed within budget.
+    refreshed: usize,
+    /// Dirty files left stale because the reindex budget was exhausted.
+    skipped_over_budget: usize,
+    /// Dirty files whose reindex failed (write contention / parse error) — kept
+    /// stale, never worse than before.
+    failed: usize,
+}
+
+impl FreshOutcome {
+    /// Some displayed files stayed stale (budget exhausted or reindex failed),
+    /// so the printed line numbers for those files may be pre-edit.
+    fn is_partial(&self) -> bool {
+        self.skipped_over_budget > 0 || self.failed > 0
+    }
+
+    /// One-line honest disclosure when the refresh was only partial. stderr only
+    /// — stdout carries the JSON/text contract and must not be polluted — and
+    /// dual-written to `tracing` per the project's user-facing-warning rule
+    /// (`feedback_tracing_invisible_in_cli`). No-op when everything was fresh or
+    /// fully refreshed.
+    fn disclose(&self) {
+        if !self.is_partial() {
+            return;
+        }
+        let stale = self.skipped_over_budget + self.failed;
+        let msg = format!(
+            "{} file(s) changed since indexing; refreshed {}, line numbers for the rest may be stale (rerun after 'code-graph-mcp incremental-index')",
+            stale, self.refreshed
+        );
+        eprintln!("[code-graph] note: {msg}");
+        tracing::warn!("cli freshness partial: {msg}");
+    }
+}
+
+/// Query-time freshness resync shared by the read commands that print
+/// `start_line`/`end_line` straight from the index (`show`, `refs`, `overview`,
+/// `search`, `ast-search`, `trace`, `similar`, `impact`, `dead-code`). Semantics
+/// lifted from `cmd_show`'s original inline loop and the MCP tools'
+/// `ensure_file_fresh_opt`: for each DISPLAYED file (dedup + sorted), hash-compare
+/// against the index and re-index the dirty ones through `ensure_file_indexed` so
+/// their line numbers reflect the post-edit source.
+///
+/// Bounded (8-file reindex budget — overridable via `CODE_GRAPH_RESYNC_BUDGET`
+/// for tests — plus a 250ms busy_timeout) so a common name spanning many dirty
+/// files can't stall an interactive command; on write contention / parse failure
+/// the stale node is kept, exactly the pre-resync behavior, never worse. `paths`
+/// must be the POST-limit result set (what the command will print), not the whole
+/// index. Callers re-run their query when the outcome reports `any_changed`.
+fn refresh_files_if_stale(db: &Database, root: &Path, paths: &[String]) -> FreshOutcome {
+    let mut outcome = FreshOutcome::default();
+    let conn = db.conn();
+    // Never let a concurrent writer (MCP watcher, another index run) stall an
+    // interactive command for the default 5s busy_timeout — fail fast, keep stale.
+    let _ = conn.execute_batch("PRAGMA busy_timeout = 250;");
+
+    let mut files: Vec<&str> = paths.iter().map(String::as_str).collect();
+    files.sort_unstable();
+    files.dedup();
+
+    let mut budget: usize = std::env::var("CODE_GRAPH_RESYNC_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+
+    for f in files {
+        // Only files already in the index are candidates (parity with cmd_grep):
+        // indexing a brand-new path here could pull gitignored supplement files
+        // into the index, diverging from scan_directory's scope.
+        let stored: Option<String> = conn
+            .query_row("SELECT blake3_hash FROM files WHERE path = ?1", [f], |r| r.get(0))
+            .ok();
+        let Some(stored_hash) = stored else { continue };
+        let abs = root.join(f);
+        if crate::indexer::merkle::hash_file(&abs).ok().as_deref() == Some(stored_hash.as_str()) {
+            continue; // already fresh
+        }
+        // Dirty from here down.
+        if budget == 0 {
+            outcome.skipped_over_budget += 1;
+            continue;
+        }
+        match crate::indexer::pipeline::ensure_file_indexed(db, root, f, None) {
+            Ok(true) => {
+                outcome.any_changed = true;
+                outcome.refreshed += 1;
+                budget -= 1;
+            }
+            // Hash differed but the reindex reported no node change — nothing
+            // stale to re-query or disclose.
+            Ok(false) => {}
+            // SQLITE_BUSY / parse failure: keep the stale node, disclose below.
+            Err(_) => outcome.failed += 1,
+        }
+    }
+    outcome
+}
+
 /// Show symbol details (code, type, signature).
 /// CLI equivalent of MCP `get_ast_node`.
 /// Resolve a `show` positional symbol to its node(s), applying the shared
@@ -4511,7 +4688,6 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         // so a common name spanning many dirty files can't stall an interactive
         // show; on write contention / parse failure we keep the (stale-but-present)
         // node — exactly the pre-fix behavior, never worse.
-        let _ = conn.execute_batch("PRAGMA busy_timeout = 250;");
         let mut files: Vec<String> = nodes
             .iter()
             .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
@@ -4521,36 +4697,11 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         if let Some(fp) = file_filter {
             files.push(fp.to_string());
         }
-        files.sort();
-        files.dedup();
-        let mut any_changed = false;
-        let mut budget = 8usize;
-        for f in &files {
-            if budget == 0 {
-                break;
-            }
-            let stored: Option<String> = conn
-                .query_row(
-                    "SELECT blake3_hash FROM files WHERE path = ?1",
-                    [f.as_str()],
-                    |r| r.get(0),
-                )
-                .ok();
-            let Some(stored_hash) = stored else { continue };
-            let abs = project_root.join(f);
-            if crate::indexer::merkle::hash_file(&abs).ok().as_deref() == Some(stored_hash.as_str()) {
-                continue;
-            }
-            if let Ok(true) =
-                crate::indexer::pipeline::ensure_file_indexed(&ctx.db, project_root, f, None)
-            {
-                any_changed = true;
-                budget -= 1;
-            }
-        }
-        if any_changed {
+        let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+        if outcome.any_changed {
             nodes = resolve_show_nodes(conn, symbol, file_filter)?;
         }
+        outcome.disclose();
 
         if nodes.is_empty() {
             if json_mode { println!("[]"); }
@@ -4807,18 +4958,30 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     };
 
     use crate::domain::REL_ROUTES_TO;
-    let mut rows = queries::find_routes_by_path(conn, path, REL_ROUTES_TO)?;
-
-    // Filter by HTTP method if specified (parse metadata JSON for accurate matching)
-    if let Some(ref method) = method_filter {
-        rows.retain(|r| {
-            r.metadata.as_ref().is_some_and(|m| {
-                serde_json::from_str::<serde_json::Value>(m).ok()
-                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
-                    .is_some_and(|rm| rm.eq_ignore_ascii_case(method))
-            })
-        });
+    // Fetch + method-filter the route handlers. Wrapped so a query-time freshness
+    // resync can re-run it against the refreshed index (shared with show/refs/…) —
+    // the printed handler start_line then reflects a post-edit route file.
+    let run_query = |conn: &rusqlite::Connection| -> Result<Vec<queries::RouteMatch>> {
+        let mut rows = queries::find_routes_by_path(conn, path, REL_ROUTES_TO)?;
+        // Filter by HTTP method if specified (parse metadata JSON for accurate matching)
+        if let Some(ref method) = method_filter {
+            rows.retain(|r| {
+                r.metadata.as_ref().is_some_and(|m| {
+                    serde_json::from_str::<serde_json::Value>(m).ok()
+                        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                        .is_some_and(|rm| rm.eq_ignore_ascii_case(method))
+                })
+            });
+        }
+        Ok(rows)
+    };
+    let mut rows = run_query(conn)?;
+    let files: Vec<String> = rows.iter().map(|rm| rm.file_path.clone()).collect();
+    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    if outcome.any_changed {
+        rows = run_query(conn)?;
     }
+    outcome.disclose();
 
     if rows.is_empty() {
         // Disclose the framework-coverage limit (mirrors the MCP trace path's
@@ -5349,6 +5512,31 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         );
     }
 
+    // Query-time freshness (shared with show/refs/… via refresh_files_if_stale):
+    // re-index any displayed file edited since indexing so the printed
+    // start_line/end_line are post-edit. NOTE: unlike the other read commands we do
+    // NOT re-run the vector search afterward — `ensure_file_indexed` re-indexes with
+    // model=None, dropping the touched nodes' embeddings until backfill, so a re-run
+    // of vector_search would lose exactly the just-edited rows. Instead we patch the
+    // line numbers in place by matching name+file in the refreshed index, preserving
+    // the similarity ranking and set.
+    let files: Vec<String> = similar.iter().map(|(_, fp, _)| fp.clone()).collect();
+    let outcome = refresh_files_if_stale(&db, project_root, &files);
+    if outcome.any_changed {
+        for (node, fp, _) in similar.iter_mut() {
+            if let Ok(fresh) = queries::get_nodes_by_file_path(conn, fp) {
+                if let Some(m) = fresh
+                    .iter()
+                    .find(|n| n.name == node.name && n.qualified_name == node.qualified_name)
+                {
+                    node.start_line = m.start_line;
+                    node.end_line = m.end_line;
+                }
+            }
+        }
+    }
+    outcome.disclose();
+
     let mut stdout = std::io::stdout().lock();
 
     if similar.is_empty() {
@@ -5566,44 +5754,61 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         Some(other) => anyhow::bail!("Unknown relation '{}'. Valid: calls, imports, inherits, implements, references, all", other),
     };
 
-    let mut all_refs: Vec<queries::IncomingReference> = Vec::new();
+    // Build the deduped reference set. Wrapped in a closure so a query-time
+    // freshness resync can re-run it against the refreshed index (parity with
+    // show/overview/… via refresh_files_if_stale) — after re-indexing an edited
+    // source file its referencing symbol's start_line is post-edit.
     // Dedup key is (name, file_path, relation) — it does NOT include the target,
     // so two edges from the same source to DIFFERENT same-name targets collapse to
     // one row. When their confidence differs, show the LOWEST (most conservative)
     // tier: the displayed confidence must not understate a hidden sibling's
     // ambiguity (L1 — surfacing low confidence is the whole point of the feature).
-    let mut seen: std::collections::HashMap<(String, String, String), usize> =
-        std::collections::HashMap::new();
-    let mut conf_filtered = 0usize;
-    for target_id in &target_ids {
-        let refs = queries::get_incoming_references(conn, *target_id, relation_filter)?;
-        for r in refs {
-            // --min-confidence: drop refs below the requested tier (default: keep all).
-            if let Some(min) = min_confidence {
-                if crate::domain::confidence_rank(&r.confidence)
-                    < crate::domain::confidence_rank(min)
-                {
-                    conf_filtered += 1;
-                    continue;
-                }
-            }
-            let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
-            match seen.get(&key) {
-                Some(&idx) => {
-                    // Keep the worst-case (lowest) confidence among deduped siblings.
+    let build_refs = |conn: &rusqlite::Connection|
+        -> Result<(Vec<queries::IncomingReference>, usize)> {
+        let mut all_refs: Vec<queries::IncomingReference> = Vec::new();
+        let mut seen: std::collections::HashMap<(String, String, String), usize> =
+            std::collections::HashMap::new();
+        let mut conf_filtered = 0usize;
+        for target_id in &target_ids {
+            let refs = queries::get_incoming_references(conn, *target_id, relation_filter)?;
+            for r in refs {
+                // --min-confidence: drop refs below the requested tier (default: keep all).
+                if let Some(min) = min_confidence {
                     if crate::domain::confidence_rank(&r.confidence)
-                        < crate::domain::confidence_rank(&all_refs[idx].confidence)
+                        < crate::domain::confidence_rank(min)
                     {
-                        all_refs[idx].confidence = r.confidence;
+                        conf_filtered += 1;
+                        continue;
                     }
                 }
-                None => {
-                    seen.insert(key, all_refs.len());
-                    all_refs.push(r);
+                let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
+                match seen.get(&key) {
+                    Some(&idx) => {
+                        // Keep the worst-case (lowest) confidence among deduped siblings.
+                        if crate::domain::confidence_rank(&r.confidence)
+                            < crate::domain::confidence_rank(&all_refs[idx].confidence)
+                        {
+                            all_refs[idx].confidence = r.confidence;
+                        }
+                    }
+                    None => {
+                        seen.insert(key, all_refs.len());
+                        all_refs.push(r);
+                    }
                 }
             }
         }
+        Ok((all_refs, conf_filtered))
+    };
+    let (mut all_refs, mut conf_filtered) = build_refs(conn)?;
+    let files: Vec<String> = all_refs.iter().map(|r| r.file_path.clone()).collect();
+    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    if outcome.any_changed {
+        let (a, c) = build_refs(conn)?;
+        all_refs = a;
+        conf_filtered = c;
     }
+    outcome.disclose();
 
     if json_mode {
         let items: Vec<serde_json::Value> = all_refs.iter().map(|r| {
@@ -5741,7 +5946,19 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
-    let report = queries::dead_code_report(conn, path_filter, type_filter, include_tests, min_lines, &ignore_prefixes)?;
+    let run_query = |conn: &rusqlite::Connection| -> Result<queries::DeadCodeReport> {
+        queries::dead_code_report(conn, path_filter, type_filter, include_tests, min_lines, &ignore_prefixes)
+    };
+    let mut report = run_query(conn)?;
+    // Query-time freshness (shared resync with show/refs/…): re-index any displayed
+    // candidate's file edited since indexing so its start_line/end_line are post-edit,
+    // then re-run against the refreshed index.
+    let files: Vec<String> = report.items.iter().map(|it| it.file_path.clone()).collect();
+    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    if outcome.any_changed {
+        report = run_query(conn)?;
+    }
+    outcome.disclose();
 
     if report.is_empty() {
         if json_mode {
