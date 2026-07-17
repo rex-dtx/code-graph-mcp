@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.97.1 — fix dead-code over-suppression regression
+
+### Fixed — cross-file dead-code detection restored
+- **v0.97.0 silently disabled cross-file dead-code detection for edgeless kinds**
+  (constant/struct/enum/type_alias/interface/trait). The truncation keep-bias added to
+  the cross-file probe (`src/storage/queries/dead_code.rs`) was name-independent: a
+  single truncated node anywhere in the project (and `code_content` caps at 4096 bytes,
+  so every real repo has one) satisfied the `NOT EXISTS` subquery for **every**
+  candidate, so nothing was ever reported dead cross-file. Caught by a post-release
+  code review (the v0.97.0 negative-control test had no truncated node, so it never
+  exercised the over-suppression path). The cross-file truncation term is removed; the
+  **same-file** probe keeps its co-signal (there the truncated node shares the
+  candidate's file — high correlation, one-file blast radius, no over-suppression).
+  Regression test `test_find_dead_code_cross_file_unrelated_truncated_node_does_not_suppress`.
+  This reopens the original (narrow) audit finding — a struct whose *sole* cross-file use
+  sits past the 4096-byte cap of an importing file may be reported dead — as an accepted
+  documented limitation, far rarer than the feature-nullifying false-negative it caused.
+
 ## v0.97.0 — audit-v0961 remediation batch (INDEX_VERSION 48→49)
 
 Fixes every actionable finding from the 2026-07-16 full audit (docs/AUDIT-2026-07-16.md, local).
