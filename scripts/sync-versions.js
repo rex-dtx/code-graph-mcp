@@ -2,21 +2,40 @@
 'use strict';
 /**
  * Sync version across all project files.
- * Usage: node scripts/sync-versions.js <version>
+ * Usage: node scripts/sync-versions.js <version>   # write mode
+ *        node scripts/sync-versions.js --check      # read-only drift check
  * Example: node scripts/sync-versions.js 0.5.27
+ *
+ * --check reads every version site the script knows, compares each against the
+ * canonical version (package.json), prints a per-file OK/DRIFT table, and exits
+ * 1 on any drift. It writes NOTHING — safe to run in CI / pre-commit.
  */
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const version = process.argv[2];
-if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
-  console.error('Usage: node scripts/sync-versions.js <semver>');
-  console.error('Example: node scripts/sync-versions.js 0.5.27');
-  process.exit(1);
-}
-
 const root = path.resolve(__dirname, '..');
+
+const CHECK_MODE = process.argv[2] === '--check';
+
+// In --check mode the canonical version is whatever package.json declares; every
+// other site is compared against it. In write mode it's the CLI-supplied semver.
+let version;
+if (CHECK_MODE) {
+  const pkgPath = path.join(root, 'package.json');
+  version = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version;
+  if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
+    console.error(`--check: package.json version is not valid semver: ${JSON.stringify(version)}`);
+    process.exit(1);
+  }
+} else {
+  version = process.argv[2];
+  if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
+    console.error('Usage: node scripts/sync-versions.js <semver>');
+    console.error('Example: node scripts/sync-versions.js 0.5.27');
+    process.exit(1);
+  }
+}
 
 const PLATFORM_PACKAGES = [
   'npm/linux-x64/package.json',
@@ -66,6 +85,42 @@ const updates = [
     transform: (obj) => { obj.version = version; return obj; },
   })),
 ];
+
+// --check: read-only drift report. A site is DRIFT exactly when a write would
+// change it (same transform, compared against the current bytes), so --check and
+// the write path can never disagree about what is out of sync.
+if (CHECK_MODE) {
+  const rows = [];
+  let drift = false;
+  for (const { file, json, transform } of updates) {
+    const filePath = path.join(root, file);
+    if (!fs.existsSync(filePath)) {
+      rows.push({ file, status: 'SKIP (not found)' });
+      continue;
+    }
+    const original = fs.readFileSync(filePath, 'utf8');
+    let result;
+    if (json) {
+      result = JSON.stringify(transform(JSON.parse(original)), null, 2) + '\n';
+    } else {
+      result = transform(original);
+    }
+    const ok = result === original;
+    if (!ok) drift = true;
+    rows.push({ file, status: ok ? 'OK' : 'DRIFT' });
+  }
+  const width = Math.max(...rows.map((r) => r.file.length));
+  console.log(`Canonical version (package.json): ${version}\n`);
+  for (const { file, status } of rows) {
+    console.log(`  ${file.padEnd(width)}  ${status}`);
+  }
+  if (drift) {
+    console.error(`\nDRIFT: one or more files disagree with package.json (${version}). Fix with: node scripts/sync-versions.js ${version}`);
+    process.exit(1);
+  }
+  console.log(`\nAll version sites agree with package.json (${version}).`);
+  process.exit(0);
+}
 
 let changed = 0;
 for (const { file, json, transform } of updates) {

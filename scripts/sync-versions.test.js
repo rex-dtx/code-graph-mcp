@@ -192,6 +192,41 @@ test('SYNC_VERSIONS_SKIP_BUILD=1 skips cargo build and announces the skip', (t) 
     'must not run the build step when SKIP env is set');
 });
 
+test('--check exits 0 when every version site agrees with package.json', (t) => {
+  const root = setupFixture(t, '1.2.3');
+  const result = require('child_process').spawnSync(
+    process.execPath,
+    [path.join(root, 'scripts', 'sync-versions.js'), '--check'],
+    { cwd: root, stdio: 'pipe', encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, 'a consistent tree must exit 0');
+  assert.match(result.stdout, /All version sites agree with package\.json \(1\.2\.3\)/,
+    '--check must confirm agreement on the success path');
+  assert.doesNotMatch(result.stdout, /DRIFT/, 'no site should be flagged when all agree');
+});
+
+test('--check exits 1, flags the drifted file, and writes nothing', (t) => {
+  const root = setupFixture(t, '1.2.3');
+  // Introduce drift: one platform package lags behind package.json's 1.2.3.
+  const drifted = path.join(root, 'npm/linux-x64/package.json');
+  writeJson(drifted, { name: '@sdsrs/linux-x64', version: '0.0.1' });
+
+  const result = require('child_process').spawnSync(
+    process.execPath,
+    [path.join(root, 'scripts', 'sync-versions.js'), '--check'],
+    { cwd: root, stdio: 'pipe', encoding: 'utf8' },
+  );
+  assert.equal(result.status, 1, 'any drift must exit 1');
+  assert.match(result.stdout, /npm\/linux-x64\/package\.json\s+DRIFT/,
+    'the lagging file must be marked DRIFT in the table');
+
+  // Read-only contract: --check must not rewrite the drifted file (or any other).
+  assert.equal(readJson(drifted).version, '0.0.1',
+    '--check must leave the drifted file untouched');
+  assert.equal(readJson(path.join(root, 'package.json')).version, '1.2.3',
+    '--check must leave package.json untouched');
+});
+
 test('default (no SKIP env) attempts cargo build — fixture is not a crate so build fails with exit 2', (t) => {
   const root = setupFixture(t);
   // Sanity: this fixture has Cargo.toml [package] but no src/, so a real
