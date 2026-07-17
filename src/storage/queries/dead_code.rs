@@ -257,6 +257,25 @@ pub fn find_dead_code(
                                  OR instr(n3.code_content, n.name || '.') > 0
                                  OR instr(n3.code_content, n.name || '{{') > 0
                                  OR instr(n3.code_content, n.name || '}}') > 0
+                                 -- Truncation co-signal (mirrors the same-file probe
+                                 -- above): code_content is capped at 4096 bytes + a
+                                 -- trailing `...` sentinel, so a cross-file reference
+                                 -- sitting past the cap is invisible to the instr
+                                 -- checks. A node whose stored body is truncated
+                                 -- (sentinel present AND a >5-line gap between the
+                                 -- declared span and the stored newline count) may
+                                 -- carry the reference in its dropped tail — treat it
+                                 -- as a potential referencer (keep-bias, the safe
+                                 -- direction for an LLM-facing tool). Both signals are
+                                 -- required: the sentinel alone false-positives on
+                                 -- Python `def stub(): ...`, the gap alone on compact
+                                 -- fixtures with short content.
+                                 OR (
+                                     substr(n3.code_content, -3) = '...'
+                                     AND (n3.end_line - n3.start_line + 1)
+                                         - (length(n3.code_content) - length(replace(n3.code_content, char(10), '')))
+                                         > 5
+                                 )
                              )
                        )
                    )
@@ -269,7 +288,7 @@ pub fn find_dead_code(
     let mut stmt = conn.prepare(&sql)?;
 
     let path_pattern = path_prefix.map(|pp| {
-        let escaped = pp.replace('%', "\\%").replace('_', "\\_");
+        let escaped = super::helpers::escape_like(pp);
         format!("{}%", escaped)
     });
 
@@ -858,6 +877,103 @@ mod tests {
              NOT be reported dead; got: {:?}", names);
         assert!(names.contains(&"OrphanConfig"),
             "OrphanConfig is referenced nowhere and must still be reported dead; got: {:?}", names);
+    }
+
+    /// Regression: the CROSS-FILE probe for edgeless kinds (constant/struct/
+    /// enum/type_alias/interface/trait) must carry the same truncation co-signal
+    /// as the same-file probe. `code_content` is capped at 4096 bytes + a `...`
+    /// sentinel, so a struct's ONLY cross-file reference can sit in a referencing
+    /// function's dropped tail — invisible to the bare `instr` checks. Without the
+    /// co-signal such a live struct was reported dead (unsafe direction for an
+    /// LLM-facing tool: drives deletion of working code). A truncated cross-file
+    /// node must count as a potential referencer (keep-bias), mirroring the
+    /// same-file probe's semantics.
+    #[test]
+    fn test_find_dead_code_cross_file_truncated_reference() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let domain_fid = upsert_file(conn, &FileRecord {
+            path: "src/domain.rs".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+        let consumer_fid = upsert_file(conn, &FileRecord {
+            path: "src/consumer.rs".into(), blake3_hash: "h2".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+
+        // Live struct (name len >= 5, no incoming edge). Its only cross-file use
+        // lives in wide_consumer's truncated tail, so no textual `instr` match.
+        insert_node(conn, &NodeRecord {
+            file_id: domain_fid, node_type: "struct".into(), name: "TruncatedRefStruct".into(),
+            qualified_name: None, start_line: 1, end_line: 4,
+            code_content: "pub struct TruncatedRefStruct {\n    id: u32,\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // Cross-file consumer whose stored body is TRUNCATED: declared 56 lines but
+        // code_content stores only the head + `...` sentinel (mimics
+        // truncate_code_content cutting at MAX_CODE_LEN). The reference to
+        // TruncatedRefStruct is in the cut-off tail — NOT present in stored content.
+        insert_node(conn, &NodeRecord {
+            file_id: consumer_fid, node_type: "function".into(), name: "wide_consumer".into(),
+            qualified_name: None, start_line: 5, end_line: 60, // 56 declared lines
+            code_content: "pub fn wide_consumer() {\n    let a = 1;\n    let b = 2;...".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let results = find_dead_code(conn, None, None, false, 1, 100).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(!names.contains(&"TruncatedRefStruct"),
+            "TruncatedRefStruct's only cross-file reference is in wide_consumer's \
+             truncated tail; the cross-file probe's truncation co-signal must keep it \
+             from being reported dead; got: {:?}", names);
+    }
+
+    /// Negative control for the cross-file truncation co-signal: an edgeless
+    /// struct referenced NOWHERE, with no truncated cross-file node in play, must
+    /// STILL be reported dead. Guards that the co-signal fires only on genuinely
+    /// truncated nodes and did not become a blanket "never report edgeless kinds".
+    #[test]
+    fn test_find_dead_code_cross_file_untruncated_dead_struct_still_flagged() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+
+        let domain_fid = upsert_file(conn, &FileRecord {
+            path: "src/domain.rs".into(), blake3_hash: "h1".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+        let consumer_fid = upsert_file(conn, &FileRecord {
+            path: "src/consumer.rs".into(), blake3_hash: "h2".into(), last_modified: 1,
+            language: Some("rust".into()),
+        }).unwrap();
+
+        // Genuinely-dead struct: referenced nowhere.
+        insert_node(conn, &NodeRecord {
+            file_id: domain_fid, node_type: "struct".into(), name: "LonelyStruct".into(),
+            qualified_name: None, start_line: 1, end_line: 4,
+            code_content: "pub struct LonelyStruct {\n    id: u32,\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        // A short, NON-truncated cross-file function that does not mention
+        // LonelyStruct — no `...` sentinel, no line-span gap → no truncation signal.
+        insert_node(conn, &NodeRecord {
+            file_id: consumer_fid, node_type: "function".into(), name: "normal_consumer".into(),
+            qualified_name: None, start_line: 1, end_line: 3,
+            code_content: "pub fn normal_consumer() {\n    do_thing();\n}".into(),
+            signature: None, doc_comment: None, context_string: None,
+            name_tokens: None, return_type: None, param_types: None, is_test: false,
+        }).unwrap();
+
+        let results = find_dead_code(conn, None, None, false, 1, 100).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"LonelyStruct"),
+            "LonelyStruct is referenced nowhere and no cross-file node is truncated, \
+             so it must still be reported dead; got: {:?}", names);
     }
 
     /// Regression: C/C++ "limited" extraction emits no inheritance and no

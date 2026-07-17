@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
-use super::helpers::{first_row, make_placeholders, MAX_IN_PARAMS};
+use super::helpers::{escape_like, first_row, make_placeholders, MAX_IN_PARAMS};
 
 pub(super) const NODE_SELECT: &str =
     "id, file_id, type, name, qualified_name, start_line, end_line, code_content, signature, doc_comment, context_string, name_tokens, return_type, param_types, is_test";
@@ -383,19 +383,19 @@ pub fn get_nodes_with_files_by_filters(
     // char / any-run wildcard. Mirrors find_functions_by_fuzzy_name's escaping.
     if let Some(rt) = returns_filter {
         conditions.push(format!("LOWER(n.return_type) LIKE ?{} ESCAPE '\\'", param_idx));
-        let escaped = rt.to_lowercase().replace('%', "\\%").replace('_', "\\_");
+        let escaped = escape_like(&rt.to_lowercase());
         params.push(Box::new(format!("%{}%", escaped)));
         param_idx += 1;
     }
     if let Some(pt) = params_filter {
         conditions.push(format!("LOWER(n.param_types) LIKE ?{} ESCAPE '\\'", param_idx));
-        let escaped = pt.to_lowercase().replace('%', "\\%").replace('_', "\\_");
+        let escaped = escape_like(&pt.to_lowercase());
         params.push(Box::new(format!("%{}%", escaped)));
         param_idx += 1;
     }
     if let Some(nf) = name_filter {
         conditions.push(format!("LOWER(n.name) LIKE ?{} ESCAPE '\\'", param_idx));
-        let escaped = nf.to_lowercase().replace('%', "\\%").replace('_', "\\_");
+        let escaped = escape_like(&nf.to_lowercase());
         params.push(Box::new(format!("%{}%", escaped)));
         let _ = param_idx;
     }
@@ -639,7 +639,7 @@ pub fn filter_method_ids(
     // gate keeps its intentional wildcards. Mirrors nodes.rs return/param/name
     // filters and lesson #1533.
     let like = match of_type {
-        Some(t) => format!("{}.%", t.replace('%', "\\%").replace('_', "\\_")),
+        Some(t) => format!("{}.%", escape_like(t)),
         None => "%.%".to_string(),
     };
     for chunk in node_ids.chunks(MAX_IN_PARAMS) {
@@ -1278,5 +1278,64 @@ mod tests {
             db.conn(), Some(fn_types), None, None, Some("Result"), 10,
         ).unwrap();
         assert_eq!(r_fn.len(), 1, "type=function + name=Result matches only compress_results");
+    }
+
+    /// Regression: LIKE-escape helpers must escape the backslash ITSELF before the
+    /// `%`/`_` metachars. Under `ESCAPE '\'` a literal `\` in the query is the escape
+    /// char, so an unescaped `a\b` pattern degrades to `ab` (the `\b` escapes `b` to a
+    /// literal), and a trailing `\` escapes the closing wildcard — wrong matches both
+    /// ways. `escape_like` prepends `\` → `\\`, restoring literal semantics. This path
+    /// (`get_nodes_with_files_by_filters` name_filter) is pure LIKE with no fuzzy
+    /// fallback, so the assertions isolate the escape behavior.
+    #[test]
+    fn test_get_nodes_with_files_by_filters_name_filter_escapes_backslash() {
+        let (db, _tmp) = test_db();
+        let file_id = upsert_file(db.conn(), &FileRecord {
+            path: "src/lib.rs".into(), blake3_hash: "h".into(),
+            last_modified: 1, language: Some("rust".into()),
+        }).unwrap();
+
+        let mk = |name: &str| -> i64 {
+            insert_node(db.conn(), &NodeRecord {
+                file_id, node_type: "function".into(), name: name.into(),
+                qualified_name: None, start_line: 1, end_line: 1,
+                code_content: String::new(), signature: None,
+                doc_comment: None, context_string: None, name_tokens: None,
+                return_type: None, param_types: None, is_test: false,
+            }).unwrap()
+        };
+        let backslash_node = mk("a\\b"); // literal name: a, backslash, b
+        let plain_node = mk("ab");
+        let trailing_node = mk("x\\"); // literal name: x, backslash
+
+        let fn_types: &[&str] = &["function"];
+
+        // Query `a\b` must match the literal `a\b` node and NOT `ab`. Pre-fix the
+        // pattern degraded to `%a\b%` where `\b` = literal `b`, matching `ab` instead.
+        let r = get_nodes_with_files_by_filters(
+            db.conn(), Some(fn_types), None, None, Some("a\\b"), 10,
+        ).unwrap();
+        let ids: Vec<i64> = r.iter().map(|nwf| nwf.node.id).collect();
+        assert!(ids.contains(&backslash_node),
+            "query `a\\b` must match the literal `a\\b` node; got ids {ids:?}");
+        assert!(!ids.contains(&plain_node),
+            "query `a\\b` must NOT match `ab` (the backslash is a literal, not an escape); got ids {ids:?}");
+
+        // Trailing backslash: query `x\` must match `x\`. Pre-fix `%x\%` escaped the
+        // closing wildcard (`\%` = literal `%`) and matched nothing.
+        let r_tail = get_nodes_with_files_by_filters(
+            db.conn(), Some(fn_types), None, None, Some("x\\"), 10,
+        ).unwrap();
+        let tail_ids: Vec<i64> = r_tail.iter().map(|nwf| nwf.node.id).collect();
+        assert!(tail_ids.contains(&trailing_node),
+            "query `x\\` (trailing backslash) must match the literal `x\\` node; got ids {tail_ids:?}");
+
+        // Control: a wildcard-free query `ab` matches only `ab`, never `a\b`.
+        let r_plain = get_nodes_with_files_by_filters(
+            db.conn(), Some(fn_types), None, None, Some("ab"), 10,
+        ).unwrap();
+        let plain_ids: Vec<i64> = r_plain.iter().map(|nwf| nwf.node.id).collect();
+        assert!(plain_ids.contains(&plain_node) && !plain_ids.contains(&backslash_node),
+            "query `ab` must match `ab` and not `a\\b`; got ids {plain_ids:?}");
     }
 }

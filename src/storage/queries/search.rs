@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
+use super::helpers::escape_like;
 use super::nodes::{map_node_row, NodeResult, NODE_SELECT_ALIASED};
 
 /// Stopwords filtered from FTS5 queries to reduce noise.
@@ -167,11 +168,11 @@ pub struct NameCandidate {
 /// Matches all node types except modules.
 pub fn find_functions_by_fuzzy_name(conn: &Connection, partial_name: &str) -> Result<Vec<NameCandidate>> {
     // Phase 1: LIKE-based substring + token matching (fast path)
-    let escaped = partial_name.replace('%', "\\%").replace('_', "\\_");
+    let escaped = escape_like(partial_name);
     let pattern = format!("%{}%", escaped);
 
     let tokens_only = crate::search::tokenizer::split_identifier_tokens(partial_name);
-    let token_escaped = tokens_only.replace('%', "\\%").replace('_', "\\_");
+    let token_escaped = escape_like(&tokens_only);
     let token_pattern = format!("%{}%", token_escaped);
 
     let sql =

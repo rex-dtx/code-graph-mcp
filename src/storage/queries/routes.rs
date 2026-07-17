@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
-use super::helpers::{make_placeholders, MAX_IN_PARAMS};
+use super::helpers::{escape_like, make_placeholders, MAX_IN_PARAMS};
 
 pub struct RouteMatch {
     pub node_id: i64,
@@ -30,7 +30,7 @@ pub fn find_routes_by_path(conn: &Connection, route_path: &str, relation: &str) 
 
     // Support both exact match and prefix match with path boundary
     // (e.g., "/api/users" matches "/api/users/:id" but not "/api/userservices")
-    let escaped = route_path.replace('%', "\\%").replace('_', "\\_");
+    let escaped = escape_like(route_path);
     let prefix_pattern = format!("{}/%", escaped);
     let rows = stmt.query_map(rusqlite::params![route_path, relation, prefix_pattern], |row| {
         Ok(RouteMatch {
@@ -138,7 +138,7 @@ impl ModuleExport {
 /// falls back to returning all named top-level symbols (functions, structs, classes, etc.).
 pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<ModuleExport>> {
     use crate::domain::{REL_EXPORTS, REL_CALLS};
-    let escaped_prefix = dir_prefix.replace('%', "\\%").replace('_', "\\_");
+    let escaped_prefix = escape_like(dir_prefix);
     let prefix_pattern = format!("{}%", escaped_prefix);
 
     // Per-file export semantics (decided per file, NOT globally over the prefix):
