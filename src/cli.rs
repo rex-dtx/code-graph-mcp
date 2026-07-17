@@ -2435,17 +2435,29 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // ripgrep exit codes: 0 = matched, 1 = no match, 2 = error (invalid regex,
     // unreadable path). grep-parity: surface as exit 2 — a regex parse error
     // (e.g. an unescaped `(` in `res.json(`) must not look like a no-match.
+    // An error with NON-empty stdout (e.g. one of several paths missing) still
+    // carries matches from the readable paths — GNU grep prints those and exits
+    // 2; discarding them here turned a one-bad-path multi-path grep into a
+    // silent exit 2. Deliver the partial results and keep the exit code.
+    let mut partial_error = false;
     if rg_output.status.code() == Some(2) {
-        if json_mode {
-            println!("[]");
-        }
         let stderr = String::from_utf8_lossy(&rg_output.stderr);
         let stderr = stderr.trim();
+        if rg_output.stdout.is_empty() {
+            if json_mode {
+                println!("[]");
+            }
+            eprintln!(
+                "[code-graph] ripgrep error: {}",
+                if stderr.is_empty() { "invalid pattern or unreadable path" } else { stderr }
+            );
+            grep_exit(2);
+        }
         eprintln!(
-            "[code-graph] ripgrep error: {}",
-            if stderr.is_empty() { "invalid pattern or unreadable path" } else { stderr }
+            "[code-graph] ripgrep error (results below cover the remaining paths): {}",
+            if stderr.is_empty() { "unreadable path" } else { stderr }
         );
-        grep_exit(2);
+        partial_error = true;
     }
 
     // -l mode: rg already printed one path per line; relativize and pass through.
@@ -2481,6 +2493,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         match write_result {
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => grep_exit(0),
             other => other?,
+        }
+        if partial_error {
+            grep_exit(2);
         }
         return Ok(());
     }
@@ -2528,6 +2543,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => grep_exit(0),
             other => other?,
         }
+        if partial_error {
+            grep_exit(2);
+        }
         return Ok(());
     }
 
@@ -2550,6 +2568,13 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     if matches.is_empty() {
         if json_mode {
             println!("[]");
+        }
+        // rg --json emits a trailing summary line even with zero matches, so an
+        // error-only run (e.g. the single named path is missing) has non-empty
+        // stdout and reaches here with partial_error set — that's an error (2),
+        // not a no-match (1), and its stderr was already surfaced above.
+        if partial_error {
+            grep_exit(2);
         }
         // Surface ripgrep errors (e.g., path not found) instead of a silent exit
         let stderr = String::from_utf8_lossy(&rg_output.stderr);
@@ -2747,6 +2772,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         eprintln!("[code-graph] Showing plain grep results (no AST context).");
     }
 
+    if partial_error {
+        grep_exit(2);
+    }
     Ok(())
 }
 

@@ -697,6 +697,38 @@ fn test_cli_grep_invalid_regex_exits_two() {
 }
 
 #[test]
+fn test_cli_grep_partial_results_on_missing_path() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // GNU grep parity: an unreadable/missing path is an error (exit 2), but
+    // matches from the readable paths still print — rg itself emits the hits
+    // from `src` and exits 2 on `no_such_dir`. The exit-2 branch used to
+    // discard rg's stdout wholesale, so a multi-path grep with one bad path
+    // silently dropped every result.
+    let (stdout, stderr, code) =
+        run_cli(&project, &["grep", "validateToken", "src", "no_such_dir"]);
+    assert_eq!(code, 2, "path error must exit 2 (grep parity), got stderr: {stderr}");
+    assert!(stdout.contains("validateToken"),
+        "partial results from the valid path must print, got stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("No such file") || stderr.contains("ripgrep error"),
+        "the path error must be surfaced on stderr, got: {stderr:?}");
+}
+
+#[test]
+fn test_cli_grep_partial_results_count_mode() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // Same partial-results contract for -c (the observed field failure shape:
+    // `grep "pat" scripts parse -c` where `parse` did not exist → exit 2 with
+    // all counts dropped).
+    let (stdout, stderr, code) =
+        run_cli(&project, &["grep", "validateToken", "src", "no_such_dir", "-c"]);
+    assert_eq!(code, 2, "path error must exit 2 (grep parity), got stderr: {stderr}");
+    assert!(stdout.contains("src/auth.ts:") && stdout.contains("src/api.ts:"),
+        "counts from the valid path must print, got stdout: {stdout:?}");
+}
+
+#[test]
 fn test_cli_grep_with_path() {
     if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
     let project = setup_indexed_project();
