@@ -298,8 +298,22 @@ impl McpServer {
         }
         // Forward truncation metadata so compact callers see the cap, not silent truncation.
         // `dead_code` is forwarded so `compact: true + include_dead: true` returns the
-        // dead-code section instead of silently dropping it.
-        for key in ["active_capped", "showing", "total_active", "hint", "dead_code"] {
+        // dead-code section instead of silently dropping it. `dependencies` +
+        // the two `*_unavailable` error variants are forwarded so `include_deps`/
+        // `include_dead` payloads (and their failure disclosures) survive compact mode.
+        // Any new top-level key assigned onto `result` in tool_module_overview MUST be
+        // added here (or to DELIBERATELY_COMPACTED in tests/freshness_parity.rs) —
+        // the `compact_allowlist_covers_all_result_keys` drift-guard enforces this.
+        for key in [
+            "active_capped",
+            "showing",
+            "total_active",
+            "hint",
+            "dead_code",
+            "dependencies",
+            "dependencies_unavailable",
+            "dead_code_unavailable",
+        ] {
             if let Some(v) = full.get(key) {
                 result[key] = v.clone();
             }
