@@ -76,12 +76,18 @@ CLI 有、MCP 无（[features-v053-v054]）。小工作量；注意 MCP `instruc
 ## 4. 路线图
 
 ```
-Phase 1  披露修复批（1.1–1.7）           ── 1 个会话批量完成；全部无 bump；发一个 patch/minor
-Phase 2a Rust 路由提取（axum 先行）       ── INDEX bump 顺风车批主项（+2.3 barrel re-export 同批）
-Phase 2b Worktree Rust 读侧（D#106）     ── 独立小批，无 bump
-Phase 2c MCP centrality                  ── 独立小批；routing_bench 回归
-Phase 3  仪表修正（3.1→3.3）+ 卫生（3.2 SCHEMA bump 单独批）+ 3.4/3.5 择机
+Phase 1  披露修复批（1.1–1.7）           ── ✅ RELEASED v0.99.1（2026-07-18，run 全绿）
+Phase 2a Rust 路由提取（axum）+ 2.3 barrel ── ✅ IDX 50→51，v0.100.0（axum .route/.nest；
+                                             import * as / export * / ns_require 模块级边）
+Phase 2b Worktree Rust 读侧（D#106）     ── ✅ cc655aa（CliContext 读侧回落；D#106 已闭环）
+Phase 2c MCP centrality                  ── ✅ 99e4be7（project_map include_centrality；
+                                             routing_bench 66/66 零回归）
+Phase 3  仪表修正（3.1→3.3）+ 卫生（3.2 SCHEMA bump 单独批）+ 3.4/3.5 择机 ── 未开始
 ```
+
+> 状态更新 2026-07-18：Phase 1 与 2a/2b/2c 全部落地。residual（各条目内已注明）：
+> actix/Spring 路由、closure handler、跨变量 nest、star-barrel 名字级穿透、
+> freshness_partial 数组形命令仅 stderr。Phase 3 为下一批。
 
 排序理由：Phase 1 直接服务日常 LLM 消费路径（本周 3 起误判全属此类），修法统一、风险最低；
 Phase 2a 是唯一"新能力"级缺口且需要 INDEX bump 编排（顺风车摊薄成本）；仪表（3.1/3.3）决定
