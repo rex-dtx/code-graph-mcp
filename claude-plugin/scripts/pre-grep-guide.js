@@ -376,6 +376,15 @@ function extractUnansweredTail(cmd) {
 // two lines, verbatim command so the model can re-issue without thinking.
 // Wording is path-neutral — it must stay true for BOTH the answered deny
 // ("grep half answered, tail wasn't") and the static fallback (nothing was).
+// Head-line marker paired with the NOTE below: the NOTE sits at the END of a
+// long deny message and Claude Code's transcript view folds long tool errors,
+// so a human reading the truncated view saw a clean "answered" deny with no
+// clue the compound's tail was dropped (2026-07-18: two such denies were
+// misdiagnosed as product bugs). The model gets the full reason either way.
+function tailFlagSuffix(tail) {
+  return tail ? ' (compound tail NOT run — see NOTE at end)' : '';
+}
+
 function appendUnansweredTailNote(lines, tail) {
   if (!tail) return;
   const shown = tail.length > 300 ? tail.slice(0, 300) + '…' : tail;
@@ -538,7 +547,7 @@ function buildBlockReason(unansweredTail) {
   // permanent prefix (adopted in 8s, reused 11×, incl. on the exact identifier
   // searches this hook targets). The env opt-out stays documented in README.
   const lines = [
-    '[code-graph] Raw `grep -rn` on indexed source — denied by code-graph hook.',
+    `[code-graph] Raw \`grep -rn\` on indexed source — denied by code-graph hook.${tailFlagSuffix(unansweredTail)}`,
     'Use the AST-aware equivalent (returns containing fn/module per hit, repo-wide):',
     '  code-graph-mcp grep "<pattern>" [paths...]      # AST context per hit; -F literal, -i, -w, -l, -C N, --max-count 0',
     '  code-graph-mcp ast-search "<pattern>" --type fn # filter by node type',
@@ -558,7 +567,7 @@ function buildBlockReason(unansweredTail) {
 function buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail) {
   const cmdShown = `code-graph-mcp grep "${pattern}"${searchPath ? ` ${searchPath}` : ''}`;
   const lines = [
-    '[code-graph] Raw `grep` on indexed source — denied; the AST-aware equivalent already ran for you:',
+    `[code-graph] Raw \`grep\` on indexed source — denied; the AST-aware equivalent already ran for you:${tailFlagSuffix(unansweredTail)}`,
     `$ ${cmdShown}`,
     answer.text,
   ];
@@ -584,7 +593,7 @@ function buildBlockReasonWithAnswer(pattern, searchPath, answer, unansweredTail)
 // `$ code-graph-mcp show <sym>` headers.
 function buildShowDenyReason(answer, unansweredTail) {
   const lines = [
-    '[code-graph] Raw grep for symbol definitions — denied; here are the definitions from the AST index:',
+    `[code-graph] Raw grep for symbol definitions — denied; here are the definitions from the AST index:${tailFlagSuffix(unansweredTail)}`,
     answer.text,
   ];
   if (answer.truncated) {

@@ -1074,6 +1074,34 @@ test('buildBlockReason: no tail → unchanged static deny', () => {
   assert.doesNotMatch(reason, /did NOT run/);
 });
 
+test('deny copy: compound tail flagged on the FIRST line of all three builders', () => {
+  // The re-issue NOTE sits at the END of a long deny message; Claude Code's
+  // transcript view truncates long tool errors, so a human reading the folded
+  // view saw "answered" with no clue a tail was dropped (2026-07-18 field
+  // misdiagnosis: two compound denies read as product bugs). The model sees the
+  // full reason either way — the head-line marker is for the truncated view.
+  const tail = "sed -n '100,150p' lib/x.mjs";
+  const answered = buildBlockReasonWithAnswer('fts5_search', 'src/', {
+    status: 'hits', text: 'hit', truncated: false,
+  }, tail);
+  assert.match(answered.split('\n')[0], /compound tail NOT run — see NOTE at end/);
+  const show = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false }, tail);
+  assert.match(show.split('\n')[0], /compound tail NOT run — see NOTE at end/);
+  const staticDeny = buildBlockReason(tail);
+  assert.match(staticDeny.split('\n')[0], /compound tail NOT run — see NOTE at end/);
+});
+
+test('deny copy: no tail → no head-line marker in any builder', () => {
+  const answered = buildBlockReasonWithAnswer('fts5_search', 'src/', {
+    status: 'hits', text: 'hit', truncated: false,
+  });
+  assert.doesNotMatch(answered, /compound tail NOT run/);
+  const show = buildShowDenyReason({ status: 'hits', text: 'fn body', truncated: false });
+  assert.doesNotMatch(show, /compound tail NOT run/);
+  const staticDeny = buildBlockReason();
+  assert.doesNotMatch(staticDeny, /compound tail NOT run/);
+});
+
 test('buildNoHitsFyi: names the pattern and says raw grep proceeds', () => {
   const fyi = buildNoHitsFyi('GhostSymbol');
   assert.match(fyi, /GhostSymbol/);

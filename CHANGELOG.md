@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Compound-command denies now flag the dropped tail on the FIRST line** — the
+  pre-grep hook's re-issue NOTE (`the rest of this compound command did NOT run`)
+  sits at the end of a long deny message, which Claude Code's transcript view folds;
+  a human reading the truncated view saw a clean "answered" deny and misread the
+  hook as broken. All three deny builders (answered / show / static) now append
+  `(compound tail NOT run — see NOTE at end)` to their head line. Model-visible
+  content is otherwise unchanged.
+
 ## v0.99.0 — worktree-aware root resolution + grep zero-hit disclosure
 
 Behavior change (plugin JS resolver, `project-root.js` — shared by the statusline and
