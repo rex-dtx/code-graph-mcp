@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.100.1 — worktree read-side + MCP centrality (roadmap Phase 2b/2c)
 
 ### Added
 - **MCP surface for centrality** (roadmap §2.4): `project_map` gains
