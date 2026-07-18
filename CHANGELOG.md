@@ -9,6 +9,20 @@ index** instead of going dark. Numbers/answers reflect the main checkout's conte
 a worktree that builds its own index (run any `code-graph-mcp` command in it) takes
 precedence over the fallback. Revert path: pin the previous plugin version.
 
+### Fixed — grep zero-hit disclosure
+- **`grep -c` zero matches on a named file printed nothing on stdout** — GNU grep
+  prints a `0` count per named file and exits 1; ours emitted a stderr-only note, so
+  `grep "pat" file.py -c 2>/dev/null` was total silence (field failure). Named FILE
+  args now get a `path:0` row (also filled for non-matching named files when other
+  files match, per GNU); the `--json` shape gains the same `{file, count: 0}` rows.
+  Deliberate GNU deviation kept: dir/repo-wide args do not enumerate zero rows
+  (GNU `-rc` prints every scanned file — repo-scale noise).
+- **BRE-style escape zero-hits now disclose the regex dialect** — `\|` is alternation
+  in GNU BRE but a LITERAL pipe in ripgrep's Rust regex, so grep-habit patterns like
+  `protocol\|proto` silently zero-hit and an LLM consumer concludes "no such code".
+  The no-match path (all modes) now appends a one-line hint naming the escapes found;
+  suppressed under `-F` where backslashes are genuinely literal.
+
 ### Fixed
 - **Statusline + all hooks were dark in linked worktrees** — the worktree's `.git`
   FILE hit the hard submodule boundary (`hasGit → no index → null`). Worktree

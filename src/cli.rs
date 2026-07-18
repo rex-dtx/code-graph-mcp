@@ -2195,6 +2195,36 @@ fn grep_exit(code: i32) -> ! {
     std::process::exit(code);
 }
 
+/// GNU BRE inverts escaping for its operators: `\|` `\(` `\)` `\{` `\}` `\+`
+/// `\?` mean alternation/grouping/repetition, and the UNESCAPED forms are
+/// literals. ripgrep's Rust regex dialect is the other way around, so a
+/// grep-muscle-memory pattern like `protocol\|proto` silently becomes the
+/// literal string "protocol|proto" and zero-hits — an LLM consumer then
+/// concludes "no such code". Returns the escapes present so the no-match path
+/// can disclose the dialect.
+fn bre_style_escapes(pattern: &str) -> Vec<&'static str> {
+    ["\\|", "\\(", "\\)", "\\{", "\\}", "\\+", "\\?"]
+        .into_iter()
+        .filter(|e| pattern.contains(e))
+        .collect()
+}
+
+/// Shared zero-hit note for every grep mode. Skips the dialect hint under -F,
+/// where backslashes are genuinely literal and the pattern means what it says.
+fn emit_no_match(pattern: &str, fixed_strings: bool) {
+    eprintln!("[code-graph] No matches for: {}", pattern);
+    if fixed_strings {
+        return;
+    }
+    let escapes = bre_style_escapes(pattern);
+    if !escapes.is_empty() {
+        eprintln!(
+            "[code-graph] hint: pattern contains BRE-style escapes ({}) — this grep uses ripgrep's Rust regex dialect, where those match the literal character; write the operator unescaped (GNU `a\\|b` → `a|b`)",
+            escapes.join(" ")
+        );
+    }
+}
+
 /// git-tracked files that ripgrep's walk skips: tracked ∖ `rg --files`.
 /// Three blind-spot classes share this root cause (rg prunes by its own
 /// ignore/hidden rules without checking tracked status):
@@ -2474,7 +2504,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             if json_mode {
                 println!("[]");
             }
-            eprintln!("[code-graph] No matches for: {}", pattern);
+            emit_no_match(&pattern, fixed_strings);
             grep_exit(1);
         }
         let write_result: std::io::Result<()> = (|| {
@@ -2512,6 +2542,17 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                 Some((relativize_path(path, &root_str).to_string(), n.trim().parse().ok()?))
             })
             .collect();
+        // GNU parity: every explicitly named FILE arg gets a count row, zero
+        // included (`grep -c pat f1 f2` prints `f2:0`). Scoped to file args —
+        // enumerating a dir/repo walk's zero-match files would be
+        // `--include-zero` noise at repo scale (deliberate GNU deviation).
+        // `search_rels` entries share the root-relative shape of the
+        // relativized rg rows, so the sort/dedup below treats them uniformly.
+        for (p, rel) in search_paths.iter().zip(&search_rels) {
+            if p.is_file() && !counts.iter().any(|(f, _)| f == rel) {
+                counts.push((rel.clone(), 0));
+            }
+        }
         counts.sort_by(|a, b| a.0.cmp(&b.0)); // global ascending-path order
         // Overlapping/repeated path args make rg emit a file's `path:N` line once
         // per instance (identical count each); keep a single row per file.
@@ -2520,9 +2561,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             if json_mode {
                 println!("[]");
             }
-            eprintln!("[code-graph] No matches for: {}", pattern);
+            emit_no_match(&pattern, fixed_strings);
             grep_exit(1);
         }
+        let total_matches: u64 = counts.iter().map(|(_, n)| n).sum();
         let write_result: std::io::Result<()> = (|| {
             let mut stdout = std::io::stdout().lock();
             if json_mode {
@@ -2545,6 +2587,12 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         }
         if partial_error {
             grep_exit(2);
+        }
+        if total_matches == 0 {
+            // Zero rows printed (named files only) — still a no-match run:
+            // grep parity exits 1 and the stderr note + dialect hint fire.
+            emit_no_match(&pattern, fixed_strings);
+            grep_exit(1);
         }
         return Ok(());
     }
@@ -2582,7 +2630,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         if !stderr.is_empty() {
             eprintln!("[code-graph] {}", stderr);
         } else {
-            eprintln!("[code-graph] No matches for: {}", pattern);
+            emit_no_match(&pattern, fixed_strings);
         }
         // grep parity: no match exits 1.
         grep_exit(1);

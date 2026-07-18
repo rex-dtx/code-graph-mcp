@@ -1037,10 +1037,79 @@ fn test_cli_grep_count_mode() {
     let v: serde_json::Value = serde_json::from_str(j.trim()).unwrap();
     assert_eq!(v[0]["file"], "many.txt");
     assert_eq!(v[0]["count"], 150);
-    // no match → exit 1 + [] (JSON contract)
+    // no match on a NAMED file → exit 1 + zero row (GNU `grep -c` prints a
+    // count for every named file, including 0 — pre-fix this was `[]`/silence)
     let (je, _, ce) = run_cli(&project, &["grep", "-c", "zzz_nothing", "many.txt", "--json"]);
     assert_eq!(ce, 1);
-    assert_eq!(je.trim(), "[]");
+    let ve: serde_json::Value = serde_json::from_str(je.trim()).unwrap();
+    assert_eq!(ve[0]["file"], "many.txt");
+    assert_eq!(ve[0]["count"], 0);
+}
+
+#[test]
+fn test_cli_grep_count_zero_named_file() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // GNU parity: `grep -c pat file` with zero matches prints `file:0` on
+    // STDOUT and exits 1 — not stderr-only silence. Field failure shape:
+    // `grep "pat" file.py -c 2>/dev/null` showed literally nothing.
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "xyznonexistent", "src/auth.ts", "-c"]);
+    assert_eq!(code, 1, "all-zero counts still exit 1 (grep parity)");
+    assert!(stdout.contains("src/auth.ts:0"),
+        "named file must get a zero row on stdout, got stdout: {stdout:?}");
+    assert!(stderr.contains("No matches"), "stderr note stays, got: {stderr:?}");
+}
+
+#[test]
+fn test_cli_grep_count_zero_fills_nonmatching_named_files() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // hashPassword exists only in auth.ts: the matching file keeps its count,
+    // the non-matching NAMED file gets a 0 row, and the run exits 0 (matches
+    // exist). GNU prints zeros for every named file; rg lists matching only.
+    let (stdout, _, code) =
+        run_cli(&project, &["grep", "hashPassword", "src/auth.ts", "src/api.ts", "-c"]);
+    assert_eq!(code, 0, "matches exist → exit 0");
+    assert!(stdout.contains("src/auth.ts:") && !stdout.contains("src/auth.ts:0"),
+        "matching file keeps its real count, got: {stdout:?}");
+    assert!(stdout.contains("src/api.ts:0"),
+        "non-matching named file must get a zero row, got: {stdout:?}");
+}
+
+#[test]
+fn test_cli_grep_count_zero_dir_arg_no_zero_rows() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // Deliberate GNU deviation: dir / repo-wide args do NOT enumerate zero rows
+    // (GNU -rc prints `path:0` for every scanned file — repo-scale noise).
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "xyznonexistent", "src", "-c"]);
+    assert_eq!(code, 1);
+    assert_eq!(stdout.trim(), "", "dir args stay silent on stdout, got: {stdout:?}");
+    assert!(stderr.contains("No matches"), "got: {stderr:?}");
+}
+
+#[test]
+fn test_cli_grep_bre_escape_hint_on_zero_hits() {
+    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    let project = setup_indexed_project();
+    // `\|` is alternation in GNU BRE but a LITERAL pipe in ripgrep's Rust regex
+    // dialect — the habit pattern zero-hits silently and an LLM consumer
+    // concludes "no such code". The no-match path must disclose the dialect.
+    let (_, stderr, code) = run_cli(&project, &["grep", r"validateToken\|hashPassword"]);
+    assert_eq!(code, 1, "literal 'validateToken|hashPassword' matches nothing");
+    assert!(stderr.contains("BRE") && stderr.contains(r"\|"),
+        "zero-hit + BRE-style escape must emit the dialect hint, got: {stderr:?}");
+    // -c mode shares the hint path
+    let (_, stderr_c, _) =
+        run_cli(&project, &["grep", r"validateToken\|hashPassword", "src/auth.ts", "-c"]);
+    assert!(stderr_c.contains("BRE"), "hint must fire in -c mode too, got: {stderr_c:?}");
+    // no escapes → no hint
+    let (_, stderr_plain, _) = run_cli(&project, &["grep", "xyznonexistent"]);
+    assert!(!stderr_plain.contains("BRE"), "plain zero-hit must not hint, got: {stderr_plain:?}");
+    // -F: backslashes are genuinely literal — never hint
+    let (_, stderr_f, code_f) = run_cli(&project, &["grep", "-F", r"validateToken\|hashPassword"]);
+    assert_eq!(code_f, 1);
+    assert!(!stderr_f.contains("BRE"), "-F must suppress the hint, got: {stderr_f:?}");
 }
 
 #[test]
