@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.99.1 — disclosure batch (roadmap Phase 1)
 
 ### Fixed — disclosure batch (roadmap 2026-07-18 §1: honest info must reach the consumer)
 
