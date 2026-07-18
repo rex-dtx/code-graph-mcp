@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed
+- **`pending_unresolved_calls` is now bounded** (roadmap §3.2, D#77;
+  SCHEMA_VERSION 9 → 10): each resolution sweep ages surviving rows by one
+  `attempts`; rows failing 50 consecutive sweeps are evicted. ~99% of buffered
+  rows are never-resolvable external/builtin calls (require/Some/Ok/…) that
+  previously accumulated until the next INDEX_VERSION wipe (2909 rows on this
+  repo). The incremental-edge-timing guarantee is preserved below the
+  threshold — a row one sweep from eviction still resolves when its callee
+  arrives (resolution drains before aging), and a caller-file re-parse resets
+  the clock via cascade + re-buffer (verified live on a real binary).
+  Upgraded DBs migrate in place (guarded ALTER + attempts backfilled to 0,
+  verified against a real v9 index copy); after upgrading, older binaries
+  refuse the migrated DB with the standard schema-too-new marker until they
+  update ("↻ updating" statusline window).
+
 ### Fixed
 - **`outcome` under-counted batched cg calls** (roadmap §3.1) — two cg calls
   issued in ONE assistant turn gave the first call a zero-width adoption

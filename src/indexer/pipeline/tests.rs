@@ -1443,6 +1443,79 @@ fn test_pending_unresolved_call_resolves_when_callee_added_later() {
         "resolved pending row must be deleted after edge insertion");
 }
 
+/// Bounded retention (SCHEMA v10, D#77): a pending row that fails to resolve
+/// for `PENDING_CALL_MAX_ATTEMPTS` consecutive sweeps is evicted — ~99% of
+/// buffered rows are never-resolvable external/builtin calls that otherwise
+/// accumulate until the next INDEX_VERSION wipe. Below the threshold the
+/// incremental-edge-timing guarantee is untouched (see the boundary test).
+#[test]
+fn test_pending_evicted_after_max_failed_sweeps() {
+    use super::resolve::resolve_pending_calls;
+    use crate::domain::PENDING_CALL_MAX_ATTEMPTS;
+    use crate::storage::queries::count_pending_unresolved_calls;
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(project_dir.path().join("b.ts"),
+        "function caller_b() { neverDefinedAnywhere(); }\n").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
+
+    // The full index above already ran one sweep (attempts = 1). Sweep until
+    // one shy of the threshold: the row must still be buffered.
+    for _ in 0..(PENDING_CALL_MAX_ATTEMPTS - 2) {
+        resolve_pending_calls(&db).unwrap();
+    }
+    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
+        "row must survive below PENDING_CALL_MAX_ATTEMPTS failed sweeps");
+
+    // The threshold-crossing sweep evicts it.
+    resolve_pending_calls(&db).unwrap();
+    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
+        "row must be evicted once it has failed PENDING_CALL_MAX_ATTEMPTS sweeps");
+}
+
+/// Boundary guard for the incremental-edge-timing guarantee under bounded
+/// retention: a row aged to ONE sweep short of eviction must still bridge —
+/// resolution in the same sweep wins over eviction (resolved rows are drained
+/// before survivors age).
+#[test]
+fn test_pending_at_eviction_boundary_still_resolves() {
+    use super::resolve::resolve_pending_calls;
+    use crate::domain::PENDING_CALL_MAX_ATTEMPTS;
+    use crate::storage::queries::{count_pending_unresolved_calls, get_node_ids_by_name};
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(project_dir.path().join("b.ts"),
+        "function caller_b() { lateFoo(); }\n").unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Age to the brink: attempts = MAX - 1 (full index swept once already).
+    for _ in 0..(PENDING_CALL_MAX_ATTEMPTS - 2) {
+        resolve_pending_calls(&db).unwrap();
+    }
+    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
+
+    // Callee arrives — the incremental pass's sweep must resolve, not evict.
+    fs::write(project_dir.path().join("a.ts"),
+        "export function lateFoo() {}\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let caller_id = get_node_ids_by_name(db.conn(), "caller_b").unwrap()
+        .into_iter().next().expect("caller_b must exist").0;
+    let foo_id = get_node_ids_by_name(db.conn(), "lateFoo").unwrap()
+        .into_iter().next().expect("lateFoo must exist").0;
+    let edges = crate::storage::queries::get_edges_from(db.conn(), caller_id).unwrap();
+    assert!(edges.iter().any(|e| e.relation == REL_CALLS && e.target_id == foo_id),
+        "a row at the eviction boundary must still resolve when the callee arrives");
+    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0);
+}
+
 /// Cross-language pending must NOT resolve cross-language. If B (TS)
 /// calls `update()` and a later-indexed Rust file defines `fn update()`,
 /// the pending row must stay buffered, not silently bind cross-language

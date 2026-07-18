@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 // Meta keys stored in the `meta` table (added in v7).
 pub const META_KEY_EMBEDDING_DIM: &str = "embedding_dim";
@@ -110,7 +110,11 @@ CREATE TABLE IF NOT EXISTS pending_unresolved_calls (
     source_id       INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     target_name     TEXT NOT NULL,
     source_language TEXT NOT NULL,
-    metadata        TEXT
+    metadata        TEXT,
+    -- Failed-resolution sweep count (added by migrate_v9_to_v10, SCHEMA_VERSION
+    -- 10). Rows reaching domain::PENDING_CALL_MAX_ATTEMPTS are evicted so
+    -- never-resolvable external/builtin calls don't accumulate forever.
+    attempts        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pending_target_lang ON pending_unresolved_calls(target_name, source_language);
 CREATE INDEX IF NOT EXISTS idx_pending_source ON pending_unresolved_calls(source_id);
@@ -121,7 +125,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls
 /// Check if a column exists on a table using PRAGMA table_info (safe from SQL injection).
 fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
     // Validate table name against allowlist to prevent injection via PRAGMA
-    const ALLOWED_TABLES: &[&str] = &["files", "nodes", "edges"];
+    const ALLOWED_TABLES: &[&str] = &["files", "nodes", "edges", "pending_unresolved_calls"];
     if !ALLOWED_TABLES.contains(&table) {
         tracing::warn!("column_exists: table '{}' not in allowlist, add it to ALLOWED_TABLES", table);
         return false;
@@ -325,6 +329,27 @@ pub fn migrate_v8_to_v9(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         )?;
     }
     tracing::info!("[schema] Migration v8->v9 complete.");
+    Ok(())
+}
+
+/// v9 -> v10: add `pending_unresolved_calls.attempts` (failed-sweep counter for
+/// bounded pending-row retention). Same seam as v8->v9: `CREATE TABLE IF NOT
+/// EXISTS` is a no-op on an upgraded DB, so without a guarded ALTER the column
+/// never appears and the sweep's attempts UPDATE crashes with
+/// `no such column: attempts`. The table may not exist yet on a contentless
+/// older DB (migrations run BEFORE create_tables_sql) — skip then; create_tables
+/// builds it WITH the column.
+pub fn migrate_v9_to_v10(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    tracing::info!("[schema] Migrating v9 -> v10: adding pending_unresolved_calls.attempts (bounded retention)");
+    let table_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pending_unresolved_calls'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if table_exists {
+        add_column_if_not_exists(conn, "pending_unresolved_calls", "attempts", "INTEGER NOT NULL DEFAULT 0")?;
+    }
+    tracing::info!("[schema] Migration v9->v10 complete.");
     Ok(())
 }
 

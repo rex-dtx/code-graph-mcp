@@ -245,6 +245,11 @@ impl Database {
                 schema::migrate_v8_to_v9(&conn)?;
                 tx.commit()?;
             }
+            if existing_version < 10 {
+                let tx = conn.unchecked_transaction()?;
+                schema::migrate_v9_to_v10(&conn)?;
+                tx.commit()?;
+            }
         }
 
         conn.execute_batch(&schema::create_tables_sql())?;
@@ -1148,6 +1153,59 @@ mod tests {
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
         assert!(version >= 9, "version must have advanced to at least 9");
+    }
+
+    /// v9→v10 seam (D#77 bounded pending retention): upgraded DBs keep their
+    /// existing `pending_unresolved_calls` table, where `CREATE TABLE IF NOT
+    /// EXISTS` is a no-op — without migrate_v9_to_v10 the `attempts` column
+    /// never appears and the sweep's aging UPDATE crashes with
+    /// `no such column: attempts`. Hand-build the COLUMN-LESS pre-v10 shape
+    /// (create_tables_sql() would include the column and mask the bug).
+    #[test]
+    fn test_v9_to_v10_migration_adds_attempts_column() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            // Pre-v10 pending shape: no `attempts` column.
+            c.execute_batch(
+                "CREATE TABLE pending_unresolved_calls (
+                    id              INTEGER PRIMARY KEY,
+                    source_id       INTEGER NOT NULL,
+                    target_name     TEXT NOT NULL,
+                    source_language TEXT NOT NULL,
+                    metadata        TEXT
+                );"
+            ).unwrap();
+            c.execute(
+                "INSERT INTO pending_unresolved_calls (source_id, target_name, source_language)
+                 VALUES (1, 'foo', 'typescript')",
+                [],
+            ).unwrap();
+            c.pragma_update(None, "user_version", 9).unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+
+        // (a) The column now exists, existing rows backfilled to 0.
+        let attempts: i64 = db.conn().query_row(
+            "SELECT attempts FROM pending_unresolved_calls WHERE target_name = 'foo'",
+            [], |r| r.get(0),
+        ).expect("attempts column must exist after v9→v10 migration");
+        assert_eq!(attempts, 0, "pre-existing rows must backfill attempts = 0");
+
+        // (b) The exact statements the sweep runs now succeed.
+        let evicted = crate::storage::queries::age_and_evict_pending_unresolved_calls(db.conn())
+            .expect("age/evict must not error after migration");
+        assert_eq!(evicted, 0, "a once-aged row is far below the eviction threshold");
+
+        // (c) user_version advanced.
+        let version: i32 = db.conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::SCHEMA_VERSION);
     }
 
     #[test]

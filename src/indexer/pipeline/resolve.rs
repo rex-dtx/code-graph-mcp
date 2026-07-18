@@ -12,8 +12,9 @@ use std::collections::HashMap;
 
 use crate::storage::db::Database;
 use crate::storage::queries::{
-    delete_pending_unresolved_call, filter_method_ids, get_node_paths_by_ids,
-    get_node_qualified_names_by_ids, insert_edge_cached, list_pending_unresolved_calls,
+    age_and_evict_pending_unresolved_calls, delete_pending_unresolved_call, filter_method_ids,
+    get_node_paths_by_ids, get_node_qualified_names_by_ids, insert_edge_cached,
+    list_pending_unresolved_calls,
 };
 use crate::domain::REL_CALLS;
 
@@ -275,6 +276,14 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
 
     for id in to_delete {
         delete_pending_unresolved_call(db.conn(), id)?;
+    }
+
+    // Bounded retention (SCHEMA v10): rows that survived this sweep age by one
+    // failed attempt; rows reaching PENDING_CALL_MAX_ATTEMPTS are evicted.
+    // Resolution wins ties — resolved rows were drained above before aging.
+    let evicted = age_and_evict_pending_unresolved_calls(db.conn())?;
+    if evicted > 0 {
+        tracing::debug!("[pipeline] pending-call sweep evicted {evicted} rows at max attempts");
     }
 
     Ok(edges_added)

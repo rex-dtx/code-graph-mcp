@@ -83,7 +83,8 @@ Phase 2b Worktree Rust 读侧（D#106）     ── ✅ cc655aa（CliContext 读
 Phase 2c MCP centrality                  ── ✅ 99e4be7（project_map include_centrality；
                                              routing_bench 66/66 零回归）
 Phase 3  仪表修正（3.1→3.3）           ── ✅ 落地（batched-turn 窗口修复 + 距离标定 + 括号路径提取）
-         卫生（3.2 SCHEMA bump 单独批）+ 3.4/3.5 择机 ── 未开始
+         卫生 3.2（SCHEMA 9→10，attempts 有界驻留）── ✅ 落地（D#77 闭环）
+         3.4/3.5 择机                    ── 未开始
 ```
 
 > 状态更新 2026-07-18：Phase 1 与 2a/2b/2c 全部落地。residual（各条目内已注明）：

@@ -103,6 +103,23 @@ pub fn delete_pending_unresolved_call(conn: &Connection, id: i64) -> Result<()> 
     Ok(())
 }
 
+/// Age every surviving pending row by one failed sweep and evict rows that have
+/// reached `domain::PENDING_CALL_MAX_ATTEMPTS`. Called at the END of
+/// `resolve_pending_calls` (rows resolved by that sweep are already deleted, so
+/// only genuinely-unresolved rows age). Bounds the table: ~99% of buffered rows
+/// are never-resolvable external/builtin calls that would otherwise accumulate
+/// until the next INDEX_VERSION wipe. Returns the number of evicted rows.
+/// A re-parse of the caller file resets the clock naturally: cascade delete +
+/// re-buffer inserts a fresh row with attempts = 0.
+pub fn age_and_evict_pending_unresolved_calls(conn: &Connection) -> Result<usize> {
+    conn.execute("UPDATE pending_unresolved_calls SET attempts = attempts + 1", [])?;
+    let evicted = conn.execute(
+        "DELETE FROM pending_unresolved_calls WHERE attempts >= ?1",
+        [crate::domain::PENDING_CALL_MAX_ATTEMPTS],
+    )?;
+    Ok(evicted)
+}
+
 /// Diagnostic: number of buffered unresolved calls. Useful in tests + a future
 /// `code-graph-mcp health-check` warning when the table grows unbounded.
 pub fn count_pending_unresolved_calls(conn: &Connection) -> Result<i64> {
