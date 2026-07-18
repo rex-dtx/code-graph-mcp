@@ -366,7 +366,7 @@ test('e2e: `cargo test | grep FAIL` → no inject (output filter)', () => {
   }
 });
 
-test('e2e: stub reports no hits → silent (no inject)', () => {
+test('e2e: stub reports no hits → silent (no inject) but RECORDS the skip', () => {
   const uniq = `PostMiss${Date.now()}`;
   const fixture = e2eFixture(
     `process.stdout.write('[code-graph] No matches\\n');`);
@@ -375,6 +375,18 @@ test('e2e: stub reports no hits → silent (no inject)', () => {
     const res = runHook(cmd, fixture);
     assert.equal(res.status, 0);
     assert.equal(res.stdout.trim(), '', 'no-hits must inject nothing');
+    // Dark-vs-empty disclosure (roadmap 2026-07-18 §1.6): the skip must land in
+    // recommendations.jsonl so the funnel can tell "ran, nothing to say" from
+    // "hook never fired". answered:false keeps it out of funnel arming.
+    const recs = fs.readFileSync(
+      path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8');
+    const rec = JSON.parse(recs.trim().split('\n').pop());
+    assert.equal(rec.action, 'inject');
+    assert.equal(rec.answered, false);
+    assert.equal(rec.hook, 'grep');
+    assert.equal(rec.fallthrough, 'no-hits');
+    assert.equal(rec.reason, 'no-hits');
+    assert.equal(rec.pattern, uniq);
   } finally {
     cleanupFixture(fixture, cmd);
   }

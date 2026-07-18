@@ -1466,6 +1466,13 @@ pub struct RecommendationSummary {
     /// as lumping in drill-down/observe (v0.64). Tracked so the named subsets of
     /// `researched_after_answer` stay legible.
     pub followup_inconclusive: u64,
+    /// PostToolUse inject events that did NOT deliver (answered:false — cg ran but
+    /// hit no-hits/no-binary/unavailable, recorded with `fallthrough`/`reason`).
+    /// Before this counter the non-hits path recorded NOTHING, so the funnel could
+    /// not distinguish "hook dark (binary missing)" from "ran, genuinely empty"
+    /// (disclosure-gap class, roadmap 2026-07-18 §1.6). A sub-breakdown of
+    /// `by_action["inject"]`; `by_action["inject"] - inject_skipped` = delivered.
+    pub inject_skipped: u64,
 }
 
 /// Parse and aggregate `recommendations.jsonl` content. Pure: no IO, no panics —
@@ -1560,9 +1567,10 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                 // an answered deny — the next search event scores whether the
                 // inline inject sufficed (inject→fallthrough) or cg also answered
                 // the deeper step (sustained), parallel to deny→fallthrough.
-                // inject is recorded only when it actually delivered hits, so it is
-                // always answered; no unanswered counter (unlike deny). It still
-                // lands in total/by_action via the generic map above.
+                // answered:false injects (v0.99.1+) are the non-delivering path
+                // (no-hits / no-binary / unavailable) — counted in inject_skipped
+                // below, and they do NOT arm the funnel. Still land in
+                // total/by_action via the generic map above.
                 // Sub-breakdown by payload mode (best-effort: pre-v0.75 injects have
                 // no `mode` → uncounted here, still counted in by_action["inject"]).
                 if let Some(mode) = v.get("mode").and_then(|x| x.as_str()) {
@@ -1571,6 +1579,10 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                 if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
                     armed = true;
                     armed_pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
+                } else if v.get("answered").and_then(|x| x.as_bool()) == Some(false) {
+                    // Explicit answered:false only — pre-v0.99.1 injects lack the
+                    // field but were ALWAYS delivered (recorded only on hits).
+                    s.inject_skipped += 1;
                 }
             }
         }
@@ -1706,7 +1718,7 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         let full_avg = summary.full_index_ms_sum.checked_div(summary.full_index_count).unwrap_or(0);
         let mut sorted_versions: Vec<String> = summary.versions.iter().cloned().collect();
         sorted_versions.sort_by_key(|v| version_sort_key(v));
-        sout!("{}", serde_json::json!({
+        let mut stats_json = serde_json::json!({
             "sessions": summary.sessions,
             "parse_errors": summary.parse_errors,
             "versions": sorted_versions,
@@ -1785,7 +1797,13 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                     "hint_conversion": session_conversion(summary.sessions_with_hint_and_use, summary.sessions_with_hint),
                 },
             },
-        }));
+        });
+        // Assigned post-hoc: the json! literal above is at the macro recursion
+        // limit — one more inline key fails to expand (`json_internal!` recursion).
+        // Non-delivering injects (answered:false: no-hits/no-binary/unavailable) —
+        // distinguishes "hook ran, nothing to say" from "hook dark" (§1.6).
+        stats_json["recommendations"]["inject_skipped"] = serde_json::json!(recs.inject_skipped);
+        sout!("{}", stats_json);
     } else {
         let mut versions: Vec<&str> = summary.versions.iter().map(|s| s.as_str()).collect();
         versions.sort_by_key(|v| version_sort_key(v));
@@ -3100,18 +3118,39 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     }
 
     if filtered_nodes.is_empty() {
-        if json_mode {
-            println!("[]");
-        }
         if filtered && dropped_by_filter > 0 {
             // Matches existed but the language/node_type filter removed them all — the
-            // index has hits, just not of this language/type. (CLI stdout stays `[]`.)
-            eprintln!(
-                "[code-graph] No results for: {} — {} candidate(s) matched the query but were removed by the active filter (language: {}{}). Broaden or clear the filter.",
-                query, dropped_by_filter, language_filter.unwrap_or("any"),
+            // index has hits, just not of this language/type. Disclose IN-BAND
+            // (stdout), not only stderr: under `--json 2>/dev/null` a bare `[]`
+            // is byte-identical to a true zero-hit and the LLM consumer reports
+            // "no such code" (disclosure-gap class, roadmap 2026-07-18 §1.1).
+            // True zero-hit keeps the plain `[]` / stderr shape below.
+            let filter_desc = format!(
+                "language: {}{}",
+                language_filter.unwrap_or("any"),
                 node_type_filter.map(|t| format!(", node-type: {t}")).unwrap_or_default()
             );
+            if json_mode {
+                println!("{}", serde_json::json!({
+                    "results": [],
+                    "query": query,
+                    "filtered_out": dropped_by_filter,
+                    "filter": filter_desc,
+                }));
+            } else {
+                println!(
+                    "[code-graph] No results for: {} — {} candidate(s) matched but were removed by the active filter ({}). Broaden or clear the filter.",
+                    query, dropped_by_filter, filter_desc
+                );
+            }
+            eprintln!(
+                "[code-graph] No results for: {} — {} candidate(s) matched the query but were removed by the active filter ({}). Broaden or clear the filter.",
+                query, dropped_by_filter, filter_desc
+            );
         } else {
+            if json_mode {
+                println!("[]");
+            }
             eprintln!("[code-graph] No results for: {} (language: {})", query, language_filter.unwrap_or("any"));
         }
         return Ok(());
@@ -3234,13 +3273,19 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     // Two paths: filter-only (direct SQL) vs query+filter (FTS5 then filter).
     // Wrapped in a closure so a query-time freshness resync can re-run it against
     // the refreshed index; the bool reports the fts-empty case (distinct message).
+    // Third tuple slot: how many FTS candidates the STRUCTURAL filters
+    // (--type/--returns/--params) rejected — so an all-filtered empty result can
+    // disclose "candidates existed" in-band instead of a bare empty envelope
+    // (disclosure-gap class, roadmap 2026-07-18 §1.1). Skippable-triad drops are
+    // deliberately NOT counted: they are internal hygiene, not a user filter.
     let run_query = |conn: &rusqlite::Connection|
-        -> Result<(Vec<queries::NodeWithFile>, bool)> {
+        -> Result<(Vec<queries::NodeWithFile>, bool, usize)> {
+    let mut dropped_by_filter = 0usize;
     let results_with_files: Vec<queries::NodeWithFile> = if let Some(query) = query {
         // FTS5 search then filter in Rust
         let fts_result = queries::fts5_search(conn, query, (limit * 4) as i64)?;
         if fts_result.nodes.is_empty() {
-            return Ok((Vec::new(), true));
+            return Ok((Vec::new(), true, 0));
         }
 
         let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
@@ -3265,6 +3310,7 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
                 if let Some(tf) = type_filter {
                     let normalized = normalize_type_filter(tf);
                     if !normalized.iter().any(|t| n.node_type == *t) {
+                        dropped_by_filter += 1;
                         return false;
                     }
                 }
@@ -3272,20 +3318,22 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
                     match &n.return_type {
                         Some(rt) => {
                             if !rt.to_lowercase().contains(&rf.to_lowercase()) {
+                                dropped_by_filter += 1;
                                 return false;
                             }
                         }
-                        None => return false,
+                        None => { dropped_by_filter += 1; return false; }
                     }
                 }
                 if let Some(pf) = params_filter {
                     match &n.param_types {
                         Some(pt) => {
                             if !pt.to_lowercase().contains(&pf.to_lowercase()) {
+                                dropped_by_filter += 1;
                                 return false;
                             }
                         }
-                        None => return false,
+                        None => { dropped_by_filter += 1; return false; }
                     }
                 }
                 true
@@ -3305,18 +3353,19 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
             conn, type_refs, returns_filter, params_filter, None, limit,
         )?
     };
-    Ok((results_with_files, false))
+    Ok((results_with_files, false, dropped_by_filter))
     };
 
-    let (mut results_with_files, mut fts_empty) = run_query(conn)?;
+    let (mut results_with_files, mut fts_empty, mut dropped_by_filter) = run_query(conn)?;
     // Re-index any displayed file edited since indexing so start_line/end_line are
     // post-edit, then re-run once (shared resync with show/refs/…).
     let files: Vec<String> = results_with_files.iter().map(|nwf| nwf.file_path.clone()).collect();
     let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
     if outcome.any_changed {
-        let (r, e) = run_query(conn)?;
+        let (r, e, d) = run_query(conn)?;
         results_with_files = r;
         fts_empty = e;
+        dropped_by_filter = d;
     }
     outcome.disclose();
 
@@ -3329,10 +3378,43 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     }
 
     if results_with_files.is_empty() {
-        if json_mode {
-            println!("{}", serde_json::json!({"results": [], "count": 0}));
+        if dropped_by_filter > 0 {
+            // The query HAD hits; the structural filters removed every one. Say so
+            // in-band — a bare empty envelope under `2>/dev/null` reads as "no such
+            // code" (disclosure-gap class, roadmap 2026-07-18 §1.1). Mirrors the
+            // cmd_search filter-emptied object.
+            let filter_desc = [
+                type_filter.map(|t| format!("type: {t}")),
+                returns_filter.map(|r| format!("returns: {r}")),
+                params_filter.map(|p| format!("params: {p}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            if json_mode {
+                println!("{}", serde_json::json!({
+                    "results": [],
+                    "count": 0,
+                    "filtered_out": dropped_by_filter,
+                    "filter": filter_desc,
+                }));
+            } else {
+                println!(
+                    "[code-graph] No results — {} candidate(s) matched the query but were removed by the active filter ({}). Broaden or clear the filter.",
+                    dropped_by_filter, filter_desc
+                );
+            }
+            eprintln!(
+                "[code-graph] No results matching filters — {} candidate(s) removed by ({}).",
+                dropped_by_filter, filter_desc
+            );
+        } else {
+            if json_mode {
+                println!("{}", serde_json::json!({"results": [], "count": 0}));
+            }
+            eprintln!("[code-graph] No results matching filters.");
         }
-        eprintln!("[code-graph] No results matching filters.");
         return Ok(());
     }
 
@@ -3356,10 +3438,11 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
             })
             .collect();
         // Envelope matches MCP ast_search: {results, count}
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "results": results,
             "count": results_with_files.len(),
         });
+        outcome.attach_partial(&mut envelope);
         writeln!(stdout, "{}", serde_json::to_string(&envelope)?)?;
         return Ok(());
     }
@@ -3522,7 +3605,15 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let symbol = resolved_symbol.as_str();
     if result.nodes.is_empty() {
         if json_mode {
-            println!("{{\"results\":[]}}");
+            // In-band error (disclosure-gap class, roadmap 2026-07-18 §1.3):
+            // a bare `{"results":[]}` under `2>/dev/null` is indistinguishable
+            // from a legitimately edge-less symbol. Same shape as the ambiguous
+            // branch above ({results, error, …}) and impact's error object.
+            println!("{}", serde_json::json!({
+                "results": [],
+                "error": format!("No call graph results for: {}", symbol),
+                "symbol": symbol,
+            }));
         }
         eprintln!("[code-graph] No call graph results for: {}", symbol);
         std::process::exit(1);
@@ -3793,7 +3884,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // reflects disk (a caller added/removed since indexing). impact prints no line
     // numbers, so this refreshes the caller SET; re-run the caller query and re-fetch
     // symbol_nodes when anything changed.
-    {
+    let fresh_outcome = {
         let mut files: Vec<String> = symbol_nodes
             .iter()
             .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
@@ -3807,7 +3898,8 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
         }
         outcome.disclose();
-    }
+        outcome
+    };
     // Ambiguous callers folded out of the blast radius by the confidence floor,
     // counted across the whole returned frontier (seed direct + every kept
     // caller's pruned callers) so a TRANSITIVE ambiguous caller of a
@@ -3885,6 +3977,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 ambiguous_callers_excluded
             ));
         }
+        fresh_outcome.attach_partial(&mut result);
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
     }
@@ -4220,6 +4313,11 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
         for d in deps.iter().take(max_deps) {
             writeln!(stdout, "  {} → {} ({} imports)", d.from, d.to, d.import_count)?;
         }
+        // Truncation marker (roadmap 2026-07-18 §1.7): the silent .min(30) cap
+        // read as "that's every dependency" — same pattern as the modules cap.
+        if deps.len() > max_deps {
+            writeln!(stdout, "  ... and {} more dependencies", deps.len() - max_deps)?;
+        }
     }
 
     // Hot functions (compact: top 5)
@@ -4241,6 +4339,9 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
                     h.name, h.node_type, h.caller_count, h.file
                 )?;
             }
+        }
+        if hot_functions.len() > max_hot {
+            writeln!(stdout, "  ... and {} more hot functions", hot_functions.len() - max_hot)?;
         }
     }
 
@@ -4421,7 +4522,11 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
         // instead of `anyhow::bail!` so the JSON-mode stderr doesn't carry
         // the anyhow `Error:` prefix that confuses log consumers.
         if json_mode {
-            println!("[]");
+            // In-band error object (roadmap 2026-07-18 §1.3): a bare `[]` under
+            // `2>/dev/null` is indistinguishable from an empty-but-indexed dir.
+            println!("{}", serde_json::json!({
+                "error": "No symbols found", "path": raw_path,
+            }));
             eprintln!("[code-graph] No symbols found under: {}", raw_path);
             std::process::exit(1);
         }
@@ -4597,6 +4702,19 @@ impl FreshOutcome {
         eprintln!("[code-graph] note: {msg}");
         tracing::warn!("cli freshness partial: {msg}");
     }
+
+    /// In-band partial-freshness marker for OBJECT-shaped `--json` outputs
+    /// (roadmap 2026-07-18 §1.4): the stderr note above is invisible under
+    /// `--json 2>/dev/null`, so envelope emitters attach `freshness_partial:
+    /// true` when some displayed files stayed stale. Array-shaped outputs
+    /// (search/show/overview/similar/dead-code) cannot carry a top-level field
+    /// without breaking their success shape — for those the stderr note remains
+    /// the only channel (documented boundary). No-op when fully fresh.
+    fn attach_partial(&self, obj: &mut serde_json::Value) {
+        if self.is_partial() {
+            obj["freshness_partial"] = serde_json::json!(true);
+        }
+    }
 }
 
 /// Query-time freshness resync shared by the read commands that print
@@ -4765,7 +4883,13 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         match queries::get_node_with_file_by_id(conn, nid)? {
             Some(nwf) => vec![(nwf.node, nwf.file_path)],
             None => {
-                if json_mode { println!("[]"); }
+                if json_mode {
+                    // In-band error object (roadmap 2026-07-18 §1.3), matching
+                    // impact's `{"error", "symbol"}` miss contract.
+                    println!("{}", serde_json::json!({
+                        "error": "Node ID not found", "node_id": nid,
+                    }));
+                }
                 eprintln!("[code-graph] Node ID {} not found.", nid);
                 std::process::exit(1);
             }
@@ -4804,9 +4928,20 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         outcome.disclose();
 
         if nodes.is_empty() {
-            if json_mode { println!("[]"); }
-            eprintln!("[code-graph] Symbol not found: {}", symbol);
             let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
+            if json_mode {
+                // In-band error + fuzzy candidates (roadmap 2026-07-18 §1.3):
+                // the stderr-only "Did you mean" list was invisible under
+                // `--json 2>/dev/null`, so the miss read as "symbol absent".
+                // Shape matches impact's `{"error", "symbol"}` miss contract.
+                let sugg: Vec<serde_json::Value> = candidates.iter().take(5).map(|c| serde_json::json!({
+                    "name": c.name, "type": c.node_type, "file_path": c.file_path,
+                })).collect();
+                println!("{}", serde_json::json!({
+                    "error": "Symbol not found", "symbol": symbol, "candidates": sugg,
+                }));
+            }
+            eprintln!("[code-graph] Symbol not found: {}", symbol);
             if !candidates.is_empty() {
                 eprintln!("[code-graph] Did you mean:");
                 for c in candidates.iter().take(5) {
@@ -5157,6 +5292,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         if ambiguous_hidden > 0 {
             envelope["ambiguous_edges_hidden"] = serde_json::json!(ambiguous_hidden);
         }
+        outcome.attach_partial(&mut envelope);
         writeln!(stdout, "{}", serde_json::to_string(&envelope)?)?;
         return Ok(());
     }
@@ -5938,12 +6074,13 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         for r in &all_refs {
             *by_relation.entry(r.relation.clone()).or_insert(0) += 1;
         }
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "symbol": symbol,
             "total_references": items.len(),
             "by_relation": by_relation,
             "references": items,
         });
+        outcome.attach_partial(&mut envelope);
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
         let mut stdout = std::io::stdout().lock();
@@ -6061,20 +6198,47 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     outcome.disclose();
 
     if report.is_empty() {
-        if json_mode {
-            writeln!(std::io::stdout().lock(), "[]")?;
-        }
+        // Empty-but-something-hidden discloses IN-BAND (stdout/JSON), not only
+        // stderr: under `--json 2>/dev/null` a bare `[]` reads as "clean" even
+        // when --ignore/--min-lines hid real candidates (disclosure-gap class,
+        // roadmap 2026-07-18 §1.2). True clean keeps the plain `[]`.
         if report.ignored_count > 0 {
+            if json_mode {
+                println!("{}", serde_json::json!({
+                    "results": [],
+                    "ignored_count": report.ignored_count,
+                }));
+            } else {
+                println!(
+                    "[code-graph] No dead code found after filtering; {} suppressed by --ignore (use --no-ignore to see them).",
+                    report.ignored_count,
+                );
+            }
             eprintln!(
                 "[code-graph] No dead code found after filtering; {} suppressed by --ignore (use --no-ignore to see them).",
                 report.ignored_count,
             );
         } else if report.hidden_below_threshold > 0 {
+            if json_mode {
+                println!("{}", serde_json::json!({
+                    "results": [],
+                    "below_threshold_count": report.hidden_below_threshold,
+                    "min_lines": min_lines,
+                }));
+            } else {
+                println!(
+                    "[code-graph] No dead code found at \u{2265}{min_lines} lines ({} shorter symbol(s) below the threshold; rerun with --min-lines 1 to include them).",
+                    report.hidden_below_threshold
+                );
+            }
             eprintln!(
                 "[code-graph] No dead code found at \u{2265}{min_lines} lines ({} shorter symbol(s) below the threshold; rerun with --min-lines 1 to include them).",
                 report.hidden_below_threshold
             );
         } else {
+            if json_mode {
+                writeln!(std::io::stdout().lock(), "[]")?;
+            }
             eprintln!("[code-graph] No dead code found.");
         }
         return Ok(());
@@ -6253,7 +6417,12 @@ pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
 
     let edges = crate::storage::queries::all_file_import_edges(conn)?;
     let mut cycles = crate::graph::cycles::find_cycles(&edges);
+    // Record the pre-truncation total: printing "(N found)" from the truncated
+    // length under-reported ("50 found" when 80 exist) with no truncation marker
+    // (disclosure-gap class, roadmap 2026-07-18 §1.5).
+    let total_found = cycles.len();
     cycles.truncate(limit as usize);
+    let truncated = total_found > cycles.len();
 
     let mut stdout = std::io::stdout().lock();
 
@@ -6266,7 +6435,18 @@ pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
                 "cycle": c.path,
             })
         }).collect();
-        writeln!(stdout, "{}", serde_json::to_string(&items)?)?;
+        if truncated {
+            // Disclosure envelope only when --limit actually cut results
+            // (mirrors callgraph's `limit_hit`); the common untruncated case
+            // keeps the plain array shape.
+            writeln!(stdout, "{}", serde_json::to_string(&serde_json::json!({
+                "results": items,
+                "total_found": total_found,
+                "truncated": true,
+            }))?)?;
+        } else {
+            writeln!(stdout, "{}", serde_json::to_string(&items)?)?;
+        }
         return Ok(());
     }
 
@@ -6275,7 +6455,11 @@ pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
         return Ok(());
     }
 
-    writeln!(stdout, "Circular import dependencies ({} found):", cycles.len())?;
+    if truncated {
+        writeln!(stdout, "Circular import dependencies (showing {} of {} found — raise --limit for the rest):", cycles.len(), total_found)?;
+    } else {
+        writeln!(stdout, "Circular import dependencies ({} found):", cycles.len())?;
+    }
     writeln!(stdout, "(files that transitively import each other — a → b → … → a)\n")?;
     for c in &cycles {
         writeln!(stdout, "  {}", c.headline())?;
@@ -7075,6 +7259,33 @@ mod tests {
         // t5 has no `mode` field → not counted in any mode bucket; the mode map sums
         // to 4 while by_action.inject stays 5 (mode is best-effort metadata).
         assert_eq!(s.inject_by_mode.values().sum::<u64>(), 4, "t5 (no mode) is uncounted");
+    }
+
+    #[test]
+    fn test_aggregate_recommendations_inject_skipped() {
+        // v0.99.1 (roadmap §1.6): the PostToolUse non-hits path now RECORDS
+        // (answered:false + fallthrough/reason) instead of staying dark, so the
+        // funnel can tell "hook ran, nothing to say" from "hook never fired".
+        // answered:false must count in inject_skipped, must NOT arm the funnel,
+        // and a skip following an answered deny must score via the existing
+        // inconclusive shapes (fallthrough:"no-hits" / reason:"unavailable").
+        let content = "\
+{\"ts\":\"t1\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":false,\"pattern\":\"a\",\"fallthrough\":\"no-hits\",\"reason\":\"no-hits\"}
+{\"ts\":\"t2\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"b\",\"mode\":\"callgraph\"}
+{\"ts\":\"t3\",\"hook\":\"grep\",\"action\":\"deny\",\"answered\":true,\"pattern\":\"c\"}
+{\"ts\":\"t4\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":false,\"pattern\":\"d\",\"fallthrough\":\"unavailable\",\"reason\":\"unavailable\"}
+";
+        let s = aggregate_recommendations_jsonl(content);
+        assert_eq!(s.inject_skipped, 2, "t1 + t4 are skips");
+        assert_eq!(s.by_action.get("inject"), Some(&3), "skips still count as inject events");
+        // t1 (answered:false) must NOT arm — so t2 is not scored as a re-search.
+        // t2 (answered inject) arms → t3 (answered deny, different pattern) scores
+        // sustained; t3 arms → t4's reason:"unavailable" scores inconclusive, not
+        // fallthrough. Total re-searches: t2→t3 and t3→t4 (NOT t1→t2).
+        assert_eq!(s.researched_after_answer, 2, "t2→t3 and t3→t4; t1 must not arm");
+        assert_eq!(s.sustained_after_answer, 1, "t3 after answered t2");
+        assert_eq!(s.followup_inconclusive, 1, "unavailable skip is a null signal");
+        assert_eq!(s.fallthrough_after_answer, 0);
     }
 
     #[test]

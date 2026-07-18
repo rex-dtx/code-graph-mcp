@@ -309,8 +309,22 @@ function runMain() {
 
   // Only inject on hits — no-hits / unavailable / no-binary stay silent (the grep
   // already ran and produced its own output; a failed cg answer adds no value and
-  // 0 hits ≠ proof of absence given regex-dialect differences).
-  if (answer.status !== 'hits') return;
+  // 0 hits ≠ proof of absence given regex-dialect differences). But RECORD the
+  // skip (roadmap 2026-07-18 §1.6): without a record the funnel cannot tell
+  // "hook dark (binary missing)" from "ran, genuinely nothing" — the sibling
+  // hooks all record their non-answered paths. `fallthrough`+`reason` carry the
+  // status in the shapes the Rust aggregator already scores as inconclusive
+  // (`fallthrough:"no-hits"` / `reason:"unavailable"`); answered:false keeps it
+  // out of funnel arming and lands it in `inject_skipped`.
+  if (answer.status !== 'hits') {
+    recordRecommendation(root, {
+      hook: 'grep', action: 'inject', answered: false,
+      ...(pattern ? { pattern } : {}),
+      fallthrough: answer.status,
+      reason: answer.status,
+    });
+    return;
+  }
 
   recordRecommendation(root, {
     hook: 'grep', action: 'inject', answered: true,

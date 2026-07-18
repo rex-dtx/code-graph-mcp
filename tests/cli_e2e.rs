@@ -557,15 +557,18 @@ fn test_cli_search_language_filter() {
 #[test]
 fn test_cli_search_filter_removed_all_explains_why() {
     // Regression: an over-selective language filter that removes EVERY query match must
-    // explain on stderr that candidates matched but were filtered out — not a bare
-    // "no results" — while stdout keeps the `[]` JSON contract. Guards the post-fetch
-    // under-fetch fix: vec0/FTS can't pre-filter on joined language, so the drop happens
-    // after fetch and is invisible without this signal (CLI↔MCP parity).
+    // explain that candidates matched but were filtered out — not a bare "no results".
+    // Guards the post-fetch under-fetch fix: vec0/FTS can't pre-filter on joined
+    // language, so the drop happens after fetch and is invisible without this signal.
+    // v0.99.1 (roadmap §1.1): stdout now carries a self-describing object (NOT `[]`)
+    // so the disclosure survives `2>/dev/null`; stderr keeps the human message.
     let project = setup_indexed_project(); // TS fixture: validateToken in api.ts/auth.ts
     let (stdout, stderr, code) =
         run_cli(&project, &["search", "validateToken", "--language", "python", "--json"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[]", "stdout JSON contract must stay []; got: {stdout:?}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["results"], serde_json::json!([]));
+    assert!(v["filtered_out"].as_u64().unwrap_or(0) >= 1, "in-band disclosure; got {stdout:?}");
     assert!(
         stderr.contains("removed by the active filter"),
         "stderr must explain the filter emptied the results; got: {stderr:?}"
@@ -2961,7 +2964,9 @@ fn test_cli_overview_json_empty_no_anyhow_prefix() {
     let project = setup_indexed_project();
     let (stdout, stderr, code) = run_cli(&project, &["overview", "nonexistent/", "--json"]);
     assert_eq!(code, 1, "JSON empty overview exit code; stderr={stderr:?}");
-    assert_eq!(stdout.trim(), "[]", "stdout must be exactly `[]`; got {stdout:?}");
+    // v0.99.1: the miss emits a self-describing error object (roadmap §1.3), not `[]`.
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["error"], "No symbols found", "in-band error field; got {stdout:?}");
     assert!(!stderr.contains("Error:"),
         "JSON mode must not emit anyhow `Error:` prefix on stderr; got {stderr:?}");
     assert!(stderr.contains("No symbols found"),
@@ -3785,6 +3790,11 @@ fn test_cli_json_empty_callgraph() {
     assert_eq!(code, 1);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert!(v.is_object(), "JSON callgraph error should output JSON object");
+    // v0.99.1 (roadmap §1.3): the miss is self-describing in-band, not a bare
+    // {"results":[]} indistinguishable from an edge-less symbol under 2>/dev/null.
+    assert!(v["error"].as_str().unwrap_or("").contains("No call graph results"),
+        "in-band error field; got {stdout:?}");
+    assert_eq!(v["results"], serde_json::json!([]));
 }
 
 #[test]
@@ -3792,19 +3802,40 @@ fn test_cli_json_empty_show() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["show", "xyznonexistent", "--json"]);
     assert_eq!(code, 1);
-    assert_eq!(stdout.trim(), "[]", "JSON show with no results should output []");
+    // v0.99.1 (roadmap §1.3): self-describing error object with the fuzzy
+    // candidates in-band (they were stderr-only, invisible under 2>/dev/null).
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["error"], "Symbol not found", "in-band error; got {stdout:?}");
+    assert_eq!(v["symbol"], "xyznonexistent");
+    assert!(v["candidates"].is_array(), "candidates array must be present (may be empty)");
+}
+
+#[test]
+fn test_cli_show_json_miss_carries_fuzzy_candidates() {
+    // A near-miss symbol must surface its "Did you mean" candidates IN the JSON
+    // error object, not only on stderr (roadmap §1.3).
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["show", "validateTokenz", "--json"]);
+    assert_eq!(code, 1);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let cands = v["candidates"].as_array().unwrap();
+    assert!(
+        cands.iter().any(|c| c["name"] == "validateToken"),
+        "fuzzy candidate validateToken must be in-band; got {stdout:?}"
+    );
 }
 
 #[test]
 fn test_cli_json_empty_show_node_id_missing() {
     // Regression: `show --node-id 999999` for a nonexistent ID exited 1 with
-    // empty stdout in --json mode, asymmetric with the symbol-not-found path
-    // above which already emits []. Both empty-result paths must agree.
+    // empty stdout in --json mode. Both miss paths must agree on the
+    // self-describing error-object contract (roadmap §1.3).
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["show", "--node-id", "9999999", "--json"]);
     assert_eq!(code, 1);
-    assert_eq!(stdout.trim(), "[]",
-        "JSON show with nonexistent --node-id should output [] (matches symbol-not-found path)");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["error"], "Node ID not found", "in-band error; got {stdout:?}");
+    assert_eq!(v["node_id"], 9999999);
 }
 
 #[test]
@@ -3855,22 +3886,36 @@ fn test_cli_json_empty_overview() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["overview", "nonexistent/", "--json"]);
     assert_eq!(code, 1);
-    assert_eq!(stdout.trim(), "[]", "JSON overview with no results should output []");
+    // v0.99.1 (roadmap §1.3): self-describing error object instead of a bare `[]`
+    // indistinguishable from an empty-but-indexed dir under 2>/dev/null.
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["error"], "No symbols found", "in-band error; got {stdout:?}");
+    assert_eq!(v["path"], "nonexistent/");
 }
 
 #[test]
 fn test_cli_json_empty_dead_code() {
     // Regression: dead-code --json with all results filtered by --ignore returned
-    // only stderr (no stdout), breaking JSON consumers piping stdout. Must emit `[]`.
+    // only stderr (no stdout), breaking JSON consumers piping stdout. v0.99.1
+    // (roadmap §1.2): when --ignore actually suppressed candidates, the empty
+    // output is a self-describing object carrying ignored_count in-band.
     let project = setup_indexed_project();
+    // --min-lines 1 so the fixture's short dead symbols land in the candidate set
+    // and are then ignore-suppressed (ignored_count is counted at the ACTIVE
+    // min-lines; at the default 3 the short fixture symbols never reach it).
     let (stdout, stderr, code) = run_cli(&project, &[
         "dead-code",
+        "--min-lines", "1",
         "--ignore", "src/",
         "--ignore", "tests/",
         "--json",
     ]);
     assert_eq!(code, 0, "dead-code with no matches should exit 0");
-    assert_eq!(stdout.trim(), "[]", "dead-code --json with no results must output []");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("dead-code --json must emit valid JSON on the ignored-empty path");
+    assert_eq!(v["results"], serde_json::json!([]));
+    assert!(v["ignored_count"].as_u64().unwrap_or(0) >= 1,
+        "ignored_count must disclose the suppressed candidates; got {stdout:?}");
     assert!(
         stderr.contains("No dead code"),
         "stderr should still surface the human-readable reason; got: {stderr}",
@@ -3971,6 +4016,142 @@ fn test_cli_json_empty_ast_search() {
     assert!(v.is_object(), "ast-search --json empty should be the {{results,count}} envelope");
     assert!(v["results"].is_array(), "envelope must include results array");
     assert_eq!(v["count"], 0, "empty result count is 0");
+}
+
+#[test]
+fn test_cli_search_filter_emptied_discloses() {
+    // v0.99.1 (roadmap §1.1 HIGH): when the query HAD hits but the language
+    // filter removed them all, the JSON must be a self-describing object —
+    // previously a bare `[]`, byte-identical to a true zero-hit under
+    // `2>/dev/null`. Text mode gets a stdout line for the same reason.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["search", "validateToken", "--language", "python", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["results"], serde_json::json!([]));
+    assert!(v["filtered_out"].as_u64().unwrap_or(0) >= 1,
+        "filtered_out must disclose the removed candidates; got {stdout:?}");
+    assert!(v["filter"].as_str().unwrap_or("").contains("python"),
+        "active filter must be named; got {stdout:?}");
+
+    // Text mode: the disclosure reaches stdout (not only stderr).
+    let (t_stdout, _, t_code) = run_cli(&project, &["search", "validateToken", "--language", "python"]);
+    assert_eq!(t_code, 0);
+    assert!(t_stdout.contains("removed by the active filter"),
+        "text mode must disclose on stdout; got {t_stdout:?}");
+
+    // Negative control: a true zero-hit (no filter) keeps the plain `[]`.
+    let (z_stdout, _, _) = run_cli(&project, &["search", "xyznonexistent", "--json"]);
+    assert_eq!(z_stdout.trim(), "[]");
+}
+
+#[test]
+fn test_cli_ast_search_filter_emptied_discloses() {
+    // Same disclosure for ast-search's structural filters (§1.1): query hits +
+    // an over-selective --returns → envelope carries filtered_out + filter.
+    let project = setup_indexed_project();
+    let (stdout, _, code) = run_cli(&project, &["ast-search", "validateToken", "--returns", "zzznope", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["results"], serde_json::json!([]));
+    assert_eq!(v["count"], 0);
+    assert!(v["filtered_out"].as_u64().unwrap_or(0) >= 1,
+        "filtered_out must disclose the removed candidates; got {stdout:?}");
+    assert!(v["filter"].as_str().unwrap_or("").contains("returns: zzznope"),
+        "active filter must be named; got {stdout:?}");
+
+    // Negative control: a no-hit query (nothing filtered) keeps the bare envelope.
+    let (z_stdout, _, _) = run_cli(&project, &["ast-search", "xyznonexistent", "--json"]);
+    let z: serde_json::Value = serde_json::from_str(z_stdout.trim()).unwrap();
+    assert!(z.get("filtered_out").is_none(), "no disclosure fields on a true zero-hit");
+}
+
+#[test]
+fn test_cli_dead_code_below_threshold_json_discloses() {
+    // §1.2: the threshold-hidden empty case must be self-describing in JSON —
+    // mirrors test_cli_dead_code_hints_at_symbols_below_min_lines (stderr) but
+    // pins the `--json 2>/dev/null` surface an LLM consumer actually reads.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("m.py"),
+        "def orphan1():\n    return 1\n\ndef used():\n    return 2\n\ndef caller():\n    return used()\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["dead-code", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["results"], serde_json::json!([]));
+    assert!(v["below_threshold_count"].as_u64().unwrap_or(0) >= 1,
+        "below_threshold_count must disclose hidden short symbols; got {stdout:?}");
+    assert_eq!(v["min_lines"], 3, "the active threshold must be named");
+
+    // Text mode: the rerun hint reaches stdout too.
+    let (t_stdout, _, _) = run_cli(&project, &["dead-code"]);
+    assert!(t_stdout.contains("--min-lines 1"),
+        "text mode must put the rerun hint on stdout; got {t_stdout:?}");
+}
+
+#[test]
+fn test_cli_cycles_truncation_discloses() {
+    // §1.5: `--limit` used to shrink the printed "(N found)" to the truncated
+    // length with no marker. Two independent 2-file cycles + --limit 1 must
+    // disclose the real total on both surfaces; without truncation the JSON
+    // keeps its plain array shape.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.ts"), "import { b } from './b';\nexport function a(): number { return b(); }\n").unwrap();
+    std::fs::write(src.join("b.ts"), "import { a } from './a';\nexport function b(): number { return a(); }\n").unwrap();
+    std::fs::write(src.join("c.ts"), "import { d } from './d';\nexport function c(): number { return d(); }\n").unwrap();
+    std::fs::write(src.join("d.ts"), "import { c } from './c';\nexport function d(): number { return c(); }\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["cycles", "--limit", "1", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["truncated"], true, "truncation must be disclosed; got {stdout:?}");
+    assert_eq!(v["total_found"], 2);
+    assert_eq!(v["results"].as_array().unwrap().len(), 1);
+
+    let (t_stdout, _, _) = run_cli(&project, &["cycles", "--limit", "1"]);
+    assert!(t_stdout.contains("showing 1 of 2"),
+        "text mode must print the pre-truncation total; got {t_stdout:?}");
+
+    // Untruncated: plain array shape, both cycles present.
+    let (full, _, _) = run_cli(&project, &["cycles", "--json"]);
+    let fv: serde_json::Value = serde_json::from_str(full.trim()).unwrap();
+    assert_eq!(fv.as_array().map(|a| a.len()), Some(2),
+        "untruncated cycles keeps the plain array; got {full:?}");
+}
+
+#[test]
+fn test_cli_ast_search_freshness_partial_in_json() {
+    // §1.4: a partial freshness resync was stderr-only — invisible under
+    // `--json 2>/dev/null`. Object-shaped outputs must carry freshness_partial.
+    // RESYNC_BUDGET=0 forces the partial (skipped_over_budget) path.
+    let project = setup_indexed_project();
+    let (fresh, _, _) = run_cli(&project, &["ast-search", "hashPassword", "--json"]);
+    let fv: serde_json::Value = serde_json::from_str(fresh.trim()).unwrap();
+    assert!(fv.get("freshness_partial").is_none(),
+        "fully-fresh run must not carry the marker; got {fresh:?}");
+
+    prepend_pad(&project, "src/auth.ts", 1);
+
+    let (stale, _, code) = run_cli_env(&project, &["ast-search", "hashPassword", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    assert_eq!(code, 0);
+    let sv: serde_json::Value = serde_json::from_str(stale.trim()).unwrap();
+    assert_eq!(sv["freshness_partial"], true,
+        "partial resync must be disclosed in-band; got {stale:?}");
 }
 
 #[test]

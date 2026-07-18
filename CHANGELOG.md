@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Fixed — disclosure batch (roadmap 2026-07-18 §1: honest info must reach the consumer)
+
+All CLI query commands whose discriminating information lived only on stderr (or
+nowhere) now put it in-band on stdout/JSON, where an LLM consumer running with
+`2>/dev/null` actually reads. JSON shape notes below; every change is on an
+empty/miss/truncated path — populated success outputs are unchanged.
+
+- **`search` / `ast-search`: filter-emptied results are self-describing** — when
+  the query HAD hits but `--language`/`--node-type`/`--returns`/`--params`
+  removed them all, JSON was a bare `[]` (or `{results:[],count:0}`),
+  byte-identical to a true zero-hit. Now an object:
+  `{"results":[],"filtered_out":N,"filter":"language: python"}` (search keeps
+  `query`; ast-search keeps `count`). Text mode prints the same line on stdout.
+  True zero-hits keep the old shapes.
+- **`dead-code`: hidden-candidate empties are self-describing** — empty because
+  `--ignore` suppressed candidates → `{"results":[],"ignored_count":N}`; empty
+  because all orphans sit below `--min-lines` → `{"results":[],
+  "below_threshold_count":N,"min_lines":M}`. True clean keeps `[]`. Text mode
+  puts the rerun hint on stdout.
+- **`show` / `overview` / `callgraph`: misses carry an in-band error object**
+  (exit codes unchanged, still 1) — `show` emits `{"error":"Symbol not found",
+  "symbol":…,"candidates":[…]}` with the fuzzy "Did you mean" list in-band
+  (was stderr-only); `show --node-id` emits `{"error":"Node ID not found",
+  "node_id":…}`; `overview` emits `{"error":"No symbols found","path":…}`
+  (was `[]`); `callgraph` adds `error`+`symbol` to its `{"results":[]}` object.
+  Matches the `impact`/`refs`/`trace` in-band miss contract.
+- **Partial freshness resync is disclosed in JSON** — the "N file(s) changed
+  since indexing; line numbers may be stale" note was stderr-only. Object-shaped
+  outputs (`ast-search`, `impact`, `trace`, `refs`) now carry
+  `"freshness_partial":true` when it applies. Array-shaped outputs
+  (`search`/`show`/`overview`/`similar`/`dead-code`) cannot carry a top-level
+  field without breaking their success shape — stderr remains their channel.
+- **`cycles`: truncation is disclosed** — `--limit` used to shrink the printed
+  "(N found)" to the truncated length with no marker. Text now prints
+  "(showing L of N found)"; JSON becomes `{"results":[…],"total_found":N,
+  "truncated":true}` when (and only when) truncated — the untruncated array
+  shape is unchanged.
+- **`map`: silent list caps get "+N more" markers** — dependencies (top-30
+  non-compact / top-10 compact) and compact hot-functions (top-5) now say
+  "... and N more", matching the modules cap.
+- **post-grep-inject records its non-delivering path** — the PostToolUse
+  compound-grep hook recorded nothing when cg had no answer, so telemetry could
+  not distinguish "hook dark (binary missing)" from "ran, genuinely nothing".
+  Skips now log `answered:false` + `fallthrough`/`reason` (status), surfaced as
+  `inject_skipped` in `stats --json`; they do not arm the conversion funnel.
+
 ### Fixed
 - **Compound-command denies now flag the dropped tail on the FIRST line** — the
   pre-grep hook's re-issue NOTE (`the rest of this compound command did NOT run`)
