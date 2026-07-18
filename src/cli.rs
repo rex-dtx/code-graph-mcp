@@ -100,6 +100,52 @@ pub fn resolve_project_root() -> std::io::Result<PathBuf> {
     Ok(resolve_project_root_from(&std::env::current_dir()?))
 }
 
+/// Main-checkout root of a LINKED git worktree, or None. A linked worktree's
+/// `.git` is a FILE containing `gitdir: <main>/.git/worktrees/<name>`; a
+/// regular repo has a `.git` DIRECTORY, and a submodule's `.git` file points
+/// at `…/.git/modules/…` (a different codebase — hard boundary, returns None
+/// because the `worktrees` marker is absent). Rust mirror of
+/// `claude-plugin/scripts/project-root.js` `worktreeMainRoot` — keep the two
+/// in sync by hand (they share the marker-substring contract, not code).
+fn worktree_main_root(root: &Path) -> Option<PathBuf> {
+    let git_path = root.join(".git");
+    if !git_path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&git_path).ok()?;
+    let gitdir_line = content.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    if gitdir_line.is_empty() {
+        return None;
+    }
+    let gitdir = if Path::new(gitdir_line).is_absolute() {
+        PathBuf::from(gitdir_line)
+    } else {
+        root.join(gitdir_line)
+    };
+    let s = gitdir.to_string_lossy();
+    let sep = std::path::MAIN_SEPARATOR;
+    let marker = format!("{sep}.git{sep}worktrees{sep}");
+    let idx = s.rfind(&marker)?;
+    let main_root = PathBuf::from(&s[..idx]);
+    if main_root.as_os_str().is_empty() { None } else { Some(main_root) }
+}
+
+/// Read-side effective root (D#106): the given root when its index exists
+/// (own index always wins); else, for a linked worktree whose MAIN checkout
+/// is indexed, the main checkout root; else the given root unchanged (the
+/// caller's "No index found" path fires with the original location).
+fn effective_read_root(project_root: &Path) -> PathBuf {
+    if project_root.join(CODE_GRAPH_DIR).join("index.db").exists() {
+        return project_root.to_path_buf();
+    }
+    if let Some(main) = worktree_main_root(project_root) {
+        if main.join(CODE_GRAPH_DIR).join("index.db").exists() {
+            return main;
+        }
+    }
+    project_root.to_path_buf()
+}
+
 /// Project-root markers — the literal set the JS activation gate uses
 /// (`claude-plugin/scripts/project-detect.js` `PROJECT_MARKERS`). Both layers
 /// must agree on "what is a real project"; kept in sync by hand.
@@ -210,6 +256,14 @@ pub struct CliContext {
 
 impl CliContext {
     pub fn open(project_root: &Path) -> Result<Self> {
+        // Read-side worktree fallback (D#106, roadmap §2.2 — Rust mirror of the
+        // v0.99.0 project-root.js fix): a linked worktree with no OWN index
+        // reads the main checkout's index instead of erroring/cold-building.
+        // Own index wins (checked first inside effective_read_root); write side
+        // (index/serve/rebuild) does not go through CliContext and still builds
+        // a local index. Paths/line numbers in answers are the main checkout's,
+        // same contract as the JS hooks/statusline side.
+        let project_root = &effective_read_root(project_root);
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
             anyhow::bail!(
@@ -231,6 +285,8 @@ impl CliContext {
 
     /// Try to open, returning None if no index exists (for grep fallback).
     pub fn try_open(project_root: &Path) -> Option<Self> {
+        // Same read-side worktree fallback as open() above.
+        let project_root = &effective_read_root(project_root);
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         if !db_path.exists() {
             return None;
@@ -7260,6 +7316,28 @@ mod tests {
         // t5 has no `mode` field → not counted in any mode bucket; the mode map sums
         // to 4 while by_action.inject stays 5 (mode is best-effort metadata).
         assert_eq!(s.inject_by_mode.values().sum::<u64>(), 4, "t5 (no mode) is uncounted");
+    }
+
+    #[test]
+    fn test_worktree_main_root_boundaries() {
+        // Linked worktree (.git FILE, gitdir → …/.git/worktrees/<n>) resolves to
+        // the main checkout; a submodule pointer (…/.git/modules/…) and a regular
+        // repo (.git DIRECTORY) must both return None (hard boundaries — mirrors
+        // project-root.js worktreeMainRoot).
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+
+        std::fs::write(d.join(".git"), format!(
+            "gitdir: {}/main/.git/worktrees/wt\n", d.display())).unwrap();
+        assert_eq!(worktree_main_root(d), Some(d.join("main")));
+
+        std::fs::write(d.join(".git"), format!(
+            "gitdir: {}/outer/.git/modules/sub\n", d.display())).unwrap();
+        assert_eq!(worktree_main_root(d), None, "submodule gitdir is a hard boundary");
+
+        std::fs::remove_file(d.join(".git")).unwrap();
+        std::fs::create_dir(d.join(".git")).unwrap();
+        assert_eq!(worktree_main_root(d), None, ".git DIRECTORY = regular repo");
     }
 
     #[test]

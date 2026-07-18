@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Query commands inside a linked git worktree read the main checkout's
+  index** (roadmap §2.2, Rust read-side of the v0.99.0 JS fix) — every
+  CLI reader behind `CliContext` (search/show/callgraph/grep/…) used to
+  error "No index found" (or cold-build a duplicate index) in a Claude Code
+  `.claude/worktrees/<slug>` checkout. A worktree with no own index now
+  falls back to the main checkout's index (own index still wins; submodule
+  `.git` pointers remain a hard boundary; write side — index/serve/rebuild —
+  still builds locally). Paths and line numbers in answers are the main
+  checkout's, same contract as the JS hooks/statusline.
+
 ## v0.100.0 — axum routes + namespace/star-barrel edges (roadmap Phase 2a)
 
 ### Added — INDEX_VERSION 51 (existing indexes auto-rebuild once on upgrade)

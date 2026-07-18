@@ -3275,6 +3275,51 @@ app.get('/widgets', (req, res) => {
 }
 
 #[test]
+fn test_cli_worktree_reads_main_checkout_index() {
+    // D#106 / roadmap §2.2 (Rust read-side of the v0.99.0 JS worktree fix):
+    // query commands run inside a linked git worktree with no own index must
+    // fall back to the MAIN checkout's index instead of erroring "No index
+    // found" (and instead of cold-building a duplicate). Write side is
+    // unchanged; a worktree's OWN index still wins (open() checks it first).
+    if !has_git() { eprintln!("skipping: git not installed"); return; }
+    let root = TempDir::new().unwrap();
+    let main = root.path().join("main");
+    let src = main.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("auth.ts"),
+        "export function hashPassword(p: string): string { return p; }\n").unwrap();
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out = Command::new("git").args(args).current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .output().unwrap();
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"], &main);
+    git(&["add", "."], &main);
+    git(&["commit", "-qm", "init"], &main);
+    // Index the MAIN checkout.
+    let db_dir = main.join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, &main, None, None).unwrap();
+    drop(db);
+    // Linked worktree (its `.git` is a FILE pointing at main/.git/worktrees/<n>).
+    let wt = root.path().join("wt");
+    git(&["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"], &main);
+    assert!(wt.join(".git").is_file(), "fixture must be a linked worktree");
+
+    let out = Command::new(binary_path()).args(["search", "hashPassword", "--json"])
+        .current_dir(&wt).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0),
+        "worktree query must fall back to the main index; stderr: {stderr}");
+    assert!(stdout.contains("hashPassword"),
+        "results must come from the main checkout's index; got stdout: {stdout} stderr: {stderr}");
+}
+
+#[test]
 fn test_cli_deps_namespace_import_and_star_barrel() {
     // v51 (roadmap §2.3): `import * as ns from './m'` and `export * from './m'`
     // now bind a module-level imports edge to the resolved file's <module> node,
