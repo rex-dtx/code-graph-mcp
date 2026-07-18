@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.100.0 — axum routes + namespace/star-barrel edges (roadmap Phase 2a)
 
 ### Added — INDEX_VERSION 51 (existing indexes auto-rebuild once on upgrade)
 
