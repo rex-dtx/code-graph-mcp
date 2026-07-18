@@ -135,17 +135,48 @@ fn scan_path_line_paths(text: &str) -> Vec<String> {
     out
 }
 
+/// Paths appearing as bare parenthesized tokens — `symbol (src/foo.rs)` — the
+/// shape callgraph/impact/overview human output uses (no `:line` suffix). A match
+/// must be whitespace-free and contain `/` so prose parentheticals
+/// (`(75 test callers hidden…)`) and version strings (`(v0.99.1)`) never match.
+fn scan_paren_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(open) = rest.find('(') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find(')') else { break; };
+            let token = &after[..close];
+            if !token.is_empty()
+                && token.contains('/')
+                && !token.chars().any(|c| c.is_whitespace())
+            {
+                out.push(token.to_string());
+            }
+            rest = &after[close + 1..];
+        }
+    }
+    out
+}
+
 /// Returned files from a model-initiated cg CLI call's stdout. JSON fast-path
 /// (model passed `--json` → same `{results}` shape as MCP); else scan human
-/// `path:line` tokens. Dedupe to unique paths in first-occurrence order; `ranked`
-/// → rank = first-occurrence index, else None.
+/// `path:line` tokens, falling back to `(path)` parenthesized tokens when there are
+/// NO path:line hits (callgraph/impact-style output has no line numbers at all —
+/// without the fallback those calls always read as returned_files = [] and adoption
+/// was structurally impossible). Dedupe to unique paths in first-occurrence order;
+/// `ranked` → rank = first-occurrence index, else None.
 pub fn extract_returned_from_cli(stdout: &str, ranked: bool) -> Vec<ReturnedItem> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
         return extract_returned(&v, ranked);
     }
+    let mut paths = scan_path_line_paths(stdout);
+    if paths.is_empty() {
+        paths = scan_paren_paths(stdout);
+    }
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for path in scan_path_line_paths(stdout) {
+    for path in paths {
         if seen.insert(path.clone()) {
             let rank = if ranked { Some(out.len()) } else { None };
             out.push(ReturnedItem { file_path: path, rank });
@@ -156,7 +187,11 @@ pub fn extract_returned_from_cli(stdout: &str, ranked: bool) -> Vec<ReturnedItem
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    CgCall { tool: String, query: String, returned: Vec<ReturnedItem> },
+    /// `turn` is the transcript line index the tool_use block came from — all
+    /// tool_use blocks batched in one assistant message share it, so the scorer
+    /// can tell batch-mates (shared forward window) from sequential calls
+    /// (window ends at the next call).
+    CgCall { tool: String, query: String, returned: Vec<ReturnedItem>, turn: usize },
     FileTouch { path: String },
     RawGrep,
     Other,
@@ -292,7 +327,7 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
     }
     // Pass 2: build events in order from tool_use blocks.
     let mut out = ParsedTranscript::default();
-    for line in content.lines() {
+    for (turn, line) in content.lines().enumerate() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue; };
         if let Some(ts) = v.get("timestamp").and_then(|x| x.as_str()) {
             if out.first_ts.is_none() { out.first_ts = Some(ts.to_string()); }
@@ -313,7 +348,7 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
                                 .or_else(|| input.get("name"))
                                 .and_then(|x| x.as_str()).unwrap_or("").to_string();
                             let returned = extract_returned(&payload, is_ranked_tool(&tool));
-                            out.events.push(Event::CgCall { tool, query, returned });
+                            out.events.push(Event::CgCall { tool, query, returned, turn });
                         }
                         Err(_) => out.unparseable += 1,
                     },
@@ -331,7 +366,7 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
                         None => out.unresolved += 1,
                         Some(stdout) => {
                             let returned = extract_returned_from_cli(stdout, ranked);
-                            out.events.push(Event::CgCall { tool, query, returned });
+                            out.events.push(Event::CgCall { tool, query, returned, turn });
                         }
                     }
                 } else if cmd.contains("grep ") || cmd.contains("rg ") {
@@ -357,6 +392,11 @@ pub struct CallOutcome {
     /// ORIGINAL array index; `returned_files` is positional). None when not adopted.
     pub adopted_file: Option<String>,
     pub ranked: bool,
+    /// 1-based index of the FIRST adopting FileTouch among the file touches after
+    /// the call (1 = the very next touch adopted). Calibrates the adoption window:
+    /// if the mass sits at small N, the unbounded until-next-call window is
+    /// insensitive; a long tail would mean late touches are being credited.
+    pub adoption_distance: Option<usize>,
 }
 
 pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
@@ -366,7 +406,7 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
     for (i, ev) in events.iter().enumerate() {
         match ev {
             Event::FileTouch { path } => { touched_before.insert(path.clone()); }
-            Event::CgCall { tool, query, returned } => {
+            Event::CgCall { tool, query, returned, turn } => {
                 // Candidate returned files not already opened before this call.
                 let candidates: Vec<&ReturnedItem> = returned.iter()
                     .filter(|it| !touched_before.iter().any(|t| paths_match(&it.file_path, t)))
@@ -378,15 +418,23 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
                 let mut best_ranked: Option<(usize, String)> = None;
                 let mut first_match_file: Option<String> = None;
                 let mut adopted = false;
+                let mut touches_seen = 0usize;
+                let mut adoption_distance: Option<usize> = None;
                 for ev2 in &events[i + 1..] {
                     match ev2 {
-                        Event::CgCall { .. } => break,
+                        // A batch-mate (same assistant turn) doesn't close the window —
+                        // the model saw all batched results before acting on any of
+                        // them. Only a call from a LATER turn ends attribution.
+                        Event::CgCall { turn: t2, .. } if t2 != turn => break,
+                        Event::CgCall { .. } => {}
                         Event::FileTouch { path } => {
+                            touches_seen += 1;
                             for it in &candidates {
                                 if paths_match(&it.file_path, path) {
                                     adopted = true;
                                     if first_match_file.is_none() {
                                         first_match_file = Some(it.file_path.clone());
+                                        adoption_distance = Some(touches_seen);
                                     }
                                     if let Some(r) = it.rank {
                                         if best_ranked.as_ref().is_none_or(|(b, _)| r < *b) {
@@ -413,6 +461,7 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
                     adopted_rank,
                     adopted_file,
                     ranked: is_ranked_tool(tool),
+                    adoption_distance,
                 });
             }
             _ => {}
@@ -437,6 +486,8 @@ pub struct OutcomeSummary {
     pub field_mrr_adopted: f64,
     pub field_mrr_all: f64,
     pub rank_histogram: std::collections::BTreeMap<usize, usize>,
+    /// distance (Nth file-touch after the call) -> adoption count. Window calibration.
+    pub adoption_distance_histogram: std::collections::BTreeMap<usize, usize>,
     pub by_tool: std::collections::BTreeMap<String, (usize, usize)>, // tool -> (calls, adopted)
     /// Adoption-rate confidence: total cg calls below MIN_N.
     pub low_confidence: bool,
@@ -478,6 +529,9 @@ pub fn aggregate(
             e.1 += 1;
             if let Some(r) = c.adopted_rank {
                 *s.rank_histogram.entry(r).or_insert(0) += 1;
+            }
+            if let Some(d) = c.adoption_distance {
+                *s.adoption_distance_histogram.entry(d).or_insert(0) += 1;
             }
         }
         if c.ranked {
@@ -629,6 +683,9 @@ fn render_human(s: &OutcomeSummary, target: &std::path::Path) {
              s.ranked_adopted, s.ranked_calls, s.field_mrr_adopted, s.field_mrr_all, mrr_caveat);
     let hist: Vec<String> = s.rank_histogram.iter().map(|(r, n)| format!("r{r}={n}")).collect();
     println!("Adopted-rank histogram: {}", if hist.is_empty() { "-".into() } else { hist.join("  ") });
+    let dist: Vec<String> = s.adoption_distance_histogram.iter().map(|(d, n)| format!("d{d}={n}")).collect();
+    println!("Adoption-distance histogram (Nth file-touch after call): {}",
+             if dist.is_empty() { "-".into() } else { dist.join("  ") });
     for (tool, (calls, adopted)) in &s.by_tool {
         println!("  {:<24} {}/{}", tool, adopted, calls);
     }
@@ -654,6 +711,7 @@ fn render_json(s: &OutcomeSummary, target: &std::path::Path) {
         "field_mrr_all": (s.field_mrr_all * 1000.0).round() / 1000.0,
         "field_mrr_low_confidence": s.field_mrr_low_confidence,
         "rank_histogram": s.rank_histogram.iter().map(|(k,v)| (k.to_string(), *v)).collect::<std::collections::BTreeMap<_,_>>(),
+        "adoption_distance_histogram": s.adoption_distance_histogram.iter().map(|(k,v)| (k.to_string(), *v)).collect::<std::collections::BTreeMap<_,_>>(),
         "by_tool": s.by_tool.iter().map(|(k,(c,a))| (k.clone(), serde_json::json!({"calls": c, "adopted": a}))).collect::<serde_json::Map<_,_>>(),
         "low_confidence": s.low_confidence,
     }}));
@@ -775,7 +833,7 @@ mod tests {
         assert_eq!(p.unresolved, 0);
         assert_eq!(p.events.len(), 2);
         match &p.events[0] {
-            Event::CgCall { tool, query, returned } => {
+            Event::CgCall { tool, query, returned, .. } => {
                 assert_eq!(tool, "semantic_code_search");
                 assert_eq!(query, "login flow");
                 assert_eq!(returned[0].file_path, "src/auth.rs");
@@ -814,12 +872,19 @@ mod tests {
 
     // ── score_session helpers ──────────────────────────────────────────────
 
-    fn cg(tool: &str, files: &[(&str, Option<usize>)]) -> Event {
+    fn cg_at(turn: usize, tool: &str, files: &[(&str, Option<usize>)]) -> Event {
         Event::CgCall {
             tool: tool.into(),
             query: "q".into(),
             returned: files.iter().map(|(f, r)| ReturnedItem { file_path: f.to_string(), rank: *r }).collect(),
+            turn,
         }
+    }
+    /// Each call on its own turn (the sequential, non-batched default).
+    fn cg(tool: &str, files: &[(&str, Option<usize>)]) -> Event {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_TURN: AtomicUsize = AtomicUsize::new(1000);
+        cg_at(NEXT_TURN.fetch_add(1, Ordering::Relaxed), tool, files)
     }
     fn touch(p: &str) -> Event { Event::FileTouch { path: p.into() } }
 
@@ -833,6 +898,22 @@ mod tests {
         assert_eq!(outs.len(), 1);
         assert!(outs[0].adopted);
         assert_eq!(outs[0].adopted_rank, Some(1));
+        assert_eq!(outs[0].adoption_distance, Some(1), "adopted on the very next touch");
+    }
+
+    #[test]
+    fn adoption_distance_counts_intervening_non_matching_touches() {
+        let events = vec![
+            cg("get_call_graph", &[("src/a.rs", None)]),
+            touch("/proj/src/unrelated.rs"),
+            touch("/proj/src/also_unrelated.rs"),
+            touch("/proj/src/a.rs"), // 3rd touch after the call adopts
+        ];
+        let outs = score_session(&events);
+        assert!(outs[0].adopted);
+        assert_eq!(outs[0].adoption_distance, Some(3));
+        let s = aggregate(&outs, 1, 1, 0, 0);
+        assert_eq!(s.adoption_distance_histogram.get(&3), Some(&1));
     }
 
     #[test]
@@ -856,6 +937,55 @@ mod tests {
         let outs = score_session(&events);
         assert!(!outs[0].adopted); // a.rs touched after call 2 — outside call 1's window
         assert!(!outs[1].adopted); // call 2 returned z.rs; only a.rs was touched
+    }
+
+    #[test]
+    fn batched_same_turn_calls_share_forward_window() {
+        // Two cg calls batched in ONE assistant turn (same `turn`): the model saw both
+        // results before touching anything, so a touch after the batch must credit
+        // whichever call returned the file — not just the last batch member.
+        let events = vec![
+            cg_at(7, "grep_cli", &[("src/a.rs", None)]),
+            cg_at(7, "grep_cli", &[("src/z.rs", None)]),
+            touch("/proj/src/a.rs"),
+        ];
+        let outs = score_session(&events);
+        assert!(outs[0].adopted, "first batched call returned the touched file → credit");
+        assert!(!outs[1].adopted, "second batch member returned z.rs only");
+    }
+
+    #[test]
+    fn batched_window_still_ends_at_next_turn_call() {
+        // The shared batch window ends at the first call from a DIFFERENT turn.
+        let events = vec![
+            cg_at(7, "grep_cli", &[("src/a.rs", None)]),
+            cg_at(7, "grep_cli", &[("src/z.rs", None)]),
+            cg_at(9, "grep_cli", &[("src/other.rs", None)]),
+            touch("/proj/src/a.rs"), // after the turn-9 call → outside the batch window
+        ];
+        let outs = score_session(&events);
+        assert!(!outs[0].adopted, "touch after a later-turn call is outside the window");
+        assert!(!outs[1].adopted);
+    }
+
+    #[test]
+    fn parse_batched_tool_uses_in_one_message_share_turn_and_first_gets_credit() {
+        // One assistant message carrying TWO cg tool_use blocks (parallel calls in a
+        // single turn) → both events share the line's turn; an Edit after the batch
+        // credits the FIRST call (the one whose result was actually used).
+        let call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"mcp__code-graph-dev__get_call_graph","input":{"symbol":"foo"}},{"type":"tool_use","id":"tu2","name":"mcp__code-graph-dev__get_call_graph","input":{"symbol":"bar"}}]}}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"{\"file_path\":\"src/a.rs\"}"}]},{"type":"tool_result","tool_use_id":"tu2","content":[{"type":"text","text":"{\"file_path\":\"src/z.rs\"}"}]}]}}"#;
+        let edit = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu3","name":"Edit","input":{"file_path":"/proj/src/a.rs"}}]}}"#;
+        let p = parse_transcript(&format!("{call}\n{result}\n{edit}\n"));
+        let turns: Vec<usize> = p.events.iter().filter_map(|e| match e {
+            Event::CgCall { turn, .. } => Some(*turn),
+            _ => None,
+        }).collect();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0], turns[1], "same assistant message → same turn");
+        let outs = score_session(&p.events);
+        assert!(outs[0].adopted, "first batched MCP call's returned file was edited");
+        assert!(!outs[1].adopted);
     }
 
     #[test]
@@ -897,6 +1027,36 @@ mod tests {
         let text = "src/a.rs:5  fn foo\nsrc/a.rs:9  bar\nh3 Title  CHANGELOG.md:3708-3709";
         let paths = scan_path_line_paths(text);
         assert_eq!(paths, vec!["src/a.rs", "src/a.rs", "CHANGELOG.md"]); // raw, with dups
+    }
+
+    #[test]
+    fn cli_extract_callgraph_paren_paths_fallback() {
+        // callgraph/impact human output has NO path:line tokens — paths appear as
+        // `symbol (src/foo.rs)`. Without the paren fallback these calls always
+        // yielded returned_files = [] → adoption structurally impossible (the
+        // callgraph_cli 0/7 reading was this artifact, not real non-adoption).
+        let stdout = "run_full_index (src/indexer/pipeline/mod.rs)\n  \u{2190} called by: ensure_indexed (src/mcp/server/mod.rs) [function]\n  (75 test callers hidden, use --include-tests to show)";
+        let items = extract_returned_from_cli(stdout, false);
+        let paths: Vec<&str> = items.iter().map(|i| i.file_path.as_str()).collect();
+        assert_eq!(paths, vec!["src/indexer/pipeline/mod.rs", "src/mcp/server/mod.rs"]);
+        assert!(items.iter().all(|i| i.rank.is_none()));
+    }
+
+    #[test]
+    fn cli_extract_paren_fallback_not_used_when_path_line_present() {
+        // grep-style output HAS path:line hits — a parenthesized path inside code
+        // content must NOT leak into returned_files (fallback only fires on zero
+        // path:line tokens).
+        let stdout = "src/a.rs:5  include_str!(\"src/embedded.txt\")\nfn foo (src/phantom.rs)";
+        let items = extract_returned_from_cli(stdout, false);
+        let paths: Vec<&str> = items.iter().map(|i| i.file_path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn scan_paren_paths_rejects_prose_and_versions() {
+        let text = "x (src/a.rs)\ny (75 test callers hidden, use --include-tests to show)\nz (v0.99.1)\nw (lines 111-136)";
+        assert_eq!(scan_paren_paths(text), vec!["src/a.rs"]);
     }
 
     #[test]
@@ -989,7 +1149,7 @@ mod tests {
     // ── aggregate / OutcomeSummary helpers ───────────────────────────────────
 
     fn co(tool: &str, ranked: bool, adopted: bool, rank: Option<usize>) -> CallOutcome {
-        CallOutcome { tool: tool.into(), query: "q".into(), returned_files: vec![], adopted, adopted_rank: rank, adopted_file: None, ranked }
+        CallOutcome { tool: tool.into(), query: "q".into(), returned_files: vec![], adopted, adopted_rank: rank, adopted_file: None, ranked, adoption_distance: adopted.then_some(1) }
     }
 
     #[test]
@@ -1074,6 +1234,7 @@ mod tests {
             tool: "semantic_code_search".into(), query: "login".into(),
             returned_files: vec!["src/a.rs".into(), "src/b.rs".into()],
             adopted: true, adopted_rank: Some(1), adopted_file: Some("src/b.rs".into()), ranked: true,
+            adoption_distance: Some(1),
         }];
         emit_labels(&calls, path.to_str().unwrap()).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
@@ -1113,6 +1274,7 @@ mod tests {
                     ReturnedItem { file_path: "src/a.rs".into(), rank: Some(0) },
                     ReturnedItem { file_path: "src/c.rs".into(), rank: Some(2) },
                 ],
+                turn: 0,
             },
             touch("/proj/src/c.rs"),
         ];
@@ -1167,7 +1329,7 @@ mod tests {
         let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b9","content":[{"type":"text","text":"h3 a  src/auth.rs:1-2"}]}]}}"#;
         let p = parse_transcript(&format!("{call}\n{result}\n"));
         match &p.events[0] {
-            Event::CgCall { tool, query, returned } => {
+            Event::CgCall { tool, query, returned, .. } => {
                 assert_eq!(tool, "search_cli");
                 assert_eq!(query, "login flow");
                 assert_eq!(returned[0].rank, Some(0));

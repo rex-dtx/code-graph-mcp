@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **`outcome` under-counted batched cg calls** (roadmap §3.1) — two cg calls
+  issued in ONE assistant turn gave the first call a zero-width adoption
+  window (the forward scan broke at the very next `CgCall`), so its result
+  could never earn credit. Events now carry the transcript-line turn id;
+  batch-mates share the forward window, which still ends at the first call
+  from a later turn. Current 30-day windows across 3 projects show no delta
+  (the batched pattern hadn't occurred), but the class is closed.
+- **`outcome` read callgraph/impact-style CLI calls as returning zero files**
+  (roadmap §3.3) — their human output prints `symbol (path)` with no
+  `path:line` token, so `returned_files` was always empty and adoption was
+  structurally impossible (the callgraph_cli 0/7 reading was this artifact).
+  Extraction now falls back to parenthesized-path tokens when a stdout has no
+  `path:line` hits at all; outputs with real `path:line` hits are unaffected.
+
+### Added
+- **`outcome` adoption-window calibration** (roadmap §3.1): each adoption
+  records its distance (Nth file-touch after the call); human output and
+  `--json` gain an `adoption_distance_histogram`. Real-data read (59
+  adoptions, 3 projects, 30d): 78% adopt on the very next touch, 98% within
+  6 — the unbounded until-next-call window is insensitive; no cap needed.
+
 ## v0.100.2 — Windows worktree-fallback hotfix
 
 ### Fixed

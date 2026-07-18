@@ -82,12 +82,23 @@ Phase 2a Rust 路由提取（axum）+ 2.3 barrel ── ✅ IDX 50→51，v0.100
 Phase 2b Worktree Rust 读侧（D#106）     ── ✅ cc655aa（CliContext 读侧回落；D#106 已闭环）
 Phase 2c MCP centrality                  ── ✅ 99e4be7（project_map include_centrality；
                                              routing_bench 66/66 零回归）
-Phase 3  仪表修正（3.1→3.3）+ 卫生（3.2 SCHEMA bump 单独批）+ 3.4/3.5 择机 ── 未开始
+Phase 3  仪表修正（3.1→3.3）           ── ✅ 落地（batched-turn 窗口修复 + 距离标定 + 括号路径提取）
+         卫生（3.2 SCHEMA bump 单独批）+ 3.4/3.5 择机 ── 未开始
 ```
 
 > 状态更新 2026-07-18：Phase 1 与 2a/2b/2c 全部落地。residual（各条目内已注明）：
 > actix/Spring 路由、closure handler、跨变量 nest、star-barrel 名字级穿透、
-> freshness_partial 数组形命令仅 stderr。Phase 3 为下一批。
+> freshness_partial 数组形命令仅 stderr。
+>
+> Phase 3.1/3.3 落地（同日第二批）：
+> - 3.1a 批量同 turn 漏计：`Event::CgCall` 带 turn id，batch-mates 共享窗口。
+>   三项目 30 天窗口 A/B 零差（该模式此窗口内未出现）——类已关闭，字段影响 0。
+> - 3.1b ADOPTION_WINDOW 标定完成：adoption_distance 直方图（59 次 adoption/3 项目）
+>   d1=78%、d≤6=98% —— 无界窗口不敏感，**无需加界，结案**。
+> - 3.3 判读：callgraph 0/7 原是提取工件（human 输出 `sym (path)` 无 path:line →
+>   returned_files 恒空）。加括号路径 fallback 后重读 = 1/21（三项目合计 ≈5%）——
+>   与信息型使用假设一致（调用图树本身即答案）。**决定：不动 callgraph 输出**；
+>   file-touch adoption 对信息型工具是弱代理，横向对比 by_tool 时注意。
 
 排序理由：Phase 1 直接服务日常 LLM 消费路径（本周 3 起误判全属此类），修法统一、风险最低；
 Phase 2a 是唯一"新能力"级缺口且需要 INDEX bump 编排（顺风车摊薄成本）；仪表（3.1/3.3）决定
