@@ -123,9 +123,13 @@ fn worktree_main_root(root: &Path) -> Option<PathBuf> {
         root.join(gitdir_line)
     };
     let s = gitdir.to_string_lossy();
-    let sep = std::path::MAIN_SEPARATOR;
-    let marker = format!("{sep}.git{sep}worktrees{sep}");
-    let idx = s.rfind(&marker)?;
+    // git writes gitdir with FORWARD slashes even on Windows (and the JS side's
+    // path.resolve normalizes to backslashes there) — a MAIN_SEPARATOR marker
+    // never matched on Windows, so the fallback was silently dead (CI windows
+    // red on v0.100.1). Normalize length-preservingly for the search; slice the
+    // ORIGINAL string so the returned path keeps its native separators.
+    let norm = s.replace('\\', "/");
+    let idx = norm.rfind("/.git/worktrees/")?;
     let main_root = PathBuf::from(&s[..idx]);
     if main_root.as_os_str().is_empty() { None } else { Some(main_root) }
 }
@@ -7334,6 +7338,18 @@ mod tests {
         std::fs::write(d.join(".git"), format!(
             "gitdir: {}/outer/.git/modules/sub\n", d.display())).unwrap();
         assert_eq!(worktree_main_root(d), None, "submodule gitdir is a hard boundary");
+
+        // Separator-agnostic marker (CI windows-latest caught this on v0.100.1):
+        // git writes forward slashes in gitdir even on Windows — the first case
+        // above already covers that; this one pins the backslash shape, with the
+        // returned prefix keeping its ORIGINAL separators.
+        std::fs::write(d.join(".git"), format!(
+            "gitdir: {}\\main\\.git\\worktrees\\wt\n", d.display())).unwrap();
+        assert_eq!(
+            worktree_main_root(d),
+            Some(PathBuf::from(format!("{}\\main", d.display()))),
+            "backslash gitdir must resolve, preserving native separators"
+        );
 
         std::fs::remove_file(d.join(".git")).unwrap();
         std::fs::create_dir(d.join(".git")).unwrap();
