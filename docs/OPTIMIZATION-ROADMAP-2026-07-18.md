@@ -84,7 +84,11 @@ Phase 2c MCP centrality                  ── ✅ 99e4be7（project_map includ
                                              routing_bench 66/66 零回归）
 Phase 3  仪表修正（3.1→3.3）           ── ✅ 落地（batched-turn 窗口修复 + 距离标定 + 括号路径提取）
          卫生 3.2（SCHEMA 9→10，attempts 有界驻留）── ✅ 落地（D#77 闭环）
-         3.4/3.5 择机                    ── 未开始
+         3.4 激活边界残留（self-heal 提到非项目门前）── ✅ 落地（daagu dark 类结构因关闭；
+                                             注入成本本体经核实早已修复：quiet 默认 v0.17 +
+                                             非项目 stub v0.33/v0.34 + 监测 v0.49.1/v0.67）
+         3.5 release 冷缓存（D#73）      ── ✅ cache-warm.yml（main 侧同 key 预热；
+                                             根因=Actions cache ref-scoped + main 无同 key run）
 ```
 
 > 状态更新 2026-07-18：Phase 1 与 2a/2b/2c 全部落地。residual（各条目内已注明）：

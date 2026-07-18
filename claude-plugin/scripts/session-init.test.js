@@ -143,31 +143,54 @@ test('isHighIntentSource forces on session start/resume/clear but not automatic 
   assert.equal(isHighIntentSource('compact'), false); // frequent + automatic → gentle cadence
 });
 
-const { consistencyCheck, runSessionInit } = require('./session-init');
+const { consistencyCheck } = require('./session-init');
 
 test('consistencyCheck is exported as a function', () => {
   assert.equal(typeof consistencyCheck, 'function');
 });
 
-test('runSessionInit no-ops (nonProject) in a non-project cwd', (t) => {
-  // /tmp-style cwd (no .git/manifest) → the gate returns BEFORE
-  // syncLifecycleConfig / verifyBinary / ensureIndexFresh / maybeAutoAdopt /
-  // injectProjectMap, leaving zero footprint. Safe to call: the early return
-  // precedes every side-effectful step.
+test('runSessionInit in a non-project cwd: global self-heal fires, zero project footprint', (t) => {
+  // Two contracts in one (roadmap 3.4, project_cross_project_interference):
+  // (1) syncLifecycleConfig runs BEFORE the non-project gate — settings.json is
+  //     user-global, so a lost hook entry heals even when the session starts in
+  //     a marker-less cwd (the headless /tmp fleet). Pre-fix the gate returned
+  //     first and the miss never healed (lifecycle was hardcoded 'noop').
+  // (2) The cwd itself stays untouched: no .code-graph, no adoption, no map.
+  // Subprocess isolation: lifecycle.js binds CACHE_DIR from os.homedir() at
+  // MODULE LOAD, so HOME/CLAUDE_CONFIG_DIR only take effect in a fresh child.
   const os = require('os');
-  const origCwd = process.cwd();
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-nonproj-'));
-  process.chdir(tmp);
-  try {
-    const res = runSessionInit();
-    if (res.inactive) { t.skip('plugin seen inactive in this env — gate not reached'); return; }
-    assert.equal(res.nonProject, true);
-    assert.equal(res.lifecycle, 'noop');
-    assert.equal(res.autoUpdateLaunched, false);
-  } finally {
-    process.chdir(origCwd);
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
+  const { execFileSync } = require('child_process');
+  const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-nonproj-'));
+  t.after(() => fs.rmSync(sb, { recursive: true, force: true }));
+  const home = sb, cfg = path.join(sb, '.claude'), bare = path.join(sb, 'bare');
+  fs.mkdirSync(path.join(cfg, 'plugins'), { recursive: true });
+  fs.mkdirSync(bare, { recursive: true }); // no .git / package.json → non-project
+  const env = { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: cfg };
+  const lc = path.join(__dirname, 'lifecycle.js');
+  const si = path.join(__dirname, 'session-init.js');
+
+  // Full install into the sandbox HOME, then simulate the daagu incident:
+  // the PreToolUse (bash-guard) registration vanishes from settings.json.
+  execFileSync(process.execPath, [lc, 'install'], { env, cwd: bare, stdio: 'ignore' });
+  const settingsFile = path.join(cfg, 'settings.json');
+  const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.ok(settings.hooks && settings.hooks.PreToolUse, 'install registered PreToolUse');
+  delete settings.hooks.PreToolUse;
+  fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));
+
+  const res = JSON.parse(execFileSync(process.execPath, ['-e',
+    `process.stdout.write(JSON.stringify(require(${JSON.stringify(si)}).runSessionInit({source:'startup'})))`],
+    { env, cwd: bare }).toString());
+
+  assert.equal(res.nonProject, true);
+  assert.equal(res.autoUpdateLaunched, false);
+  assert.equal(res.lifecycle, 'self-healed-missing-settings-hook',
+    'a marker-less cwd must still heal the missing global hook registration');
+  const healed = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.ok(healed.hooks && healed.hooks.PreToolUse && healed.hooks.PreToolUse.length > 0,
+    'PreToolUse registration restored in settings.json');
+  assert.equal(fs.existsSync(path.join(bare, '.code-graph')), false, 'no project footprint');
+  assert.equal(fs.existsSync(path.join(bare, 'CLAUDE.md')), false, 'no adoption in non-project cwd');
 });
 
 test('runSessionInit tears down cache + adoption on a genuine uninstall (order regression)', (t) => {

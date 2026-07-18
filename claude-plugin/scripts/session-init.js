@@ -499,14 +499,28 @@ function runSessionInit({ source } = {}) {
     return { inactive: true, lifecycle: 'noop', autoUpdateLaunched: false, teardown };
   }
 
+  // Global-config self-heal runs BEFORE the non-project gate: settings.json is
+  // user-global and install() only writes claudeHome paths (idempotent, noop in
+  // steady state — a handful of JSON reads). Previously this sat behind the
+  // gate, so a missing/stale hook entry never healed while sessions started in
+  // marker-less cwds (e.g. the claude-mem-lite headless /tmp fleet) — the
+  // structural residue of the daagu weeks-dark bash-guard incident
+  // (project_cross_project_interference).
+  const lifecycle = syncLifecycleConfig();
+  // v0.49.1: a stale relic (see isStaleRelicContext) must not write ANY
+  // versioned state — that includes the adoption template: maybeAutoAdopt's
+  // drift-refresh would "refresh" MEMORY.md back to the relic's OLD shipped
+  // template, the adoption-surface twin of the settings.json downgrade war.
+  const isRelic = lifecycle === 'deferred-to-active-install';
+
   // Non-project cwd (no .git/manifest — e.g. /tmp, where claude-mem-lite
-  // spawns headless `claude -p` calls that never use code-graph): fully no-op.
-  // Returns BEFORE syncLifecycleConfig / verifyBinary / ensureIndexFresh /
-  // maybeAutoAdopt / injectProjectMap so the plugin leaves zero footprint
-  // (no incremental-index spawn, no map injection, no adoption). The MCP
-  // launcher applies the same gate — see project-detect.js.
+  // spawns headless `claude -p` calls that never use code-graph): otherwise
+  // no-op. Returns BEFORE verifyBinary / ensureIndexFresh / maybeAutoAdopt /
+  // injectProjectMap so the plugin leaves zero PROJECT footprint (no
+  // incremental-index spawn, no map injection, no adoption, no .code-graph).
+  // The MCP launcher applies the same gate — see project-detect.js.
   if (isNonProjectCwd(process.cwd())) {
-    return { inactive: false, nonProject: true, lifecycle: 'noop', autoUpdateLaunched: false };
+    return { inactive: false, nonProject: true, lifecycle, autoUpdateLaunched: false };
   }
 
   const conflict = checkScopeConflict();
@@ -516,13 +530,6 @@ function runSessionInit({ source } = {}) {
       `Use /plugin to remove one to avoid config conflicts.\n`
     );
   }
-
-  const lifecycle = syncLifecycleConfig();
-  // v0.49.1: a stale relic (see isStaleRelicContext) must not write ANY
-  // versioned state — that includes the adoption template: maybeAutoAdopt's
-  // drift-refresh would "refresh" MEMORY.md back to the relic's OLD shipped
-  // template, the adoption-surface twin of the settings.json downgrade war.
-  const isRelic = lifecycle === 'deferred-to-active-install';
 
   // Verify binary availability — catch issues early with actionable diagnostics
   const binaryCheck = verifyBinary();

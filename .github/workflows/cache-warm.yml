@@ -1,0 +1,81 @@
+name: Release cache warm
+
+# D#73: every release recompiled all ~397 deps cold on all 5 platforms
+# (4–9 min/platform, 21 min worst observed). Two causes compound:
+#   1. GitHub Actions cache is REF-scoped — a cache saved by a run on
+#      refs/tags/vX is invisible to the next tag's run. Only caches saved on
+#      the default branch are readable from every ref.
+#   2. No main-branch workflow ever used release.yml's cache key
+#      (`key: <target>`), and unused caches are evicted after 7 days
+#      (or earlier under the repo's 10 GB LRU).
+# Fix: build the exact release matrix ON MAIN so a warm, globally-readable
+# cache always exists for release.yml to restore. Runs Mon+Thu (max 4-day
+# gap keeps the eviction clock reset), on demand, and when a dep bump lands
+# (Cargo.lock push) so the cache tracks the current dependency set.
+#
+# Every environment-affecting step below MUST mirror release.yml build
+# byte-for-byte (toolchain pin, rust-cache pin + key, cross tools, build
+# flags) — a drifted toolchain or feature set produces a cache release.yml
+# can't use. No artifacts are uploaded; warming is the only product.
+
+on:
+  schedule:
+    - cron: '0 3 * * 1,4'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['Cargo.lock']
+
+permissions:
+  contents: read
+
+# Warming is preemptible — a newer run supersedes an in-flight one.
+concurrency:
+  group: cache-warm
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    name: Warm ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      # Same SHA pin as release.yml (1.95.0) — a different rustc hashes to a
+      # different cache namespace and the warm cache would never be restored.
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
+
+      # Same flags as the release build so the cached dep artifacts are the
+      # ones release.yml actually links against.
+      - name: Build (warm dependency cache)
+        run: cargo build --release --features embed-model --target ${{ matrix.target }}

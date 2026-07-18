@@ -2,7 +2,24 @@
 
 ## Unreleased
 
+### Added
+- **Release build-cache warming** (roadmap §3.5, D#73): new `cache-warm.yml`
+  workflow builds the exact 5-target release matrix on main (Mon+Thu schedule,
+  manual dispatch, and on Cargo.lock pushes). Actions caches are ref-scoped —
+  a cache saved by one tag's run is invisible to the next tag — and no
+  main-branch run ever used release.yml's cache key, so every release
+  recompiled ~397 deps cold on all 5 platforms (4–9 min each, 21 min worst
+  observed). The warm main-scoped cache is readable from any tag ref.
+
 ### Changed
+- **Global settings self-heal now runs in non-project cwds too** (roadmap
+  §3.4): `session-init` used to return at the non-project gate before
+  `syncLifecycleConfig`, so a lost/stale hook registration in the user-global
+  settings.json never healed while sessions started in marker-less cwds
+  (e.g. headless `claude -p` fleets in /tmp) — the structural residue of the
+  weeks-dark bash-guard incident. The heal (a few idempotent JSON reads,
+  claudeHome-only writes) now precedes the gate; project footprint in
+  non-project cwds stays zero (no index, no adoption, no map injection).
 - **`pending_unresolved_calls` is now bounded** (roadmap §3.2, D#77;
   SCHEMA_VERSION 9 → 10): each resolution sweep ages surviving rows by one
   `attempts`; rows failing 50 consecutive sweeps are evicted. ~99% of buffered
