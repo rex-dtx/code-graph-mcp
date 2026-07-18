@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — project-root resolution: linked worktrees + boundary fixes
+## v0.99.0 — worktree-aware root resolution + grep zero-hit disclosure
 
 Behavior change (plugin JS resolver, `project-root.js` — shared by the statusline and
 every hook gate): sessions inside a **linked git worktree** (e.g. Claude Code's
