@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — project-root resolution: linked worktrees + boundary fixes
+
+Behavior change (plugin JS resolver, `project-root.js` — shared by the statusline and
+every hook gate): sessions inside a **linked git worktree** (e.g. Claude Code's
+`.claude/worktrees/<slug>` branch checkouts) now resolve to the **main checkout's
+index** instead of going dark. Numbers/answers reflect the main checkout's content;
+a worktree that builds its own index (run any `code-graph-mcp` command in it) takes
+precedence over the fallback. Revert path: pin the previous plugin version.
+
+### Fixed
+- **Statusline + all hooks were dark in linked worktrees** — the worktree's `.git`
+  FILE hit the hard submodule boundary (`hasGit → no index → null`). Worktree
+  `gitdir: …/.git/worktrees/<name>` now resolves to the main checkout; submodule
+  `gitdir: …/.git/modules/…` remains a hard boundary (different codebase, not a
+  branch copy).
+- **Worktree root vs subdir contradiction** — subdirs of a worktree escaped through
+  the `.git` boundary to the main index while the worktree root showed nothing.
+  Both now resolve identically (main checkout, or the worktree's own index if built).
+- **Stray `~/.code-graph` leaked into every un-indexed dir under `$HOME`** — the
+  ancestor walk honored an index at home itself ("checked, not crossed"), so an
+  accidental home-dir index made unrelated directories show its statusline and
+  activate hooks. Home is now a pure stop; resolving from home itself still honors
+  a deliberate home index (own-index rule).
+- **Subdirs of an un-indexed nested repo escaped to the outer project's index** —
+  the ancestor walk now stops at `.git` boundaries, matching the root's own
+  no-escape rule. The legit inverse (only `repo/packages/foo` indexed inside an
+  un-indexed repo, resolving from below it) keeps working and is pinned by a test.
+- **SessionStart + UserPromptSubmit gates used the bare session cwd** — sessions
+  launched in a worktree or subdir skipped index-freshness, the project-map/recent-
+  impact injections, and prompt hints entirely (sibling of the v0.48 pre-*-guide
+  subdir-cwd dark class). Both now resolve the canonical root; recent-impact keeps
+  git WIP detection in the session dir (the worktree's branch state) while querying
+  the canonical index.
+
 ## v0.98.1 — grep partial results on path errors
 
 ### Fixed

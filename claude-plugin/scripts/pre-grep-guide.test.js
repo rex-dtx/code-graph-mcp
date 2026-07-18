@@ -1451,16 +1451,21 @@ test('resolveProjectRoot: walks up from nested subdir to the indexed root', () =
   } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
 });
 
-test('resolveProjectRoot: no index up to $HOME → null (home itself still checked)', () => {
+test('resolveProjectRoot: no index up to $HOME → null (home\'s own index never adopted)', () => {
   const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
   try {
     const deep = pathE2e.join(base, 'somewhere', 'deep');
     fsE2e.mkdirSync(deep, { recursive: true });
     assert.equal(resolveProjectRoot(deep, { home: base }), null);
-    // home itself holding an index is honored
+    // A stray `~/.code-graph` (home dir indexed once by accident) must NOT leak
+    // into every un-indexed dir under home — the stray-detection walk already
+    // treats an index at home as an unrelated outer project; the ancestor walk
+    // must agree. Resolving from home ITSELF still honors its index (own-index
+    // rule), tested below.
     fsE2e.mkdirSync(pathE2e.join(base, '.code-graph'), { recursive: true });
     fsE2e.writeFileSync(pathE2e.join(base, '.code-graph', 'index.db'), '');
-    assert.equal(resolveProjectRoot(deep, { home: base }), base);
+    assert.equal(resolveProjectRoot(deep, { home: base }), null);
+    assert.equal(resolveProjectRoot(base, { home: base }), base);
   } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
 });
 
@@ -1518,6 +1523,114 @@ test('resolveProjectRoot: non-git monorepo — stray subdir index resolves to in
     fsE2e.mkdirSync(pathE2e.join(sub, '.code-graph'), { recursive: true });
     fsE2e.writeFileSync(pathE2e.join(sub, '.code-graph', 'index.db'), '');
     assert.equal(resolveProjectRoot(sub, { home: base }), root);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+// ── linked git worktrees (`.git` FILE with gitdir: …/.git/worktrees/<name>) ──
+// Claude Code's EnterWorktree puts branch checkouts under
+// <main>/.claude/worktrees/<slug>; the worktree has no index of its own, so the
+// pre-fix hard `.git` boundary left the statusline + every hook dark there
+// (ubuntu-sec feat/m11-env-precheck, 2026-07-18) while SUBDIRS of the worktree
+// inconsistently escaped to the main checkout via the ancestor walk.
+
+function mkWorktree(base, mainName, wtName) {
+  // main checkout with .git dir + index; linked worktree with .git FILE
+  const main = pathE2e.join(base, mainName);
+  fsE2e.mkdirSync(pathE2e.join(main, '.git', 'worktrees', wtName), { recursive: true });
+  fsE2e.mkdirSync(pathE2e.join(main, '.code-graph'), { recursive: true });
+  fsE2e.writeFileSync(pathE2e.join(main, '.code-graph', 'index.db'), '');
+  const wt = pathE2e.join(base, 'wt', wtName);
+  fsE2e.mkdirSync(wt, { recursive: true });
+  fsE2e.writeFileSync(pathE2e.join(wt, '.git'),
+    `gitdir: ${pathE2e.join(main, '.git', 'worktrees', wtName)}\n`);
+  return { main, wt };
+}
+
+test('resolveProjectRoot: worktree root resolves to the main checkout index', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const { main, wt } = mkWorktree(base, 'proj', 'feat-x');
+    assert.equal(resolveProjectRoot(wt, { home: base }), main);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: worktree SUBDIR resolves to the main checkout (consistent with root)', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const { main, wt } = mkWorktree(base, 'proj', 'feat-x');
+    const sub = pathE2e.join(wt, 'src', 'deep');
+    fsE2e.mkdirSync(sub, { recursive: true });
+    assert.equal(resolveProjectRoot(sub, { home: base }), main);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: worktree with its OWN index wins over the main checkout', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const { wt } = mkWorktree(base, 'proj', 'feat-x');
+    fsE2e.mkdirSync(pathE2e.join(wt, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(wt, '.code-graph', 'index.db'), '');
+    assert.equal(resolveProjectRoot(wt, { home: base }), wt);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: worktree of an UNINDEXED main checkout → null', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const { main, wt } = mkWorktree(base, 'proj', 'feat-x');
+    fsE2e.rmSync(pathE2e.join(main, '.code-graph'), { recursive: true });
+    assert.equal(resolveProjectRoot(wt, { home: base }), null);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: submodule `.git` FILE (gitdir: …/.git/modules/…) stays a hard boundary', () => {
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const proj = pathE2e.join(base, 'proj'); // indexed parent repo
+    fsE2e.mkdirSync(pathE2e.join(proj, '.git', 'modules', 'lib'), { recursive: true });
+    fsE2e.mkdirSync(pathE2e.join(proj, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(proj, '.code-graph', 'index.db'), '');
+    const sub = pathE2e.join(proj, 'lib'); // submodule checkout, no index
+    fsE2e.mkdirSync(sub, { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(sub, '.git'),
+      `gitdir: ${pathE2e.join(proj, '.git', 'modules', 'lib')}\n`);
+    assert.equal(resolveProjectRoot(sub, { home: base }), null);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: SUBDIR of an unindexed nested repo never escapes to the outer index', () => {
+  // Sibling of the "start with its OWN .git but no index → null" boundary rule:
+  // the ancestor walk must stop AT the nested repo's .git, not sail through it
+  // into the outer project's index (pre-fix it did, making root-vs-subdir
+  // behavior contradictory inside the same nested repo).
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const proj = pathE2e.join(base, 'proj'); // indexed outer
+    fsE2e.mkdirSync(pathE2e.join(proj, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(proj, '.code-graph', 'index.db'), '');
+    const inner = pathE2e.join(proj, 'vendored'); // own .git, no index
+    fsE2e.mkdirSync(pathE2e.join(inner, '.git'), { recursive: true });
+    const deep = pathE2e.join(inner, 'src');
+    fsE2e.mkdirSync(deep, { recursive: true });
+    assert.equal(resolveProjectRoot(deep, { home: base }), null);
+  } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('resolveProjectRoot: indexed sub-project inside an unindexed repo still resolves from below', () => {
+  // Guard for the legit shape the boundary fix must NOT break: repo root has
+  // .git but was never indexed; only packages/foo was. Resolving from
+  // packages/foo/src must find packages/foo (nearest indexed ancestor INSIDE
+  // the boundary), not bail at the unindexed .git root.
+  const base = fsE2e.mkdtempSync(pathE2e.join(osE2e.tmpdir(), 'cg-root-'));
+  try {
+    const repo = pathE2e.join(base, 'repo');
+    fsE2e.mkdirSync(pathE2e.join(repo, '.git'), { recursive: true });
+    const pkg = pathE2e.join(repo, 'packages', 'foo');
+    fsE2e.mkdirSync(pathE2e.join(pkg, '.code-graph'), { recursive: true });
+    fsE2e.writeFileSync(pathE2e.join(pkg, '.code-graph', 'index.db'), '');
+    const deep = pathE2e.join(pkg, 'src');
+    fsE2e.mkdirSync(deep, { recursive: true });
+    assert.equal(resolveProjectRoot(deep, { home: base }), pkg);
   } finally { fsE2e.rmSync(base, { recursive: true, force: true }); }
 });
 

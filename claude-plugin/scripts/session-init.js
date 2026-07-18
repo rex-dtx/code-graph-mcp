@@ -316,7 +316,12 @@ function ensureIndexFresh() {
   const bin = findBinary();
   if (!bin) return 'skipped';
 
-  const cwd = process.cwd();
+  // Canonical index root, not the bare session cwd: a session launched in a
+  // linked worktree (resolves to the main checkout) or a subdir otherwise
+  // gate-fails here and freshness never runs (sibling of the statusline/hook
+  // subdir-cwd dark class).
+  const { resolveProjectRoot } = require('./project-root');
+  const cwd = resolveProjectRoot(process.cwd()) || process.cwd();
   const dbPath = path.join(cwd, '.code-graph', 'index.db');
   if (!fs.existsSync(dbPath)) return 'skipped';
 
@@ -592,7 +597,8 @@ function runSessionInit({ source } = {}) {
  */
 function injectProjectMap() {
   try {
-    const cwd = process.cwd();
+    const { resolveProjectRoot } = require('./project-root');
+    const cwd = resolveProjectRoot(process.cwd()) || process.cwd();
     const dbPath = path.join(cwd, '.code-graph', 'index.db');
     if (!fs.existsSync(dbPath)) return false;
 
@@ -636,7 +642,14 @@ function injectProjectMap() {
  */
 function injectRecentImpact({ source } = {}) {
   try {
-    const cwd = process.cwd();
+    // Index + telemetry live at the canonical root (worktree → main checkout,
+    // subdir → project root); git WIP detection stays in the SESSION dir — the
+    // worktree's branch state is what this session edits. Repo-relative git
+    // paths translate 1:1 to root-relative index paths (a worktree mirrors the
+    // checkout layout).
+    const { resolveProjectRoot } = require('./project-root');
+    const sessionDir = process.cwd();
+    const cwd = resolveProjectRoot(sessionDir) || sessionDir;
     const dbPath = path.join(cwd, '.code-graph', 'index.db');
     if (!fs.existsSync(dbPath)) return false;
 
@@ -646,7 +659,7 @@ function injectRecentImpact({ source } = {}) {
     // last commit. Timeouts tightened (finding #1): worst-case cap sum is now
     // status(1s) + HEAD~1(1s) + affected(1.5s) = 3.5s, comfortably under the 5s
     // SessionStart hook budget; the old 2+2+3=7s could get the whole hook killed.
-    const gitOpts = { cwd, timeout: 1000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] };
+    const gitOpts = { cwd: sessionDir, timeout: 1000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] };
     let changed = [];
     let isWip = false;
     try {

@@ -431,8 +431,11 @@ function runMain() {
   // Chinese chars are ~3 bytes but 1 char; "看看 fts5_search" is only 16 chars
   if (!message || message.length < 8) return;
 
-  // --- Check index ---
-  const cwd = process.cwd();
+  // --- Check index --- (canonical root: worktree → main checkout, subdir →
+  // project root — the bare cwd gate left this hook dark there, sibling of the
+  // pre-*-guide subdir-cwd class)
+  const { resolveProjectRoot } = require('./project-root');
+  const cwd = resolveProjectRoot(process.cwd()) || process.cwd();
   const dbPath = path.join(cwd, '.code-graph', 'index.db');
   if (!fs.existsSync(dbPath)) return;
 
