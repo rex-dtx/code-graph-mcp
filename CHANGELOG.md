@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.100.2 — Windows worktree-fallback hotfix
+
+### Fixed
+- **Worktree read-side fallback was dead on Windows** — git writes `gitdir` with
+  forward slashes even on Windows; the marker search used the native separator
+  and never matched, so v0.100.1's main-checkout fallback silently no-opped
+  there (caught by CI windows-latest). Marker search is now separator-agnostic;
+  returned paths keep native separators. Linux/macOS behavior unchanged.
+
 ## v0.100.1 — worktree read-side + MCP centrality (roadmap Phase 2b/2c)
 
 ### Added
