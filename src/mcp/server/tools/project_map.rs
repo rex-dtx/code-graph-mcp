@@ -25,7 +25,7 @@ impl McpServer {
             }
         };
 
-        let result = if let Some(cached) = full_result {
+        let mut result = if let Some(cached) = full_result {
             cached
         } else {
             let (modules, deps, entry_points, hot_functions) = queries::get_project_map(self.db.conn())?;
@@ -93,6 +93,29 @@ impl McpServer {
             r
         };
 
+        // include_centrality (roadmap 2026-07-18 §2.4 — CLI `centrality` had no MCP
+        // surface): architectural chokepoints by betweenness centrality. Computed
+        // per call and attached OUTSIDE the 60s cache (the flag/limit vary per
+        // call; the cached envelope stays flag-free). Test callers excluded, same
+        // default as the CLI.
+        if args["include_centrality"].as_bool().unwrap_or(false) {
+            let limit = args["centrality_limit"].as_u64().unwrap_or(10).max(1) as usize;
+            let ranked = crate::graph::centrality::betweenness_centrality(
+                self.db.conn(), false, limit,
+            )?;
+            let centrality_json: Vec<serde_json::Value> = ranked.iter().map(|c| {
+                json!({
+                    "name": c.name,
+                    "type": c.node_type,
+                    "file_path": c.file_path,
+                    "betweenness": c.score,
+                    "normalized": c.normalized,
+                    "caller_count": c.caller_count,
+                })
+            }).collect();
+            result["centrality"] = json!(centrality_json);
+        }
+
         if compact {
             // Compact mode: drop languages/classes/interfaces, keep key_symbols for discoverability
             let compact_modules: Vec<serde_json::Value> = result["modules"].as_array()
@@ -147,12 +170,24 @@ impl McpServer {
                 })).collect())
                 .unwrap_or_default();
 
-            return Ok(json!({
+            let mut compact_result = json!({
                 "modules": compact_modules,
                 "module_dependencies": compact_deps,
                 "entry_points": compact_entries,
                 "hot_functions": compact_hot,
-            }));
+            });
+            // Compact is a WHITELIST rebuild (feedback_compact_field_allowlist —
+            // v0.90/v0.97.1 both dropped new fields here): forward centrality
+            // explicitly, trimmed to name+file+score.
+            if let Some(cent) = result.get("centrality").and_then(|c| c.as_array()) {
+                let compact_cent: Vec<serde_json::Value> = cent.iter().map(|c| json!({
+                    "name": c["name"],
+                    "file_path": c["file_path"],
+                    "betweenness": c["betweenness"],
+                })).collect();
+                compact_result["centrality"] = json!(compact_cent);
+            }
+            return Ok(compact_result);
         }
 
         Ok(result)

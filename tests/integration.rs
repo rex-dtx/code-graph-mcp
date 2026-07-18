@@ -1690,6 +1690,51 @@ pub fn orphan_long_function_name() -> i32 {
         "dead_code must have numeric orphan_count, got: {}", dead);
 }
 
+/// project_map include_centrality (roadmap 2026-07-18 §2.4): the CLI-only
+/// `centrality` gets an MCP surface as a project_map flag. Multi-hop chain
+/// (entry → bridge → leaf ×2) makes `bridge` the chokepoint. Compact is a
+/// whitelist rebuild (feedback_compact_field_allowlist) — the second call
+/// pins that the new top-level field is forwarded, not silently dropped.
+#[test]
+fn test_project_map_include_centrality_and_compact_forwarding() {
+    let project = TempDir::new().unwrap();
+    fs::write(project.path().join("lib.rs"), r#"
+pub fn entry_a() -> i32 { bridge() }
+pub fn entry_b() -> i32 { bridge() }
+pub fn bridge() -> i32 { leaf_x() + leaf_y() }
+pub fn leaf_x() -> i32 { 1 }
+pub fn leaf_y() -> i32 { 2 }
+"#).unwrap();
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json("project_map", serde_json::json!({
+        "include_centrality": true
+    }));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let cent = result["centrality"].as_array()
+        .unwrap_or_else(|| panic!("include_centrality must attach a centrality array; got keys: {:?}",
+            result.as_object().map(|o| o.keys().collect::<Vec<_>>())));
+    assert!(cent.iter().any(|c| c["name"] == "bridge"),
+        "bridge sits on every entry→leaf path and must rank; got: {cent:?}");
+
+    // Default off: no field.
+    let resp_off = server.handle_message(&tool_call_json("project_map",
+        serde_json::json!({}))).unwrap();
+    assert!(parse_tool_result(&resp_off).get("centrality").is_none(),
+        "centrality must be opt-in");
+
+    // Compact whitelist must forward it (trimmed rows keep name+file+score).
+    let resp_c = server.handle_message(&tool_call_json("project_map",
+        serde_json::json!({"include_centrality": true, "compact": true}))).unwrap();
+    let result_c = parse_tool_result(&resp_c);
+    let cent_c = result_c["centrality"].as_array()
+        .unwrap_or_else(|| panic!("compact must forward centrality (allowlist trap); got keys: {:?}",
+            result_c.as_object().map(|o| o.keys().collect::<Vec<_>>())));
+    assert!(cent_c.iter().any(|c| c["name"] == "bridge" && c["betweenness"].is_number()),
+        "compact rows keep name+betweenness; got: {cent_c:?}");
+}
+
 /// v0.22.x fix: `ast_search query=<identifier> type=<X>` must fall back to
 /// SQL `name LIKE '%<identifier>%'` when FTS rank drowns the matching type
 /// under unrelated hits. Pre-fix `query="Result" type=struct` returned 0 even

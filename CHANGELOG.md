@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+- **MCP surface for centrality** (roadmap §2.4): `project_map` gains
+  `include_centrality` (+ `centrality_limit`, default 10) attaching the
+  CLI-only betweenness-centrality chokepoint ranking as a `centrality`
+  array; compact mode forwards it trimmed (name + file + score). Computed
+  per call outside the 60s project-map cache; test callers excluded like
+  the CLI default. routing_bench unchanged (66 passed) after the tool-
+  description update.
+
 ### Fixed
 - **Query commands inside a linked git worktree read the main checkout's
   index** (roadmap §2.2, Rust read-side of the v0.99.0 JS fix) — every

@@ -90,11 +90,13 @@ impl ToolRegistry {
             },
             ToolDefinition {
                 name: "project_map".into(),
-                description: "Architecture map (modules / deps / hot fns). Replaces Glob+Read of N top-level files. SessionStart already injected; recall only after major refactor or rebuild-index.".into(),
+                description: "Architecture map (modules / deps / hot fns; include_centrality=chokepoints). Replaces Glob+Read of N top-level files. SessionStart already injected; recall after major refactor.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves ~50% tokens)" }
+                        "compact": { "type": "boolean", "description": "Compact mode: paths+counts+key_symbols, trimmed hot_functions (saves ~50% tokens)" },
+                        "include_centrality": { "type": "boolean", "description": "Include architectural chokepoints (betweenness centrality — functions on the most shortest call paths; high score = structural bridge). Default false." },
+                        "centrality_limit": { "type": "number", "description": "With include_centrality: max ranked results (default 10)" }
                     },
                     "required": []
                 }),
