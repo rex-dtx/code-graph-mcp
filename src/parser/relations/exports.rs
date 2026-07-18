@@ -27,10 +27,14 @@ pub(super) fn extract_export_names(
     // target), matching import specifiers; the optional alias is the local
     // re-export name and is irrelevant to the dependency edge.
     //
-    // Out of scope (needs module-level, not name-level, resolution — a separate
-    // limitation shared with namespace imports `import * as ns`): `export * from
-    // './mod'` and `export * as ns from './mod'` carry no named specifiers, so no
-    // per-name edge is emitted for them here.
+    // Star forms — `export * from './mod'` and `export * as ns from './mod'` —
+    // carry no named specifiers, so they emit a MODULE-LEVEL q:"star_reexport"
+    // marker instead (roadmap 2026-07-18 §2.3): the indexer binds it to the
+    // resolved file's `<module>` node (the PHP-include/C-include pattern), so
+    // the barrel finally participates in deps/affected/cycles/map. Name-level
+    // resolution THROUGH a star barrel (`import {X} from './barrel'` where the
+    // barrel star-re-exports X) still rides the default name-based fallback —
+    // following star chains at resolution time remains a future enhancement.
     if let Some(src) = node.child_by_field_name("source") {
         let js_module = node_text(&src, source)
             .trim_matches(|c| c == '"' || c == '\'' || c == '`')
@@ -41,6 +45,21 @@ pub(super) fn extract_export_names(
                 if let Some(child) = node.named_child(i) {
                     collect_reexport_specifiers(&child, source, metadata.as_deref(), results);
                 }
+            }
+            let is_star = (0..node.child_count()).filter_map(|i| node.child(i)).any(|c| {
+                c.kind() == "*" || c.kind() == "namespace_export"
+            });
+            if is_star {
+                results.push(ParsedRelation {
+                    source_name: "<module>".into(),
+                    target_name: "<module>".into(),
+                    relation: REL_IMPORTS.into(),
+                    metadata: Some(
+                        serde_json::json!({ "q": "star_reexport", "js_module": js_module })
+                            .to_string(),
+                    ),
+                    source_language: String::new(),
+                });
             }
         }
         // A re-export statement carries no inline declaration to extract below.

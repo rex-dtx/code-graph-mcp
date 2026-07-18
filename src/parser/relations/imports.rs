@@ -27,10 +27,20 @@ pub(super) fn extract_import_names(node: &tree_sitter::Node, source: &str, resul
         if let Some(child) = node.named_child(i) {
             match child.kind() {
                 "import_clause" | "import_specifier" | "dotted_name" => {
+                    // ESM namespace form `import * as ns from './m'`: the clause
+                    // carries a namespace_import, which the specifier walk below
+                    // does not know — it used to drop the whole binding
+                    // (roadmap 2026-07-18 §2.3). Emit the q:"ns_import" marker
+                    // (alias + specifier) that the indexer binds module-level and
+                    // feeds into ns_module_map for `ns.foo()` member calls.
+                    emit_namespace_import(&child, source, js_module.as_deref(), results);
                     // For named imports: import { Foo, Bar } from '...'
                     extract_import_specifiers(&child, source, results, metadata.as_deref());
                 }
-                "identifier" | "namespace_import" => {
+                "namespace_import" => {
+                    emit_namespace_import(&child, source, js_module.as_deref(), results);
+                }
+                "identifier" => {
                     let name = node_text(&child, source).to_string();
                     if !name.is_empty() && name != "from" {
                         results.push(ParsedRelation {
@@ -48,6 +58,39 @@ pub(super) fn extract_import_names(node: &tree_sitter::Node, source: &str, resul
             }
         }
     }
+}
+
+/// Emit the ns_import marker for a `namespace_import` (`* as ns`) found either
+/// directly or as a child of the import_clause. Marker shape mirrors the CJS
+/// `q:"ns_require"` one (mod.rs) so the indexer's ns_module_map + module-level
+/// binding treat ESM and CJS namespaces identically. No specifier → no marker
+/// (nothing to resolve against).
+fn emit_namespace_import(
+    node: &tree_sitter::Node,
+    source: &str,
+    js_module: Option<&str>,
+    results: &mut Vec<ParsedRelation>,
+) {
+    let ns = if node.kind() == "namespace_import" {
+        Some(*node)
+    } else {
+        (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .find(|c| c.kind() == "namespace_import")
+    };
+    let Some(ns) = ns else { return };
+    let Some(alias) = (0..ns.named_child_count())
+        .filter_map(|i| ns.named_child(i))
+        .find(|c| c.kind() == "identifier")
+    else { return };
+    let Some(module) = js_module else { return };
+    results.push(ParsedRelation {
+        source_name: "<module>".into(),
+        target_name: node_text(&alias, source).to_string(),
+        relation: REL_IMPORTS.into(),
+        metadata: Some(serde_json::json!({ "q": "ns_import", "js_module": module }).to_string()),
+        source_language: String::new(),
+    });
 }
 
 fn extract_import_specifiers(node: &tree_sitter::Node, source: &str, results: &mut Vec<ParsedRelation>, metadata: Option<&str>) {

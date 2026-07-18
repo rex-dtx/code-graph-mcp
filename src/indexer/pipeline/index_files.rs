@@ -490,7 +490,9 @@ pub(super) fn index_files(
                 if rel.relation != REL_IMPORTS { continue; }
                 if let Some(meta_str) = rel.metadata.as_deref() {
                     if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                        if meta.get("q").and_then(|v| v.as_str()) == Some("ns_require") {
+                        // ESM `import * as ns` (q:"ns_import", v51) binds member
+                        // calls exactly like the CJS require-namespace form.
+                        if matches!(meta.get("q").and_then(|v| v.as_str()), Some("ns_require") | Some("ns_import")) {
                             if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
                                 if let Some(file) = resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths) {
                                     ns_module_map.insert(rel.target_name.clone(), file);
@@ -567,14 +569,42 @@ pub(super) fn index_files(
                     source_ids = refine_ambiguous_targets(&same_lang, &pf.rel_path, &node_id_to_path);
                 }
 
-                // Namespace-require markers (`const m = require('./x')`) were
-                // consumed by the pre-scan above into ns_module_map; the variable
-                // is not a symbol, so skip it here (a default name resolution would
-                // mint a spurious `<external>/<var>` node).
+                // Module-level import markers (v51, roadmap §2.3): namespace
+                // bindings (`const m = require('./x')` q:"ns_require", `import *
+                // as ns from './x'` q:"ns_import") and star re-exports (`export *
+                // from './x'` q:"star_reexport") name no resolvable symbol, so
+                // default name resolution would mint a spurious `<external>` node
+                // (or, for star's `<module>` target, cross-link a random file).
+                // Instead bind them to the RESOLVED file's `<module>` node — the
+                // PHP-include/C-include pattern — so a namespace-only or
+                // star-barrel dependency is finally visible to deps/affected/
+                // cycles/map. Unresolvable specifier (external package) → no
+                // edge, same as before. Always `continue`: never fall through.
                 if rel.relation == REL_IMPORTS {
                     if let Some(meta_str) = rel.metadata.as_deref() {
                         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if meta.get("q").and_then(|v| v.as_str()) == Some("ns_require") {
+                            if matches!(
+                                meta.get("q").and_then(|v| v.as_str()),
+                                Some("ns_require") | Some("ns_import") | Some("star_reexport")
+                            ) {
+                                if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
+                                    if let Some(file) = resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths) {
+                                        let module_targets: Vec<i64> = name_to_ids
+                                            .get("<module>")
+                                            .map(|ids| ids.iter().copied()
+                                                .filter(|id| node_id_to_path.get(id).map(|p| p == &file).unwrap_or(false))
+                                                .collect())
+                                            .unwrap_or_default();
+                                        for &src_id in &source_ids {
+                                            for &tgt_id in &module_targets {
+                                                if src_id != tgt_id
+                                                    && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                    total_edges_created += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 continue;
                             }
                         }

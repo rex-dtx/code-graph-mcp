@@ -626,10 +626,9 @@ fn walk_for_relations(
                 }
             }
 
-            // Check for HTTP route registration patterns first
-            if let Some(route_rel) = extract_route_pattern(&node, source, language) {
-                results.push(route_rel);
-            }
+            // Check for HTTP route registration patterns first. Vec: one axum
+            // `.route(path, get(a).post(b))` call registers several routes.
+            results.extend(extract_route_pattern(&node, source, language));
 
             // Call relation extraction. For JS/TS/TSX + Kotlin/Swift, fall back to
             // `<module>` when the call sits at file top level (imports, init code)

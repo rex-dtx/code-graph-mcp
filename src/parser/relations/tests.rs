@@ -930,6 +930,135 @@ func main() {
         "got relations: {:?}", relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
 }
 
+/// axum builder-chain route extraction (roadmap 2026-07-18 §2.1): every
+/// `.route(path, get(h).post(h2))` link emits one routes_to per (method, handler).
+#[test]
+fn test_extract_axum_routes() {
+    let code = r#"
+use axum::{routing::get, Router};
+
+async fn list_users() {}
+async fn create_user() {}
+async fn health() {}
+
+fn app() -> Router {
+    Router::new()
+        .route("/users", get(list_users).post(create_user))
+        .route("/health", get(health))
+}
+"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let routes: Vec<(&str, &str)> = relations.iter()
+        .filter(|r| r.relation == REL_ROUTES_TO)
+        .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
+        .collect();
+    assert!(routes.iter().any(|(m, t)| m.contains(r#""method":"GET"#) && m.contains("/users") && *t == "list_users"),
+        "GET /users -> list_users missing; got routes: {:?}", routes);
+    assert!(routes.iter().any(|(m, t)| m.contains(r#""method":"POST"#) && m.contains("/users") && *t == "create_user"),
+        "POST /users -> create_user (chained method router) missing; got routes: {:?}", routes);
+    assert!(routes.iter().any(|(m, t)| m.contains("/health") && *t == "health"),
+        "GET /health -> health missing; got routes: {:?}", routes);
+}
+
+/// Inline `.nest("/prefix", Router::new().route(...))` composes the prefix onto
+/// the nested paths. Cross-variable nest (a router built elsewhere) is a
+/// documented non-goal — no dataflow resolution at parse time.
+#[test]
+fn test_extract_axum_nested_route_prefix() {
+    let code = r#"
+use axum::{routing::get, Router};
+
+async fn list_users() {}
+
+fn app() -> Router {
+    Router::new().nest("/api", Router::new().route("/users", get(list_users)))
+}
+"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let routes: Vec<&str> = relations.iter()
+        .filter(|r| r.relation == REL_ROUTES_TO)
+        .map(|r| r.metadata.as_deref().unwrap_or(""))
+        .collect();
+    assert!(routes.iter().any(|m| m.contains(r#""path":"/api/users""#)),
+        "nested prefix must compose to /api/users; got: {:?}", routes);
+}
+
+/// Path-qualified handlers and method fns resolve to their last segment:
+/// `.route("/u", axum::routing::get(handlers::list_users))` → list_users.
+#[test]
+fn test_extract_axum_scoped_handler_and_method() {
+    let code = r#"
+fn app() -> axum::Router {
+    axum::Router::new().route("/u", axum::routing::get(handlers::list_users))
+}
+"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    let routes: Vec<(&str, &str)> = relations.iter()
+        .filter(|r| r.relation == REL_ROUTES_TO)
+        .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
+        .collect();
+    assert!(routes.iter().any(|(m, t)| m.contains(r#""method":"GET"#) && *t == "list_users"),
+        "scoped method fn + scoped handler must resolve; got: {:?}", routes);
+}
+
+/// ESM namespace import `import * as ns from './m'` (roadmap 2026-07-18 §2.3):
+/// must emit a q:"ns_import" REL_IMPORTS marker carrying the alias + specifier
+/// (was silently dropped — the import_clause walk only knew named specifiers).
+#[test]
+fn test_extract_ts_namespace_import_marker() {
+    let code = "import * as helpers from './helpers';\nexport function run() { return helpers.fmt(); }\n";
+    let relations = extract_relations(code, "typescript").unwrap();
+    let marker = relations.iter().find(|r| {
+        r.relation == REL_IMPORTS
+            && r.metadata.as_deref().is_some_and(|m| m.contains("ns_import"))
+    });
+    let marker = marker.unwrap_or_else(|| panic!(
+        "namespace import must emit a ns_import marker; got: {:?}",
+        relations.iter().map(|r| (&r.relation, &r.target_name, &r.metadata)).collect::<Vec<_>>()));
+    assert_eq!(marker.target_name, "helpers", "marker must carry the ALIAS (ns_module_map key)");
+    assert!(marker.metadata.as_deref().unwrap().contains("./helpers"), "specifier must ride along");
+    // The old path must NOT also emit a garbage `* as helpers` name.
+    assert!(!relations.iter().any(|r| r.target_name.contains('*')),
+        "no star-shaped garbage names; got: {:?}",
+        relations.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+}
+
+/// Star re-export `export * from './m'` (barrel wildcard): must emit a
+/// q:"star_reexport" module-level dependency marker (was ZERO edges — the
+/// barrel was invisible to deps/affected/cycles).
+#[test]
+fn test_extract_ts_star_reexport_marker() {
+    let code = "export * from './widgets';\nexport * as shapes from './shapes';\n";
+    let relations = extract_relations(code, "typescript").unwrap();
+    let stars: Vec<&ParsedRelation> = relations.iter()
+        .filter(|r| r.relation == REL_IMPORTS
+            && r.metadata.as_deref().is_some_and(|m| m.contains("star_reexport")))
+        .collect();
+    assert!(stars.iter().any(|r| r.metadata.as_deref().unwrap().contains("./widgets")),
+        "export * from must emit a star_reexport marker; got: {:?}",
+        relations.iter().map(|r| (&r.relation, &r.target_name, &r.metadata)).collect::<Vec<_>>());
+    assert!(stars.iter().any(|r| r.metadata.as_deref().unwrap().contains("./shapes")),
+        "export * as ns from must too; got: {:?}",
+        stars.iter().map(|r| (&r.target_name, &r.metadata)).collect::<Vec<_>>());
+}
+
+/// Negative: a bare `.get(...)` call outside `.route(...)` args (reqwest-style
+/// clients, HashMap::get) must not fabricate routes_to edges.
+#[test]
+fn test_axum_no_false_positive_on_client_get() {
+    let code = r#"
+fn fetch(client: &Client, m: &std::collections::HashMap<String, String>) {
+    let _r = client.get("/users");
+    let _v = m.get("key");
+}
+"#;
+    let relations = extract_relations(code, "rust").unwrap();
+    assert!(!relations.iter().any(|r| r.relation == REL_ROUTES_TO),
+        "bare .get calls must not create routes; got: {:?}",
+        relations.iter().filter(|r| r.relation == REL_ROUTES_TO)
+            .map(|r| (&r.target_name, &r.metadata)).collect::<Vec<_>>());
+}
+
 #[test]
 fn test_extract_ts_implements() {
     let code = "class UserService implements IUserService {\n    getUser() { return null; }\n}\n";

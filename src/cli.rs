@@ -5221,11 +5221,12 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     if rows.is_empty() {
         // Disclose the framework-coverage limit (mirrors the MCP trace path's
         // richer message): route extraction is implemented for Express/Connect
-        // (JS/TS/TSX), Go net/http, and Flask/FastAPI (Python) only — a Rust
-        // (axum/actix) or Java (Spring) project has real routes the extractor
-        // never sees, so a bare "no match" reads as "no such route" and misleads.
-        let hint = "route extraction covers Express/Connect (JS/TS), Go net/http, and Flask/FastAPI (Python); \
-                    Rust and Java web frameworks are not yet extracted";
+        // (JS/TS/TSX), Go net/http, Flask/FastAPI (Python), and axum (Rust,
+        // v51) — an actix (Rust) or Java (Spring) project has real routes the
+        // extractor never sees, so a bare "no match" reads as "no such route"
+        // and misleads.
+        let hint = "route extraction covers Express/Connect (JS/TS), Go net/http, Flask/FastAPI (Python), and axum (Rust); \
+                    actix and Java web frameworks are not yet extracted";
         if json_mode {
             println!("{}", serde_json::json!({
                 "handlers": [],

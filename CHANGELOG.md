@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added — INDEX_VERSION 51 (existing indexes auto-rebuild once on upgrade)
+
+- **Rust axum route extraction** (roadmap §2.1 — `trace` was blind on Rust, this
+  product's own language): `.route(path, get(h).post(h2))` builder chains emit
+  one `routes_to` edge per (method, handler); inline `.nest("/prefix", …)`
+  composes path prefixes (ancestor walk); handlers resolve by name incl.
+  cross-file (`use handlers::list_users`) via the existing routes_to recovery;
+  `axum::routing::get` scoped forms and `any` (→ ALL) supported. Scoped
+  strictly to `.route` links — bare `.get()` (reqwest/HashMap) cannot
+  fabricate routes. Non-goals (documented): closures as handlers, nest of a
+  router variable built elsewhere (needs dataflow), actix/rocket/Spring —
+  the `trace` empty-result hint names the coverage.
+- **ESM namespace imports + star barrels form real edges** (roadmap §2.3,
+  closes the v0.92.0 known limitation): `import * as ns from './m'` and
+  `export * from './m'` (incl. `export * as ns`) now bind a module-level
+  `imports` edge to the resolved file's `<module>` node (the PHP-/C-include
+  pattern), so namespace-only and star-barrel dependencies are visible to
+  `deps`/`affected`/`cycles`/`map`; CJS `const m = require('./m')` markers get
+  the same module-level edge (previously skipped entirely). The ESM namespace
+  alias also feeds the member-call binder, so `ns.fmt()` resolves cross-file
+  exactly like the CJS require-namespace path. Residual (documented):
+  name-level resolution *through* a star barrel still uses the name-based
+  fallback — star-chain following is a future enhancement.
+
 ## v0.99.1 — disclosure batch (roadmap Phase 1)
 
 ### Fixed — disclosure batch (roadmap 2026-07-18 §1: honest info must reach the consumer)

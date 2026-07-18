@@ -3275,6 +3275,88 @@ app.get('/widgets', (req, res) => {
 }
 
 #[test]
+fn test_cli_deps_namespace_import_and_star_barrel() {
+    // v51 (roadmap §2.3): `import * as ns from './m'` and `export * from './m'`
+    // now bind a module-level imports edge to the resolved file's <module> node,
+    // so namespace-only and star-barrel dependencies show in deps; the ns alias
+    // also feeds ns_module_map, binding `ns.fmt()` member calls cross-file.
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("util.ts"),
+        "export function fmt(x: string): string { return x.trim(); }\n").unwrap();
+    std::fs::write(src.join("barrel.ts"), "export * from './util';\n").unwrap();
+    std::fs::write(src.join("app.ts"),
+        "import * as u from './util';\nexport function run(): string { return u.fmt(' hi '); }\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (barrel_deps, _, code1) = run_cli(&project, &["deps", "src/barrel.ts"]);
+    assert_eq!(code1, 0, "star barrel must have dep edges now; got:\n{barrel_deps}");
+    assert!(barrel_deps.contains("util.ts"),
+        "export * from './util' must show util.ts as a dependency; got:\n{barrel_deps}");
+
+    let (app_deps, _, code2) = run_cli(&project, &["deps", "src/app.ts"]);
+    assert_eq!(code2, 0);
+    assert!(app_deps.contains("util.ts"),
+        "import * as u from './util' must show util.ts as a dependency; got:\n{app_deps}");
+
+    // Member-call binding through the ESM namespace: run → fmt cross-file.
+    let (cg, _, code3) = run_cli(&project, &["callgraph", "fmt", "--direction", "callers"]);
+    assert_eq!(code3, 0, "fmt must have callers; got:\n{cg}");
+    assert!(cg.contains("run"),
+        "u.fmt() must bind to util.ts fmt (ns_module_map via ns_import); got:\n{cg}");
+}
+
+#[test]
+fn test_cli_trace_axum_routes_end_to_end() {
+    // axum route extraction (v51, roadmap §2.1): builder-chain routes are
+    // traceable end-to-end, including the cross-file named-handler case (the
+    // [route-imported-handler] class that bit Express at IDX v29 — the handler
+    // fn lives in another file and resolves via the routes_to recovery path).
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("handlers.rs"), r#"
+pub async fn list_users() -> String {
+    fetch_all()
+}
+
+fn fetch_all() -> String { String::new() }
+"#).unwrap();
+    std::fs::write(src.join("main.rs"), r#"
+use axum::{routing::get, Router};
+use crate::handlers::list_users;
+
+async fn health() -> &'static str { "ok" }
+
+fn app() -> Router {
+    Router::new()
+        .nest("/api", Router::new().route("/users", get(list_users)))
+        .route("/health", get(health))
+}
+"#).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // Same-file handler.
+    let (out, _, code) = run_cli(&project, &["trace", "GET /health"]);
+    assert_eq!(code, 0, "axum same-file route must resolve; got:\n{out}");
+    assert!(out.contains("health"), "handler must be named; got:\n{out}");
+
+    // Cross-file handler behind an inline nest prefix, callees traced.
+    let (out2, _, code2) = run_cli(&project, &["trace", "GET /api/users"]);
+    assert_eq!(code2, 0, "nested cross-file axum route must resolve; got:\n{out2}");
+    assert!(out2.contains("list_users"), "cross-file handler; got:\n{out2}");
+    assert!(out2.contains("fetch_all"), "handler callees must chain; got:\n{out2}");
+}
+
+#[test]
 fn test_cli_trace_hides_ambiguous_fanout_by_default() {
     // v0.77: trace inherits the v0.76 confidence floor (was deliberately left at
     // rank-0 show-all). A route handler that makes an ambiguous by-name call (one

@@ -1,21 +1,174 @@
 //! HTTP route registration extraction for Express/Connect (TS/JS/TSX),
-//! Go net/http, and Python Flask/FastAPI. Each framework matches a
+//! Go net/http, Python Flask/FastAPI, and Rust axum. Each framework matches a
 //! distinct AST shape so they keep separate per-language entry points;
 //! `extract_route_pattern` is the call_expression dispatcher used by the
 //! main walker, while `extract_python_route` is a decorator-driven
 //! standalone path called when the walker hits `decorated_definition`.
+//!
+//! Returns a Vec because one registration call can register several routes:
+//! axum's `.route("/u", get(a).post(b))` is ONE call carrying one edge per
+//! (method, handler) pair. Express/Go/Python stay single-edge per call.
 
 use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::extract_string_from_subtree;
 use crate::domain::REL_ROUTES_TO;
 
-pub(super) fn extract_route_pattern(node: &tree_sitter::Node, source: &str, language: &str) -> Option<ParsedRelation> {
+pub(super) fn extract_route_pattern(node: &tree_sitter::Node, source: &str, language: &str) -> Vec<ParsedRelation> {
     match language {
-        "typescript" | "javascript" | "tsx" => extract_express_route(node, source),
-        "go" => extract_go_route(node, source),
+        "typescript" | "javascript" | "tsx" => extract_express_route(node, source).into_iter().collect(),
+        "go" => extract_go_route(node, source).into_iter().collect(),
+        "rust" => extract_axum_routes(node, source),
+        _ => Vec::new(),
+    }
+}
+
+/// axum method-router constructor names (`axum::routing::get` etc.). `trace` is
+/// a real axum verb (HTTP TRACE); `any` maps to method "ALL" like Go's Handle.
+const AXUM_METHOD_FNS: &[&str] = &[
+    "get", "post", "put", "delete", "patch", "head", "options", "trace", "any",
+];
+
+/// Rust axum builder-chain extraction (roadmap 2026-07-18 §2.1). Fires ONLY on
+/// `.route(path_literal, <method-router expr>)` call links, so bare `.get(...)`
+/// calls (reqwest clients, HashMap::get) can never fabricate a route. One edge
+/// per (method, handler) pair found in the second argument's method-router
+/// chain (`get(a).post(b)`), self-edge shape identical to Express/Go so the
+/// existing same-file + cross-file routes_to resolution applies unchanged.
+///
+/// Scope (documented non-goals, same MVP spirit as the Express extractor):
+/// - inline closures as handlers are skipped (no synthetic-node materializer
+///   on the Rust side yet); named + path-qualified handlers resolve.
+/// - `.nest("/prefix", <inline subtree>)` composes prefixes by ancestor walk;
+///   a nest whose child router is built in ANOTHER statement/variable is not
+///   composed (needs dataflow, not parse-time AST). `.merge` needs no
+///   composition — merged routers keep their own paths.
+/// - actix/rocket/warp are separate future arms, not silently claimed.
+fn extract_axum_routes(node: &tree_sitter::Node, source: &str) -> Vec<ParsedRelation> {
+    let Some(function) = node.child_by_field_name("function") else { return Vec::new() };
+    if function.kind() != "field_expression" { return Vec::new(); }
+    let Some(field) = function.child_by_field_name("field") else { return Vec::new() };
+    if node_text(&field, source) != "route" { return Vec::new(); }
+
+    let Some(args) = node.child_by_field_name("arguments") else { return Vec::new() };
+    let Some(path_arg) = args.named_child(0) else { return Vec::new() };
+    if path_arg.kind() != "string_literal" { return Vec::new(); }
+    let path = node_text(&path_arg, source).trim_matches('"').to_string();
+    let Some(router_arg) = args.named_child(1) else { return Vec::new() };
+
+    let full_path = format!("{}{}", compose_axum_nest_prefix(node, source), path);
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    collect_axum_method_handlers(&router_arg, source, &mut pairs);
+
+    pairs
+        .into_iter()
+        .map(|(method, handler)| {
+            let metadata = serde_json::json!({"method": method, "path": full_path}).to_string();
+            ParsedRelation {
+                source_name: handler.clone(),
+                target_name: handler,
+                relation: REL_ROUTES_TO.into(),
+                metadata: Some(metadata),
+                source_language: String::new(),
+            }
+        })
+        .collect()
+}
+
+/// Walk a method-router chain (`get(a)`, `axum::routing::get(a)`,
+/// `get(a).post(b)`) collecting (HTTP_METHOD, handler_name) pairs. Non-method
+/// chain links (`.route_layer`, `.layer`, `.with_state`) are skipped but the
+/// walk continues down their receiver, so `get(a).route_layer(x)` still finds a.
+fn collect_axum_method_handlers(expr: &tree_sitter::Node, source: &str, pairs: &mut Vec<(String, String)>) {
+    if expr.kind() != "call_expression" { return; }
+    let Some(function) = expr.child_by_field_name("function") else { return };
+    match function.kind() {
+        "identifier" | "scoped_identifier" => {
+            let name = node_text(&function, source);
+            let last = name.rsplit("::").next().unwrap_or(name);
+            if AXUM_METHOD_FNS.contains(&last) {
+                if let Some(handler) = axum_handler_name(expr, source) {
+                    pairs.push((axum_method_label(last), handler));
+                }
+            }
+        }
+        "field_expression" => {
+            if let Some(field) = function.child_by_field_name("field") {
+                let fname = node_text(&field, source);
+                if AXUM_METHOD_FNS.contains(&fname) {
+                    if let Some(handler) = axum_handler_name(expr, source) {
+                        pairs.push((axum_method_label(fname), handler));
+                    }
+                }
+            }
+            if let Some(value) = function.child_by_field_name("value") {
+                collect_axum_method_handlers(&value, source, pairs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn axum_method_label(method_fn: &str) -> String {
+    if method_fn == "any" { "ALL".into() } else { method_fn.to_uppercase() }
+}
+
+/// First named argument of a method-router call, as a resolvable handler name:
+/// `get(list_users)` → list_users; `get(handlers::list_users)` → list_users
+/// (last path segment — matches how the handler fn node is named). Closures /
+/// other expressions → None (skipped, per the extractor's documented scope).
+fn axum_handler_name(call: &tree_sitter::Node, source: &str) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let arg = args.named_child(0)?;
+    match arg.kind() {
+        "identifier" => Some(node_text(&arg, source).to_string()),
+        "scoped_identifier" => {
+            let text = node_text(&arg, source);
+            Some(text.rsplit("::").next().unwrap_or(text).to_string())
+        }
         _ => None,
     }
+}
+
+/// Concatenated prefixes of every enclosing `.nest("<prefix>", …)` whose SECOND
+/// argument subtree contains `node` (byte-range check — a `.nest` reached
+/// through the receiver chain, `Router::new().route(…).nest(…)`, does NOT
+/// prefix the routes registered before it). Outermost prefix first.
+fn compose_axum_nest_prefix(node: &tree_sitter::Node, source: &str) -> String {
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == "call_expression" {
+            let is_nest = p
+                .child_by_field_name("function")
+                .filter(|f| f.kind() == "field_expression")
+                .and_then(|f| f.child_by_field_name("field"))
+                .map(|f| node_text(&f, source) == "nest")
+                .unwrap_or(false);
+            if is_nest {
+                if let Some(args) = p.child_by_field_name("arguments") {
+                    let node_in_args = args.start_byte() <= node.start_byte()
+                        && node.end_byte() <= args.end_byte();
+                    if node_in_args {
+                        if let Some(prefix_arg) = args.named_child(0) {
+                            if prefix_arg.kind() == "string_literal" {
+                                prefixes.push(
+                                    node_text(&prefix_arg, source)
+                                        .trim_matches('"')
+                                        .trim_end_matches('/')
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cur = p.parent();
+    }
+    prefixes.reverse();
+    prefixes.concat()
 }
 
 fn extract_express_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
