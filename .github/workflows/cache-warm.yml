@@ -64,9 +64,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # `shared-key` mirrors release.yml exactly — rust-cache's automatic key
+      # embeds the job name, so plain `key` caches from this `warm` job could
+      # never be restored by release.yml's `build` job (proven live on
+      # v0.101.0: green priming run, yet all 5 release builds "No cache found").
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: ${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'

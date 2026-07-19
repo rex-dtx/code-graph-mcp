@@ -72,9 +72,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # `shared-key` (NOT `key`): rust-cache's automatic key embeds the JOB name,
+      # so plain `key` never matches across workflows — cache-warm.yml's `warm`
+      # job and this `build` job hashed to different caches and v0.101.0 still
+      # built cold ("No cache found" on all 5 targets) despite a green priming
+      # run. shared-key replaces the job-bound portion, making the main-branch
+      # warm cache restorable here. Must stay identical in cache-warm.yml.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: ${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
