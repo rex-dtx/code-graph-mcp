@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.101.0 — instrumentation fixes + bounded pending retention (roadmap Phase 3)
 
 ### Added
 - **Release build-cache warming** (roadmap §3.5, D#73): new `cache-warm.yml`
