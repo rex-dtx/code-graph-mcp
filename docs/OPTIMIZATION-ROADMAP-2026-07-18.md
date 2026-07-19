@@ -87,8 +87,14 @@ Phase 3  仪表修正（3.1→3.3）           ── ✅ 落地（batched-turn 
          3.4 激活边界残留（self-heal 提到非项目门前）── ✅ 落地（daagu dark 类结构因关闭；
                                              注入成本本体经核实早已修复：quiet 默认 v0.17 +
                                              非项目 stub v0.33/v0.34 + 监测 v0.49.1/v0.67）
-         3.5 release 冷缓存（D#73）      ── ✅ cache-warm.yml（main 侧同 key 预热；
-                                             根因=Actions cache ref-scoped + main 无同 key run）
+         3.5 release 冷缓存（D#73）      ── ✅ cache-warm.yml + shared-key 修正（37ef013）。
+                                             根因两层：Actions cache ref-scoped + rust-cache
+                                             自动 key 内嵌 job 名（v0.101.0 实测揭示：预热绿
+                                             但 5 build 全 "No cache found"→ 改 shared-key）。
+                                             release 侧命中留待下次发版实测
+
+Phase 1–3 全部条目已落地。v0.101.0（2026-07-19）RELEASED：release run 全绿零重试，
+npm 0.101.0 + 12 资产 + 3 平台 smoke 一次过。
 ```
 
 > 状态更新 2026-07-18：Phase 1 与 2a/2b/2c 全部落地。residual（各条目内已注明）：
