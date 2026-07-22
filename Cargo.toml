@@ -2,6 +2,7 @@
 name = "code-graph-mcp"
 version = "0.101.0"
 edition = "2021"
+license = "MIT"
 
 [features]
 # v0.18.4: default flipped to [] for direct `cargo install` users — gives a
