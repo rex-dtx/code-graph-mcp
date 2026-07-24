@@ -107,3 +107,72 @@ test('P0-b a valid current entry on a different delivery surface is NOT stale (n
   assert.equal(changed, false, 'registerHooksToSettings must be a no-op when a valid current set is already present');
   assert.equal(JSON.stringify(settings.hooks), before, 'settings.hooks must be untouched (no ping-pong rewrite)');
 });
+
+// --- Field-shape smoke: the full 2026-07-24 incident state in one settings.json
+
+test('smoke: mixed stale plugin-cache + dual-node bare npm orphans converge to exactly one current set', () => {
+  // The exact accumulated shape observed in the field before v0.104.0: an old
+  // plugin-cache version's guarded entries AND bare global-npm entries from two
+  // nvm node versions, all coexisting — every hook fired 2-3x. One registration
+  // pass must converge to exactly one current entry per desired (event,matcher),
+  // and must not touch entries that are not ours.
+  const staleCache = (name) => ({
+    matcher: 'Edit',
+    hooks: [{ type: 'command', command: `if [ -f "/home/u/.claude/plugins/cache/code-graph-mcp/code-graph-mcp/0.103.0/scripts/${name}" ]; then node "/home/u/.claude/plugins/cache/code-graph-mcp/code-graph-mcp/0.103.0/scripts/${name}"; fi` }],
+  });
+  const bareNpm = (nodeVer, name) => ({
+    matcher: 'Edit',
+    hooks: [{ type: 'command', command: `node "/home/u/.nvm/versions/node/${nodeVer}/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts/${name}"` }],
+  });
+  const foreign = {
+    matcher: 'Edit',
+    hooks: [{ type: 'command', command: 'node "/home/u/.claude/plugins/cache/other-vendor/other-plugin/1.0.0/scripts/pre-edit.js"' }],
+  };
+
+  const settings = { hooks: {
+    PreToolUse: [
+      staleCache('pre-edit-guide.js'),
+      bareNpm('v24.11.1', 'pre-edit-guide.js'),
+      bareNpm('v24.18.0', 'pre-edit-guide.js'),
+      foreign,
+    ],
+    PostToolUse: [
+      { matcher: 'Write|Edit', hooks: [{ type: 'command', command: 'node "/home/u/.nvm/versions/node/v24.11.1/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts/incremental-index.js"' }] },
+    ],
+    UserPromptSubmit: [
+      { matcher: '', hooks: [{ type: 'command', command: 'if [ -f "/home/u/.claude/plugins/cache/code-graph-mcp/code-graph-mcp/0.103.0/scripts/user-prompt-context.js" ]; then node "/home/u/.claude/plugins/cache/code-graph-mcp/code-graph-mcp/0.103.0/scripts/user-prompt-context.js"; fi' }] },
+    ],
+  } };
+
+  const changed = lifecycle.registerHooksToSettings(settings);
+  assert.equal(changed, true, 'a mixed stale/orphan state must trigger a rewrite');
+
+  const desired = lifecycle.buildSettingsHookEntries();
+  for (const [event, desiredEntries] of Object.entries(desired)) {
+    for (const d of desiredEntries) {
+      const script = (d.hooks[0].command.match(/([a-z-]+\.js)/) || [])[1];
+      const matches = (settings.hooks[event] || []).filter(e =>
+        (e.hooks || []).some(h => h.command.includes(script)));
+      assert.equal(matches.length, 1,
+        `${event}/${script}: expected exactly 1 entry after convergence, got ${matches.length}`);
+      assert.ok(matches[0].hooks[0].command.includes(d.hooks[0].command.match(/"([^"]+)"/)[1]),
+        `${event}/${script}: surviving entry must point at the current PLUGIN_ROOT script`);
+    }
+  }
+
+  const oursTotal = Object.values(settings.hooks).flat()
+    .filter(e => lifecycle.isOurHookEntry(e)).length;
+  const expectedTotal = Object.values(desired).flat().length;
+  assert.equal(oursTotal, expectedTotal,
+    `exactly ${expectedTotal} of our entries must remain, got ${oursTotal}`);
+
+  const foreignSurvivors = (settings.hooks.PreToolUse || []).filter(e =>
+    (e.hooks || []).some(h => h.command.includes('other-vendor')));
+  assert.equal(foreignSurvivors.length, 1, 'a foreign plugin hook must survive untouched');
+
+  // Idempotence: a second pass over the converged state is a no-op.
+  const after = JSON.stringify(settings.hooks);
+  assert.equal(lifecycle.registerHooksToSettings(settings), false,
+    'second registration over a converged state must be a no-op');
+  assert.equal(JSON.stringify(settings.hooks), after, 'converged state must be stable');
+});

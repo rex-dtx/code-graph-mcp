@@ -273,7 +273,12 @@ test('§1.9 session-init self-heals a stale-but-existing settings.json hook path
   const { homeDir, settingsPath } = installIntoSandbox();
 
   // Simulate: pre-edit-guide hook pinned at an old-version path that exists.
-  const staleScript = path.join(homeDir, 'old-cache', '0.45.1', 'scripts', 'pre-edit-guide.js');
+  // Must use the REAL plugin-cache layout (<marketplace>/<plugin>/<ver>/scripts):
+  // since the v0.104.0 surface-tolerant staleness fix, only a dead path or an
+  // OLDER cache-version dir is stale — an existing path of unknown shape is
+  // treated as a valid in-place surface (the ping-pong fix) and left alone.
+  const staleScript = path.join(homeDir, '.claude', 'plugins', 'cache',
+    'code-graph-mcp', 'code-graph-mcp', '0.45.1', 'scripts', 'pre-edit-guide.js');
   fs.mkdirSync(path.dirname(staleScript), { recursive: true });
   fs.writeFileSync(staleScript, '// stale copy\n');
   const settings = readJson(settingsPath);

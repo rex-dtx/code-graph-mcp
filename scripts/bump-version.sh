@@ -4,6 +4,13 @@ VERSION=${1:?Usage: scripts/bump-version.sh <version>}
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Self-heal the commit gate. core.hooksPath is per-clone config that nothing
+# forces on a pure-Rust checkout (npm `prepare` never runs without `npm
+# install`) — v0.104.0 shipped a red install-e2e §1.9 exactly this way. Wiring
+# it here guarantees any machine that cuts a release has the pre-commit gate
+# active before the bump commit is made. Covers all worktrees of the clone.
+git config core.hooksPath scripts/githooks
+
 # Build the dev binary WITH embed-model so the local MCP server (.mcp.json →
 # target/release/code-graph-mcp) keeps producing semantic vectors. A bare bump
 # would rebuild a no-embed binary, silently disabling vector search for every dev

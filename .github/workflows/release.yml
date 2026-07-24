@@ -149,8 +149,25 @@ jobs:
         env:
           SYNC_VERSIONS_SKIP_BUILD: '1'
 
-      - name: Release smoke test
-        run: node --test scripts/release-smoke.test.js
+      - name: JS test suite (full — includes install-e2e)
+        # Broadened from release-smoke only (which the glob still includes):
+        # the local pre-commit hook was the ONLY gate running install-e2e.test.js
+        # (ci.yml excludes it — needs a built binary), and that hook exists only
+        # after `npm install` runs the prepare script, which a pure-Rust checkout
+        # never does — v0.104.0 shipped with a red §1.9 because neither gate
+        # fired. Here the binaries are already built, so feed find-binary's dev
+        # path (target/release/) the linux-x64 artifact and run the whole suite.
+        # mcp-launcher.test.js stays out for the same reason as in ci.yml: its
+        # dedup stub needs the gitignored dev-only .mcp.json.
+        # --test-concurrency=1: same find-binary cache/env cross-process race as
+        # documented in ci.yml.
+        run: |
+          mkdir -p target/release
+          cp artifacts/binary-linux-x64/code-graph-mcp target/release/
+          chmod +x target/release/code-graph-mcp
+          files=$(ls claude-plugin/scripts/*.test.js scripts/*.test.js \
+            | grep -vE '(^|/)mcp-launcher\.test\.js$')
+          node --test --test-concurrency=1 $files
 
       - name: Prepare release assets
         run: |

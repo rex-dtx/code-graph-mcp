@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Activated via `git config core.hooksPath scripts/githooks` — wired by npm's
+# `prepare` script AND scripts/bump-version.sh (a pure-Rust checkout never runs
+# `npm install`, so prepare alone left clones ungated; v0.104.0 shipped a red
+# install-e2e §1.9 that way). Thin shim: the real gate stays in
+# scripts/pre-commit.sh, runnable directly and shared with the legacy
+# .git/hooks symlink path.
+exec "$(dirname "$0")/../pre-commit.sh" "$@"

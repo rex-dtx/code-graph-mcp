@@ -557,8 +557,16 @@ function surveyHookCoverage(settings) {
     if (!pScript) return false;
     if (!fs.existsSync(pScript)) return true;             // dead path
     const pv = cacheDirVersion(pScript);
-    const dv = cacheDirVersion(hookCmdScript(desiredCmd[k]));
-    if (pv && dv) return compareVersions(pv, dv) < 0;     // older cache version dir
+    if (pv) {
+      // Pinned to a plugin-cache version dir: stale iff older than us. Compare
+      // against the desired cache dir when we're the cache authority; the
+      // global-npm/dev authority's desired path carries no version dir, so
+      // fall back to our own plugin version — an old-version cache pin must be
+      // healed from EITHER surface, not only when the desired path happens to
+      // be cache-shaped. Newer-than-us stays (downgrade-war guard, §1.11).
+      const dv = cacheDirVersion(hookCmdScript(desiredCmd[k])) || getPluginVersion();
+      return compareVersions(pv, dv) < 0;
+    }
     return false;                                         // in-place/current surface
   });
   return { expected, present: [...present], missing, stale };
