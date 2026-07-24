@@ -10,7 +10,7 @@ const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
 const { claudeHome } = require('./claude-config');
 const { clearCache: clearBinaryCache, globalNodeModulesCandidates, PLATFORM_PKG, detectLibc } = require('./find-binary');
-const { readBinaryVersion, isDevMode } = require('./version-utils');
+const { readBinaryVersion, compareVersions, isDevMode } = require('./version-utils');
 const { cgTmpDir } = require('./tmp-dir');
 const { npmSpawnOpts } = require('./npm-exec');
 const { acquireLock } = require('./install-lock');
@@ -112,21 +112,9 @@ function shouldCheck(state, { force = false } = {}) {
   return elapsed >= interval;
 }
 
-// ── Version Comparison (semver) ────────────────────────────
-
-// Assumes plain numeric "M.m.p" releases (the project's tag scheme). A pre-release
-// tag (e.g. "1.2.4-rc1") is NOT semver-ordered: `Number("4-rc1")` is NaN → coerced
-// to 0, dropping that segment's number (so "1.2.4-rc1" wrongly sorts below "1.2.3").
-// Revisit with a real semver compare only if the release process adopts pre-releases.
-function compareVersions(a, b) {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] || 0) > (pb[i] || 0)) return 1;
-    if ((pa[i] || 0) < (pb[i] || 0)) return -1;
-  }
-  return 0;
-}
+// ── Version Comparison ─────────────────────────────────────
+// compareVersions is imported from version-utils.js (single canonical,
+// pre-release-aware implementation) and re-exported below.
 
 // ── GitHub API ─────────────────────────────────────────────
 

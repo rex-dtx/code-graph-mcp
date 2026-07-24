@@ -26,6 +26,37 @@ function readBinaryVersion(binaryPath) {
   }
 }
 
+/**
+ * Compare semver-ish version strings; returns -1, 0, or 1. Numeric triple
+ * compared ordinally (missing/non-numeric parts → 0); a pre-release suffix
+ * sorts BELOW its release ("1.2.3-rc1" < "1.2.3"), two pre-releases compare
+ * as plain strings. Single canonical implementation — auto-update.js and
+ * find-binary.js each carried a divergent copy whose pre-release semantics
+ * disagreed (Number("4-rc1")→NaN→0 vs parseInt("3-rc1")→3), a silent
+ * mis-ordering trap if release tags ever adopt "-rc" suffixes.
+ */
+function compareVersions(a, b) {
+  const parse = (v) => {
+    const s = String(v);
+    const dash = s.indexOf('-');
+    const core = dash === -1 ? s : s.slice(0, dash);
+    return {
+      nums: core.split('.').map((x) => parseInt(x, 10)),
+      pre: dash === -1 ? null : s.slice(dash + 1),
+    };
+  };
+  const pa = parse(a), pb = parse(b);
+  for (let i = 0; i < 3; i++) {
+    const x = Number.isFinite(pa.nums[i]) ? pa.nums[i] : 0;
+    const y = Number.isFinite(pb.nums[i]) ? pb.nums[i] : 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  if (pa.pre && !pb.pre) return -1;
+  if (!pa.pre && pb.pre) return 1;
+  if (pa.pre && pb.pre && pa.pre !== pb.pre) return pa.pre < pb.pre ? -1 : 1;
+  return 0;
+}
+
 function isDevMode(pluginRoot = path.resolve(__dirname, '..')) {
   // Explicit opt-in always wins (also lets users force dev mode in any layout)
   if (process.env.CODE_GRAPH_DEV === '1') return true;
@@ -63,4 +94,4 @@ function getNewestMtime(dir, ext = '.rs') {
   return newest;
 }
 
-module.exports = { readBinaryVersion, isDevMode, getNewestMtime, VERSION_OUTPUT_RE };
+module.exports = { readBinaryVersion, compareVersions, isDevMode, getNewestMtime, VERSION_OUTPUT_RE };

@@ -4,7 +4,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { readBinaryVersion } = require('./version-utils');
+const { readBinaryVersion, compareVersions } = require('./version-utils');
 const { npmSpawnOpts } = require('./npm-exec');
 
 const PLATFORM = os.platform();
@@ -66,23 +66,8 @@ function getPackageVersion() {
   catch { return null; }
 }
 
-/**
- * Compare semver-ish "M.m.p" strings; returns -1, 0, or 1. Non-numeric parts → 0.
- * Assumes plain numeric releases (the project's tag scheme); a pre-release tag
- * (e.g. "1.2.3-rc1") is NOT semver-ordered — `parseInt("3-rc1", 10)` keeps the
- * leading 3 and drops the suffix, so "1.2.3-rc1" compares EQUAL to "1.2.3".
- * Revisit only if releases adopt pre-release tags.
- */
-function compareVersions(a, b) {
-  const pa = String(a).split('.').map(s => parseInt(s, 10));
-  const pb = String(b).split('.').map(s => parseInt(s, 10));
-  for (let i = 0; i < 3; i++) {
-    const x = Number.isFinite(pa[i]) ? pa[i] : 0;
-    const y = Number.isFinite(pb[i]) ? pb[i] : 0;
-    if (x !== y) return x < y ? -1 : 1;
-  }
-  return 0;
-}
+// compareVersions lives in version-utils.js (single canonical implementation,
+// pre-release-aware); re-exported below for existing consumers.
 
 /**
  * Candidate paths for npm global `node_modules`.
@@ -217,19 +202,29 @@ function isDevRepo(rootDir) {
  * nvm/standard setups), so a working `npm install -g @sdsrs/code-graph` can
  * still be invisible without the fallback.
  */
+// Truncation gate for the npm platform-package tier ONLY: an interrupted npm
+// install can leave a partial binary with the right name, and unlike the
+// GitHub-download path (size + sha256 sidecar + version-exec before promote)
+// nothing else checks this tier. Real release binaries are ~40MB; 1MB matches
+// promoteVerifiedBinary's floor. Deliberately NOT inside isNativeBinary —
+// dev builds, cargo installs, and test fixtures go through other tiers.
+function isPlausibleReleaseBinary(candidate) {
+  try { return fs.statSync(candidate).size > 1_000_000; } catch { return false; }
+}
+
 function platformBinaryCandidates() {
   const out = [];
   // Fast path: standard module resolution.
   try {
     const pkgPath = require.resolve(`${PLATFORM_PKG}/package.json`);
     const bin = path.join(path.dirname(pkgPath), BINARY_NAME);
-    if (isNativeBinary(bin)) out.push(bin);
+    if (isNativeBinary(bin) && isPlausibleReleaseBinary(bin)) out.push(bin);
   } catch { /* not in node_modules walk-up */ }
 
   // Slow path: explicit global node_modules probe.
   for (const globalRoot of globalNodeModulesCandidates()) {
     const bin = path.join(globalRoot, '@sdsrs', `code-graph-${PLATFORM}-${ARCH}`, BINARY_NAME);
-    if (isNativeBinary(bin)) out.push(bin);
+    if (isNativeBinary(bin) && isPlausibleReleaseBinary(bin)) out.push(bin);
   }
 
   return out;
@@ -372,7 +367,7 @@ function clearCache() {
 
 module.exports = {
   findBinary, findBinaryUncached, clearCache,
-  globalNodeModulesCandidates, findPlatformBinary, createVersionGate,
+  globalNodeModulesCandidates, findPlatformBinary, platformBinaryCandidates, createVersionGate,
   getPackageVersion, compareVersions, isCachedBinaryFresh,
   detectLibc, unsupportedPlatformHint,
   CACHE_FILE, BINARY_NAME, PLATFORM_PKG,

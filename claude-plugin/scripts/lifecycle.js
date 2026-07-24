@@ -197,25 +197,41 @@ function isPluginInactive(settings = readJson(settingsPath()) || {}) {
   return !hasInstalledPluginRecord();
 }
 
-function detachStatuslineIntegration(settings) {
+function detachStatuslineIntegration(settings, { compositeDoomed = true } = {}) {
   let settingsChanged = false;
 
   unregisterStatuslineProvider('code-graph');
-  const previous = readRegistry().find(p => p.id === '_previous' && p.command);
+  const registry = readRegistry();
+  const previous = registry.find(p => p.id === '_previous' && p.command);
+  // Third-party providers registered through our registry (e.g. gsd). They
+  // must not be silently orphaned: with the composite gone from settings
+  // their segments stop rendering while the registry entries dangle.
+  const thirdParty = registry.filter(p => p.id !== '_previous' && p.id !== 'code-graph' && p.command);
 
   // If our composite is still configured while the plugin is disabled/uninstalled,
-  // prefer restoring the prior statusline (or removing ours entirely) so the plugin
-  // truly stops affecting Claude Code.
+  // stop affecting Claude Code — but keep surviving third parties rendering.
   if (isOurComposite(settings)) {
-    if (previous) {
+    if (thirdParty.length > 0 && !compositeDoomed) {
+      // Temporary disable: the composite script survives on disk and keeps
+      // rendering the remaining providers — only our segment was unregistered.
+    } else if (thirdParty.length > 0) {
+      // Genuine uninstall: our composite runner dies with the plugin cache.
+      // Hand the slot to the first surviving third-party provider; the rest
+      // stay listed in the registry backup for manual re-wiring.
+      settings.statusLine = { type: 'command', command: thirdParty[0].command };
+      settingsChanged = true;
+    } else if (previous) {
       settings.statusLine = { type: 'command', command: previous.command };
+      settingsChanged = true;
     } else {
       delete settings.statusLine;
+      settingsChanged = true;
     }
-    settingsChanged = true;
   }
 
-  unregisterStatuslineProvider('_previous');
+  // _previous only becomes removable once no third party still relies on the
+  // registry file (writeRegistry unlinks primary+backup when emptied).
+  if (thirdParty.length === 0) unregisterStatuslineProvider('_previous');
   return settingsChanged;
 }
 
@@ -229,7 +245,7 @@ function cleanupDisabledStatusline() {
   // registry markers detachStatuslineIntegration is about to remove.
   const uninstalled = isPluginUninstalled(settings);
 
-  let settingsChanged = detachStatuslineIntegration(settings);
+  let settingsChanged = detachStatuslineIntegration(settings, { compositeDoomed: uninstalled });
   if (removeHooksFromSettings(settings)) settingsChanged = true;
   if (settingsChanged) {
     writeJsonAtomic(settingsPath(), settings);
@@ -393,11 +409,20 @@ function removeHooksFromSettings(settings) {
 
 function buildSettingsHookEntries() {
   const root = PLUGIN_ROOT;
-  const scriptCmd = (name, timeout) => ({
-    type: 'command',
-    command: `node "${path.join(root, 'scripts', name)}"`,
-    timeout,
-  });
+  const scriptCmd = (name, timeout) => {
+    const script = path.join(root, 'scripts', name);
+    // POSIX: existence-guarded. After `/plugin uninstall`, CC may delete the
+    // plugin-cache dir before our statusline teardown gets to strip these
+    // entries — in that window every Edit/Bash/Read/prompt errored on a dead
+    // path. The `if` form preserves node's own exit code (PreToolUse deny =
+    // exit 2); `&& … || exit 0` would swallow it. Windows keeps the bare
+    // command — the hook shell there is not reliably cmd, so `if exist`
+    // can't be assumed.
+    const command = process.platform === 'win32'
+      ? `node "${script}"`
+      : `if [ -f "${script}" ]; then node "${script}"; fi`;
+    return { type: 'command', command, timeout };
+  };
 
   return {
     PreToolUse: [
@@ -604,7 +629,7 @@ function verifyHooksFire({ hooks, env, timeoutMs = 4000, tmpBase } = {}) {
 
 // --- Install (idempotent) ---
 
-function install() {
+function install({ reclaimStatusline = false } = {}) {
   const version = getPluginVersion();
   const manifest = readManifest();
   const settings = readJson(settingsPath()) || {};
@@ -620,14 +645,40 @@ function install() {
   //    b. Register code-graph as a provider
   //    c. Set statusLine to composite script
   if (!isOurComposite(settings)) {
-    // Preserve existing statusline as first provider
-    if (settings.statusLine && settings.statusLine.command) {
-      registerStatuslineProvider('_previous', settings.statusLine.command, true);
+    // Displacement tracking: we held the slot before (manifest.config.statusLine)
+    // but a foreign command sits there now — either another slot-claiming plugin
+    // (whose own self-heal re-takes it just like ours would → statusline
+    // ping-pong every session) or the user's deliberate choice. Either way,
+    // silently re-claiming forever is wrong: after >2 observed displacements
+    // stand down — stay registered as a provider, leave the slot alone.
+    // Explicit `lifecycle.js install` (or CODE_GRAPH_FORCE_STATUSLINE=1)
+    // resets the counter and re-claims.
+    const currentCmd = settings.statusLine && settings.statusLine.command;
+    if (reclaimStatusline || process.env.CODE_GRAPH_FORCE_STATUSLINE === '1') {
+      manifest.config.statuslineDisplaced = 0;
+    } else if (manifest.config.statusLine === true && currentCmd) {
+      manifest.config.statuslineDisplaced = (manifest.config.statuslineDisplaced || 0) + 1;
     }
-    // Set composite as the statusLine
-    settings.statusLine = { type: 'command', command: compositeCommand() };
-    settingsChanged = true;
-    manifest.config.statusLine = true;
+    if ((manifest.config.statuslineDisplaced || 0) > 2) {
+      if (manifest.config.statusLine === true) {
+        // Transition into stand-down exactly once: release claimed ownership
+        // (stops the counter) and leave a breadcrumb.
+        manifest.config.statusLine = false;
+        process.stderr.write(
+          '[code-graph] statusLine slot keeps being re-claimed by another provider — standing down.\n' +
+          '            Re-claim: CODE_GRAPH_FORCE_STATUSLINE=1 or `node lifecycle.js install`\n'
+        );
+      }
+    } else {
+      // Preserve existing statusline as first provider
+      if (currentCmd) {
+        registerStatuslineProvider('_previous', currentCmd, true);
+      }
+      // Set composite as the statusLine
+      settings.statusLine = { type: 'command', command: compositeCommand() };
+      settingsChanged = true;
+      manifest.config.statusLine = true;
+    }
   } else {
     // Composite exists — ensure path is correct (may have been polluted by env leak)
     const cmd = compositeCommand();
@@ -635,6 +686,9 @@ function install() {
       settings.statusLine.command = cmd;
       settingsChanged = true;
     }
+    // We hold the slot — any displacement episode is over.
+    if (manifest.config.statuslineDisplaced) manifest.config.statuslineDisplaced = 0;
+    manifest.config.statusLine = true;
   }
 
   // Register code-graph provider
@@ -690,7 +744,7 @@ function defaultRunNpm(args) {
   } catch { return false; }
 }
 
-function uninstall({ purgeGlobal = false, runNpm = defaultRunNpm, scanGlobalPkgs = installedGlobalPkgs } = {}) {
+function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRunNpm, scanGlobalPkgs = installedGlobalPkgs } = {}) {
   const settings = readJson(settingsPath());
   let settingsChanged = false;
 
@@ -742,6 +796,27 @@ function uninstall({ purgeGlobal = false, runNpm = defaultRunNpm, scanGlobalPkgs
   const pluginInstalledGlobals = !!readJson(GLOBAL_INSTALL_MARKER);
   let adoptedProjects = [];
   try { adoptedProjects = require('./adopt').readAdoptedProjects(); } catch { /* POSIX-only helper — ok */ }
+
+  // 5.4. --unadopt-all: sweep every registered project's managed CLAUDE.md
+  // block + generated detail file (unadopt is marker-guarded, so user files
+  // are never touched; the .code-graph/ index dir is project DATA and stays —
+  // its removal is listed in the guidance instead of automated).
+  const unadopted = [];
+  if (unadoptAll && adoptedProjects.length) {
+    let unadoptFn = null;
+    try { unadoptFn = require('./adopt').unadopt; } catch { /* POSIX-only — skip */ }
+    if (unadoptFn) {
+      for (const project of adoptedProjects) {
+        try {
+          const r = unadoptFn({ cwd: project });
+          unadopted.push({ project, ok: !!(r && r.ok), cleaned: !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved)) });
+        } catch (e) {
+          unadopted.push({ project, ok: false, error: (e && e.message) || String(e) });
+        }
+      }
+      try { adoptedProjects = require('./adopt').readAdoptedProjects(); } catch { /* ok */ }
+    }
+  }
   let globalPkgsRemoved = [];
   let globalPkgsRemaining = scanGlobalPkgs();
   if (globalPkgsRemaining.length && (pluginInstalledGlobals || purgeGlobal)) {
@@ -765,7 +840,7 @@ function uninstall({ purgeGlobal = false, runNpm = defaultRunNpm, scanGlobalPkgs
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ok */ }
   }
 
-  return { settingsChanged, pluginInstalledGlobals, globalPkgsRemoved, globalPkgsRemaining, adoptedProjects };
+  return { settingsChanged, pluginInstalledGlobals, globalPkgsRemoved, globalPkgsRemaining, adoptedProjects, unadopted };
 }
 
 // --- Update (refresh config points) ---
@@ -1020,11 +1095,23 @@ module.exports = {
 if (require.main === module) {
   const cmd = process.argv[2];
   if (cmd === 'install') {
-    const r = install();
+    // Explicit CLI install = user intent: reset any statusline stand-down and re-claim.
+    const r = install({ reclaimStatusline: true });
     console.log(`Installed v${r.version} | settings=${r.settingsChanged} | statusLine=${r.statusLineClaimed}`);
   } else if (cmd === 'uninstall') {
-    const r = uninstall({ purgeGlobal: process.argv.includes('--purge-global') });
+    const r = uninstall({
+      purgeGlobal: process.argv.includes('--purge-global'),
+      unadoptAll: process.argv.includes('--unadopt-all'),
+    });
     console.log(`Uninstalled | settings cleaned=${r.settingsChanged}`);
+    if (r.unadopted.length) {
+      const cleaned = r.unadopted.filter((u) => u.cleaned).length;
+      console.log(`  Unadopted ${cleaned}/${r.unadopted.length} registered project(s):`);
+      for (const u of r.unadopted) {
+        console.log(`    ${u.ok ? (u.cleaned ? 'cleaned' : 'nothing-to-clean') : `FAILED (${u.error || 'unknown'})`}  ${u.project}`);
+      }
+      console.log('    Their .code-graph/ index dirs are project data — remove per project with `rm -rf .code-graph` if unwanted.');
+    }
     if (r.globalPkgsRemoved.length) {
       console.log(`  Removed global npm package(s): ${r.globalPkgsRemoved.join(', ')}`);
     }
@@ -1038,7 +1125,7 @@ if (require.main === module) {
     if (r.adoptedProjects.length) {
       console.log('  Adopted project(s) still carrying a managed CLAUDE.md block + .code-graph/ index:');
       for (const p of r.adoptedProjects) console.log(`    ${p}`);
-      console.log('    In each: run `code-graph-mcp unadopt` and `rm -rf .code-graph` to clean up.');
+      console.log('    Clean all at once: re-run with --unadopt-all, or per project `code-graph-mcp unadopt` + `rm -rf .code-graph`.');
     }
     console.log('  Note: also run `/plugin uninstall code-graph-mcp` inside Claude Code to sync its UI state.');
   } else if (cmd === 'update') {

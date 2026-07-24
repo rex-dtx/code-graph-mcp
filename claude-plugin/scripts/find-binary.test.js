@@ -345,3 +345,41 @@ test('gate ignores non-binaries and best() is null when nothing was considered',
   assert.equal(gate.consider(path.join(os.tmpdir(), 'does-not-exist', BINARY_NAME)), null);
   assert.equal(gate.best(), null);
 });
+
+test('compareVersions: pre-release sorts below its release (unified impl)', () => {
+  // The two prior divergent copies disagreed here (NaN→0 vs parseInt
+  // truncation); the canonical version-utils impl is pre-release-aware.
+  assert.equal(compareVersions('1.2.3-rc1', '1.2.3'), -1);
+  assert.equal(compareVersions('1.2.3', '1.2.3-rc1'), 1);
+  assert.equal(compareVersions('1.2.3-rc1', '1.2.3-rc2'), -1);
+  assert.equal(compareVersions('1.2.4-rc1', '1.2.3'), 1); // numeric triple still dominates
+});
+
+test('platformBinaryCandidates rejects truncated npm platform binaries (<1MB)', (t) => {
+  // An interrupted npm install can leave a partial binary with the right
+  // name; unlike the GitHub path (size+sha+exec gates) this tier had none.
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'cgmcp-sizegate-'));
+  t.after(() => fs.rmSync(prefix, { recursive: true, force: true }));
+  const pkgDir = path.join(prefix, 'lib', 'node_modules', '@sdsrs',
+    `code-graph-${process.platform}-${process.arch}`);
+  fs.mkdirSync(pkgDir, { recursive: true });
+  const bin = path.join(pkgDir, BINARY_NAME);
+
+  const withPrefix = (fn) => {
+    const prev = process.env.NPM_CONFIG_PREFIX;
+    process.env.NPM_CONFIG_PREFIX = prefix;
+    try { return fn(); } finally {
+      if (prev === undefined) delete process.env.NPM_CONFIG_PREFIX;
+      else process.env.NPM_CONFIG_PREFIX = prev;
+    }
+  };
+
+  fs.writeFileSync(bin, 'truncated');            // ~9 bytes — a torn install
+  const { platformBinaryCandidates } = require('./find-binary');
+  const rejected = withPrefix(() => platformBinaryCandidates());
+  assert.ok(!rejected.includes(bin), 'truncated binary must not be a candidate');
+
+  fs.writeFileSync(bin, Buffer.alloc(1_100_000)); // plausible release size
+  const accepted = withPrefix(() => platformBinaryCandidates());
+  assert.ok(accepted.includes(bin), 'plausibly-sized binary is a candidate');
+});

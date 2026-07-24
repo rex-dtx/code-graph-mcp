@@ -45,16 +45,21 @@ if (sub === "uninstall") {
   if (process.argv.slice(3).some((a) => a === "--help" || a === "-h")) {
     process.stdout.write(
       "code-graph-mcp uninstall — remove code-graph config + cache from this machine\n\n" +
-      "USAGE:\n    code-graph-mcp uninstall\n\n" +
+      "USAGE:\n    code-graph-mcp uninstall [--unadopt-all] [--purge-global]\n\n" +
       "Restores your prior statusline, strips code-graph hooks from settings.json,\n" +
       "deletes ~/.cache/code-graph, and removes this project's CLAUDE.md adoption\n" +
-      "block. Also run `/plugin uninstall code-graph-mcp` in Claude Code to sync its\n" +
-      "UI, and `code-graph-mcp unadopt` in any OTHER adopted project.\n");
+      "block. --unadopt-all also removes the managed block + detail file from every\n" +
+      "registered adopted project; --purge-global removes the globally-installed\n" +
+      "@sdsrs npm packages even without the plugin-install marker. Also run\n" +
+      "`/plugin uninstall code-graph-mcp` in Claude Code to sync its UI.\n");
     process.exit(0);
   }
   const lifecycle = require("../claude-plugin/scripts/lifecycle");
   const { unadopt } = require("../claude-plugin/scripts/adopt");
-  const r = lifecycle.uninstall({ purgeGlobal: process.argv.slice(3).includes("--purge-global") });
+  const r = lifecycle.uninstall({
+    purgeGlobal: process.argv.slice(3).includes("--purge-global"),
+    unadoptAll: process.argv.slice(3).includes("--unadopt-all"),
+  });
   let ua = { ok: false };
   try { ua = unadopt(); } catch { /* best-effort — settings/cache already cleaned */ }
   const projectUnadopted = !!(ua && (ua.blockPruned || ua.fileRemoved || ua.claudeMdRemoved));
@@ -69,9 +74,14 @@ if (sub === "uninstall") {
       `    Remove with: npm uninstall -g ${r.globalPkgsRemaining.join(" ")}` +
       (r.pluginInstalledGlobals ? "\n" : "   (or re-run with --purge-global)\n");
   }
+  if (r.unadopted.length) {
+    const cleaned = r.unadopted.filter((u) => u.cleaned).length;
+    out += `  Unadopted ${cleaned}/${r.unadopted.length} registered project(s) (--unadopt-all).\n`;
+  }
   const otherAdopted = r.adoptedProjects.filter((p) => p !== process.cwd());
   if (otherAdopted.length) {
-    out += "  Other adopted project(s) — run `code-graph-mcp unadopt` + `rm -rf .code-graph` in each:\n" +
+    out += "  Other adopted project(s) — re-run with --unadopt-all, or in each:" +
+      " `code-graph-mcp unadopt` + `rm -rf .code-graph`\n" +
       otherAdopted.map((p) => `    ${p}\n`).join("");
   }
   out += "  Also run `/plugin uninstall code-graph-mcp` in Claude Code to sync its UI state.\n";

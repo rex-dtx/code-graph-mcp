@@ -553,9 +553,15 @@ function runSessionInit({ source } = {}) {
   }
   if (autoAdopt.attempted && autoAdopt.result && autoAdopt.result.ok) {
     if (autoAdopt.reason === 'refreshed') {
+      // Name BOTH refreshed surfaces: the drift-refresh fully overwrites the
+      // generated detail doc, so a user who hand-edited it must learn why
+      // their edits vanished and how to lock the file.
+      const detailNote = autoAdopt.result.detailWritten
+        ? ' + .claude/plugin_code_graph_mcp.md (manual edits to that generated file are overwritten)'
+        : '';
       process.stderr.write(
-        '[code-graph] Refreshed CLAUDE.md decision block to latest shipped version.\n' +
-        '            Lock file:  CODE_GRAPH_NO_TEMPLATE_REFRESH=1 in ~/.claude/settings.json env\n'
+        `[code-graph] Refreshed CLAUDE.md decision block to latest shipped version${detailNote}.\n` +
+        '            Lock files: CODE_GRAPH_NO_TEMPLATE_REFRESH=1 in ~/.claude/settings.json env\n'
       );
     } else {
       process.stderr.write(

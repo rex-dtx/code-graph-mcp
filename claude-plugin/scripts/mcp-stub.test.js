@@ -205,3 +205,37 @@ test('poller is wired to attemptUpgrade at the default interval', () => {
   captured.fn();                                // simulate one poll tick
   assert.equal(spawnCalls, 1);                  // tick attempted the upgrade
 });
+
+test('backoff: missing-binary probes thin out toward the 60s cap; manual nudge stays direct', () => {
+  const input = new PassThrough();
+  let captured = null, probes = 0;
+  const stub = serveEmptyMcpStub({
+    input, output: { write: () => true },
+    setInterval: (fn, ms) => { captured = { fn, ms }; return 1; },
+    clearInterval: () => {}, exit: () => {},
+    upgrade: { backoff: true, shouldUpgrade: () => { probes++; return false; }, spawnReal: () => null },
+  });
+  // 40 ticks at 4s each = 160s of session time. Without backoff that is 40
+  // full discovery walks; with doubling skip (1,2,4,8,14-cap) it must be far
+  // fewer while never stopping entirely.
+  for (let i = 0; i < 40; i++) captured.fn();
+  assert.ok(probes <= 8, `expected ≤8 probes over 40 ticks with backoff, got ${probes}`);
+  assert.ok(probes >= 3, `backoff must keep probing, got ${probes}`);
+  // External nudge (install chain onInstalled) bypasses the skip counter.
+  const before = probes;
+  stub.attemptUpgrade();
+  assert.equal(probes, before + 1, 'manual attemptUpgrade probes immediately');
+});
+
+test('no backoff flag → every tick probes (non-project gate keeps 4s responsiveness)', () => {
+  const input = new PassThrough();
+  let captured = null, probes = 0;
+  serveEmptyMcpStub({
+    input, output: { write: () => true },
+    setInterval: (fn, ms) => { captured = { fn, ms }; return 1; },
+    clearInterval: () => {}, exit: () => {},
+    upgrade: { shouldUpgrade: () => { probes++; return false; }, spawnReal: () => null },
+  });
+  for (let i = 0; i < 10; i++) captured.fn();
+  assert.equal(probes, 10);
+});

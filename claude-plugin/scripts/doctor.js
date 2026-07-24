@@ -292,12 +292,20 @@ function runDiagnostics() {
       .filter((p) => p.version);
     if (found.length) {
       const marker = !!readJson(GLOBAL_INSTALL_MARKER);
+      // Heal-exhausted is otherwise invisible: selfHealGlobalPkgs stops after
+      // 3 failed npm runs per target version and stays silent until the next
+      // release re-arms the counter — a drifted CLI shim just sits there.
+      const state = readJson(path.join(CACHE_DIR, 'update-state.json')) || {};
+      const healGaveUp = (state.globalPkgHealAttempts || 0) >= 3;
       results.push({
         name: 'Global npm packages',
-        status: 'ok',
-        detail: found.map((p) => `${p.name}@${p.version}`).join(', ') + (marker
-          ? ' — plugin-installed; `node lifecycle.js uninstall` removes them'
-          : ` — no plugin-install marker; uninstall leaves them (remove: npm uninstall -g ${found.map((p) => p.name).join(' ')})`),
+        status: healGaveUp ? 'warn' : 'ok',
+        detail: found.map((p) => `${p.name}@${p.version}`).join(', ') + (healGaveUp
+          ? ` — self-heal gave up after ${state.globalPkgHealAttempts} failed npm runs targeting v${state.globalPkgHealVersion}; ` +
+            `your npm env likely can't install globally (EACCES/system node). Run manually: npm install -g ${found.map((p) => `${p.name}@${state.globalPkgHealVersion}`).join(' ')}`
+          : (marker
+            ? ' — plugin-installed; `node lifecycle.js uninstall` removes them'
+            : ` — no plugin-install marker; uninstall leaves them (remove: npm uninstall -g ${found.map((p) => p.name).join(' ')})`)),
       });
     }
   } catch { /* probe failed — skip */ }

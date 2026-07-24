@@ -150,6 +150,10 @@ if (!binary) {
 
   const stub = serveEmptyMcpStub({
     upgrade: {
+      // Each probe is a full discovery walk (incl. `npm root -g`, up to 2s);
+      // offline the binary never appears, so back the poll off toward 60s.
+      // The install chain's onInstalled nudge below still upgrades instantly.
+      backoff: true,
       shouldUpgrade: () => !!findBinary(),
       spawnReal: () => {
         const bin = findBinary();

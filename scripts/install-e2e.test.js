@@ -67,8 +67,12 @@ function assertCurrentSettingsHooks(settings) {
       JSON.stringify(e.hooks || []).includes(script));
     assert.ok(entry, `settings.json must have ${event}:${matcher || '*'} → ${script}`);
     const expectedPath = path.join(PLUGIN_ROOT, 'scripts', script);
-    assert.equal(entry.hooks[0].command, `node "${expectedPath}"`,
-      `${event}:${matcher || '*'} must point at the current plugin root`);
+    // POSIX commands carry the existence guard (`if [ -f "…" ]; then node "…"; fi`)
+    // so a post-uninstall dead path exits 0 instead of erroring every tool call;
+    // assert on the extracted node invocation, not the full string.
+    const m = (entry.hooks[0].command || '').match(/node "([^"]+)"/);
+    assert.equal(m && m[1], expectedPath,
+      `${event}:${matcher || '*'} must point at the current plugin root (command: ${entry.hooks[0].command})`);
   }
 }
 

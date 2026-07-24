@@ -52,6 +52,8 @@ function serveEmptyMcpStub(opts = {}) {
   const queuedForChild = [];    // client lines seen after spawn, before child is ready
   let poller = null;
   let upgradeFailures = 0;      // consecutive failed upgrade attempts (see noteUpgradeFailure)
+  let backoffTicks = 0;         // poll ticks to skip before the next probe (upgrade.backoff)
+  let backoffNext = 1;
 
   function writeCc(obj) { output.write(JSON.stringify(obj) + '\n'); }
 
@@ -133,12 +135,32 @@ function serveEmptyMcpStub(opts = {}) {
 
   function attemptUpgrade() {
     if (child || !upgrade) return;
-    if (!upgrade.shouldUpgrade()) return;            // not a project yet — not a failure
+    if (!upgrade.shouldUpgrade()) {
+      // Not upgradable yet — not a failure. But when the probe itself is
+      // expensive (missing-binary: full discovery walk incl. `npm root -g`,
+      // up to 2s), a flat 4s cadence for a whole offline session is pure
+      // subprocess churn. With { backoff:true } skip a doubling number of
+      // ticks between probes, capped near 60s; a manual attemptUpgrade()
+      // nudge (install chain's onInstalled) still probes immediately.
+      if (upgrade.backoff) {
+        const pollMs = upgrade.pollMs || DEFAULT_POLL_MS;
+        backoffTicks = backoffNext;
+        backoffNext = Math.min(backoffNext * 2, Math.max(1, Math.floor(60000 / pollMs) - 1));
+      }
+      return;
+    }
     const spawned = upgrade.spawnReal();
     if (!spawned) { noteUpgradeFailure('binary-unresolved'); return; }
     if (poller) { clearIv(poller); poller = null; }
     child = spawned;
     beginProxy();
+  }
+
+  // Poll-timer tick: honors the backoff skip counter; the exported
+  // attemptUpgrade stays direct so external nudges are never delayed.
+  function pollTick() {
+    if (backoffTicks > 0) { backoffTicks--; return; }
+    attemptUpgrade();
   }
 
   function fallBackToStub(reason) {
@@ -153,7 +175,7 @@ function serveEmptyMcpStub(opts = {}) {
       try { const req = JSON.parse(line); if (req && typeof req.method === 'string') answerAsStub(req); }
       catch { /* ignore */ }
     }
-    if (upgrade && !poller) poller = setIv(attemptUpgrade, upgrade.pollMs || DEFAULT_POLL_MS);
+    if (upgrade && !poller) poller = setIv(pollTick, upgrade.pollMs || DEFAULT_POLL_MS);
     noteUpgradeFailure(reason);
   }
 
@@ -206,7 +228,7 @@ function serveEmptyMcpStub(opts = {}) {
     });
   }
 
-  if (upgrade) poller = setIv(attemptUpgrade, upgrade.pollMs || DEFAULT_POLL_MS);
+  if (upgrade) poller = setIv(pollTick, upgrade.pollMs || DEFAULT_POLL_MS);
 
   return { attemptUpgrade, _state: () => ({ hasChild: !!child, childReady }) };
 }

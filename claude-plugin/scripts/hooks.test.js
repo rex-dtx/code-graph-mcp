@@ -144,7 +144,10 @@ test('lifecycle.buildSettingsHookEntries: hook commands use absolute paths (no e
       for (const h of e.hooks) {
         assert.ok(!h.command.includes('${CLAUDE_PLUGIN_ROOT}'),
           `command must not use \${CLAUDE_PLUGIN_ROOT}: ${h.command}`);
-        assert.ok(h.command.startsWith('node "/') || h.command.match(/node "[A-Z]:\\/),
+        // POSIX commands are existence-guarded (`if [ -f "…" ]; then node "…"; fi`),
+        // so assert on the extracted node-invocation path, not a string prefix.
+        const m = h.command.match(/node "([^"]+)"/);
+        assert.ok(m && (m[1].startsWith('/') || /^[A-Z]:\\/.test(m[1])),
           `command path must be absolute: ${h.command}`);
       }
     }
@@ -227,4 +230,33 @@ test('buildSettingsHookEntries: matcher surface is exactly the intended set', ()
     'UserPromptSubmit matcher set changed unexpectedly');
   assert.deepEqual(Object.keys(desired).sort(), ['PostToolUse', 'PreToolUse', 'UserPromptSubmit'],
     'a new top-level hook event is registered into settings.json — confirm it is intended (SessionStart belongs in hooks.json)');
+});
+
+test('settings hook commands are existence-guarded on POSIX (dead path silent-0, exit codes preserved)', (t) => {
+  if (process.platform === 'win32') { t.skip('POSIX-only guard form'); return; }
+  const fs2 = require('fs');
+  const os2 = require('os');
+  const path2 = require('path');
+  const { spawnSync } = require('child_process');
+  const { buildSettingsHookEntries } = require('./lifecycle');
+
+  const cmd = buildSettingsHookEntries().PreToolUse[0].hooks[0].command;
+  assert.match(cmd, /^if \[ -f "/, 'POSIX hook command carries the existence guard');
+
+  // Post-uninstall window: plugin-cache dir deleted before teardown strips the
+  // hooks — the guard must turn "error on every tool call" into a silent 0.
+  const dead = 'if [ -f "/nonexistent/cg-hook.js" ]; then node "/nonexistent/cg-hook.js"; fi';
+  const r1 = spawnSync('sh', ['-c', dead], { encoding: 'utf8' });
+  assert.equal(r1.status, 0, 'missing script exits 0');
+  assert.equal((r1.stderr || '').trim(), '', 'missing script is silent');
+
+  // Live script: node's own exit code must pass through — PreToolUse deny
+  // semantics (exit 2) would be destroyed by an `|| exit 0` style guard.
+  const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'cg-hookguard-'));
+  t.after(() => fs2.rmSync(dir, { recursive: true, force: true }));
+  const script = path2.join(dir, 'deny.js');
+  fs2.writeFileSync(script, 'process.exit(2);');
+  const guarded = `if [ -f "${script}" ]; then node "${script}"; fi`;
+  const r2 = spawnSync('sh', ['-c', guarded], { encoding: 'utf8' });
+  assert.equal(r2.status, 2, 'live script exit code passes through the guard');
 });

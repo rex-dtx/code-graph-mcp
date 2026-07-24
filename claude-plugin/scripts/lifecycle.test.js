@@ -859,3 +859,123 @@ test('uninstall leaves user-installed globals alone without marker; --purge-glob
   assert.deepEqual(resB.npmCalls, [['uninstall', '-g', ...pkgs]]);
   assert.deepEqual(resB.r.globalPkgsRemoved, pkgs);
 });
+
+// ── detach: third-party statusline providers must survive ───────────────────
+
+function seedThirdPartyRegistry(homeDir) {
+  const registryPath = path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json');
+  writeJson(registryPath, [
+    { id: '_previous', command: 'echo previous-status', needsStdin: true },
+    { id: 'code-graph', command: 'node "/plugin/statusline.js"', needsStdin: false },
+    { id: 'gsd', command: 'node "/gsd/statusline.js"', needsStdin: true },
+  ]);
+  return registryPath;
+}
+
+test('uninstall hands the statusLine slot to a surviving third-party provider', (t) => {
+  const homeDir = mkHome(t);
+  seedOrphanedComposite(homeDir);
+  seedThirdPartyRegistry(homeDir);
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
+  `], { env: { ...process.env, HOME: homeDir } }).toString();
+
+  assert.deepEqual(JSON.parse(out), { cleaned: true, settingsChanged: true, cacheRemoved: true });
+  const settings = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'settings.json'), 'utf8'));
+  // Our composite dies with the uninstall — the slot must go to the third
+  // party, NOT to _previous (which would silently drop gsd's segment).
+  assert.equal(settings.statusLine.command, 'node "/gsd/statusline.js"');
+  // Durable backup keeps the surviving providers (primary died with the cache).
+  const backup = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'statusline-providers.json'), 'utf8'));
+  const ids = backup.map((p) => p.id).sort();
+  assert.deepEqual(ids, ['_previous', 'gsd'], 'code-graph gone; third party + _previous retained');
+});
+
+test('temporary disable keeps the composite when a third-party provider is registered', (t) => {
+  const homeDir = mkHome(t);
+  seedDisabledComposite(homeDir);
+  seedThirdPartyRegistry(homeDir);
+
+  execFileSync(process.execPath, ['-e', `
+    const { cleanupDisabledStatusline } = require(${JSON.stringify(lifecyclePath)});
+    cleanupDisabledStatusline();
+  `], { env: { ...process.env, HOME: homeDir } });
+
+  const settings = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'settings.json'), 'utf8'));
+  // Composite script survives a mere disable and keeps rendering gsd.
+  assert.ok(settings.statusLine.command.includes('statusline-composite'),
+    'composite retained so the third-party segment keeps rendering');
+});
+
+// ── install: statusline slot ping-pong stand-down ───────────────────────────
+
+test('install stands down after 3 displacements; explicit install re-claims', (t) => {
+  const homeDir = mkHome(t);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+
+  const script = `
+    const fs = require('fs');
+    const { install, readManifest } = require(${JSON.stringify(lifecyclePath)});
+    const settingsPath = ${JSON.stringify(settingsPath)};
+    const foreign = { type: 'command', command: 'node "/peer-plugin/statusline.js"' };
+    const seedForeign = () => {
+      const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      s.statusLine = foreign;
+      fs.writeFileSync(settingsPath, JSON.stringify(s));
+    };
+    const slot = () => JSON.parse(fs.readFileSync(settingsPath, 'utf8')).statusLine.command;
+    const outcomes = [];
+    for (let i = 0; i < 3; i++) {
+      seedForeign();
+      install();
+      outcomes.push(slot().includes('statusline-composite') ? 'claimed' : 'stood-down');
+    }
+    const m = readManifest();
+    seedForeign();
+    install({ reclaimStatusline: true });
+    outcomes.push(slot().includes('statusline-composite') ? 'claimed' : 'stood-down');
+    process.stdout.write(JSON.stringify({ outcomes, displaced: m.config.statuslineDisplaced, owned: m.config.statusLine }));
+  `;
+  writeJson(settingsPath, { statusLine: { type: 'command', command: 'node "/peer-plugin/statusline.js"' } });
+  writeJson(manifestPath, { version: '0.0.1', config: { statusLine: true } });
+
+  const r = JSON.parse(execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: homeDir },
+  }).toString());
+
+  // Two re-claims, then stand-down; explicit install() re-claims again.
+  assert.deepEqual(r.outcomes, ['claimed', 'claimed', 'stood-down', 'claimed']);
+  assert.equal(r.displaced, 3, 'third displacement recorded before standing down');
+  assert.equal(r.owned, false, 'ownership released on stand-down (stops the counter)');
+});
+
+// ── uninstall --unadopt-all ─────────────────────────────────────────────────
+
+test('uninstall --unadopt-all sweeps every registered adopted project', (t) => {
+  const homeDir = mkHome(t);
+  writeJson(path.join(homeDir, '.claude', 'settings.json'), {});
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-unadoptall-'));
+  t.after(() => fs.rmSync(proj, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(proj, '.git'));
+
+  const script = `
+    const { adopt } = require(${JSON.stringify(path.join(__dirname, 'adopt.js'))});
+    const { uninstall } = require(${JSON.stringify(lifecyclePath)});
+    const a = adopt({ cwd: ${JSON.stringify(proj)} });
+    const r = uninstall({ unadoptAll: true, scanGlobalPkgs: () => [], runNpm: () => true });
+    process.stdout.write(JSON.stringify({ adopted: a.ok, r }));
+  `;
+  const { adopted, r } = JSON.parse(execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: homeDir },
+  }).toString());
+
+  assert.equal(adopted, true);
+  assert.equal(r.unadopted.length, 1);
+  assert.equal(r.unadopted[0].cleaned, true);
+  assert.deepEqual(r.adoptedProjects, [], 'registry re-read shows nothing left to hand-clean');
+  assert.equal(fs.existsSync(path.join(proj, 'CLAUDE.md')), false, 'managed CLAUDE.md removed (we created it)');
+  assert.equal(fs.existsSync(path.join(proj, '.claude', 'plugin_code_graph_mcp.md')), false, 'detail file removed');
+});
