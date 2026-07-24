@@ -7,6 +7,20 @@ on:
     branches: [main]
 
 jobs:
+  # Formatting gate (audit 2026-07-24 F3): fmt was never checked anywhere —
+  # not in CI, not in pre-commit — so drift accumulated silently. Cheap
+  # (no build), one runner.
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+
   # Full matrix: 3 OSes × 2 feature combos.
   # Catches platform-specific issues (Windows path separators, macOS linker
   # differences, sqlite-vec C compilation variance) that used to ship silently
@@ -157,11 +171,13 @@ jobs:
         #     code-graph-mcp; gate is pre-commit, which runs it whenever
         #     claude-plugin/ or scripts/ JS is staged (it went stale for 3 months
         #     when neither gate ran it).
-        #   mcp-launcher.test.js — its dedup-stub test depends on the repo-root
-        #     .mcp.json, which is gitignored (a dev-only file registering
-        #     code-graph-dev for local metrics) and so absent on a CI checkout;
-        #     without it the launcher falls through to findBinary()→null and the
-        #     60s npm-install + 90s GitHub-download fallbacks, hanging the test.
+        #
+        # mcp-launcher.test.js REJOINED the glob (audit 2026-07-24 F2): its old
+        # exclusion reason — the dedup test depending on the gitignored repo-root
+        # .mcp.json — was fixed when that test became self-contained (own tmpdir
+        # fixture; see the test's comment). On a bare checkout the one
+        # binary-forwarding test self-skips via hasBuiltBinary(); the stub/dedup
+        # tests and static source checks run for real.
         #
         # --test-concurrency=1: run the files serially. cg-answer + find-binary
         # both touch find-binary's on-disk resolution cache / the _CG_ANSWER_BINARY
@@ -178,7 +194,7 @@ jobs:
           # here; add it to the exclusion grep with a reason rather than dropping
           # back to an allowlist that misses files silently.
           files=$(ls claude-plugin/scripts/*.test.js scripts/*.test.js \
-            | grep -vE '(^|/)(install-e2e|mcp-launcher)\.test\.js$')
+            | grep -vE '(^|/)install-e2e\.test\.js$')
           node --test --test-concurrency=1 $files
 
   # Supply-chain CVE scan over Cargo.lock (376 transitive deps including the

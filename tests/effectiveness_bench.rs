@@ -78,7 +78,14 @@ const CORPUS: &[Task] = &[
     // Estimate: grep ~500 bytes + 3 × 800 bytes = ~3000 bytes.
     Task {
         name: "callers of validateToken",
-        args: &["callgraph", "validateToken", "--direction", "callers", "--depth", "2"],
+        args: &[
+            "callgraph",
+            "validateToken",
+            "--direction",
+            "callers",
+            "--depth",
+            "2",
+        ],
         baseline_bytes: 3000,
         max_ratio: 0.60,
     },
@@ -107,7 +114,9 @@ fn setup_indexed_project() -> TempDir {
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
 
-    std::fs::write(src.join("auth.ts"), r#"
+    std::fs::write(
+        src.join("auth.ts"),
+        r#"
 import jwt from 'jsonwebtoken';
 
 export function validateToken(token: string): boolean {
@@ -118,9 +127,13 @@ export function validateToken(token: string): boolean {
 export function hashPassword(password: string): string {
     return password;
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    std::fs::write(src.join("api.ts"), r#"
+    std::fs::write(
+        src.join("api.ts"),
+        r#"
 import { validateToken } from './auth';
 
 export function handleLogin(req: Request, res: Response) {
@@ -136,9 +149,13 @@ export function handleLogout(req: Request, res: Response) {
 export function checkAuth(token: string): boolean {
     return validateToken(token);
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    std::fs::write(src.join("utils.ts"), r#"
+    std::fs::write(
+        src.join("utils.ts"),
+        r#"
 export function formatDate(date: Date): string {
     return date.toISOString();
 }
@@ -152,7 +169,9 @@ export class Logger {
 export function isValid(input: unknown): boolean {
     return input !== null && input !== undefined;
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Index using the library directly (avoids spawn overhead during setup).
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
@@ -217,9 +236,7 @@ fn effectiveness_against_grep_read_baseline() {
         CORPUS.len(),
     );
 
-    let results: Vec<TaskResult> = CORPUS.iter()
-        .map(|t| run_task(project_root, t))
-        .collect();
+    let results: Vec<TaskResult> = CORPUS.iter().map(|t| run_task(project_root, t)).collect();
 
     // Per-task report.
     eprintln!("\n=== Per-task token savings (bytes-as-proxy) ===");
@@ -241,19 +258,23 @@ fn effectiveness_against_grep_read_baseline() {
     let overall_ratio = total_cg as f64 / total_baseline as f64;
     eprintln!(
         "\nOverall: {} cg_bytes / {} baseline = {:.2}x (savings = {:.0}%)",
-        total_cg, total_baseline, overall_ratio,
+        total_cg,
+        total_baseline,
+        overall_ratio,
         (1.0 - overall_ratio) * 100.0,
     );
 
     // Per-task assertions are accumulated, then asserted once so all rows print.
-    let failures: Vec<String> = results.iter()
+    let failures: Vec<String> = results
+        .iter()
         .filter(|r| !r.passed)
         .map(|r| format!("{} ({:.2}x > {:.2}x)", r.name, r.ratio, r.max_ratio))
         .collect();
     assert!(
         failures.is_empty(),
         "[effectiveness_bench] {} task(s) exceeded their max_ratio: {}",
-        failures.len(), failures.join(", "),
+        failures.len(),
+        failures.join(", "),
     );
 
     // Headline assertion: overall ratio must beat the README's worst-case
@@ -265,7 +286,8 @@ fn effectiveness_against_grep_read_baseline() {
         "Overall ratio {:.2}x exceeds README headline floor {:.2}x — \
          either the bench fixture grew, the CLI got chattier, or the README \
          claim needs revising. Investigate before relaxing the threshold.",
-        overall_ratio, HEADLINE_MAX_RATIO,
+        overall_ratio,
+        HEADLINE_MAX_RATIO,
     );
 }
 
@@ -273,15 +295,30 @@ fn effectiveness_against_grep_read_baseline() {
 
 #[test]
 fn corpus_is_non_empty_and_well_formed() {
-    assert!(!CORPUS.is_empty(), "CORPUS must define at least one task");
+    // Deliberate compile-time-known assertion (see section header): the guard
+    // exists to fail loudly if someone empties CORPUS, which clippy can prove
+    // won't happen for the CURRENT const value — that proof is the point.
+    #[allow(clippy::const_is_empty)]
+    {
+        assert!(!CORPUS.is_empty(), "CORPUS must define at least one task");
+    }
     for task in CORPUS {
         assert!(!task.name.is_empty(), "task name must be non-empty");
-        assert!(!task.args.is_empty(), "task '{}' must have at least one arg", task.name);
-        assert!(task.baseline_bytes > 0, "task '{}' baseline_bytes must be > 0", task.name);
+        assert!(
+            !task.args.is_empty(),
+            "task '{}' must have at least one arg",
+            task.name
+        );
+        assert!(
+            task.baseline_bytes > 0,
+            "task '{}' baseline_bytes must be > 0",
+            task.name
+        );
         assert!(
             task.max_ratio > 0.0 && task.max_ratio <= 1.0,
             "task '{}' max_ratio must be in (0, 1], got {}",
-            task.name, task.max_ratio,
+            task.name,
+            task.max_ratio,
         );
     }
 }

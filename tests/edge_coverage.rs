@@ -17,27 +17,39 @@ fn index_fixture() -> (TempDir, Database) {
     std::fs::create_dir_all(&src).unwrap();
 
     // TypeScript: class with two methods, one calling the sibling (intra-class call).
-    std::fs::write(src.join("svc.ts"), r#"
+    std::fs::write(
+        src.join("svc.ts"),
+        r#"
 export class Svc {
     handle(x: number): number { return this.helper(x); }
     helper(x: number): number { return x + 1; }
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Python: same intra-class sibling call.
-    std::fs::write(src.join("svc.py"), r#"
+    std::fs::write(
+        src.join("svc.py"),
+        r#"
 class Svc:
     def handle(self, x):
         return self.helper(x)
     def helper(self, x):
         return x + 1
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Rust: same-file function call.
-    std::fs::write(src.join("lib.rs"), r#"
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
 pub fn helper(x: i32) -> i32 { x + 1 }
 pub fn handle(x: i32) -> i32 { helper(x) }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -47,7 +59,9 @@ pub fn handle(x: i32) -> i32 { helper(x) }
 }
 
 fn edge_counts(db: &Database) -> BTreeMap<String, BTreeMap<String, i64>> {
-    queries::resolution_stats(db.conn()).unwrap().edges_by_language
+    queries::resolution_stats(db.conn())
+        .unwrap()
+        .edges_by_language
 }
 
 #[test]
@@ -56,7 +70,13 @@ fn edge_coverage_per_language_baseline() {
     let by_lang = edge_counts(&db);
     // Lower-bound baselines: each language must produce at least these call edges.
     // Raise deliberately when extraction genuinely improves.
-    let calls = |lang: &str| by_lang.get(lang).and_then(|m| m.get("calls")).copied().unwrap_or(0);
+    let calls = |lang: &str| {
+        by_lang
+            .get(lang)
+            .and_then(|m| m.get("calls"))
+            .copied()
+            .unwrap_or(0)
+    };
     assert!(calls("typescript") >= 1, "TS calls regressed: {by_lang:?}");
     assert!(calls("python") >= 1, "Python calls regressed: {by_lang:?}");
     assert!(calls("rust") >= 1, "Rust calls regressed: {by_lang:?}");
@@ -76,7 +96,8 @@ fn c_include_resolves_to_indexed_header_module() {
     std::fs::write(
         src.join("widget.cpp"),
         "#include \"widget.h\"\nint widget_add(int a, int b) { return a + b; }\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -88,12 +109,17 @@ fn c_include_resolves_to_indexed_header_module() {
         conn.query_row(
             "SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id
              WHERE n.name = '<module>' AND f.path = ?1",
-            [path], |r| r.get::<_, i64>(0),
-        ).unwrap_or(-1)
+            [path],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(-1)
     };
     let cpp_mod = module_id("src/widget.cpp");
     let h_mod = module_id("src/widget.h");
-    assert!(cpp_mod > 0 && h_mod > 0, "both <module> nodes must exist (cpp={cpp_mod}, h={h_mod})");
+    assert!(
+        cpp_mod > 0 && h_mod > 0,
+        "both <module> nodes must exist (cpp={cpp_mod}, h={h_mod})"
+    );
 
     let has_edge: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM edges WHERE source_id=?1 AND target_id=?2 AND relation='imports')",
@@ -130,7 +156,11 @@ fn import_extraction_parity_across_full_languages() {
         ("javascript", "a.js", "const x = require('./b');\n"),
         ("go", "a.go", "package main\nimport \"fmt\"\n"),
         ("python", "a.py", "import os\n"),
-        ("rust", "a.rs", "use std::fmt;\n"),
+        // Non-std crate root: `use std::…` is skipped whole as of IDX v52
+        // (statically-external root; its bare tail used to bind same-named
+        // project symbols). An unknown crate root still exercises the Rust
+        // use-arm and lands on the `<external>` sentinel like the others.
+        ("rust", "a.rs", "use anyhow::fmt;\n"),
         ("java", "A.java", "import java.util.List;\n"),
     ];
 
@@ -148,7 +178,11 @@ fn import_extraction_parity_across_full_languages() {
 
     let by_lang = edge_counts(&db);
     for (lang, file, source) in cases {
-        let imports = by_lang.get(*lang).and_then(|m| m.get("imports")).copied().unwrap_or(0);
+        let imports = by_lang
+            .get(*lang)
+            .and_then(|m| m.get("imports"))
+            .copied()
+            .unwrap_or(0);
         assert!(
             imports >= 1,
             "{lang}: expected a REL_IMPORTS edge from {file} (`{source:?}`) but found none; edges_by_language={by_lang:?}"

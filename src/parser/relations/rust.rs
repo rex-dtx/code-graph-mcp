@@ -5,25 +5,75 @@
 //! paths (`crate::domain::FOO`) and type-position usages (`field: MyType`,
 //! `-> MyType`, `Vec<MyType>`).
 
-use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
-use crate::domain::{REL_IMPORTS, REL_IMPLEMENTS, REL_REFERENCES};
+use super::ParsedRelation;
+use crate::domain::{REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_REFERENCES};
+
+/// Leftmost path segment of a `use` argument: `std::fs` → "std",
+/// `std::{fs, io}` → "std", `crate::x::Y` → "crate", `fs` → "fs".
+/// Descends `path` fields (and through `use_as_clause`) to the root token.
+fn use_path_root<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
+    let mut cur = *node;
+    for _ in 0..MAX_SUBTREE_DEPTH {
+        if cur.kind() == "use_as_clause" {
+            match cur.named_child(0) {
+                Some(c) => {
+                    cur = c;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        match cur.child_by_field_name("path") {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    node_text(&cur, source)
+}
 
 /// Extract import names from Rust `use` declarations by walking the tree-sitter AST.
 /// Handles simple (`use foo::Bar`), grouped (`use foo::{Bar, Baz}`),
 /// nested (`use foo::{bar::{A, B}}`), aliased (`use foo::Bar as B`), and glob imports.
+///
+/// Statically-known EXTERNAL roots (`std`/`core`/`alloc`/`proc_macro`) are
+/// skipped whole (audit 2026-07-24, IDX v52): their bare trailing segment used
+/// to enter the global bare-name lookup with no qualifier metadata, where it
+/// bound to whatever single same-family project symbol shared the name —
+/// every `use std::fs;` in the repo produced a phantom `imports → fn fs`
+/// edge onto a `#[cfg(test)]` helper in `js_modules.rs`, polluting 4
+/// module_dependencies pairs in `map` (one of them 100% phantom). A std
+/// import can never resolve to a project symbol, so no edge (not even an
+/// `<external>` sentinel) beats a plausible-but-wrong one. Non-std external
+/// crates (`anyhow`, …) can't be told apart from workspace-sibling crates
+/// without Cargo.toml knowledge, so they still take the bare-name path.
 pub(super) fn extract_rust_use_imports(
     node: &tree_sitter::Node,
     source: &str,
     scope: Option<&str>,
     results: &mut Vec<ParsedRelation>,
 ) {
+    const EXTERNAL_ROOTS: &[&str] = &["std", "core", "alloc", "proc_macro"];
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if EXTERNAL_ROOTS.contains(&use_path_root(&child, source)) {
+                return;
+            }
+        }
+    }
     fn collect_use_names(node: &tree_sitter::Node, source: &str, names: &mut Vec<String>) {
         collect_use_names_inner(node, source, names, 0);
     }
-    fn collect_use_names_inner(node: &tree_sitter::Node, source: &str, names: &mut Vec<String>, depth: usize) {
-        if depth > MAX_SUBTREE_DEPTH { return; }
+    fn collect_use_names_inner(
+        node: &tree_sitter::Node,
+        source: &str,
+        names: &mut Vec<String>,
+        depth: usize,
+    ) {
+        if depth > MAX_SUBTREE_DEPTH {
+            return;
+        }
         match node.kind() {
             "use_as_clause" => {
                 if let Some(child) = node.named_child(0) {
@@ -92,7 +142,10 @@ pub(super) fn extract_rust_use_imports(
 }
 
 /// Extract `impl Trait for Type` → Type implements Trait
-pub(super) fn extract_rust_impl_trait(node: &tree_sitter::Node, source: &str) -> Option<ParsedRelation> {
+pub(super) fn extract_rust_impl_trait(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> Option<ParsedRelation> {
     // impl_item has "trait" and "type" fields when it's `impl Trait for Type`
     let trait_node = node.child_by_field_name("trait")?;
     let type_node = node.child_by_field_name("type")?;
@@ -103,7 +156,12 @@ pub(super) fn extract_rust_impl_trait(node: &tree_sitter::Node, source: &str) ->
     // text; Phase 2 source resolution (index_files.rs) does exact-name match
     // against local node names ("Type"), so without stripping, no edge would
     // emit for any generic trait impl — every method appears dead.
-    let type_name = type_text.split('<').next().unwrap_or(&type_text).trim().to_string();
+    let type_name = type_text
+        .split('<')
+        .next()
+        .unwrap_or(&type_text)
+        .trim()
+        .to_string();
     if trait_name.is_empty() || type_name.is_empty() {
         return None;
     }
@@ -163,15 +221,34 @@ pub(super) fn extract_rust_path_reference(
     // module-path values and still emit. Lowercase PRIMITIVE-type heads (`str::trim`,
     // `u32::MAX`) are also type-associated and are caught by the primitive list below.
     let path_text = node_text(node, source);
-    if path_text.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+    if path_text
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+    {
         return None;
     }
     let head = path_text.split("::").next().unwrap_or(path_text);
-    if matches!(head,
-        "str" | "bool" | "char"
-        | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
-        | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-        | "f32" | "f64"
+    if matches!(
+        head,
+        "str"
+            | "bool"
+            | "char"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
     ) {
         return None;
     }
@@ -213,8 +290,10 @@ pub(super) fn extract_rust_type_reference(
 ) -> Option<ParsedRelation> {
     if let Some(parent) = node.parent() {
         // The `name` field of a definition is the declaration, not a usage.
-        if matches!(parent.kind(), "struct_item" | "enum_item" | "type_item" | "trait_item" | "union_item")
-            && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())
+        if matches!(
+            parent.kind(),
+            "struct_item" | "enum_item" | "type_item" | "trait_item" | "union_item"
+        ) && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())
         {
             return None;
         }
@@ -289,6 +368,80 @@ pub(super) fn extract_rust_type_reference(
 /// (or an enclosing closure) is a pass-through of a LOCAL binding, not a reference to
 /// a same-named global fn — skip it. Without M2, `fn run(handler: F){ spawn(handler) }`
 /// would fabricate an edge to whatever global `handler` happens to exist (FP-a).
+/// Calls made inside macro token trees (`assert_eq!(foo(x), y)`, `macro_rules!`
+/// rule bodies): tree-sitter parses macro arguments/bodies as opaque
+/// `token_tree`s — no `call_expression` exists — so every such call was
+/// invisible: the target showed as dead code and impact/callgraph missed the
+/// calling fn (field failure 2026-07-24: `impact grep_exit` missed cmd_stats'
+/// `sout!` body; tests calling a fn only inside `assert_eq!` were absent).
+/// Heuristic: an `identifier` token directly followed by a `(…)` token_tree is
+/// a call. Exclusions:
+///   - previous token `.` → method tail; the receiver is unrecoverable in a
+///     token soup, and a bare-name edge would alias every same-named fn
+///   - previous token `::` → path tail (v1 skips: std/type-associated paths
+///     dominate and the bare tail aliases same-named local fns)
+///   - previous token `$` → macro fragment variable, not a name
+///   - previous token is a definition keyword → macro-generated item, not a call
+///   - no enclosing named scope → skip, parity with the call_expression arm's
+///     deliberate Rust top-level omission
+///
+/// A macro name itself never matches: `foo!(…)` puts a `!` between the
+/// identifier and the token_tree.
+pub(super) fn extract_rust_macro_token_call(
+    node: &tree_sitter::Node,
+    source: &str,
+    scope: Option<&str>,
+) -> Option<ParsedRelation> {
+    let scope = scope?;
+    let parent = node.parent()?;
+    if parent.kind() != "token_tree" {
+        return None;
+    }
+    let next = node.next_sibling()?;
+    if next.kind() != "token_tree" || source.as_bytes().get(next.start_byte()) != Some(&b'(') {
+        return None;
+    }
+    if let Some(prev) = node.prev_sibling() {
+        if matches!(
+            prev.kind(),
+            "." | "::"
+                | "$"
+                | "fn"
+                | "struct"
+                | "enum"
+                | "union"
+                | "trait"
+                | "mod"
+                | "type"
+                | "impl"
+        ) {
+            return None;
+        }
+    }
+    let name = node_text(node, source);
+    if name.is_empty() || name == "self" || name == "Self" || name == "_" {
+        return None;
+    }
+    // Tuple-variant/tuple-struct PATTERNS (`matches!(x, Some(y))`) parse
+    // identically to calls in a token soup — token_tree carries no
+    // pattern-vs-expression split (audit 2026-07-24, empirically reproduced:
+    // `matches!(x, Some(y))` fabricated a calls→Some edge). Variant and type
+    // names are CamelCase by convention (non_camel_case_types lint), while the
+    // fn calls this pass exists to recover are snake_case — so skip
+    // uppercase-initial names. Cost: constructor uses like `vec![Some(1)]`
+    // stay invisible, exactly as they were before this pass existed.
+    if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None;
+    }
+    Some(ParsedRelation {
+        source_name: scope.to_string(),
+        target_name: name.to_string(),
+        relation: REL_CALLS.into(),
+        metadata: None,
+        source_language: String::new(),
+    })
+}
+
 pub(super) fn extract_rust_value_reference(
     node: &tree_sitter::Node,
     source: &str,
@@ -298,14 +451,13 @@ pub(super) fn extract_rust_value_reference(
     let in_value_position = match parent.kind() {
         // Phase 1: call argument, or `&fn` argument.
         "arguments" => true,
-        "reference_expression" => {
-            parent.parent().map(|gp| gp.kind() == "arguments").unwrap_or(false)
-        }
+        "reference_expression" => parent
+            .parent()
+            .map(|gp| gp.kind() == "arguments")
+            .unwrap_or(false),
         // Phase 2: binding RHS (`let cb = handler`) — only the `value` field, never
         // the `pattern` (which is a local binding, handled by M2.5).
-        "let_declaration" => {
-            parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id())
-        }
+        "let_declaration" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
         // Phase 2: struct field value (`Config { cb: handler }`) — `value` field
         // only, never the `field` name.
         "field_initializer" => {
@@ -355,7 +507,10 @@ pub(super) fn extract_rust_value_reference(
 ///
 /// Rust `let` scope is function-local (nested fns don't capture), so the nearest
 /// `function_item` is the correct boundary.
-fn enclosing_fn_local_names(node: &tree_sitter::Node, source: &str) -> std::collections::HashSet<String> {
+fn enclosing_fn_local_names(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     let mut cur = node.parent();
     while let Some(n) = cur {

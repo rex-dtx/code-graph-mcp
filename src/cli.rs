@@ -113,7 +113,10 @@ fn worktree_main_root(root: &Path) -> Option<PathBuf> {
         return None;
     }
     let content = std::fs::read_to_string(&git_path).ok()?;
-    let gitdir_line = content.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let gitdir_line = content
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))?
+        .trim();
     if gitdir_line.is_empty() {
         return None;
     }
@@ -131,7 +134,11 @@ fn worktree_main_root(root: &Path) -> Option<PathBuf> {
     let norm = s.replace('\\', "/");
     let idx = norm.rfind("/.git/worktrees/")?;
     let main_root = PathBuf::from(&s[..idx]);
-    if main_root.as_os_str().is_empty() { None } else { Some(main_root) }
+    if main_root.as_os_str().is_empty() {
+        None
+    } else {
+        Some(main_root)
+    }
 }
 
 /// Read-side effective root (D#106): the given root when its index exists
@@ -221,9 +228,15 @@ pub fn serve_non_project_stub<R: BufRead, W: Write>(
                     }
                 }
             }),
-            "tools/list" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [] } }),
-            "resources/list" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "resources": [] } }),
-            "prompts/list" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "prompts": [] } }),
+            "tools/list" => {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [] } })
+            }
+            "resources/list" => {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "resources": [] } })
+            }
+            "prompts/list" => {
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "prompts": [] } })
+            }
             "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             _ => serde_json::json!({
                 "jsonrpc": "2.0", "id": id,
@@ -346,10 +359,13 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
     // `read_source_context` canonicalize guard, and `is_safe_relative_path`. ANY
     // project-relative result, whether typed directly OR derived by stripping the
     // root prefix off an absolute path, must not climb above the root via `..`.
-    let escape = || anyhow::anyhow!(
-        "path '{}' escapes the project root '{}' \u{2014} use a path inside the project",
-        raw, project_root.display()
-    );
+    let escape = || {
+        anyhow::anyhow!(
+            "path '{}' escapes the project root '{}' \u{2014} use a path inside the project",
+            raw,
+            project_root.display()
+        )
+    };
 
     // Absolute path: cwd-independent. CRITICAL: `Path::strip_prefix` matches
     // components and does NOT collapse `..`, so `<root>/../../etc/passwd` strips
@@ -384,7 +400,10 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
     // production cwd is the root or a descendant; a non-descendant cwd (only
     // reachable in tests / pathological envs) yields an empty offset and the
     // historical root-relative reading.
-    let cwd_rel = cwd.strip_prefix(project_root).map(|r| r.to_path_buf()).unwrap_or_default();
+    let cwd_rel = cwd
+        .strip_prefix(project_root)
+        .map(|r| r.to_path_buf())
+        .unwrap_or_default();
     if cwd_rel.as_os_str().is_empty() {
         // cwd == project root: historical root-relative behavior, unchanged.
         if raw == "." {
@@ -408,7 +427,45 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
     // cwd is a subdirectory of the root: resolve `raw` against it, collapsing
     // `.`/`..` lexically so a `../` climbs back toward (but never above) the
     // root. A `..` that pops past the root is the subdir-relative escape.
-    collapse_within_root(&cwd_rel.join(raw)).ok_or_else(escape)
+    let subdir_rel = collapse_within_root(&cwd_rel.join(raw)).ok_or_else(escape)?;
+    // Near-miss rebase (same field failure as cmd_grep's, 2026-07-24): the
+    // agent's shell often sits in a subdir while it quotes repo-root-relative
+    // paths (hook answers display them root-relative), doubling the prefix into
+    // a path that exists nowhere — downstream that surfaces as a misleading
+    // "No symbols found under: <the valid path the caller typed>". cwd-missing +
+    // root-existing is unambiguous: take the root reading and say so on stderr.
+    // When the cwd-relative target exists — or neither does (it may be indexed
+    // but deleted/gitignored; don't guess) — the cwd reading stands. `.`, `./x`
+    // and `../x` are explicitly cwd-anchored (and `root.join(".")` always
+    // exists), so they never rebase; a bare `.hidden` name still can.
+    if !is_cwd_anchored(raw)
+        && !project_root.join(&subdir_rel).exists()
+        && is_safe_relative_path(raw)
+        && project_root.join(raw).exists()
+    {
+        note_root_rebase(raw, project_root);
+        return collapse_within_root(Path::new(raw)).ok_or_else(escape);
+    }
+    Ok(subdir_rel)
+}
+
+/// A path the caller explicitly anchored to the current directory (`.`, `./x`,
+/// `../x`) — such paths never take the near-miss root rebase. Single source of
+/// the exclusion list shared by BOTH rebase arms (`normalize_user_path_from`
+/// and `cmd_grep`); extend it here so the two arms can't drift apart again
+/// (audit 2026-07-24: the arms were hand-duplicated copies).
+fn is_cwd_anchored(raw: &str) -> bool {
+    raw == "." || raw.starts_with("./") || raw.starts_with("../")
+}
+
+/// The one stderr surface for a near-miss root rebase, shared by both arms so
+/// the disclosure wording stays identical.
+fn note_root_rebase(raw: &str, root: &Path) {
+    eprintln!(
+        "[code-graph] note: '{}' not found under the current directory; resolved against project root {}",
+        raw,
+        root.display()
+    );
 }
 
 /// Lexically collapse a root-relative path's `.`/`..` components and return the
@@ -422,7 +479,9 @@ fn collapse_within_root(rel: &Path) -> Option<String> {
         match comp {
             Component::Normal(c) => stack.push(c.to_string_lossy().into_owned()),
             Component::CurDir => {}
-            Component::ParentDir => { stack.pop()?; }
+            Component::ParentDir => {
+                stack.pop()?;
+            }
             Component::RootDir | Component::Prefix(_) => return None,
         }
     }
@@ -449,7 +508,11 @@ fn resolve_fuzzy_name_cli(conn: &rusqlite::Connection, name: &str) -> Result<Cli
         .into_iter()
         .filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path))
         .collect();
-    let exact: Vec<_> = candidates.iter().filter(|c| c.name == name).cloned().collect();
+    let exact: Vec<_> = candidates
+        .iter()
+        .filter(|c| c.name == name)
+        .cloned()
+        .collect();
     if exact.len() == 1 {
         return Ok(CliFuzzyResolution::Unique(exact[0].name.clone()));
     }
@@ -457,7 +520,9 @@ fn resolve_fuzzy_name_cli(conn: &rusqlite::Connection, name: &str) -> Result<Cli
         return Ok(CliFuzzyResolution::Ambiguous(exact));
     }
     if candidates.len() == 1 {
-        return Ok(CliFuzzyResolution::Unique(candidates.into_iter().next().unwrap().name));
+        return Ok(CliFuzzyResolution::Unique(
+            candidates.into_iter().next().unwrap().name,
+        ));
     }
     if !candidates.is_empty() {
         return Ok(CliFuzzyResolution::Ambiguous(candidates));
@@ -474,16 +539,24 @@ fn resolve_fuzzy_name_cli(conn: &rusqlite::Connection, name: &str) -> Result<Cli
 fn emit_exact_ambiguity(symbol: &str, cands: &[queries::NameCandidate], json_mode: bool) -> ! {
     let message = crate::resolve::ambiguity_message(symbol, cands, crate::resolve::Surface::Cli);
     if json_mode {
-        let sugg: Vec<serde_json::Value> =
-            crate::resolve::candidates_to_json(cands).into_iter().take(5).collect();
-        println!("{}", serde_json::json!({
-            "error": message,
-            "suggestions": sugg,
-        }));
+        let sugg: Vec<serde_json::Value> = crate::resolve::candidates_to_json(cands)
+            .into_iter()
+            .take(5)
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "error": message,
+                "suggestions": sugg,
+            })
+        );
     } else {
         eprintln!("[code-graph] {}", message);
         for c in cands.iter().take(5) {
-            eprintln!("  {} ({}) in {} [node_id {}]", c.name, c.node_type, c.file_path, c.node_id);
+            eprintln!(
+                "  {} ({}) in {} [node_id {}]",
+                c.name, c.node_type, c.file_path, c.node_id
+            );
         }
     }
     std::process::exit(1);
@@ -588,8 +661,10 @@ fn format_node_compact(node: &queries::NodeResult, file_path: &str) -> String {
 // reindex/rebuild-index callers are unaffected.
 /// CLI arguments for the `incremental-index` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp incremental-index",
-          about = "Run incremental index update (full index when none exists)")]
+#[command(
+    name = "code-graph-mcp incremental-index",
+    about = "Run incremental index update (full index when none exists)"
+)]
 pub struct IncrementalIndexArgs {
     /// Suppress progress output (used by the PostToolUse hook)
     #[arg(long)]
@@ -641,15 +716,23 @@ fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
         let mut failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
         loop {
             let exclude: Vec<i64> = failed.iter().copied().collect();
-            let chunk = wrap_index_busy(queries::get_unembedded_nodes_excluding(db.conn(), 64, &exclude))?;
-            if chunk.is_empty() { break; }
+            let chunk = wrap_index_busy(queries::get_unembedded_nodes_excluding(
+                db.conn(),
+                64,
+                &exclude,
+            ))?;
+            if chunk.is_empty() {
+                break;
+            }
             let chunk_len = chunk.len();
             let embedded_ids = wrap_index_busy(embed_and_store_batch(db, &model, &chunk))?;
             total += embedded_ids.len();
             if embedded_ids.len() < chunk_len {
                 let ok: std::collections::HashSet<i64> = embedded_ids.into_iter().collect();
                 for (id, _) in &chunk {
-                    if !ok.contains(id) { failed.insert(*id); }
+                    if !ok.contains(id) {
+                        failed.insert(*id);
+                    }
                 }
             }
         }
@@ -676,9 +759,15 @@ fn warn_parse_errors(stats: &crate::indexer::pipeline::IndexStats, quiet: bool) 
     if n == 0 {
         return;
     }
-    tracing::warn!("{} file(s) parsed with syntax errors (symbols may be incomplete)", n);
+    tracing::warn!(
+        "{} file(s) parsed with syntax errors (symbols may be incomplete)",
+        n
+    );
     if !quiet {
-        eprintln!("{} file(s) parsed with syntax errors (symbols may be incomplete)", n);
+        eprintln!(
+            "{} file(s) parsed with syntax errors (symbols may be incomplete)",
+            n
+        );
     }
 }
 
@@ -686,7 +775,12 @@ fn warn_parse_errors(stats: &crate::indexer::pipeline::IndexStats, quiet: bool) 
 /// opened and dropped within this call, so on return the WAL is checkpointed and
 /// `db_path` is self-contained — which lets `rebuild-index` build into a temp
 /// file and atomically rename it over `index.db`.
-fn build_full_index_at(db_path: &Path, project_root: &Path, quiet: bool, no_embed: bool) -> Result<()> {
+fn build_full_index_at(
+    db_path: &Path,
+    project_root: &Path,
+    quiet: bool,
+    no_embed: bool,
+) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
         cleanup_legacy_db_files(parent);
@@ -720,8 +814,8 @@ fn build_full_index_at(db_path: &Path, project_root: &Path, quiet: bool, no_embe
 fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Result<()> {
     if no_embed {
         if !quiet && db.vec_enabled() {
-            let (embedded, embeddable) = queries::count_nodes_with_vectors(db.conn())
-                .unwrap_or((0, 0));
+            let (embedded, embeddable) =
+                queries::count_nodes_with_vectors(db.conn()).unwrap_or((0, 0));
             eprintln!(
                 "Structure index ready (AST/grep/callgraph usable now). Skipping embeddings \
                  (--no-embed): {}/{} nodes have vectors; the rest backfill in the background \
@@ -813,8 +907,10 @@ fn db_sidecar(db_path: &Path, suffix: &str) -> std::path::PathBuf {
 /// index). Mirrors MCP `rebuild_index` tool semantics.
 /// `rebuild-index` arguments (clap-migrated, audit #4).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp rebuild-index",
-          about = "Drop and rebuild the index from scratch (requires --confirm)")]
+#[command(
+    name = "code-graph-mcp rebuild-index",
+    about = "Drop and rebuild the index from scratch (requires --confirm)"
+)]
 pub struct RebuildIndexArgs {
     /// Confirm the destructive drop-and-rebuild (required to proceed)
     #[arg(long)]
@@ -867,7 +963,9 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     ];
     let remove_all = |paths: &[std::path::PathBuf]| {
         for p in paths {
-            if p.exists() { let _ = std::fs::remove_file(p); }
+            if p.exists() {
+                let _ = std::fs::remove_file(p);
+            }
         }
     };
     // Clear leftover temp files from previously-killed rebuilds (ANY pid). The
@@ -877,7 +975,11 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     // concurrent rebuild-index runs were never supported.
     if let Ok(entries) = std::fs::read_dir(&code_graph_dir) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("index.db.rebuild-") {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index.db.rebuild-")
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -913,8 +1015,10 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
 // stay untouched (plan §2 item 14).
 /// CLI arguments for the `health-check` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp health-check",
-          about = "Query index status (nodes/edges/files, freshness, embedding coverage)")]
+#[command(
+    name = "code-graph-mcp health-check",
+    about = "Query index status (nodes/edges/files, freshness, embedding coverage)"
+)]
 pub struct HealthCheckArgs {
     /// JSON output (shorthand for --format json; wins when both are set)
     #[arg(long)]
@@ -946,11 +1050,17 @@ impl HealthCheckArgs {
 /// structurally dark); `"empty"` = file present, no recommendations yet;
 /// `"live"` = recommendations recorded.
 pub fn recommendation_metric_state(project_root: &Path) -> &'static str {
-    let p = project_root.join(CODE_GRAPH_DIR).join("recommendations.jsonl");
+    let p = project_root
+        .join(CODE_GRAPH_DIR)
+        .join("recommendations.jsonl");
     match std::fs::read_to_string(&p) {
         Err(_) => "absent",
         Ok(c) => {
-            if aggregate_recommendations_jsonl(&c).total > 0 { "live" } else { "empty" }
+            if aggregate_recommendations_jsonl(&c).total > 0 {
+                "live"
+            } else {
+                "empty"
+            }
         }
     }
 }
@@ -1002,10 +1112,15 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64 - ts)
             .unwrap_or(0);
-        if elapsed < 60 { format!("{}s ago", elapsed) }
-        else if elapsed < 3600 { format!("{}m ago", elapsed / 60) }
-        else if elapsed < 86400 { format!("{}h ago", elapsed / 3600) }
-        else { format!("{}d ago", elapsed / 86400) }
+        if elapsed < 60 {
+            format!("{}s ago", elapsed)
+        } else if elapsed < 3600 {
+            format!("{}m ago", elapsed / 60)
+        } else if elapsed < 86400 {
+            format!("{}h ago", elapsed / 3600)
+        } else {
+            format!("{}d ago", elapsed / 86400)
+        }
     });
 
     // Embedding coverage (works without sqlite-vec loaded)
@@ -1024,7 +1139,11 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     // `embedding_progress`/`embedding_status` to tell apart "compiled but not
     // loaded yet" from "compiled and embedding in progress".
     let model_available: bool = cfg!(feature = "embed-model");
-    let search_mode = if model_available && vectors_done > 0 { "hybrid" } else { "fts_only" };
+    let search_mode = if model_available && vectors_done > 0 {
+        "hybrid"
+    } else {
+        "fts_only"
+    };
     let embedding_status = if !model_available {
         "unavailable"
     } else if vectors_done == 0 {
@@ -1036,19 +1155,26 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     };
 
     // Snapshot metadata block — reads keys written by `snapshot install`.
-    let snapshot_url = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_URL)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
-    let snapshot_commit = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_COMMIT)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
-    let snapshot_fetched_at = crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_FETCHED_AT)
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse::<i64>().ok());
-    let snapshot_status = if snapshot_url.is_some() { "present" } else { "absent" };
+    let snapshot_url =
+        crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_URL)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+    let snapshot_commit =
+        crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_SOURCE_COMMIT)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+    let snapshot_fetched_at =
+        crate::snapshot::meta::read_meta(conn, crate::snapshot::meta::META_SNAPSHOT_FETCHED_AT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i64>().ok());
+    let snapshot_status = if snapshot_url.is_some() {
+        "present"
+    } else {
+        "absent"
+    };
     // commit_drift: how many local commits landed after the snapshot was taken.
     let commit_drift = snapshot_commit.as_deref().and_then(|c| {
         std::process::Command::new("git")
@@ -1056,10 +1182,15 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
             .current_dir(project_root)
             .output()
             .ok()
-            .and_then(|o| if o.status.success() {
-                String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok()
-            } else {
-                None
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                } else {
+                    None
+                }
             })
     });
     let snapshot_block = serde_json::json!({
@@ -1116,7 +1247,8 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 // startup), not this poll, performs.
                 json["issue"] = serde_json::json!(format!(
                     "index built by older version (v{} ≠ v{}); rebuild pending",
-                    old, crate::domain::INDEX_VERSION
+                    old,
+                    crate::domain::INDEX_VERSION
                 ));
             }
             println!("{}", json);
@@ -1129,25 +1261,36 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
             // which attaches the block unconditionally (F12). Healthy keeps `OK:` first.
             let print_resolution = || {
                 if let Some(ref r) = resolution {
-                    let summary: Vec<String> = r.edges_by_language.iter()
+                    let summary: Vec<String> = r
+                        .edges_by_language
+                        .iter()
                         .map(|(lang, rels)| format!("{} {}", lang, rels.values().sum::<i64>()))
                         .collect();
-                    println!("Resolution: {} pending; edges by lang: {}",
-                        r.pending_unresolved_calls, summary.join(", "));
+                    println!(
+                        "Resolution: {} pending; edges by lang: {}",
+                        r.pending_unresolved_calls,
+                        summary.join(", ")
+                    );
                 }
             };
             if healthy {
-                let age_info = age_str.map(|a| format!(" (updated {})", a)).unwrap_or_default();
+                let age_info = age_str
+                    .map(|a| format!(" (updated {})", a))
+                    .unwrap_or_default();
                 println!(
                     "OK: {} nodes, {} edges, {} files{}",
                     status.nodes_count, status.edges_count, status.files_count, age_info
                 );
                 println!("Snapshot: {}", snapshot_status);
-                println!("Conversion metric: {}", match recommendation_metric_state(project_root) {
-                    "live" => "live (recommendations recorded)",
-                    "empty" => "active, no recommendations recorded yet",
-                    _ => "DARK (no recommendations.jsonl — PreToolUse hooks not recording here)",
-                });
+                println!(
+                    "Conversion metric: {}",
+                    match recommendation_metric_state(project_root) {
+                        "live" => "live (recommendations recorded)",
+                        "empty" => "active, no recommendations recorded yet",
+                        _ =>
+                            "DARK (no recommendations.jsonl — PreToolUse hooks not recording here)",
+                    }
+                );
                 // Vector/embedding status — make a silent FTS5-only degradation visible
                 // (the prior gap: text health-check never surfaced search_mode, so a user
                 // whose model download failed had no way to see vector was inactive).
@@ -1312,10 +1455,20 @@ impl UsageSummary {
 /// funnel measures real "used cg instead of grep" substitution, not background
 /// bookkeeping. Kept in sync by hand with the `src/mcp/tools.rs` registry.
 const CG_QUERY_TOOLS: &[&str] = &[
-    "get_call_graph", "get_ast_node", "module_overview", "semantic_code_search",
-    "ast_search", "find_references", "project_map", "impact_analysis",
-    "trace_http_chain", "dependency_graph", "find_similar_code", "find_dead_code",
-    "find_http_route", "read_snippet",
+    "get_call_graph",
+    "get_ast_node",
+    "module_overview",
+    "semantic_code_search",
+    "ast_search",
+    "find_references",
+    "project_map",
+    "impact_analysis",
+    "trace_http_chain",
+    "dependency_graph",
+    "find_similar_code",
+    "find_dead_code",
+    "find_http_route",
+    "read_snippet",
 ];
 
 /// Per-session funnel conversion = `num/denom` rounded to 2 decimals, or JSON
@@ -1336,7 +1489,9 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
     let mut parse_errors: u64 = 0;
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
         match serde_json::from_str::<serde_json::Value>(trimmed) {
             Ok(v) => records.push(v),
             Err(_) => parse_errors += 1,
@@ -1380,20 +1535,28 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
             summary.versions.insert(v.to_string());
         }
         if let Some(ts) = rec.get("ts").and_then(|v| v.as_str()) {
-            if summary.first_ts.is_none() { summary.first_ts = Some(ts.to_string()); }
+            if summary.first_ts.is_none() {
+                summary.first_ts = Some(ts.to_string());
+            }
             summary.last_ts = Some(ts.to_string());
         }
         if let Some(tools_obj) = rec.get("tools").and_then(|v| v.as_object()) {
             for (name, s) in tools_obj {
                 let agg = summary.tools.entry(name.clone()).or_insert(ToolAgg {
-                    n: 0, total_ms: 0, err: 0, max_ms: 0, err_kinds: HashMap::new(),
+                    n: 0,
+                    total_ms: 0,
+                    err: 0,
+                    max_ms: 0,
+                    err_kinds: HashMap::new(),
                     other_sample: None,
                 });
                 agg.n += s.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
                 agg.total_ms += s.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 agg.err += s.get("err").and_then(|v| v.as_u64()).unwrap_or(0);
                 let m = s.get("max_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                if m > agg.max_ms { agg.max_ms = m; }
+                if m > agg.max_ms {
+                    agg.max_ms = m;
+                }
                 // Merge the per-session err_kinds breakdown (additive; absent on
                 // pre-feature rows, so `sum(err_kinds)` may trail `err`).
                 if let Some(ek) = s.get("err_kinds").and_then(|v| v.as_object()) {
@@ -1430,11 +1593,19 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
         }
         // Recommend→use funnel: per-session, did a session that saw a deny/hint
         // (window-joined into the `recs` field at flush) also call a cg query tool?
-        let used_cg = rec.get("tools").and_then(|v| v.as_object()).is_some_and(|tools| {
-            CG_QUERY_TOOLS.iter().any(|t| {
-                tools.get(*t).and_then(|s| s.get("n")).and_then(|n| n.as_u64()).unwrap_or(0) > 0
-            })
-        });
+        let used_cg = rec
+            .get("tools")
+            .and_then(|v| v.as_object())
+            .is_some_and(|tools| {
+                CG_QUERY_TOOLS.iter().any(|t| {
+                    tools
+                        .get(*t)
+                        .and_then(|s| s.get("n"))
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0)
+                        > 0
+                })
+            });
         if let Some(recs) = rec.get("recs") {
             let deny = recs.get("deny").and_then(|v| v.as_u64()).unwrap_or(0);
             let hint = recs.get("hint").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1443,15 +1614,27 @@ pub fn aggregate_usage_jsonl(content: &str, last_n: Option<usize>) -> UsageSumma
             let used_any = used_cg || used_cli;
             if deny > 0 {
                 summary.sessions_with_deny += 1;
-                if used_cg { summary.sessions_with_deny_and_cg += 1; }
-                if used_cli { summary.sessions_with_deny_and_cli += 1; }
-                if used_any { summary.sessions_with_deny_and_use += 1; }
+                if used_cg {
+                    summary.sessions_with_deny_and_cg += 1;
+                }
+                if used_cli {
+                    summary.sessions_with_deny_and_cli += 1;
+                }
+                if used_any {
+                    summary.sessions_with_deny_and_use += 1;
+                }
             }
             if hint > 0 {
                 summary.sessions_with_hint += 1;
-                if used_cg { summary.sessions_with_hint_and_cg += 1; }
-                if used_cli { summary.sessions_with_hint_and_cli += 1; }
-                if used_any { summary.sessions_with_hint_and_use += 1; }
+                if used_cg {
+                    summary.sessions_with_hint_and_cg += 1;
+                }
+                if used_cli {
+                    summary.sessions_with_hint_and_cli += 1;
+                }
+                if used_any {
+                    summary.sessions_with_hint_and_use += 1;
+                }
             }
         }
     }
@@ -1557,14 +1740,21 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
     let mut armed_pattern: Option<String> = None;
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else { continue; };
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
         let action = v.get("action").and_then(|x| x.as_str());
         let hook = v.get("hook").and_then(|x| x.as_str());
 
         // Re-search detection runs on every tool event, before action bucketing.
         let is_search_event = matches!(hook, Some("grep") | Some("read"))
-            && matches!(action, Some("deny") | Some("hint") | Some("bypass") | Some("observe") | Some("inject"));
+            && matches!(
+                action,
+                Some("deny") | Some("hint") | Some("bypass") | Some("observe") | Some("inject")
+            );
         if armed {
             if is_search_event {
                 s.researched_after_answer += 1;
@@ -1608,9 +1798,18 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
 
         // observe / use are not recommendation events: count separately, like cli use.
         match action {
-            Some("use") => { s.cli_uses += 1; continue; }
-            Some("observe") => { s.observe += 1; continue; }
-            Some("live_impact") => { s.live_impact += 1; continue; }
+            Some("use") => {
+                s.cli_uses += 1;
+                continue;
+            }
+            Some("observe") => {
+                s.observe += 1;
+                continue;
+            }
+            Some("live_impact") => {
+                s.live_impact += 1;
+                continue;
+            }
             _ => {}
         }
         s.total += 1;
@@ -1620,8 +1819,8 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
                 if v.get("answered").and_then(|x| x.as_bool()) == Some(true) {
                     s.deny_answered += 1;
                     armed = true; // watch the next event for a re-search
-                    // Remember the pattern (if recorded) so a verbatim re-grep of it
-                    // is scored as fall-through, not sustained.
+                                  // Remember the pattern (if recorded) so a verbatim re-grep of it
+                                  // is scored as fall-through, not sustained.
                     armed_pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
                 } else {
                     s.deny_unanswered += 1;
@@ -1664,8 +1863,10 @@ pub fn aggregate_recommendations_jsonl(content: &str) -> RecommendationSummary {
 // the prior warn-and-show-all fallback.
 /// CLI arguments for the `stats` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp stats",
-          about = "Aggregate session metrics from .code-graph/usage.jsonl")]
+#[command(
+    name = "code-graph-mcp stats",
+    about = "Aggregate session metrics from .code-graph/usage.jsonl"
+)]
 pub struct StatsArgs {
     /// JSON output
     #[arg(long)]
@@ -1700,7 +1901,11 @@ fn version_sort_key(v: &str) -> (u64, u64, u64) {
 /// for single-file modules and one-line dead-code candidates). Naive `+s` only —
 /// callers pass already-plural-friendly stems (file, line, symbol).
 fn plural(n: i64, singular: &str) -> String {
-    if n == 1 { format!("1 {singular}") } else { format!("{n} {singular}s") }
+    if n == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{n} {singular}s")
+    }
 }
 
 /// Print aggregated session metrics from `.code-graph/usage.jsonl`.
@@ -1726,11 +1931,14 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     let usage_path = project_root.join(CODE_GRAPH_DIR).join("usage.jsonl");
     if !usage_path.exists() {
         if json_mode {
-            sout!("{}", serde_json::json!({
-                "sessions": 0,
-                "tools": {},
-                "note": format!("no usage data at {}", usage_path.display()),
-            }));
+            sout!(
+                "{}",
+                serde_json::json!({
+                    "sessions": 0,
+                    "tools": {},
+                    "note": format!("no usage data at {}", usage_path.display()),
+                })
+            );
         } else {
             eprintln!("No usage data yet at {}", usage_path.display());
             eprintln!("Run an MCP session first (sessions flush metrics on EOF).");
@@ -1744,15 +1952,24 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     // Conversion metric: cg tool calls vs PreToolUse recommendations. The JSONL
     // has no per-session boundary, so it is aggregated whole (last_n applies only
     // to usage sessions). Absent file → empty (default) summary.
-    let rec_path = project_root.join(CODE_GRAPH_DIR).join("recommendations.jsonl");
+    let rec_path = project_root
+        .join(CODE_GRAPH_DIR)
+        .join("recommendations.jsonl");
     let rec_exists = rec_path.exists();
-    let recs = std::fs::read_to_string(&rec_path).ok()
+    let recs = std::fs::read_to_string(&rec_path)
+        .ok()
         .map(|c| aggregate_recommendations_jsonl(&c))
         .unwrap_or_default();
     // Recording-side state of the conversion metric, made explicit so a dark
     // metric (file absent → PreToolUse hooks not recording here) is never
     // silently indistinguishable from "feature absent" or "no data yet".
-    let rec_state = if recs.total > 0 || recs.cli_uses > 0 { "live" } else if rec_exists { "empty" } else { "absent" };
+    let rec_state = if recs.total > 0 || recs.cli_uses > 0 {
+        "live"
+    } else if rec_exists {
+        "empty"
+    } else {
+        "absent"
+    };
 
     if summary.sessions == 0 {
         if json_mode {
@@ -1780,8 +1997,13 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         }).collect();
         let avg_q = if summary.search_queries > 0 {
             summary.search_quality_weighted_sum / summary.search_queries as f64
-        } else { 0.0 };
-        let full_avg = summary.full_index_ms_sum.checked_div(summary.full_index_count).unwrap_or(0);
+        } else {
+            0.0
+        };
+        let full_avg = summary
+            .full_index_ms_sum
+            .checked_div(summary.full_index_count)
+            .unwrap_or(0);
         let mut sorted_versions: Vec<String> = summary.versions.iter().cloned().collect();
         sorted_versions.sort_by_key(|v| version_sort_key(v));
         let mut stats_json = serde_json::json!({
@@ -1873,15 +2095,23 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
     } else {
         let mut versions: Vec<&str> = summary.versions.iter().map(|s| s.as_str()).collect();
         versions.sort_by_key(|v| version_sort_key(v));
-        sout!("Sessions: {}   versions: {}   {} → {}",
+        sout!(
+            "Sessions: {}   versions: {}   {} → {}",
             summary.sessions,
-            if versions.is_empty() { "-".into() } else { versions.join(",") },
+            if versions.is_empty() {
+                "-".into()
+            } else {
+                versions.join(",")
+            },
             summary.first_ts.as_deref().unwrap_or("-"),
             summary.last_ts.as_deref().unwrap_or("-"),
         );
         sout!("Total tool calls: {}", summary.total_tool_calls());
         if summary.parse_errors > 0 {
-            sout!("(warning: {} malformed line(s) skipped)", summary.parse_errors);
+            sout!(
+                "(warning: {} malformed line(s) skipped)",
+                summary.parse_errors
+            );
         }
         sout!();
 
@@ -1891,7 +2121,14 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         if sorted.is_empty() {
             sout!("(no tool calls recorded)");
         } else {
-            sout!("{:<28} {:>6} {:>10} {:>6} {:>8}", "Tool", "n", "avg_ms", "err", "max_ms");
+            sout!(
+                "{:<28} {:>6} {:>10} {:>6} {:>8}",
+                "Tool",
+                "n",
+                "avg_ms",
+                "err",
+                "max_ms"
+            );
             sout!("{}", "-".repeat(62));
             let mut any_legacy = false;
             for (name, agg) in &sorted {
@@ -1900,9 +2137,22 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 // or hidden, recorded by older sessions) so the table doesn't
                 // commingle historical names with the current live set.
                 let legacy = !crate::domain::LIVE_MCP_TOOLS.contains(&name.as_str());
-                if legacy { any_legacy = true; }
-                let label = if legacy { format!("{name} †") } else { name.to_string() };
-                sout!("{:<28} {:>6} {:>10} {:>6} {:>8}", label, agg.n, avg, agg.err, agg.max_ms);
+                if legacy {
+                    any_legacy = true;
+                }
+                let label = if legacy {
+                    format!("{name} †")
+                } else {
+                    name.to_string()
+                };
+                sout!(
+                    "{:<28} {:>6} {:>10} {:>6} {:>8}",
+                    label,
+                    agg.n,
+                    avg,
+                    agg.err,
+                    agg.max_ms
+                );
             }
             if any_legacy {
                 sout!("  † not in the current tools/list surface (folded/hidden; from older sessions)");
@@ -1943,49 +2193,86 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
         }
 
         if summary.search_queries > 0 {
-            let zero_pct = (summary.search_zero as f64 / summary.search_queries as f64 * 100.0).round() as u64;
+            let zero_pct =
+                (summary.search_zero as f64 / summary.search_queries as f64 * 100.0).round() as u64;
             let avg_q = summary.search_quality_weighted_sum / summary.search_queries as f64;
             sout!();
-            sout!("Search: {} queries, {} zero-result ({}%), hybrid/fts {}/{}, avg quality {:.2}",
-                summary.search_queries, summary.search_zero, zero_pct,
-                summary.search_hybrid, summary.search_fts_only, avg_q);
+            sout!(
+                "Search: {} queries, {} zero-result ({}%), hybrid/fts {}/{}, avg quality {:.2}",
+                summary.search_queries,
+                summary.search_zero,
+                zero_pct,
+                summary.search_hybrid,
+                summary.search_fts_only,
+                avg_q
+            );
         }
 
         if summary.full_index_count > 0 || summary.incr_count > 0 {
-            let full_part = match summary.full_index_ms_sum.checked_div(summary.full_index_count) {
+            let full_part = match summary
+                .full_index_ms_sum
+                .checked_div(summary.full_index_count)
+            {
                 Some(avg) if summary.full_index_count > 0 => format!(" (avg {}ms)", avg),
                 _ => String::new(),
             };
-            sout!("Index:  {} full{}, {} incremental, {} files indexed",
-                summary.full_index_count, full_part, summary.incr_count, summary.files_indexed);
+            sout!(
+                "Index:  {} full{}, {} incremental, {} files indexed",
+                summary.full_index_count,
+                full_part,
+                summary.incr_count,
+                summary.files_indexed
+            );
         }
 
         sout!();
         if recs.total > 0 {
-            let actions: Vec<String> = recs.by_action.iter().map(|(k, v)| format!("{v} {k}")).collect();
+            let actions: Vec<String> = recs
+                .by_action
+                .iter()
+                .map(|(k, v)| format!("{v} {k}"))
+                .collect();
             let ratio = summary.total_tool_calls() as f64 / recs.total as f64;
-            sout!("Recommendations: {} emitted ({})", recs.total, actions.join(", "));
+            sout!(
+                "Recommendations: {} emitted ({})",
+                recs.total,
+                actions.join(", ")
+            );
             // Inject payload mix. callgraph is the only mode with marginal value over
             // the model's own grep (cross-file tree); grep/show echo hits it already
             // saw (2026-06-26 audit: 0 CONSUMED). Lead with the callgraph share — the
             // lever is raising it. Modes may sum below by_action.inject (pre-v0.75
             // injects carry no mode).
             if !recs.inject_by_mode.is_empty() {
-                let modes: Vec<String> = recs.inject_by_mode.iter().map(|(k, v)| format!("{v} {k}")).collect();
+                let modes: Vec<String> = recs
+                    .inject_by_mode
+                    .iter()
+                    .map(|(k, v)| format!("{v} {k}"))
+                    .collect();
                 let inj_total: u64 = recs.inject_by_mode.values().sum();
                 let cg = recs.inject_by_mode.get("callgraph").copied().unwrap_or(0);
-                let cg_pct = if inj_total > 0 { (cg as f64 / inj_total as f64 * 100.0).round() as u64 } else { 0 };
+                let cg_pct = if inj_total > 0 {
+                    (cg as f64 / inj_total as f64 * 100.0).round() as u64
+                } else {
+                    0
+                };
                 sout!("Inject payloads: {} by mode ({}) — callgraph (cross-file, high-value) = {cg_pct}%",
                     inj_total, modes.join(", "));
             }
             if recs.deny_answered + recs.deny_unanswered > 0 {
                 // answered:true denies satisfy the need in-place — read their
                 // conversion separately or the funnel under-reports the feature.
-                sout!("Denies: {} answered in-place, {} static",
-                    recs.deny_answered, recs.deny_unanswered);
+                sout!(
+                    "Denies: {} answered in-place, {} static",
+                    recs.deny_answered,
+                    recs.deny_unanswered
+                );
             }
             if recs.cli_uses > 0 {
-                sout!("CLI uses: {} model-initiated code-graph-mcp queries", recs.cli_uses);
+                sout!(
+                    "CLI uses: {} model-initiated code-graph-mcp queries",
+                    recs.cli_uses
+                );
             }
             // Outcome proxy ("search-decay"): of the answered denies (cg delivered
             // the grep result in-place), how often did the model immediately keep
@@ -2001,7 +2288,9 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                 // count lumps all three
                 // and reads alarmingly high even when cg wins every step, so lead
                 // with fall-through and show the raw count correctly framed.
-                let ft_pct = (recs.fallthrough_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
+                let ft_pct = (recs.fallthrough_after_answer as f64 / recs.deny_answered as f64
+                    * 100.0)
+                    .round() as u64;
                 sout!("Fall-through after cg answer: {}/{} answered denies → inline answer didn't end the hunt (verbatim re-grep or a search cg couldn't satisfy) = {ft_pct}% (the real 'answer insufficient' rate; lower is better)",
                     recs.fallthrough_after_answer, recs.deny_answered);
                 if recs.sustained_after_answer > 0 {
@@ -2012,12 +2301,17 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
                     sout!("  ↳ inconclusive (excluded): {} follow-up(s) where cg found nothing (no-hits = a new query) or was unavailable — says nothing about the prior answer",
                         recs.followup_inconclusive);
                 }
-                let raw_pct = (recs.researched_after_answer as f64 / recs.deny_answered as f64 * 100.0).round() as u64;
+                let raw_pct = (recs.researched_after_answer as f64 / recs.deny_answered as f64
+                    * 100.0)
+                    .round() as u64;
                 sout!("  ↳ any follow-up (raw): {}/{} = {raw_pct}% — incl. drill-down + file-reads; NOT a failure rate",
                     recs.researched_after_answer, recs.deny_answered);
             }
             if recs.observe > 0 {
-                sout!("Tool observes: {} silent grep/read allows recorded (fan-out timeline)", recs.observe);
+                sout!(
+                    "Tool observes: {} silent grep/read allows recorded (fan-out timeline)",
+                    recs.observe
+                );
             }
             // Volume ratio (NOT a conversion rate): cg tool calls and hook
             // recommendations are independent populations, so this only signals
@@ -2035,27 +2329,48 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
             // PreToolUse hooks disabled). Surface the dark state instead of
             // printing nothing — silence reads as "feature absent".
             sout!("Conversion metric: DARK — no recommendations.jsonl. PreToolUse hooks are not");
-            sout!("  recording here, so recommend→use conversion cannot be measured in this project.");
+            sout!(
+                "  recording here, so recommend→use conversion cannot be measured in this project."
+            );
         }
         // v0.63 — SessionStart live-context injections. Printed outside the
         // total>0 branch (it's a separate counter): a session whose only event was
         // the SessionStart injection still surfaces it instead of reading dark.
         if recs.live_impact > 0 {
-            sout!("Live-context: {} recent-change blast-radius injection(s) at SessionStart", recs.live_impact);
+            sout!(
+                "Live-context: {} recent-change blast-radius injection(s) at SessionStart",
+                recs.live_impact
+            );
         }
         // Per-session funnel: of sessions that saw a deny/hint, how many also called
         // a cg query tool. This is the deny→use attribution the aggregate ratio can't give.
         if summary.sessions_with_deny > 0 {
-            let pct = (summary.sessions_with_deny_and_use as f64 / summary.sessions_with_deny as f64 * 100.0).round() as u64;
-            sout!("Deny→use: {}/{} deny-sessions used cg = {}% (mcp {}, cli {})",
-                summary.sessions_with_deny_and_use, summary.sessions_with_deny, pct,
-                summary.sessions_with_deny_and_cg, summary.sessions_with_deny_and_cli);
+            let pct = (summary.sessions_with_deny_and_use as f64
+                / summary.sessions_with_deny as f64
+                * 100.0)
+                .round() as u64;
+            sout!(
+                "Deny→use: {}/{} deny-sessions used cg = {}% (mcp {}, cli {})",
+                summary.sessions_with_deny_and_use,
+                summary.sessions_with_deny,
+                pct,
+                summary.sessions_with_deny_and_cg,
+                summary.sessions_with_deny_and_cli
+            );
         }
         if summary.sessions_with_hint > 0 {
-            let pct = (summary.sessions_with_hint_and_use as f64 / summary.sessions_with_hint as f64 * 100.0).round() as u64;
-            sout!("Hint→use: {}/{} hint-sessions used cg = {}% (mcp {}, cli {})",
-                summary.sessions_with_hint_and_use, summary.sessions_with_hint, pct,
-                summary.sessions_with_hint_and_cg, summary.sessions_with_hint_and_cli);
+            let pct = (summary.sessions_with_hint_and_use as f64
+                / summary.sessions_with_hint as f64
+                * 100.0)
+                .round() as u64;
+            sout!(
+                "Hint→use: {}/{} hint-sessions used cg = {}% (mcp {}, cli {})",
+                summary.sessions_with_hint_and_use,
+                summary.sessions_with_hint,
+                pct,
+                summary.sessions_with_hint_and_cg,
+                summary.sessions_with_hint_and_cli
+            );
         }
     }
 
@@ -2066,8 +2381,10 @@ pub fn cmd_stats(project_root: &Path, args: StatsArgs) -> Result<()> {
 
 /// CLI arguments for the `grep` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp grep",
-          about = "AST-context grep (ripgrep + containing function/class)")]
+#[command(
+    name = "code-graph-mcp grep",
+    about = "AST-context grep (ripgrep + containing function/class)"
+)]
 pub struct GrepArgs {
     /// Search pattern (ripgrep regex; use -F for literal strings)
     #[arg(allow_hyphen_values = true)]
@@ -2103,7 +2420,12 @@ pub struct GrepArgs {
     pub max_count: u64,
     /// Truncate displayed lines to N chars; 0 = unlimited (default 512 — keeps a
     /// long minified/generated line from flooding output).
-    #[arg(short = 'M', long = "max-columns", value_name = "N", default_value_t = 512)]
+    #[arg(
+        short = 'M',
+        long = "max-columns",
+        value_name = "N",
+        default_value_t = 512
+    )]
     pub max_columns: u64,
     /// Print only a count of matching lines per file (the per-file cap is ignored)
     #[arg(short = 'c', long)]
@@ -2190,7 +2512,10 @@ fn split_attached_context(tok: &str) -> Option<(String, String)> {
     {
         return None;
     }
-    Some((tok[..digit_start].to_string(), tok[digit_start..].to_string()))
+    Some((
+        tok[..digit_start].to_string(),
+        tok[digit_start..].to_string(),
+    ))
 }
 
 /// Return the first single-dash short-flag cluster (pre-`--`) that contains a
@@ -2328,7 +2653,9 @@ fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> V
     for rel in scope_rels {
         ls.arg(rel);
     }
-    let Ok(out) = ls.output() else { return Vec::new() };
+    let Ok(out) = ls.output() else {
+        return Vec::new();
+    };
     if !out.status.success() {
         return Vec::new();
     }
@@ -2360,20 +2687,37 @@ fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> V
         Err(_) => return Vec::new(),
     };
 
-    tracked.into_iter().filter(|t| !walked.contains(t)).collect()
+    tracked
+        .into_iter()
+        .filter(|t| !walked.contains(t))
+        .collect()
 }
 
 pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     let GrepArgs {
-        pattern, paths, json: json_mode,
-        ignore_case, word_regexp, fixed_strings, max_count,
-        files_with_matches, context, after_context, before_context,
-        max_columns, count: count_mode, file_type, glob,
+        pattern,
+        paths,
+        json: json_mode,
+        ignore_case,
+        word_regexp,
+        fixed_strings,
+        max_count,
+        files_with_matches,
+        context,
+        after_context,
+        before_context,
+        max_columns,
+        count: count_mode,
+        file_type,
+        glob,
         // -n/-r/-R/-H: accepted for grep muscle-memory parity, all no-ops here
         // (line numbers, recursion, and filenames are already the default).
-        line_number: _, recursive: _, with_filename: _,
+        line_number: _,
+        recursive: _,
+        with_filename: _,
     } = args;
-    let context_requested = context.is_some() || after_context.is_some() || before_context.is_some();
+    let context_requested =
+        context.is_some() || after_context.is_some() || before_context.is_some();
     // clap accepts an empty-string positional (e.g. an unset shell var expanding
     // to ""); preserve the non-empty guard + Usage string. Usage error → exit 2.
     if pattern.is_empty() {
@@ -2384,7 +2728,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         grep_exit(2);
     }
 
-    let root_canonical = project_root.canonicalize().unwrap_or(project_root.to_path_buf());
+    let root_canonical = project_root
+        .canonicalize()
+        .unwrap_or(project_root.to_path_buf());
     // Relative search paths resolve against the caller's cwd (like ripgrep/grep),
     // so `grep foo parser` from `src/` searches `src/parser`. Hooks and agents
     // spawn the binary with cwd==root, where `cwd.join` equals the historical
@@ -2397,12 +2743,35 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     let mut search_rels: Vec<String> = Vec::new();
     for path in &paths {
         let resolved = cwd.join(path);
-        let canonical = resolved.canonicalize().unwrap_or(resolved);
+        let canonical = match resolved.canonicalize() {
+            Ok(c) => c,
+            // Near-miss rebase (field failure 2026-07-24): the agent's shell often
+            // sits in a subdir while it quotes repo-root-relative paths (the deny
+            // hook displays them root-relative), so cwd.join doubles the prefix —
+            // rg got `<root>/<sub>/<sub>/…` and exited 2 with a cryptic "No such
+            // file". cwd-missing + root-existing is unambiguous: take the root
+            // reading and say so on stderr. Paths that exist under cwd never reach
+            // this arm, so grep's cwd-relative parity is untouched; the rebased
+            // path still passes the starts_with(root) traversal guard below.
+            // `.`, `./x` and `../x` are explicitly cwd-anchored and never rebase
+            // (same rule as normalize_user_path_from) — they fall through to the
+            // rg "No such file" error, matching what rg itself would say.
+            Err(_) => match root_canonical.join(path).canonicalize() {
+                Ok(c) if Path::new(path).is_relative() && !is_cwd_anchored(path) => {
+                    note_root_rebase(path, &root_canonical);
+                    c
+                }
+                _ => resolved,
+            },
+        };
         if !canonical.starts_with(&root_canonical) {
             if json_mode {
                 println!("[]");
             }
-            eprintln!("[code-graph] search path must be within project root: {}", path);
+            eprintln!(
+                "[code-graph] search path must be within project root: {}",
+                path
+            );
             grep_exit(2);
         }
         if let Ok(rel) = canonical.strip_prefix(&root_canonical) {
@@ -2500,7 +2869,11 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         } else {
             let mut b = ignore::overrides::OverrideBuilder::new(project_root);
             let ok = glob.iter().all(|g| b.add(g).is_ok());
-            if ok { b.build().ok() } else { None }
+            if ok {
+                b.build().ok()
+            } else {
+                None
+            }
         };
         supplement.retain(|rel| {
             let p = Path::new(rel);
@@ -2520,7 +2893,8 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     if supplement.len() > SUPPLEMENT_CAP {
         eprintln!(
             "[code-graph] {} tracked files outside the rg walk; searching the first {} only",
-            supplement.len(), SUPPLEMENT_CAP
+            supplement.len(),
+            SUPPLEMENT_CAP
         );
         supplement.truncate(SUPPLEMENT_CAP);
     }
@@ -2563,13 +2937,21 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             }
             eprintln!(
                 "[code-graph] ripgrep error: {}",
-                if stderr.is_empty() { "invalid pattern or unreadable path" } else { stderr }
+                if stderr.is_empty() {
+                    "invalid pattern or unreadable path"
+                } else {
+                    stderr
+                }
             );
             grep_exit(2);
         }
         eprintln!(
             "[code-graph] ripgrep error (results below cover the remaining paths): {}",
-            if stderr.is_empty() { "unreadable path" } else { stderr }
+            if stderr.is_empty() {
+                "unreadable path"
+            } else {
+                stderr
+            }
         );
         partial_error = true;
     }
@@ -2594,8 +2976,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         let write_result: std::io::Result<()> = (|| {
             let mut stdout = std::io::stdout().lock();
             if json_mode {
-                let serialized = serde_json::to_string(&files)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let serialized = serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string());
                 writeln!(stdout, "{}", serialized)?;
             } else {
                 for f in &files {
@@ -2623,7 +3004,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             .filter(|l| !l.is_empty())
             .filter_map(|l| {
                 let (path, n) = l.rsplit_once(':')?;
-                Some((relativize_path(path, &root_str).to_string(), n.trim().parse().ok()?))
+                Some((
+                    relativize_path(path, &root_str).to_string(),
+                    n.trim().parse().ok()?,
+                ))
             })
             .collect();
         // GNU parity: every explicitly named FILE arg gets a count row, zero
@@ -2638,8 +3022,8 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             }
         }
         counts.sort_by(|a, b| a.0.cmp(&b.0)); // global ascending-path order
-        // Overlapping/repeated path args make rg emit a file's `path:N` line once
-        // per instance (identical count each); keep a single row per file.
+                                              // Overlapping/repeated path args make rg emit a file's `path:N` line once
+                                              // per instance (identical count each); keep a single row per file.
         counts.dedup_by(|a, b| a.0 == b.0);
         if counts.is_empty() {
             if json_mode {
@@ -2764,7 +3148,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     let mut stale_count = 0usize;
     let mut node_cache: std::collections::HashMap<String, (Vec<queries::NodeResult>, bool)> =
         std::collections::HashMap::new();
-    let mut lookup_container = |file: &str, line: u64| -> Option<(String, String, i64, i64, bool)> {
+    let mut lookup_container = |file: &str,
+                                line: u64|
+     -> Option<(String, String, i64, i64, bool)> {
         let ctx = ctx.as_ref()?;
         if !node_cache.contains_key(file) {
             let mut stale = false;
@@ -2774,7 +3160,11 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             let stored: Option<String> = ctx
                 .db
                 .conn()
-                .query_row("SELECT blake3_hash FROM files WHERE path = ?1", [file], |r| r.get(0))
+                .query_row(
+                    "SELECT blake3_hash FROM files WHERE path = ?1",
+                    [file],
+                    |r| r.get(0),
+                )
                 .ok();
             if let Some(stored_hash) = stored {
                 let abs = ctx.project_root.join(file);
@@ -2782,7 +3172,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                 if disk.as_deref() != Some(stored_hash.as_str()) {
                     if synced < sync_budget {
                         match crate::indexer::pipeline::ensure_file_indexed(
-                            &ctx.db, &ctx.project_root, file, None,
+                            &ctx.db,
+                            &ctx.project_root,
+                            file,
+                            None,
                         ) {
                             Ok(changed) => {
                                 if changed {
@@ -2845,8 +3238,8 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                 }
                 json_results.push(entry);
             }
-            let serialized = serde_json::to_string(&json_results)
-                .unwrap_or_else(|_| "[]".to_string());
+            let serialized =
+                serde_json::to_string(&json_results).unwrap_or_else(|_| "[]".to_string());
             writeln!(stdout, "{}", serialized)?;
         } else {
             // grep formatting: matches `file:line`, context lines `file-line`,
@@ -2873,7 +3266,11 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                         lookup_container(&m.file, m.line)
                     {
                         let marker = if stale { " [stale]" } else { "" };
-                        writeln!(stdout, "  → {} {} (lines {}-{}){}", node_type, name, start, end, marker)?;
+                        writeln!(
+                            stdout,
+                            "  → {} {} (lines {}-{}){}",
+                            node_type, name, start, end, marker
+                        )?;
                     }
                 }
             }
@@ -3009,11 +3406,7 @@ fn find_containing_node_in(
             "function" | "method" => "fn",
             other => other,
         };
-        let name = n
-            .qualified_name
-            .as_deref()
-            .unwrap_or(&n.name)
-            .to_string();
+        let name = n.qualified_name.as_deref().unwrap_or(&n.name).to_string();
         (short_type.to_string(), name, n.start_line, n.end_line)
     })
 }
@@ -3022,8 +3415,10 @@ fn find_containing_node_in(
 
 /// CLI arguments for the `search` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp search",
-          about = "FTS5 text search by concept (CLI is FTS-only; MCP adds vector+RRF fusion)")]
+#[command(
+    name = "code-graph-mcp search",
+    about = "FTS5 text search by concept (CLI is FTS-only; MCP adds vector+RRF fusion)"
+)]
 pub struct SearchArgs {
     /// Search query (concept keywords)
     pub query: String,
@@ -3104,18 +3499,21 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
     let fetch_limit = crate::domain::search_fetch_count(limit, filtered);
     // FTS5 + file join, wrapped so a query-time freshness resync can re-run it
     // against the refreshed index (parity with show/refs/… via refresh_files_if_stale).
-    let run_query = |conn: &rusqlite::Connection|
-        -> Result<(queries::FtsResult, Vec<queries::NodeWithFile>)> {
-        let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
-        let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
-        let nodes_with_files = queries::get_nodes_with_files_by_ids(conn, &node_ids)?;
-        Ok((fts_result, nodes_with_files))
-    };
+    let run_query =
+        |conn: &rusqlite::Connection| -> Result<(queries::FtsResult, Vec<queries::NodeWithFile>)> {
+            let fts_result = queries::fts5_search(conn, query, fetch_limit)?;
+            let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
+            let nodes_with_files = queries::get_nodes_with_files_by_ids(conn, &node_ids)?;
+            Ok((fts_result, nodes_with_files))
+        };
     let (mut fts_result, mut nodes_with_files) = run_query(conn)?;
     // Re-index any matched file edited since indexing so start_line/end_line are
     // post-edit, then re-run once. Bounded by the fetched pool (fetch_limit), not
     // the whole index.
-    let files: Vec<String> = nodes_with_files.iter().map(|nwf| nwf.file_path.clone()).collect();
+    let files: Vec<String> = nodes_with_files
+        .iter()
+        .map(|nwf| nwf.file_path.clone())
+        .collect();
     let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
     if outcome.any_changed {
         let (f, n) = run_query(conn)?;
@@ -3130,10 +3528,22 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
         }
         eprintln!("[code-graph] No results for: {}", query);
         // Hint: if query looks like code syntax, suggest ast-search
-        if query.contains('(') || query.contains(')') || query.contains("->") || query.contains("::") || query.contains('<') {
+        if query.contains('(')
+            || query.contains(')')
+            || query.contains("->")
+            || query.contains("::")
+            || query.contains('<')
+        {
             // Replace non-word chars with spaces, collapse multiple spaces, extract clean keywords
-            let clean: String = query.chars()
-                .map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' })
+            let clean: String = query
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        ' '
+                    }
+                })
                 .collect();
             let keywords: Vec<&str> = clean.split_whitespace().collect();
             if !keywords.is_empty() {
@@ -3164,14 +3574,23 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
         // Skip <module>/<external> placeholders and test symbols, consistent with
         // MCP semantic_code_search (domain::is_skippable_result = the shared triad;
         // the CLI path previously omitted the <external> leg the MCP path applied).
-        let fp = nwf_map.get(&n.id).map(|nwf| nwf.file_path.as_str()).unwrap_or("");
-        if crate::domain::is_skippable_result(&n.node_type, &n.name, fp) { continue; }
+        let fp = nwf_map
+            .get(&n.id)
+            .map(|nwf| nwf.file_path.as_str())
+            .unwrap_or("");
+        if crate::domain::is_skippable_result(&n.node_type, &n.name, fp) {
+            continue;
+        }
         if let Some(lang) = language_filter {
-            let lang_ok = nwf_map.get(&n.id)
+            let lang_ok = nwf_map
+                .get(&n.id)
                 .and_then(|nwf| nwf.language.as_deref())
                 .map(|l| l.eq_ignore_ascii_case(lang))
                 .unwrap_or(false);
-            if !lang_ok { dropped_by_filter += 1; continue; }
+            if !lang_ok {
+                dropped_by_filter += 1;
+                continue;
+            }
         }
         if !normalized_node_types.is_empty()
             && !normalized_node_types.iter().any(|t| n.node_type == *t)
@@ -3180,7 +3599,9 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
             continue;
         }
         filtered_nodes.push(n);
-        if filtered_nodes.len() >= limit as usize { break; }
+        if filtered_nodes.len() >= limit as usize {
+            break;
+        }
     }
 
     if filtered_nodes.is_empty() {
@@ -3194,15 +3615,20 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
             let filter_desc = format!(
                 "language: {}{}",
                 language_filter.unwrap_or("any"),
-                node_type_filter.map(|t| format!(", node-type: {t}")).unwrap_or_default()
+                node_type_filter
+                    .map(|t| format!(", node-type: {t}"))
+                    .unwrap_or_default()
             );
             if json_mode {
-                println!("{}", serde_json::json!({
-                    "results": [],
-                    "query": query,
-                    "filtered_out": dropped_by_filter,
-                    "filter": filter_desc,
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "results": [],
+                        "query": query,
+                        "filtered_out": dropped_by_filter,
+                        "filter": filter_desc,
+                    })
+                );
             } else {
                 println!(
                     "[code-graph] No results for: {} — {} candidate(s) matched but were removed by the active filter ({}). Broaden or clear the filter.",
@@ -3217,7 +3643,11 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
             if json_mode {
                 println!("[]");
             }
-            eprintln!("[code-graph] No results for: {} (language: {})", query, language_filter.unwrap_or("any"));
+            eprintln!(
+                "[code-graph] No results for: {} (language: {})",
+                query,
+                language_filter.unwrap_or("any")
+            );
         }
         return Ok(());
     }
@@ -3256,7 +3686,11 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
         let fp = file_map.get(&node.id).copied().unwrap_or("?");
         if compact {
             let name = node.qualified_name.as_deref().unwrap_or(&node.name);
-            writeln!(stdout, "{}  {}:{}-{}", name, fp, node.start_line, node.end_line)?;
+            writeln!(
+                stdout,
+                "{}  {}:{}-{}",
+                name, fp, node.start_line, node.end_line
+            )?;
         } else {
             writeln!(stdout, "{}", format_node_compact(node, fp))?;
         }
@@ -3276,8 +3710,10 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
 
 /// CLI arguments for the `ast-search` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp ast-search",
-          about = "Structured search with --type/--returns/--params filters")]
+#[command(
+    name = "code-graph-mcp ast-search",
+    about = "Structured search with --type/--returns/--params filters"
+)]
 pub struct AstSearchArgs {
     /// Search query (optional if a --type/--returns/--params filter is given)
     pub query: Option<String>,
@@ -3344,88 +3780,107 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
     // disclose "candidates existed" in-band instead of a bare empty envelope
     // (disclosure-gap class, roadmap 2026-07-18 §1.1). Skippable-triad drops are
     // deliberately NOT counted: they are internal hygiene, not a user filter.
-    let run_query = |conn: &rusqlite::Connection|
-        -> Result<(Vec<queries::NodeWithFile>, bool, usize)> {
-    let mut dropped_by_filter = 0usize;
-    let results_with_files: Vec<queries::NodeWithFile> = if let Some(query) = query {
-        // FTS5 search then filter in Rust
-        let fts_result = queries::fts5_search(conn, query, (limit * 4) as i64)?;
-        if fts_result.nodes.is_empty() {
-            return Ok((Vec::new(), true, 0));
-        }
-
-        let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
-        let all = queries::get_nodes_with_files_by_ids(conn, &node_ids)?;
-
-        // Preserve FTS5 rank order, then apply filters
-        let id_order: std::collections::HashMap<i64, usize> = node_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-        let mut sorted = all;
-        sorted.sort_by_key(|nwf| id_order.get(&nwf.node.id).copied().unwrap_or(usize::MAX));
-
-        sorted
-            .into_iter()
-            .filter(|nwf| {
-                let n = &nwf.node;
-                // Skip <module>/<external> placeholders and test symbols, consistent
-                // with `search`/`similar` (domain::is_skippable_result). ast-search
-                // previously leaked these into structural results — an `<external>:0-0`
-                // stub and `<module>` file nodes alongside real symbols.
-                if crate::domain::is_skippable_result(&n.node_type, &n.name, &nwf.file_path) {
-                    return false;
+    let run_query =
+        |conn: &rusqlite::Connection| -> Result<(Vec<queries::NodeWithFile>, bool, usize)> {
+            let mut dropped_by_filter = 0usize;
+            let results_with_files: Vec<queries::NodeWithFile> = if let Some(query) = query {
+                // FTS5 search then filter in Rust
+                let fts_result = queries::fts5_search(conn, query, (limit * 4) as i64)?;
+                if fts_result.nodes.is_empty() {
+                    return Ok((Vec::new(), true, 0));
                 }
-                if let Some(tf) = type_filter {
-                    let normalized = normalize_type_filter(tf);
-                    if !normalized.iter().any(|t| n.node_type == *t) {
-                        dropped_by_filter += 1;
-                        return false;
-                    }
-                }
-                if let Some(rf) = returns_filter {
-                    match &n.return_type {
-                        Some(rt) => {
-                            if !rt.to_lowercase().contains(&rf.to_lowercase()) {
+
+                let node_ids: Vec<i64> = fts_result.nodes.iter().map(|n| n.id).collect();
+                let all = queries::get_nodes_with_files_by_ids(conn, &node_ids)?;
+
+                // Preserve FTS5 rank order, then apply filters
+                let id_order: std::collections::HashMap<i64, usize> = node_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| (*id, i))
+                    .collect();
+                let mut sorted = all;
+                sorted.sort_by_key(|nwf| id_order.get(&nwf.node.id).copied().unwrap_or(usize::MAX));
+
+                sorted
+                    .into_iter()
+                    .filter(|nwf| {
+                        let n = &nwf.node;
+                        // Skip <module>/<external> placeholders and test symbols, consistent
+                        // with `search`/`similar` (domain::is_skippable_result). ast-search
+                        // previously leaked these into structural results — an `<external>:0-0`
+                        // stub and `<module>` file nodes alongside real symbols.
+                        if crate::domain::is_skippable_result(&n.node_type, &n.name, &nwf.file_path)
+                        {
+                            return false;
+                        }
+                        if let Some(tf) = type_filter {
+                            let normalized = normalize_type_filter(tf);
+                            if !normalized.iter().any(|t| n.node_type == *t) {
                                 dropped_by_filter += 1;
                                 return false;
                             }
                         }
-                        None => { dropped_by_filter += 1; return false; }
-                    }
-                }
-                if let Some(pf) = params_filter {
-                    match &n.param_types {
-                        Some(pt) => {
-                            if !pt.to_lowercase().contains(&pf.to_lowercase()) {
-                                dropped_by_filter += 1;
-                                return false;
+                        if let Some(rf) = returns_filter {
+                            match &n.return_type {
+                                Some(rt) => {
+                                    if !rt.to_lowercase().contains(&rf.to_lowercase()) {
+                                        dropped_by_filter += 1;
+                                        return false;
+                                    }
+                                }
+                                None => {
+                                    dropped_by_filter += 1;
+                                    return false;
+                                }
                             }
                         }
-                        None => { dropped_by_filter += 1; return false; }
-                    }
-                }
-                true
-            })
-            .take(limit)
-            .collect()
-    } else {
-        // Filter-only: direct SQL query
-        let normalized_types: Vec<&str>;
-        let type_refs = if let Some(tf) = type_filter {
-            normalized_types = normalize_type_filter(tf).into_iter().collect();
-            Some(normalized_types.as_slice())
-        } else {
-            None
+                        if let Some(pf) = params_filter {
+                            match &n.param_types {
+                                Some(pt) => {
+                                    if !pt.to_lowercase().contains(&pf.to_lowercase()) {
+                                        dropped_by_filter += 1;
+                                        return false;
+                                    }
+                                }
+                                None => {
+                                    dropped_by_filter += 1;
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    })
+                    .take(limit)
+                    .collect()
+            } else {
+                // Filter-only: direct SQL query
+                let normalized_types: Vec<&str>;
+                let type_refs = if let Some(tf) = type_filter {
+                    normalized_types = normalize_type_filter(tf).into_iter().collect();
+                    Some(normalized_types.as_slice())
+                } else {
+                    None
+                };
+                queries::get_nodes_with_files_by_filters(
+                    conn,
+                    type_refs,
+                    returns_filter,
+                    params_filter,
+                    None,
+                    limit,
+                )?
+            };
+            Ok((results_with_files, false, dropped_by_filter))
         };
-        queries::get_nodes_with_files_by_filters(
-            conn, type_refs, returns_filter, params_filter, None, limit,
-        )?
-    };
-    Ok((results_with_files, false, dropped_by_filter))
-    };
 
     let (mut results_with_files, mut fts_empty, mut dropped_by_filter) = run_query(conn)?;
     // Re-index any displayed file edited since indexing so start_line/end_line are
     // post-edit, then re-run once (shared resync with show/refs/…).
-    let files: Vec<String> = results_with_files.iter().map(|nwf| nwf.file_path.clone()).collect();
+    let files: Vec<String> = results_with_files
+        .iter()
+        .map(|nwf| nwf.file_path.clone())
+        .collect();
     let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
     if outcome.any_changed {
         let (r, e, d) = run_query(conn)?;
@@ -3459,12 +3914,15 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
             if json_mode {
-                println!("{}", serde_json::json!({
-                    "results": [],
-                    "count": 0,
-                    "filtered_out": dropped_by_filter,
-                    "filter": filter_desc,
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "results": [],
+                        "count": 0,
+                        "filtered_out": dropped_by_filter,
+                        "filter": filter_desc,
+                    })
+                );
             } else {
                 println!(
                     "[code-graph] No results — {} candidate(s) matched the query but were removed by the active filter ({}). Broaden or clear the filter.",
@@ -3535,8 +3993,10 @@ fn normalize_type_filter(input: &str) -> Vec<&'static str> {
 
 /// CLI arguments for the `callgraph` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp callgraph",
-          about = "Show call graph (callers/callees)")]
+#[command(
+    name = "code-graph-mcp callgraph",
+    about = "Show call graph (callers/callees)"
+)]
 pub struct CallgraphArgs {
     /// Symbol name to analyze
     pub symbol: String,
@@ -3626,7 +4086,14 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         }
     }
 
-    let mut result = crate::graph::query::get_call_graph_filtered(conn, symbol, direction, depth, file_filter, min_conf_rank)?;
+    let mut result = crate::graph::query::get_call_graph_filtered(
+        conn,
+        symbol,
+        direction,
+        depth,
+        file_filter,
+        min_conf_rank,
+    )?;
     // Fuzzy auto-resolve: if exact-name lookup returned nothing (or only the seed
     // node with no edges) and no --file was specified, promote a unique fuzzy
     // match. Matches MCP get_call_graph behavior.
@@ -3637,26 +4104,49 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         match resolve_fuzzy_name_cli(conn, symbol)? {
             CliFuzzyResolution::Unique(resolved) => {
                 if resolved != symbol {
-                    result = crate::graph::query::get_call_graph_filtered(conn, &resolved, direction, depth, file_filter, min_conf_rank)?;
+                    result = crate::graph::query::get_call_graph_filtered(
+                        conn,
+                        &resolved,
+                        direction,
+                        depth,
+                        file_filter,
+                        min_conf_rank,
+                    )?;
                     eprintln!("[code-graph] Resolved '{}' → '{}'", symbol, resolved);
                 }
                 resolved_symbol = resolved;
             }
             CliFuzzyResolution::Ambiguous(cands) => {
                 if json_mode {
-                    let sugg: Vec<serde_json::Value> = cands.iter().take(5).map(|c| serde_json::json!({
-                        "name": c.name, "file_path": c.file_path, "type": c.node_type,
-                        "node_id": c.node_id, "start_line": c.start_line,
-                    })).collect();
-                    println!("{}", serde_json::json!({
-                        "results": [],
-                        "error": format!("Ambiguous symbol '{}': {} matches", symbol, cands.len()),
-                        "candidates": sugg,
-                    }));
+                    let sugg: Vec<serde_json::Value> = cands
+                        .iter()
+                        .take(5)
+                        .map(|c| {
+                            serde_json::json!({
+                                "name": c.name, "file_path": c.file_path, "type": c.node_type,
+                                "node_id": c.node_id, "start_line": c.start_line,
+                            })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "results": [],
+                            "error": format!("Ambiguous symbol '{}': {} matches", symbol, cands.len()),
+                            "candidates": sugg,
+                        })
+                    );
                 } else {
-                    eprintln!("[code-graph] Ambiguous symbol '{}': {} matches. Did you mean:", symbol, cands.len());
+                    eprintln!(
+                        "[code-graph] Ambiguous symbol '{}': {} matches. Did you mean:",
+                        symbol,
+                        cands.len()
+                    );
                     for c in cands.iter().take(5) {
-                        eprintln!("  {} ({}) in {} [node_id {}]", c.name, c.node_type, c.file_path, c.node_id);
+                        eprintln!(
+                            "  {} ({}) in {} [node_id {}]",
+                            c.name, c.node_type, c.file_path, c.node_id
+                        );
                     }
                 }
                 std::process::exit(1);
@@ -3675,11 +4165,14 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             // a bare `{"results":[]}` under `2>/dev/null` is indistinguishable
             // from a legitimately edge-less symbol. Same shape as the ambiguous
             // branch above ({results, error, …}) and impact's error object.
-            println!("{}", serde_json::json!({
-                "results": [],
-                "error": format!("No call graph results for: {}", symbol),
-                "symbol": symbol,
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "results": [],
+                    "error": format!("No call graph results for: {}", symbol),
+                    "symbol": symbol,
+                })
+            );
         }
         eprintln!("[code-graph] No call graph results for: {}", symbol);
         std::process::exit(1);
@@ -3817,7 +4310,11 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     render_subtree(&mut stdout, &children, root_id, "callees", compact)?;
 
     if test_count > 0 {
-        writeln!(stdout, "  ({} test callers hidden, use --include-tests to show)", test_count)?;
+        writeln!(
+            stdout,
+            "  ({} test callers hidden, use --include-tests to show)",
+            test_count
+        )?;
     }
     if result.limit_hit {
         writeln!(
@@ -3848,8 +4345,10 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
 
 /// CLI arguments for the `impact` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp impact",
-          about = "Impact analysis (callers, routes, risk level)")]
+#[command(
+    name = "code-graph-mcp impact",
+    about = "Impact analysis (callers, routes, risk level)"
+)]
 pub struct ImpactArgs {
     /// Symbol name to analyze
     pub symbol: String,
@@ -3922,7 +4421,10 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let mut symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
     if symbol_nodes.is_empty() {
         if json_mode {
-            println!("{}", serde_json::json!({"error": "Symbol not found", "symbol": symbol}));
+            println!(
+                "{}",
+                serde_json::json!({"error": "Symbol not found", "symbol": symbol})
+            );
         }
         eprintln!("[code-graph] Symbol not found: {}", symbol);
         let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
@@ -3944,7 +4446,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
     }
 
-    let mut callers = crate::graph::routes::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
+    let mut callers = crate::graph::routes::get_callers_with_route_info(
+        conn,
+        symbol,
+        file_filter,
+        depth,
+        min_conf_rank,
+    )?;
     // Query-time freshness (shared resync with show/refs/… via refresh_files_if_stale):
     // re-index the symbol's own file(s) and its caller files so the blast radius
     // reflects disk (a caller added/removed since indexing). impact prints no line
@@ -3960,7 +4468,13 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
         let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
         if outcome.any_changed {
-            callers = crate::graph::routes::get_callers_with_route_info(conn, symbol, file_filter, depth, min_conf_rank)?;
+            callers = crate::graph::routes::get_callers_with_route_info(
+                conn,
+                symbol,
+                file_filter,
+                depth,
+                min_conf_rank,
+            )?;
             symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
         }
         outcome.disclose();
@@ -3971,10 +4485,19 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // caller's pruned callers) so a TRANSITIVE ambiguous caller of a
     // uniquely-named symbol is disclosed too. Surfaced (not silently dropped) so a
     // folded real caller never under-states risk; --min-confidence ambiguous counts them.
-    let caller_ids: Vec<i64> = callers.iter().filter(|c| c.depth > 0).map(|c| c.node_id).collect();
-    let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
-        conn, symbol, file_filter, crate::graph::query::Direction::Callers, min_conf_rank,
-    )? + crate::graph::query::count_suppressed_into(conn, &caller_ids, min_conf_rank)?;
+    let caller_ids: Vec<i64> = callers
+        .iter()
+        .filter(|c| c.depth > 0)
+        .map(|c| c.node_id)
+        .collect();
+    let ambiguous_callers_excluded =
+        crate::graph::query::count_suppressed_seed_edges(
+            conn,
+            symbol,
+            file_filter,
+            crate::graph::query::Direction::Callers,
+            min_conf_rank,
+        )? + crate::graph::query::count_suppressed_into(conn, &caller_ids, min_conf_rank)?;
 
     // Partition prod/test callers (deduped by name,file,depth), count routes/files,
     // and assess risk via the surface-shared classifier — the MCP impact tool runs
@@ -3997,7 +4520,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         use std::collections::HashSet;
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for n in &symbol_nodes {
-            for r in queries::get_incoming_references(conn, n.id, Some(crate::domain::REL_REFERENCES))? {
+            for r in
+                queries::get_incoming_references(conn, n.id, Some(crate::domain::REL_REFERENCES))?
+            {
                 if !crate::domain::is_test_symbol(&r.name, &r.file_path) {
                     seen.insert((r.name, r.file_path));
                 }
@@ -4083,7 +4608,11 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(route_str) {
                 let method = v["method"].as_str().unwrap_or("?");
                 let path = v["path"].as_str().unwrap_or("?");
-                writeln!(stdout, "  {} {} → {} ({})", method, path, r.name, r.file_path)?;
+                writeln!(
+                    stdout,
+                    "  {} {} → {} ({})",
+                    method, path, r.name, r.file_path
+                )?;
             } else {
                 writeln!(stdout, "  {} → {} ({})", route_str, r.name, r.file_path)?;
             }
@@ -4094,7 +4623,11 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         writeln!(stdout, "Callers:")?;
         for c in prod_callers {
             let indent = "  ".repeat(c.depth as usize);
-            writeln!(stdout, "{}{}  ({}) {}", indent, c.name, c.node_type, c.file_path)?;
+            writeln!(
+                stdout,
+                "{}{}  ({}) {}",
+                indent, c.name, c.node_type, c.file_path
+            )?;
         }
     }
 
@@ -4104,8 +4637,10 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
 // --- affected subcommand ---
 
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp affected",
-          about = "Changed files → test files to re-run (+ full blast radius)")]
+#[command(
+    name = "code-graph-mcp affected",
+    about = "Changed files → test files to re-run (+ full blast radius)"
+)]
 pub struct AffectedArgs {
     /// Changed file paths (relative to project root, or absolute under it)
     pub files: Vec<String>,
@@ -4172,7 +4707,9 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
         let norm = match normalize_user_path(project_root, r) {
             Ok(p) => p,
             Err(_) => {
-                if !not_indexed.contains(r) { not_indexed.push(r.clone()); }
+                if !not_indexed.contains(r) {
+                    not_indexed.push(r.clone());
+                }
                 continue;
             }
         };
@@ -4180,7 +4717,9 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
             continue;
         }
         if !queries::file_is_indexed(conn, &norm)? {
-            if !not_indexed.contains(r) { not_indexed.push(r.clone()); }
+            if !not_indexed.contains(r) {
+                not_indexed.push(r.clone());
+            }
             continue;
         }
         if seen_changed.insert(norm.clone()) {
@@ -4204,7 +4743,11 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
             }
             affected
                 .entry(dep_path)
-                .and_modify(|d| if dep_depth < *d { *d = dep_depth })
+                .and_modify(|d| {
+                    if dep_depth < *d {
+                        *d = dep_depth
+                    }
+                })
                 .or_insert(dep_depth);
         }
     }
@@ -4227,9 +4770,14 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     // 5. Emit (same-shape JSON on every path — empty included).
     let mut stdout = std::io::stdout().lock();
     if args.json {
-        let affected_files: Vec<_> = affected.iter().map(|(p, d)| serde_json::json!({
-            "path": p, "depth": d, "is_test": crate::domain::is_test_path(p),
-        })).collect();
+        let affected_files: Vec<_> = affected
+            .iter()
+            .map(|(p, d)| {
+                serde_json::json!({
+                    "path": p, "depth": d, "is_test": crate::domain::is_test_path(p),
+                })
+            })
+            .collect();
         let result = serde_json::json!({
             "changed": changed,
             "tests": tests,
@@ -4240,18 +4788,31 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
         return Ok(());
     }
 
-    writeln!(stdout, "Affected by {} changed file(s) — {} test file(s) to re-run:",
-        changed.len(), tests.len())?;
+    writeln!(
+        stdout,
+        "Affected by {} changed file(s) — {} test file(s) to re-run:",
+        changed.len(),
+        tests.len()
+    )?;
     for t in &tests {
         writeln!(stdout, "  {}", t)?;
     }
-    writeln!(stdout, "Full blast radius: {} file(s) (depth <= {})", affected.len(), depth)?;
+    writeln!(
+        stdout,
+        "Full blast radius: {} file(s) (depth <= {})",
+        affected.len(),
+        depth
+    )?;
     for (p, d) in &affected {
         writeln!(stdout, "  {} (depth {})", p, d)?;
     }
     if !not_indexed.is_empty() {
-        writeln!(stdout, "{} input file(s) not in index: {}",
-            not_indexed.len(), not_indexed.join(", "))?;
+        writeln!(
+            stdout,
+            "{} input file(s) not in index: {}",
+            not_indexed.len(),
+            not_indexed.join(", ")
+        )?;
     }
     Ok(())
 }
@@ -4260,8 +4821,10 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
 
 /// CLI arguments for the `map` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp map",
-          about = "Project architecture map (modules, deps, entry points)")]
+#[command(
+    name = "code-graph-mcp map",
+    about = "Project architecture map (modules, deps, entry points)"
+)]
 pub struct MapArgs {
     /// JSON output
     #[arg(long)]
@@ -4294,18 +4857,22 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
         // cap (top-10) match MCP `project_map`. CLI default returns top-15
         // (the DB LIMIT in get_project_map).
         let hot_cap = if compact { 10 } else { hot_functions.len() };
-        let hot_json: Vec<serde_json::Value> = hot_functions.iter().take(hot_cap).map(|h| {
-            let mut obj = serde_json::json!({
-                "name": h.name,
-                "type": h.node_type,
-                "file": h.file,
-                "caller_count": h.caller_count,
-            });
-            if h.test_caller_count > 0 {
-                obj["test_caller_count"] = serde_json::json!(h.test_caller_count);
-            }
-            obj
-        }).collect();
+        let hot_json: Vec<serde_json::Value> = hot_functions
+            .iter()
+            .take(hot_cap)
+            .map(|h| {
+                let mut obj = serde_json::json!({
+                    "name": h.name,
+                    "type": h.node_type,
+                    "file": h.file,
+                    "caller_count": h.caller_count,
+                });
+                if h.test_caller_count > 0 {
+                    obj["test_caller_count"] = serde_json::json!(h.test_caller_count);
+                }
+                obj
+            })
+            .collect();
 
         let result = serde_json::json!({
             "modules": modules.iter().map(|m| serde_json::json!({
@@ -4357,7 +4924,9 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
         write!(
             stdout,
             "{} ({}, {}",
-            m.path, plural(m.files as i64, "file"), plural(total_symbols as i64, "symbol")
+            m.path,
+            plural(m.files as i64, "file"),
+            plural(total_symbols as i64, "symbol")
         )?;
         if !m.languages.is_empty() {
             write!(stdout, ", {}", m.languages.join("/"))?;
@@ -4368,7 +4937,11 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
         }
     }
     if compact && modules.len() > max_modules {
-        writeln!(stdout, "  ... and {} more modules", modules.len() - max_modules)?;
+        writeln!(
+            stdout,
+            "  ... and {} more modules",
+            modules.len() - max_modules
+        )?;
     }
 
     // Dependencies (compact: top 10)
@@ -4377,12 +4950,20 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
         writeln!(stdout, "Dependencies:")?;
         let max_deps = if compact { 10 } else { deps.len().min(30) };
         for d in deps.iter().take(max_deps) {
-            writeln!(stdout, "  {} → {} ({} imports)", d.from, d.to, d.import_count)?;
+            writeln!(
+                stdout,
+                "  {} → {} ({} imports)",
+                d.from, d.to, d.import_count
+            )?;
         }
         // Truncation marker (roadmap 2026-07-18 §1.7): the silent .min(30) cap
         // read as "that's every dependency" — same pattern as the modules cap.
         if deps.len() > max_deps {
-            writeln!(stdout, "  ... and {} more dependencies", deps.len() - max_deps)?;
+            writeln!(
+                stdout,
+                "  ... and {} more dependencies",
+                deps.len() - max_deps
+            )?;
         }
     }
 
@@ -4407,7 +4988,11 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
             }
         }
         if hot_functions.len() > max_hot {
-            writeln!(stdout, "  ... and {} more hot functions", hot_functions.len() - max_hot)?;
+            writeln!(
+                stdout,
+                "  ... and {} more hot functions",
+                hot_functions.len() - max_hot
+            )?;
         }
     }
 
@@ -4418,8 +5003,10 @@ pub fn cmd_map(project_root: &Path, args: MapArgs) -> Result<()> {
 
 /// CLI arguments for the `tour` subcommand.
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp tour",
-          about = "Dependency-ordered reading order: where to start reading a repo (or subtree)")]
+#[command(
+    name = "code-graph-mcp tour",
+    about = "Dependency-ordered reading order: where to start reading a repo (or subtree)"
+)]
 pub struct TourArgs {
     /// Optional path prefix to scope the tour to a subtree (omit = whole project;
     /// absolute paths under the project root are accepted)
@@ -4470,14 +5057,19 @@ pub fn cmd_tour(project_root: &Path, args: TourArgs) -> Result<()> {
 
     if json_mode {
         // Object envelope (cli_json_empty contract: same shape on the empty path).
-        let arr: Vec<serde_json::Value> = order.iter().map(|e| serde_json::json!({
-            "path": e.path,
-            "role": e.role.as_str(),
-            "depended_on_by": e.depended_on_by,
-            "depends_on": e.depends_on,
-            "key_symbols": e.key_symbols,
-            "in_cycle": e.in_cycle,
-        })).collect();
+        let arr: Vec<serde_json::Value> = order
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "path": e.path,
+                    "role": e.role.as_str(),
+                    "depended_on_by": e.depended_on_by,
+                    "depends_on": e.depends_on,
+                    "key_symbols": e.key_symbols,
+                    "in_cycle": e.in_cycle,
+                })
+            })
+            .collect();
         let result = serde_json::json!({ "reading_order": arr });
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
@@ -4493,10 +5085,18 @@ pub fn cmd_tour(project_root: &Path, args: TourArgs) -> Result<()> {
 
     let cycles = order.iter().filter(|e| e.in_cycle).count();
     if cycles > 0 {
-        writeln!(stdout, "Reading order (foundational → entry; {} modules, {} via cycle-break):",
-            order.len(), cycles)?;
+        writeln!(
+            stdout,
+            "Reading order (foundational → entry; {} modules, {} via cycle-break):",
+            order.len(),
+            cycles
+        )?;
     } else {
-        writeln!(stdout, "Reading order (foundational → entry; {} modules):", order.len())?;
+        writeln!(
+            stdout,
+            "Reading order (foundational → entry; {} modules):",
+            order.len()
+        )?;
     }
     for (i, e) in order.iter().enumerate() {
         let mut annot: Vec<String> = vec![format!("[{}]", e.role.as_str())];
@@ -4507,14 +5107,30 @@ pub fn cmd_tour(project_root: &Path, args: TourArgs) -> Result<()> {
             annot.push(format!("depended-on-by {}", e.depended_on_by));
         }
         if !e.depends_on.is_empty() {
-            let shown = e.depends_on.iter().take(3).cloned().collect::<Vec<_>>().join(",");
+            let shown = e
+                .depends_on
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",");
             let extra = e.depends_on.len().saturating_sub(3);
-            let suffix = if extra > 0 { format!("+{}", extra) } else { String::new() };
+            let suffix = if extra > 0 {
+                format!("+{}", extra)
+            } else {
+                String::new()
+            };
             annot.push(format!("imports {}{}", shown, suffix));
         }
         write!(stdout, "  {:>2}. {}  {}", i + 1, e.path, annot.join(" · "))?;
         if !e.key_symbols.is_empty() {
-            let syms = e.key_symbols.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+            let syms = e
+                .key_symbols
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
             write!(stdout, "  — {}", syms)?;
         }
         writeln!(stdout)?;
@@ -4527,8 +5143,10 @@ pub fn cmd_tour(project_root: &Path, args: TourArgs) -> Result<()> {
 
 /// CLI arguments for the `overview` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp overview",
-          about = "Module overview (symbols grouped by file and type)")]
+#[command(
+    name = "code-graph-mcp overview",
+    about = "Module overview (symbols grouped by file and type)"
+)]
 pub struct OverviewArgs {
     /// Path prefix to scan ('.' = whole project; absolute paths under root OK)
     pub path: String,
@@ -4590,9 +5208,12 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
         if json_mode {
             // In-band error object (roadmap 2026-07-18 §1.3): a bare `[]` under
             // `2>/dev/null` is indistinguishable from an empty-but-indexed dir.
-            println!("{}", serde_json::json!({
-                "error": "No symbols found", "path": raw_path,
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "No symbols found", "path": raw_path,
+                })
+            );
             eprintln!("[code-graph] No symbols found under: {}", raw_path);
             std::process::exit(1);
         }
@@ -4648,8 +5269,15 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
                 String::new()
             };
             if compact {
-                writeln!(stdout, "  L{}-{}  {}  {}{}",
-                    s.start_line, s.end_line, s.node_type, s.display_name(), callers)?;
+                writeln!(
+                    stdout,
+                    "  L{}-{}  {}  {}{}",
+                    s.start_line,
+                    s.end_line,
+                    s.node_type,
+                    s.display_name(),
+                    callers
+                )?;
             } else {
                 let sig = s.signature.as_deref().unwrap_or("");
                 let sig_display = if sig.is_empty() {
@@ -4657,8 +5285,16 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
                 } else {
                     format!("  {}", sig.lines().next().unwrap_or("").trim())
                 };
-                writeln!(stdout, "  L{}-{}  {}  {}{}{}",
-                    s.start_line, s.end_line, s.node_type, s.display_name(), callers, sig_display)?;
+                writeln!(
+                    stdout,
+                    "  L{}-{}  {}  {}{}{}",
+                    s.start_line,
+                    s.end_line,
+                    s.node_type,
+                    s.display_name(),
+                    callers,
+                    sig_display
+                )?;
             }
         }
         return Ok(());
@@ -4696,8 +5332,10 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
 
 /// CLI arguments for the `show` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp show",
-          about = "Show symbol details (code, type, signature)")]
+#[command(
+    name = "code-graph-mcp show",
+    about = "Show symbol details (code, type, signature)"
+)]
 pub struct ShowArgs {
     /// Symbol name (required unless --node-id is given)
     pub symbol: Option<String>,
@@ -4818,7 +5456,9 @@ fn refresh_files_if_stale(db: &Database, root: &Path, paths: &[String]) -> Fresh
         // indexing a brand-new path here could pull gitignored supplement files
         // into the index, diverging from scan_directory's scope.
         let stored: Option<String> = conn
-            .query_row("SELECT blake3_hash FROM files WHERE path = ?1", [f], |r| r.get(0))
+            .query_row("SELECT blake3_hash FROM files WHERE path = ?1", [f], |r| {
+                r.get(0)
+            })
             .ok();
         let Some(stored_hash) = stored else { continue };
         let abs = root.join(f);
@@ -4885,10 +5525,12 @@ fn resolve_show_nodes(
         if found.is_empty() && symbol.contains('.') {
             if let Some(base_name) = symbol.rsplit('.').next() {
                 let by_name = queries::get_nodes_by_name(conn, base_name)?;
-                let any_qualified = by_name.iter()
+                let any_qualified = by_name
+                    .iter()
                     .any(|n| n.qualified_name.as_deref() == Some(symbol));
                 if any_qualified {
-                    found = by_name.into_iter()
+                    found = by_name
+                        .into_iter()
                         .filter(|n| n.qualified_name.as_deref() == Some(symbol))
                         .collect();
                 } else {
@@ -4914,8 +5556,8 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
     let context_lines_explicit: Option<usize> = args.context_lines;
     let node_id_arg: Option<i64> = args.node_id;
     // Default context_lines=3 when using --node-id (align with MCP behavior), 0 otherwise
-    let context_lines: usize = context_lines_explicit
-        .unwrap_or(if node_id_arg.is_some() { 3 } else { 0 });
+    let context_lines: usize =
+        context_lines_explicit.unwrap_or(if node_id_arg.is_some() { 3 } else { 0 });
 
     // If positional arg points at a real file on disk (has a recognized code
     // extension), nudge the user toward `overview` — `show` takes symbol names.
@@ -4933,9 +5575,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                     "            File-level symbols: code-graph-mcp overview {}",
                     arg
                 );
-                eprintln!(
-                    "            Full file content:  Read the file directly."
-                );
+                eprintln!("            Full file content:  Read the file directly.");
                 std::process::exit(1);
             }
         }
@@ -4952,9 +5592,12 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 if json_mode {
                     // In-band error object (roadmap 2026-07-18 §1.3), matching
                     // impact's `{"error", "symbol"}` miss contract.
-                    println!("{}", serde_json::json!({
-                        "error": "Node ID not found", "node_id": nid,
-                    }));
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "error": "Node ID not found", "node_id": nid,
+                        })
+                    );
                 }
                 eprintln!("[code-graph] Node ID {} not found.", nid);
                 std::process::exit(1);
@@ -5000,12 +5643,21 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // the stderr-only "Did you mean" list was invisible under
                 // `--json 2>/dev/null`, so the miss read as "symbol absent".
                 // Shape matches impact's `{"error", "symbol"}` miss contract.
-                let sugg: Vec<serde_json::Value> = candidates.iter().take(5).map(|c| serde_json::json!({
-                    "name": c.name, "type": c.node_type, "file_path": c.file_path,
-                })).collect();
-                println!("{}", serde_json::json!({
-                    "error": "Symbol not found", "symbol": symbol, "candidates": sugg,
-                }));
+                let sugg: Vec<serde_json::Value> = candidates
+                    .iter()
+                    .take(5)
+                    .map(|c| {
+                        serde_json::json!({
+                            "name": c.name, "type": c.node_type, "file_path": c.file_path,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": "Symbol not found", "symbol": symbol, "candidates": sugg,
+                    })
+                );
             }
             eprintln!("[code-graph] Symbol not found: {}", symbol);
             if !candidates.is_empty() {
@@ -5017,11 +5669,16 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             std::process::exit(1);
         }
 
-        nodes.into_iter().map(|n| {
-            let fp = queries::get_file_path(conn, n.file_id)
-                .ok().flatten().unwrap_or_else(|| "?".to_string());
-            (n, fp)
-        }).collect()
+        nodes
+            .into_iter()
+            .map(|n| {
+                let fp = queries::get_file_path(conn, n.file_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "?".to_string());
+                (n, fp)
+            })
+            .collect()
     };
 
     let mut stdout = std::io::stdout().lock();
@@ -5100,7 +5757,13 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         writeln!(stdout, "{}", format_node_compact(node, fp))?;
         if !compact {
             if context_lines > 0 {
-                if let Some(code) = read_source_context(project_root, fp, node.start_line, node.end_line, context_lines) {
+                if let Some(code) = read_source_context(
+                    project_root,
+                    fp,
+                    node.start_line,
+                    node.end_line,
+                    context_lines,
+                ) {
                     for line in code.lines() {
                         writeln!(stdout, "  {}", line)?;
                     }
@@ -5118,8 +5781,10 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         if include_refs {
             use crate::domain::REL_CALLS;
             let include_tests = args.include_tests;
-            let callees = queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
-            let callers = queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
+            let callees =
+                queries::get_edge_targets_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
+            let callers =
+                queries::get_edge_sources_with_files(conn, node.id, REL_CALLS).unwrap_or_default();
             if !callees.is_empty() {
                 writeln!(stdout, "  Calls:")?;
                 for (name, file) in &callees {
@@ -5137,19 +5802,40 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                     }
                 }
                 if test_count > 0 {
-                    writeln!(stdout, "    ({} test callers hidden, use --include-tests to show)", test_count)?;
+                    writeln!(
+                        stdout,
+                        "    ({} test callers hidden, use --include-tests to show)",
+                        test_count
+                    )?;
                 }
             }
         }
         if include_impact {
-            let callers = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, 0).unwrap_or_default();
+            let callers = crate::graph::routes::get_callers_with_route_info(
+                conn,
+                &node.name,
+                Some(fp.as_str()),
+                3,
+                0,
+            )
+            .unwrap_or_default();
             let is_function_like = crate::domain::is_function_node_type(&node.node_type);
             let cls = crate::graph::impact::classify_impact(&callers, "behavior", is_function_like);
-            writeln!(stdout, "  Impact: {} — {} direct, {} transitive, {} files, {} routes",
-                cls.risk_level, cls.prod_callers.iter().filter(|c| c.depth == 1).count(),
-                cls.prod_callers.iter().filter(|c| c.depth > 1).count(), cls.affected_files, cls.route_callers.len())?;
+            writeln!(
+                stdout,
+                "  Impact: {} — {} direct, {} transitive, {} files, {} routes",
+                cls.risk_level,
+                cls.prod_callers.iter().filter(|c| c.depth == 1).count(),
+                cls.prod_callers.iter().filter(|c| c.depth > 1).count(),
+                cls.affected_files,
+                cls.route_callers.len()
+            )?;
             if cls.test_count > 0 {
-                writeln!(stdout, "  ({} test callers excluded from the risk count)", cls.test_count)?;
+                writeln!(
+                    stdout,
+                    "  ({} test callers excluded from the risk count)",
+                    cls.test_count
+                )?;
             }
         }
     }
@@ -5158,7 +5844,13 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
 }
 
 /// Read source code with context lines from the project file system.
-fn read_source_context(project_root: &Path, file_path: &str, start_line: i64, end_line: i64, context_lines: usize) -> Option<String> {
+fn read_source_context(
+    project_root: &Path,
+    file_path: &str,
+    start_line: i64,
+    end_line: i64,
+    context_lines: usize,
+) -> Option<String> {
     use std::io::BufRead;
     let abs_path = project_root.join(file_path);
     let canonical = abs_path.canonicalize().ok()?;
@@ -5172,10 +5864,16 @@ fn read_source_context(project_root: &Path, file_path: &str, start_line: i64, en
     let end = (end_line as usize) + context_lines;
     let mut collected = Vec::new();
     for (i, line) in reader.lines().enumerate() {
-        if i >= end { break; }
-        if i >= start { collected.push(line.ok()?); }
+        if i >= end {
+            break;
+        }
+        if i >= start {
+            collected.push(line.ok()?);
+        }
     }
-    if collected.is_empty() { return None; }
+    if collected.is_empty() {
+        return None;
+    }
     Some(collected.join("\n"))
 }
 
@@ -5183,8 +5881,10 @@ fn read_source_context(project_root: &Path, file_path: &str, start_line: i64, en
 
 /// CLI arguments for the `trace` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp trace",
-          about = "Trace HTTP route → handler → downstream calls")]
+#[command(
+    name = "code-graph-mcp trace",
+    about = "Trace HTTP route → handler → downstream calls"
+)]
 pub struct TraceArgs {
     /// Route to trace (e.g. "/api/login" or "POST /api/login")
     pub route: String,
@@ -5253,7 +5953,10 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
 
     // Parse method filter (e.g., "POST /api/login" → method=POST, path=/api/login)
     let (method_filter, path) = if let Some(idx) = route_path.find(' ') {
-        (Some(route_path[..idx].to_uppercase()), &route_path[idx + 1..])
+        (
+            Some(route_path[..idx].to_uppercase()),
+            &route_path[idx + 1..],
+        )
     } else {
         (None, route_path)
     };
@@ -5268,8 +5971,13 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         if let Some(ref method) = method_filter {
             rows.retain(|r| {
                 r.metadata.as_ref().is_some_and(|m| {
-                    serde_json::from_str::<serde_json::Value>(m).ok()
-                        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                    serde_json::from_str::<serde_json::Value>(m)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("method")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .is_some_and(|rm| rm.eq_ignore_ascii_case(method))
                 })
             });
@@ -5294,15 +6002,21 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         let hint = "route extraction covers Express/Connect (JS/TS), Go net/http, Flask/FastAPI (Python), and axum (Rust); \
                     actix and Java web frameworks are not yet extracted";
         if json_mode {
-            println!("{}", serde_json::json!({
-                "handlers": [],
-                "message": format!("No routes matching: {} ({})", route_path, hint),
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "handlers": [],
+                    "message": format!("No routes matching: {} ({})", route_path, hint),
+                })
+            );
         }
         // Match the refs/impact/show not-found pattern (clean `[code-graph] …` on
         // stderr + exit 1) instead of `anyhow::bail!`, which main renders as the
         // double-prefixed `Error: [code-graph] No routes matching`.
-        eprintln!("[code-graph] No routes matching: {}\n  Note: {}.", route_path, hint);
+        eprintln!(
+            "[code-graph] No routes matching: {}\n  Note: {}.",
+            route_path, hint
+        );
         std::process::exit(1);
     }
 
@@ -5323,15 +6037,26 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         let mut ambiguous_hidden: usize = 0;
         for rm in &rows {
             let chain = crate::graph::query::get_call_graph_filtered(
-                conn, &rm.handler_name, "callees", depth, Some(&rm.file_path), min_conf_rank,
+                conn,
+                &rm.handler_name,
+                "callees",
+                depth,
+                Some(&rm.file_path),
+                min_conf_rank,
             )?;
             ambiguous_hidden += chain.suppressed_ambiguous;
-            let chain_nodes: Vec<serde_json::Value> = chain.nodes.iter()
+            let chain_nodes: Vec<serde_json::Value> = chain
+                .nodes
+                .iter()
                 .filter(|n| n.depth > 0)
-                .filter(|n| include_tests || !crate::domain::is_test_node(n.is_test, &n.name, &n.file_path))
-                .map(|n| serde_json::json!({
-                    "name": n.name, "file_path": n.file_path, "depth": n.depth,
-                }))
+                .filter(|n| {
+                    include_tests || !crate::domain::is_test_node(n.is_test, &n.name, &n.file_path)
+                })
+                .map(|n| {
+                    serde_json::json!({
+                        "name": n.name, "file_path": n.file_path, "depth": n.depth,
+                    })
+                })
                 .collect();
             let mut entry = serde_json::json!({
                 "handler_name": rm.handler_name,
@@ -5345,9 +6070,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
                 entry["call_chain_truncated"] = serde_json::json!(true);
             }
             if include_middleware {
-                let downstream = downstream_map.get(&rm.node_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let downstream = downstream_map.get(&rm.node_id).cloned().unwrap_or_default();
                 entry["downstream_calls"] = serde_json::json!(downstream);
             }
             handlers.push(entry);
@@ -5368,14 +6091,23 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     for rm in &rows {
         // Render the route label as "METHOD path" from the routes_to metadata
         // (matching the map's Entry Points) instead of dumping the raw JSON blob.
-        let route_label = rm.metadata.as_deref()
+        let route_label = rm
+            .metadata
+            .as_deref()
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-            .map(|v| format!("{} {}",
-                v["method"].as_str().unwrap_or("ALL"),
-                v["path"].as_str().unwrap_or(path)))
+            .map(|v| {
+                format!(
+                    "{} {}",
+                    v["method"].as_str().unwrap_or("ALL"),
+                    v["path"].as_str().unwrap_or(path)
+                )
+            })
             .unwrap_or_else(|| path.to_string());
-        writeln!(stdout, "{} → {} ({}:{})",
-            route_label, rm.handler_name, rm.file_path, rm.start_line)?;
+        writeln!(
+            stdout,
+            "{} → {} ({}:{})",
+            route_label, rm.handler_name, rm.file_path, rm.start_line
+        )?;
 
         if include_middleware {
             if let Some(downstream) = downstream_map.get(&rm.node_id) {
@@ -5387,12 +6119,21 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
 
         // Show call chain
         let chain = crate::graph::query::get_call_graph_filtered(
-            conn, &rm.handler_name, "callees", depth, Some(&rm.file_path), min_conf_rank,
+            conn,
+            &rm.handler_name,
+            "callees",
+            depth,
+            Some(&rm.file_path),
+            min_conf_rank,
         )?;
         ambiguous_hidden += chain.suppressed_ambiguous;
         for n in &chain.nodes {
-            if n.depth == 0 { continue; }
-            if !include_tests && crate::domain::is_test_node(n.is_test, &n.name, &n.file_path) { continue; }
+            if n.depth == 0 {
+                continue;
+            }
+            if !include_tests && crate::domain::is_test_node(n.is_test, &n.name, &n.file_path) {
+                continue;
+            }
             let indent = "  ".repeat(n.depth as usize);
             writeln!(stdout, "{}→ {} ({})", indent, n.name, n.file_path)?;
         }
@@ -5439,21 +6180,15 @@ fn scan_barrel_patterns(project_root: &Path, file_path: &str) -> Option<Vec<(usi
                     || t.starts_with("use ")
             }
             Some("typescript") | Some("tsx") | Some("javascript") => {
-                t.starts_with("import ")
-                    || (t.starts_with("export ") && t.contains(" from "))
+                t.starts_with("import ") || (t.starts_with("export ") && t.contains(" from "))
             }
             Some("python") => {
-                (t.starts_with("from ") && t.contains(" import "))
-                    || t.starts_with("import ")
+                (t.starts_with("from ") && t.contains(" import ")) || t.starts_with("import ")
             }
-            Some("go") | Some("java") | Some("csharp") | Some("kotlin") => {
-                t.starts_with("import ")
-            }
+            Some("go") | Some("java") | Some("csharp") | Some("kotlin") => t.starts_with("import "),
             Some("ruby") => t.starts_with("require ") || t.starts_with("require_relative "),
             Some("php") => {
-                t.starts_with("use ")
-                    || t.starts_with("require ")
-                    || t.starts_with("include ")
+                t.starts_with("use ") || t.starts_with("require ") || t.starts_with("include ")
             }
             _ => false,
         };
@@ -5461,15 +6196,18 @@ fn scan_barrel_patterns(project_root: &Path, file_path: &str) -> Option<Vec<(usi
             hits.push((idx + 1, line.to_string()));
         }
     }
-    if hits.is_empty() { None } else { Some(hits) }
+    if hits.is_empty() {
+        None
+    } else {
+        Some(hits)
+    }
 }
 
 // --- deps subcommand ---
 
 /// CLI arguments for the `deps` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp deps",
-          about = "File-level dependency graph")]
+#[command(name = "code-graph-mcp deps", about = "File-level dependency graph")]
 pub struct DepsArgs {
     /// File whose dependencies to show (absolute paths under root OK)
     pub file: String,
@@ -5529,7 +6267,10 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
                 writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
             } else {
                 writeln!(stdout, "{}", file_path)?;
-                writeln!(stdout, "  (no tracked dep edges \u{2014} raw re-export/import lines from file scan:)")?;
+                writeln!(
+                    stdout,
+                    "  (no tracked dep edges \u{2014} raw re-export/import lines from file scan:)"
+                )?;
                 for (ln, text) in lines {
                     writeln!(stdout, "    {}: {}", ln, text.trim())?;
                 }
@@ -5583,17 +6324,25 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
     let is_compatible_lang =
         |dep_path: &str| crate::utils::config::is_compatible_lang(file_path, dep_path);
 
-    let outgoing: Vec<&_> = deps.iter().filter(|d| d.direction == "outgoing" && is_compatible_lang(&d.file_path)).collect();
-    let incoming: Vec<&_> = deps.iter().filter(|d| d.direction == "incoming" && is_compatible_lang(&d.file_path)).collect();
+    let outgoing: Vec<&_> = deps
+        .iter()
+        .filter(|d| d.direction == "outgoing" && is_compatible_lang(&d.file_path))
+        .collect();
+    let incoming: Vec<&_> = deps
+        .iter()
+        .filter(|d| d.direction == "incoming" && is_compatible_lang(&d.file_path))
+        .collect();
 
     // Distinguish "no edges at all" (handled by the barrel-fallback branch above)
     // from "edges exist but all targets are <external> or cross-language" — the
     // latter previously rendered as a bare filename with no explanation, which
     // looked like a successful no-op even when the file had unresolved imports.
-    let unresolved_outgoing = deps.iter()
+    let unresolved_outgoing = deps
+        .iter()
         .filter(|d| d.direction == "outgoing" && !is_compatible_lang(&d.file_path))
         .count();
-    let unresolved_incoming = deps.iter()
+    let unresolved_incoming = deps
+        .iter()
         .filter(|d| d.direction == "incoming" && !is_compatible_lang(&d.file_path))
         .count();
 
@@ -5648,7 +6397,10 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
             }
         }
     }
-    if outgoing.is_empty() && incoming.is_empty() && (unresolved_outgoing > 0 || unresolved_incoming > 0) {
+    if outgoing.is_empty()
+        && incoming.is_empty()
+        && (unresolved_outgoing > 0 || unresolved_incoming > 0)
+    {
         writeln!(
             stdout,
             "  (no resolved deps; {} unresolved outgoing, {} unresolved incoming — targets are <external> or in another language)",
@@ -5663,8 +6415,10 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
 
 /// CLI arguments for the `similar` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp similar",
-          about = "Find semantically similar code (requires embeddings)")]
+#[command(
+    name = "code-graph-mcp similar",
+    about = "Find semantically similar code (requires embeddings)"
+)]
 pub struct SimilarArgs {
     /// Symbol name (required unless --node-id is given)
     pub symbol: Option<String>,
@@ -5704,7 +6458,9 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     let conn = db.conn();
 
     if !db.vec_enabled() {
-        if json_mode { println!("[]"); }
+        if json_mode {
+            println!("[]");
+        }
         eprintln!("[code-graph] Vector search not available (sqlite-vec extension not loaded).");
         eprintln!("  To enable: build with `cargo build --release --features embed-model`.");
         eprintln!("  Alternative: use `code-graph-mcp search <query>` for text-based similarity.");
@@ -5722,7 +6478,9 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         // true cause. This check is embedding-independent → reachable and testable
         // in the default (no embed-model) build, and mirrors refs --node-id.
         if queries::get_node_by_id(conn, nid)?.is_none() {
-            if json_mode { println!("[]"); }
+            if json_mode {
+                println!("[]");
+            }
             eprintln!("[code-graph] node_id {} not found in index", nid);
             std::process::exit(1);
         }
@@ -5737,7 +6495,9 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         match queries::get_first_node_id_by_name(conn, symbol)? {
             Some(id) => (id, symbol.to_string()),
             None => {
-                if json_mode { println!("[]"); }
+                if json_mode {
+                    println!("[]");
+                }
                 // All-digit positional is almost certainly a node_id mistakenly passed
                 // without the flag — guide the user instead of "Symbol not found: 1010".
                 if !symbol.is_empty() && symbol.chars().all(|c| c.is_ascii_digit()) {
@@ -5760,8 +6520,13 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         // (feedback_cli_json_empty_contract.md). This path (vec extension present
         // but no embeddings generated yet) is the only one in cmd_similar that was
         // missing it — a consumer piping stdout got an empty string → parse error.
-        if json_mode { println!("[]"); }
-        eprintln!("[code-graph] No embeddings found ({}/{} nodes embedded).", embedded_count, total_nodes);
+        if json_mode {
+            println!("[]");
+        }
+        eprintln!(
+            "[code-graph] No embeddings found ({}/{} nodes embedded).",
+            embedded_count, total_nodes
+        );
         eprintln!("  To enable: build with `cargo build --release --features embed-model`,");
         eprintln!("  then restart the MCP server to generate embeddings.");
         eprintln!("  Alternative: use `code-graph-mcp search <query>` for text-based similarity.");
@@ -5775,7 +6540,9 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
                 // Node exists (validated above) but this one has no embedding yet —
                 // embeddings still generating. Empty-JSON contract: emit [] under
                 // --json instead of bailing with empty stdout.
-                if json_mode { println!("[]"); }
+                if json_mode {
+                    println!("[]");
+                }
                 eprintln!(
                     "[code-graph] No embedding for {} ({}/{} nodes embedded \u{2014} embeddings still generating; try again shortly or pick a node with `--node-id` from `show {}`).",
                     target_label, embedded_count, total_nodes, target_label
@@ -5795,17 +6562,26 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     // Collect filtered results
     let mut similar: Vec<(queries::NodeResult, String, f64)> = Vec::new();
     for (id, distance) in &raw_results {
-        if *id == node_id || *distance > max_distance { continue; }
-        let Some(node) = queries::get_node_by_id(conn, *id)? else { continue; };
+        if *id == node_id || *distance > max_distance {
+            continue;
+        }
+        let Some(node) = queries::get_node_by_id(conn, *id)? else {
+            continue;
+        };
         let fp = queries::get_file_path(conn, node.file_id)?.unwrap_or_default();
-        if crate::domain::is_skippable_result(&node.node_type, &node.name, &fp) { continue; }
+        if crate::domain::is_skippable_result(&node.node_type, &node.name, &fp) {
+            continue;
+        }
         similar.push((node, fp, *distance));
-        if similar.len() >= top_k as usize { break; }
+        if similar.len() >= top_k as usize {
+            break;
+        }
     }
 
     // Observability: post-filters (max_distance + test/module) can shrink results below
     // top_k even with over-fetch. Surface to stderr; stdout JSON stays a bare array.
-    let cutoff_dropped = raw_results.iter()
+    let cutoff_dropped = raw_results
+        .iter()
         .filter(|(id, dist)| *id != node_id && *dist > max_distance)
         .count();
     if (similar.len() as i64) < top_k && cutoff_dropped > 0 {
@@ -5846,7 +6622,10 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         if json_mode {
             writeln!(stdout, "[]")?;
         }
-        eprintln!("[code-graph] No similar code found for node_id: {}", node_id);
+        eprintln!(
+            "[code-graph] No similar code found for node_id: {}",
+            node_id
+        );
         return Ok(());
     }
 
@@ -5865,10 +6644,16 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
 
     for (node, fp, distance) in &similar {
         let similarity = 1.0 / (1.0 + distance);
-        writeln!(stdout, "{:.1}%  {} {}  {}:{}-{}",
+        writeln!(
+            stdout,
+            "{:.1}%  {} {}  {}:{}-{}",
             similarity * 100.0,
-            node.node_type, node.qualified_name.as_deref().unwrap_or(&node.name),
-            fp, node.start_line, node.end_line)?;
+            node.node_type,
+            node.qualified_name.as_deref().unwrap_or(&node.name),
+            fp,
+            node.start_line,
+            node.end_line
+        )?;
     }
 
     Ok(())
@@ -5878,8 +6663,10 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
 
 /// CLI arguments for the `refs` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp refs",
-          about = "Find all references to a symbol (callers, importers, etc.)")]
+#[command(
+    name = "code-graph-mcp refs",
+    about = "Find all references to a symbol (callers, importers, etc.)"
+)]
 pub struct RefsArgs {
     /// Symbol name (required unless --node-id is given)
     pub symbol: Option<String>,
@@ -5914,13 +6701,16 @@ pub struct RefsArgs {
 /// every `--json` exit path produces parseable stdout (empty-JSON contract).
 /// Used by all three not-found branches: symbol, --file miss, and --node-id miss.
 fn print_refs_notfound_json(symbol: &str) {
-    println!("{}", serde_json::json!({
-        "symbol": symbol,
-        "total_references": 0,
-        "by_relation": {},
-        "references": [],
-        "error": "Symbol not found",
-    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "symbol": symbol,
+            "total_references": 0,
+            "by_relation": {},
+            "references": [],
+            "error": "Symbol not found",
+        })
+    );
 }
 
 /// Find all references to a symbol. CLI equivalent of MCP `find_references`.
@@ -5973,7 +6763,9 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             Some(n) => n,
             None => {
                 // Empty-JSON contract: emit a parseable envelope, not empty stdout.
-                if json_mode { print_refs_notfound_json(&format!("node_id {}", nid)); }
+                if json_mode {
+                    print_refs_notfound_json(&format!("node_id {}", nid));
+                }
                 eprintln!("[code-graph] node_id {} not found in index", nid);
                 std::process::exit(1);
             }
@@ -5990,10 +6782,16 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
 
         if let Some(fp) = file_path {
             let nodes = queries::get_nodes_by_file_path(conn, fp)?;
-            let matched: Vec<i64> = nodes.iter().filter(|n| n.name == base).map(|n| n.id).collect();
+            let matched: Vec<i64> = nodes
+                .iter()
+                .filter(|n| n.name == base)
+                .map(|n| n.id)
+                .collect();
             if matched.is_empty() {
                 // Empty-JSON contract: emit a parseable envelope, not empty stdout.
-                if json_mode { print_refs_notfound_json(base); }
+                if json_mode {
+                    print_refs_notfound_json(base);
+                }
                 eprintln!("[code-graph] Symbol '{}' not found in file '{}'.", base, fp);
                 std::process::exit(1);
             }
@@ -6005,7 +6803,10 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 match resolve_fuzzy_name_cli(conn, base)? {
                     CliFuzzyResolution::Unique(resolved) => {
                         let resolved_ids = queries::get_node_ids_by_name(conn, &resolved)?;
-                        (resolved_ids.into_iter().map(|(id, _)| id).collect(), resolved)
+                        (
+                            resolved_ids.into_iter().map(|(id, _)| id).collect(),
+                            resolved,
+                        )
                     }
                     CliFuzzyResolution::Ambiguous(cands) => {
                         if json_mode {
@@ -6013,14 +6814,20 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                                 "name": c.name, "file_path": c.file_path,
                                 "type": c.node_type, "node_id": c.node_id, "start_line": c.start_line,
                             })).collect();
-                            println!("{}", serde_json::json!({
-                                "error": format!("Ambiguous symbol '{}': {} matches. Specify --file or --node-id to disambiguate.", base, cands.len()),
-                                "suggestions": sugg,
-                            }));
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "error": format!("Ambiguous symbol '{}': {} matches. Specify --file or --node-id to disambiguate.", base, cands.len()),
+                                    "suggestions": sugg,
+                                })
+                            );
                         } else {
                             eprintln!("[code-graph] Ambiguous symbol '{}': {} matches. Specify --file or --node-id.", base, cands.len());
                             for c in cands.iter().take(5) {
-                                eprintln!("  {} ({}) in {} [node_id {}]", c.name, c.node_type, c.file_path, c.node_id);
+                                eprintln!(
+                                    "  {} ({}) in {} [node_id {}]",
+                                    c.name, c.node_type, c.file_path, c.node_id
+                                );
                             }
                         }
                         std::process::exit(1);
@@ -6031,13 +6838,18 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         // commands (callgraph/trace/deps) all emit an object on the
                         // empty/error path so one parser handles both — refs was the
                         // outlier returning `[]`, which broke `.references` access.
-                        if json_mode { print_refs_notfound_json(base); }
+                        if json_mode {
+                            print_refs_notfound_json(base);
+                        }
                         eprintln!("[code-graph] Symbol not found: {}", base);
                         std::process::exit(1);
                     }
                 }
             } else {
-                (ids.into_iter().map(|(id, _)| id).collect(), base.to_string())
+                (
+                    ids.into_iter().map(|(id, _)| id).collect(),
+                    base.to_string(),
+                )
             }
         }
     };
@@ -6046,7 +6858,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     // return doesn't get dropped across the .as_str() borrow.
     let symbol = symbol.as_str();
 
-    use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_IMPLEMENTS, REL_REFERENCES};
+    use crate::domain::{REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS, REL_REFERENCES};
     let relation_filter = match relation {
         Some("calls") => Some(REL_CALLS),
         Some("imports") => Some(REL_IMPORTS),
@@ -6054,7 +6866,10 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         Some("implements") => Some(REL_IMPLEMENTS),
         Some("references") => Some(REL_REFERENCES),
         Some("all") | None => None,
-        Some(other) => anyhow::bail!("Unknown relation '{}'. Valid: calls, imports, inherits, implements, references, all", other),
+        Some(other) => anyhow::bail!(
+            "Unknown relation '{}'. Valid: calls, imports, inherits, implements, references, all",
+            other
+        ),
     };
 
     // Build the deduped reference set. Wrapped in a closure so a query-time
@@ -6066,43 +6881,43 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     // one row. When their confidence differs, show the LOWEST (most conservative)
     // tier: the displayed confidence must not understate a hidden sibling's
     // ambiguity (L1 — surfacing low confidence is the whole point of the feature).
-    let build_refs = |conn: &rusqlite::Connection|
-        -> Result<(Vec<queries::IncomingReference>, usize)> {
-        let mut all_refs: Vec<queries::IncomingReference> = Vec::new();
-        let mut seen: std::collections::HashMap<(String, String, String), usize> =
-            std::collections::HashMap::new();
-        let mut conf_filtered = 0usize;
-        for target_id in &target_ids {
-            let refs = queries::get_incoming_references(conn, *target_id, relation_filter)?;
-            for r in refs {
-                // --min-confidence: drop refs below the requested tier (default: keep all).
-                if let Some(min) = min_confidence {
-                    if crate::domain::confidence_rank(&r.confidence)
-                        < crate::domain::confidence_rank(min)
-                    {
-                        conf_filtered += 1;
-                        continue;
-                    }
-                }
-                let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
-                match seen.get(&key) {
-                    Some(&idx) => {
-                        // Keep the worst-case (lowest) confidence among deduped siblings.
+    let build_refs =
+        |conn: &rusqlite::Connection| -> Result<(Vec<queries::IncomingReference>, usize)> {
+            let mut all_refs: Vec<queries::IncomingReference> = Vec::new();
+            let mut seen: std::collections::HashMap<(String, String, String), usize> =
+                std::collections::HashMap::new();
+            let mut conf_filtered = 0usize;
+            for target_id in &target_ids {
+                let refs = queries::get_incoming_references(conn, *target_id, relation_filter)?;
+                for r in refs {
+                    // --min-confidence: drop refs below the requested tier (default: keep all).
+                    if let Some(min) = min_confidence {
                         if crate::domain::confidence_rank(&r.confidence)
-                            < crate::domain::confidence_rank(&all_refs[idx].confidence)
+                            < crate::domain::confidence_rank(min)
                         {
-                            all_refs[idx].confidence = r.confidence;
+                            conf_filtered += 1;
+                            continue;
                         }
                     }
-                    None => {
-                        seen.insert(key, all_refs.len());
-                        all_refs.push(r);
+                    let key = (r.name.clone(), r.file_path.clone(), r.relation.clone());
+                    match seen.get(&key) {
+                        Some(&idx) => {
+                            // Keep the worst-case (lowest) confidence among deduped siblings.
+                            if crate::domain::confidence_rank(&r.confidence)
+                                < crate::domain::confidence_rank(&all_refs[idx].confidence)
+                            {
+                                all_refs[idx].confidence = r.confidence;
+                            }
+                        }
+                        None => {
+                            seen.insert(key, all_refs.len());
+                            all_refs.push(r);
+                        }
                     }
                 }
             }
-        }
-        Ok((all_refs, conf_filtered))
-    };
+            Ok((all_refs, conf_filtered))
+        };
     let (mut all_refs, mut conf_filtered) = build_refs(conn)?;
     let files: Vec<String> = all_refs.iter().map(|r| r.file_path.clone()).collect();
     let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
@@ -6114,30 +6929,34 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     outcome.disclose();
 
     if json_mode {
-        let items: Vec<serde_json::Value> = all_refs.iter().map(|r| {
-            if compact {
-                serde_json::json!({
-                    "name": r.name,
-                    "file_path": r.file_path,
-                    "start_line": r.start_line,
-                    "relation": r.relation,
-                    "confidence": r.confidence,
-                    "node_id": r.node_id,
-                })
-            } else {
-                serde_json::json!({
-                    "node_id": r.node_id,
-                    "name": r.name,
-                    "type": r.node_type,
-                    "file_path": r.file_path,
-                    "start_line": r.start_line,
-                    "relation": r.relation,
-                    "confidence": r.confidence,
-                })
-            }
-        }).collect();
+        let items: Vec<serde_json::Value> = all_refs
+            .iter()
+            .map(|r| {
+                if compact {
+                    serde_json::json!({
+                        "name": r.name,
+                        "file_path": r.file_path,
+                        "start_line": r.start_line,
+                        "relation": r.relation,
+                        "confidence": r.confidence,
+                        "node_id": r.node_id,
+                    })
+                } else {
+                    serde_json::json!({
+                        "node_id": r.node_id,
+                        "name": r.name,
+                        "type": r.node_type,
+                        "file_path": r.file_path,
+                        "start_line": r.start_line,
+                        "relation": r.relation,
+                        "confidence": r.confidence,
+                    })
+                }
+            })
+            .collect();
         // Group counts by relation, mirroring MCP find_references envelope
-        let mut by_relation: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut by_relation: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         for r in &all_refs {
             *by_relation.entry(r.relation.clone()).or_insert(0) += 1;
         }
@@ -6154,7 +6973,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         // Annotate only non-extracted edges so precise refs stay visually clean;
         // inferred/ambiguous are the ones worth scrutiny (by-name cross-file).
         let tag = |c: &str| -> String {
-            if c == crate::domain::CONF_EXTRACTED { String::new() } else { format!(" ~{c}") }
+            if c == crate::domain::CONF_EXTRACTED {
+                String::new()
+            } else {
+                format!(" ~{c}")
+            }
         };
         if all_refs.is_empty() {
             writeln!(stdout, "No references found for '{}'.", symbol)?;
@@ -6162,14 +6985,33 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             writeln!(stdout, "{} references to '{}':", all_refs.len(), symbol)?;
             for r in &all_refs {
                 if compact {
-                    writeln!(stdout, "  [{}] {} {}{}", r.relation, r.name, r.file_path, tag(&r.confidence))?;
+                    writeln!(
+                        stdout,
+                        "  [{}] {} {}{}",
+                        r.relation,
+                        r.name,
+                        r.file_path,
+                        tag(&r.confidence)
+                    )?;
                 } else {
-                    writeln!(stdout, "  [{}] {} ({}:{}){}", r.relation, r.name, r.file_path, r.start_line, tag(&r.confidence))?;
+                    writeln!(
+                        stdout,
+                        "  [{}] {} ({}:{}){}",
+                        r.relation,
+                        r.name,
+                        r.file_path,
+                        r.start_line,
+                        tag(&r.confidence)
+                    )?;
                 }
             }
         }
         if conf_filtered > 0 {
-            writeln!(stdout, "({} lower-confidence ref(s) hidden by --min-confidence)", conf_filtered)?;
+            writeln!(
+                stdout,
+                "({} lower-confidence ref(s) hidden by --min-confidence)",
+                conf_filtered
+            )?;
         }
     }
 
@@ -6180,8 +7022,10 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
 
 /// CLI arguments for the `dead-code` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp dead-code",
-          about = "Find unused code (orphans and exported-unused symbols)")]
+#[command(
+    name = "code-graph-mcp dead-code",
+    about = "Find unused code (orphans and exported-unused symbols)"
+)]
 pub struct DeadCodeArgs {
     /// Restrict the scan to this path prefix (absolute paths under root OK)
     pub path: Option<String>,
@@ -6220,7 +7064,13 @@ pub struct DeadCodeArgs {
 /// CLI equivalent of MCP `find_dead_code`.
 pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     let DeadCodeArgs {
-        path, node_type, include_tests, min_lines, no_compact, ignore, no_ignore,
+        path,
+        node_type,
+        include_tests,
+        min_lines,
+        no_compact,
+        ignore,
+        no_ignore,
         json: json_mode,
     } = args;
 
@@ -6251,7 +7101,14 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
     let run_query = |conn: &rusqlite::Connection| -> Result<queries::DeadCodeReport> {
-        queries::dead_code_report(conn, path_filter, type_filter, include_tests, min_lines, &ignore_prefixes)
+        queries::dead_code_report(
+            conn,
+            path_filter,
+            type_filter,
+            include_tests,
+            min_lines,
+            &ignore_prefixes,
+        )
     };
     let mut report = run_query(conn)?;
     // Query-time freshness (shared resync with show/refs/…): re-index any displayed
@@ -6271,10 +7128,13 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         // roadmap 2026-07-18 §1.2). True clean keeps the plain `[]`.
         if report.ignored_count > 0 {
             if json_mode {
-                println!("{}", serde_json::json!({
-                    "results": [],
-                    "ignored_count": report.ignored_count,
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "results": [],
+                        "ignored_count": report.ignored_count,
+                    })
+                );
             } else {
                 println!(
                     "[code-graph] No dead code found after filtering; {} suppressed by --ignore (use --no-ignore to see them).",
@@ -6287,11 +7147,14 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
             );
         } else if report.hidden_below_threshold > 0 {
             if json_mode {
-                println!("{}", serde_json::json!({
-                    "results": [],
-                    "below_threshold_count": report.hidden_below_threshold,
-                    "min_lines": min_lines,
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "results": [],
+                        "below_threshold_count": report.hidden_below_threshold,
+                        "min_lines": min_lines,
+                    })
+                );
             } else {
                 println!(
                     "[code-graph] No dead code found at \u{2265}{min_lines} lines ({} shorter symbol(s) below the threshold; rerun with --min-lines 1 to include them).",
@@ -6314,38 +7177,58 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
-        let items: Vec<serde_json::Value> = report.items.iter().map(|it| {
-            let mut obj = serde_json::json!({
-                "name": it.name,
-                "type": it.node_type,
-                "file_path": it.file_path,
-                "start_line": it.start_line,
-                "end_line": it.end_line,
-                "category": if it.is_exported { "exported_unused" } else { "orphan" },
-                "lines": it.end_line - it.start_line + 1,
-            });
-            if !compact {
-                obj["code"] = serde_json::json!(it.code_content);
-            }
-            obj
-        }).collect();
+        let items: Vec<serde_json::Value> = report
+            .items
+            .iter()
+            .map(|it| {
+                let mut obj = serde_json::json!({
+                    "name": it.name,
+                    "type": it.node_type,
+                    "file_path": it.file_path,
+                    "start_line": it.start_line,
+                    "end_line": it.end_line,
+                    "category": if it.is_exported { "exported_unused" } else { "orphan" },
+                    "lines": it.end_line - it.start_line + 1,
+                });
+                if !compact {
+                    obj["code"] = serde_json::json!(it.code_content);
+                }
+                obj
+            })
+            .collect();
         writeln!(stdout, "{}", serde_json::to_string(&items)?)?;
         return Ok(());
     }
 
-    writeln!(stdout, "Dead code: {} candidates ({} orphan, {} exported-unused)",
-        report.items.len(), report.orphan_count, report.exported_count)?;
+    writeln!(
+        stdout,
+        "Dead code: {} candidates ({} orphan, {} exported-unused)",
+        report.items.len(),
+        report.orphan_count,
+        report.exported_count
+    )?;
     writeln!(stdout, "(candidates to verify — receiver-method calls (obj.method()) and cross-file const/type uses are not edge-tracked)\n")?;
 
     let (orphans, exported_unused): (Vec<_>, Vec<_>) =
         report.items.iter().partition(|it| !it.is_exported);
 
     if !orphans.is_empty() {
-        writeln!(stdout, "ORPHAN ({}) — no tracked references, not exported", orphans.len())?;
+        writeln!(
+            stdout,
+            "ORPHAN ({}) — no tracked references, not exported",
+            orphans.len()
+        )?;
         for it in &orphans {
             let lines = it.end_line - it.start_line + 1;
-            writeln!(stdout, "  {} {} {}:{} ({})",
-                it.node_type, it.name, it.file_path, it.start_line, plural(lines, "line"))?;
+            writeln!(
+                stdout,
+                "  {} {} {}:{} ({})",
+                it.node_type,
+                it.name,
+                it.file_path,
+                it.start_line,
+                plural(lines, "line")
+            )?;
             if !compact {
                 for line in it.code_content.lines().take(5) {
                     writeln!(stdout, "    {}", line)?;
@@ -6358,12 +7241,25 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     }
 
     if !exported_unused.is_empty() {
-        if !orphans.is_empty() { writeln!(stdout)?; }
-        writeln!(stdout, "EXPORTED-UNUSED ({}) — exported/public, no tracked callers", exported_unused.len())?;
+        if !orphans.is_empty() {
+            writeln!(stdout)?;
+        }
+        writeln!(
+            stdout,
+            "EXPORTED-UNUSED ({}) — exported/public, no tracked callers",
+            exported_unused.len()
+        )?;
         for it in &exported_unused {
             let lines = it.end_line - it.start_line + 1;
-            writeln!(stdout, "  {} {} {}:{} ({})",
-                it.node_type, it.name, it.file_path, it.start_line, plural(lines, "line"))?;
+            writeln!(
+                stdout,
+                "  {} {} {}:{} ({})",
+                it.node_type,
+                it.name,
+                it.file_path,
+                it.start_line,
+                plural(lines, "line")
+            )?;
             if !compact {
                 for line in it.code_content.lines().take(5) {
                     writeln!(stdout, "    {}", line)?;
@@ -6382,8 +7278,10 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
 
 /// CLI arguments for the `centrality` subcommand.
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp centrality",
-          about = "Rank architectural chokepoints by betweenness centrality (call graph)")]
+#[command(
+    name = "code-graph-mcp centrality",
+    about = "Rank architectural chokepoints by betweenness centrality (call graph)"
+)]
 pub struct CentralityArgs {
     /// Number of functions to report (default: 15)
     #[arg(long, default_value_t = 15)]
@@ -6402,7 +7300,11 @@ pub struct CentralityArgs {
 /// centrality): a chokepoint can have few callers yet route most cross-cluster
 /// traffic. CLI-only; not exposed as an MCP tool.
 pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
-    let CentralityArgs { limit, include_tests, json: json_mode } = args;
+    let CentralityArgs {
+        limit,
+        include_tests,
+        json: json_mode,
+    } = args;
     // Clamp to >=1 (mirrors cmd_callgraph's depth.max(1)): --limit 0 would return
     // an empty ranking and trip the "No chokepoints found (graph has no multi-hop
     // call paths)" branch below — a message that falsely blames the graph when the
@@ -6412,26 +7314,26 @@ pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let ranked = crate::graph::centrality::betweenness_centrality(
-        conn,
-        include_tests,
-        limit as usize,
-    )?;
+    let ranked =
+        crate::graph::centrality::betweenness_centrality(conn, include_tests, limit as usize)?;
 
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
         // Empty → `[]` (array-shaped success), per the CLI JSON-empty contract.
-        let items: Vec<serde_json::Value> = ranked.iter().map(|c| {
-            serde_json::json!({
-                "name": c.name,
-                "type": c.node_type,
-                "file_path": c.file_path,
-                "betweenness": c.score,
-                "normalized": c.normalized,
-                "caller_count": c.caller_count,
+        let items: Vec<serde_json::Value> = ranked
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "type": c.node_type,
+                    "file_path": c.file_path,
+                    "betweenness": c.score,
+                    "normalized": c.normalized,
+                    "caller_count": c.caller_count,
+                })
             })
-        }).collect();
+            .collect();
         writeln!(stdout, "{}", serde_json::to_string(&items)?)?;
         return Ok(());
     }
@@ -6439,12 +7341,20 @@ pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
     if ranked.is_empty() {
         eprintln!(
             "[code-graph] No chokepoints found (graph has no multi-hop call paths{}).",
-            if include_tests { "" } else { "; try --include-tests" }
+            if include_tests {
+                ""
+            } else {
+                "; try --include-tests"
+            }
         );
         return Ok(());
     }
 
-    writeln!(stdout, "Architectural chokepoints (betweenness centrality, top {}):", ranked.len())?;
+    writeln!(
+        stdout,
+        "Architectural chokepoints (betweenness centrality, top {}):",
+        ranked.len()
+    )?;
     writeln!(stdout, "(functions on the most shortest call paths between others — high score = structural bridge)\n")?;
     for c in &ranked {
         writeln!(
@@ -6459,8 +7369,10 @@ pub fn cmd_centrality(project_root: &Path, args: CentralityArgs) -> Result<()> {
 
 /// CLI arguments for the `cycles` subcommand.
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp cycles",
-          about = "Detect circular import dependencies (file-level)")]
+#[command(
+    name = "code-graph-mcp cycles",
+    about = "Detect circular import dependencies (file-level)"
+)]
 pub struct CyclesArgs {
     /// Maximum number of cycles to report (default: 50)
     #[arg(long, default_value_t = 50)]
@@ -6477,7 +7389,10 @@ pub struct CyclesArgs {
 /// circular import. Most actionable for JS/TS/Python/Go; Rust intra-crate module
 /// cycles are frequently benign. CLI-only; not exposed as an MCP tool.
 pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
-    let CyclesArgs { limit, json: json_mode } = args;
+    let CyclesArgs {
+        limit,
+        json: json_mode,
+    } = args;
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -6495,22 +7410,29 @@ pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
 
     if json_mode {
         // Empty → `[]` (array-shaped success), per the CLI JSON-empty contract.
-        let items: Vec<serde_json::Value> = cycles.iter().map(|c| {
-            serde_json::json!({
-                "files": c.files,
-                "size": c.size,
-                "cycle": c.path,
+        let items: Vec<serde_json::Value> = cycles
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "files": c.files,
+                    "size": c.size,
+                    "cycle": c.path,
+                })
             })
-        }).collect();
+            .collect();
         if truncated {
             // Disclosure envelope only when --limit actually cut results
             // (mirrors callgraph's `limit_hit`); the common untruncated case
             // keeps the plain array shape.
-            writeln!(stdout, "{}", serde_json::to_string(&serde_json::json!({
-                "results": items,
-                "total_found": total_found,
-                "truncated": true,
-            }))?)?;
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "results": items,
+                    "total_found": total_found,
+                    "truncated": true,
+                }))?
+            )?;
         } else {
             writeln!(stdout, "{}", serde_json::to_string(&items)?)?;
         }
@@ -6523,11 +7445,23 @@ pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
     }
 
     if truncated {
-        writeln!(stdout, "Circular import dependencies (showing {} of {} found — raise --limit for the rest):", cycles.len(), total_found)?;
+        writeln!(
+            stdout,
+            "Circular import dependencies (showing {} of {} found — raise --limit for the rest):",
+            cycles.len(),
+            total_found
+        )?;
     } else {
-        writeln!(stdout, "Circular import dependencies ({} found):", cycles.len())?;
+        writeln!(
+            stdout,
+            "Circular import dependencies ({} found):",
+            cycles.len()
+        )?;
     }
-    writeln!(stdout, "(files that transitively import each other — a → b → … → a)\n")?;
+    writeln!(
+        stdout,
+        "(files that transitively import each other — a → b → … → a)\n"
+    )?;
     for c in &cycles {
         writeln!(stdout, "  {}", c.headline())?;
         // When the SCC has more files than the representative loop visits, list them all.
@@ -6541,8 +7475,10 @@ pub fn cmd_cycles(project_root: &Path, args: CyclesArgs) -> Result<()> {
 
 /// CLI arguments for the `surprising` subcommand.
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp surprising",
-          about = "Surface unexpected cross-module couplings (uncertain / sole-bridge edges)")]
+#[command(
+    name = "code-graph-mcp surprising",
+    about = "Surface unexpected cross-module couplings (uncertain / sole-bridge edges)"
+)]
 pub struct SurprisingArgs {
     /// Number of connections to report (default: 15)
     #[arg(long, default_value_t = 15)]
@@ -6561,7 +7497,11 @@ pub struct SurprisingArgs {
 /// Surfaces uncertain or non-obvious couplings for review/audit; structural edges
 /// (imports/inherits) are excluded. CLI-only; not exposed as an MCP tool.
 pub fn cmd_surprising(project_root: &Path, args: SurprisingArgs) -> Result<()> {
-    let SurprisingArgs { limit, include_tests, json: json_mode } = args;
+    let SurprisingArgs {
+        limit,
+        include_tests,
+        json: json_mode,
+    } = args;
 
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
@@ -6573,18 +7513,21 @@ pub fn cmd_surprising(project_root: &Path, args: SurprisingArgs) -> Result<()> {
 
     if json_mode {
         // Empty → `[]` (array-shaped success), per the CLI JSON-empty contract.
-        let items: Vec<serde_json::Value> = found.iter().map(|c| {
-            serde_json::json!({
-                "source": c.source,
-                "source_file": c.source_file,
-                "target": c.target,
-                "target_file": c.target_file,
-                "relation": c.relation,
-                "confidence": c.confidence,
-                "score": c.score,
-                "why": c.reasons,
+        let items: Vec<serde_json::Value> = found
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "source": c.source,
+                    "source_file": c.source_file,
+                    "target": c.target,
+                    "target_file": c.target_file,
+                    "relation": c.relation,
+                    "confidence": c.confidence,
+                    "score": c.score,
+                    "why": c.reasons,
+                })
             })
-        }).collect();
+            .collect();
         writeln!(stdout, "{}", serde_json::to_string(&items)?)?;
         return Ok(());
     }
@@ -6592,15 +7535,26 @@ pub fn cmd_surprising(project_root: &Path, args: SurprisingArgs) -> Result<()> {
     if found.is_empty() {
         eprintln!(
             "[code-graph] No surprising connections found{}.",
-            if include_tests { "" } else { " (try --include-tests)" }
+            if include_tests {
+                ""
+            } else {
+                " (try --include-tests)"
+            }
         );
         return Ok(());
     }
 
     writeln!(stdout, "Surprising connections (top {}):", found.len())?;
-    writeln!(stdout, "(score = low resolution confidence + crosses modules + sole bridge between them)\n")?;
+    writeln!(
+        stdout,
+        "(score = low resolution confidence + crosses modules + sole bridge between them)\n"
+    )?;
     for c in &found {
-        writeln!(stdout, "  [{}] {} → {}  ({} {})", c.score, c.source, c.target, c.confidence, c.relation)?;
+        writeln!(
+            stdout,
+            "  [{}] {} → {}  ({} {})",
+            c.score, c.source, c.target, c.confidence, c.relation
+        )?;
         writeln!(stdout, "      {} → {}", c.source_file, c.target_file)?;
         writeln!(stdout, "      {}", c.reasons.join("; "))?;
     }
@@ -6610,8 +7564,10 @@ pub fn cmd_surprising(project_root: &Path, args: SurprisingArgs) -> Result<()> {
 
 /// CLI arguments for the `report` subcommand.
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp report",
-          about = "Consolidated code-health report (summary, hot functions, chokepoints, cycles, surprising, dead code)")]
+#[command(
+    name = "code-graph-mcp report",
+    about = "Consolidated code-health report (summary, hot functions, chokepoints, cycles, surprising, dead code)"
+)]
 pub struct ReportArgs {
     /// Items per section (default: 5)
     #[arg(long, default_value_t = 5)]
@@ -6630,7 +7586,11 @@ pub struct ReportArgs {
 /// Pure read-time aggregation of existing analyses. CLI-only; not an MCP tool.
 pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     use crate::domain::{CONF_AMBIGUOUS, CONF_EXTRACTED, CONF_INFERRED};
-    let ReportArgs { top, include_tests, json: json_mode } = args;
+    let ReportArgs {
+        top,
+        include_tests,
+        json: json_mode,
+    } = args;
     let top = top as usize;
 
     let ctx = CliContext::open(project_root)?;
@@ -6641,7 +7601,8 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     // Edge-confidence breakdown.
     let mut conf: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     {
-        let mut stmt = conn.prepare("SELECT confidence, COUNT(*) FROM edges GROUP BY confidence")?;
+        let mut stmt =
+            conn.prepare("SELECT confidence, COUNT(*) FROM edges GROUP BY confidence")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
             let (c, n) = row?;
@@ -6657,9 +7618,9 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
         crate::graph::cycles::find_cycles(&edges)
     };
     cycles.truncate(top);
-    let surprising =
-        crate::graph::surprising::surprising_connections(conn, include_tests, top)?;
-    let dead = crate::storage::queries::find_dead_code(conn, None, None, include_tests, 3, top as i64)?;
+    let surprising = crate::graph::surprising::surprising_connections(conn, include_tests, top)?;
+    let dead =
+        crate::storage::queries::find_dead_code(conn, None, None, include_tests, 3, top as i64)?;
 
     let mut stdout = std::io::stdout().lock();
 
@@ -6699,17 +7660,29 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
 
     writeln!(stdout, "# Code Health Report\n")?;
     writeln!(stdout, "## Summary")?;
-    writeln!(stdout, "  {} files · {} nodes · {} edges",
-        status.files_count, status.nodes_count, status.edges_count)?;
-    writeln!(stdout, "  edge confidence: {} extracted · {} inferred · {} ambiguous",
-        conf_get(CONF_EXTRACTED), conf_get(CONF_INFERRED), conf_get(CONF_AMBIGUOUS))?;
+    writeln!(
+        stdout,
+        "  {} files · {} nodes · {} edges",
+        status.files_count, status.nodes_count, status.edges_count
+    )?;
+    writeln!(
+        stdout,
+        "  edge confidence: {} extracted · {} inferred · {} ambiguous",
+        conf_get(CONF_EXTRACTED),
+        conf_get(CONF_INFERRED),
+        conf_get(CONF_AMBIGUOUS)
+    )?;
 
     writeln!(stdout, "\n## Hot functions (most-called)")?;
     if hot.is_empty() {
         writeln!(stdout, "  (none)")?;
     }
     for h in hot.iter().take(top) {
-        writeln!(stdout, "  {:>4} callers  {} ({}) — {}", h.caller_count, h.name, h.node_type, h.file)?;
+        writeln!(
+            stdout,
+            "  {:>4} callers  {} ({}) — {}",
+            h.caller_count, h.name, h.node_type, h.file
+        )?;
     }
 
     writeln!(stdout, "\n## Architectural chokepoints (betweenness)")?;
@@ -6737,7 +7710,11 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
         writeln!(stdout, "  (none)")?;
     }
     for c in &surprising {
-        writeln!(stdout, "  [{}] {} → {}  ({} {})", c.score, c.source, c.target, c.confidence, c.relation)?;
+        writeln!(
+            stdout,
+            "  [{}] {} → {}  ({} {})",
+            c.score, c.source, c.target, c.confidence, c.relation
+        )?;
     }
 
     writeln!(stdout, "\n## Dead code (unused symbols)")?;
@@ -6745,7 +7722,11 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
         writeln!(stdout, "  (none)")?;
     }
     for d in &dead {
-        writeln!(stdout, "  {} ({}) — {}:{}", d.name, d.node_type, d.file_path, d.start_line)?;
+        writeln!(
+            stdout,
+            "  {} ({}) — {}:{}",
+            d.name, d.node_type, d.file_path, d.start_line
+        )?;
     }
 
     Ok(())
@@ -6753,8 +7734,10 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
 
 /// CLI arguments for the `benchmark` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp benchmark",
-          about = "Benchmark index speed, query latency, token savings")]
+#[command(
+    name = "code-graph-mcp benchmark",
+    about = "Benchmark index speed, query latency, token savings"
+)]
 pub struct BenchmarkArgs {
     /// JSON output
     #[arg(long)]
@@ -6789,8 +7772,10 @@ pub fn cmd_benchmark(project_root: &Path, args: BenchmarkArgs) -> Result<()> {
     let nodes_created = result.nodes_created;
     let edges_created = result.edges_created;
 
-    eprintln!("[benchmark] Full index: {}ms ({} files, {} nodes, {} edges)",
-        full_index_ms, files_indexed, nodes_created, edges_created);
+    eprintln!(
+        "[benchmark] Full index: {}ms ({} files, {} nodes, {} edges)",
+        full_index_ms, files_indexed, nodes_created, edges_created
+    );
 
     // 2. Incremental index (no-change detection — should be fast)
     let t_incr = Instant::now();
@@ -6814,7 +7799,10 @@ pub fn cmd_benchmark(project_root: &Path, args: BenchmarkArgs) -> Result<()> {
     let p50_us = query_times_us[query_times_us.len() / 2];
     let p99_us = query_times_us[query_times_us.len() - 1]; // with 5 samples, P99 ≈ max
 
-    eprintln!("[benchmark] Query latency P50: {}us, P99: {}us", p50_us, p99_us);
+    eprintln!(
+        "[benchmark] Query latency P50: {}us, P99: {}us",
+        p50_us, p99_us
+    );
 
     // 4. DB size
     let db_size_bytes = std::fs::metadata(&bench_db_path)
@@ -6840,8 +7828,12 @@ pub fn cmd_benchmark(project_root: &Path, args: BenchmarkArgs) -> Result<()> {
     // Also clean up WAL/SHM files that SQLite may leave behind
     let wal_path = bench_db_path.with_extension("db-wal");
     let shm_path = bench_db_path.with_extension("db-shm");
-    if wal_path.exists() { let _ = std::fs::remove_file(&wal_path); }
-    if shm_path.exists() { let _ = std::fs::remove_file(&shm_path); }
+    if wal_path.exists() {
+        let _ = std::fs::remove_file(&wal_path);
+    }
+    if shm_path.exists() {
+        let _ = std::fs::remove_file(&shm_path);
+    }
 
     if json_mode {
         let json = serde_json::json!({
@@ -6861,8 +7853,11 @@ pub fn cmd_benchmark(project_root: &Path, args: BenchmarkArgs) -> Result<()> {
         writeln!(stdout, "Benchmark Results")?;
         writeln!(stdout, "=================")?;
         writeln!(stdout)?;
-        writeln!(stdout, "Full index:          {:>8}ms  ({} files, {} nodes, {} edges)",
-            full_index_ms, files_indexed, nodes_created, edges_created)?;
+        writeln!(
+            stdout,
+            "Full index:          {:>8}ms  ({} files, {} nodes, {} edges)",
+            full_index_ms, files_indexed, nodes_created, edges_created
+        )?;
         writeln!(stdout, "Incremental (noop):  {:>8}ms", incr_index_ms)?;
         writeln!(stdout, "Query latency P50:   {:>8}us", p50_us)?;
         writeln!(stdout, "Query latency P99:   {:>8}us", p99_us)?;
@@ -6877,8 +7872,10 @@ pub fn cmd_benchmark(project_root: &Path, args: BenchmarkArgs) -> Result<()> {
 
 /// CLI arguments for the `snapshot` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp snapshot",
-          about = "Build or inspect a portable graph snapshot")]
+#[command(
+    name = "code-graph-mcp snapshot",
+    about = "Build or inspect a portable graph snapshot"
+)]
 pub struct SnapshotArgs {
     #[command(subcommand)]
     pub command: SnapshotCommand,
@@ -6920,7 +7917,12 @@ pub struct SnapshotInspectArgs {
 /// Build a portable graph snapshot. `snapshot create --out <path>
 /// [--include-embeddings] [--root <dir>] [--quiet]`.
 pub fn cmd_snapshot_create(project_root: &Path, args: SnapshotCreateArgs) -> Result<()> {
-    let SnapshotCreateArgs { out, include_embeddings: include, root, quiet } = args;
+    let SnapshotCreateArgs {
+        out,
+        include_embeddings: include,
+        root,
+        quiet,
+    } = args;
 
     let root = root
         .map(std::path::PathBuf::from)
@@ -6940,7 +7942,8 @@ pub fn cmd_snapshot_create(project_root: &Path, args: SnapshotCreateArgs) -> Res
         if !parent.as_os_str().is_empty() && !parent.exists() {
             anyhow::bail!(
                 "--out parent directory does not exist: {} (create it first with `mkdir -p {}`)",
-                parent.display(), parent.display()
+                parent.display(),
+                parent.display()
             );
         }
     }
@@ -6970,8 +7973,10 @@ pub fn cmd_snapshot_inspect(args: SnapshotInspectArgs) -> Result<()> {
 
 /// CLI arguments for the `reindex` subcommand (audit #4 clap migration).
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp reindex",
-          about = "Incremental index refresh; --from-snapshot drops the index and refetches the published snapshot (rebuild-index for an unconditional rebuild)")]
+#[command(
+    name = "code-graph-mcp reindex",
+    about = "Incremental index refresh; --from-snapshot drops the index and refetches the published snapshot (rebuild-index for an unconditional rebuild)"
+)]
 pub struct ReindexArgs {
     /// Refetch the published snapshot before indexing (falls back to full index)
     #[arg(long)]
@@ -7031,7 +8036,11 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         let outside = tempfile::TempDir::new().unwrap();
         let secret = outside.path().join("secret.ts");
-        std::fs::write(&secret, "import { KEY } from './creds';\nexport { KEY } from './creds';\n").unwrap();
+        std::fs::write(
+            &secret,
+            "import { KEY } from './creds';\nexport { KEY } from './creds';\n",
+        )
+        .unwrap();
         let link = root.path().join("link.ts");
         symlink(&secret, &link).unwrap();
 
@@ -7071,7 +8080,11 @@ mod tests {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let outside = tmp.path().parent().unwrap().join("secret-deps-drift-guard.ts");
+        let outside = tmp
+            .path()
+            .parent()
+            .unwrap()
+            .join("secret-deps-drift-guard.ts");
         std::fs::write(&outside, "import { s } from './secret-source';\n").unwrap();
         let link = root.join("link.ts");
         symlink(&outside, &link).unwrap();
@@ -7121,7 +8134,10 @@ mod tests {
             .conn()
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
             .unwrap();
-        assert!(nodes > 0, "structure index must be built even with --no-embed");
+        assert!(
+            nodes > 0,
+            "structure index must be built even with --no-embed"
+        );
         let (embedded, _embeddable) = queries::count_nodes_with_vectors(db.conn()).unwrap();
         assert_eq!(embedded, 0, "--no-embed must leave zero vectors");
     }
@@ -7151,12 +8167,25 @@ mod tests {
             "t1→t2 (re-grep) and t5→t6 (read) count; t3→t4 (cli use) is a conversion, not re-search");
         // Both follow-ups here are observe (a file read acting on the delivered
         // answer) → neither a sustained drill-down nor a fall-through cg failed.
-        assert_eq!(s.sustained_after_answer, 0, "no follow-up was itself answered by cg");
-        assert_eq!(s.fallthrough_after_answer, 0, "no follow-up was a search cg couldn't satisfy");
+        assert_eq!(
+            s.sustained_after_answer, 0,
+            "no follow-up was itself answered by cg"
+        );
+        assert_eq!(
+            s.fallthrough_after_answer, 0,
+            "no follow-up was a search cg couldn't satisfy"
+        );
         assert_eq!(s.observe, 3, "t2,t6,t8 observes");
         assert_eq!(s.cli_uses, 1, "t4");
-        assert_eq!(s.by_action.get("observe"), None, "observe is not a recommendation action");
-        assert_eq!(s.total, 4, "4 denies counted; observe + cli use excluded from total");
+        assert_eq!(
+            s.by_action.get("observe"),
+            None,
+            "observe is not a recommendation action"
+        );
+        assert_eq!(
+            s.total, 4,
+            "4 denies counted; observe + cli use excluded from total"
+        );
     }
 
     #[test]
@@ -7190,9 +8219,18 @@ mod tests {
         let s = aggregate_recommendations_jsonl(content);
         assert_eq!(s.deny_answered, 7, "L1,L2,L4,L6,L8,L10,L12 answered");
         assert_eq!(s.deny_unanswered, 1, "L5 static");
-        assert_eq!(s.researched_after_answer, 4, "L2,L5,L7,L9 are search follow-ups; L3/L11 use disarm");
-        assert_eq!(s.sustained_after_answer, 1, "L1→L2: cg answered the follow-up too");
-        assert_eq!(s.fallthrough_after_answer, 2, "L4→L5 (static) and L6→L7 (advisory hint): cg couldn't satisfy");
+        assert_eq!(
+            s.researched_after_answer, 4,
+            "L2,L5,L7,L9 are search follow-ups; L3/L11 use disarm"
+        );
+        assert_eq!(
+            s.sustained_after_answer, 1,
+            "L1→L2: cg answered the follow-up too"
+        );
+        assert_eq!(
+            s.fallthrough_after_answer, 2,
+            "L4→L5 (static) and L6→L7 (advisory hint): cg couldn't satisfy"
+        );
         assert_eq!(s.observe, 1, "L9");
         assert_eq!(s.cli_uses, 2, "L3,L11");
     }
@@ -7230,10 +8268,18 @@ mod tests {
 ";
         let s = aggregate_recommendations_jsonl(content);
         assert_eq!(s.deny_answered, 6, "A1,A2,A4,A6,A7,A9 answered");
-        assert_eq!(s.researched_after_answer, 4, "A2,A5,A7,A10 follow answered denies; A3/A8 use disarm");
-        assert_eq!(s.fallthrough_after_answer, 2,
-            "A1→A2 (same-pattern re-deny) and A4→A5 (same-pattern re-grep observe): answer ignored");
-        assert_eq!(s.sustained_after_answer, 1, "A6→A7: different pattern = genuine drill-down cg also answered");
+        assert_eq!(
+            s.researched_after_answer, 4,
+            "A2,A5,A7,A10 follow answered denies; A3/A8 use disarm"
+        );
+        assert_eq!(
+            s.fallthrough_after_answer, 2,
+            "A1→A2 (same-pattern re-deny) and A4→A5 (same-pattern re-grep observe): answer ignored"
+        );
+        assert_eq!(
+            s.sustained_after_answer, 1,
+            "A6→A7: different pattern = genuine drill-down cg also answered"
+        );
         assert_eq!(s.observe, 2, "A5,A10");
         assert_eq!(s.cli_uses, 2, "A3,A8");
     }
@@ -7263,11 +8309,22 @@ mod tests {
 ";
         let s = aggregate_recommendations_jsonl(content);
         assert_eq!(s.deny_answered, 4, "N1,N3,N5,N7 answered");
-        assert_eq!(s.researched_after_answer, 4, "N2,N4,N6,N8 all follow answered denies");
-        assert_eq!(s.followup_inconclusive, 2, "N2 (no-hits) + N4 (unavailable): null signal, excluded");
-        assert_eq!(s.fallthrough_after_answer, 2,
-            "N6 (static deny cg couldn't satisfy) + N8 (same-pattern re-grep wins over no-hits)");
-        assert_eq!(s.sustained_after_answer, 0, "no follow-up was itself answered by cg");
+        assert_eq!(
+            s.researched_after_answer, 4,
+            "N2,N4,N6,N8 all follow answered denies"
+        );
+        assert_eq!(
+            s.followup_inconclusive, 2,
+            "N2 (no-hits) + N4 (unavailable): null signal, excluded"
+        );
+        assert_eq!(
+            s.fallthrough_after_answer, 2,
+            "N6 (static deny cg couldn't satisfy) + N8 (same-pattern re-grep wins over no-hits)"
+        );
+        assert_eq!(
+            s.sustained_after_answer, 0,
+            "no follow-up was itself answered by cg"
+        );
     }
 
     #[test]
@@ -7294,12 +8351,32 @@ mod tests {
 {\"ts\":\"I6\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"baz\",\"mode\":\"grep\"}
 ";
         let s = aggregate_recommendations_jsonl(content);
-        assert_eq!(s.by_action.get("inject"), Some(&3), "I1,I3,I6 are inject recommendation events");
-        assert_eq!(*s.by_hook.get("grep").unwrap(), 4, "I1,I3,I4,I6 are grep recommendation events (I2 observe excluded)");
-        assert_eq!(s.total, 4, "I1,I3,I4,I6 in total; I2 observe + I5 use excluded");
-        assert_eq!(s.researched_after_answer, 2, "I2 (after I1) and I4 (after I3) follow answered injects");
-        assert_eq!(s.fallthrough_after_answer, 1, "I1→I2: same-pattern re-grep = inline inject ignored");
-        assert_eq!(s.sustained_after_answer, 1, "I3→I4: different pattern, cg also answered = drill-down");
+        assert_eq!(
+            s.by_action.get("inject"),
+            Some(&3),
+            "I1,I3,I6 are inject recommendation events"
+        );
+        assert_eq!(
+            *s.by_hook.get("grep").unwrap(),
+            4,
+            "I1,I3,I4,I6 are grep recommendation events (I2 observe excluded)"
+        );
+        assert_eq!(
+            s.total, 4,
+            "I1,I3,I4,I6 in total; I2 observe + I5 use excluded"
+        );
+        assert_eq!(
+            s.researched_after_answer, 2,
+            "I2 (after I1) and I4 (after I3) follow answered injects"
+        );
+        assert_eq!(
+            s.fallthrough_after_answer, 1,
+            "I1→I2: same-pattern re-grep = inline inject ignored"
+        );
+        assert_eq!(
+            s.sustained_after_answer, 1,
+            "I3→I4: different pattern, cg also answered = drill-down"
+        );
         assert_eq!(s.observe, 1, "I2");
         assert_eq!(s.cli_uses, 1, "I5");
     }
@@ -7319,13 +8396,21 @@ mod tests {
 {\"ts\":\"t5\",\"hook\":\"grep\",\"action\":\"inject\",\"answered\":true,\"pattern\":\"e\"}
 ";
         let s = aggregate_recommendations_jsonl(content);
-        assert_eq!(s.by_action.get("inject"), Some(&5), "all 5 are inject events");
+        assert_eq!(
+            s.by_action.get("inject"),
+            Some(&5),
+            "all 5 are inject events"
+        );
         assert_eq!(s.inject_by_mode.get("callgraph"), Some(&2), "t1,t3");
         assert_eq!(s.inject_by_mode.get("grep"), Some(&1), "t2");
         assert_eq!(s.inject_by_mode.get("show"), Some(&1), "t4");
         // t5 has no `mode` field → not counted in any mode bucket; the mode map sums
         // to 4 while by_action.inject stays 5 (mode is best-effort metadata).
-        assert_eq!(s.inject_by_mode.values().sum::<u64>(), 4, "t5 (no mode) is uncounted");
+        assert_eq!(
+            s.inject_by_mode.values().sum::<u64>(),
+            4,
+            "t5 (no mode) is uncounted"
+        );
     }
 
     #[test]
@@ -7337,20 +8422,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
 
-        std::fs::write(d.join(".git"), format!(
-            "gitdir: {}/main/.git/worktrees/wt\n", d.display())).unwrap();
+        std::fs::write(
+            d.join(".git"),
+            format!("gitdir: {}/main/.git/worktrees/wt\n", d.display()),
+        )
+        .unwrap();
         assert_eq!(worktree_main_root(d), Some(d.join("main")));
 
-        std::fs::write(d.join(".git"), format!(
-            "gitdir: {}/outer/.git/modules/sub\n", d.display())).unwrap();
-        assert_eq!(worktree_main_root(d), None, "submodule gitdir is a hard boundary");
+        std::fs::write(
+            d.join(".git"),
+            format!("gitdir: {}/outer/.git/modules/sub\n", d.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            worktree_main_root(d),
+            None,
+            "submodule gitdir is a hard boundary"
+        );
 
         // Separator-agnostic marker (CI windows-latest caught this on v0.100.1):
         // git writes forward slashes in gitdir even on Windows — the first case
         // above already covers that; this one pins the backslash shape, with the
         // returned prefix keeping its ORIGINAL separators.
-        std::fs::write(d.join(".git"), format!(
-            "gitdir: {}\\main\\.git\\worktrees\\wt\n", d.display())).unwrap();
+        std::fs::write(
+            d.join(".git"),
+            format!("gitdir: {}\\main\\.git\\worktrees\\wt\n", d.display()),
+        )
+        .unwrap();
         assert_eq!(
             worktree_main_root(d),
             Some(PathBuf::from(format!("{}\\main", d.display()))),
@@ -7378,14 +8476,24 @@ mod tests {
 ";
         let s = aggregate_recommendations_jsonl(content);
         assert_eq!(s.inject_skipped, 2, "t1 + t4 are skips");
-        assert_eq!(s.by_action.get("inject"), Some(&3), "skips still count as inject events");
+        assert_eq!(
+            s.by_action.get("inject"),
+            Some(&3),
+            "skips still count as inject events"
+        );
         // t1 (answered:false) must NOT arm — so t2 is not scored as a re-search.
         // t2 (answered inject) arms → t3 (answered deny, different pattern) scores
         // sustained; t3 arms → t4's reason:"unavailable" scores inconclusive, not
         // fallthrough. Total re-searches: t2→t3 and t3→t4 (NOT t1→t2).
-        assert_eq!(s.researched_after_answer, 2, "t2→t3 and t3→t4; t1 must not arm");
+        assert_eq!(
+            s.researched_after_answer, 2,
+            "t2→t3 and t3→t4; t1 must not arm"
+        );
         assert_eq!(s.sustained_after_answer, 1, "t3 after answered t2");
-        assert_eq!(s.followup_inconclusive, 1, "unavailable skip is a null signal");
+        assert_eq!(
+            s.followup_inconclusive, 1,
+            "unavailable skip is a null signal"
+        );
         assert_eq!(s.fallthrough_after_answer, 0);
     }
 
@@ -7403,11 +8511,22 @@ mod tests {
         let s = aggregate_recommendations_jsonl(content);
         assert_eq!(s.live_impact, 2, "t1,t3 live_impact");
         assert_eq!(s.total, 2, "only the deny + hint are recommendation events");
-        assert_eq!(s.by_action.get("live_impact"), None, "live_impact is not a recommendation action");
-        assert_eq!(s.by_hook.get("session"), None, "session hook is not a recommendation hook");
+        assert_eq!(
+            s.by_action.get("live_impact"),
+            None,
+            "live_impact is not a recommendation action"
+        );
+        assert_eq!(
+            s.by_hook.get("session"),
+            None,
+            "session hook is not a recommendation hook"
+        );
         // t2 answered deny arms; t3 is live_impact (not a search event) → it must
         // NOT count as a re-search and must disarm.
-        assert_eq!(s.researched_after_answer, 0, "live_impact after an answered deny is not a re-search");
+        assert_eq!(
+            s.researched_after_answer, 0,
+            "live_impact after an answered deny is not a re-search"
+        );
     }
 
     #[test]
@@ -7460,7 +8579,8 @@ mod tests {
         let cwd = mid.join("src");
         std::fs::create_dir_all(&cwd).unwrap();
         assert_eq!(
-            resolve_project_root_from(&cwd), root,
+            resolve_project_root_from(&cwd),
+            root,
             "cwd below a stray nested index must resolve to the indexed .git root, not the stray",
         );
     }
@@ -7569,7 +8689,10 @@ mod tests {
         record_cli_use(root, "callgraph");
 
         let size = std::fs::metadata(&rec).unwrap().len();
-        assert!(size < 600_000, "recommendations.jsonl should be rotated, got {size} bytes");
+        assert!(
+            size < 600_000,
+            "recommendations.jsonl should be rotated, got {size} bytes"
+        );
         // The freshly recorded use line is last + valid; first surviving line is whole JSON.
         let content = std::fs::read_to_string(&rec).unwrap();
         let last: serde_json::Value =
@@ -7596,13 +8719,20 @@ mod tests {
         // No sentinel → the use event is recorded.
         record_cli_use(root, "grep");
         let after_first = std::fs::read_to_string(&rec).unwrap();
-        assert_eq!(after_first.lines().count(), 1, "use event recorded when no sentinel present");
+        assert_eq!(
+            after_first.lines().count(),
+            1,
+            "use event recorded when no sentinel present"
+        );
 
         // Sentinel present → record_cli_use is a no-op; the file is byte-unchanged.
         std::fs::write(cg.join(crate::domain::NO_METRICS_SENTINEL), b"").unwrap();
         record_cli_use(root, "callgraph");
         let after_second = std::fs::read_to_string(&rec).unwrap();
-        assert_eq!(after_second, after_first, "sentinel must suppress the second use event");
+        assert_eq!(
+            after_second, after_first,
+            "sentinel must suppress the second use event"
+        );
     }
 
     #[test]
@@ -7691,8 +8821,14 @@ mod tests {
         assert!(!dir.join("code-graph.db").exists());
         assert!(!dir.join("code_graph.db").exists());
         assert!(!dir.join("graph.db").exists());
-        assert!(dir.join("index.db").exists(), "non-empty index.db must survive");
-        assert!(dir.join("usage.jsonl").exists(), "unrelated file must survive");
+        assert!(
+            dir.join("index.db").exists(),
+            "non-empty index.db must survive"
+        );
+        assert!(
+            dir.join("usage.jsonl").exists(),
+            "unrelated file must survive"
+        );
     }
 
     #[test]
@@ -7754,7 +8890,10 @@ mod tests {
         assert!(formatted.contains("-> Result<Value>"));
         // Guard the fix: param_types already carries its parens, so the formatter must
         // not add a second pair.
-        assert!(!formatted.contains("(("), "must not double-wrap params: {formatted}");
+        assert!(
+            !formatted.contains("(("),
+            "must not double-wrap params: {formatted}"
+        );
     }
 
     #[test]
@@ -7784,7 +8923,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_usage_skips_malformed_and_blank() {
-        let content = "\n\nnot-json\n{\"ts\":\"2026-04-20T00:00:00Z\",\"v\":\"0.12.1\",\"tools\":{}}\n";
+        let content =
+            "\n\nnot-json\n{\"ts\":\"2026-04-20T00:00:00Z\",\"v\":\"0.12.1\",\"tools\":{}}\n";
         let s = aggregate_usage_jsonl(content, None);
         assert_eq!(s.sessions, 1);
         assert_eq!(s.parse_errors, 1);
@@ -7801,14 +8941,24 @@ mod tests {
         let s3 = r#"{"ts":"2026-06-01T00:00:00Z","v":"0.60.0","tools":{"get_call_graph":{"n":1,"ms":90,"err":1,"max_ms":90}}}"#;
         let content = format!("{s1}\n{s2}\n{s3}\n");
         let s = aggregate_usage_jsonl(&content, None);
-        let cg = s.tools.get("get_call_graph").expect("get_call_graph aggregated");
+        let cg = s
+            .tools
+            .get("get_call_graph")
+            .expect("get_call_graph aggregated");
         assert_eq!(cg.n, 9);
-        assert_eq!(cg.err, 5, "err sums across all sessions incl. the pre-err_kinds one");
+        assert_eq!(
+            cg.err, 5,
+            "err sums across all sessions incl. the pre-err_kinds one"
+        );
         assert_eq!(cg.err_kinds.get("other").copied(), Some(3));
         assert_eq!(cg.err_kinds.get("not_found").copied(), Some(1));
         let classified: u64 = cg.err_kinds.values().sum();
         assert_eq!(classified, 4);
-        assert_eq!(cg.err - classified, 1, "the pre-feature session is the unrecorded remainder");
+        assert_eq!(
+            cg.err - classified,
+            1,
+            "the pre-feature session is the unrecorded remainder"
+        );
     }
 
     #[test]
@@ -7842,7 +8992,8 @@ mod tests {
         // s3: hint + called cg. s4: no recs (ignored by funnel). s5: deny but only
         // a housekeeping tool (get_index_status) → NOT counted as cg use.
         let s1 = r#"{"ts":"2026-06-10T10:00:00Z","v":"0.45.4","tools":{"get_call_graph":{"n":1,"ms":5,"err":0,"max_ms":5}},"recs":{"deny":2,"hint":0}}"#;
-        let s2 = r#"{"ts":"2026-06-10T11:00:00Z","v":"0.45.4","tools":{},"recs":{"deny":1,"hint":1}}"#;
+        let s2 =
+            r#"{"ts":"2026-06-10T11:00:00Z","v":"0.45.4","tools":{},"recs":{"deny":1,"hint":1}}"#;
         let s3 = r#"{"ts":"2026-06-10T12:00:00Z","v":"0.45.4","tools":{"find_references":{"n":3,"ms":9,"err":0,"max_ms":4}},"recs":{"deny":0,"hint":1}}"#;
         let s4 = r#"{"ts":"2026-06-10T13:00:00Z","v":"0.45.4","tools":{"get_call_graph":{"n":1,"ms":5,"err":0,"max_ms":5}}}"#;
         let s5 = r#"{"ts":"2026-06-10T14:00:00Z","v":"0.45.4","tools":{"get_index_status":{"n":1,"ms":0,"err":0,"max_ms":0}},"recs":{"deny":1,"hint":0}}"#;
@@ -7850,7 +9001,10 @@ mod tests {
         let s = aggregate_usage_jsonl(&content, None);
         // deny sessions: s1, s2, s5 = 3; of those, only s1 called a cg query tool.
         assert_eq!(s.sessions_with_deny, 3, "s1+s2+s5 saw a deny");
-        assert_eq!(s.sessions_with_deny_and_cg, 1, "only s1 called a cg query tool (s5's get_index_status is housekeeping)");
+        assert_eq!(
+            s.sessions_with_deny_and_cg, 1,
+            "only s1 called a cg query tool (s5's get_index_status is housekeeping)"
+        );
         // hint sessions: s2, s3 = 2; of those, only s3 called cg.
         assert_eq!(s.sessions_with_hint, 2);
         assert_eq!(s.sessions_with_hint_and_cg, 1);
@@ -7863,7 +9017,10 @@ mod tests {
         // (major, minor, patch) so the displayed list reads in true version order.
         let mut vs = vec!["0.32.2", "0.5.40", "0.11.0", "0.9.0", "0.5.43", "0.7.1"];
         vs.sort_by_key(|v| version_sort_key(v));
-        assert_eq!(vs, vec!["0.5.40", "0.5.43", "0.7.1", "0.9.0", "0.11.0", "0.32.2"]);
+        assert_eq!(
+            vs,
+            vec!["0.5.40", "0.5.43", "0.7.1", "0.9.0", "0.11.0", "0.32.2"]
+        );
         // Lexical sort would have put "0.11.0"/"0.32.2" before "0.5.40" — guard that.
         assert!(
             vs.iter().position(|v| *v == "0.5.40").unwrap()
@@ -7895,10 +9052,11 @@ mod tests {
         let content = [
             r#"{"ts":"t1","hook":"grep","action":"deny"}"#,
             r#"{"ts":"t2","hook":"grep","action":"hint"}"#,
-            r#"  "#,                                   // blank → skipped
-            r#"{not json}"#,                           // malformed → skipped, not counted
+            r#"  "#,         // blank → skipped
+            r#"{not json}"#, // malformed → skipped, not counted
             r#"{"ts":"t3","hook":"read","action":"hint"}"#,
-        ].join("\n");
+        ]
+        .join("\n");
         let s = aggregate_recommendations_jsonl(&content);
         assert_eq!(s.total, 3, "only 3 well-formed lines counted");
         assert_eq!(s.by_action.get("hint").copied(), Some(2));
@@ -7918,14 +9076,21 @@ mod tests {
             // CLI conversions: counted in cli_uses, NOT in total/by_action/by_hook
             r#"{"ts":"t5","hook":"cli","action":"use","cmd":"callgraph"}"#,
             r#"{"ts":"t6","hook":"cli","action":"use","cmd":"grep"}"#,
-        ].join("\n");
+        ]
+        .join("\n");
         let s = aggregate_recommendations_jsonl(&content);
         assert_eq!(s.total, 4, "use lines are conversions, not recommendations");
         assert_eq!(s.cli_uses, 2);
         assert_eq!(s.deny_answered, 1);
-        assert_eq!(s.deny_unanswered, 2, "answered:false and missing field are both static");
+        assert_eq!(
+            s.deny_unanswered, 2,
+            "answered:false and missing field are both static"
+        );
         assert_eq!(s.by_action.get("bypass").copied(), Some(1));
-        assert!(!s.by_hook.contains_key("cli"), "cli use lines stay out of by_hook");
+        assert!(
+            !s.by_hook.contains_key("cli"),
+            "cli use lines stay out of by_hook"
+        );
     }
 
     #[test]
@@ -7962,21 +9127,33 @@ mod tests {
     fn test_normalize_user_path_dot_means_whole_project() {
         // From the project root, `.` is the whole project (empty prefix).
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(normalize_user_path_from(tmp.path(), tmp.path(), ".").unwrap(), "");
+        assert_eq!(
+            normalize_user_path_from(tmp.path(), tmp.path(), ".").unwrap(),
+            ""
+        );
     }
 
     #[test]
     fn test_normalize_user_path_strips_dot_slash() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(normalize_user_path_from(tmp.path(), tmp.path(), "./src/parser").unwrap(), "src/parser");
+        assert_eq!(
+            normalize_user_path_from(tmp.path(), tmp.path(), "./src/parser").unwrap(),
+            "src/parser"
+        );
     }
 
     #[test]
     fn test_normalize_user_path_passes_relative_through() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        assert_eq!(normalize_user_path_from(root, root, "src/parser").unwrap(), "src/parser");
-        assert_eq!(normalize_user_path_from(root, root, "src/parser/").unwrap(), "src/parser/");
+        assert_eq!(
+            normalize_user_path_from(root, root, "src/parser").unwrap(),
+            "src/parser"
+        );
+        assert_eq!(
+            normalize_user_path_from(root, root, "src/parser/").unwrap(),
+            "src/parser/"
+        );
     }
 
     #[test]
@@ -7989,18 +9166,92 @@ mod tests {
         let sub = root.join("src");
         let deep = root.join("src/parser");
         // Plain name + `./name` from src/ → src/name.
-        assert_eq!(normalize_user_path_from(root, &sub, "main.rs").unwrap(), "src/main.rs");
-        assert_eq!(normalize_user_path_from(root, &sub, "./parser").unwrap(), "src/parser");
-        assert_eq!(normalize_user_path_from(root, &sub, "parser/mod.rs").unwrap(), "src/parser/mod.rs");
+        assert_eq!(
+            normalize_user_path_from(root, &sub, "main.rs").unwrap(),
+            "src/main.rs"
+        );
+        assert_eq!(
+            normalize_user_path_from(root, &sub, "./parser").unwrap(),
+            "src/parser"
+        );
+        assert_eq!(
+            normalize_user_path_from(root, &sub, "parser/mod.rs").unwrap(),
+            "src/parser/mod.rs"
+        );
         // `.` from a subdir is that subdir, NOT the whole repo (the bug fixed).
         assert_eq!(normalize_user_path_from(root, &sub, ".").unwrap(), "src");
-        assert_eq!(normalize_user_path_from(root, &deep, ".").unwrap(), "src/parser");
+        assert_eq!(
+            normalize_user_path_from(root, &deep, ".").unwrap(),
+            "src/parser"
+        );
         // `../` climbs back toward the root.
-        assert_eq!(normalize_user_path_from(root, &deep, "../mod.rs").unwrap(), "src/mod.rs");
-        assert_eq!(normalize_user_path_from(root, &sub, "../Cargo.toml").unwrap(), "Cargo.toml");
+        assert_eq!(
+            normalize_user_path_from(root, &deep, "../mod.rs").unwrap(),
+            "src/mod.rs"
+        );
+        assert_eq!(
+            normalize_user_path_from(root, &sub, "../Cargo.toml").unwrap(),
+            "Cargo.toml"
+        );
         // An absolute path is still root-relative regardless of cwd.
         let abs = root.join("lib.rs");
-        assert_eq!(normalize_user_path_from(root, &sub, abs.to_str().unwrap()).unwrap(), "lib.rs");
+        assert_eq!(
+            normalize_user_path_from(root, &sub, abs.to_str().unwrap()).unwrap(),
+            "lib.rs"
+        );
+    }
+
+    #[test]
+    fn test_normalize_user_path_root_relative_from_subdir_rebases() {
+        // Field failure 2026-07-24 (same class as cmd_grep's): the agent's shell
+        // sits in a subdir while it quotes repo-root-relative paths (hook answers
+        // display them root-relative), so the cwd-relative reading doubles the
+        // prefix into a path that exists nowhere. cwd-missing + root-existing is
+        // unambiguous — take the root reading.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join("src");
+        std::fs::create_dir_all(sub.join("parser")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        // File: `src/main.rs` from `src/` — src/src/main.rs missing, src/main.rs exists.
+        assert_eq!(
+            normalize_user_path_from(root, &sub, "src/main.rs").unwrap(),
+            "src/main.rs"
+        );
+        // Directory: `src` from `src/` — the shape of the observed overview failure.
+        assert_eq!(normalize_user_path_from(root, &sub, "src").unwrap(), "src");
+        // Parity guard: when the cwd-relative reading exists, it wins — no rebase.
+        assert_eq!(
+            normalize_user_path_from(root, &sub, "parser").unwrap(),
+            "src/parser"
+        );
+        // Neither exists: historical cwd-relative reading stands (the target may
+        // be indexed but deleted/gitignored — do not guess).
+        assert_eq!(
+            normalize_user_path_from(root, &sub, "ghost.rs").unwrap(),
+            "src/ghost.rs"
+        );
+    }
+
+    #[test]
+    fn test_normalize_user_path_rebase_same_name_collision_documented_tradeoff() {
+        // Audit 2026-07-24 P2: the rebase heuristic decides by filesystem
+        // existence, so when the cwd-relative target was JUST deleted while an
+        // unrelated same-named file exists at the root, it picks the root file.
+        // Disk state alone cannot distinguish this from the doubling case the
+        // heuristic exists for; the stderr note is the disclosure. This test
+        // PINS that tradeoff — if it starts failing because the heuristic got
+        // smarter (e.g. consults the index), update it deliberately.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // Root-level `utils.rs` exists; `src/utils.rs` (what a user in src/
+        // plausibly means) does not — deleted, never existed, or gitignored.
+        std::fs::write(root.join("utils.rs"), "").unwrap();
+        assert_eq!(
+            normalize_user_path_from(root, &root.join("src"), "utils.rs").unwrap(),
+            "utils.rs"
+        );
     }
 
     #[test]
@@ -8013,10 +9264,16 @@ mod tests {
         for escape in ["../../../etc/passwd", "../../../../secret.js"] {
             let err = normalize_user_path_from(root, &deep, escape)
                 .expect_err(&format!("{escape:?} from src/parser must escape"));
-            assert!(format!("{err}").contains("escapes the project root"), "got: {err}");
+            assert!(
+                format!("{err}").contains("escapes the project root"),
+                "got: {err}"
+            );
         }
         // Exactly enough `../` to reach the root (not past) is still in-root.
-        assert_eq!(normalize_user_path_from(root, &deep, "../../lib.rs").unwrap(), "lib.rs");
+        assert_eq!(
+            normalize_user_path_from(root, &deep, "../../lib.rs").unwrap(),
+            "lib.rs"
+        );
     }
 
     #[test]
@@ -8024,7 +9281,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let abs = root.join("src/parser");
-        assert_eq!(normalize_user_path(root, abs.to_str().unwrap()).unwrap(), "src/parser");
+        assert_eq!(
+            normalize_user_path(root, abs.to_str().unwrap()).unwrap(),
+            "src/parser"
+        );
     }
 
     #[test]
@@ -8046,8 +9306,10 @@ mod tests {
         for c in &climbs {
             let err = normalize_user_path(root, c)
                 .expect_err(&format!("{c:?} must be rejected as an escape"));
-            assert!(format!("{err}").contains("escapes the project root"),
-                "{c:?} should be rejected as an escape; got: {err}");
+            assert!(
+                format!("{err}").contains("escapes the project root"),
+                "{c:?} should be rejected as an escape; got: {err}"
+            );
         }
         // Absolute path under root with interior `..` that stays in-root is allowed.
         let inroot = format!("{root_str}/src/../lib.rs");
@@ -8060,14 +9322,20 @@ mod tests {
         // swap. For `index.db` both happen to agree, but for the rebuild temp
         // `index.db.rebuild-<pid>` only the literal append is correct.
         let canonical = std::path::Path::new("/p/.code-graph/index.db");
-        assert_eq!(db_sidecar(canonical, "-wal"),
-            std::path::PathBuf::from("/p/.code-graph/index.db-wal"));
-        assert_eq!(db_sidecar(canonical, "-shm"),
-            std::path::PathBuf::from("/p/.code-graph/index.db-shm"));
+        assert_eq!(
+            db_sidecar(canonical, "-wal"),
+            std::path::PathBuf::from("/p/.code-graph/index.db-wal")
+        );
+        assert_eq!(
+            db_sidecar(canonical, "-shm"),
+            std::path::PathBuf::from("/p/.code-graph/index.db-shm")
+        );
         let temp = std::path::Path::new("/p/.code-graph/index.db.rebuild-1234");
-        assert_eq!(db_sidecar(temp, "-wal"),
+        assert_eq!(
+            db_sidecar(temp, "-wal"),
             std::path::PathBuf::from("/p/.code-graph/index.db.rebuild-1234-wal"),
-            "WAL of a multi-dot temp db must append -wal, not swap the extension");
+            "WAL of a multi-dot temp db must append -wal, not swap the extension"
+        );
     }
 
     #[test]
@@ -8082,12 +9350,17 @@ mod tests {
         for escape in ["../secret.js", "../../etc/passwd", "a/../../b", ".."] {
             let err = normalize_user_path(root, escape).unwrap_err();
             let msg = format!("{err}");
-            assert!(msg.contains("escapes the project root"),
-                "{escape:?} should be rejected as an escape; got: {msg}");
+            assert!(
+                msg.contains("escapes the project root"),
+                "{escape:?} should be rejected as an escape; got: {msg}"
+            );
         }
         // Non-escaping `..` (stays at or below the root) is still allowed through.
         assert_eq!(normalize_user_path(root, "a/../b").unwrap(), "a/../b");
-        assert_eq!(normalize_user_path(root, "src/sub/../mod.rs").unwrap(), "src/sub/../mod.rs");
+        assert_eq!(
+            normalize_user_path(root, "src/sub/../mod.rs").unwrap(),
+            "src/sub/../mod.rs"
+        );
     }
 
     #[test]
@@ -8106,10 +9379,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src/parser")).unwrap();
-        let link_root = tmp.path().parent().unwrap().join(format!(
-            "cg-norm-link-{}",
-            std::process::id()
-        ));
+        let link_root = tmp
+            .path()
+            .parent()
+            .unwrap()
+            .join(format!("cg-norm-link-{}", std::process::id()));
         let _ = std::fs::remove_file(&link_root);
         #[cfg(unix)]
         std::os::unix::fs::symlink(root, &link_root).unwrap();
@@ -8126,33 +9400,77 @@ mod tests {
     fn test_normalize_grep_argv_attached_context() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // Attached numeric context forms split into flag + value.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-A2", "pat"])), s(&["grep", "-A", "2", "pat"]));
-        assert_eq!(normalize_grep_argv(s(&["grep", "-B1", "pat"])), s(&["grep", "-B", "1", "pat"]));
-        assert_eq!(normalize_grep_argv(s(&["grep", "-C10", "pat"])), s(&["grep", "-C", "10", "pat"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-A2", "pat"])),
+            s(&["grep", "-A", "2", "pat"])
+        );
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-B1", "pat"])),
+            s(&["grep", "-B", "1", "pat"])
+        );
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-C10", "pat"])),
+            s(&["grep", "-C", "10", "pat"])
+        );
         // Bundled boolean short(s) + trailing attached context: peel the digits,
         // keep the cluster so clap parses `-nA 2` as `-n -A=2`.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-nA2", "pat"])), s(&["grep", "-nA", "2", "pat"]));
-        assert_eq!(normalize_grep_argv(s(&["grep", "-niB3", "pat"])), s(&["grep", "-niB", "3", "pat"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-nA2", "pat"])),
+            s(&["grep", "-nA", "2", "pat"])
+        );
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-niB3", "pat"])),
+            s(&["grep", "-niB", "3", "pat"])
+        );
         // Value flag not last in the bundle (`-A2B3`) → digit in the middle → left alone.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-A2B3"])), s(&["grep", "-A2B3"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-A2B3"])),
+            s(&["grep", "-A2B3"])
+        );
         // Bare `-A` (clap takes the next token as its value) is untouched.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-A", "2", "pat"])), s(&["grep", "-A", "2", "pat"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-A", "2", "pat"])),
+            s(&["grep", "-A", "2", "pat"])
+        );
         // Non-context single-dash flags and `--long` patterns are untouched.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-n", "pat"])), s(&["grep", "-n", "pat"]));
-        assert_eq!(normalize_grep_argv(s(&["grep", "--no-default-features"])),
-                   s(&["grep", "--no-default-features"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-n", "pat"])),
+            s(&["grep", "-n", "pat"])
+        );
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "--no-default-features"])),
+            s(&["grep", "--no-default-features"])
+        );
         // `-m` is the `--max-count` short alias: attached `-m2` splits like `-A2`
         // (the same allow_hyphen_values quirk forces the peel — see the fn doc).
-        assert_eq!(normalize_grep_argv(s(&["grep", "-m2", "pat"])), s(&["grep", "-m", "2", "pat"]));
-        assert_eq!(normalize_grep_argv(s(&["grep", "-nm2", "pat"])), s(&["grep", "-nm", "2", "pat"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-m2", "pat"])),
+            s(&["grep", "-m", "2", "pat"])
+        );
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-nm2", "pat"])),
+            s(&["grep", "-nm", "2", "pat"])
+        );
         // `-M` (`--max-columns`) is also a numeric value short → attached splits.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-M512", "pat"])), s(&["grep", "-M", "512", "pat"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-M512", "pat"])),
+            s(&["grep", "-M", "512", "pat"])
+        );
         // Digit-suffix on an unsupported short (`-z2`) is left alone.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-z2", "pat"])), s(&["grep", "-z2", "pat"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-z2", "pat"])),
+            s(&["grep", "-z2", "pat"])
+        );
         // Non-digit tail (`-A2x`) is not a valid attached form → left alone.
-        assert_eq!(normalize_grep_argv(s(&["grep", "-A2x"])), s(&["grep", "-A2x"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "-A2x"])),
+            s(&["grep", "-A2x"])
+        );
         // `--` stops normalization so a literal `-A2` pattern survives.
-        assert_eq!(normalize_grep_argv(s(&["grep", "--", "-A2"])), s(&["grep", "--", "-A2"]));
+        assert_eq!(
+            normalize_grep_argv(s(&["grep", "--", "-A2"])),
+            s(&["grep", "--", "-A2"])
+        );
     }
 
     #[test]
@@ -8169,8 +9487,10 @@ mod tests {
         }
         // Supported shorts (incl. bundles + attached/standalone value shorts) pass.
         // -c (count), -t (type), -g (glob), -M (max-columns) were added in v0.79.
-        for ok in ["-i", "-w", "-F", "-l", "-n", "-r", "-R", "-H", "-A2", "-nA2",
-                   "-niB3", "-C", "-m", "-m5", "-iw", "-c", "-t", "-g", "-M", "-M512"] {
+        for ok in [
+            "-i", "-w", "-F", "-l", "-n", "-r", "-R", "-H", "-A2", "-nA2", "-niB3", "-C", "-m",
+            "-m5", "-iw", "-c", "-t", "-g", "-M", "-M512",
+        ] {
             assert_eq!(
                 first_unsupported_grep_flag(&s(&["grep", ok, "pat"])),
                 None,

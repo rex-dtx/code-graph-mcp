@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{REL_ROUTES_TO, REL_EXPORTS, REL_REFERENCES};
+use crate::domain::{REL_EXPORTS, REL_REFERENCES, REL_ROUTES_TO};
 
 #[test]
 fn test_extract_php_include_imports() {
@@ -17,16 +17,37 @@ fn test_extract_php_include_imports() {
         use App\\Models\\Account;\n\
         function handle($r) { return process($r); }\n";
     let rels = extract_relations(code, "php").unwrap();
-    let imports: Vec<&str> = rels.iter()
+    let imports: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"lib"), "require_once 'lib.php' → import 'lib'; got: {:?}", imports);
-    assert!(imports.contains(&"User"), "require 'src/User.php' → 'User' (dir stripped); got: {:?}", imports);
-    assert!(imports.contains(&"helpers"), "include 'helpers.php' → 'helpers'; got: {:?}", imports);
-    assert!(imports.contains(&"config"), "include_once __DIR__.'/config.php' → 'config'; got: {:?}", imports);
+    assert!(
+        imports.contains(&"lib"),
+        "require_once 'lib.php' → import 'lib'; got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"User"),
+        "require 'src/User.php' → 'User' (dir stripped); got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"helpers"),
+        "include 'helpers.php' → 'helpers'; got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"config"),
+        "include_once __DIR__.'/config.php' → 'config'; got: {:?}",
+        imports
+    );
     // The existing `use` namespace import (last segment) must still work.
-    assert!(imports.contains(&"Account"), "use App\\Models\\Account → 'Account'; got: {:?}", imports);
+    assert!(
+        imports.contains(&"Account"),
+        "use App\\Models\\Account → 'Account'; got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -40,14 +61,19 @@ fn test_php_top_level_call_attributes_to_module() {
         function greetPhp() { return 1; }\n\
         greetPhp();\n";
     let rels = extract_relations(code, "php").unwrap();
-    let has_edge = rels.iter().any(|r|
+    let has_edge = rels.iter().any(|r| {
         r.relation == crate::domain::REL_CALLS
             && r.target_name == "greetPhp"
-            && r.source_name == "<module>");
-    assert!(has_edge,
+            && r.source_name == "<module>"
+    });
+    assert!(
+        has_edge,
         "top-level greetPhp() must produce a <module> → greetPhp call edge; got calls: {:?}",
-        rels.iter().filter(|r| r.relation == crate::domain::REL_CALLS)
-            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .filter(|r| r.relation == crate::domain::REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -66,19 +92,38 @@ import java.util.*;\n\
 import static org.junit.Assert.assertEquals;\n\
 class App { }\n";
     let rels = extract_relations(code, "java").unwrap();
-    let imports: Vec<&str> = rels.iter()
+    let imports: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"B"), "import p.B → 'B'; got: {:?}", imports);
-    assert!(imports.contains(&"List"), "import java.util.List → 'List'; got: {:?}", imports);
-    assert!(imports.contains(&"assertEquals"),
-        "static import → last segment 'assertEquals'; got: {:?}", imports);
+    assert!(
+        imports.contains(&"B"),
+        "import p.B → 'B'; got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"List"),
+        "import java.util.List → 'List'; got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"assertEquals"),
+        "static import → last segment 'assertEquals'; got: {:?}",
+        imports
+    );
     // A wildcard on-demand import names no single symbol → emit nothing (in
     // particular never the package segment `util` or a bare `*`).
-    assert!(!imports.contains(&"util"),
-        "wildcard import must not emit the package segment; got: {:?}", imports);
-    assert!(!imports.contains(&"*"), "wildcard '*' must not be emitted; got: {:?}", imports);
+    assert!(
+        !imports.contains(&"util"),
+        "wildcard import must not emit the package segment; got: {:?}",
+        imports
+    );
+    assert!(
+        !imports.contains(&"*"),
+        "wildcard '*' must not be emitted; got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -95,30 +140,63 @@ fn test_extract_ts_reexport_from_barrel() {
         export function localFn() { return 1; }\n";
     let rels = extract_relations(code, "typescript").unwrap();
 
-    let reexports: Vec<&str> = rels.iter()
+    let reexports: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(reexports.contains(&"API_URL"), "re-export → import 'API_URL'; got: {:?}", reexports);
-    assert!(reexports.contains(&"host"), "re-export → import 'host'; got: {:?}", reexports);
+    assert!(
+        reexports.contains(&"API_URL"),
+        "re-export → import 'API_URL'; got: {:?}",
+        reexports
+    );
+    assert!(
+        reexports.contains(&"host"),
+        "re-export → import 'host'; got: {:?}",
+        reexports
+    );
     // A renamed re-export resolves on the SOURCE name (callApi), not the alias (call).
-    assert!(reexports.contains(&"callApi"), "renamed re-export uses source name 'callApi'; got: {:?}", reexports);
-    assert!(!reexports.contains(&"call"), "the alias must not be the dependency target; got: {:?}", reexports);
+    assert!(
+        reexports.contains(&"callApi"),
+        "renamed re-export uses source name 'callApi'; got: {:?}",
+        reexports
+    );
+    assert!(
+        !reexports.contains(&"call"),
+        "the alias must not be the dependency target; got: {:?}",
+        reexports
+    );
 
     // The js_module specifier is stamped so Phase-2 resolves to the concrete file.
-    let api = rels.iter()
+    let api = rels
+        .iter()
         .find(|r| r.relation == REL_IMPORTS && r.target_name == "API_URL")
         .expect("API_URL re-export edge");
-    assert!(api.metadata.as_deref().unwrap_or("").contains("./constants"),
-        "re-export import carries js_module metadata; got: {:?}", api.metadata);
+    assert!(
+        api.metadata
+            .as_deref()
+            .unwrap_or("")
+            .contains("./constants"),
+        "re-export import carries js_module metadata; got: {:?}",
+        api.metadata
+    );
 
     // Declaration exports in the same file still emit REL_EXPORTS (path unchanged).
-    let exports: Vec<&str> = rels.iter()
+    let exports: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_EXPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(exports.contains(&"LOCAL"), "declaration const export still works; got: {:?}", exports);
-    assert!(exports.contains(&"localFn"), "function export still works; got: {:?}", exports);
+    assert!(
+        exports.contains(&"LOCAL"),
+        "declaration const export still works; got: {:?}",
+        exports
+    );
+    assert!(
+        exports.contains(&"localFn"),
+        "function export still works; got: {:?}",
+        exports
+    );
 }
 
 #[test]
@@ -145,12 +223,28 @@ fn test_extract_flask_route_methods_kwarg() {
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
             .and_then(|v| v.get("method").and_then(|x| x.as_str()).map(String::from))
     };
-    assert_eq!(route_method("list_users").as_deref(), Some("GET"), "methods=['GET'] → GET");
-    assert_eq!(route_method("remove_user").as_deref(), Some("DELETE"), "methods=['DELETE'] → DELETE");
+    assert_eq!(
+        route_method("list_users").as_deref(),
+        Some("GET"),
+        "methods=['GET'] → GET"
+    );
+    assert_eq!(
+        route_method("remove_user").as_deref(),
+        Some("DELETE"),
+        "methods=['DELETE'] → DELETE"
+    );
     // Multi-method: the single-method metadata schema stores the first listed.
-    assert_eq!(route_method("multi").as_deref(), Some("POST"), "methods=['POST','PUT'] → first (POST)");
+    assert_eq!(
+        route_method("multi").as_deref(),
+        Some("POST"),
+        "methods=['POST','PUT'] → first (POST)"
+    );
     // No methods= kwarg → "ANY" (unspecified) preserved.
-    assert_eq!(route_method("noverb").as_deref(), Some("ANY"), "no methods= → ANY");
+    assert_eq!(
+        route_method("noverb").as_deref(),
+        Some("ANY"),
+        "no methods= → ANY"
+    );
 }
 
 #[test]
@@ -170,21 +264,49 @@ run_pipeline() {
 }
 "#;
     let relations = extract_relations(code, "bash").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "run_pipeline")
         .map(|r| r.target_name.as_str())
         .collect();
     // Static, identifier-shaped callees → emitted (path prefix stripped).
-    assert!(calls.contains(&"fetch_data"), "missing fetch_data, got: {:?}", calls);
-    assert!(calls.contains(&"transform_records"), "missing transform_records, got: {:?}", calls);
-    assert!(calls.contains(&"cat"), "missing cat (path prefix stripped), got: {:?}", calls);
-    assert!(calls.contains(&"finalize.sh"), "missing finalize.sh (./prefix stripped), got: {:?}", calls);
+    assert!(
+        calls.contains(&"fetch_data"),
+        "missing fetch_data, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"transform_records"),
+        "missing transform_records, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"cat"),
+        "missing cat (path prefix stripped), got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"finalize.sh"),
+        "missing finalize.sh (./prefix stripped), got: {:?}",
+        calls
+    );
     assert!(calls.contains(&"echo"), "missing echo, got: {:?}", calls);
     // Non-static / non-identifier-shaped → skipped.
-    assert!(!calls.contains(&":"), "':' should be skipped, got: {:?}", calls);
-    assert!(!calls.contains(&"["), "'[' test command should be skipped, got: {:?}", calls);
-    assert!(!calls.iter().any(|c| c.contains('$')),
-        "variable expansions / substitutions should be skipped, got: {:?}", calls);
+    assert!(
+        !calls.contains(&":"),
+        "':' should be skipped, got: {:?}",
+        calls
+    );
+    assert!(
+        !calls.contains(&"["),
+        "'[' test command should be skipped, got: {:?}",
+        calls
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains('$')),
+        "variable expansions / substitutions should be skipped, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -201,16 +323,23 @@ cd /tmp
 run_app "$@"
 "#;
     let relations = extract_relations(code, "bash").unwrap();
-    let module_calls: Vec<&str> = relations.iter()
+    let module_calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "<module>")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(module_calls.contains(&"run_app"),
-        "top-level `run_app` invocation must attribute to <module>, got: {:?}", module_calls);
+    assert!(
+        module_calls.contains(&"run_app"),
+        "top-level `run_app` invocation must attribute to <module>, got: {:?}",
+        module_calls
+    );
     // A call INSIDE a function still attributes to that function, not <module>.
-    assert!(!relations.iter().any(|r|
-        r.relation == REL_CALLS && r.source_name == "<module>" && r.target_name == "echo"),
-        "`echo` is inside run_app's body, must attribute to run_app not <module>");
+    assert!(
+        !relations.iter().any(|r| r.relation == REL_CALLS
+            && r.source_name == "<module>"
+            && r.target_name == "echo"),
+        "`echo` is inside run_app's body, must attribute to run_app not <module>"
+    );
 }
 
 #[test]
@@ -218,17 +347,24 @@ fn test_extract_python_top_level_call_attributes_to_module() {
     // A function invoked only at module top level must produce a
     // `<module> calls main_entry` edge, else dead-code flags the entry point.
     // (Same fix as bash, INDEX_VERSION 26→27.)
-    let code = "def main_entry():\n    return helper()\n\ndef helper():\n    return 1\n\nmain_entry()\n";
+    let code =
+        "def main_entry():\n    return helper()\n\ndef helper():\n    return 1\n\nmain_entry()\n";
     let relations = extract_relations(code, "python").unwrap();
-    let module_calls: Vec<&str> = relations.iter()
+    let module_calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "<module>")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(module_calls.contains(&"main_entry"),
-        "top-level main_entry() must attribute to <module>, got: {:?}", module_calls);
+    assert!(
+        module_calls.contains(&"main_entry"),
+        "top-level main_entry() must attribute to <module>, got: {:?}",
+        module_calls
+    );
     // The call INSIDE main_entry still attributes to main_entry, not <module>.
-    assert!(!module_calls.contains(&"helper"),
-        "`helper` is inside main_entry's body, must attribute to main_entry not <module>");
+    assert!(
+        !module_calls.contains(&"helper"),
+        "`helper` is inside main_entry's body, must attribute to main_entry not <module>"
+    );
 }
 
 #[test]
@@ -238,48 +374,73 @@ fn test_extract_ruby_top_level_call_attributes_to_module() {
     // top-level `entry()` must attribute to <module> so the entry isn't dead.
     let code = "def entry\n  1\nend\n\nentry()\n";
     let relations = extract_relations(code, "ruby").unwrap();
-    let module_calls: Vec<&str> = relations.iter()
+    let module_calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "<module>")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(module_calls.contains(&"entry"),
-        "top-level entry() must attribute to <module>, got: {:?}", module_calls);
+    assert!(
+        module_calls.contains(&"entry"),
+        "top-level entry() must attribute to <module>, got: {:?}",
+        module_calls
+    );
 }
 
 #[test]
 fn test_extract_c_include_imports() {
     let code = "#include \"local/utils.h\"\n#include <stdio.h>\n#include \"helpers.hpp\"\n\nint main() { return 0; }\n";
     let relations = extract_relations(code, "c").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"utils"),
-        "C: missing utils (.h stripped, path stripped), got: {:?}", imports);
-    assert!(imports.contains(&"stdio"),
-        "C: missing stdio (system_lib_string), got: {:?}", imports);
-    assert!(imports.contains(&"helpers"),
-        "C: missing helpers (.hpp stripped), got: {:?}", imports);
-    let import_sources: Vec<&str> = relations.iter()
+    assert!(
+        imports.contains(&"utils"),
+        "C: missing utils (.h stripped, path stripped), got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"stdio"),
+        "C: missing stdio (system_lib_string), got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"helpers"),
+        "C: missing helpers (.hpp stripped), got: {:?}",
+        imports
+    );
+    let import_sources: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.source_name.as_str())
         .collect();
-    assert!(import_sources.iter().all(|s| *s == "<module>"),
-        "all C #include sources should be <module>, got: {:?}", import_sources);
+    assert!(
+        import_sources.iter().all(|s| *s == "<module>"),
+        "all C #include sources should be <module>, got: {:?}",
+        import_sources
+    );
 }
 
 #[test]
 fn test_extract_cpp_include_imports() {
     let code = "#include <vector>\n#include \"my/header.hpp\"\n\nint main() { return 0; }\n";
     let relations = extract_relations(code, "cpp").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"vector"),
-        "C++: missing vector (system header, no extension), got: {:?}", imports);
-    assert!(imports.contains(&"header"),
-        "C++: missing header (.hpp stripped + path stripped), got: {:?}", imports);
+    assert!(
+        imports.contains(&"vector"),
+        "C++: missing vector (system header, no extension), got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"header"),
+        "C++: missing header (.hpp stripped + path stripped), got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -296,16 +457,25 @@ void Engine::ignite() { }
 void run() { Engine::ignite(); }
 "#;
     let relations = extract_relations(code, "cpp").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
     // (1) qualified call `Engine::ignite()` inside run() must be an edge to `ignite`
-    assert!(calls.iter().any(|(s, t)| *s == "run" && *t == "ignite"),
-        "Engine::ignite() qualified call should yield run→ignite; got: {:?}", calls);
+    assert!(
+        calls.iter().any(|(s, t)| *s == "run" && *t == "ignite"),
+        "Engine::ignite() qualified call should yield run→ignite; got: {:?}",
+        calls
+    );
     // (2) in-class method scope: start() calls ignite() → source Engine.start
-    assert!(calls.iter().any(|(s, t)| *s == "Engine.start" && *t == "ignite"),
-        "in-class method call source should be Engine.start; got: {:?}", calls);
+    assert!(
+        calls
+            .iter()
+            .any(|(s, t)| *s == "Engine.start" && *t == "ignite"),
+        "in-class method call source should be Engine.start; got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -325,38 +495,71 @@ bootstrap() {
 }
 "#;
     let relations = extract_relations(code, "bash").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
     // Static, .sh-stripped, path-stripped targets.
-    assert!(imports.contains(&"utils"), "missing utils, got: {:?}", imports);
-    assert!(imports.contains(&"lang"), "missing lang (double-quoted), got: {:?}", imports);
-    assert!(imports.contains(&"helpers"),
-        "missing helpers (single-quoted, .bash stripped), got: {:?}", imports);
-    assert!(imports.contains(&".bashrc"),
-        "missing .bashrc (no extension to strip), got: {:?}", imports);
-    assert!(imports.contains(&"init"), "missing init, got: {:?}", imports);
-    assert!(imports.contains(&"feature"),
-        "missing feature (inside function), got: {:?}", imports);
+    assert!(
+        imports.contains(&"utils"),
+        "missing utils, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"lang"),
+        "missing lang (double-quoted), got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"helpers"),
+        "missing helpers (single-quoted, .bash stripped), got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&".bashrc"),
+        "missing .bashrc (no extension to strip), got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"init"),
+        "missing init, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"feature"),
+        "missing feature (inside function), got: {:?}",
+        imports
+    );
     // Dynamic paths skipped.
-    assert!(!imports.iter().any(|i| i.contains('$') || i.contains('{')),
-        "dynamic paths should be skipped, got: {:?}", imports);
+    assert!(
+        !imports.iter().any(|i| i.contains('$') || i.contains('{')),
+        "dynamic paths should be skipped, got: {:?}",
+        imports
+    );
     // All imports use <module> as source_name (mirrors JS require pattern).
-    let import_sources: Vec<&str> = relations.iter()
+    let import_sources: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.source_name.as_str())
         .collect();
-    assert!(import_sources.iter().all(|s| *s == "<module>"),
-        "all import sources should be <module>, got: {:?}", import_sources);
+    assert!(
+        import_sources.iter().all(|s| *s == "<module>"),
+        "all import sources should be <module>, got: {:?}",
+        import_sources
+    );
     // `source ./conditional/feature.sh` inside bootstrap() must NOT also
     // emit a CALLS edge for `source`.
-    let calls_to_source: Vec<&str> = relations.iter()
+    let calls_to_source: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.target_name == "source")
         .map(|r| r.source_name.as_str())
         .collect();
-    assert!(calls_to_source.is_empty(),
-        "`source` should not emit CALLS, got source_names: {:?}", calls_to_source);
+    assert!(
+        calls_to_source.is_empty(),
+        "`source` should not emit CALLS, got source_names: {:?}",
+        calls_to_source
+    );
 }
 
 #[test]
@@ -368,7 +571,8 @@ function handleLogin(req) {
 }
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| r.target_name.as_str())
         .collect();
@@ -383,11 +587,16 @@ import { UserService } from './services/user';
 import jwt from 'jsonwebtoken';
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"UserService"), "got imports: {:?}", imports);
+    assert!(
+        imports.contains(&"UserService"),
+        "got imports: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -399,15 +608,31 @@ const lifecycle = require('./lifecycle');
 const versionUtils = require('../utils/version-utils.js');
 "#;
     let relations = extract_relations(code, "javascript").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"fs"),        "expected fs import, got: {:?}", imports);
-    assert!(imports.contains(&"path"),      "expected path import, got: {:?}", imports);
-    assert!(imports.contains(&"lifecycle"), "expected lifecycle import, got: {:?}", imports);
-    assert!(imports.contains(&"version-utils"),
-        "expected stripped .js extension, got: {:?}", imports);
+    assert!(
+        imports.contains(&"fs"),
+        "expected fs import, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"path"),
+        "expected path import, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"lifecycle"),
+        "expected lifecycle import, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"version-utils"),
+        "expected stripped .js extension, got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -420,17 +645,32 @@ const { helpers } = require('./helpers');
 app.get('/api/widgets', getWidgets);
 "#;
     let relations = extract_relations(code, "tsx").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
-        .map(|r| r.target_name.as_str()).collect();
-    assert!(imports.contains(&"react"),   "tsx require('react'); got: {:?}", imports);
-    assert!(imports.contains(&"helpers"), "tsx require('./helpers'); got: {:?}", imports);
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        imports.contains(&"react"),
+        "tsx require('react'); got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"helpers"),
+        "tsx require('./helpers'); got: {:?}",
+        imports
+    );
 
-    let routes: Vec<&str> = relations.iter()
+    let routes: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
-        .map(|r| r.target_name.as_str()).collect();
-    assert!(routes.contains(&"getWidgets"),
-        "tsx Express route target; got: {:?}", routes);
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        routes.contains(&"getWidgets"),
+        "tsx Express route target; got: {:?}",
+        routes
+    );
 }
 
 #[test]
@@ -441,11 +681,16 @@ class AdminService extends UserService {
 }
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"UserService"), "got inherits: {:?}", inherits);
+    assert!(
+        inherits.contains(&"UserService"),
+        "got inherits: {:?}",
+        inherits
+    );
 }
 
 #[test]
@@ -455,12 +700,18 @@ app.post('/api/login', handleLogin);
 app.get('/api/users/:id', getUser);
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
-    let routes: Vec<(&str, &str)> = relations.iter()
+    let routes: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
         .collect();
-    assert!(routes.iter().any(|(meta, target)| meta.contains("/api/login") && *target == "handleLogin"),
-        "got routes: {:?}", routes);
+    assert!(
+        routes
+            .iter()
+            .any(|(meta, target)| meta.contains("/api/login") && *target == "handleLogin"),
+        "got routes: {:?}",
+        routes
+    );
 }
 
 #[test]
@@ -475,14 +726,25 @@ router.get('/api/users/:id', authMiddleware, async (req, res) => {
 });
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
-    let routes: Vec<(&str, &str)> = relations.iter()
+    let routes: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
         .collect();
-    assert!(routes.iter().any(|(meta, _target)| meta.contains("/api/login") && meta.contains("\"inline\":true")),
-        "should detect inline arrow handler route, got: {:?}", routes);
-    assert!(routes.iter().any(|(meta, _target)| meta.contains("/api/users/:id")),
-        "should detect multi-arg inline route, got: {:?}", routes);
+    assert!(
+        routes
+            .iter()
+            .any(|(meta, _target)| meta.contains("/api/login") && meta.contains("\"inline\":true")),
+        "should detect inline arrow handler route, got: {:?}",
+        routes
+    );
+    assert!(
+        routes
+            .iter()
+            .any(|(meta, _target)| meta.contains("/api/users/:id")),
+        "should detect multi-arg inline route, got: {:?}",
+        routes
+    );
 }
 
 #[test]
@@ -495,16 +757,30 @@ app.get('/users', async (req, res) => {
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
     // routes_to edge now targets the synthetic handler node, not <module>.
-    let route = relations.iter().find(|r| r.relation == REL_ROUTES_TO).expect("route edge");
+    let route = relations
+        .iter()
+        .find(|r| r.relation == REL_ROUTES_TO)
+        .expect("route edge");
     // Synthetic handler name now carries a per-occurrence `#Lstart` suffix so
     // duplicate same-route handlers stay distinct; assert the base + that all four
     // derivation points (route source/target, scoped call, materialized node) agree.
-    assert!(route.source_name.starts_with("GET /users#L"),
-        "route edge source = synthetic handler name, got {}", route.source_name);
-    assert_eq!(route.target_name, route.source_name, "routes_to is a self-edge on the handler node");
-    assert!(route.metadata.as_deref().unwrap_or("").contains("\"inline\":true"));
+    assert!(
+        route.source_name.starts_with("GET /users#L"),
+        "route edge source = synthetic handler name, got {}",
+        route.source_name
+    );
+    assert_eq!(
+        route.target_name, route.source_name,
+        "routes_to is a self-edge on the handler node"
+    );
+    assert!(route
+        .metadata
+        .as_deref()
+        .unwrap_or("")
+        .contains("\"inline\":true"));
     // The call inside the handler attributes to the handler, not the file <module>.
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == crate::domain::REL_CALLS && r.target_name == "fetchUser")
         .expect("fetchUser call edge");
     assert_eq!(call.source_name, route.source_name,
@@ -512,9 +788,16 @@ app.get('/users', async (req, res) => {
     // Node materialization: extract_nodes produces a function node with the same name.
     let tree = crate::parser::treesitter::parse_tree(code, "typescript").unwrap();
     let nodes = crate::parser::treesitter::extract_nodes_from_tree(&tree, code, "typescript");
-    assert!(nodes.iter().any(|n| n.name == route.source_name && n.node_type == "function"),
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n.name == route.source_name && n.node_type == "function"),
         "inline handler must be materialized as a function node matching the edge name; got: {:?}",
-        nodes.iter().map(|n| (n.name.clone(), n.node_type.clone())).collect::<Vec<_>>());
+        nodes
+            .iter()
+            .map(|n| (n.name.clone(), n.node_type.clone()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -526,14 +809,24 @@ fastify.post('/login', async (req, reply) => {
 });
 "#;
     let relations = extract_relations(code, "javascript").unwrap();
-    let route = relations.iter().find(|r| r.relation == REL_ROUTES_TO).expect("fastify route edge");
-    assert!(route.source_name.starts_with("POST /login#L"),
-        "fastify route recognized + synthetic name, got {}", route.source_name);
-    let call = relations.iter()
+    let route = relations
+        .iter()
+        .find(|r| r.relation == REL_ROUTES_TO)
+        .expect("fastify route edge");
+    assert!(
+        route.source_name.starts_with("POST /login#L"),
+        "fastify route recognized + synthetic name, got {}",
+        route.source_name
+    );
+    let call = relations
+        .iter()
         .find(|r| r.relation == crate::domain::REL_CALLS && r.target_name == "checkAuth")
         .expect("checkAuth call edge");
-    assert_eq!(call.source_name, route.source_name,
-        "fastify inline handler must scope its calls to the same handler node, got source={}", call.source_name);
+    assert_eq!(
+        call.source_name, route.source_name,
+        "fastify inline handler must scope its calls to the same handler node, got source={}",
+        call.source_name
+    );
 }
 
 #[test]
@@ -544,7 +837,8 @@ def get_users():
     return jsonify(users)
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let routes: Vec<&str> = relations.iter()
+    let routes: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .map(|r| r.target_name.as_str())
         .collect();
@@ -557,7 +851,8 @@ def get_users():
 fn test_extract_java_inheritance() {
     let code = "public class Dog extends Animal {\n    public void bark() {}\n}\n";
     let relations = extract_relations(code, "java").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| r.target_name.as_str())
         .collect();
@@ -573,13 +868,26 @@ fn test_extract_java_inheritance() {
 fn test_extract_java_method_calls() {
     let code = "class Svc {\n  void run() { helper(); this.other(); dep.work(); }\n  void helper() {}\n  void other() {}\n}\n";
     let relations = extract_relations(code, "java").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "Svc.run")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"helper"), "bare call helper() missing; got: {:?}", calls);
-    assert!(calls.contains(&"other"), "this.other() call missing; got: {:?}", calls);
-    assert!(calls.contains(&"work"), "receiver dep.work() call missing; got: {:?}", calls);
+    assert!(
+        calls.contains(&"helper"),
+        "bare call helper() missing; got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"other"),
+        "this.other() call missing; got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"work"),
+        "receiver dep.work() call missing; got: {:?}",
+        calls
+    );
 }
 
 // --- Task 3: Python imports ---
@@ -588,7 +896,8 @@ fn test_extract_java_method_calls() {
 fn test_extract_python_import() {
     let code = "import os\n";
     let relations = extract_relations(code, "python").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
@@ -599,7 +908,8 @@ fn test_extract_python_import() {
 fn test_extract_python_from_import() {
     let code = "from collections import OrderedDict, defaultdict\n";
     let relations = extract_relations(code, "python").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
@@ -613,7 +923,8 @@ fn test_extract_python_from_import() {
 fn test_extract_python_inheritance() {
     let code = "class Dog(Animal):\n    def bark(self):\n        pass\n";
     let relations = extract_relations(code, "python").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| r.target_name.as_str())
         .collect();
@@ -632,9 +943,66 @@ fn main() {
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
     let relations = extract_relations_from_tree(&tree, source, "rust");
-    let imports: Vec<&ParsedRelation> = relations.iter().filter(|r| r.relation == REL_IMPORTS).collect();
-    assert!(imports.iter().any(|r| r.target_name == "HashMap"), "should import HashMap, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
-    assert!(imports.iter().any(|r| r.target_name == "Result"), "should import Result, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+    let imports: Vec<&ParsedRelation> = relations
+        .iter()
+        .filter(|r| r.relation == REL_IMPORTS)
+        .collect();
+    assert!(
+        imports.iter().any(|r| r.target_name == "Result"),
+        "should import Result, got: {:?}",
+        imports.iter().map(|r| &r.target_name).collect::<Vec<_>>()
+    );
+    // IDX v52 (audit 2026-07-24): std-root imports are skipped whole — the
+    // bare "HashMap" used to enter global bare-name resolution and could bind
+    // any same-named project symbol (the phantom `use std::fs` → `fn fs`
+    // test-helper edges). Non-std externals (anyhow above) still extract.
+    assert!(
+        !imports.iter().any(|r| r.target_name == "HashMap"),
+        "std::collections::HashMap must NOT emit an import edge, got: {:?}",
+        imports.iter().map(|r| &r.target_name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_rust_std_root_use_skipped_entirely() {
+    // Audit 2026-07-24 (map phantom edges): every `use std::fs;` in the repo
+    // emitted a bare `imports → fs` relation that global bare-name resolution
+    // bound to the single project symbol named `fs` — a #[cfg(test)] helper in
+    // an unrelated module — fabricating 13 cross-module import edges. Roots
+    // that are statically known external (`std`/`core`/`alloc`/`proc_macro`)
+    // can never resolve inside the project: skip the whole declaration, in
+    // every shape (simple / grouped / aliased). `crate::`-rooted and
+    // unknown-crate roots keep extracting.
+    let source = r#"
+use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::io::Read as _;
+use core::fmt::Debug;
+use alloc::vec::Vec;
+use crate::domain::normalize;
+use somecrate::helpers::assist;
+
+fn main() {}
+"#;
+    let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
+    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let imports: Vec<&str> = relations
+        .iter()
+        .filter(|r| r.relation == REL_IMPORTS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    for banned in ["fs", "HashMap", "HashSet", "Read", "Debug", "Vec"] {
+        assert!(
+            !imports.contains(&banned),
+            "std/core/alloc-rooted `{banned}` must not emit an import edge, got: {imports:?}"
+        );
+    }
+    for kept in ["normalize", "assist"] {
+        assert!(
+            imports.contains(&kept),
+            "project/unknown-crate import `{kept}` must still extract, got: {imports:?}"
+        );
+    }
 }
 
 #[test]
@@ -653,31 +1021,65 @@ func main() {
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "go").unwrap();
     let relations = extract_relations_from_tree(&tree, source, "go");
-    let imports: Vec<&ParsedRelation> = relations.iter().filter(|r| r.relation == REL_IMPORTS).collect();
-    assert!(imports.iter().any(|r| r.target_name == "fmt"), "should import fmt, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
-    assert!(imports.iter().any(|r| r.target_name == "http"), "should import http, got: {:?}", imports.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+    let imports: Vec<&ParsedRelation> = relations
+        .iter()
+        .filter(|r| r.relation == REL_IMPORTS)
+        .collect();
+    assert!(
+        imports.iter().any(|r| r.target_name == "fmt"),
+        "should import fmt, got: {:?}",
+        imports.iter().map(|r| &r.target_name).collect::<Vec<_>>()
+    );
+    assert!(
+        imports.iter().any(|r| r.target_name == "http"),
+        "should import http, got: {:?}",
+        imports.iter().map(|r| &r.target_name).collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_extract_rust_grouped_use_imports() {
+    // Non-std crate root: std-root declarations are skipped whole as of IDX
+    // v52, so grouped/nested/aliased coverage must ride a resolvable root.
     let source = r#"
-use std::collections::{HashMap, HashSet, BTreeMap};
-use std::io::Read as _;
+use mylib::collections::{HashMap, HashSet, BTreeMap};
+use mylib::io::Read as _;
 
 fn main() {}
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
     let relations = extract_relations_from_tree(&tree, source, "rust");
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"HashMap"), "should import HashMap, got: {:?}", imports);
-    assert!(imports.contains(&"HashSet"), "should import HashSet, got: {:?}", imports);
-    assert!(imports.contains(&"BTreeMap"), "should import BTreeMap, got: {:?}", imports);
-    assert!(imports.contains(&"Read"), "should import Read (not 'Read as _'), got: {:?}", imports);
+    assert!(
+        imports.contains(&"HashMap"),
+        "should import HashMap, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"HashSet"),
+        "should import HashSet, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"BTreeMap"),
+        "should import BTreeMap, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"Read"),
+        "should import Read (not 'Read as _'), got: {:?}",
+        imports
+    );
     // Should NOT contain braces or 'as _'
-    assert!(!imports.iter().any(|i| i.contains('{')), "should not have brace in import names: {:?}", imports);
+    assert!(
+        !imports.iter().any(|i| i.contains('{')),
+        "should not have brace in import names: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -689,11 +1091,18 @@ def get_dashboard():
     return render_template('dashboard.html')
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let routes: Vec<&ParsedRelation> = relations.iter()
+    let routes: Vec<&ParsedRelation> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .collect();
-    assert!(routes.is_empty(), "should not detect route from @cache.get, got: {:?}",
-        routes.iter().map(|r| (&r.source_name, &r.target_name)).collect::<Vec<_>>());
+    assert!(
+        routes.is_empty(),
+        "should not detect route from @cache.get, got: {:?}",
+        routes
+            .iter()
+            .map(|r| (&r.source_name, &r.target_name))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -705,10 +1114,18 @@ def get_dashboard():
     return render_template('dashboard.html')
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let routes: Vec<&ParsedRelation> = relations.iter()
+    let routes: Vec<&ParsedRelation> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .collect();
-    assert!(routes.is_empty(), "should not detect route from @login_required, got: {:?}", routes.iter().map(|r| (&r.source_name, &r.target_name)).collect::<Vec<_>>());
+    assert!(
+        routes.is_empty(),
+        "should not detect route from @login_required, got: {:?}",
+        routes
+            .iter()
+            .map(|r| (&r.source_name, &r.target_name))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -720,11 +1137,18 @@ def list_items():
     return items
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let routes: Vec<&ParsedRelation> = relations.iter()
+    let routes: Vec<&ParsedRelation> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .collect();
-    assert!(!routes.is_empty(), "should detect route from @app.get, got no routes");
-    assert!(routes[0].target_name == "list_items", "target should be list_items");
+    assert!(
+        !routes.is_empty(),
+        "should detect route from @app.get, got no routes"
+    );
+    assert!(
+        routes[0].target_name == "list_items",
+        "target should be list_items"
+    );
 }
 
 /// Regression: Python `call` nodes (tree-sitter uses `call`, not `call_expression`)
@@ -737,12 +1161,16 @@ def list_items():
 fn test_extract_python_bare_call() {
     let code = "def caller():\n    return used_fn()\n";
     let relations = extract_relations(code, "python").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
-    assert!(calls.iter().any(|(s, t)| *s == "caller" && *t == "used_fn"),
-        "Python bare call `used_fn()` inside `caller` should emit REL_CALLS edge; got: {:?}", calls);
+    assert!(
+        calls.iter().any(|(s, t)| *s == "caller" && *t == "used_fn"),
+        "Python bare call `used_fn()` inside `caller` should emit REL_CALLS edge; got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -750,7 +1178,8 @@ fn test_extract_python_method_call() {
     // obj.method() — Python `attribute` node inside `call.function`.
     let code = "def caller(obj):\n    return obj.method()\n";
     let relations = extract_relations(code, "python").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
@@ -769,16 +1198,34 @@ impl MyTrait for MyStruct {
 }
 "#;
     let relations = extract_relations(source, "rust").unwrap();
-    let impls: Vec<(&str, &str)> = relations.iter()
+    let impls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPLEMENTS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
     // Type-level: MyStruct implements MyTrait
-    assert!(impls.contains(&("MyStruct", "MyTrait")), "got implements: {:?}", impls);
+    assert!(
+        impls.contains(&("MyStruct", "MyTrait")),
+        "got implements: {:?}",
+        impls
+    );
     // Method-level: MyStruct → do_thing, MyStruct → other
-    assert!(impls.contains(&("MyStruct", "do_thing")), "method-level edge missing for do_thing: {:?}", impls);
-    assert!(impls.contains(&("MyStruct", "other")), "method-level edge missing for other: {:?}", impls);
-    assert_eq!(impls.len(), 3, "expected 3 implements edges (1 type + 2 methods), got: {:?}", impls);
+    assert!(
+        impls.contains(&("MyStruct", "do_thing")),
+        "method-level edge missing for do_thing: {:?}",
+        impls
+    );
+    assert!(
+        impls.contains(&("MyStruct", "other")),
+        "method-level edge missing for other: {:?}",
+        impls
+    );
+    assert_eq!(
+        impls.len(),
+        3,
+        "expected 3 implements edges (1 type + 2 methods), got: {:?}",
+        impls
+    );
 }
 
 #[test]
@@ -797,17 +1244,20 @@ impl<'a, W: std::io::Write> MyTrait for Generic<'a, W> {
 }
 "#;
     let relations = extract_relations(source, "rust").unwrap();
-    let impls: Vec<(&str, &str)> = relations.iter()
+    let impls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPLEMENTS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
     assert!(
         impls.contains(&("Generic", "MyTrait")),
-        "type-level edge must use bare struct name (no generics); got: {:?}", impls
+        "type-level edge must use bare struct name (no generics); got: {:?}",
+        impls
     );
     assert!(
         impls.contains(&("Generic", "do_thing")),
-        "method-level edge must use bare struct name; got: {:?}", impls
+        "method-level edge must use bare struct name; got: {:?}",
+        impls
     );
 }
 
@@ -822,11 +1272,18 @@ impl MyStruct {
 }
 "#;
     let relations = extract_relations(source, "rust").unwrap();
-    let impls: Vec<_> = relations.iter()
+    let impls: Vec<_> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPLEMENTS)
         .collect();
-    assert!(impls.is_empty(), "bare impl should produce no implements relations, got: {:?}",
-        impls.iter().map(|r| (&r.source_name, &r.target_name)).collect::<Vec<_>>());
+    assert!(
+        impls.is_empty(),
+        "bare impl should produce no implements relations, got: {:?}",
+        impls
+            .iter()
+            .map(|r| (&r.source_name, &r.target_name))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -839,12 +1296,16 @@ fn build_config() -> Config {
 }
 "#;
     let relations = extract_relations(source, "rust").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
-    assert!(calls.contains(&("build_config", "Config")),
-        "struct instantiation should create calls edge, got: {:?}", calls);
+    assert!(
+        calls.contains(&("build_config", "Config")),
+        "struct instantiation should create calls edge, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -855,13 +1316,17 @@ fn create() {
 }
 "#;
     let relations = extract_relations(source, "rust").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
     // Should strip path prefix, keeping just "NodeRecord"
-    assert!(calls.contains(&("create", "NodeRecord")),
-        "scoped struct should strip path, got: {:?}", calls);
+    assert!(
+        calls.contains(&("create", "NodeRecord")),
+        "scoped struct should strip path, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -873,10 +1338,16 @@ fn build() -> String {
 }
 "#;
     let rels = extract_relations(src, "rust").unwrap();
-    let has_ref = rels.iter().any(|r|
-        r.relation == REL_REFERENCES && r.target_name == "SHARED");
-    assert!(has_ref, "expected a references edge to SHARED; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+    let has_ref = rels
+        .iter()
+        .any(|r| r.relation == REL_REFERENCES && r.target_name == "SHARED");
+    assert!(
+        has_ref,
+        "expected a references edge to SHARED; got: {:?}",
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -886,21 +1357,187 @@ fn test_rust_path_reference_as_call_argument_emits_references_edge() {
     // the callee case, where the `function`-field path is already a calls edge.
     let src = r#"fn f() { do_thing(crate::domain::CB); }"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "CB"),
+    assert!(
+        rels.iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "CB"),
         "arg-position path must emit a references edge to CB; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_rust_path_reference_call_callee_does_not_emit_references_edge() {
     let src = r#"fn build() { crate::domain::compute(); }"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_CALLS && r.target_name == "compute"),
+    assert!(
+        rels.iter()
+            .any(|r| r.relation == REL_CALLS && r.target_name == "compute"),
         "call must be a calls edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "compute"),
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "compute"),
         "a called fn must NOT also be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_rust_macro_arg_call_emits_calls_edge() {
+    // tree-sitter parses macro arguments as opaque token_trees — `normalize(...)`
+    // inside assert_eq! has no call_expression node, so calls made only through
+    // macros were invisible: their targets showed as dead code and impact/
+    // callgraph missed the calling fn (field failure 2026-07-24).
+    let src = r#"
+fn check() {
+    assert_eq!(normalize(1, 2), 3);
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(
+        rels.iter().any(|r| r.relation == REL_CALLS
+            && r.source_name == "check"
+            && r.target_name == "normalize"),
+        "call inside macro args must emit a calls edge, got: {:?}",
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_rust_macro_rules_body_call_emits_calls_edge() {
+    // The cmd_stats shape: a fn-local macro_rules! whose rule body calls a fn.
+    // The body is a token_tree, so `bail_out(0)` had no edge and `impact
+    // bail_out` missed `run` as a caller.
+    let src = r#"
+fn run() {
+    macro_rules! sout {
+        ($($a:tt)*) => {
+            if let Err(e) = writeln!(out, $($a)*) {
+                bail_out(0);
+            }
+        };
+    }
+    sout!("x");
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(
+        rels.iter().any(|r| r.relation == REL_CALLS
+            && r.source_name == "run"
+            && r.target_name == "bail_out"),
+        "call inside macro_rules body must emit a calls edge, got: {:?}",
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
+    // The macro's own name (`writeln!`, `sout!`) is not a fn call.
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_CALLS && r.target_name == "writeln"),
+        "macro names must not become calls edges"
+    );
+}
+
+#[test]
+fn test_rust_macro_token_call_exclusions() {
+    // Token-soup shapes that LOOK call-adjacent but must not emit calls edges:
+    // method tails (unknown receiver aliases same-named fns), `$fragment(...)`,
+    // path tails after `::` (v1 skips them — std paths dominate), and
+    // macro-generated `fn` definitions.
+    let src = r#"
+fn run() {
+    assert!(x.compute());
+    assert!(crate::util::helper(1));
+    macro_rules! gen {
+        ($f:ident) => { $f(1) };
+        () => { fn generated() {} };
+    }
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    for banned in ["compute", "helper", "f", "generated"] {
+        assert!(
+            !rels
+                .iter()
+                .any(|r| r.relation == REL_CALLS && r.target_name == banned),
+            "{banned} must not get a calls edge from macro tokens, got: {:?}",
+            rels.iter()
+                .filter(|r| r.relation == REL_CALLS)
+                .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn test_rust_macro_pattern_match_not_a_call() {
+    // matches!/assert!(matches!(…)) put PATTERNS in macro args: `Some(y)`
+    // parses identically to a call inside the opaque token_tree (audit
+    // 2026-07-24 — this fabricated a calls→Some edge and could mark a
+    // pattern-only variant as "live"). Uppercase-initial names are
+    // variant/type constructors-or-patterns, never the snake_case fn calls
+    // this pass recovers, so they must not emit calls edges.
+    let src = r#"
+fn check(x: Option<u32>) -> bool {
+    matches!(x, Some(y) if y > 0)
+}
+fn guard(e: &MyEnum) -> bool {
+    assert!(matches!(e, MyEnum::Variant(_) | Wrapped(_)));
+    debug_assert!(matches!(e, Boxed(inner) if inner.ready()));
+    true
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    for banned in ["Some", "Variant", "Wrapped", "Boxed"] {
+        assert!(
+            !rels
+                .iter()
+                .any(|r| r.relation == REL_CALLS && r.target_name == banned),
+            "pattern {banned} must not get a calls edge from macro tokens, got: {:?}",
+            rels.iter()
+                .filter(|r| r.relation == REL_CALLS)
+                .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn test_rust_top_level_macro_call_not_indexed() {
+    // Parity with the call_expression arm: Rust calls with no enclosing named
+    // scope are deliberately not indexed (no bare top-level statements in Rust;
+    // a <module> edge here would be noise the graph commands never resolve).
+    let src = r#"
+lazy_static! {
+    static ref X: u32 = build_x();
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_CALLS && r.target_name == "build_x"),
+        "top-level macro-body call must not emit a calls edge"
+    );
 }
 
 #[test]
@@ -911,9 +1548,13 @@ fn test_rust_path_reference_struct_expr_path_does_not_emit_references_edge() {
     // is already covered by the `calls` edge to the struct ("NodeRecord").
     let src = r#"fn create() { let node = crate::parser::NodeRecord { name: 1 }; }"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES),
+    assert!(
+        !rels.iter().any(|r| r.relation == REL_REFERENCES),
         "struct-expr type path must not emit references edges; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -926,8 +1567,16 @@ func main() {
 }
 "#;
     let relations = extract_relations(code, "go").unwrap();
-    assert!(relations.iter().any(|r| r.relation == REL_ROUTES_TO && r.target_name == "healthCheck"),
-        "got relations: {:?}", relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
+    assert!(
+        relations
+            .iter()
+            .any(|r| r.relation == REL_ROUTES_TO && r.target_name == "healthCheck"),
+        "got relations: {:?}",
+        relations
+            .iter()
+            .map(|r| (&r.relation, &r.target_name))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// axum builder-chain route extraction (roadmap 2026-07-18 §2.1): every
@@ -948,16 +1597,32 @@ fn app() -> Router {
 }
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let routes: Vec<(&str, &str)> = relations.iter()
+    let routes: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
         .collect();
-    assert!(routes.iter().any(|(m, t)| m.contains(r#""method":"GET"#) && m.contains("/users") && *t == "list_users"),
-        "GET /users -> list_users missing; got routes: {:?}", routes);
-    assert!(routes.iter().any(|(m, t)| m.contains(r#""method":"POST"#) && m.contains("/users") && *t == "create_user"),
-        "POST /users -> create_user (chained method router) missing; got routes: {:?}", routes);
-    assert!(routes.iter().any(|(m, t)| m.contains("/health") && *t == "health"),
-        "GET /health -> health missing; got routes: {:?}", routes);
+    assert!(
+        routes.iter().any(|(m, t)| m.contains(r#""method":"GET"#)
+            && m.contains("/users")
+            && *t == "list_users"),
+        "GET /users -> list_users missing; got routes: {:?}",
+        routes
+    );
+    assert!(
+        routes.iter().any(|(m, t)| m.contains(r#""method":"POST"#)
+            && m.contains("/users")
+            && *t == "create_user"),
+        "POST /users -> create_user (chained method router) missing; got routes: {:?}",
+        routes
+    );
+    assert!(
+        routes
+            .iter()
+            .any(|(m, t)| m.contains("/health") && *t == "health"),
+        "GET /health -> health missing; got routes: {:?}",
+        routes
+    );
 }
 
 /// Inline `.nest("/prefix", Router::new().route(...))` composes the prefix onto
@@ -975,12 +1640,16 @@ fn app() -> Router {
 }
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let routes: Vec<&str> = relations.iter()
+    let routes: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .map(|r| r.metadata.as_deref().unwrap_or(""))
         .collect();
-    assert!(routes.iter().any(|m| m.contains(r#""path":"/api/users""#)),
-        "nested prefix must compose to /api/users; got: {:?}", routes);
+    assert!(
+        routes.iter().any(|m| m.contains(r#""path":"/api/users""#)),
+        "nested prefix must compose to /api/users; got: {:?}",
+        routes
+    );
 }
 
 /// Path-qualified handlers and method fns resolve to their last segment:
@@ -993,12 +1662,18 @@ fn app() -> axum::Router {
 }
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let routes: Vec<(&str, &str)> = relations.iter()
+    let routes: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_ROUTES_TO)
         .map(|r| (r.metadata.as_deref().unwrap_or(""), r.target_name.as_str()))
         .collect();
-    assert!(routes.iter().any(|(m, t)| m.contains(r#""method":"GET"#) && *t == "list_users"),
-        "scoped method fn + scoped handler must resolve; got: {:?}", routes);
+    assert!(
+        routes
+            .iter()
+            .any(|(m, t)| m.contains(r#""method":"GET"#) && *t == "list_users"),
+        "scoped method fn + scoped handler must resolve; got: {:?}",
+        routes
+    );
 }
 
 /// ESM namespace import `import * as ns from './m'` (roadmap 2026-07-18 §2.3):
@@ -1006,21 +1681,38 @@ fn app() -> axum::Router {
 /// (was silently dropped — the import_clause walk only knew named specifiers).
 #[test]
 fn test_extract_ts_namespace_import_marker() {
-    let code = "import * as helpers from './helpers';\nexport function run() { return helpers.fmt(); }\n";
+    let code =
+        "import * as helpers from './helpers';\nexport function run() { return helpers.fmt(); }\n";
     let relations = extract_relations(code, "typescript").unwrap();
     let marker = relations.iter().find(|r| {
         r.relation == REL_IMPORTS
-            && r.metadata.as_deref().is_some_and(|m| m.contains("ns_import"))
+            && r.metadata
+                .as_deref()
+                .is_some_and(|m| m.contains("ns_import"))
     });
-    let marker = marker.unwrap_or_else(|| panic!(
-        "namespace import must emit a ns_import marker; got: {:?}",
-        relations.iter().map(|r| (&r.relation, &r.target_name, &r.metadata)).collect::<Vec<_>>()));
-    assert_eq!(marker.target_name, "helpers", "marker must carry the ALIAS (ns_module_map key)");
-    assert!(marker.metadata.as_deref().unwrap().contains("./helpers"), "specifier must ride along");
+    let marker = marker.unwrap_or_else(|| {
+        panic!(
+            "namespace import must emit a ns_import marker; got: {:?}",
+            relations
+                .iter()
+                .map(|r| (&r.relation, &r.target_name, &r.metadata))
+                .collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(
+        marker.target_name, "helpers",
+        "marker must carry the ALIAS (ns_module_map key)"
+    );
+    assert!(
+        marker.metadata.as_deref().unwrap().contains("./helpers"),
+        "specifier must ride along"
+    );
     // The old path must NOT also emit a garbage `* as helpers` name.
-    assert!(!relations.iter().any(|r| r.target_name.contains('*')),
+    assert!(
+        !relations.iter().any(|r| r.target_name.contains('*')),
         "no star-shaped garbage names; got: {:?}",
-        relations.iter().map(|r| &r.target_name).collect::<Vec<_>>());
+        relations.iter().map(|r| &r.target_name).collect::<Vec<_>>()
+    );
 }
 
 /// Star re-export `export * from './m'` (barrel wildcard): must emit a
@@ -1030,16 +1722,35 @@ fn test_extract_ts_namespace_import_marker() {
 fn test_extract_ts_star_reexport_marker() {
     let code = "export * from './widgets';\nexport * as shapes from './shapes';\n";
     let relations = extract_relations(code, "typescript").unwrap();
-    let stars: Vec<&ParsedRelation> = relations.iter()
-        .filter(|r| r.relation == REL_IMPORTS
-            && r.metadata.as_deref().is_some_and(|m| m.contains("star_reexport")))
+    let stars: Vec<&ParsedRelation> = relations
+        .iter()
+        .filter(|r| {
+            r.relation == REL_IMPORTS
+                && r.metadata
+                    .as_deref()
+                    .is_some_and(|m| m.contains("star_reexport"))
+        })
         .collect();
-    assert!(stars.iter().any(|r| r.metadata.as_deref().unwrap().contains("./widgets")),
+    assert!(
+        stars
+            .iter()
+            .any(|r| r.metadata.as_deref().unwrap().contains("./widgets")),
         "export * from must emit a star_reexport marker; got: {:?}",
-        relations.iter().map(|r| (&r.relation, &r.target_name, &r.metadata)).collect::<Vec<_>>());
-    assert!(stars.iter().any(|r| r.metadata.as_deref().unwrap().contains("./shapes")),
+        relations
+            .iter()
+            .map(|r| (&r.relation, &r.target_name, &r.metadata))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        stars
+            .iter()
+            .any(|r| r.metadata.as_deref().unwrap().contains("./shapes")),
         "export * as ns from must too; got: {:?}",
-        stars.iter().map(|r| (&r.target_name, &r.metadata)).collect::<Vec<_>>());
+        stars
+            .iter()
+            .map(|r| (&r.target_name, &r.metadata))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Negative: a bare `.get(...)` call outside `.route(...)` args (reqwest-style
@@ -1053,28 +1764,39 @@ fn fetch(client: &Client, m: &std::collections::HashMap<String, String>) {
 }
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    assert!(!relations.iter().any(|r| r.relation == REL_ROUTES_TO),
+    assert!(
+        !relations.iter().any(|r| r.relation == REL_ROUTES_TO),
         "bare .get calls must not create routes; got: {:?}",
-        relations.iter().filter(|r| r.relation == REL_ROUTES_TO)
-            .map(|r| (&r.target_name, &r.metadata)).collect::<Vec<_>>());
+        relations
+            .iter()
+            .filter(|r| r.relation == REL_ROUTES_TO)
+            .map(|r| (&r.target_name, &r.metadata))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_extract_ts_implements() {
     let code = "class UserService implements IUserService {\n    getUser() { return null; }\n}\n";
     let relations = extract_relations(code, "typescript").unwrap();
-    let impls: Vec<&str> = relations.iter()
+    let impls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPLEMENTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(impls.contains(&"IUserService"), "got implements: {:?}", impls);
+    assert!(
+        impls.contains(&"IUserService"),
+        "got implements: {:?}",
+        impls
+    );
 }
 
 #[test]
 fn test_extract_java_implements() {
     let code = "public class ArrayList implements List, Serializable {\n}\n";
     let relations = extract_relations(code, "java").unwrap();
-    let impls: Vec<&str> = relations.iter()
+    let impls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPLEMENTS)
         .map(|r| r.target_name.as_str())
         .collect();
@@ -1085,12 +1807,21 @@ fn test_extract_java_implements() {
 fn test_extract_ts_exports() {
     let code = "export function handleLogin(req: Request) {}\nexport class AuthService {}\n";
     let relations = extract_relations(code, "typescript").unwrap();
-    let exports: Vec<&str> = relations.iter()
+    let exports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_EXPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(exports.contains(&"handleLogin"), "got exports: {:?}", exports);
-    assert!(exports.contains(&"AuthService"), "got exports: {:?}", exports);
+    assert!(
+        exports.contains(&"handleLogin"),
+        "got exports: {:?}",
+        exports
+    );
+    assert!(
+        exports.contains(&"AuthService"),
+        "got exports: {:?}",
+        exports
+    );
 }
 
 #[test]
@@ -1107,14 +1838,21 @@ func main() {
 }
 "#;
     let relations = extract_relations(code, "go").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
-    assert!(calls.contains(&("main", "Println")),
-        "fmt.Println() should create call relation, got: {:?}", calls);
-    assert!(calls.contains(&("main", "HandleFunc")),
-        "http.HandleFunc() should create call relation, got: {:?}", calls);
+    assert!(
+        calls.contains(&("main", "Println")),
+        "fmt.Println() should create call relation, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("main", "HandleFunc")),
+        "http.HandleFunc() should create call relation, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1131,14 +1869,21 @@ impl Database {
 }
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
-    assert!(calls.contains(&("open", "open_impl")),
-        "Self::open_impl() should create call relation, got: {:?}", calls);
-    assert!(calls.contains(&("open_impl", "new")),
-        "HashMap::new() should create call relation, got: {:?}", calls);
+    assert!(
+        calls.contains(&("open", "open_impl")),
+        "Self::open_impl() should create call relation, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("open_impl", "new")),
+        "HashMap::new() should create call relation, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1154,19 +1899,32 @@ fn test_func() {
     let relations = extract_relations(code, "rust").unwrap();
     eprintln!("All relations:");
     for r in &relations {
-        eprintln!("  {} --[{}]--> {}", r.source_name, r.relation, r.target_name);
+        eprintln!(
+            "  {} --[{}]--> {}",
+            r.source_name, r.relation, r.target_name
+        );
     }
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
     eprintln!("Calls: {:?}", calls);
-    assert!(calls.contains(&("test_func", "from_project_root")),
-        "McpServer::from_project_root() should create call, got: {:?}", calls);
-    assert!(calls.contains(&("test_func", "handle_message")),
-        "server.handle_message() should create call, got: {:?}", calls);
-    assert!(calls.contains(&("test_func", "tool_call_json")),
-        "tool_call_json() should create call, got: {:?}", calls);
+    assert!(
+        calls.contains(&("test_func", "from_project_root")),
+        "McpServer::from_project_root() should create call, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("test_func", "handle_message")),
+        "server.handle_message() should create call, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("test_func", "tool_call_json")),
+        "tool_call_json() should create call, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1190,20 +1948,36 @@ fn run_serve() {
 }
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
-    assert!(calls.contains(&("run_serve", "from_project_root")),
-        "McpServer::from_project_root() missing, got: {:?}", calls);
-    assert!(calls.contains(&("run_serve", "set_notify_writer")),
-        "server.set_notify_writer() missing, got: {:?}", calls);
-    assert!(calls.contains(&("run_serve", "handle_message")),
-        "server.handle_message() missing, got: {:?}", calls);
-    assert!(calls.contains(&("run_serve", "run_startup_tasks")),
-        "server.run_startup_tasks() missing, got: {:?}", calls);
-    assert!(calls.contains(&("run_serve", "flush_metrics")),
-        "server.flush_metrics() missing, got: {:?}", calls);
+    assert!(
+        calls.contains(&("run_serve", "from_project_root")),
+        "McpServer::from_project_root() missing, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("run_serve", "set_notify_writer")),
+        "server.set_notify_writer() missing, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("run_serve", "handle_message")),
+        "server.handle_message() missing, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("run_serve", "run_startup_tasks")),
+        "server.run_startup_tasks() missing, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("run_serve", "flush_metrics")),
+        "server.flush_metrics() missing, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1221,15 +1995,26 @@ class UserService {
 }
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
     // The scope for getUser should be "UserService.getUser", not just "getUser"
-    assert!(calls.iter().any(|(src, tgt)| *src == "UserService.getUser" && *tgt == "findById"),
-        "getUser scope should be qualified as UserService.getUser, got calls: {:?}", calls);
-    assert!(calls.iter().any(|(src, tgt)| *src == "UserService.deleteUser" && *tgt == "getUser"),
-        "deleteUser scope should be qualified as UserService.deleteUser, got calls: {:?}", calls);
+    assert!(
+        calls
+            .iter()
+            .any(|(src, tgt)| *src == "UserService.getUser" && *tgt == "findById"),
+        "getUser scope should be qualified as UserService.getUser, got calls: {:?}",
+        calls
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(src, tgt)| *src == "UserService.deleteUser" && *tgt == "getUser"),
+        "deleteUser scope should be qualified as UserService.deleteUser, got calls: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1241,12 +2026,18 @@ function doWork() {
 }
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
-    assert!(calls.iter().any(|(src, tgt)| *src == "doWork" && *tgt == "process"),
-        "standalone function scope should remain unqualified, got calls: {:?}", calls);
+    assert!(
+        calls
+            .iter()
+            .any(|(src, tgt)| *src == "doWork" && *tgt == "process"),
+        "standalone function scope should remain unqualified, got calls: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1261,17 +2052,27 @@ fn main() {
 fn print_version() {}
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
     eprintln!("All calls: {:?}", calls);
-    assert!(calls.contains(&("main", "print_version")),
-        "simple call should work, got: {:?}", calls);
-    assert!(calls.contains(&("main", "cmd_show")),
-        "deeply nested scoped call should extract rightmost name, got: {:?}", calls);
-    assert!(calls.contains(&("main", "current_dir")),
-        "std::env::current_dir() should extract current_dir, got: {:?}", calls);
+    assert!(
+        calls.contains(&("main", "print_version")),
+        "simple call should work, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("main", "cmd_show")),
+        "deeply nested scoped call should extract rightmost name, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("main", "current_dir")),
+        "std::env::current_dir() should extract current_dir, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1292,19 +2093,29 @@ impl Server {
 }
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
     eprintln!("Match arm calls: {:?}", calls);
     // Note: Rust `impl` blocks don't set class context (unlike class {} in TS/JS),
     // so scope is just "handle_tool" not "Server.handle_tool"
-    assert!(calls.contains(&("handle_tool", "tool_search")),
-        "self.tool_search() in match arm should be detected, got: {:?}", calls);
-    assert!(calls.contains(&("handle_tool", "tool_map")),
-        "self.tool_map() in match arm should be detected, got: {:?}", calls);
-    assert!(calls.contains(&("handle_tool", "log_result")),
-        "self.log_result() outside match should be detected, got: {:?}", calls);
+    assert!(
+        calls.contains(&("handle_tool", "tool_search")),
+        "self.tool_search() in match arm should be detected, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("handle_tool", "tool_map")),
+        "self.tool_map() in match arm should be detected, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&("handle_tool", "log_result")),
+        "self.log_result() outside match should be detected, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1340,7 +2151,8 @@ impl McpServer {
 }
 "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let calls: Vec<(&str, &str)> = relations.iter()
+    let calls: Vec<(&str, &str)> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
         .collect();
@@ -1348,14 +2160,26 @@ impl McpServer {
     for (src, tgt) in &calls {
         eprintln!("  {} -> {}", src, tgt);
     }
-    assert!(calls.iter().any(|(_, t)| *t == "tool_semantic_search"),
-        "tool_semantic_search not found in: {:?}", calls);
-    assert!(calls.iter().any(|(_, t)| *t == "tool_find_dead_code"),
-        "tool_find_dead_code not found in: {:?}", calls);
-    assert!(calls.iter().any(|(_, t)| *t == "lock_or_recover"),
-        "lock_or_recover not found in: {:?}", calls);
-    assert!(calls.iter().any(|(_, t)| *t == "record_tool_call"),
-        "record_tool_call not found in: {:?}", calls);
+    assert!(
+        calls.iter().any(|(_, t)| *t == "tool_semantic_search"),
+        "tool_semantic_search not found in: {:?}",
+        calls
+    );
+    assert!(
+        calls.iter().any(|(_, t)| *t == "tool_find_dead_code"),
+        "tool_find_dead_code not found in: {:?}",
+        calls
+    );
+    assert!(
+        calls.iter().any(|(_, t)| *t == "lock_or_recover"),
+        "lock_or_recover not found in: {:?}",
+        calls
+    );
+    assert!(
+        calls.iter().any(|(_, t)| *t == "record_tool_call"),
+        "record_tool_call not found in: {:?}",
+        calls
+    );
 }
 
 /// Every ParsedRelation returned by extract_relations must be stamped with
@@ -1403,14 +2227,21 @@ fn test_extract_kotlin_inheritance() {
     // (Kotlin doesn't syntactically distinguish, the type system does).
     let code = "class UserService : BaseService(), Cloneable {\n    fun foo() {}\n}\n";
     let relations = extract_relations(code, "kotlin").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"BaseService"),
-        "Kotlin: missing BaseService, got: {:?}", inherits);
-    assert!(inherits.contains(&"Cloneable"),
-        "Kotlin: missing Cloneable, got: {:?}", inherits);
+    assert!(
+        inherits.contains(&"BaseService"),
+        "Kotlin: missing BaseService, got: {:?}",
+        inherits
+    );
+    assert!(
+        inherits.contains(&"Cloneable"),
+        "Kotlin: missing Cloneable, got: {:?}",
+        inherits
+    );
 }
 
 #[test]
@@ -1418,16 +2249,26 @@ fn test_extract_swift_inheritance() {
     // Swift: `class S: BaseService, Codable` — comma-separated conformance.
     let code = "class UserService: BaseService, Codable, Hashable {\n    func foo() {}\n}\n";
     let relations = extract_relations(code, "swift").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"BaseService"),
-        "Swift: missing BaseService, got: {:?}", inherits);
-    assert!(inherits.contains(&"Codable"),
-        "Swift: missing Codable, got: {:?}", inherits);
-    assert!(inherits.contains(&"Hashable"),
-        "Swift: missing Hashable, got: {:?}", inherits);
+    assert!(
+        inherits.contains(&"BaseService"),
+        "Swift: missing BaseService, got: {:?}",
+        inherits
+    );
+    assert!(
+        inherits.contains(&"Codable"),
+        "Swift: missing Codable, got: {:?}",
+        inherits
+    );
+    assert!(
+        inherits.contains(&"Hashable"),
+        "Swift: missing Hashable, got: {:?}",
+        inherits
+    );
 }
 
 #[test]
@@ -1436,16 +2277,26 @@ fn test_extract_dart_inheritance() {
     // with (mixin, multi). All conceptually contribute to type lineage.
     let code = "class UserService extends BaseService implements Loggable, Cacheable {\n  void foo() {}\n}\n";
     let relations = extract_relations(code, "dart").unwrap();
-    let lineage: Vec<&str> = relations.iter()
+    let lineage: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS || r.relation == REL_IMPLEMENTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(lineage.contains(&"BaseService"),
-        "Dart: missing BaseService (extends), got: {:?}", lineage);
-    assert!(lineage.contains(&"Loggable"),
-        "Dart: missing Loggable (implements), got: {:?}", lineage);
-    assert!(lineage.contains(&"Cacheable"),
-        "Dart: missing Cacheable (implements), got: {:?}", lineage);
+    assert!(
+        lineage.contains(&"BaseService"),
+        "Dart: missing BaseService (extends), got: {:?}",
+        lineage
+    );
+    assert!(
+        lineage.contains(&"Loggable"),
+        "Dart: missing Loggable (implements), got: {:?}",
+        lineage
+    );
+    assert!(
+        lineage.contains(&"Cacheable"),
+        "Dart: missing Cacheable (implements), got: {:?}",
+        lineage
+    );
 }
 
 #[test]
@@ -1453,38 +2304,55 @@ fn test_extract_php_inheritance() {
     // PHP: extends (single class) + implements (multiple interfaces).
     let code = "<?php\nclass UserService extends BaseService implements Loggable, Cacheable {\n    public function foo() {}\n}\n";
     let relations = extract_relations(code, "php").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| r.target_name.as_str())
         .collect();
-    let implements: Vec<&str> = relations.iter()
+    let implements: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPLEMENTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"BaseService"),
-        "PHP: missing BaseService (extends), got INHERITS: {:?}", inherits);
-    assert!(implements.contains(&"Loggable"),
-        "PHP: missing Loggable (implements), got IMPLEMENTS: {:?}", implements);
-    assert!(implements.contains(&"Cacheable"),
-        "PHP: missing Cacheable (implements), got IMPLEMENTS: {:?}", implements);
+    assert!(
+        inherits.contains(&"BaseService"),
+        "PHP: missing BaseService (extends), got INHERITS: {:?}",
+        inherits
+    );
+    assert!(
+        implements.contains(&"Loggable"),
+        "PHP: missing Loggable (implements), got IMPLEMENTS: {:?}",
+        implements
+    );
+    assert!(
+        implements.contains(&"Cacheable"),
+        "PHP: missing Cacheable (implements), got IMPLEMENTS: {:?}",
+        implements
+    );
 }
 
 #[test]
 fn test_extract_ruby_inheritance() {
     let code = "class UserService < BaseService\n  def foo\n  end\nend\n";
     let relations = extract_relations(code, "ruby").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"BaseService"),
-        "Ruby: missing BaseService, got: {:?}", inherits);
+    assert!(
+        inherits.contains(&"BaseService"),
+        "Ruby: missing BaseService, got: {:?}",
+        inherits
+    );
 }
 
 // --- Go struct/interface embedding → inherits (method promotion / iface composition) ---
 
 fn go_inherits(code: &str) -> Vec<(String, String)> {
-    extract_relations(code, "go").unwrap().iter()
+    extract_relations(code, "go")
+        .unwrap()
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| (r.source_name.clone(), r.target_name.clone()))
         .collect()
@@ -1496,10 +2364,16 @@ fn test_extract_go_struct_embedding() {
     // promotion); a normal named field is NOT.
     let code = "package p\ntype Animal struct{}\ntype Dog struct {\n\tAnimal\n\tName string\n}\n";
     let inh = go_inherits(code);
-    assert!(inh.contains(&("Dog".into(), "Animal".into())),
-        "Go: struct embedding should emit inherits Dog->Animal, got: {:?}", inh);
-    assert!(!inh.iter().any(|(_, t)| t == "Name" || t == "string"),
-        "Go: normal named field must not be inheritance, got: {:?}", inh);
+    assert!(
+        inh.contains(&("Dog".into(), "Animal".into())),
+        "Go: struct embedding should emit inherits Dog->Animal, got: {:?}",
+        inh
+    );
+    assert!(
+        !inh.iter().any(|(_, t)| t == "Name" || t == "string"),
+        "Go: normal named field must not be inheritance, got: {:?}",
+        inh
+    );
 }
 
 #[test]
@@ -1507,12 +2381,21 @@ fn test_extract_go_interface_embedding() {
     // Embedded interfaces (type_elem) compose; methods (method_elem) do not.
     let code = "package p\ntype Reader interface{ Read() }\ntype Writer interface{ Write() }\ntype RW interface {\n\tReader\n\tWriter\n\tClose() error\n}\n";
     let inh = go_inherits(code);
-    assert!(inh.contains(&("RW".into(), "Reader".into())),
-        "Go: interface embedding should emit inherits RW->Reader, got: {:?}", inh);
-    assert!(inh.contains(&("RW".into(), "Writer".into())),
-        "Go: interface embedding should emit inherits RW->Writer, got: {:?}", inh);
-    assert!(!inh.iter().any(|(_, t)| t == "Close" || t == "error"),
-        "Go: interface method must not be inheritance, got: {:?}", inh);
+    assert!(
+        inh.contains(&("RW".into(), "Reader".into())),
+        "Go: interface embedding should emit inherits RW->Reader, got: {:?}",
+        inh
+    );
+    assert!(
+        inh.contains(&("RW".into(), "Writer".into())),
+        "Go: interface embedding should emit inherits RW->Writer, got: {:?}",
+        inh
+    );
+    assert!(
+        !inh.iter().any(|(_, t)| t == "Close" || t == "error"),
+        "Go: interface method must not be inheritance, got: {:?}",
+        inh
+    );
 }
 
 #[test]
@@ -1521,18 +2404,27 @@ fn test_extract_go_pointer_and_qualified_embedding() {
     // methods; bind on the simple type name (Base / Mutex).
     let code = "package p\ntype Base struct{}\ntype Sub struct {\n\t*Base\n\tsync.Mutex\n}\n";
     let inh = go_inherits(code);
-    assert!(inh.contains(&("Sub".into(), "Base".into())),
-        "Go: pointer embedding should emit inherits Sub->Base, got: {:?}", inh);
-    assert!(inh.contains(&("Sub".into(), "Mutex".into())),
-        "Go: qualified embedding should emit inherits Sub->Mutex, got: {:?}", inh);
+    assert!(
+        inh.contains(&("Sub".into(), "Base".into())),
+        "Go: pointer embedding should emit inherits Sub->Base, got: {:?}",
+        inh
+    );
+    assert!(
+        inh.contains(&("Sub".into(), "Mutex".into())),
+        "Go: qualified embedding should emit inherits Sub->Mutex, got: {:?}",
+        inh
+    );
 }
 
 #[test]
 fn test_go_normal_field_not_inheritance() {
     let code = "package p\ntype Foo struct{}\ntype S struct {\n\tf Foo\n}\n";
     let inh = go_inherits(code);
-    assert!(inh.is_empty(),
-        "Go: a normal named field (f Foo) must produce no inherits, got: {:?}", inh);
+    assert!(
+        inh.is_empty(),
+        "Go: a normal named field (f Foo) must produce no inherits, got: {:?}",
+        inh
+    );
 }
 
 #[test]
@@ -1541,23 +2433,37 @@ fn test_go_interface_typeset_not_inheritance() {
     // (one type_elem with >1 child), NOT embedding — must emit no inherits edge.
     // A genuine embedded interface is one type_elem per parent (1 child each).
     let inh = go_inherits("package p\ntype Number interface {\n\tSigned | Unsigned\n}\n");
-    assert!(inh.is_empty(),
-        "Go: a type-set union constraint must not be inheritance, got: {:?}", inh);
+    assert!(
+        inh.is_empty(),
+        "Go: a type-set union constraint must not be inheritance, got: {:?}",
+        inh
+    );
     // ~int approximation element is also a constraint, not embedding.
     let inh2 = go_inherits("package p\ntype I interface {\n\t~int\n}\n");
-    assert!(inh2.is_empty(), "Go: ~int approximation must not be inheritance, got: {:?}", inh2);
+    assert!(
+        inh2.is_empty(),
+        "Go: ~int approximation must not be inheritance, got: {:?}",
+        inh2
+    );
     // Sanity: genuine multi-parent embedding still works (regression guard).
     let inh3 = go_inherits("package p\ntype RW interface {\n\tReader\n\tWriter\n}\n");
-    assert!(inh3.contains(&("RW".into(), "Reader".into())) && inh3.contains(&("RW".into(), "Writer".into())),
-        "Go: genuine interface embedding must still emit inherits, got: {:?}", inh3);
+    assert!(
+        inh3.contains(&("RW".into(), "Reader".into()))
+            && inh3.contains(&("RW".into(), "Writer".into())),
+        "Go: genuine interface embedding must still emit inherits, got: {:?}",
+        inh3
+    );
 }
 
 #[test]
 fn test_go_generic_embedding() {
     // Embedded generic types bind on the generic's base name.
     let s = go_inherits("package p\ntype Sub struct {\n\tBase[int]\n}\n");
-    assert!(s.contains(&("Sub".into(), "Base".into())),
-        "Go: embedded generic struct field Base[int] should emit inherits Sub->Base, got: {:?}", s);
+    assert!(
+        s.contains(&("Sub".into(), "Base".into())),
+        "Go: embedded generic struct field Base[int] should emit inherits Sub->Base, got: {:?}",
+        s
+    );
     let i = go_inherits("package p\ntype X interface {\n\tContainer[int]\n}\n");
     assert!(i.contains(&("X".into(), "Container".into())),
         "Go: embedded generic interface Container[int] should emit inherits X->Container, got: {:?}", i);
@@ -1568,16 +2474,27 @@ fn test_go_generic_embedding() {
 #[test]
 fn test_extract_dart_mixin() {
     let code = "class Base {}\nmixin M {}\nmixin N {}\nclass C extends Base with M, N {}\n";
-    let inh: Vec<(String, String)> = extract_relations(code, "dart").unwrap().iter()
+    let inh: Vec<(String, String)> = extract_relations(code, "dart")
+        .unwrap()
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| (r.source_name.clone(), r.target_name.clone()))
         .collect();
-    assert!(inh.contains(&("C".into(), "Base".into())),
-        "Dart: extends should emit inherits C->Base, got: {:?}", inh);
-    assert!(inh.contains(&("C".into(), "M".into())),
-        "Dart: mixin M should emit inherits C->M, got: {:?}", inh);
-    assert!(inh.contains(&("C".into(), "N".into())),
-        "Dart: mixin N should emit inherits C->N, got: {:?}", inh);
+    assert!(
+        inh.contains(&("C".into(), "Base".into())),
+        "Dart: extends should emit inherits C->Base, got: {:?}",
+        inh
+    );
+    assert!(
+        inh.contains(&("C".into(), "M".into())),
+        "Dart: mixin M should emit inherits C->M, got: {:?}",
+        inh
+    );
+    assert!(
+        inh.contains(&("C".into(), "N".into())),
+        "Dart: mixin N should emit inherits C->N, got: {:?}",
+        inh
+    );
 }
 
 #[test]
@@ -1585,20 +2502,30 @@ fn test_extract_dart_mixin_only() {
     // No `extends`: the mixin must still bind to the bare mixin name, never the
     // malformed `"with M"` the text-clean fallback used to produce.
     let code = "mixin M {}\nclass C with M {}\n";
-    let inh: Vec<String> = extract_relations(code, "dart").unwrap().iter()
+    let inh: Vec<String> = extract_relations(code, "dart")
+        .unwrap()
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| r.target_name.clone())
         .collect();
-    assert!(inh.contains(&"M".to_string()),
-        "Dart: `with M` should emit inherits C->M, got: {:?}", inh);
-    assert!(!inh.iter().any(|t| t.contains("with")),
-        "Dart: mixin target must be the bare name, not `with M`, got: {:?}", inh);
+    assert!(
+        inh.contains(&"M".to_string()),
+        "Dart: `with M` should emit inherits C->M, got: {:?}",
+        inh
+    );
+    assert!(
+        !inh.iter().any(|t| t.contains("with")),
+        "Dart: mixin target must be the bare name, not `with M`, got: {:?}",
+        inh
+    );
 }
 
 // --- C++ base classes → inherits (C++ has no separate interface concept) ---
 
 fn cpp_inherits(code: &str) -> Vec<(String, String)> {
-    extract_relations(code, "cpp").unwrap().iter()
+    extract_relations(code, "cpp")
+        .unwrap()
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| (r.source_name.clone(), r.target_name.clone()))
         .collect()
@@ -1607,8 +2534,11 @@ fn cpp_inherits(code: &str) -> Vec<(String, String)> {
 #[test]
 fn test_extract_cpp_single_inheritance() {
     let inh = cpp_inherits("class Animal {};\nclass Dog : public Animal {};\n");
-    assert!(inh.contains(&("Dog".into(), "Animal".into())),
-        "C++: `class Dog : public Animal` should emit inherits Dog->Animal, got: {:?}", inh);
+    assert!(
+        inh.contains(&("Dog".into(), "Animal".into())),
+        "C++: `class Dog : public Animal` should emit inherits Dog->Animal, got: {:?}",
+        inh
+    );
 }
 
 #[test]
@@ -1616,8 +2546,12 @@ fn test_extract_cpp_multiple_inheritance() {
     // Access specifiers (public/private/protected) are skipped; every base is inherits.
     let inh = cpp_inherits("class D : public A, private B, protected C {};\n");
     for base in ["A", "B", "C"] {
-        assert!(inh.contains(&("D".into(), base.into())),
-            "C++: multiple inheritance missing D->{}, got: {:?}", base, inh);
+        assert!(
+            inh.contains(&("D".into(), base.into())),
+            "C++: multiple inheritance missing D->{}, got: {:?}",
+            base,
+            inh
+        );
     }
 }
 
@@ -1625,32 +2559,45 @@ fn test_extract_cpp_multiple_inheritance() {
 fn test_extract_cpp_struct_inheritance() {
     // struct default inheritance has no access_specifier node.
     let inh = cpp_inherits("struct Base {};\nstruct S : Base {};\n");
-    assert!(inh.contains(&("S".into(), "Base".into())),
-        "C++: `struct S : Base` should emit inherits S->Base, got: {:?}", inh);
+    assert!(
+        inh.contains(&("S".into(), "Base".into())),
+        "C++: `struct S : Base` should emit inherits S->Base, got: {:?}",
+        inh
+    );
 }
 
 #[test]
 fn test_extract_cpp_qualified_and_template_base() {
     // Qualified (ns::Base) binds on the name tail; template base (Tmpl<int>) on the template name.
     let inh = cpp_inherits("class T : public ns::Base {};\nclass U : public Tmpl<int> {};\n");
-    assert!(inh.contains(&("T".into(), "Base".into())),
-        "C++: qualified base should bind T->Base, got: {:?}", inh);
-    assert!(inh.contains(&("U".into(), "Tmpl".into())),
-        "C++: template base should bind U->Tmpl, got: {:?}", inh);
+    assert!(
+        inh.contains(&("T".into(), "Base".into())),
+        "C++: qualified base should bind T->Base, got: {:?}",
+        inh
+    );
+    assert!(
+        inh.contains(&("U".into(), "Tmpl".into())),
+        "C++: template base should bind U->Tmpl, got: {:?}",
+        inh
+    );
 }
 
 #[test]
 fn test_cpp_no_base_no_inheritance() {
     let inh = cpp_inherits("struct Point { int x; int y; };\nclass Empty {};\n");
-    assert!(inh.is_empty(),
-        "C++: a class/struct with no base clause must produce no inherits, got: {:?}", inh);
+    assert!(
+        inh.is_empty(),
+        "C++: a class/struct with no base clause must produce no inherits, got: {:?}",
+        inh
+    );
 }
 
 #[test]
 fn test_c_struct_no_inheritance() {
     // Pure C has no inheritance concept; a C struct never carries a base clause.
     let inh: Vec<(String, String)> = extract_relations("struct Point { int x; int y; };\n", "c")
-        .unwrap().iter()
+        .unwrap()
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| (r.source_name.clone(), r.target_name.clone()))
         .collect();
@@ -1663,71 +2610,111 @@ fn test_c_struct_no_inheritance() {
 fn test_extract_kotlin_calls() {
     let code = "fun process() {\n    fetch()\n    store()\n}\n";
     let relations = extract_relations(code, "kotlin").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"fetch"),
-        "Kotlin: missing fetch call, got: {:?}", calls);
-    assert!(calls.contains(&"store"),
-        "Kotlin: missing store call, got: {:?}", calls);
+    assert!(
+        calls.contains(&"fetch"),
+        "Kotlin: missing fetch call, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"store"),
+        "Kotlin: missing store call, got: {:?}",
+        calls
+    );
 }
 
 #[test]
 fn test_extract_kotlin_imports() {
-    let code = "import com.example.UserService\nimport kotlinx.coroutines.flow.Flow\n\nfun process() {}\n";
+    let code =
+        "import com.example.UserService\nimport kotlinx.coroutines.flow.Flow\n\nfun process() {}\n";
     let relations = extract_relations(code, "kotlin").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(!imports.is_empty(),
+    assert!(
+        !imports.is_empty(),
         "Kotlin: expected at least one IMPORTS edge, got 0 (relations: {:?})",
-        relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
-    assert!(imports.iter().any(|i| i == &"UserService" || i.contains("UserService")),
-        "Kotlin: missing UserService import, got: {:?}", imports);
+        relations
+            .iter()
+            .map(|r| (&r.relation, &r.target_name))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        imports
+            .iter()
+            .any(|i| i == &"UserService" || i.contains("UserService")),
+        "Kotlin: missing UserService import, got: {:?}",
+        imports
+    );
 }
 
 #[test]
 fn test_extract_swift_calls() {
     let code = "func process() {\n    fetch()\n    store()\n}\n";
     let relations = extract_relations(code, "swift").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"fetch"),
-        "Swift: missing fetch call, got: {:?}", calls);
-    assert!(calls.contains(&"store"),
-        "Swift: missing store call, got: {:?}", calls);
+    assert!(
+        calls.contains(&"fetch"),
+        "Swift: missing fetch call, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"store"),
+        "Swift: missing store call, got: {:?}",
+        calls
+    );
 }
 
 #[test]
 fn test_extract_swift_imports() {
     let code = "import Foundation\nimport UIKit\n\nfunc process() {}\n";
     let relations = extract_relations(code, "swift").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"Foundation"),
-        "Swift: missing Foundation, got: {:?}", imports);
-    assert!(imports.contains(&"UIKit"),
-        "Swift: missing UIKit, got: {:?}", imports);
+    assert!(
+        imports.contains(&"Foundation"),
+        "Swift: missing Foundation, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"UIKit"),
+        "Swift: missing UIKit, got: {:?}",
+        imports
+    );
 }
 
 #[test]
 fn test_extract_dart_calls() {
     let code = "void process() {\n  fetch();\n  store();\n}\n";
     let relations = extract_relations(code, "dart").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"fetch"),
-        "Dart: missing fetch call, got: {:?}", calls);
-    assert!(calls.contains(&"store"),
-        "Dart: missing store call, got: {:?}", calls);
+    assert!(
+        calls.contains(&"fetch"),
+        "Dart: missing fetch call, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"store"),
+        "Dart: missing store call, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1752,24 +2739,43 @@ String arrow() => render();
 ";
     let relations = extract_relations(code, "dart").unwrap();
     let calls = |scope: &str| -> Vec<String> {
-        relations.iter()
+        relations
+            .iter()
             .filter(|r| r.relation == REL_CALLS && r.source_name == scope)
             .map(|r| r.target_name.clone())
             .collect()
     };
-    assert!(calls("describe").contains(&"sound".to_string()),
-        "call inside `return \"x\" + sound()` (binary expr) must resolve; got: {:?}", calls("describe"));
-    assert!(calls("compute").contains(&"helper".to_string()),
-        "call inside `return helper(y)` must resolve; got: {:?}", calls("compute"));
+    assert!(
+        calls("describe").contains(&"sound".to_string()),
+        "call inside `return \"x\" + sound()` (binary expr) must resolve; got: {:?}",
+        calls("describe")
+    );
+    assert!(
+        calls("compute").contains(&"helper".to_string()),
+        "call inside `return helper(y)` must resolve; got: {:?}",
+        calls("compute")
+    );
     let b = calls("build");
-    assert!(b.contains(&"make".to_string()),
-        "call inside `var d = make()` must resolve; got: {:?}", b);
-    assert!(b.contains(&"run".to_string()),
-        "method call `obj.run()` must resolve to `run`; got: {:?}", b);
-    assert!(b.contains(&"wrap".to_string()) && b.contains(&"inner".to_string()),
-        "both outer `wrap(...)` and nested `inner()` must resolve; got: {:?}", b);
-    assert!(calls("arrow").contains(&"render".to_string()),
-        "call in arrow body `=> render()` must resolve; got: {:?}", calls("arrow"));
+    assert!(
+        b.contains(&"make".to_string()),
+        "call inside `var d = make()` must resolve; got: {:?}",
+        b
+    );
+    assert!(
+        b.contains(&"run".to_string()),
+        "method call `obj.run()` must resolve to `run`; got: {:?}",
+        b
+    );
+    assert!(
+        b.contains(&"wrap".to_string()) && b.contains(&"inner".to_string()),
+        "both outer `wrap(...)` and nested `inner()` must resolve; got: {:?}",
+        b
+    );
+    assert!(
+        calls("arrow").contains(&"render".to_string()),
+        "call in arrow body `=> render()` must resolve; got: {:?}",
+        calls("arrow")
+    );
 }
 
 #[test]
@@ -1780,61 +2786,109 @@ fn test_extract_dart_top_level_function_symbol() {
     let code = "int helper(int x) {\n  return x + 1;\n}\n\nclass C {\n  int m() => 1;\n}\n";
     let nodes = crate::parser::treesitter::parse_code(code, "dart").unwrap();
     let helper = nodes.iter().find(|n| n.name == "helper");
-    assert!(helper.is_some(), "top-level Dart function `helper` must be a symbol node; got: {:?}",
-        nodes.iter().map(|n| (&n.node_type, &n.name)).collect::<Vec<_>>());
-    assert_eq!(helper.unwrap().node_type, "function",
-        "top-level function should be type `function`");
+    assert!(
+        helper.is_some(),
+        "top-level Dart function `helper` must be a symbol node; got: {:?}",
+        nodes
+            .iter()
+            .map(|n| (&n.node_type, &n.name))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        helper.unwrap().node_type,
+        "function",
+        "top-level function should be type `function`"
+    );
     // The class method must NOT be double-extracted as a top-level function.
     let m_count = nodes.iter().filter(|n| n.name == "m").count();
-    assert_eq!(m_count, 1, "class method `m` must be extracted exactly once (no double-extract)");
+    assert_eq!(
+        m_count, 1,
+        "class method `m` must be extracted exactly once (no double-extract)"
+    );
 }
 
 #[test]
 fn test_extract_dart_imports() {
-    let code = "import 'package:flutter/material.dart';\nimport 'dart:async';\n\nvoid process() {}\n";
+    let code =
+        "import 'package:flutter/material.dart';\nimport 'dart:async';\n\nvoid process() {}\n";
     let relations = extract_relations(code, "dart").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(!imports.is_empty(),
+    assert!(
+        !imports.is_empty(),
         "Dart: expected at least one IMPORTS edge, got 0 (relations: {:?})",
-        relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
-    assert!(imports.iter().any(|i| i.contains("material") || i.contains("flutter")),
-        "Dart: missing material/flutter import, got: {:?}", imports);
-    assert!(imports.iter().any(|i| i.contains("async") || i.contains("dart:async")),
-        "Dart: missing async import, got: {:?}", imports);
+        relations
+            .iter()
+            .map(|r| (&r.relation, &r.target_name))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        imports
+            .iter()
+            .any(|i| i.contains("material") || i.contains("flutter")),
+        "Dart: missing material/flutter import, got: {:?}",
+        imports
+    );
+    assert!(
+        imports
+            .iter()
+            .any(|i| i.contains("async") || i.contains("dart:async")),
+        "Dart: missing async import, got: {:?}",
+        imports
+    );
 }
 
 #[test]
 fn test_extract_php_calls() {
     let code = "<?php\nfunction process() {\n    fetch();\n    store();\n}\n";
     let relations = extract_relations(code, "php").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"fetch"),
-        "PHP: missing fetch call, got: {:?}", calls);
-    assert!(calls.contains(&"store"),
-        "PHP: missing store call, got: {:?}", calls);
+    assert!(
+        calls.contains(&"fetch"),
+        "PHP: missing fetch call, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"store"),
+        "PHP: missing store call, got: {:?}",
+        calls
+    );
 }
 
 #[test]
 fn test_extract_php_imports() {
     let code = "<?php\nuse App\\Services\\UserService;\nuse App\\Models\\Order;\n\nfunction process() {}\n";
     let relations = extract_relations(code, "php").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(!imports.is_empty(),
+    assert!(
+        !imports.is_empty(),
         "PHP: expected at least one IMPORTS edge, got 0 (relations: {:?})",
-        relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
-    assert!(imports.iter().any(|i| i.contains("UserService")),
-        "PHP: missing UserService, got: {:?}", imports);
-    assert!(imports.iter().any(|i| i.contains("Order")),
-        "PHP: missing Order, got: {:?}", imports);
+        relations
+            .iter()
+            .map(|r| (&r.relation, &r.target_name))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        imports.iter().any(|i| i.contains("UserService")),
+        "PHP: missing UserService, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.iter().any(|i| i.contains("Order")),
+        "PHP: missing Order, got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -1845,14 +2899,21 @@ fn test_extract_ruby_calls() {
     // in RHS/argument positions stay ambiguous and are intentionally skipped.
     let code = "def process\n  fetch()\n  store()\nend\n";
     let relations = extract_relations(code, "ruby").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"fetch"),
-        "Ruby: missing fetch call, got: {:?}", calls);
-    assert!(calls.contains(&"store"),
-        "Ruby: missing store call, got: {:?}", calls);
+    assert!(
+        calls.contains(&"fetch"),
+        "Ruby: missing fetch call, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"store"),
+        "Ruby: missing store call, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1862,13 +2923,26 @@ fn test_extract_ruby_bare_calls_statement_position() {
     // are method calls; `x` (assigned) is a local and must NOT produce an edge.
     let code = "def entry\n  setup\n  helper\n  x = 5\n  x\nend\n\ndef setup\n  1\nend\n\ndef helper\n  2\nend\n";
     let relations = extract_relations(code, "ruby").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "entry")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"setup"), "bare `setup` call must be captured, got: {:?}", calls);
-    assert!(calls.contains(&"helper"), "bare `helper` call must be captured, got: {:?}", calls);
-    assert!(!calls.contains(&"x"), "local var `x` must NOT be a call, got: {:?}", calls);
+    assert!(
+        calls.contains(&"setup"),
+        "bare `setup` call must be captured, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"helper"),
+        "bare `helper` call must be captured, got: {:?}",
+        calls
+    );
+    assert!(
+        !calls.contains(&"x"),
+        "local var `x` must NOT be a call, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -1879,14 +2953,22 @@ fn test_ruby_bare_calls_exclude_locals_params_blockparams() {
     // produce a bare-call edge — Ruby's own assigned-vs-call disambiguation.
     let code = "def config\n  9\nend\n\ndef process(data)\n  config = load()\n  config\n  data\n  a, b = pair()\n  a\n  b\n  items.each do |item|\n    item\n  end\n  go\nend\n\ndef go\n  1\nend\n";
     let relations = extract_relations(code, "ruby").unwrap();
-    let bare: Vec<&str> = relations.iter()
+    let bare: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.source_name == "process")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(bare.contains(&"go"), "bare `go` call must be captured, got: {:?}", bare);
+    assert!(
+        bare.contains(&"go"),
+        "bare `go` call must be captured, got: {:?}",
+        bare
+    );
     for local in ["config", "data", "a", "b", "item"] {
-        assert!(!bare.contains(&local),
-            "`{local}` is a local/param/block-param and must NOT be a bare call, got: {:?}", bare);
+        assert!(
+            !bare.contains(&local),
+            "`{local}` is a local/param/block-param and must NOT be a bare call, got: {:?}",
+            bare
+        );
     }
 }
 
@@ -1897,85 +2979,129 @@ fn test_ruby_bare_call_nested_method_is_own_scope() {
     let code = "def outer\n  helper = 1\n  helper\n  def inner\n    helper\n  end\nend\n\ndef helper\n  2\nend\n";
     let relations = extract_relations(code, "ruby").unwrap();
     // outer: `helper` is a local (assigned) → no edge.
-    assert!(!relations.iter().any(|r|
-        r.relation == REL_CALLS && r.source_name == "outer" && r.target_name == "helper"),
-        "outer's `helper` is a local var, must not be a call");
+    assert!(
+        !relations.iter().any(|r| r.relation == REL_CALLS
+            && r.source_name == "outer"
+            && r.target_name == "helper"),
+        "outer's `helper` is a local var, must not be a call"
+    );
     // inner: `helper` is NOT bound in inner → a call.
-    assert!(relations.iter().any(|r|
-        r.relation == REL_CALLS && r.source_name == "inner" && r.target_name == "helper"),
-        "inner's `helper` (unbound in inner's scope) must be a call");
+    assert!(
+        relations.iter().any(|r| r.relation == REL_CALLS
+            && r.source_name == "inner"
+            && r.target_name == "helper"),
+        "inner's `helper` (unbound in inner's scope) must be a call"
+    );
 }
 
 #[test]
 fn test_extract_ruby_imports() {
     let code = "require 'json'\nrequire_relative 'helper'\n\ndef process\nend\n";
     let relations = extract_relations(code, "ruby").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"json"),
-        "Ruby: missing json (require), got: {:?}", imports);
-    assert!(imports.contains(&"helper"),
-        "Ruby: missing helper (require_relative), got: {:?}", imports);
+    assert!(
+        imports.contains(&"json"),
+        "Ruby: missing json (require), got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"helper"),
+        "Ruby: missing helper (require_relative), got: {:?}",
+        imports
+    );
 }
 
 #[test]
 fn test_extract_csharp_calls() {
     let code = "class App {\n    void Process() {\n        Fetch();\n        Store();\n    }\n}\n";
     let relations = extract_relations(code, "csharp").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"Fetch"),
-        "C#: missing Fetch call, got: {:?}", calls);
-    assert!(calls.contains(&"Store"),
-        "C#: missing Store call, got: {:?}", calls);
+    assert!(
+        calls.contains(&"Fetch"),
+        "C#: missing Fetch call, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"Store"),
+        "C#: missing Store call, got: {:?}",
+        calls
+    );
 }
 
 #[test]
 fn test_extract_csharp_imports() {
     let code = "using System;\nusing System.Collections.Generic;\n\nclass App {}\n";
     let relations = extract_relations(code, "csharp").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPORTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(!imports.is_empty(),
+    assert!(
+        !imports.is_empty(),
         "C#: expected at least one IMPORTS edge, got 0 (relations: {:?})",
-        relations.iter().map(|r| (&r.relation, &r.target_name)).collect::<Vec<_>>());
-    assert!(imports.iter().any(|i| i == &"System" || i.contains("System")),
-        "C#: missing System import, got: {:?}", imports);
+        relations
+            .iter()
+            .map(|r| (&r.relation, &r.target_name))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        imports
+            .iter()
+            .any(|i| i == &"System" || i.contains("System")),
+        "C#: missing System import, got: {:?}",
+        imports
+    );
 }
 
 #[test]
 fn test_extract_csharp_inheritance() {
     // C#: `class S : Base, IInterface` — current code uses IFoo prefix
     // heuristic to split into INHERITS (Base) vs IMPLEMENTS (IInterface).
-    let code = "class UserService : BaseService, IDisposable, ICloneable {\n    public void Foo() {}\n}\n";
+    let code =
+        "class UserService : BaseService, IDisposable, ICloneable {\n    public void Foo() {}\n}\n";
     let relations = extract_relations(code, "csharp").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_INHERITS)
         .map(|r| r.target_name.as_str())
         .collect();
-    let implements: Vec<&str> = relations.iter()
+    let implements: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == REL_IMPLEMENTS)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"BaseService"),
-        "C#: missing BaseService (INHERITS), got: {:?}", inherits);
-    assert!(implements.contains(&"IDisposable"),
-        "C#: missing IDisposable (IMPLEMENTS), got: {:?}", implements);
-    assert!(implements.contains(&"ICloneable"),
-        "C#: missing ICloneable (IMPLEMENTS), got: {:?}", implements);
+    assert!(
+        inherits.contains(&"BaseService"),
+        "C#: missing BaseService (INHERITS), got: {:?}",
+        inherits
+    );
+    assert!(
+        implements.contains(&"IDisposable"),
+        "C#: missing IDisposable (IMPLEMENTS), got: {:?}",
+        implements
+    );
+    assert!(
+        implements.contains(&"ICloneable"),
+        "C#: missing ICloneable (IMPLEMENTS), got: {:?}",
+        implements
+    );
 }
 
 #[test]
 fn test_rust_callee_path_qualifier_strips_crate() {
     let code = "fn caller() { crate::snapshot::create(); }";
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "create")
         .expect("missing call to create");
     assert_eq!(
@@ -1990,7 +3116,8 @@ fn test_rust_callee_path_qualifier_strips_crate() {
 fn test_rust_callee_type_method_call_path() {
     let code = r#"fn caller() { File::create("/tmp/x"); }"#;
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "create")
         .expect("missing call to create");
     assert_eq!(
@@ -2005,7 +3132,8 @@ fn test_rust_callee_type_method_call_path() {
 fn test_rust_callee_crate_only_path_collapses_to_bare() {
     let code = "fn caller() { crate::foo(); }";
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
         .expect("missing call to foo");
     assert_eq!(
@@ -2020,7 +3148,8 @@ fn test_rust_callee_super_prefix_stripped() {
     // super:: must be stripped per reserved-prefix rule.
     let code = "fn caller() { super::sibling::foo(); }";
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
         .expect("missing call to foo");
     assert_eq!(
@@ -2033,7 +3162,8 @@ fn test_rust_callee_super_prefix_stripped() {
 fn test_rust_callee_multi_segment_path_preserved() {
     let code = "fn caller() { crate::a::b::c::deep(); }";
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "deep")
         .expect("missing call to deep");
     assert_eq!(
@@ -2048,7 +3178,8 @@ fn test_rust_callee_chained_reserved_prefixes_stripped() {
     // ALL leading reserved segments, not just the first.
     let code = "fn caller() { super::super::foo(); }";
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "foo")
         .expect("missing call to foo");
     assert_eq!(
@@ -2061,7 +3192,8 @@ fn test_rust_callee_chained_reserved_prefixes_stripped() {
 fn test_rust_callee_obj_method_receiver_qualifier() {
     let code = "fn caller(p: &std::path::Path) { p.exists(); }";
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "exists")
         .expect("missing call to exists");
     assert_eq!(
@@ -2079,7 +3211,8 @@ fn test_rust_callee_builder_chain_qualifier() {
     let relations = extract_relations(code, "rust").unwrap();
 
     // OpenOptions::new() → Path
-    let new_call = relations.iter()
+    let new_call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "new")
         .expect("missing call to new");
     assert_eq!(
@@ -2088,22 +3221,18 @@ fn test_rust_callee_builder_chain_qualifier() {
     );
 
     // .create(true) — receiver is call_expression → Chain
-    let create_call = relations.iter()
+    let create_call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "create")
         .expect("missing call to create");
-    assert_eq!(
-        create_call.metadata.as_deref(),
-        Some(r#"{"q":"chain"}"#),
-    );
+    assert_eq!(create_call.metadata.as_deref(), Some(r#"{"q":"chain"}"#),);
 
     // .open(...) — receiver is also call_expression → Chain
-    let open_call = relations.iter()
+    let open_call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "open")
         .expect("missing call to open");
-    assert_eq!(
-        open_call.metadata.as_deref(),
-        Some(r#"{"q":"chain"}"#),
-    );
+    assert_eq!(open_call.metadata.as_deref(), Some(r#"{"q":"chain"}"#),);
 }
 
 #[test]
@@ -2116,7 +3245,8 @@ fn test_rust_callee_self_recv_within_impl() {
         }
     "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "helper")
         .expect("missing call to helper");
     assert_eq!(
@@ -2136,8 +3266,11 @@ fn test_rust_callee_self_type_within_impl() {
         impl Default for Db { fn default() -> Self { Db } }
     "#;
     let relations = extract_relations(code, "rust").unwrap();
-    let call = relations.iter()
-        .find(|r| r.relation == REL_CALLS && r.target_name == "default" && r.source_name.contains("make"))
+    let call = relations
+        .iter()
+        .find(|r| {
+            r.relation == REL_CALLS && r.target_name == "default" && r.source_name.contains("make")
+        })
         .expect("missing call to default from make");
     assert_eq!(
         call.metadata.as_deref(),
@@ -2155,7 +3288,8 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
     // unchanged enforced, preserved here for the non-receiver shapes.
     let code = "function caller() { foo.bar(); baz(); }";
     let relations = extract_relations(code, "javascript").unwrap();
-    let bar = relations.iter()
+    let bar = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "bar")
         .expect("missing call bar");
     assert_eq!(
@@ -2163,7 +3297,8 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
         Some(r#"{"q":"recv","v":"foo"}"#),
         "foo.bar() must emit a Receiver qualifier for require-namespace resolution"
     );
-    let baz = relations.iter()
+    let baz = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "baz")
         .expect("missing call baz");
     assert_eq!(baz.metadata, None, "bare baz() must keep metadata=None");
@@ -2185,7 +3320,8 @@ def save(x):
     writer.write(x)
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "write")
         .expect("missing call to write");
     assert_eq!(
@@ -2194,10 +3330,14 @@ def save(x):
         "writer.write() with `writer = DataWriter()` must carry rtype=DataWriter"
     );
     // The constructor call itself is a bare identifier call — no rtype.
-    let ctor = relations.iter()
+    let ctor = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.target_name == "DataWriter")
         .expect("missing constructor call DataWriter");
-    assert_eq!(ctor.metadata, None, "DataWriter() constructor call stays bare");
+    assert_eq!(
+        ctor.metadata, None,
+        "DataWriter() constructor call stays bare"
+    );
 }
 
 #[test]
@@ -2234,10 +3374,14 @@ class Holder:
         return 0
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let runs: Vec<_> = relations.iter()
+    let runs: Vec<_> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.target_name == "run")
         .collect();
-    assert!(!runs.is_empty(), "expected some run() calls to be extracted");
+    assert!(
+        !runs.is_empty(),
+        "expected some run() calls to be extracted"
+    );
     for r in &runs {
         assert_eq!(
             r.metadata, None,
@@ -2265,10 +3409,16 @@ def save_default(writer: DataWriter = None):
     writer.write(1)
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let writes: Vec<_> = relations.iter()
+    let writes: Vec<_> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.target_name == "write")
         .collect();
-    assert_eq!(writes.len(), 2, "expected two write() calls; got {:?}", writes.iter().map(|r| &r.source_name).collect::<Vec<_>>());
+    assert_eq!(
+        writes.len(),
+        2,
+        "expected two write() calls; got {:?}",
+        writes.iter().map(|r| &r.source_name).collect::<Vec<_>>()
+    );
     for w in &writes {
         assert_eq!(
             w.metadata.as_deref(),
@@ -2303,7 +3453,8 @@ def reassigned(w: A):
     w.run()
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let runs: Vec<_> = relations.iter()
+    let runs: Vec<_> = relations
+        .iter()
         .filter(|r| r.relation == REL_CALLS && r.target_name == "run")
         .collect();
     assert!(!runs.is_empty(), "expected some run() calls");
@@ -2312,12 +3463,17 @@ def reassigned(w: A):
         // it legitimately carries rtype=B (the local reassignment wins, not the
         // stale param annotation A). The other two must be bare.
         if r.source_name.contains("reassigned") {
-            assert_eq!(r.metadata.as_deref(), Some(r#"{"q":"rtype","v":"B"}"#),
-                "local reassignment `w = B()` overrides the param annotation");
+            assert_eq!(
+                r.metadata.as_deref(),
+                Some(r#"{"q":"rtype","v":"B"}"#),
+                "local reassignment `w = B()` overrides the param annotation"
+            );
         } else {
-            assert_eq!(r.metadata, None,
+            assert_eq!(
+                r.metadata, None,
                 "un-annotated / builtin-annotated receiver must stay bare (source={}); got {:?}",
-                r.source_name, r.metadata);
+                r.source_name, r.metadata
+            );
         }
     }
 }
@@ -2331,23 +3487,36 @@ struct AppConfig {
 fn make() -> WidgetConfig { WidgetConfig {} }
 "#;
     let rels = extract_relations(src, "rust").unwrap();
-    let ref_count = rels.iter().filter(|r|
-        r.relation == REL_REFERENCES && r.target_name == "WidgetConfig").count();
+    let ref_count = rels
+        .iter()
+        .filter(|r| r.relation == REL_REFERENCES && r.target_name == "WidgetConfig")
+        .count();
     // Exactly 2: the field type + the return type. The `WidgetConfig {}`
     // struct-expr name is skipped (already a `calls` edge), and the struct's
     // own `name` (AppConfig) is not WidgetConfig.
-    assert_eq!(ref_count, 2,
+    assert_eq!(
+        ref_count,
+        2,
         "expected exactly 2 references edges to WidgetConfig (field type + return type); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_rust_type_definition_name_does_not_self_reference() {
     let src = r#"struct Foo { x: u32 }"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Foo"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Foo"),
         "a struct's own name must not be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2357,9 +3526,15 @@ fn test_rust_inherent_impl_header_does_not_emit_references_edge() {
     // would always look used).
     let src = r#"impl Widget { fn f() {} }"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
         "an inherent impl header type must not be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2368,10 +3543,14 @@ fn test_rust_trait_impl_header_does_not_emit_references_edge() {
     // should yield a references edge (both are IMPLEMENTS-edge territory).
     let src = r#"impl MyTrait for Widget {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
+    assert!(
+        !rels.iter().any(|r| r.relation == REL_REFERENCES
             && (r.target_name == "Widget" || r.target_name == "MyTrait")),
         "a trait impl header (type or trait) must not be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2384,18 +3563,29 @@ impl Widget { fn f() {} }
 fn make() -> Widget { todo!() }
 "#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
+    assert!(
+        rels.iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
         "a return-type usage of Widget must still emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_rust_inferred_type_placeholder_does_not_emit_references_edge() {
     let src = r#"fn f() { let v: Vec<_> = items.collect::<Vec<_>>(); }"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "_"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "_"),
         "inferred-type placeholder `_` must not emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2405,17 +3595,31 @@ fn test_ts_type_usage_emits_references_edge() {
     // `Widget` must NOT self-reference.
     let src = r#"interface Widget { size: number } function make(): Widget { return null as any; } const w: Widget = make();"#;
     let rels = extract_relations(src, "typescript").unwrap();
-    let has_ref = rels.iter().any(|r|
-        r.relation == REL_REFERENCES && r.target_name == "Widget");
-    assert!(has_ref,
+    let has_ref = rels
+        .iter()
+        .any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget");
+    assert!(
+        has_ref,
         "expected a references edge to Widget (return type / annotation); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
     // The interface's own name must not self-reference.
-    let widget_self_ref = rels.iter().any(|r|
-        r.relation == REL_REFERENCES && r.target_name == "Widget" && r.source_name == "Widget");
-    assert!(!widget_self_ref,
+    let widget_self_ref = rels.iter().any(|r| {
+        r.relation == REL_REFERENCES && r.target_name == "Widget" && r.source_name == "Widget"
+    });
+    assert!(
+        !widget_self_ref,
         "the interface's own name `Widget` must not self-reference; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2424,9 +3628,14 @@ fn test_ts_generic_arg_emits_references_edge() {
     // usage and must emit a references edge.
     let src = r#"function g(): Array<Foo> { return []; }"#;
     let rels = extract_relations(src, "typescript").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Foo"),
+    assert!(
+        rels.iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Foo"),
         "a generic-arg type usage of Foo must emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2435,9 +3644,15 @@ fn test_ts_extends_clause_does_not_emit_references_edge() {
     // references edge (avoid double-emit).
     let src = r#"class Foo extends Bar {}"#;
     let rels = extract_relations(src, "typescript").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Bar"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Bar"),
         "an extends-clause superclass must not be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2446,9 +3661,15 @@ fn test_ts_implements_clause_does_not_emit_references_edge() {
     // references edge.
     let src = r#"class Foo implements Iface {}"#;
     let rels = extract_relations(src, "typescript").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Iface"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Iface"),
         "an implements-clause interface must not be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2457,10 +3678,14 @@ fn test_ts_predefined_types_do_not_emit_references_edge() {
     // `type_identifier`, so they are naturally excluded.
     let src = r#"function f(x: number, y: string): boolean { return true; }"#;
     let rels = extract_relations(src, "typescript").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
+    assert!(
+        !rels.iter().any(|r| r.relation == REL_REFERENCES
             && matches!(r.target_name.as_str(), "number" | "string" | "boolean")),
         "predefined primitive types must not emit references edges; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2469,12 +3694,23 @@ fn test_ts_type_alias_rhs_emits_but_name_does_not() {
     // name `Alias` is a declaration (skip).
     let src = r#"type Alias = Widget;"#;
     let rels = extract_relations(src, "typescript").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
+    assert!(
+        rels.iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Widget"),
         "type-alias RHS Widget must emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Alias"),
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Alias"),
         "type-alias own name Alias must not self-reference; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 // --- Python type-annotation REFERENCES edges ---
@@ -2492,18 +3728,31 @@ fn test_python_param_and_return_annotation_emit_references() {
     // `account` (`u.account`) must NOT.
     let src = "def make(u: User) -> Account:\n    return u.account\n";
     let rels = extract_relations(src, "python").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"User"),
-        "param annotation `User` must emit a references edge; got: {:?}", refs);
-    assert!(refs.contains(&"Account"),
-        "return annotation `Account` must emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"u"),
-        "value identifier `u` must NOT be a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"account"),
-        "attribute read `account` must NOT be a references edge; got: {:?}", refs);
+    assert!(
+        refs.contains(&"User"),
+        "param annotation `User` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        refs.contains(&"Account"),
+        "return annotation `Account` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"u"),
+        "value identifier `u` must NOT be a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"account"),
+        "attribute read `account` must NOT be a references edge; got: {:?}",
+        refs
+    );
 }
 
 #[test]
@@ -2512,14 +3761,21 @@ fn test_python_annotated_class_attr_emits_references() {
     // to `Cache`.
     let src = "class Service:\n    cache: Cache\n";
     let rels = extract_relations(src, "python").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"Cache"),
-        "annotated class attr `Cache` must emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"cache"),
-        "the annotated name `cache` (LHS) must NOT be a references edge; got: {:?}", refs);
+    assert!(
+        refs.contains(&"Cache"),
+        "annotated class attr `Cache` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"cache"),
+        "the annotated name `cache` (LHS) must NOT be a references edge; got: {:?}",
+        refs
+    );
 }
 
 #[test]
@@ -2528,9 +3784,15 @@ fn test_python_base_class_does_not_emit_references() {
     // NOT a references edge (avoid double-emit).
     let src = "class Foo(Base):\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Base"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Base"),
         "base class `Base` must NOT be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2538,9 +3800,15 @@ fn test_python_builtin_annotation_does_not_emit_references() {
     // `x: int = 3` — `int` is a builtin, must NOT emit a references edge (noise).
     let src = "x: int = 3\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
         "builtin `int` must NOT be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2550,16 +3818,26 @@ fn test_python_generic_arg_annotation_emits_references_skips_typing_generic() {
     // `str` are stdlib → skipped.
     let src = "def g(items: List[User]) -> Dict[str, User]:\n    return {}\n";
     let rels = extract_relations(src, "python").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"User"),
-        "generic arg `User` must emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"List") && !refs.contains(&"Dict"),
-        "typing generics `List`/`Dict` must be skipped; got: {:?}", refs);
-    assert!(!refs.contains(&"str"),
-        "builtin `str` must be skipped; got: {:?}", refs);
+    assert!(
+        refs.contains(&"User"),
+        "generic arg `User` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"List") && !refs.contains(&"Dict"),
+        "typing generics `List`/`Dict` must be skipped; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"str"),
+        "builtin `str` must be skipped; got: {:?}",
+        refs
+    );
 }
 
 #[test]
@@ -2569,16 +3847,26 @@ fn test_python_dotted_annotation_emits_tail_only_and_no_value_attr_noise() {
     // `obj.method` in non-annotation position must NOT emit any reference.
     let src = "def f(self):\n    meta: mod.Meta = None\n    v = obj.attr\n    return v\n";
     let rels = extract_relations(src, "python").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"Meta"),
-        "dotted annotation tail `Meta` must emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"mod"),
-        "dotted annotation head `mod` (module path) must NOT be a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"obj") && !refs.contains(&"attr"),
-        "value attribute read `obj.attr` must NOT emit any references edge; got: {:?}", refs);
+    assert!(
+        refs.contains(&"Meta"),
+        "dotted annotation tail `Meta` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"mod"),
+        "dotted annotation head `mod` (module path) must NOT be a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"obj") && !refs.contains(&"attr"),
+        "value attribute read `obj.attr` must NOT emit any references edge; got: {:?}",
+        refs
+    );
 }
 
 // --- Go type-position REFERENCES edges ---
@@ -2599,20 +3887,36 @@ fn test_go_param_and_return_type_emit_references() {
     // builtins must not emit.
     let src = "type Account struct {}\nfunc make(u User) Account { return Account{} }\n";
     let rels = extract_relations(src, "go").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"User"),
-        "param type `User` must emit a references edge; got: {:?}", refs);
-    assert!(refs.contains(&"Account"),
-        "return type `Account` must emit a references edge; got: {:?}", refs);
+    assert!(
+        refs.contains(&"User"),
+        "param type `User` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        refs.contains(&"Account"),
+        "return type `Account` must emit a references edge; got: {:?}",
+        refs
+    );
     // The struct's own definition name must not self-reference.
-    let account_self_ref = rels.iter().any(|r|
-        r.relation == REL_REFERENCES && r.target_name == "Account" && r.source_name == "Account");
-    assert!(!account_self_ref,
+    let account_self_ref = rels.iter().any(|r| {
+        r.relation == REL_REFERENCES && r.target_name == "Account" && r.source_name == "Account"
+    });
+    assert!(
+        !account_self_ref,
         "the struct's own name `Account` must not self-reference; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2621,16 +3925,26 @@ fn test_go_struct_field_type_emits_references() {
     // The field NAME `conn` (`field_identifier`) and the struct name `S` must not.
     let src = "type S struct {\n\tconn Conn\n}\n";
     let rels = extract_relations(src, "go").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"Conn"),
-        "struct field type `Conn` must emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"conn"),
-        "the field name `conn` must NOT emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"S"),
-        "the struct's own name `S` must NOT self-reference; got: {:?}", refs);
+    assert!(
+        refs.contains(&"Conn"),
+        "struct field type `Conn` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"conn"),
+        "the field name `conn` must NOT emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"S"),
+        "the struct's own name `S` must NOT self-reference; got: {:?}",
+        refs
+    );
 }
 
 #[test]
@@ -2639,12 +3953,24 @@ fn test_go_value_selector_does_not_emit_references() {
     // a `type_identifier`, so it must not emit a references edge.
     let src = "func run() {\n\tpkg.DoThing()\n}\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "DoThing"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "DoThing"),
         "a value selector call `pkg.DoThing()` must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "pkg"),
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "pkg"),
         "the selector operand `pkg` must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2653,9 +3979,15 @@ fn test_go_builtin_type_does_not_emit_references() {
     // so it must be filtered out by GO_TYPE_REFERENCE_NOISE.
     let src = "var x int\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
         "builtin `int` must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2667,22 +3999,41 @@ fn test_java_param_and_return_and_new_type_emit_references() {
     // NOT self-reference. Primitives must not emit.
     let src = "class Account {}\nclass Svc { Account make(User u) { return new Account(); } }\n";
     let rels = extract_relations(src, "java").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"User"),
-        "param type `User` must emit a references edge; got: {:?}", refs);
-    assert!(refs.contains(&"Account"),
-        "return type / `new Account()` type `Account` must emit a references edge; got: {:?}", refs);
+    assert!(
+        refs.contains(&"User"),
+        "param type `User` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        refs.contains(&"Account"),
+        "return type / `new Account()` type `Account` must emit a references edge; got: {:?}",
+        refs
+    );
     // Class definition names must never self-reference.
-    let account_self = rels.iter().any(|r|
-        r.relation == REL_REFERENCES && r.target_name == "Account" && r.source_name == "Account");
-    assert!(!account_self,
+    let account_self = rels.iter().any(|r| {
+        r.relation == REL_REFERENCES && r.target_name == "Account" && r.source_name == "Account"
+    });
+    assert!(
+        !account_self,
         "the class's own name `Account` must not self-reference; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
-    assert!(!refs.contains(&"Svc"),
-        "the class's own name `Svc` must NOT emit a references edge; got: {:?}", refs);
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !refs.contains(&"Svc"),
+        "the class's own name `Svc` must NOT emit a references edge; got: {:?}",
+        refs
+    );
 }
 
 #[test]
@@ -2692,16 +4043,26 @@ fn test_java_field_type_emits_references() {
     // name `S` must not.
     let src = "class S { Conn conn; }\n";
     let rels = extract_relations(src, "java").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"Conn"),
-        "field type `Conn` must emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"conn"),
-        "the field name `conn` must NOT emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"S"),
-        "the class's own name `S` must NOT self-reference; got: {:?}", refs);
+    assert!(
+        refs.contains(&"Conn"),
+        "field type `Conn` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"conn"),
+        "the field name `conn` must NOT emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"S"),
+        "the class's own name `S` must NOT self-reference; got: {:?}",
+        refs
+    );
 }
 
 #[test]
@@ -2711,12 +4072,24 @@ fn test_java_heritage_types_do_not_emit_references() {
     // they must NOT also emit references edges.
     let src = "class Foo extends Bar implements Baz {}\n";
     let rels = extract_relations(src, "java").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Bar"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Bar"),
         "superclass `Bar` must NOT emit a references edge (heritage); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "Baz"),
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "Baz"),
         "interface `Baz` must NOT emit a references edge (heritage); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2725,9 +4098,15 @@ fn test_java_jdk_noise_type_does_not_emit_references() {
     // be filtered out by JAVA_TYPE_REFERENCE_NOISE.
     let src = "class S { String name; }\n";
     let rels = extract_relations(src, "java").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "String"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "String"),
         "JDK type `String` must NOT emit a references edge (noise); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2736,9 +4115,15 @@ fn test_java_primitive_type_does_not_emit_references() {
     // `type_identifier`, so it is naturally excluded (never reaches the extractor).
     let src = "class S { int x; }\n";
     let rels = extract_relations(src, "java").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "int"),
         "primitive `int` must NOT emit a references edge (separate kind); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2748,21 +4133,37 @@ fn test_java_generic_arg_and_qualified_tail_emit_only_tail() {
     // (also `type_identifier`s under nested `scoped_type_identifier`) must NOT.
     let src = "class A { java.util.List<Foo> g() { return null; } pkg.Sub.Deep d; }\n";
     let rels = extract_relations(src, "java").unwrap();
-    let refs: Vec<&str> = rels.iter()
+    let refs: Vec<&str> = rels
+        .iter()
         .filter(|r| r.relation == REL_REFERENCES)
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(refs.contains(&"Foo"),
-        "generic arg `Foo` in `List<Foo>` must emit a references edge; got: {:?}", refs);
-    assert!(refs.contains(&"Deep"),
-        "qualified-type tail `Deep` in `pkg.Sub.Deep` must emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"pkg"),
-        "qualified-type package segment `pkg` must NOT emit a references edge; got: {:?}", refs);
-    assert!(!refs.contains(&"Sub"),
-        "qualified-type package segment `Sub` must NOT emit a references edge; got: {:?}", refs);
+    assert!(
+        refs.contains(&"Foo"),
+        "generic arg `Foo` in `List<Foo>` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        refs.contains(&"Deep"),
+        "qualified-type tail `Deep` in `pkg.Sub.Deep` must emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"pkg"),
+        "qualified-type package segment `pkg` must NOT emit a references edge; got: {:?}",
+        refs
+    );
+    assert!(
+        !refs.contains(&"Sub"),
+        "qualified-type package segment `Sub` must NOT emit a references edge; got: {:?}",
+        refs
+    );
     // `java.util.List` is JDK noise on the tail (List) and path segments java/util.
-    assert!(!refs.contains(&"java") && !refs.contains(&"util"),
-        "qualified-type package segments `java`/`util` must NOT emit a references edge; got: {:?}", refs);
+    assert!(
+        !refs.contains(&"java") && !refs.contains(&"util"),
+        "qualified-type package segments `java`/`util` must NOT emit a references edge; got: {:?}",
+        refs
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2779,30 +4180,57 @@ fn test_java_generic_arg_and_qualified_tail_emit_only_tail() {
 fn test_r1_rust_bare_fn_call_arg_emits_references_edge() {
     let src = r#"fn caller() { install(handler); } fn handler() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "bare fn passed as a call argument must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r2_rust_bare_fn_hof_arg_emits_references_edge() {
     let src = r#"fn caller() { let _ = xs.iter().map(double); } fn double() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "double" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "double"
+            && r.source_name == "caller"),
         "bare fn passed to a HOF (.map) must emit references caller->double; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r3_rust_address_of_fn_arg_emits_references_edge() {
     let src = r#"fn caller() { signal(&shutdown); } fn shutdown() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "shutdown" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "shutdown"
+            && r.source_name == "caller"),
         "address-of fn passed as arg (&shutdown) must emit references caller->shutdown; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2811,80 +4239,145 @@ fn test_r4_rust_param_passed_as_arg_does_not_emit_references_edge() {
     // must NOT emit a references edge (M2 param exclusion).
     let src = r#"fn run<F>(handler: F) { spawn(handler); } fn handler() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "run"),
+    assert!(
+        !rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "run"),
         "a parameter passed through must NOT emit a references edge (M2); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r5_rust_call_in_arg_position_does_not_emit_references_edge() {
     let src = r#"fn caller() { foo(bar()); } fn bar() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
         "a called fn in arg position (bar()) is a calls edge, not references; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r6_rust_field_access_arg_does_not_emit_references_edge() {
     let src = r#"fn caller() { foo(x.field); }"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
-        && (r.target_name == "field" || r.target_name == "x")),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES
+                && (r.target_name == "field" || r.target_name == "x")),
         "member access in arg position must not emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r7_rust_call_callee_does_not_also_emit_value_reference() {
     let src = r#"fn caller() { register(handler); } fn handler() {} fn register<F>(_f: F) {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_CALLS && r.target_name == "register"),
+    assert!(
+        rels.iter()
+            .any(|r| r.relation == REL_CALLS && r.target_name == "register"),
         "the callee must still be a calls edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "register"),
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "register"),
         "the callee must NOT also be a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r8_js_bare_fn_call_arg_emits_references_edge() {
     let src = r#"function caller() { arr.map(myFunc); } function myFunc() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "myFunc" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "myFunc"
+            && r.source_name == "caller"),
         "bare fn passed to .map must emit references caller->myFunc; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r9_js_callback_arg_emits_references_edge() {
     let src = r#"function caller() { on('click', handler); } function handler() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "bare fn passed as a callback arg must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r10_ts_param_passed_as_arg_does_not_emit_references_edge() {
     let src = r#"function run(cb: Fn) { q(cb); }"#;
     let rels = extract_relations(src, "typescript").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "cb" && r.source_name == "run"),
+    assert!(
+        !rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "cb"
+            && r.source_name == "run"),
         "a TS parameter passed through must NOT emit a references edge (M2); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r11_js_call_in_arg_position_does_not_emit_references_edge() {
     let src = r#"function caller() { foo(bar()); } function bar() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
         "a called fn in arg position (bar()) is a calls edge, not references; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2895,18 +4388,38 @@ fn test_r16_rust_local_let_binding_does_not_emit_references_edge() {
     // run(&db)` where an accessor fn/method `db` also exists.
     let src = r#"fn caller() { let db = open(); run(&db); use_it(db); } fn db() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
         "a local `let` binding passed as arg must NOT emit a references edge (M2.5); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r17_js_local_const_binding_does_not_emit_references_edge() {
     let src = r#"function caller() { const cb = make(); run(cb); } function cb() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "cb"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "cb"),
         "a local const binding passed as arg must NOT emit a references edge (M2.5); got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2916,10 +4429,19 @@ fn test_r18_rust_genuine_fn_pointer_still_emits_after_m2_5() {
     // accidentally killing real callbacks.
     let src = r#"fn caller() { query_map(params, map_row); } fn map_row() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "map_row" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "map_row"
+            && r.source_name == "caller"),
         "a genuine fn-pointer callback (no local shadow) must still emit references; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2929,9 +4451,15 @@ fn test_n1_rust_macro_path_does_not_emit_references_edge() {
     // name tail (`error`) as a value reference — it collides with same-named fns.
     let src = r#"fn f() { tracing::error!("boom {}", x); } fn error() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "error"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "error"),
         "a macro path tail must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2953,9 +4481,14 @@ fn test_n3_rust_module_path_value_still_emits_after_noise_fix() {
     // legitimate lowercase module-path value references (`crate::domain::SHARED`).
     let src = r#"fn build() { let w = crate::domain::SHARED; }"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "SHARED"),
+    assert!(
+        rels.iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "SHARED"),
         "a lowercase module-path value reference must still emit; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -2964,28 +4497,56 @@ fn test_r19_rust_if_let_binding_does_not_emit_references_edge() {
     // if-let/while-let bindings are `let_condition` patterns, NOT `let_declaration`.
     let src = r#"fn caller() { if let Some(node) = g() { use_it(node); } } fn node() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "node"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "node"),
         "an if-let pattern binding must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r20_rust_for_loop_binding_does_not_emit_references_edge() {
     let src = r#"fn caller() { for item in xs { take(item); } } fn item() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "item"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "item"),
         "a for-loop pattern binding must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_r21_rust_match_arm_binding_does_not_emit_references_edge() {
     let src = r#"fn caller() { match g() { Ok(val) => keep(val), Err(error) => log(error) } } fn val() {} fn error() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES
-        && (r.target_name == "val" || r.target_name == "error")),
+    assert!(
+        !rels.iter().any(|r| r.relation == REL_REFERENCES
+            && (r.target_name == "val" || r.target_name == "error")),
         "match-arm pattern bindings must NOT emit references edges; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2999,20 +4560,38 @@ fn test_p1_rust_let_rhs_fn_emits_references_edge() {
     // `let cb = handler;` stores a fn by name — RHS value reference.
     let src = r#"fn caller() { let cb = handler; use_it(cb); } fn handler() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "let-binding RHS fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_p2_js_const_rhs_fn_emits_references_edge() {
     let src = r#"function caller() { const cb = handler; } function handler() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "const-binding RHS fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3020,19 +4599,38 @@ fn test_p3_rust_let_rhs_param_does_not_emit_references_edge() {
     // RHS is a parameter, not a global fn — M2 excludes.
     let src = r#"fn caller(p: i32) { let x = p; } fn p() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "p"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "p"),
         "let RHS that is a parameter must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_p4_rust_explicit_return_fn_emits_references_edge() {
     let src = r#"fn caller() -> F { return handler; } fn handler() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "explicit `return fn` must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3040,20 +4638,38 @@ fn test_p5_rust_tail_expr_fn_emits_references_edge() {
     // Rust tail expression (no `return`, no trailing `;`) returns the fn by name.
     let src = r#"fn caller() -> F { handler } fn handler() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "Rust tail-expr fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_p6_js_return_fn_emits_references_edge() {
     let src = r#"function caller() { return handler; } function handler() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "JS `return fn` must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3061,10 +4677,19 @@ fn test_p7_js_arrow_body_fn_emits_references_edge() {
     // `const f = () => handler` is an implicit-return of the fn by name.
     let src = r#"const f = () => handler; function handler() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "f"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "f"),
         "JS arrow implicit-return fn must emit references f->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3072,9 +4697,19 @@ fn test_p8_rust_tail_expr_local_does_not_emit_references_edge() {
     // Returning a LOCAL by tail expression must NOT reference a same-named fn (M2.5).
     let src = r#"fn caller() -> X { let r = compute(); r } fn r() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "r"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "r"),
         "tail-expr returning a local must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3082,9 +4717,15 @@ fn test_p9_rust_return_call_does_not_emit_references_edge() {
     // `return helper();` is a CALL, not a value reference.
     let src = r#"fn caller() -> X { return helper(); } fn helper() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "helper"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "helper"),
         "returning a call result must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Phase 2 Inc A: struct / object field VALUES (`Config { cb: handler }`) ──
@@ -3093,20 +4734,38 @@ fn test_p9_rust_return_call_does_not_emit_references_edge() {
 fn test_q1_rust_struct_field_value_fn_emits_references_edge() {
     let src = r#"fn caller() { let _c = Config { cb: handler }; } fn handler() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "struct field value fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_q2_js_object_property_value_fn_emits_references_edge() {
     let src = r#"function caller() { const o = { onClick: handler }; } function handler() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "object property value fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3114,9 +4773,15 @@ fn test_q3_js_object_property_key_does_not_emit_references_edge() {
     // The property KEY (`handler:`) is not a value reference — only the value is.
     let src = r#"function caller() { const o = { handler: compute() }; } function handler() {}"#;
     let rels = extract_relations(src, "javascript").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
         "an object property key must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Phase 2 Inc B: Python value references (call-arg / keyword / RHS / return) ──
@@ -3125,67 +4790,129 @@ fn test_q3_js_object_property_key_does_not_emit_references_edge() {
 fn test_b1_python_call_arg_fn_emits_references_edge() {
     let src = "def caller():\n    install(handler)\n\ndef handler():\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "python call-arg fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_b2_python_keyword_arg_fn_emits_references_edge() {
     let src = "def caller():\n    sorted(xs, key=my_key)\n\ndef my_key():\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "my_key" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "my_key"
+            && r.source_name == "caller"),
         "python keyword-arg fn value must emit references caller->my_key; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_b3_python_assignment_rhs_fn_emits_references_edge() {
     let src = "def caller():\n    cb = handler\n\ndef handler():\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "python assignment RHS fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_b4_python_return_fn_emits_references_edge() {
     let src = "def caller():\n    return handler\n\ndef handler():\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "python return fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_b5_python_param_does_not_emit_references_edge() {
     let src = "def caller(handler):\n    install(handler)\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
         "python parameter passed through must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_b6_python_local_assignment_target_does_not_emit_references_edge() {
     let src = "def caller():\n    db = get()\n    use(db)\n\ndef db():\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
         "a python local assignment target must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_b7_python_call_in_arg_does_not_emit_references_edge() {
     let src = "def caller():\n    foo(bar())\n\ndef bar():\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
         "a called fn in arg position must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Phase 2 Inc C: Go value references (call-arg / := RHS / return) ──
@@ -3194,57 +4921,110 @@ fn test_b7_python_call_in_arg_does_not_emit_references_edge() {
 fn test_c1_go_call_arg_fn_emits_references_edge() {
     let src = "package main\nfunc caller() { install(handler) }\nfunc handler() {}\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "go call-arg fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_c2_go_short_var_rhs_fn_emits_references_edge() {
     let src = "package main\nfunc caller() { cb := handler; _ = cb }\nfunc handler() {}\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "go := RHS fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_c3_go_return_fn_emits_references_edge() {
     let src = "package main\nfunc caller() func() { return handler }\nfunc handler() {}\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "go return fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_c4_go_param_does_not_emit_references_edge() {
     let src = "package main\nfunc caller(handler func()) { install(handler) }\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
         "go parameter passed through must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_c5_go_short_var_local_does_not_emit_references_edge() {
     let src = "package main\nfunc caller() { db := get(); use(db) }\nfunc db() {}\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
         "a go := local must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_c6_go_call_in_arg_does_not_emit_references_edge() {
     let src = "package main\nfunc caller() { foo(bar()) }\nfunc bar() {}\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
         "a called fn in arg position must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Phase 3a: C/C++ value references (call-arg / &fn / designated init / RHS / return) ──
@@ -3253,77 +5033,148 @@ fn test_c6_go_call_in_arg_does_not_emit_references_edge() {
 fn test_d1_c_call_arg_fn_emits_references_edge() {
     let src = "void handler(void) {}\nvoid caller(void) { install(handler); }\n";
     let rels = extract_relations(src, "c").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "c call-arg fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_d2_c_address_of_fn_emits_references_edge() {
     let src = "void handler(int s) {}\nvoid caller(void) { signal(2, &handler); }\n";
     let rels = extract_relations(src, "c").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "c &fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_d3_c_designated_initializer_vtable_emits_references_edge() {
     let src = "int my_read(void) { return 0; }\nvoid caller(void) { struct ops o = { .read = my_read }; }\n";
     let rels = extract_relations(src, "c").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "my_read" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "my_read"
+            && r.source_name == "caller"),
         "c designated-init vtable field must emit references caller->my_read; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_d4_c_init_declarator_rhs_fn_emits_references_edge() {
     let src = "void handler(void) {}\nvoid caller(void) { fn_t cb = handler; (void)cb; }\n";
     let rels = extract_relations(src, "c").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "c init-declarator RHS fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_d5_c_return_fn_emits_references_edge() {
     let src = "void handler(void) {}\nfn_t caller(void) { return handler; }\n";
     let rels = extract_relations(src, "c").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "c return fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_d6_c_param_does_not_emit_references_edge() {
     let src = "void caller(fn_t handler) { install(handler); }\n";
     let rels = extract_relations(src, "c").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "handler"),
         "c parameter passed through must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_d7_c_local_declaration_does_not_emit_references_edge() {
     let src = "void use(void* p) {}\nvoid db(void) {}\nvoid caller(void) { void* db = get(); use(db); }\n";
     let rels = extract_relations(src, "c").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "db"),
         "a c local declaration must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_d8_c_call_in_arg_does_not_emit_references_edge() {
     let src = "int bar(void) { return 0; }\nvoid caller(void) { foo(bar()); }\n";
     let rels = extract_relations(src, "c").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "bar"),
         "a called fn in arg position must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3331,10 +5182,19 @@ fn test_d9_cpp_call_arg_fn_emits_references_edge() {
     // Confirm the cpp config dispatches the value-reference pass too.
     let src = "void handler() {}\nvoid caller() { install(handler); }\n";
     let rels = extract_relations(src, "cpp").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "cpp call-arg fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Phase 3b Inc E: JSX attribute callbacks (`onClick={handleClick}`) ──
@@ -3343,20 +5203,36 @@ fn test_d9_cpp_call_arg_fn_emits_references_edge() {
 fn test_e1_tsx_jsx_attr_callback_emits_references_edge() {
     let src = r#"function caller() { return <Button onClick={handleClick} />; } function handleClick() {}"#;
     let rels = extract_relations(src, "tsx").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handleClick" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handleClick"
+            && r.source_name == "caller"),
         "JSX attr callback must emit references caller->handleClick; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn test_e2_tsx_jsx_attr_arrow_does_not_emit_bare_reference() {
     // An inline arrow attr (`onClick={() => h()}`) is not a bare-id value reference.
-    let src = r#"function caller() { return <Button onClick={() => other()} />; } function other() {}"#;
+    let src =
+        r#"function caller() { return <Button onClick={() => other()} />; } function other() {}"#;
     let rels = extract_relations(src, "tsx").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "other"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "other"),
         "an inline-arrow JSX attr must NOT emit a bare references edge to its call; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Phase 3b Inc F: Go composite-literal field values (`T{cb: fn}`) ──
@@ -3365,10 +5241,19 @@ fn test_e2_tsx_jsx_attr_arrow_does_not_emit_bare_reference() {
 fn test_f1_go_composite_keyed_field_fn_emits_references_edge() {
     let src = "package main\nfunc caller() { _ = Handler{OnEvent: handler} }\nfunc handler() {}\n";
     let rels = extract_relations(src, "go").unwrap();
-    assert!(rels.iter().any(|r| r.relation == REL_REFERENCES
-        && r.target_name == "handler" && r.source_name == "caller"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_REFERENCES
+            && r.target_name == "handler"
+            && r.source_name == "caller"),
         "go composite keyed field fn must emit references caller->handler; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (
+                r.relation.as_str(),
+                r.source_name.as_str(),
+                r.target_name.as_str()
+            ))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Phase 3b Inc G: tuple return / RHS (Python `return f, g`) ──
@@ -3377,10 +5262,16 @@ fn test_f1_go_composite_keyed_field_fn_emits_references_edge() {
 fn test_g1_python_tuple_return_emits_references_edges() {
     let src = "def caller():\n    return f, g\n\ndef f():\n    pass\n\ndef g():\n    pass\n";
     let rels = extract_relations(src, "python").unwrap();
-    let got: Vec<&str> = rels.iter().filter(|r| r.relation == REL_REFERENCES && r.source_name == "caller")
-        .map(|r| r.target_name.as_str()).collect();
-    assert!(got.contains(&"f") && got.contains(&"g"),
-        "python tuple return must emit references to both f and g; got: {:?}", got);
+    let got: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_REFERENCES && r.source_name == "caller")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        got.contains(&"f") && got.contains(&"g"),
+        "python tuple return must emit references to both f and g; got: {:?}",
+        got
+    );
 }
 
 // ── Phase 3b Inc H: primitive-type-head path residual (`str::trim`) ──
@@ -3389,11 +5280,16 @@ fn test_g1_python_tuple_return_emits_references_edges() {
 fn test_h1_rust_primitive_head_path_does_not_emit_references_edge() {
     let src = r#"fn caller() { let _ = xs.iter().map(str::trim); } fn trim() {}"#;
     let rels = extract_relations(src, "rust").unwrap();
-    assert!(!rels.iter().any(|r| r.relation == REL_REFERENCES && r.target_name == "trim"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_REFERENCES && r.target_name == "trim"),
         "a primitive-type-head path (`str::trim`) must NOT emit a references edge; got: {:?}",
-        rels.iter().map(|r| (r.relation.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .map(|r| (r.relation.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
-
 
 // --- v49 audit fixes: top-level call `<module>` fallback parity (C#/Kotlin/Swift/Dart) ---
 
@@ -3406,12 +5302,17 @@ fn test_csharp_top_level_call_attributes_to_module() {
     // Some(active_scope), dropping every top-level call. INDEX_VERSION 48→49.
     let code = "int Helper() { return 1; }\nHelper();\n";
     let rels = extract_relations(code, "csharp").unwrap();
-    let has_edge = rels.iter().any(|r|
-        r.relation == REL_CALLS && r.target_name == "Helper" && r.source_name == "<module>");
-    assert!(has_edge,
+    let has_edge = rels.iter().any(|r| {
+        r.relation == REL_CALLS && r.target_name == "Helper" && r.source_name == "<module>"
+    });
+    assert!(
+        has_edge,
         "top-level Helper() must produce a <module> → Helper call edge; got calls: {:?}",
-        rels.iter().filter(|r| r.relation == REL_CALLS)
-            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3421,12 +5322,17 @@ fn test_kotlin_top_level_call_attributes_to_module() {
     // call_expression fallback granted <module> only to js/ts/tsx.
     let code = "fun helper(): Int { return 1 }\nval x = helper()\n";
     let rels = extract_relations(code, "kotlin").unwrap();
-    let has_edge = rels.iter().any(|r|
-        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>");
-    assert!(has_edge,
+    let has_edge = rels.iter().any(|r| {
+        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>"
+    });
+    assert!(
+        has_edge,
         "top-level helper() must produce a <module> → helper call edge; got calls: {:?}",
-        rels.iter().filter(|r| r.relation == REL_CALLS)
-            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3436,12 +5342,17 @@ fn test_swift_top_level_call_attributes_to_module() {
     // the generic call_expression <module> fallback.
     let code = "func helper() -> Int { return 1 }\nlet x = helper()\n";
     let rels = extract_relations(code, "swift").unwrap();
-    let has_edge = rels.iter().any(|r|
-        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>");
-    assert!(has_edge,
+    let has_edge = rels.iter().any(|r| {
+        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>"
+    });
+    assert!(
+        has_edge,
         "top-level helper() must produce a <module> → helper call edge; got calls: {:?}",
-        rels.iter().filter(|r| r.relation == REL_CALLS)
-            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3453,19 +5364,30 @@ fn test_rust_go_top_level_calls_still_excluded_from_module_fallback() {
     // enclosing fn — it must stay dropped, not attribute to <module>.)
     let rust = "const X: i32 = compute();\nfn compute() -> i32 { 1 }\n";
     let rels = extract_relations(rust, "rust").unwrap();
-    assert!(!rels.iter().any(|r|
-        r.relation == REL_CALLS && r.source_name == "<module>"),
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.relation == REL_CALLS && r.source_name == "<module>"),
         "Rust top-level init calls must NOT attribute to <module>; got: {:?}",
-        rels.iter().filter(|r| r.relation == REL_CALLS)
-            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 
     let go = "package main\nvar x = compute()\nfunc compute() int { return 1 }\n";
     let grels = extract_relations(go, "go").unwrap();
-    assert!(!grels.iter().any(|r|
-        r.relation == REL_CALLS && r.source_name == "<module>"),
+    assert!(
+        !grels
+            .iter()
+            .any(|r| r.relation == REL_CALLS && r.source_name == "<module>"),
         "Go package-level init calls must NOT attribute to <module>; got: {:?}",
-        grels.iter().filter(|r| r.relation == REL_CALLS)
-            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        grels
+            .iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3475,12 +5397,17 @@ fn test_dart_top_level_call_attributes_to_module() {
     // Some(active_scope), dropping library-level calls.
     let code = "int helper() => 1;\nfinal x = helper();\n";
     let rels = extract_relations(code, "dart").unwrap();
-    let has_edge = rels.iter().any(|r|
-        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>");
-    assert!(has_edge,
+    let has_edge = rels.iter().any(|r| {
+        r.relation == REL_CALLS && r.target_name == "helper" && r.source_name == "<module>"
+    });
+    assert!(
+        has_edge,
         "top-level helper() must produce a <module> → helper call edge; got calls: {:?}",
-        rels.iter().filter(|r| r.relation == REL_CALLS)
-            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 // --- v49 audit fix: Dart `mixin M {}` extracted as a symbol node ---
@@ -3494,18 +5421,28 @@ fn test_dart_mixin_declaration_extracted_as_node() {
     let code = "class Derived extends Base with MixinA {}\nmixin MixinA {}\nclass Base {}\n";
     let nodes = crate::parser::treesitter::parse_code(code, "dart").unwrap();
     let mixin = nodes.iter().find(|n| n.name == "MixinA");
-    assert!(mixin.is_some(),
+    assert!(
+        mixin.is_some(),
         "Dart `mixin MixinA` must be extracted as a symbol node named `MixinA`; got: {:?}",
-        nodes.iter().map(|n| (n.node_type.as_str(), n.name.as_str())).collect::<Vec<_>>());
+        nodes
+            .iter()
+            .map(|n| (n.node_type.as_str(), n.name.as_str()))
+            .collect::<Vec<_>>()
+    );
     // The name must be the bare identifier, never `mixin MixinA`.
     assert_eq!(mixin.unwrap().name, "MixinA");
     // And the inherits edge Derived→MixinA is still emitted (target now resolvable).
     let rels = extract_relations(code, "dart").unwrap();
-    assert!(rels.iter().any(|r|
-        r.relation == REL_INHERITS && r.source_name == "Derived" && r.target_name == "MixinA"),
+    assert!(
+        rels.iter().any(|r| r.relation == REL_INHERITS
+            && r.source_name == "Derived"
+            && r.target_name == "MixinA"),
         "inherits edge Derived→MixinA must be emitted; got inherits: {:?}",
-        rels.iter().filter(|r| r.relation == REL_INHERITS)
-            .map(|r| (r.source_name.as_str(), r.target_name.as_str())).collect::<Vec<_>>());
+        rels.iter()
+            .filter(|r| r.relation == REL_INHERITS)
+            .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 // --- v49 audit fix: callee-qualifier metadata JSON built with serde_json (escaping) ---
@@ -3517,21 +5454,29 @@ fn test_serialize_callee_qualifier_escapes_special_chars() {
     // malformed blob that parse_callee_metadata / json_extract silently reject.
     let q = CalleeQualifier::Receiver("a\"b\\c".to_string());
     let s = serialize_callee_qualifier(&q).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&s)
-        .unwrap_or_else(|e| panic!("must be valid JSON; got {s:?}: {e}"));
+    let v: serde_json::Value =
+        serde_json::from_str(&s).unwrap_or_else(|e| panic!("must be valid JSON; got {s:?}: {e}"));
     assert_eq!(v.get("q").and_then(|x| x.as_str()), Some("recv"));
-    assert_eq!(v.get("v").and_then(|x| x.as_str()), Some("a\"b\\c"),
-        "the `v` payload must round-trip through JSON unescaping");
+    assert_eq!(
+        v.get("v").and_then(|x| x.as_str()),
+        Some("a\"b\\c"),
+        "the `v` payload must round-trip through JSON unescaping"
+    );
     // Byte-identical to the old format! output for the common identifier-only case.
     let plain = serialize_callee_qualifier(&CalleeQualifier::Receiver("foo".to_string())).unwrap();
-    assert_eq!(plain, r#"{"q":"recv","v":"foo"}"#,
-        "identifier-only payload must stay byte-identical to the pre-fix format");
+    assert_eq!(
+        plain, r#"{"q":"recv","v":"foo"}"#,
+        "identifier-only payload must stay byte-identical to the pre-fix format"
+    );
     let stype = serialize_callee_qualifier(&CalleeQualifier::SelfType("Db".to_string())).unwrap();
     assert_eq!(stype, r#"{"q":"stype","v":"Db"}"#);
-    let path = serialize_callee_qualifier(
-        &CalleeQualifier::Path(vec!["a".into(), "b".into()])).unwrap();
+    let path =
+        serialize_callee_qualifier(&CalleeQualifier::Path(vec!["a".into(), "b".into()])).unwrap();
     assert_eq!(path, r#"{"q":"path","v":"a::b"}"#);
-    assert_eq!(serialize_callee_qualifier(&CalleeQualifier::Chain).unwrap(), r#"{"q":"chain"}"#);
+    assert_eq!(
+        serialize_callee_qualifier(&CalleeQualifier::Chain).unwrap(),
+        r#"{"q":"chain"}"#
+    );
 }
 
 // --- v49 audit fix: doc_comment NUL bytes stripped (FTS5 C-string truncation) ---
@@ -3546,14 +5491,23 @@ fn test_doc_comment_strips_nul_bytes() {
     // re-tokenized around the NUL and never reach get_preceding_comment intact).
     let code = "/* a\0b */\nfn foo() -> i32 { 1 }\n";
     let nodes = crate::parser::treesitter::parse_code(code, "rust").unwrap();
-    let foo = nodes.iter().find(|n| n.name == "foo")
+    let foo = nodes
+        .iter()
+        .find(|n| n.name == "foo")
         .expect("fn foo must be extracted");
-    let doc = foo.doc_comment.clone().expect("foo must carry the preceding block comment");
-    assert!(!doc.contains('\0'),
-        "doc_comment must not contain NUL bytes; got: {doc:?}");
+    let doc = foo
+        .doc_comment
+        .clone()
+        .expect("foo must carry the preceding block comment");
+    assert!(
+        !doc.contains('\0'),
+        "doc_comment must not contain NUL bytes; got: {doc:?}"
+    );
     // The bytes around the NUL must remain (NUL→space, not truncated at the NUL).
-    assert_eq!(doc, "/* a b */",
-        "NUL must become a space with all other bytes unchanged; got: {doc:?}");
+    assert_eq!(
+        doc, "/* a b */",
+        "NUL must become a space with all other bytes unchanged; got: {doc:?}"
+    );
 }
 
 // --- v50: constructor-instantiation call edges (Task 1) ---
@@ -3564,8 +5518,10 @@ fn test_doc_comment_strips_nul_bytes() {
 // and non-dead.
 
 fn calls_of(rels: &[ParsedRelation]) -> Vec<(String, String)> {
-    rels.iter().filter(|r| r.relation == REL_CALLS)
-        .map(|r| (r.source_name.clone(), r.target_name.clone())).collect()
+    rels.iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.clone(), r.target_name.clone()))
+        .collect()
 }
 
 #[test]
@@ -3575,16 +5531,29 @@ fn test_js_new_expression_creates_calls_edge() {
                 const top = new Root();\n";
     let rels = extract_relations(code, "javascript").unwrap();
     let calls = calls_of(&rels);
-    assert!(calls.contains(&("build".into(), "Widget".into())),
-        "new Widget() → build→Widget calls edge; got {calls:?}");
-    assert!(calls.contains(&("build".into(), "Panel".into())),
-        "new ns.Panel() → build→Panel (member form, bare class name); got {calls:?}");
-    assert!(calls.contains(&("<module>".into(), "Root".into())),
-        "top-level new Root() → <module>→Root; got {calls:?}");
+    assert!(
+        calls.contains(&("build".into(), "Widget".into())),
+        "new Widget() → build→Widget calls edge; got {calls:?}"
+    );
+    assert!(
+        calls.contains(&("build".into(), "Panel".into())),
+        "new ns.Panel() → build→Panel (member form, bare class name); got {calls:?}"
+    );
+    assert!(
+        calls.contains(&("<module>".into(), "Root".into())),
+        "top-level new Root() → <module>→Root; got {calls:?}"
+    );
     // Member form carries a Receiver qualifier consistent with member call_expressions.
-    let panel = rels.iter().find(|r| r.relation == REL_CALLS && r.target_name == "Panel").unwrap();
-    assert_eq!(panel.metadata.as_deref(), Some(r#"{"q":"recv","v":"ns"}"#),
-        "member new ns.Panel() carries recv=ns; got {:?}", panel.metadata);
+    let panel = rels
+        .iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "Panel")
+        .unwrap();
+    assert_eq!(
+        panel.metadata.as_deref(),
+        Some(r#"{"q":"recv","v":"ns"}"#),
+        "member new ns.Panel() carries recv=ns; got {:?}",
+        panel.metadata
+    );
 }
 
 #[test]
@@ -3592,18 +5561,25 @@ fn test_ts_new_expression_creates_calls_edge_strips_generics() {
     let code = "function build() { const a = new Store<State>(); const b = new mod.Cache(); }\n";
     let rels = extract_relations(code, "typescript").unwrap();
     let calls = calls_of(&rels);
-    assert!(calls.contains(&("build".into(), "Store".into())),
-        "new Store<State>() → build→Store (generic arg stripped); got {calls:?}");
-    assert!(calls.contains(&("build".into(), "Cache".into())),
-        "new mod.Cache() → build→Cache; got {calls:?}");
+    assert!(
+        calls.contains(&("build".into(), "Store".into())),
+        "new Store<State>() → build→Store (generic arg stripped); got {calls:?}"
+    );
+    assert!(
+        calls.contains(&("build".into(), "Cache".into())),
+        "new mod.Cache() → build→Cache; got {calls:?}"
+    );
 }
 
 #[test]
 fn test_tsx_new_expression_creates_calls_edge() {
     let code = "function build() { const a = new Model(); }\n";
     let rels = extract_relations(code, "tsx").unwrap();
-    assert!(calls_of(&rels).contains(&("build".into(), "Model".into())),
-        "TSX new Model() → build→Model; got {:?}", calls_of(&rels));
+    assert!(
+        calls_of(&rels).contains(&("build".into(), "Model".into())),
+        "TSX new Model() → build→Model; got {:?}",
+        calls_of(&rels)
+    );
 }
 
 #[test]
@@ -3612,24 +5588,35 @@ fn test_csharp_object_creation_creates_calls_edge() {
     let code = "class App { void M() { var a = new Widget(); var b = new Ns.Panel(); } }\n";
     let rels = extract_relations(code, "csharp").unwrap();
     let calls = calls_of(&rels);
-    assert!(calls.contains(&("App.M".into(), "Widget".into())),
-        "C# new Widget() → App.M→Widget; got {calls:?}");
-    assert!(calls.contains(&("App.M".into(), "Panel".into())),
-        "C# new Ns.Panel() → App.M→Panel (qualified tail); got {calls:?}");
+    assert!(
+        calls.contains(&("App.M".into(), "Widget".into())),
+        "C# new Widget() → App.M→Widget; got {calls:?}"
+    );
+    assert!(
+        calls.contains(&("App.M".into(), "Panel".into())),
+        "C# new Ns.Panel() → App.M→Panel (qualified tail); got {calls:?}"
+    );
 }
 
 #[test]
 fn test_php_object_creation_creates_calls_edge() {
     // Bare, namespaced, and the relative `self`/`static`/`parent` skips.
-    let code = "<?php\nfunction build() { $a = new Widget(); $b = new Ns\\Panel(); $c = new self(); }\n";
+    let code =
+        "<?php\nfunction build() { $a = new Widget(); $b = new Ns\\Panel(); $c = new self(); }\n";
     let rels = extract_relations(code, "php").unwrap();
     let calls = calls_of(&rels);
-    assert!(calls.contains(&("build".into(), "Widget".into())),
-        "PHP new Widget() → build→Widget; got {calls:?}");
-    assert!(calls.contains(&("build".into(), "Panel".into())),
-        "PHP new Ns\\Panel() → build→Panel (last segment); got {calls:?}");
-    assert!(!calls.iter().any(|(_, t)| t == "self"),
-        "PHP new self() must NOT emit a `self` calls edge; got {calls:?}");
+    assert!(
+        calls.contains(&("build".into(), "Widget".into())),
+        "PHP new Widget() → build→Widget; got {calls:?}"
+    );
+    assert!(
+        calls.contains(&("build".into(), "Panel".into())),
+        "PHP new Ns\\Panel() → build→Panel (last segment); got {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|(_, t)| t == "self"),
+        "PHP new self() must NOT emit a `self` calls edge; got {calls:?}"
+    );
 }
 
 #[test]
@@ -3639,10 +5626,15 @@ fn test_java_object_creation_covered_by_type_reference() {
     // calls edge in v50. This guards that the covering edge still exists.
     let code = "class A { void m() { Foo x = new Foo(); } }\n";
     let rels = extract_relations(code, "java").unwrap();
-    let refs: Vec<&str> = rels.iter().filter(|r| r.relation == REL_REFERENCES)
-        .map(|r| r.target_name.as_str()).collect();
-    assert!(refs.contains(&"Foo"),
-        "Java new Foo() must keep its references edge (dead-code-safe); got refs {refs:?}");
+    let refs: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        refs.contains(&"Foo"),
+        "Java new Foo() must keep its references edge (dead-code-safe); got refs {refs:?}"
+    );
 }
 
 // --- v50: C# top-level local function extraction (Task 2) ---
@@ -3652,14 +5644,26 @@ fn test_csharp_local_function_extracted_as_symbol() {
     // top-level `void Greet(){}`, so the v49 <module>→Greet call edge dangled.
     let code = "void Greet() { Log(); }\nGreet();\n";
     let nodes = crate::parser::treesitter::parse_code(code, "csharp").unwrap();
-    let greet = nodes.iter().find(|n| n.name == "Greet")
-        .unwrap_or_else(|| panic!("C# top-level local fn Greet must be extracted; got {:?}",
-            nodes.iter().map(|n| (n.node_type.as_str(), n.name.as_str())).collect::<Vec<_>>()));
-    assert_eq!(greet.node_type, "function", "top-level local fn is function-kind");
+    let greet = nodes.iter().find(|n| n.name == "Greet").unwrap_or_else(|| {
+        panic!(
+            "C# top-level local fn Greet must be extracted; got {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.node_type.as_str(), n.name.as_str()))
+                .collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(
+        greet.node_type, "function",
+        "top-level local fn is function-kind"
+    );
     // The <module>→Greet call edge (v49) now has a resolvable target node.
     let rels = extract_relations(code, "csharp").unwrap();
-    assert!(calls_of(&rels).contains(&("<module>".into(), "Greet".into())),
-        "top-level Greet() → <module>→Greet edge present; got {:?}", calls_of(&rels));
+    assert!(
+        calls_of(&rels).contains(&("<module>".into(), "Greet".into())),
+        "top-level Greet() → <module>→Greet edge present; got {:?}",
+        calls_of(&rels)
+    );
 }
 
 // --- v50: edge-metadata serde_json migration (Task 3) ---
@@ -3669,15 +5673,27 @@ fn test_rtype_and_impl_method_metadata_escape_hostile_names() {
     // carrying `"` and `\` (serde_json escapes; the old format! form did not for
     // rtype). Parse back and confirm the value round-trips exactly.
     let hostile = r#"Ev"il\Type"#;
-    for built in [serialize_rtype_metadata(hostile), serialize_impl_method_metadata(hostile)] {
+    for built in [
+        serialize_rtype_metadata(hostile),
+        serialize_impl_method_metadata(hostile),
+    ] {
         let v: serde_json::Value = serde_json::from_str(&built)
             .unwrap_or_else(|e| panic!("metadata must be valid JSON, got {built:?}: {e}"));
-        assert_eq!(v["v"].as_str(), Some(hostile),
-            "hostile name must round-trip through the escaped JSON; got {built:?}");
+        assert_eq!(
+            v["v"].as_str(),
+            Some(hostile),
+            "hostile name must round-trip through the escaped JSON; got {built:?}"
+        );
     }
     // Byte-identical to the historic form for the identifier-only common case.
-    assert_eq!(serialize_rtype_metadata("DataWriter"), r#"{"q":"rtype","v":"DataWriter"}"#);
-    assert_eq!(serialize_impl_method_metadata("Db"), r#"{"q":"impl_method","v":"Db"}"#);
+    assert_eq!(
+        serialize_rtype_metadata("DataWriter"),
+        r#"{"q":"rtype","v":"DataWriter"}"#
+    );
+    assert_eq!(
+        serialize_impl_method_metadata("Db"),
+        r#"{"q":"impl_method","v":"Db"}"#
+    );
 }
 
 // --- v50: NUL strip on the signature triplet (Task 4) ---
@@ -3689,11 +5705,23 @@ fn test_signature_fields_strip_nul_bytes() {
     // context_string built downstream derives from these now-clean fields.
     let code = "function f(x: string = \"a\0b\"): number { return 1; }\n";
     let nodes = crate::parser::treesitter::parse_code(code, "typescript").unwrap();
-    let f = nodes.iter().find(|n| n.name == "f").expect("fn f extracted");
+    let f = nodes
+        .iter()
+        .find(|n| n.name == "f")
+        .expect("fn f extracted");
     let params = f.param_types.clone().expect("f has params");
-    assert!(!params.contains('\0'), "param_types must be NUL-free; got {params:?}");
-    assert!(params.contains('b'), "bytes after the NUL must survive; got {params:?}");
+    assert!(
+        !params.contains('\0'),
+        "param_types must be NUL-free; got {params:?}"
+    );
+    assert!(
+        params.contains('b'),
+        "bytes after the NUL must survive; got {params:?}"
+    );
     if let Some(sig) = &f.signature {
-        assert!(!sig.contains('\0'), "signature must be NUL-free; got {sig:?}");
+        assert!(
+            !sig.contains('\0'),
+            "signature must be NUL-free; got {sig:?}"
+        );
     }
 }

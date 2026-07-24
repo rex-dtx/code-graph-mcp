@@ -1,10 +1,10 @@
+use anyhow::Result;
+use ignore::WalkBuilder;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::SystemTime;
-use anyhow::Result;
-use ignore::WalkBuilder;
-use rayon::prelude::*;
 
 use crate::utils::config::detect_language;
 
@@ -43,7 +43,9 @@ pub fn hash_file(path: &Path) -> Result<String> {
     let mut buf = [0u8; 16384];
     loop {
         let n = reader.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize().to_hex().to_string())
@@ -62,16 +64,48 @@ fn is_excluded_build_dir(rel_str: &str) -> bool {
     rel_str.split('/').any(|seg| EXCLUDED.contains(&seg))
 }
 
+/// The walkers below run with the `ignore` crate default `follow_links=false`,
+/// so a symlinked source file arrives with `file_type().is_file() == false` and
+/// is dropped by the `is_file()` guards — previously the ONLY skip path in this
+/// file with no log (audit 2026-07-24: monorepo shared-package symlinks silently
+/// vanished from the index with zero observability). Returns the rel path when
+/// the skipped entry is a symlink that would otherwise have been indexed.
+/// Following links needs cycle/escape protection and is tracked separately.
+fn symlink_skip_candidate(entry: &ignore::DirEntry, root: &Path) -> Option<String> {
+    if !entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+        return None;
+    }
+    let rel = entry.path().strip_prefix(root).ok()?;
+    let rel_str = normalize_rel_path(rel);
+    if is_excluded_build_dir(&rel_str) || detect_language(&rel_str).is_none() {
+        return None;
+    }
+    Some(rel_str)
+}
+
+/// One aggregate warn per scan (not per file) so the periodic watcher-driven
+/// rescans don't spam a line per symlink on every pass.
+fn warn_skipped_symlinks(skipped: &[String]) {
+    if let Some(first) = skipped.first() {
+        tracing::warn!(
+            "{} symlinked source file(s) skipped — symlinks are not followed and never indexed (e.g. {})",
+            skipped.len(),
+            first
+        );
+    }
+}
+
 pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
     // Collect eligible file paths first, then hash in parallel
     let walker = WalkBuilder::new(root)
-        .hidden(true)       // skip hidden files
-        .git_ignore(true)   // respect .gitignore
+        .hidden(true) // skip hidden files
+        .git_ignore(true) // respect .gitignore
         .git_global(true)
         .git_exclude(true)
         .build();
 
     let mut file_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut skipped_symlinks: Vec<String> = Vec::new();
     for entry in walker {
         // Skip per-entry errors (permission denied on a subdir, broken
         // symlink, etc.) rather than aborting the whole scan. Without this,
@@ -84,6 +118,9 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
             }
         };
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            if let Some(rel) = symlink_skip_candidate(&entry, root) {
+                skipped_symlinks.push(rel);
+            }
             continue;
         }
         let path = entry.path();
@@ -101,6 +138,7 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
             file_paths.push((rel_str, path.to_path_buf()));
         }
     }
+    warn_skipped_symlinks(&skipped_symlinks);
 
     Ok(hash_files_parallel(&file_paths))
 }
@@ -109,13 +147,11 @@ pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
 fn hash_files_parallel(files: &[(String, std::path::PathBuf)]) -> HashMap<String, String> {
     files
         .par_iter()
-        .filter_map(|(rel_str, path)| {
-            match hash_file(path) {
-                Ok(h) => Some((rel_str.clone(), h)),
-                Err(e) => {
-                    tracing::warn!("Skipping file (hash error): {}: {}", path.display(), e);
-                    None
-                }
+        .filter_map(|(rel_str, path)| match hash_file(path) {
+            Ok(h) => Some((rel_str.clone(), h)),
+            Err(e) => {
+                tracing::warn!("Skipping file (hash error): {}: {}", path.display(), e);
+                None
             }
         })
         .collect()
@@ -140,6 +176,14 @@ impl DirectoryCache {
 
 /// Scan directory with optional mtime cache. Directories whose mtime
 /// hasn't changed since the cached value can skip file hashing.
+///
+/// Known blind spot (accepted tradeoff, audit 2026-07-24): the skip decision
+/// compares mtimes for equality, so a content edit landing within the same
+/// filesystem timestamp tick as the previous scan (coarse-mtime filesystems,
+/// two edits inside one tick) is invisible to this path. The interactive flow
+/// is covered anyway — `ensure_file_indexed` always re-hashes content with no
+/// mtime shortcut — but background/periodic freshness for files nobody
+/// explicitly re-queries can lag until the next real mtime change.
 pub fn scan_directory_cached(
     root: &Path,
     cache: Option<&DirectoryCache>,
@@ -172,7 +216,9 @@ pub fn scan_directory_cached(
         }
         if let Ok(rel) = entry.path().strip_prefix(root) {
             let rel_str = normalize_rel_path(rel);
-            if rel_str.starts_with(".git") { continue; }
+            if rel_str.starts_with(".git") {
+                continue;
+            }
 
             if let Ok(meta) = entry.path().metadata() {
                 if let Ok(mtime) = meta.modified() {
@@ -197,8 +243,12 @@ pub fn scan_directory_cached(
     // Directory mtime only changes on file add/remove (not content edits on ext4/btrfs),
     // so we also check individual file mtimes to catch content modifications.
     let mut files_to_hash: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut skipped_symlinks: Vec<String> = Vec::new();
     for entry in &entries {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            if let Some(rel) = symlink_skip_candidate(entry, root) {
+                skipped_symlinks.push(rel);
+            }
             continue;
         }
         let path = entry.path();
@@ -214,9 +264,7 @@ pub fn scan_directory_cached(
                 continue;
             }
 
-            let parent_dir = rel.parent()
-                .map(normalize_rel_path)
-                .unwrap_or_default();
+            let parent_dir = rel.parent().map(normalize_rel_path).unwrap_or_default();
 
             // Track file mtime in the new cache
             let file_mtime = path.metadata().ok().and_then(|m| m.modified().ok());
@@ -226,11 +274,12 @@ pub fn scan_directory_cached(
 
             if !changed_dirs.contains(&parent_dir) {
                 // Directory unchanged — check if individual file mtime changed
-                let file_changed = match (file_mtime, cache.and_then(|c| c.file_mtimes.get(&rel_str))) {
-                    (Some(current), Some(cached)) => current != *cached,
-                    (Some(_), None) => true, // No cached mtime — treat as changed
-                    _ => false,
-                };
+                let file_changed =
+                    match (file_mtime, cache.and_then(|c| c.file_mtimes.get(&rel_str))) {
+                        (Some(current), Some(cached)) => current != *cached,
+                        (Some(_), None) => true, // No cached mtime — treat as changed
+                        _ => false,
+                    };
                 if !file_changed {
                     continue;
                 }
@@ -241,6 +290,7 @@ pub fn scan_directory_cached(
     }
 
     // Hash files in parallel
+    warn_skipped_symlinks(&skipped_symlinks);
     hashes.extend(hash_files_parallel(&files_to_hash));
 
     Ok((hashes, new_cache))
@@ -278,8 +328,8 @@ pub fn compute_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_hash_file() {
@@ -325,6 +375,45 @@ mod tests {
 
         let diff = compute_diff(&old, &current);
         assert_eq!(diff.deleted_files.len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_directory_skips_symlinked_file_and_candidate_detection() {
+        // Pins CURRENT behavior (audit 2026-07-24 P1-3): symlinked source files
+        // are not followed and never indexed. The observability fix only adds a
+        // warn — if a future change makes the walker follow links, this test
+        // must be updated deliberately alongside cycle/escape protection.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("real.rs"), "fn a() {}").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real.rs"), tmp.path().join("linked.rs"))
+            .unwrap();
+        let hashes = scan_directory(tmp.path()).unwrap();
+        assert!(hashes.contains_key("real.rs"));
+        assert!(
+            !hashes.contains_key("linked.rs"),
+            "symlinked file unexpectedly indexed — update the symlink warn path too"
+        );
+        // The skipped symlink is recognized as a would-have-been-indexed
+        // candidate (what the aggregate warn reports)…
+        let entry = ignore::WalkBuilder::new(tmp.path())
+            .build()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().file_name().is_some_and(|n| n == "linked.rs"))
+            .unwrap();
+        assert_eq!(
+            symlink_skip_candidate(&entry, tmp.path()).as_deref(),
+            Some("linked.rs")
+        );
+        // …while non-source symlinks stay out of the warn.
+        fs::write(tmp.path().join("notes.xyz"), "").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("notes.xyz"), tmp.path().join("l.xyz")).unwrap();
+        let entry = ignore::WalkBuilder::new(tmp.path())
+            .build()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().file_name().is_some_and(|n| n == "l.xyz"))
+            .unwrap();
+        assert_eq!(symlink_skip_candidate(&entry, tmp.path()), None);
     }
 
     #[test]
@@ -375,7 +464,11 @@ mod tests {
 
         // Modify content of root-level file (dir mtime does NOT change)
         std::thread::sleep(std::time::Duration::from_millis(50));
-        fs::write(tmp.path().join("main.rs"), "fn main(){ println!(\"changed\"); }").unwrap();
+        fs::write(
+            tmp.path().join("main.rs"),
+            "fn main(){ println!(\"changed\"); }",
+        )
+        .unwrap();
 
         let (hashes2, _cache2) = scan_directory_cached(tmp.path(), Some(&cache1)).unwrap();
         // The file mtime check (Pass 2) should detect the content change
@@ -415,14 +508,24 @@ mod tests {
         fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
         fs::write(tmp.path().join("target/debug/junk.rs"), "pub fn j(){}").unwrap();
         fs::create_dir_all(tmp.path().join("packages/a/node_modules/b")).unwrap();
-        fs::write(tmp.path().join("packages/a/node_modules/b/c.js"), "function nested(){}").unwrap();
+        fs::write(
+            tmp.path().join("packages/a/node_modules/b/c.js"),
+            "function nested(){}",
+        )
+        .unwrap();
 
         let hashes = scan_directory(tmp.path()).unwrap();
         assert!(hashes.contains_key("src/main.rs"));
-        assert!(hashes.contains_key("src/target.rs"), "a file named target.rs is source, not a build dir");
+        assert!(
+            hashes.contains_key("src/target.rs"),
+            "a file named target.rs is source, not a build dir"
+        );
         assert!(!hashes.contains_key("node_modules/pkg/i.js"));
         assert!(!hashes.contains_key("target/debug/junk.rs"));
-        assert!(!hashes.contains_key("packages/a/node_modules/b/c.js"), "nested node_modules must be excluded");
+        assert!(
+            !hashes.contains_key("packages/a/node_modules/b/c.js"),
+            "nested node_modules must be excluded"
+        );
     }
 
     #[test]

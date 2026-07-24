@@ -20,23 +20,23 @@
 //! (splitting it per-language would either duplicate the recursion or lose
 //! scope context across language-specific arms).
 
-use anyhow::Result;
 use super::lang_config::LanguageConfig;
 use super::node_text;
-use crate::domain::{REL_CALLS, REL_INHERITS, REL_IMPORTS, REL_IMPLEMENTS, MAX_RELATION_DEPTH};
+use crate::domain::{MAX_RELATION_DEPTH, REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS};
+use anyhow::Result;
 
+mod cpp;
+mod dart;
+mod exports;
+mod go;
 mod helpers;
 mod imports;
 mod inherits;
-mod exports;
+mod java;
+mod python;
 mod routes;
 mod rust;
 mod typescript;
-mod python;
-mod go;
-mod java;
-mod dart;
-mod cpp;
 
 /// Serialize a CalleeQualifier into the wire-format JSON for `edges.metadata`.
 /// Bare → None (matches non-Rust callers and old DB rows).
@@ -79,18 +79,25 @@ fn serialize_impl_method_metadata(ty: &str) -> String {
 #[cfg(test)]
 mod tests;
 
-use helpers::{extract_callee, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
-use imports::{extract_import_names, extract_python_import_names, extract_python_from_import_names};
-use inherits::{extract_superclasses, extract_implements};
+use cpp::{extract_cpp_inheritance, extract_cpp_value_reference};
+use dart::{extract_dart_call_from_selector, extract_dart_imports};
 use exports::extract_export_names;
-use routes::{extract_route_pattern, extract_python_route};
-use rust::{extract_rust_use_imports, extract_rust_impl_trait, extract_rust_path_reference, extract_rust_type_reference, extract_rust_value_reference};
-use typescript::{extract_ts_type_reference, extract_js_value_reference};
-use python::{extract_python_type_reference, extract_python_value_reference, infer_python_call_receiver_type};
-use go::{extract_go_type_reference, extract_go_value_reference, extract_go_inheritance};
-use cpp::{extract_cpp_value_reference, extract_cpp_inheritance};
+use go::{extract_go_inheritance, extract_go_type_reference, extract_go_value_reference};
+use helpers::{extract_callee, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
+use imports::{
+    extract_import_names, extract_python_from_import_names, extract_python_import_names,
+};
+use inherits::{extract_implements, extract_superclasses};
 use java::extract_java_type_reference;
-use dart::{extract_dart_imports, extract_dart_call_from_selector};
+use python::{
+    extract_python_type_reference, extract_python_value_reference, infer_python_call_receiver_type,
+};
+use routes::{extract_python_route, extract_route_pattern};
+use rust::{
+    extract_rust_impl_trait, extract_rust_macro_token_call, extract_rust_path_reference,
+    extract_rust_type_reference, extract_rust_use_imports, extract_rust_value_reference,
+};
+use typescript::{extract_js_value_reference, extract_ts_type_reference};
 
 pub struct ParsedRelation {
     pub source_name: String,
@@ -110,10 +117,24 @@ pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelat
 }
 
 /// Extract relations from a pre-parsed tree (avoids re-parsing).
-pub fn extract_relations_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedRelation> {
+pub fn extract_relations_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    language: &str,
+) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
     let config = LanguageConfig::for_language(language);
-    walk_for_relations(tree.root_node(), source, language, &config, None, None, None, &mut relations, 0);
+    walk_for_relations(
+        tree.root_node(),
+        source,
+        language,
+        &config,
+        None,
+        None,
+        None,
+        &mut relations,
+        0,
+    );
     // Ruby bare (parens-less) method calls are `identifier` nodes structurally
     // identical to local-variable reads (the `"call"` arm above only fires on
     // parenthesized / receiver calls). Resolve them with Ruby's own rule in a
@@ -268,11 +289,16 @@ mod ruby_bare_calls {
     /// never bare method calls), and not a literal keyword that surfaces as an
     /// identifier in some grammar positions.
     fn is_callable(name: &str) -> bool {
-        let Some(first) = name.chars().next() else { return false };
+        let Some(first) = name.chars().next() else {
+            return false;
+        };
         if !(first == '_' || first.is_ascii_lowercase()) {
             return false;
         }
-        !matches!(name, "self" | "nil" | "true" | "false" | "super" | "__method__")
+        !matches!(
+            name,
+            "self" | "nil" | "true" | "false" | "super" | "__method__"
+        )
     }
 }
 
@@ -288,15 +314,22 @@ fn walk_for_relations(
     results: &mut Vec<ParsedRelation>,
     depth: usize,
 ) {
-    if depth > MAX_RELATION_DEPTH { return; }
+    if depth > MAX_RELATION_DEPTH {
+        return;
+    }
     let kind = node.kind();
 
     // Determine if this node creates a new scope
     let scope_name = match kind {
-        "function_declaration" | "function_definition" | "function_item"
-        | "method_definition" | "method_declaration" | "constructor_declaration"
+        "function_declaration"
+        | "function_definition"
+        | "function_item"
+        | "method_definition"
+        | "method_declaration"
+        | "constructor_declaration"
         | "async_function_definition"
-        | "method" | "singleton_method" => {
+        | "method"
+        | "singleton_method" => {
             node.child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string())
                 .or_else(|| {
@@ -315,7 +348,10 @@ fn walk_for_relations(
                     // An out-of-class `Foo::bar` carries its own class; otherwise
                     // inherit the enclosing class context (current_class).
                     let (own_cls, method) = match name.rsplit_once("::") {
-                        Some((c, m)) => (Some(c.rsplit("::").next().unwrap_or(c).to_string()), m.to_string()),
+                        Some((c, m)) => (
+                            Some(c.rsplit("::").next().unwrap_or(c).to_string()),
+                            m.to_string(),
+                        ),
                         None => (None, name),
                     };
                     match own_cls.as_deref().or(current_class) {
@@ -359,14 +395,21 @@ fn walk_for_relations(
             node.prev_sibling()
                 .and_then(|s| match s.kind() {
                     // Top-level Dart function: declaration > function_signature + function_body
-                    "function_signature" => s.child_by_field_name("name")
+                    "function_signature" => s
+                        .child_by_field_name("name")
                         .map(|n| node_text(&n, source).to_string()),
                     // Class method: method_signature wraps function_signature
                     "method_signature" => (0..s.named_child_count())
                         .filter_map(|i| s.named_child(i))
-                        .find(|c| matches!(c.kind(),
-                            "function_signature" | "constructor_signature"
-                            | "getter_signature" | "setter_signature"))
+                        .find(|c| {
+                            matches!(
+                                c.kind(),
+                                "function_signature"
+                                    | "constructor_signature"
+                                    | "getter_signature"
+                                    | "setter_signature"
+                            )
+                        })
                         .and_then(|sig| sig.child_by_field_name("name"))
                         .map(|n| node_text(&n, source).to_string()),
                     _ => None,
@@ -409,6 +452,10 @@ fn walk_for_relations(
             // (M2). Path-qualified values are `scoped_identifier` (above).
             "identifier" => {
                 if let Some(r) = extract_rust_value_reference(&node, source, active_scope) {
+                    results.push(r);
+                } else if let Some(r) = extract_rust_macro_token_call(&node, source, active_scope) {
+                    // Inside a macro token_tree the value-reference pass never
+                    // fires (parent is `token_tree`), so the two are disjoint.
                     results.push(r);
                 }
             }
@@ -534,7 +581,8 @@ fn walk_for_relations(
             // segment so node_modules imports become `<external>` sentinels and
             // relative imports can match a file module node by name.
             if matches!(config.name, "javascript" | "typescript" | "tsx")
-                && node.child_by_field_name("function")
+                && node
+                    .child_by_field_name("function")
                     .map(|f| node_text(&f, source) == "require")
                     .unwrap_or(false)
             {
@@ -543,7 +591,8 @@ fn walk_for_relations(
                         if let Some(path) = extract_string_from_subtree(&first, source) {
                             // Normalize `node:fs` → `fs`; strip trailing JS extensions.
                             let normalized = path.strip_prefix("node:").unwrap_or(&path);
-                            let segment = normalized.trim_end_matches(".js")
+                            let segment = normalized
+                                .trim_end_matches(".js")
                                 .trim_end_matches(".ts")
                                 .trim_end_matches(".mjs")
                                 .trim_end_matches(".cjs")
@@ -567,10 +616,13 @@ fn walk_for_relations(
                             // export (and Phase 2d-bind repoints calls made under the EXPORT
                             // name) — the CommonJS analog of ES named imports. The last-segment
                             // module import above is kept for module-level dep tracking.
-                            if let Some(decl) = node.parent().filter(|p| p.kind() == "variable_declarator") {
+                            if let Some(decl) =
+                                node.parent().filter(|p| p.kind() == "variable_declarator")
+                            {
                                 if let Some(name_node) = decl.child_by_field_name("name") {
                                     if name_node.kind() == "object_pattern" {
-                                        let metadata = serde_json::json!({ "js_module": &path }).to_string();
+                                        let metadata =
+                                            serde_json::json!({ "js_module": &path }).to_string();
                                         for i in 0..name_node.named_child_count() {
                                             if let Some(binding) = name_node.named_child(i) {
                                                 // Shorthand `{ foo }` → the binding name; renamed
@@ -583,9 +635,12 @@ fn walk_for_relations(
                                                 // see feedback_import_aware_call_resolution).
                                                 let imported = match binding.kind() {
                                                     "shorthand_property_identifier_pattern" => {
-                                                        Some(node_text(&binding, source).to_string())
+                                                        Some(
+                                                            node_text(&binding, source).to_string(),
+                                                        )
                                                     }
-                                                    "pair_pattern" => binding.child_by_field_name("key")
+                                                    "pair_pattern" => binding
+                                                        .child_by_field_name("key")
                                                         .map(|k| node_text(&k, source).to_string()),
                                                     _ => None,
                                                 };
@@ -642,13 +697,19 @@ fn walk_for_relations(
             // keeps their callgraphs clean.
             let call_scope: Option<String> = match active_scope {
                 Some(s) => Some(s.to_string()),
-                None if matches!(config.name, "javascript" | "typescript" | "tsx" | "kotlin" | "swift") => {
+                None if matches!(
+                    config.name,
+                    "javascript" | "typescript" | "tsx" | "kotlin" | "swift"
+                ) =>
+                {
                     Some("<module>".to_string())
                 }
                 None => None,
             };
             if let Some(scope) = call_scope {
-                if let Some((callee, mut qualifier)) = extract_callee(&node, source, language, current_rust_impl) {
+                if let Some((callee, mut qualifier)) =
+                    extract_callee(&node, source, language, current_rust_impl)
+                {
                     // Fill SelfRecv/SelfType payload from current impl context.
                     // The helper emits these with empty payload because it
                     // doesn't know the enclosing impl's type; we know it here.
@@ -657,7 +718,8 @@ fn walk_for_relations(
                     );
                     if needs_payload {
                         match &mut qualifier {
-                            helpers::CalleeQualifier::SelfRecv(t) | helpers::CalleeQualifier::SelfType(t) => {
+                            helpers::CalleeQualifier::SelfRecv(t)
+                            | helpers::CalleeQualifier::SelfType(t) => {
                                 if let Some(impl_type) = current_rust_impl {
                                     *t = impl_type.to_string();
                                 } else {
@@ -728,22 +790,23 @@ fn walk_for_relations(
                         (!name.is_empty())
                             .then(|| (name.to_string(), helpers::CalleeQualifier::Bare))
                     }
-                    "member_expression" => {
-                        ctor.child_by_field_name("property").and_then(|prop| {
-                            let raw = node_text(&prop, source);
-                            let name = raw.split('<').next().unwrap_or(raw).trim();
-                            if name.is_empty() {
-                                return None;
-                            }
-                            let qual = ctor
-                                .child_by_field_name("object")
-                                .filter(|o| o.kind() == "identifier")
-                                .map(|o| helpers::CalleeQualifier::Receiver(
-                                    node_text(&o, source).to_string()))
-                                .unwrap_or(helpers::CalleeQualifier::Bare);
-                            Some((name.to_string(), qual))
-                        })
-                    }
+                    "member_expression" => ctor.child_by_field_name("property").and_then(|prop| {
+                        let raw = node_text(&prop, source);
+                        let name = raw.split('<').next().unwrap_or(raw).trim();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        let qual = ctor
+                            .child_by_field_name("object")
+                            .filter(|o| o.kind() == "identifier")
+                            .map(|o| {
+                                helpers::CalleeQualifier::Receiver(
+                                    node_text(&o, source).to_string(),
+                                )
+                            })
+                            .unwrap_or(helpers::CalleeQualifier::Bare);
+                        Some((name.to_string(), qual))
+                    }),
                     _ => None,
                 };
                 if let Some((name, qualifier)) = callee {
@@ -871,7 +934,9 @@ fn walk_for_relations(
                 if method_name == "require" || method_name == "require_relative" {
                     if let Some(args) = node.child_by_field_name("arguments") {
                         if let Some(first_arg) = args.named_child(0) {
-                            if let Some(string_val) = extract_string_from_subtree(&first_arg, source) {
+                            if let Some(string_val) =
+                                extract_string_from_subtree(&first_arg, source)
+                            {
                                 results.push(ParsedRelation {
                                     source_name: active_scope.unwrap_or("<module>").to_string(),
                                     target_name: string_val,
@@ -983,8 +1048,10 @@ fn walk_for_relations(
         // file-include edges, so deps/cycles/affected/project_map under-reported
         // PHP cross-file dependencies (the AST node is a dedicated
         // `*_expression`, never a function_call_expression, so no double-count).
-        "require_expression" | "require_once_expression"
-        | "include_expression" | "include_once_expression"
+        "require_expression"
+        | "require_once_expression"
+        | "include_expression"
+        | "include_once_expression"
             if config.name == "php" =>
         {
             if let Some(raw) = extract_string_from_subtree(&node, source) {
@@ -1020,15 +1087,25 @@ fn walk_for_relations(
                         fn find_last_name(n: &tree_sitter::Node, source: &str) -> Option<String> {
                             find_last_name_inner(n, source, 0)
                         }
-                        fn find_last_name_inner(n: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
-                            if depth > MAX_SUBTREE_DEPTH { return None; }
+                        fn find_last_name_inner(
+                            n: &tree_sitter::Node,
+                            source: &str,
+                            depth: usize,
+                        ) -> Option<String> {
+                            if depth > MAX_SUBTREE_DEPTH {
+                                return None;
+                            }
                             let mut result = None;
                             for i in 0..n.child_count() {
                                 if let Some(child) = n.child(i) {
                                     if child.kind() == "name" {
                                         result = Some(node_text(&child, source).to_string());
-                                    } else if child.kind() == "qualified_name" || child.kind() == "namespace_name" {
-                                        if let Some(inner) = find_last_name_inner(&child, source, depth + 1) {
+                                    } else if child.kind() == "qualified_name"
+                                        || child.kind() == "namespace_name"
+                                    {
+                                        if let Some(inner) =
+                                            find_last_name_inner(&child, source, depth + 1)
+                                        {
                                             result = Some(inner);
                                         }
                                     }
@@ -1154,7 +1231,8 @@ fn walk_for_relations(
 
         // Class inheritance
         "class_declaration" | "class_definition" | "class" => {
-            let class_name = node.child_by_field_name("name")
+            let class_name = node
+                .child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string());
 
             if let Some(ref cls) = class_name {
@@ -1215,7 +1293,9 @@ fn walk_for_relations(
                                             source_name: type_name.clone(),
                                             target_name: method_name.to_string(),
                                             relation: REL_IMPLEMENTS.into(),
-                                            metadata: Some(serialize_impl_method_metadata(&type_name)),
+                                            metadata: Some(serialize_impl_method_metadata(
+                                                &type_name,
+                                            )),
                                             source_language: String::new(),
                                         });
                                     }
@@ -1291,7 +1371,8 @@ fn walk_for_relations(
         // C# inheritance: class Dog : Animal, IWalkable
         "base_list" if config.name == "csharp" => {
             // Get the class/struct name from the parent node
-            let owner_name = node.parent()
+            let owner_name = node
+                .parent()
                 .and_then(|p| p.child_by_field_name("name"))
                 .map(|n| node_text(&n, source).to_string());
             let owner = owner_name.as_deref().or(active_scope).unwrap_or("<module>");
@@ -1300,8 +1381,14 @@ fn walk_for_relations(
                     let base_name = node_text(&child, source).to_string();
                     if !base_name.is_empty() {
                         let rel = if config.interface_by_prefix
-                            && base_name.starts_with('I') && base_name.len() > 1
-                            && base_name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false) {
+                            && base_name.starts_with('I')
+                            && base_name.len() > 1
+                            && base_name
+                                .chars()
+                                .nth(1)
+                                .map(|c| c.is_uppercase())
+                                .unwrap_or(false)
+                        {
                             REL_IMPLEMENTS
                         } else {
                             REL_INHERITS
@@ -1381,7 +1468,8 @@ fn walk_for_relations(
                 let unquoted = raw.trim_matches(|c| c == '"' || c == '<' || c == '>');
                 if !unquoted.is_empty() {
                     let last = unquoted.rsplit('/').next().unwrap_or(unquoted);
-                    let stem = last.trim_end_matches(".hpp")
+                    let stem = last
+                        .trim_end_matches(".hpp")
                         .trim_end_matches(".hxx")
                         .trim_end_matches(".hh")
                         .trim_end_matches(".h");
@@ -1391,7 +1479,8 @@ fn walk_for_relations(
                         // PHP `php_include` / JS `js_module` specifiers). target_name
                         // stays the bare stem for the name-based fallback when the
                         // path doesn't resolve to an indexed file (system headers).
-                        let metadata = Some(serde_json::json!({ "c_include": unquoted }).to_string());
+                        let metadata =
+                            Some(serde_json::json!({ "c_include": unquoted }).to_string());
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: stem.to_string(),
@@ -1454,12 +1543,14 @@ fn walk_for_relations(
                     // ($(...), `...`), and concatenations (foo$VAR) — not statically
                     // resolvable. Allow [a-zA-Z_.][a-zA-Z0-9_.-]* (covers `cat`,
                     // `_helper`, `Backup_Files`, `script.sh`, `.bashrc`).
-                    let first_ok = short.chars().next()
+                    let first_ok = short
+                        .chars()
+                        .next()
                         .map(|c| c == '_' || c == '.' || c.is_ascii_alphabetic())
                         .unwrap_or(false);
-                    let all_ok = short.chars().all(|c|
-                        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
-                    );
+                    let all_ok = short
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
                     if first_ok && all_ok {
                         results.push(ParsedRelation {
                             source_name: scope.to_string(),
@@ -1479,11 +1570,10 @@ fn walk_for_relations(
     // Determine class context for children: when entering a class body,
     // pass the class name so methods can build qualified scope names.
     let child_class = match kind {
-        "class_declaration" | "class_definition" | "class"
-        | "class_specifier" | "struct_specifier" => {
-            node.child_by_field_name("name")
-                .map(|n| node_text(&n, source).to_string())
-        }
+        "class_declaration" | "class_definition" | "class" | "class_specifier"
+        | "struct_specifier" => node
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, source).to_string()),
         _ => None,
     };
     let effective_class = child_class.as_deref().or(current_class);
@@ -1495,15 +1585,14 @@ fn walk_for_relations(
     // (relations source_name="conn" matches pf.node_names "conn"; would
     // become "Database.conn" if folded into current_class).
     let child_rust_impl: Option<String> = if language == "rust" && kind == "impl_item" {
-        node.child_by_field_name("type")
-            .map(|t| {
-                let full = node_text(&t, source);
-                // Strip path prefix: `impl crate::db_a::Db` → "Db". Mirrors
-                // treesitter.rs's parent_class strip so SelfRecv payloads
-                // match qualified_name (which uses just the rightmost type
-                // segment).
-                full.rsplit("::").next().unwrap_or(full).to_string()
-            })
+        node.child_by_field_name("type").map(|t| {
+            let full = node_text(&t, source);
+            // Strip path prefix: `impl crate::db_a::Db` → "Db". Mirrors
+            // treesitter.rs's parent_class strip so SelfRecv payloads
+            // match qualified_name (which uses just the rightmost type
+            // segment).
+            full.rsplit("::").next().unwrap_or(full).to_string()
+        })
     } else {
         None
     };
@@ -1512,7 +1601,17 @@ fn walk_for_relations(
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            walk_for_relations(child, source, language, config, active_scope, effective_class, effective_rust_impl, results, depth + 1);
+            walk_for_relations(
+                child,
+                source,
+                language,
+                config,
+                active_scope,
+                effective_class,
+                effective_rust_impl,
+                results,
+                depth + 1,
+            );
         }
     }
 }
@@ -1527,7 +1626,8 @@ fn cpp_declarator_name(node: &tree_sitter::Node, source: &str, depth: usize) -> 
         return None;
     }
     if node.kind() == "function_declarator" {
-        return node.child_by_field_name("declarator")
+        return node
+            .child_by_field_name("declarator")
             .map(|d| node_text(&d, source).to_string());
     }
     for i in 0..node.named_child_count() {

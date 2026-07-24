@@ -137,6 +137,23 @@ jobs:
           done
           cp artifacts/binary-win32-x64/code-graph-mcp.exe npm/win32-x64/
 
+      - name: Assert built binary version matches tag
+        # Pre-publish drift gate (audit 2026-07-24 F1): the build job compiles
+        # from the tag checkout BEFORE sync-versions rewrites anything, so a tag
+        # cut with a lagging Cargo.toml (partial bump) ships a binary that
+        # reports the OLD version — and until this step the only catch was
+        # smoke-verify, which runs AFTER the packages are public. Exec one
+        # artifact and diff against the tag while nothing has been published.
+        run: |
+          chmod +x artifacts/binary-linux-x64/code-graph-mcp
+          actual=$(artifacts/binary-linux-x64/code-graph-mcp --version)
+          expected="code-graph-mcp ${VERSION}"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::built binary reports '$actual' but tag says '$expected' — Cargo.toml lagged the tag (partial bump). Fix versions and re-cut the tag; nothing was published."
+            exit 1
+          fi
+          echo "OK: $actual"
+
       - name: Update versions
         # SYNC_VERSIONS_SKIP_BUILD: the Publish job already has the 5 pre-built
         # platform binaries (matrix artifacts); sync-versions.js's local
@@ -157,17 +174,18 @@ jobs:
         # never does — v0.104.0 shipped with a red §1.9 because neither gate
         # fired. Here the binaries are already built, so feed find-binary's dev
         # path (target/release/) the linux-x64 artifact and run the whole suite.
-        # mcp-launcher.test.js stays out for the same reason as in ci.yml: its
-        # dedup stub needs the gitignored dev-only .mcp.json.
+        # mcp-launcher.test.js is included (audit 2026-07-24 F2): its old
+        # exclusion reason (dedup test needing the gitignored dev .mcp.json) was
+        # fixed when that test became self-contained, and with the artifact in
+        # target/release/ even the binary-forwarding test runs for real here —
+        # the stub→binary handover gets release-gate coverage.
         # --test-concurrency=1: same find-binary cache/env cross-process race as
         # documented in ci.yml.
         run: |
           mkdir -p target/release
           cp artifacts/binary-linux-x64/code-graph-mcp target/release/
           chmod +x target/release/code-graph-mcp
-          files=$(ls claude-plugin/scripts/*.test.js scripts/*.test.js \
-            | grep -vE '(^|/)mcp-launcher\.test\.js$')
-          node --test --test-concurrency=1 $files
+          node --test --test-concurrency=1 claude-plugin/scripts/*.test.js scripts/*.test.js
 
       - name: Prepare release assets
         run: |

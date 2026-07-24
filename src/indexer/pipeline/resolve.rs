@@ -10,13 +10,13 @@
 use anyhow::Result;
 use std::collections::HashMap;
 
+use crate::domain::REL_CALLS;
 use crate::storage::db::Database;
 use crate::storage::queries::{
     age_and_evict_pending_unresolved_calls, delete_pending_unresolved_call, filter_method_ids,
     get_node_paths_by_ids, get_node_qualified_names_by_ids, insert_edge_cached,
     list_pending_unresolved_calls,
 };
-use crate::domain::REL_CALLS;
 
 /// Decoded form of `edges.metadata` for REL_CALLS rows. See
 /// `docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md`
@@ -53,10 +53,22 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
                 Some(CalleeMeta::Path(segments))
             }
         }
-        "self" => v.get("v")?.as_str().map(|t| CalleeMeta::SelfRecv(t.to_string())),
-        "stype" => v.get("v")?.as_str().map(|t| CalleeMeta::SelfType(t.to_string())),
-        "rtype" => v.get("v")?.as_str().map(|t| CalleeMeta::RecvType(t.to_string())),
-        "recv" => v.get("v")?.as_str().map(|r| CalleeMeta::Receiver(r.to_string())),
+        "self" => v
+            .get("v")?
+            .as_str()
+            .map(|t| CalleeMeta::SelfRecv(t.to_string())),
+        "stype" => v
+            .get("v")?
+            .as_str()
+            .map(|t| CalleeMeta::SelfType(t.to_string())),
+        "rtype" => v
+            .get("v")?
+            .as_str()
+            .map(|t| CalleeMeta::RecvType(t.to_string())),
+        "recv" => v
+            .get("v")?
+            .as_str()
+            .map(|r| CalleeMeta::Receiver(r.to_string())),
         _ => None,
     }
 }
@@ -87,9 +99,12 @@ pub(super) fn refine_ambiguous_targets(
     // suffix/prefix rules in `domain::is_test_path`. Kept separate on purpose; see the
     // "Five sites must agree" note in domain.rs (feedback_test_classifier_dual_sources.md).
     let is_test_path = |p: &str| {
-        p.contains(".test.") || p.contains("_test.")
-            || p.starts_with("tests/") || p.contains("/tests/")
-            || p.starts_with("test/") || p.contains("/test/")
+        p.contains(".test.")
+            || p.contains("_test.")
+            || p.starts_with("tests/")
+            || p.contains("/tests/")
+            || p.starts_with("test/")
+            || p.contains("/test/")
             || p.contains(".spec.")
     };
     let caller_is_test = is_test_path(caller_rel_path);
@@ -98,42 +113,63 @@ pub(super) fn refine_ambiguous_targets(
     let pool: Vec<i64> = if caller_is_test {
         candidates.to_vec()
     } else {
-        let non_test: Vec<i64> = candidates.iter().copied()
+        let non_test: Vec<i64> = candidates
+            .iter()
+            .copied()
             .filter(|id| {
                 let p = node_id_to_path.get(id).map(String::as_str).unwrap_or("");
                 !is_test_path(p)
             })
             .collect();
-        if non_test.is_empty() { candidates.to_vec() } else { non_test }
+        if non_test.is_empty() {
+            candidates.to_vec()
+        } else {
+            non_test
+        }
     };
 
-    if pool.len() == 1 { return pool; }
+    if pool.len() == 1 {
+        return pool;
+    }
 
     // Pass 2: keep only candidates tied for the longest common path prefix
     // with the caller. Byte-wise prefix is a rough proxy for module locality
     // — e.g. `claude-plugin/scripts/session-init.js` shares 21 bytes with
     // `claude-plugin/scripts/lifecycle.js` but 0 bytes with `scripts/*`.
     let prefix_len = |p: &str| -> usize {
-        caller_rel_path.bytes().zip(p.bytes())
+        caller_rel_path
+            .bytes()
+            .zip(p.bytes())
             .take_while(|(a, b)| a == b)
             .count()
     };
-    let max_prefix = pool.iter()
+    let max_prefix = pool
+        .iter()
         .map(|id| prefix_len(node_id_to_path.get(id).map(String::as_str).unwrap_or("")))
         .max()
         .unwrap_or(0);
-    let closest: Vec<i64> = pool.iter().copied()
-        .filter(|id| prefix_len(node_id_to_path.get(id).map(String::as_str).unwrap_or("")) == max_prefix)
+    let closest: Vec<i64> = pool
+        .iter()
+        .copied()
+        .filter(|id| {
+            prefix_len(node_id_to_path.get(id).map(String::as_str).unwrap_or("")) == max_prefix
+        })
         .collect();
 
-    if closest.len() == 1 { return closest; }
+    if closest.len() == 1 {
+        return closest;
+    }
 
     // Still ambiguous — return the remaining pool rather than dropping. This
     // keeps dead-code precision high for edges we cannot confidently prune
     // (most notably Rust bare-name scoped calls) at the cost of leaving a
     // small amount of fan-out; the single-winner fast path above handles
     // the common case (unique non-test match, or unique closest path).
-    if !closest.is_empty() { closest } else { pool }
+    if !closest.is_empty() {
+        closest
+    } else {
+        pool
+    }
 }
 
 /// Sweep `pending_unresolved_calls` against the current node state. Rows whose
@@ -165,7 +201,7 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
             "SELECT n.id, n.name, COALESCE(f.language, ''), f.path
              FROM nodes n JOIN files f ON f.id = n.file_id
              WHERE f.language IS NOT NULL
-               AND n.name IN (SELECT DISTINCT target_name FROM pending_unresolved_calls)"
+               AND n.name IN (SELECT DISTINCT target_name FROM pending_unresolved_calls)",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -180,7 +216,10 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
             if lang.is_empty() {
                 continue;
             }
-            name_to_lang_targets.entry(name).or_default().push((id, lang));
+            name_to_lang_targets
+                .entry(name)
+                .or_default()
+                .push((id, lang));
             node_id_to_path.insert(id, path);
         }
     }
@@ -200,12 +239,16 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
     let mut to_delete: Vec<i64> = Vec::new();
 
     for row in &pending {
-        let candidates: Vec<i64> = name_to_lang_targets.get(&row.target_name)
-            .map(|entries| entries.iter()
-                .filter(|(_, lang)| *lang == row.source_language)
-                .map(|(id, _)| *id)
-                .filter(|id| *id != row.source_id) // self-call guard
-                .collect())
+        let candidates: Vec<i64> = name_to_lang_targets
+            .get(&row.target_name)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(_, lang)| *lang == row.source_language)
+                    .map(|(id, _)| *id)
+                    .filter(|id| *id != row.source_id) // self-call guard
+                    .collect()
+            })
             .unwrap_or_default();
 
         if candidates.is_empty() {
@@ -236,17 +279,19 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
         let resolved: Vec<i64> = match parse_callee_metadata(row.metadata.as_deref()) {
             Some(CalleeMeta::RecvType(t)) => {
                 let filtered = self_filter_candidates(&t, &candidates, db)?;
-                if filtered.is_empty() { candidates } else { filtered }
+                if filtered.is_empty() {
+                    candidates
+                } else {
+                    filtered
+                }
             }
             Some(CalleeMeta::SelfType(t)) | Some(CalleeMeta::SelfRecv(t)) => {
-                let filtered = self_filter_candidates(&t, &candidates, db)?;
                 // Drop on empty (drain the row without binding), never bare-fall-back.
-                filtered
+                self_filter_candidates(&t, &candidates, db)?
             }
             Some(CalleeMeta::Path(segments)) => {
-                let filtered = path_filter_candidates(&segments, &candidates, &node_id_to_path, db)?;
                 // Drop on empty (drain the row without binding), never bare-fall-back.
-                filtered
+                path_filter_candidates(&segments, &candidates, &node_id_to_path, db)?
             }
             // Bare / chain / JS receiver: Phase 2's default chain resolves these by
             // bare name too, so the existing behavior already matches.
@@ -254,7 +299,10 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
         };
 
         let refined = if resolved.len() > 1 {
-            let source_path = source_id_to_path.get(&row.source_id).cloned().unwrap_or_default();
+            let source_path = source_id_to_path
+                .get(&row.source_id)
+                .cloned()
+                .unwrap_or_default();
             refine_ambiguous_targets(&resolved, &source_path, &node_id_to_path)
         } else {
             resolved
@@ -465,7 +513,7 @@ pub(super) fn prune_import_contradicted_call_edges(db: &Database) -> Result<usiz
 /// edge becomes `ambiguous` when a duplicate-named sibling is later added (and
 /// back when it is removed). Returns the number of edges downgraded.
 pub(super) fn classify_edge_confidence(db: &Database) -> Result<usize> {
-    use crate::domain::{CONF_AMBIGUOUS, CONF_INFERRED, REL_CALLS, REL_REFERENCES, REL_IMPORTS};
+    use crate::domain::{CONF_AMBIGUOUS, CONF_INFERRED, REL_CALLS, REL_IMPORTS, REL_REFERENCES};
     let downgraded = db.conn().execute(
         "UPDATE edges
          SET confidence = CASE
@@ -550,21 +598,27 @@ pub(super) fn path_filter_candidates(
         None
     };
 
-    let kept: Vec<i64> = candidates.iter().copied().filter(|id| {
-        let path = node_id_to_path.get(id).map(String::as_str).unwrap_or("");
-        let qn = id_to_qn.get(id).map(String::as_str).unwrap_or("");
+    let kept: Vec<i64> = candidates
+        .iter()
+        .copied()
+        .filter(|id| {
+            let path = node_id_to_path.get(id).map(String::as_str).unwrap_or("");
+            let qn = id_to_qn.get(id).map(String::as_str).unwrap_or("");
 
-        let path_match = path.contains(&format!("/{}/", path_chain))
-            || path.starts_with(&format!("{}/", path_chain))
-            || single_file_suffix.as_deref().is_some_and(|sfx| path.ends_with(sfx));
+            let path_match = path.contains(&format!("/{}/", path_chain))
+                || path.starts_with(&format!("{}/", path_chain))
+                || single_file_suffix
+                    .as_deref()
+                    .is_some_and(|sfx| path.ends_with(sfx));
 
-        let qn_match = qn == qn_chain
-            || qn.starts_with(&format!("{}.", qn_chain))
-            || qn.contains(&format!(".{}.", qn_chain))
-            || qn.ends_with(&format!(".{}", qn_chain));
+            let qn_match = qn == qn_chain
+                || qn.starts_with(&format!("{}.", qn_chain))
+                || qn.contains(&format!(".{}.", qn_chain))
+                || qn.ends_with(&format!(".{}", qn_chain));
 
-        path_match || qn_match
-    }).collect();
+            path_match || qn_match
+        })
+        .collect();
     Ok(kept)
 }
 
@@ -659,7 +713,10 @@ mod tests {
     fn parse_metadata_routes_or_python_imports_returns_none() {
         // Other relations also use metadata; resolver should skip non-call shapes.
         assert!(parse_callee_metadata(Some(r#"{"method":"GET","path":"/api"}"#)).is_none());
-        assert!(parse_callee_metadata(Some(r#"{"python_module":"foo","is_module_import":false}"#)).is_none());
+        assert!(
+            parse_callee_metadata(Some(r#"{"python_module":"foo","is_module_import":false}"#))
+                .is_none()
+        );
     }
 
     mod pending_qualifier {
@@ -673,26 +730,52 @@ mod tests {
         use tempfile::TempDir;
 
         fn pyfile(conn: &rusqlite::Connection, path: &str) -> i64 {
-            upsert_file(conn, &FileRecord {
-                path: path.into(), blake3_hash: format!("h-{path}"),
-                last_modified: 1, language: Some("python".into()),
-            }).unwrap()
+            upsert_file(
+                conn,
+                &FileRecord {
+                    path: path.into(),
+                    blake3_hash: format!("h-{path}"),
+                    last_modified: 1,
+                    language: Some("python".into()),
+                },
+            )
+            .unwrap()
         }
-        fn method(conn: &rusqlite::Connection, name: &str, qname: Option<&str>, file_id: i64) -> i64 {
-            insert_node(conn, &NodeRecord {
-                file_id, node_type: "function".into(), name: name.into(),
-                qualified_name: qname.map(String::from), start_line: 1, end_line: 3,
-                code_content: format!("def {name}(self): pass"), signature: None,
-                doc_comment: None, context_string: None, name_tokens: None,
-                return_type: None, param_types: None, is_test: false,
-            }).unwrap()
+        fn method(
+            conn: &rusqlite::Connection,
+            name: &str,
+            qname: Option<&str>,
+            file_id: i64,
+        ) -> i64 {
+            insert_node(
+                conn,
+                &NodeRecord {
+                    file_id,
+                    node_type: "function".into(),
+                    name: name.into(),
+                    qualified_name: qname.map(String::from),
+                    start_line: 1,
+                    end_line: 3,
+                    code_content: format!("def {name}(self): pass"),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap()
         }
         fn call_targets(conn: &rusqlite::Connection, src: i64) -> Vec<i64> {
             let mut stmt = conn.prepare(
                 "SELECT target_id FROM edges WHERE source_id=?1 AND relation=?2 ORDER BY target_id"
             ).unwrap();
             stmt.query_map(rusqlite::params![src, REL_CALLS], |r| r.get::<_, i64>(0))
-                .unwrap().map(Result::unwrap).collect()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
         }
 
         /// H1 regression: the pending-call sweep must apply the SAME callee-qualifier
@@ -717,19 +800,35 @@ mod tests {
 
             // `w = DataWriter(); w.write()` buffered while no `write` was indexed yet.
             insert_pending_unresolved_call(
-                conn, run, "write", "python", Some(r#"{"q":"rtype","v":"DataWriter"}"#),
-            ).unwrap();
+                conn,
+                run,
+                "write",
+                "python",
+                Some(r#"{"q":"rtype","v":"DataWriter"}"#),
+            )
+            .unwrap();
 
             let added = resolve_pending_calls(&db).unwrap();
             let targets = call_targets(conn, run);
 
-            assert_eq!(added, 1, "exactly one edge should bind (DataWriter.write); got {added}");
-            assert_eq!(targets, vec![dw_write],
-                "rtype qualifier must bind DataWriter.write only");
-            assert!(!targets.contains(&pf_write),
-                "must NOT wire the wrong same-name sibling Profile.write");
-            assert_eq!(list_pending_unresolved_calls(conn).unwrap().len(), 0,
-                "the resolved pending row must be drained");
+            assert_eq!(
+                added, 1,
+                "exactly one edge should bind (DataWriter.write); got {added}"
+            );
+            assert_eq!(
+                targets,
+                vec![dw_write],
+                "rtype qualifier must bind DataWriter.write only"
+            );
+            assert!(
+                !targets.contains(&pf_write),
+                "must NOT wire the wrong same-name sibling Profile.write"
+            );
+            assert_eq!(
+                list_pending_unresolved_calls(conn).unwrap().len(),
+                0,
+                "the resolved pending row must be drained"
+            );
         }
 
         /// Bare (no-qualifier) pending calls keep the existing behavior: a unique
@@ -772,16 +871,26 @@ mod tests {
             // Buffered `self.write()` whose impl type is DataWriter (stype). No
             // DataWriter.write in the project → filter empty.
             insert_pending_unresolved_call(
-                conn, run, "write", "python", Some(r#"{"q":"stype","v":"DataWriter"}"#),
-            ).unwrap();
+                conn,
+                run,
+                "write",
+                "python",
+                Some(r#"{"q":"stype","v":"DataWriter"}"#),
+            )
+            .unwrap();
 
             let added = resolve_pending_calls(&db).unwrap();
             assert_eq!(added, 0,
                 "empty stype filter must bind NOTHING (no bare fallback to Profile.write); got {added}");
-            assert!(call_targets(conn, run).is_empty(),
-                "no call edge may be created for an unmatched stype qualifier");
-            assert_eq!(list_pending_unresolved_calls(conn).unwrap().len(), 0,
-                "the row must be drained (dropped), never left buffered forever");
+            assert!(
+                call_targets(conn, run).is_empty(),
+                "no call edge may be created for an unmatched stype qualifier"
+            );
+            assert_eq!(
+                list_pending_unresolved_calls(conn).unwrap().len(),
+                0,
+                "the row must be drained (dropped), never left buffered forever"
+            );
         }
 
         /// v49 audit fix: same parity for the Path qualifier — empty filter binds
@@ -799,16 +908,28 @@ mod tests {
             let _helper = method(conn, "helper", Some("Unrelated.helper"), f_other);
 
             insert_pending_unresolved_call(
-                conn, run, "helper", "python", Some(r#"{"q":"path","v":"foo::bar"}"#),
-            ).unwrap();
+                conn,
+                run,
+                "helper",
+                "python",
+                Some(r#"{"q":"path","v":"foo::bar"}"#),
+            )
+            .unwrap();
 
             let added = resolve_pending_calls(&db).unwrap();
-            assert_eq!(added, 0,
-                "empty path filter must bind NOTHING (no bare fallback); got {added}");
-            assert!(call_targets(conn, run).is_empty(),
-                "no call edge may be created for an unmatched path qualifier");
-            assert_eq!(list_pending_unresolved_calls(conn).unwrap().len(), 0,
-                "the row must be drained (dropped), never left buffered forever");
+            assert_eq!(
+                added, 0,
+                "empty path filter must bind NOTHING (no bare fallback); got {added}"
+            );
+            assert!(
+                call_targets(conn, run).is_empty(),
+                "no call edge may be created for an unmatched path qualifier"
+            );
+            assert_eq!(
+                list_pending_unresolved_calls(conn).unwrap().len(),
+                0,
+                "the row must be drained (dropped), never left buffered forever"
+            );
         }
     }
 
@@ -816,29 +937,48 @@ mod tests {
         use super::*;
         use crate::domain::{REL_CALLS, REL_IMPORTS, REL_REFERENCES};
         use crate::storage::db::Database;
-        use crate::storage::queries::{insert_edge, insert_node, upsert_file, FileRecord, NodeRecord};
+        use crate::storage::queries::{
+            insert_edge, insert_node, upsert_file, FileRecord, NodeRecord,
+        };
         use tempfile::TempDir;
 
         fn node(name: &str, file_id: i64) -> NodeRecord {
             NodeRecord {
-                file_id, node_type: "function".into(), name: name.into(),
-                qualified_name: None, start_line: 1, end_line: 5,
-                code_content: format!("function {name}() {{}}"), signature: None,
-                doc_comment: None, context_string: None, name_tokens: None,
-                return_type: None, param_types: None, is_test: false,
+                file_id,
+                node_type: "function".into(),
+                name: name.into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: format!("function {name}() {{}}"),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
             }
         }
         fn file(conn: &rusqlite::Connection, path: &str, lang: &str) -> i64 {
-            upsert_file(conn, &FileRecord {
-                path: path.into(), blake3_hash: format!("h-{path}"),
-                last_modified: 1, language: Some(lang.into()),
-            }).unwrap()
+            upsert_file(
+                conn,
+                &FileRecord {
+                    path: path.into(),
+                    blake3_hash: format!("h-{path}"),
+                    last_modified: 1,
+                    language: Some(lang.into()),
+                },
+            )
+            .unwrap()
         }
         fn conf_of(conn: &rusqlite::Connection, s: i64, t: i64, rel: &str) -> String {
             conn.query_row(
                 "SELECT confidence FROM edges WHERE source_id=?1 AND target_id=?2 AND relation=?3",
-                rusqlite::params![s, t, rel], |r| r.get(0),
-            ).unwrap()
+                rusqlite::params![s, t, rel],
+                |r| r.get(0),
+            )
+            .unwrap()
         }
 
         /// Same-file → extracted; cross-file unique by-name → inferred;
@@ -881,13 +1021,36 @@ mod tests {
             insert_edge(conn, i, j, REL_REFERENCES, None).unwrap();
 
             let downgraded = classify_edge_confidence(&db).unwrap();
-            assert_eq!(downgraded, 3, "3 cross-file calls/refs edges downgraded (C->D, E->F, I->J)");
+            assert_eq!(
+                downgraded, 3,
+                "3 cross-file calls/refs edges downgraded (C->D, E->F, I->J)"
+            );
 
-            assert_eq!(conf_of(conn, a, b, REL_CALLS), "extracted", "same-file call stays extracted");
-            assert_eq!(conf_of(conn, c, d, REL_CALLS), "inferred", "cross-file unique name → inferred");
-            assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "ambiguous", "cross-file duplicate name → ambiguous");
-            assert_eq!(conf_of(conn, g, h, REL_IMPORTS), "extracted", "imports stays extracted cross-file");
-            assert_eq!(conf_of(conn, i, j, REL_REFERENCES), "inferred", "cross-file unique reference → inferred");
+            assert_eq!(
+                conf_of(conn, a, b, REL_CALLS),
+                "extracted",
+                "same-file call stays extracted"
+            );
+            assert_eq!(
+                conf_of(conn, c, d, REL_CALLS),
+                "inferred",
+                "cross-file unique name → inferred"
+            );
+            assert_eq!(
+                conf_of(conn, e, f_target, REL_CALLS),
+                "ambiguous",
+                "cross-file duplicate name → ambiguous"
+            );
+            assert_eq!(
+                conf_of(conn, g, h, REL_IMPORTS),
+                "extracted",
+                "imports stays extracted cross-file"
+            );
+            assert_eq!(
+                conf_of(conn, i, j, REL_REFERENCES),
+                "inferred",
+                "cross-file unique reference → inferred"
+            );
         }
 
         /// Import-corroboration: a cross-file call whose target NAME is duplicated
@@ -924,13 +1087,18 @@ mod tests {
 
             // Control: a call to the OTHER (non-imported) duplicate stays ambiguous.
             let caller2 = insert_node(conn, &node("caller2", f_helpers)).unwrap();
-            let proc_other = conn.query_row(
-                "SELECT id FROM nodes WHERE name='process' AND file_id=?1",
-                [f_other], |r| r.get::<_, i64>(0)).unwrap();
+            let proc_other = conn
+                .query_row(
+                    "SELECT id FROM nodes WHERE name='process' AND file_id=?1",
+                    [f_other],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
             insert_edge(conn, caller2, proc_other, REL_CALLS, None).unwrap();
             classify_edge_confidence(&db).unwrap();
             assert_eq!(
-                conf_of(conn, caller2, proc_other, REL_CALLS), "ambiguous",
+                conf_of(conn, caller2, proc_other, REL_CALLS),
+                "ambiguous",
                 "call to a duplicate-named target with no corroborating import stays ambiguous",
             );
         }
@@ -956,7 +1124,14 @@ mod tests {
             let e = insert_node(conn, &node("E", f1)).unwrap();
             let v_target = insert_node(conn, &node("validate", f2)).unwrap();
             insert_node(conn, &node("validate", f3)).unwrap(); // same-lang duplicate name
-            insert_edge(conn, e, v_target, REL_CALLS, Some(r#"{"q":"stype","v":"Alpha"}"#)).unwrap();
+            insert_edge(
+                conn,
+                e,
+                v_target,
+                REL_CALLS,
+                Some(r#"{"q":"stype","v":"Alpha"}"#),
+            )
+            .unwrap();
 
             // Control: a BARE call to the same duplicate-named target stays ambiguous.
             let g = insert_node(conn, &node("G", f1)).unwrap();
@@ -965,8 +1140,11 @@ mod tests {
             classify_edge_confidence(&db).unwrap();
             assert_eq!(conf_of(conn, e, v_target, REL_CALLS), "inferred",
                 "a stype-qualifier-resolved edge to a duplicate-named target must stay inferred, not ambiguous");
-            assert_eq!(conf_of(conn, g, v_target, REL_CALLS), "ambiguous",
-                "a bare call to the same duplicate-named target stays ambiguous (control)");
+            assert_eq!(
+                conf_of(conn, g, v_target, REL_CALLS),
+                "ambiguous",
+                "a bare call to the same duplicate-named target stays ambiguous (control)"
+            );
         }
 
         /// A `path`-qualifier edge (Rust `crate::a::foo()`) gets the same exemption.
@@ -983,8 +1161,11 @@ mod tests {
             insert_node(conn, &node("foo", f3)).unwrap();
             insert_edge(conn, e, t, REL_CALLS, Some(r#"{"q":"path","v":"b"}"#)).unwrap();
             classify_edge_confidence(&db).unwrap();
-            assert_eq!(conf_of(conn, e, t, REL_CALLS), "inferred",
-                "path-qualifier-resolved edge must stay inferred despite the duplicate name");
+            assert_eq!(
+                conf_of(conn, e, t, REL_CALLS),
+                "inferred",
+                "path-qualifier-resolved edge must stay inferred despite the duplicate name"
+            );
         }
 
         /// Idempotency: removing the duplicate flips ambiguous→inferred on re-run;
@@ -1010,10 +1191,14 @@ mod tests {
             assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "ambiguous");
 
             // remove the duplicate node → name now unique → inferred on re-run
-            conn.execute("DELETE FROM nodes WHERE id=?1", [dup]).unwrap();
+            conn.execute("DELETE FROM nodes WHERE id=?1", [dup])
+                .unwrap();
             classify_edge_confidence(&db).unwrap();
-            assert_eq!(conf_of(conn, e, f_target, REL_CALLS), "inferred",
-                "removing the duplicate must flip ambiguous→inferred");
+            assert_eq!(
+                conf_of(conn, e, f_target, REL_CALLS),
+                "inferred",
+                "removing the duplicate must flip ambiguous→inferred"
+            );
         }
     }
 }

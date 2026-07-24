@@ -17,7 +17,9 @@ fn setup_indexed_project() -> TempDir {
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
 
-    std::fs::write(src.join("auth.ts"), r#"
+    std::fs::write(
+        src.join("auth.ts"),
+        r#"
 import jwt from 'jsonwebtoken';
 
 export function validateToken(token: string): boolean {
@@ -28,9 +30,13 @@ export function validateToken(token: string): boolean {
 export function hashPassword(password: string): string {
     return password; // stub
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    std::fs::write(src.join("api.ts"), r#"
+    std::fs::write(
+        src.join("api.ts"),
+        r#"
 import { validateToken } from './auth';
 
 export function handleLogin(req: Request, res: Response) {
@@ -42,9 +48,13 @@ export function handleLogin(req: Request, res: Response) {
 export function handleLogout(req: Request, res: Response) {
     res.json({ ok: true });
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    std::fs::write(src.join("utils.ts"), r#"
+    std::fs::write(
+        src.join("utils.ts"),
+        r#"
 export function formatDate(date: Date): string {
     return date.toISOString();
 }
@@ -54,7 +64,9 @@ export class Logger {
         console.log(msg);
     }
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Index using the library directly
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
@@ -86,6 +98,19 @@ fn run_cli_env(project: &TempDir, args: &[&str], envs: &[(&str, &str)]) -> (Stri
     (stdout, stderr, code)
 }
 
+/// Like `run_cli` but with the shell cwd inside a subdirectory of the project
+/// (the persistent-shell shape: the agent `cd`'d into a module and stayed there).
+fn run_cli_from(project: &TempDir, subdir: &str, args: &[&str]) -> (String, String, i32) {
+    let mut cmd = Command::new(binary_path());
+    cmd.current_dir(project.path().join(subdir)).args(args);
+    let output = cmd.output().expect("failed to run binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    (stdout, stderr, code)
+}
+
 /// Temp project where src/api.ts and src/auth.test.ts both depend on src/auth.ts.
 /// auth.test.ts is co-located so the proven `./auth` import resolves, and `.test.ts`
 /// makes it a test file via is_test_path.
@@ -94,25 +119,37 @@ fn setup_affected_project() -> TempDir {
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
 
-    std::fs::write(src.join("auth.ts"), r#"
+    std::fs::write(
+        src.join("auth.ts"),
+        r#"
 export function validateToken(token: string): boolean {
     return token.length > 0;
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    std::fs::write(src.join("api.ts"), r#"
+    std::fs::write(
+        src.join("api.ts"),
+        r#"
 import { validateToken } from './auth';
 export function handleLogin(token: string): boolean {
     return validateToken(token);
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    std::fs::write(src.join("auth.test.ts"), r#"
+    std::fs::write(
+        src.join("auth.test.ts"),
+        r#"
 import { validateToken } from './auth';
 export function testValidate(): void {
     validateToken('x');
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -129,15 +166,27 @@ fn test_cli_affected_json_core() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("invalid json: {e}; raw: {stdout}"));
 
-    let tests: Vec<String> = v["tests"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
-    assert!(tests.contains(&"src/auth.test.ts".to_string()),
-        "auth.test.ts must be a test to re-run; got {tests:?}");
+    let tests: Vec<String> = v["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        tests.contains(&"src/auth.test.ts".to_string()),
+        "auth.test.ts must be a test to re-run; got {tests:?}"
+    );
 
-    let affected: Vec<String> = v["affected_files"].as_array().unwrap()
-        .iter().map(|x| x["path"].as_str().unwrap().to_string()).collect();
-    assert!(affected.contains(&"src/api.ts".to_string()),
-        "api.ts depends on auth.ts and must be in blast radius; got {affected:?}");
+    let affected: Vec<String> = v["affected_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        affected.contains(&"src/api.ts".to_string()),
+        "api.ts depends on auth.ts and must be in blast radius; got {affected:?}"
+    );
     assert_eq!(v["not_indexed"].as_array().unwrap().len(), 0);
 }
 
@@ -193,8 +242,12 @@ fn test_cli_affected_not_indexed_json_envelope() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
     assert_eq!(v["tests"].as_array().unwrap().len(), 0);
     assert_eq!(v["affected_files"].as_array().unwrap().len(), 0);
-    let ni: Vec<String> = v["not_indexed"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    let ni: Vec<String> = v["not_indexed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
     assert_eq!(ni, vec!["src/ghost.ts".to_string()]);
 }
 
@@ -213,7 +266,10 @@ fn test_cli_affected_bare_invocation_hints() {
         "bare affected must hint at how to supply input; stderr: {stderr}"
     );
     // stdout still reports the empty result (shape unchanged).
-    assert!(stdout.contains("0 test file(s) to re-run"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("0 test file(s) to re-run"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -222,14 +278,17 @@ fn test_cli_affected_empty_stdin_pipe_stays_silent() {
     // `git diff`) used the command correctly and found no changes — it must NOT
     // get the "No files given" hint (that would be wrong/annoying for a working
     // pipe). Only the bare no-input invocation is hinted.
-    use std::process::{Command, Stdio};
     use std::io::Write;
+    use std::process::{Command, Stdio};
     let project = setup_affected_project();
     let mut child = Command::new(binary_path())
         .current_dir(project.path())
         .args(["affected", "--stdin"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     child.stdin.take().unwrap().write_all(b"").unwrap(); // empty pipe
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -243,20 +302,35 @@ fn test_cli_affected_empty_stdin_pipe_stays_silent() {
 fn test_cli_affected_stdin_matches_positional() {
     let project = setup_affected_project();
     // Pipe the path via stdin instead of positional.
-    use std::process::{Command, Stdio};
     use std::io::Write;
+    use std::process::{Command, Stdio};
     let mut child = Command::new(binary_path())
         .current_dir(project.path())
         .args(["affected", "--stdin", "--json"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().unwrap();
-    child.stdin.take().unwrap().write_all(b"src/auth.ts\n").unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"src/auth.ts\n")
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
-    let tests: Vec<String> = v["tests"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
-    assert!(tests.contains(&"src/auth.test.ts".to_string()), "got {tests:?}");
+    let tests: Vec<String> = v["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        tests.contains(&"src/auth.test.ts".to_string()),
+        "got {tests:?}"
+    );
 }
 
 #[test]
@@ -266,10 +340,16 @@ fn test_cli_affected_changed_test_file_is_self_included() {
     let (stdout, _, code) = run_cli(&project, &["affected", "src/auth.test.ts", "--json"]);
     assert_eq!(code, 0, "stdout: {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
-    let tests: Vec<String> = v["tests"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
-    assert!(tests.contains(&"src/auth.test.ts".to_string()),
-        "a changed test file must re-run itself; got {tests:?}");
+    let tests: Vec<String> = v["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        tests.contains(&"src/auth.test.ts".to_string()),
+        "a changed test file must re-run itself; got {tests:?}"
+    );
 }
 
 #[test]
@@ -279,8 +359,16 @@ fn test_cli_affected_dot_input_no_pollution() {
     let (stdout, _, code) = run_cli(&project, &["affected", ".", "--json"]);
     assert_eq!(code, 0, "stdout: {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
-    assert_eq!(v["changed"].as_array().unwrap().len(), 0, "`.` must not be a changed file");
-    assert_eq!(v["not_indexed"].as_array().unwrap().len(), 0, "`.` must not be reported not_indexed");
+    assert_eq!(
+        v["changed"].as_array().unwrap().len(),
+        0,
+        "`.` must not be a changed file"
+    );
+    assert_eq!(
+        v["not_indexed"].as_array().unwrap().len(),
+        0,
+        "`.` must not be reported not_indexed"
+    );
 }
 
 #[test]
@@ -290,13 +378,26 @@ fn test_cli_affected_nonexistent_test_path_not_in_tests() {
     let (stdout, _, code) = run_cli(&project, &["affected", "src/ghost.test.ts", "--json"]);
     assert_eq!(code, 0, "stdout: {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
-    let tests: Vec<String> = v["tests"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
-    let ni: Vec<String> = v["not_indexed"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
-    assert!(ni.contains(&"src/ghost.test.ts".to_string()), "nonexistent input → not_indexed; got {ni:?}");
-    assert!(!tests.contains(&"src/ghost.test.ts".to_string()),
-        "nonexistent test must NOT be in the re-run set; got {tests:?}");
+    let tests: Vec<String> = v["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    let ni: Vec<String> = v["not_indexed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ni.contains(&"src/ghost.test.ts".to_string()),
+        "nonexistent input → not_indexed; got {ni:?}"
+    );
+    assert!(
+        !tests.contains(&"src/ghost.test.ts".to_string()),
+        "nonexistent test must NOT be in the re-run set; got {tests:?}"
+    );
 }
 
 #[test]
@@ -304,15 +405,29 @@ fn test_cli_affected_blast_radius_disjoint_from_changed() {
     // F4: a changed file must never appear in affected_files. api.ts imports auth.ts;
     // changing BOTH must not list api.ts (a changed file) as 'affected'.
     let project = setup_affected_project();
-    let (stdout, _, code) = run_cli(&project, &["affected", "src/auth.ts", "src/api.ts", "--json"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["affected", "src/auth.ts", "src/api.ts", "--json"],
+    );
     assert_eq!(code, 0, "stdout: {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
-    let affected: Vec<String> = v["affected_files"].as_array().unwrap()
-        .iter().map(|x| x["path"].as_str().unwrap().to_string()).collect();
-    let changed: Vec<String> = v["changed"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    let affected: Vec<String> = v["affected_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["path"].as_str().unwrap().to_string())
+        .collect();
+    let changed: Vec<String> = v["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
     for c in &changed {
-        assert!(!affected.contains(c), "changed file {c} must not be in affected_files; affected={affected:?}");
+        assert!(
+            !affected.contains(c),
+            "changed file {c} must not be in affected_files; affected={affected:?}"
+        );
     }
 }
 
@@ -326,10 +441,16 @@ fn test_cli_health_check_resolution_block() {
     assert!(res.is_object(), "resolution block must be present; got {v}");
     assert!(res["pending_unresolved_calls"].is_number());
     // Key-agnostic: ≥1 resolved call edge across all languages (handleLogin→validateToken).
-    let total_calls: i64 = res["edges_by_language"].as_object().unwrap().values()
+    let total_calls: i64 = res["edges_by_language"]
+        .as_object()
+        .unwrap()
+        .values()
         .filter_map(|rels| rels["calls"].as_i64())
         .sum();
-    assert!(total_calls >= 1, "expected ≥1 resolved call edge across languages; got {res}");
+    assert!(
+        total_calls >= 1,
+        "expected ≥1 resolved call edge across languages; got {res}"
+    );
 }
 
 // ============================================================
@@ -344,11 +465,35 @@ fn test_cli_health_check_resolution_block() {
 #[test]
 fn test_cli_migrated_help_has_no_internal_notes() {
     let project = setup_indexed_project();
-    let internal_tokens = ["audit #", "clap-migrat", "resolved_format", "plan §", "issue #"];
+    let internal_tokens = [
+        "audit #",
+        "clap-migrat",
+        "resolved_format",
+        "plan §",
+        "issue #",
+    ];
     for cmd in [
-        "stats", "benchmark", "incremental-index", "reindex", "rebuild-index", "health-check",
-        "map", "tour", "grep", "overview", "dead-code", "search", "ast-search", "deps", "trace",
-        "snapshot", "callgraph", "impact", "show", "refs", "similar",
+        "stats",
+        "benchmark",
+        "incremental-index",
+        "reindex",
+        "rebuild-index",
+        "health-check",
+        "map",
+        "tour",
+        "grep",
+        "overview",
+        "dead-code",
+        "search",
+        "ast-search",
+        "deps",
+        "trace",
+        "snapshot",
+        "callgraph",
+        "impact",
+        "show",
+        "refs",
+        "similar",
     ] {
         let (stdout, _, code) = run_cli(&project, &[cmd, "--help"]);
         assert_eq!(code, 0, "{cmd} --help should exit 0");
@@ -376,11 +521,37 @@ fn test_cli_top_level_help_lists_all_commands() {
     let (stdout, _, code) = run_cli(&project, &["--help"]);
     assert_eq!(code, 0, "--help should exit 0");
     for cmd in [
-        "serve", "grep", "search", "ast-search", "callgraph", "impact", "affected",
-        "show", "map", "tour", "overview", "deps", "trace", "similar", "refs",
-        "dead-code", "centrality", "cycles", "surprising", "report", "incremental-index",
-        "rebuild-index", "reindex", "health-check", "doctor", "benchmark", "stats",
-        "outcome", "adopt", "unadopt", "snapshot",
+        "serve",
+        "grep",
+        "search",
+        "ast-search",
+        "callgraph",
+        "impact",
+        "affected",
+        "show",
+        "map",
+        "tour",
+        "overview",
+        "deps",
+        "trace",
+        "similar",
+        "refs",
+        "dead-code",
+        "centrality",
+        "cycles",
+        "surprising",
+        "report",
+        "incremental-index",
+        "rebuild-index",
+        "reindex",
+        "health-check",
+        "doctor",
+        "benchmark",
+        "stats",
+        "outcome",
+        "adopt",
+        "unadopt",
+        "snapshot",
     ] {
         assert!(
             stdout.contains(&format!("\n    {cmd} ")),
@@ -401,18 +572,27 @@ fn test_cli_js_subcommands_help_is_side_effect_free() {
     for cmd in ["doctor", "adopt", "unadopt"] {
         for help_flag in ["--help", "-h"] {
             let (stdout, _, code) = run_cli(&project, &[cmd, help_flag]);
-            assert_eq!(code, 0, "{cmd} {help_flag} should exit 0; got {code}\n{stdout}");
-            assert!(stdout.contains("USAGE"),
-                "{cmd} {help_flag} should print usage, not run the command; got:\n{stdout}");
+            assert_eq!(
+                code, 0,
+                "{cmd} {help_flag} should exit 0; got {code}\n{stdout}"
+            );
+            assert!(
+                stdout.contains("USAGE"),
+                "{cmd} {help_flag} should print usage, not run the command; got:\n{stdout}"
+            );
             // The doctor diagnostic run prints a `🔍` header; help must not.
-            assert!(!stdout.contains('\u{1f50d}'),
-                "{cmd} {help_flag} ran the command instead of showing help; got:\n{stdout}");
+            assert!(
+                !stdout.contains('\u{1f50d}'),
+                "{cmd} {help_flag} ran the command instead of showing help; got:\n{stdout}"
+            );
         }
     }
     // doctor help must advertise the diagnose-only escape hatch.
     let (stdout, _, _) = run_cli(&project, &["doctor", "--help"]);
-    assert!(stdout.contains("--check-only"),
-        "doctor --help must document --check-only; got:\n{stdout}");
+    assert!(
+        stdout.contains("--check-only"),
+        "doctor --help must document --check-only; got:\n{stdout}"
+    );
 }
 
 // ============================================================
@@ -427,7 +607,11 @@ fn test_cli_health_check() {
     assert!(stdout.starts_with("OK:"), "expected OK, got: {}", stdout);
     assert!(stdout.contains("nodes"), "should mention nodes");
     // F12: text health-check surfaces the Resolution line (mirrors the --json block).
-    assert!(stdout.contains("Resolution:"), "text health-check must show Resolution line: {}", stdout);
+    assert!(
+        stdout.contains("Resolution:"),
+        "text health-check must show Resolution line: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -451,17 +635,32 @@ fn test_cli_health_check_files_excludes_external_pseudo_file() {
         code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
         // Self-check: the fixture must actually create the <external> pseudo-file,
         // else this test would pass even with the bug present.
-        let total: i64 = db.conn().query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
-        let real: i64 = db.conn()
-            .query_row("SELECT COUNT(*) FROM files WHERE path != '<external>'", [], |r| r.get(0)).unwrap();
+        let total: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        let real: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path != '<external>'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(real, 2, "fixture has 2 real source files");
-        assert_eq!(total, 3, "fixture must create the <external> pseudo-file to exercise the bug; total={total}");
+        assert_eq!(
+            total, 3,
+            "fixture must create the <external> pseudo-file to exercise the bug; total={total}"
+        );
     }
     let (stdout, _, code) = run_cli(&project, &["health-check", "--json"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
-    assert_eq!(v["files"].as_i64().unwrap(), 2,
-        "health-check `files` must exclude the <external> pseudo-file; got: {stdout}");
+    assert_eq!(
+        v["files"].as_i64().unwrap(),
+        2,
+        "health-check `files` must exclude the <external> pseudo-file; got: {stdout}"
+    );
 }
 
 #[test]
@@ -479,7 +678,11 @@ fn test_cli_health_check_unhealthy_exit_code() {
     let project = TempDir::new().unwrap();
     // No index — should fail
     let (_, stderr, code) = run_cli(&project, &["health-check"]);
-    assert_ne!(code, 0, "unhealthy should exit non-zero, stderr: {}", stderr);
+    assert_ne!(
+        code, 0,
+        "unhealthy should exit non-zero, stderr: {}",
+        stderr
+    );
 }
 
 // clap-migrated (audit #4) contract lock. The --json/--format duality is now
@@ -495,7 +698,10 @@ fn test_cli_health_check_format_json_equiv_to_json() {
     assert_eq!(code_fmt, 0);
     let v_flag: serde_json::Value = serde_json::from_str(out_flag.trim()).unwrap();
     let v_fmt: serde_json::Value = serde_json::from_str(out_fmt.trim()).unwrap();
-    assert_eq!(v_flag["healthy"], v_fmt["healthy"], "--format json must mirror --json");
+    assert_eq!(
+        v_flag["healthy"], v_fmt["healthy"],
+        "--format json must mirror --json"
+    );
     assert_eq!(v_flag["nodes"], v_fmt["nodes"]);
 }
 
@@ -504,8 +710,10 @@ fn test_cli_health_check_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["health-check", "--help"]);
     assert_eq!(code, 0, "health-check --help should exit 0 (clap help)");
-    assert!(stdout.contains("index status") || stdout.contains("--format"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("index status") || stdout.contains("--format"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -525,7 +733,11 @@ fn test_cli_search() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["search", "validateToken"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("validateToken"), "should find validateToken, got: {}", stdout);
+    assert!(
+        stdout.contains("validateToken"),
+        "should find validateToken, got: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -533,7 +745,10 @@ fn test_cli_search_no_results() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["search", "xyznonexistent"]);
     assert_eq!(code, 0);
-    assert!(stderr.contains("No results"), "should show no results message");
+    assert!(
+        stderr.contains("No results"),
+        "should show no results message"
+    );
 }
 
 #[test]
@@ -549,7 +764,10 @@ fn test_cli_search_json() {
 #[test]
 fn test_cli_search_language_filter() {
     let project = setup_indexed_project();
-    let (stdout, _, code) = run_cli(&project, &["search", "validate", "--language", "typescript"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["search", "validate", "--language", "typescript"],
+    );
     assert_eq!(code, 0);
     assert!(stdout.contains("validateToken"));
 }
@@ -563,12 +781,17 @@ fn test_cli_search_filter_removed_all_explains_why() {
     // v0.99.1 (roadmap §1.1): stdout now carries a self-describing object (NOT `[]`)
     // so the disclosure survives `2>/dev/null`; stderr keeps the human message.
     let project = setup_indexed_project(); // TS fixture: validateToken in api.ts/auth.ts
-    let (stdout, stderr, code) =
-        run_cli(&project, &["search", "validateToken", "--language", "python", "--json"]);
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["search", "validateToken", "--language", "python", "--json"],
+    );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["results"], serde_json::json!([]));
-    assert!(v["filtered_out"].as_u64().unwrap_or(0) >= 1, "in-band disclosure; got {stdout:?}");
+    assert!(
+        v["filtered_out"].as_u64().unwrap_or(0) >= 1,
+        "in-band disclosure; got {stdout:?}"
+    );
     assert!(
         stderr.contains("removed by the active filter"),
         "stderr must explain the filter emptied the results; got: {stderr:?}"
@@ -582,9 +805,14 @@ fn test_cli_search_unknown_language_rejected() {
     // swallowed and reported as a too-narrow "removed by the active filter" (which
     // wrongly implies the language is valid but the query too specific).
     let project = setup_indexed_project();
-    let (_stdout, stderr, code) =
-        run_cli(&project, &["search", "validateToken", "--language", "pyton"]);
-    assert_ne!(code, 0, "unknown language must exit nonzero; stderr: {stderr:?}");
+    let (_stdout, stderr, code) = run_cli(
+        &project,
+        &["search", "validateToken", "--language", "pyton"],
+    );
+    assert_ne!(
+        code, 0,
+        "unknown language must exit nonzero; stderr: {stderr:?}"
+    );
     assert!(
         stderr.contains("Unknown language filter") && stderr.contains("pyton"),
         "stderr must name the bad language and list the valid set; got: {stderr:?}"
@@ -601,8 +829,10 @@ fn test_cli_search_language_case_insensitive() {
     // (mcp::server::tests::test_semantic_search_language_case_insensitive), whose
     // downstream filter is case-sensitive.
     let project = setup_indexed_project();
-    let (stdout, _stderr, code) =
-        run_cli(&project, &["search", "validate", "--language", "TypeScript"]);
+    let (stdout, _stderr, code) = run_cli(
+        &project,
+        &["search", "validate", "--language", "TypeScript"],
+    );
     assert_eq!(code, 0);
     assert!(stdout.contains("validateToken"));
 }
@@ -618,7 +848,11 @@ fn test_cli_search_compact() {
     let lines: Vec<&str> = stdout.lines().collect();
     for line in &lines {
         if line.contains("validateToken") {
-            assert!(!line.contains("(token:"), "compact should not include params, got: {}", line);
+            assert!(
+                !line.contains("(token:"),
+                "compact should not include params, got: {}",
+                line
+            );
         }
     }
 }
@@ -628,7 +862,11 @@ fn test_cli_search_limit() {
     let project = setup_indexed_project();
     let (stdout, _, _) = run_cli(&project, &["search", "function", "--limit", "2"]);
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    assert!(lines.len() <= 2, "should respect --limit, got {} lines", lines.len());
+    assert!(
+        lines.len() <= 2,
+        "should respect --limit, got {} lines",
+        lines.len()
+    );
 }
 
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection; --top-k is
@@ -638,8 +876,10 @@ fn test_cli_search_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["search", "--help"]);
     assert_eq!(code, 0, "search --help should exit 0 (clap help)");
-    assert!(stdout.contains("FTS5") || stdout.contains("QUERY"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("FTS5") || stdout.contains("QUERY"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -652,10 +892,19 @@ fn test_cli_search_unknown_flag_errors() {
 #[test]
 fn test_cli_search_top_k_alias_matches_limit() {
     let project = setup_indexed_project();
-    let (out_limit, _, code_limit) = run_cli(&project, &["search", "function", "--limit", "2", "--json"]);
-    let (out_topk, _, code_topk) = run_cli(&project, &["search", "function", "--top-k", "2", "--json"]);
-    assert_eq!(code_limit, code_topk, "--top-k must mirror --limit exit code");
-    assert_eq!(out_limit.trim(), out_topk.trim(), "--top-k 2 must equal --limit 2");
+    let (out_limit, _, code_limit) =
+        run_cli(&project, &["search", "function", "--limit", "2", "--json"]);
+    let (out_topk, _, code_topk) =
+        run_cli(&project, &["search", "function", "--top-k", "2", "--json"]);
+    assert_eq!(
+        code_limit, code_topk,
+        "--top-k must mirror --limit exit code"
+    );
+    assert_eq!(
+        out_limit.trim(),
+        out_topk.trim(),
+        "--top-k 2 must equal --limit 2"
+    );
 }
 
 // ============================================================
@@ -668,7 +917,10 @@ fn has_ripgrep() -> bool {
 
 #[test]
 fn test_cli_grep() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["grep", "validateToken"]);
     assert_eq!(code, 0);
@@ -678,30 +930,47 @@ fn test_cli_grep() {
 
 #[test]
 fn test_cli_grep_no_matches() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // grep-parity: no match exits 1 (was 0 pre-v0.50) so scripts can branch
     // on match presence like with real grep.
     let (_, stderr, code) = run_cli(&project, &["grep", "xyznonexistent"]);
     assert_eq!(code, 1, "no match must exit 1 (grep parity)");
-    assert!(stderr.contains("No matches"), "should show no matches message");
+    assert!(
+        stderr.contains("No matches"),
+        "should show no matches message"
+    );
 }
 
 #[test]
 fn test_cli_grep_invalid_regex_exits_two() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // Unescaped `(` is an invalid regex — ripgrep exits 2. grep-parity: error
     // paths exit 2 (grep's "trouble" code), distinct from no-match (1).
     let (_, stderr, code) = run_cli(&project, &["grep", "res.json("]);
-    assert_eq!(code, 2, "invalid regex must exit 2 (grep parity), got stderr: {stderr}");
-    assert!(stderr.contains("ripgrep error") || stderr.to_lowercase().contains("regex"),
-        "should surface the ripgrep error, got: {stderr}");
+    assert_eq!(
+        code, 2,
+        "invalid regex must exit 2 (grep parity), got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ripgrep error") || stderr.to_lowercase().contains("regex"),
+        "should surface the ripgrep error, got: {stderr}"
+    );
 }
 
 #[test]
 fn test_cli_grep_partial_results_on_missing_path() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // GNU grep parity: an unreadable/missing path is an error (exit 2), but
     // matches from the readable paths still print — rg itself emits the hits
@@ -710,34 +979,152 @@ fn test_cli_grep_partial_results_on_missing_path() {
     // silently dropped every result.
     let (stdout, stderr, code) =
         run_cli(&project, &["grep", "validateToken", "src", "no_such_dir"]);
-    assert_eq!(code, 2, "path error must exit 2 (grep parity), got stderr: {stderr}");
-    assert!(stdout.contains("validateToken"),
-        "partial results from the valid path must print, got stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(stderr.contains("No such file") || stderr.contains("ripgrep error"),
-        "the path error must be surfaced on stderr, got: {stderr:?}");
+    assert_eq!(
+        code, 2,
+        "path error must exit 2 (grep parity), got stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("validateToken"),
+        "partial results from the valid path must print, got stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("No such file") || stderr.contains("ripgrep error"),
+        "the path error must be surfaced on stderr, got: {stderr:?}"
+    );
 }
 
 #[test]
 fn test_cli_grep_partial_results_count_mode() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // Same partial-results contract for -c (the observed field failure shape:
     // `grep "pat" scripts parse -c` where `parse` did not exist → exit 2 with
     // all counts dropped).
-    let (stdout, stderr, code) =
-        run_cli(&project, &["grep", "validateToken", "src", "no_such_dir", "-c"]);
-    assert_eq!(code, 2, "path error must exit 2 (grep parity), got stderr: {stderr}");
-    assert!(stdout.contains("src/auth.ts:") && stdout.contains("src/api.ts:"),
-        "counts from the valid path must print, got stdout: {stdout:?}");
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["grep", "validateToken", "src", "no_such_dir", "-c"],
+    );
+    assert_eq!(
+        code, 2,
+        "path error must exit 2 (grep parity), got stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("src/auth.ts:") && stdout.contains("src/api.ts:"),
+        "counts from the valid path must print, got stdout: {stdout:?}"
+    );
 }
 
 #[test]
 fn test_cli_grep_with_path() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["grep", "validateToken", "src/auth.ts"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("validateToken"));
+}
+
+#[test]
+fn test_cli_grep_root_relative_path_from_subdir_rebases() {
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
+    let project = setup_indexed_project();
+    // Field failure 2026-07-24: the shell sat in claude-plugin/scripts while the
+    // path was quoted repo-root-relative (the deny-hook displays paths that way),
+    // so cwd.join doubled the prefix — rg got <root>/<sub>/<sub>/… and exited 2
+    // with a cryptic "No such file". cwd-missing + root-existing is unambiguous:
+    // rebase against the project root and note it on stderr.
+    let (stdout, stderr, code) =
+        run_cli_from(&project, "src", &["grep", "validateToken", "src/auth.ts"]);
+    assert_eq!(
+        code, 0,
+        "root-relative path from a subdir must rebase to the project root, stderr: {stderr:?}"
+    );
+    assert!(
+        stdout.contains("validateToken"),
+        "matches must print, got: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("project root"),
+        "the rebase must be surfaced on stderr, got: {stderr:?}"
+    );
+}
+
+#[test]
+fn test_cli_overview_root_relative_path_from_subdir_rebases() {
+    let project = setup_indexed_project();
+    // Same near-miss class as the grep test above, through normalize_user_path
+    // (covers overview/callgraph/impact/show/deps/refs/dead_code/tour/affected):
+    // `overview src` from inside src/ used to look up the doubled "src/src" and
+    // report "No symbols found under: src" — echoing the perfectly valid path
+    // the caller typed.
+    let (stdout, stderr, code) = run_cli_from(&project, "src", &["overview", "src"]);
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stdout.contains("validateToken"),
+        "overview must list the module's symbols after the rebase, got: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("project root"),
+        "the rebase must be surfaced on stderr, got: {stderr:?}"
+    );
+}
+
+#[test]
+fn test_cli_grep_cwd_anchored_path_never_rebases() {
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
+    let project = setup_indexed_project();
+    // `./x` (like `.` and `../x`) is explicitly cwd-anchored: `./src/auth.ts`
+    // from inside src/ means src/src/auth.ts, which doesn't exist — that's the
+    // caller's error to see, not a near-miss to silently repair. Both rebase
+    // sites (cmd_grep here, normalize_user_path_from in the unit tests) follow
+    // the same rule; audit 2026-07-24 caught cmd_grep rebasing these.
+    let (_stdout, stderr, code) =
+        run_cli_from(&project, "src", &["grep", "validateToken", "./src/auth.ts"]);
+    assert_eq!(
+        code, 2,
+        "cwd-anchored miss must surface as an rg error, stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("project root"),
+        "cwd-anchored paths must not rebase, got: {stderr:?}"
+    );
+}
+
+#[test]
+fn test_cli_grep_cwd_relative_path_from_subdir_unchanged() {
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
+    let project = setup_indexed_project();
+    // grep/rg parity guard: a path that DOES exist under the shell cwd keeps its
+    // cwd-relative reading — the rebase fires only on the cwd-missing +
+    // root-existing near-miss, never when both readings exist.
+    let (stdout, stderr, code) =
+        run_cli_from(&project, "src", &["grep", "validateToken", "auth.ts"]);
+    assert_eq!(
+        code, 0,
+        "cwd-relative path must keep working, stderr: {stderr:?}"
+    );
+    assert!(
+        stdout.contains("validateToken"),
+        "matches must print, got: {stdout:?}"
+    );
+    assert!(
+        !stderr.contains("project root"),
+        "no rebase note when the cwd-relative path exists, got: {stderr:?}"
+    );
 }
 
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection; the
@@ -748,8 +1135,10 @@ fn test_cli_grep_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["grep", "--help"]);
     assert_eq!(code, 0, "grep --help should exit 0 (clap help)");
-    assert!(stdout.contains("AST-context grep") || stdout.contains("PATTERN"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("AST-context grep") || stdout.contains("PATTERN"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -765,21 +1154,36 @@ fn test_cli_grep_empty_pattern_errors() {
     // erroring with the Usage hint, not run ripgrep against an empty regex.
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["grep", ""]);
-    assert_eq!(code, 2, "empty pattern is a usage error: exit 2 (grep parity); stderr={stderr:?}");
-    assert!(stderr.contains("Usage:"), "should show usage on empty pattern; got: {stderr:?}");
+    assert_eq!(
+        code, 2,
+        "empty pattern is a usage error: exit 2 (grep parity); stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Usage:"),
+        "should show usage on empty pattern; got: {stderr:?}"
+    );
 }
 
 #[test]
 fn test_cli_grep_leading_dash_pattern() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
-    std::fs::write(project.path().join("BUILD.md"),
-        "Use cargo build --no-default-features for the small binary.\n").unwrap();
+    std::fs::write(
+        project.path().join("BUILD.md"),
+        "Use cargo build --no-default-features for the small binary.\n",
+    )
+    .unwrap();
     // A pattern starting with `-` must be searchable without clap or rg
     // swallowing it as a flag (rg invocation needs the `--` separator).
     let (stdout, stderr, code) = run_cli(&project, &["grep", "--no-default-features"]);
     assert_eq!(code, 0, "leading-dash pattern must work; stderr={stderr}");
-    assert!(stdout.contains("BUILD.md"), "should find the hit, got: {stdout}");
+    assert!(
+        stdout.contains("BUILD.md"),
+        "should find the hit, got: {stdout}"
+    );
     // The clap-suggested `--` escape form must work too.
     let (stdout2, _, code2) = run_cli(&project, &["grep", "--", "--no-default-features"]);
     assert_eq!(code2, 0);
@@ -788,7 +1192,10 @@ fn test_cli_grep_leading_dash_pattern() {
 
 #[test]
 fn test_cli_grep_noop_muscle_memory_flags() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // "drop-in grep" parity: -n/-r/-R/-H are accepted no-ops (line numbers,
     // recursion, and filenames are already the default output here), NOT
@@ -796,10 +1203,24 @@ fn test_cli_grep_noop_muscle_memory_flags() {
     // bound `-n` as the pattern and pushed "pat" into the path list → rg errored
     // with "No such file or directory: pat" at exit 2 — silently training the
     // model to abandon the tool the whole project exists to steer it toward.
-    for flag in ["-n", "--line-number", "-r", "-R", "--recursive", "-H", "--with-filename"] {
+    for flag in [
+        "-n",
+        "--line-number",
+        "-r",
+        "-R",
+        "--recursive",
+        "-H",
+        "--with-filename",
+    ] {
         let (stdout, stderr, code) = run_cli(&project, &["grep", flag, "validateToken"]);
-        assert_eq!(code, 0, "grep {flag} <pat> must bind the pattern, not swallow the flag; stderr={stderr}");
-        assert!(stdout.contains("validateToken"), "grep {flag}: should find matches, got: {stdout}");
+        assert_eq!(
+            code, 0,
+            "grep {flag} <pat> must bind the pattern, not swallow the flag; stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("validateToken"),
+            "grep {flag}: should find matches, got: {stdout}"
+        );
     }
     // -n combined with an explicit path (the most common real invocation).
     let (stdout, _, code) = run_cli(&project, &["grep", "-n", "validateToken", "src/auth.ts"]);
@@ -809,7 +1230,10 @@ fn test_cli_grep_noop_muscle_memory_flags() {
 
 #[test]
 fn test_cli_grep_attached_context_forms() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // Drop-in grep parity: the attached numeric context forms `-A2`/`-B1`/`-C2`
     // (real grep and ripgrep both accept them) must parse as context, NOT get
@@ -819,11 +1243,19 @@ fn test_cli_grep_attached_context_forms() {
     // on one of grep's most common invocations.
     let (stdout, stderr, code) =
         run_cli(&project, &["grep", "-A2", "validateToken", "src/auth.ts"]);
-    assert_eq!(code, 0, "attached -A2 must parse as after-context; stderr={stderr}");
-    assert!(stdout.contains("validateToken"), "should find the match, got: {stdout}");
+    assert_eq!(
+        code, 0,
+        "attached -A2 must parse as after-context; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("validateToken"),
+        "should find the match, got: {stdout}"
+    );
     // After-context lines render with a `-` line separator (rg/grep style).
-    assert!(stdout.contains("src/auth.ts-"),
-        "after-context lines should appear for -A2, got: {stdout}");
+    assert!(
+        stdout.contains("src/auth.ts-"),
+        "after-context lines should appear for -A2, got: {stdout}"
+    );
     // -C2 and -B1 attached forms likewise bind the pattern, not the flag.
     let (_, se_c, code_c) = run_cli(&project, &["grep", "-C2", "validateToken", "src/auth.ts"]);
     assert_eq!(code_c, 0, "attached -C2 must work; stderr={se_c}");
@@ -833,37 +1265,69 @@ fn test_cli_grep_attached_context_forms() {
     // accept `-nA2`; the value flag is always last in a bundle. `-n` is advertised
     // here as a no-op parity flag, so `grep -nA2 pat` is a high-probability
     // muscle-memory form that must not regress to the cryptic rg path error.
-    let (so_n, se_n, code_n) =
-        run_cli(&project, &["grep", "-nA2", "validateToken", "src/auth.ts"]);
-    assert_eq!(code_n, 0, "bundled -nA2 must parse as -n + after-context; stderr={se_n}");
-    assert!(so_n.contains("validateToken"), "should find the match, got: {so_n}");
-    assert!(so_n.contains("src/auth.ts-"), "after-context lines should appear for -nA2, got: {so_n}");
+    let (so_n, se_n, code_n) = run_cli(&project, &["grep", "-nA2", "validateToken", "src/auth.ts"]);
+    assert_eq!(
+        code_n, 0,
+        "bundled -nA2 must parse as -n + after-context; stderr={se_n}"
+    );
+    assert!(
+        so_n.contains("validateToken"),
+        "should find the match, got: {so_n}"
+    );
+    assert!(
+        so_n.contains("src/auth.ts-"),
+        "after-context lines should appear for -nA2, got: {so_n}"
+    );
     // -niA2: the bundled -i must still take effect (case-insensitive match).
     let (so_ni, se_ni, code_ni) =
         run_cli(&project, &["grep", "-niA2", "VALIDATETOKEN", "src/auth.ts"]);
-    assert_eq!(code_ni, 0, "bundled -niA2 (with -i) must work; stderr={se_ni}");
-    assert!(so_ni.contains("validateToken"), "-niA2 should match case-insensitively, got: {so_ni}");
+    assert_eq!(
+        code_ni, 0,
+        "bundled -niA2 (with -i) must work; stderr={se_ni}"
+    );
+    assert!(
+        so_ni.contains("validateToken"),
+        "-niA2 should match case-insensitively, got: {so_ni}"
+    );
     // The `--` escape still lets a literal "-A2" be searched as a pattern
     // (normalization must stop at the `--` separator).
     std::fs::write(project.path().join("DASH.md"), "the -A2 flag here\n").unwrap();
     let (stdout_lit, _, code_lit) = run_cli(&project, &["grep", "--", "-A2"]);
-    assert_eq!(code_lit, 0, "literal -A2 via -- must still search as a pattern");
-    assert!(stdout_lit.contains("DASH.md"), "should find literal -A2, got: {stdout_lit}");
+    assert_eq!(
+        code_lit, 0,
+        "literal -A2 via -- must still search as a pattern"
+    );
+    assert!(
+        stdout_lit.contains("DASH.md"),
+        "should find literal -A2, got: {stdout_lit}"
+    );
 }
 
 #[test]
 fn test_cli_grep_fixed_strings_literal() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // -F treats the pattern literally — `res.json(` stops being a regex error.
     let (stdout, _, code) = run_cli(&project, &["grep", "-F", "res.json(", "src/api.ts"]);
-    assert_eq!(code, 0, "-F literal search must succeed on regex-hostile pattern");
-    assert!(stdout.contains("res.json("), "should find literal hits, got: {stdout}");
+    assert_eq!(
+        code, 0,
+        "-F literal search must succeed on regex-hostile pattern"
+    );
+    assert!(
+        stdout.contains("res.json("),
+        "should find literal hits, got: {stdout}"
+    );
 }
 
 #[test]
 fn test_cli_grep_ignore_case() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let (_, _, code_sensitive) = run_cli(&project, &["grep", "VALIDATETOKEN"]);
     assert_eq!(code_sensitive, 1, "case-sensitive by default (grep parity)");
@@ -874,7 +1338,10 @@ fn test_cli_grep_ignore_case() {
 
 #[test]
 fn test_cli_grep_word_regexp() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // `validate` appears only inside `validateToken` — -w must not match it.
     let (_, _, code) = run_cli(&project, &["grep", "-w", "validate"]);
@@ -886,38 +1353,76 @@ fn test_cli_grep_word_regexp() {
 
 #[test]
 fn test_cli_grep_multi_path() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
-    let (stdout, _, code) =
-        run_cli(&project, &["grep", "validateToken", "src/auth.ts", "src/api.ts"]);
-    assert_eq!(code, 0, "multiple path arguments must be accepted (grep parity)");
-    assert!(stdout.contains("src/auth.ts"), "hit from first path, got: {stdout}");
-    assert!(stdout.contains("src/api.ts"), "hit from second path, got: {stdout}");
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["grep", "validateToken", "src/auth.ts", "src/api.ts"],
+    );
+    assert_eq!(
+        code, 0,
+        "multiple path arguments must be accepted (grep parity)"
+    );
+    assert!(
+        stdout.contains("src/auth.ts"),
+        "hit from first path, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/api.ts"),
+        "hit from second path, got: {stdout}"
+    );
 }
 
 #[test]
 fn test_cli_grep_max_count_truncation_note() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let many = "needle\n".repeat(5);
     std::fs::write(project.path().join("many.txt"), &many).unwrap();
     // Cap hit → must say so on stderr instead of silently truncating.
-    let (stdout, stderr, code) = run_cli(&project, &["grep", "needle", "many.txt", "--max-count", "2"]);
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["grep", "needle", "many.txt", "--max-count", "2"],
+    );
     assert_eq!(code, 0);
-    assert_eq!(stdout.matches("needle").count(), 2, "cap applies, got: {stdout}");
-    assert!(stderr.contains("--max-count") || stderr.contains("truncat"),
-        "truncation must be surfaced on stderr, got: {stderr:?}");
+    assert_eq!(
+        stdout.matches("needle").count(),
+        2,
+        "cap applies, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("--max-count") || stderr.contains("truncat"),
+        "truncation must be surfaced on stderr, got: {stderr:?}"
+    );
     // --max-count 0 lifts the cap entirely.
-    let (stdout_all, stderr_all, code_all) =
-        run_cli(&project, &["grep", "needle", "many.txt", "--max-count", "0"]);
+    let (stdout_all, stderr_all, code_all) = run_cli(
+        &project,
+        &["grep", "needle", "many.txt", "--max-count", "0"],
+    );
     assert_eq!(code_all, 0);
-    assert_eq!(stdout_all.matches("needle").count(), 5, "0 = unlimited, got: {stdout_all}");
-    assert!(!stderr_all.contains("truncat"), "no cap → no truncation note");
+    assert_eq!(
+        stdout_all.matches("needle").count(),
+        5,
+        "0 = unlimited, got: {stdout_all}"
+    );
+    assert!(
+        !stderr_all.contains("truncat"),
+        "no cap → no truncation note"
+    );
 }
 
 #[test]
 fn test_cli_grep_max_count_short_flag() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     std::fs::write(project.path().join("many.txt"), "needle\n".repeat(5)).unwrap();
     // grep/ripgrep short `-m` is the `--max-count` alias. Separated `-m 2` and
@@ -930,17 +1435,28 @@ fn test_cli_grep_max_count_short_flag() {
     for argv in forms {
         let (stdout, stderr, code) = run_cli(&project, argv);
         assert_eq!(code, 0, "{argv:?} must succeed; stderr={stderr}");
-        assert_eq!(stdout.matches("needle").count(), 2, "{argv:?}: -m caps at 2, got: {stdout}");
+        assert_eq!(
+            stdout.matches("needle").count(),
+            2,
+            "{argv:?}: -m caps at 2, got: {stdout}"
+        );
     }
     // -m0 lifts the cap (attached zero).
     let (stdout0, _, code0) = run_cli(&project, &["grep", "-m0", "needle", "many.txt"]);
     assert_eq!(code0, 0);
-    assert_eq!(stdout0.matches("needle").count(), 5, "-m0 = unlimited, got: {stdout0}");
+    assert_eq!(
+        stdout0.matches("needle").count(),
+        5,
+        "-m0 = unlimited, got: {stdout0}"
+    );
 }
 
 #[test]
 fn test_cli_grep_unsupported_flag_clear_error() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // Unsupported common grep shorts (-v invert, -c count, -o only-matching) must
     // fail with a clear "unsupported flag" message + exit 2, NOT bind as the
@@ -949,59 +1465,98 @@ fn test_cli_grep_unsupported_flag_clear_error() {
     for bad in ["-v", "-o", "-e"] {
         let (_, stderr, code) = run_cli(&project, &["grep", bad, "validateToken"]);
         assert_eq!(code, 2, "{bad} must exit 2; stderr={stderr}");
-        assert!(stderr.contains("unsupported flag"), "{bad}: clear message expected, got: {stderr}");
-        assert!(!stderr.contains("No such file"), "{bad}: must not leak cryptic rg error, got: {stderr}");
+        assert!(
+            stderr.contains("unsupported flag"),
+            "{bad}: clear message expected, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("No such file"),
+            "{bad}: must not leak cryptic rg error, got: {stderr}"
+        );
     }
     // --json keeps the empty-array contract even on this usage error.
     let (stdout, _, code) = run_cli(&project, &["grep", "-v", "validateToken", "--json"]);
     assert_eq!(code, 2);
-    assert_eq!(stdout.trim(), "[]", "--json unsupported-flag bail must emit []");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "--json unsupported-flag bail must emit []"
+    );
     // The `--` escape still lets a literal "-v" be searched (parity preserved).
     std::fs::write(project.path().join("DASHV.md"), "the -v flag here\n").unwrap();
     let (stdout2, _, code2) = run_cli(&project, &["grep", "--", "-v"]);
     assert_eq!(code2, 0, "literal -v via -- must search; got code {code2}");
-    assert!(stdout2.contains("DASHV.md"), "should find literal -v, got: {stdout2}");
+    assert!(
+        stdout2.contains("DASHV.md"),
+        "should find literal -v, got: {stdout2}"
+    );
 }
 
 #[test]
 fn test_cli_grep_json_truncated_marker() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     std::fs::write(project.path().join("many.txt"), "needle\n".repeat(5)).unwrap();
     // A `--json` consumer can't see the stderr truncation note, so each match in
     // a file that hit the per-file cap carries `"truncated": true`.
-    let (stdout, _, code) =
-        run_cli(&project, &["grep", "needle", "many.txt", "--max-count", "2", "--json"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["grep", "needle", "many.txt", "--max-count", "2", "--json"],
+    );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON array");
     let arr = v.as_array().expect("grep --json is an array");
     assert_eq!(arr.len(), 2, "cap applies in JSON too, got: {stdout}");
-    assert!(arr.iter().all(|e| e["truncated"] == serde_json::json!(true)),
-        "each capped-file entry must be marked truncated, got: {stdout}");
+    assert!(
+        arr.iter()
+            .all(|e| e["truncated"] == serde_json::json!(true)),
+        "each capped-file entry must be marked truncated, got: {stdout}"
+    );
     // Uncapped search carries no truncated marker.
-    let (stdout2, _, code2) =
-        run_cli(&project, &["grep", "needle", "many.txt", "--max-count", "0", "--json"]);
+    let (stdout2, _, code2) = run_cli(
+        &project,
+        &["grep", "needle", "many.txt", "--max-count", "0", "--json"],
+    );
     assert_eq!(code2, 0);
     let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
-    assert!(v2.as_array().unwrap().iter().all(|e| e.get("truncated").is_none()),
-        "no cap → no truncated marker, got: {stdout2}");
+    assert!(
+        v2.as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e.get("truncated").is_none()),
+        "no cap → no truncated marker, got: {stdout2}"
+    );
     // v0.79: the JSON `text` value carries no trailing newline (strip is applied
     // uniformly, truncated or not).
-    assert!(v2[0]["text"].as_str().is_some_and(|t| !t.ends_with('\n')),
-        "json text must not carry a trailing newline, got: {stdout2}");
+    assert!(
+        v2[0]["text"].as_str().is_some_and(|t| !t.ends_with('\n')),
+        "json text must not carry a trailing newline, got: {stdout2}"
+    );
 }
 
 #[test]
 fn test_cli_grep_type_filter() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     std::fs::write(project.path().join("probe.rs"), "fn x() { NEEDLE }\n").unwrap();
     std::fs::write(project.path().join("probe.md"), "doc NEEDLE here\n").unwrap();
     // -t rust restricts to ripgrep's `rust` type (*.rs), excluding the md hit.
     let (stdout, stderr, code) = run_cli(&project, &["grep", "-t", "rust", "NEEDLE"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert!(stdout.contains("probe.rs"), "should hit the rust file, got: {stdout}");
-    assert!(!stdout.contains("probe.md"), "must exclude non-rust, got: {stdout}");
+    assert!(
+        stdout.contains("probe.rs"),
+        "should hit the rust file, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("probe.md"),
+        "must exclude non-rust, got: {stdout}"
+    );
     // An unknown type is an rg error (exit 2), surfaced not swallowed.
     let (_, _, code_bad) = run_cli(&project, &["grep", "-t", "nosuchtype", "NEEDLE"]);
     assert_eq!(code_bad, 2, "unknown --type must error");
@@ -1009,31 +1564,45 @@ fn test_cli_grep_type_filter() {
 
 #[test]
 fn test_cli_grep_glob_filter() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     std::fs::write(project.path().join("probe.rs"), "fn x() { NEEDLE }\n").unwrap();
     std::fs::write(project.path().join("probe.md"), "doc NEEDLE here\n").unwrap();
     // include-glob: only *.md
     let (inc, _, code) = run_cli(&project, &["grep", "-g", "*.md", "NEEDLE"]);
     assert_eq!(code, 0);
-    assert!(inc.contains("probe.md") && !inc.contains("probe.rs"), "include glob, got: {inc}");
+    assert!(
+        inc.contains("probe.md") && !inc.contains("probe.rs"),
+        "include glob, got: {inc}"
+    );
     // exclude-glob: drop *.md
     let (exc, _, code2) = run_cli(&project, &["grep", "-g", "!*.md", "NEEDLE"]);
     assert_eq!(code2, 0);
-    assert!(exc.contains("probe.rs") && !exc.contains("probe.md"), "exclude glob, got: {exc}");
+    assert!(
+        exc.contains("probe.rs") && !exc.contains("probe.md"),
+        "exclude glob, got: {exc}"
+    );
 }
 
 #[test]
 fn test_cli_grep_count_mode() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     std::fs::write(project.path().join("many.txt"), "needle\n".repeat(150)).unwrap();
     // -c prints file:count and is exhaustive — it ignores the default per-file
     // cap of 100 (150 > 100), unlike content mode.
     let (stdout, _, code) = run_cli(&project, &["grep", "-c", "needle", "many.txt"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("many.txt") && stdout.trim().ends_with(":150"),
-        "exhaustive count expected, got: {stdout}");
+    assert!(
+        stdout.contains("many.txt") && stdout.trim().ends_with(":150"),
+        "exhaustive count expected, got: {stdout}"
+    );
     // --json count shape: [{file, count}]
     let (j, _, cj) = run_cli(&project, &["grep", "-c", "needle", "many.txt", "--json"]);
     assert_eq!(cj, 0);
@@ -1042,7 +1611,10 @@ fn test_cli_grep_count_mode() {
     assert_eq!(v[0]["count"], 150);
     // no match on a NAMED file → exit 1 + zero row (GNU `grep -c` prints a
     // count for every named file, including 0 — pre-fix this was `[]`/silence)
-    let (je, _, ce) = run_cli(&project, &["grep", "-c", "zzz_nothing", "many.txt", "--json"]);
+    let (je, _, ce) = run_cli(
+        &project,
+        &["grep", "-c", "zzz_nothing", "many.txt", "--json"],
+    );
     assert_eq!(ce, 1);
     let ve: serde_json::Value = serde_json::from_str(je.trim()).unwrap();
     assert_eq!(ve[0]["file"], "many.txt");
@@ -1051,83 +1623,141 @@ fn test_cli_grep_count_mode() {
 
 #[test]
 fn test_cli_grep_count_zero_named_file() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // GNU parity: `grep -c pat file` with zero matches prints `file:0` on
     // STDOUT and exits 1 — not stderr-only silence. Field failure shape:
     // `grep "pat" file.py -c 2>/dev/null` showed literally nothing.
-    let (stdout, stderr, code) = run_cli(&project, &["grep", "xyznonexistent", "src/auth.ts", "-c"]);
+    let (stdout, stderr, code) =
+        run_cli(&project, &["grep", "xyznonexistent", "src/auth.ts", "-c"]);
     assert_eq!(code, 1, "all-zero counts still exit 1 (grep parity)");
-    assert!(stdout.contains("src/auth.ts:0"),
-        "named file must get a zero row on stdout, got stdout: {stdout:?}");
-    assert!(stderr.contains("No matches"), "stderr note stays, got: {stderr:?}");
+    assert!(
+        stdout.contains("src/auth.ts:0"),
+        "named file must get a zero row on stdout, got stdout: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("No matches"),
+        "stderr note stays, got: {stderr:?}"
+    );
 }
 
 #[test]
 fn test_cli_grep_count_zero_fills_nonmatching_named_files() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // hashPassword exists only in auth.ts: the matching file keeps its count,
     // the non-matching NAMED file gets a 0 row, and the run exits 0 (matches
     // exist). GNU prints zeros for every named file; rg lists matching only.
-    let (stdout, _, code) =
-        run_cli(&project, &["grep", "hashPassword", "src/auth.ts", "src/api.ts", "-c"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["grep", "hashPassword", "src/auth.ts", "src/api.ts", "-c"],
+    );
     assert_eq!(code, 0, "matches exist → exit 0");
-    assert!(stdout.contains("src/auth.ts:") && !stdout.contains("src/auth.ts:0"),
-        "matching file keeps its real count, got: {stdout:?}");
-    assert!(stdout.contains("src/api.ts:0"),
-        "non-matching named file must get a zero row, got: {stdout:?}");
+    assert!(
+        stdout.contains("src/auth.ts:") && !stdout.contains("src/auth.ts:0"),
+        "matching file keeps its real count, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("src/api.ts:0"),
+        "non-matching named file must get a zero row, got: {stdout:?}"
+    );
 }
 
 #[test]
 fn test_cli_grep_count_zero_dir_arg_no_zero_rows() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // Deliberate GNU deviation: dir / repo-wide args do NOT enumerate zero rows
     // (GNU -rc prints `path:0` for every scanned file — repo-scale noise).
     let (stdout, stderr, code) = run_cli(&project, &["grep", "xyznonexistent", "src", "-c"]);
     assert_eq!(code, 1);
-    assert_eq!(stdout.trim(), "", "dir args stay silent on stdout, got: {stdout:?}");
+    assert_eq!(
+        stdout.trim(),
+        "",
+        "dir args stay silent on stdout, got: {stdout:?}"
+    );
     assert!(stderr.contains("No matches"), "got: {stderr:?}");
 }
 
 #[test]
 fn test_cli_grep_bre_escape_hint_on_zero_hits() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // `\|` is alternation in GNU BRE but a LITERAL pipe in ripgrep's Rust regex
     // dialect — the habit pattern zero-hits silently and an LLM consumer
     // concludes "no such code". The no-match path must disclose the dialect.
     let (_, stderr, code) = run_cli(&project, &["grep", r"validateToken\|hashPassword"]);
-    assert_eq!(code, 1, "literal 'validateToken|hashPassword' matches nothing");
-    assert!(stderr.contains("BRE") && stderr.contains(r"\|"),
-        "zero-hit + BRE-style escape must emit the dialect hint, got: {stderr:?}");
+    assert_eq!(
+        code, 1,
+        "literal 'validateToken|hashPassword' matches nothing"
+    );
+    assert!(
+        stderr.contains("BRE") && stderr.contains(r"\|"),
+        "zero-hit + BRE-style escape must emit the dialect hint, got: {stderr:?}"
+    );
     // -c mode shares the hint path
-    let (_, stderr_c, _) =
-        run_cli(&project, &["grep", r"validateToken\|hashPassword", "src/auth.ts", "-c"]);
-    assert!(stderr_c.contains("BRE"), "hint must fire in -c mode too, got: {stderr_c:?}");
+    let (_, stderr_c, _) = run_cli(
+        &project,
+        &["grep", r"validateToken\|hashPassword", "src/auth.ts", "-c"],
+    );
+    assert!(
+        stderr_c.contains("BRE"),
+        "hint must fire in -c mode too, got: {stderr_c:?}"
+    );
     // no escapes → no hint
     let (_, stderr_plain, _) = run_cli(&project, &["grep", "xyznonexistent"]);
-    assert!(!stderr_plain.contains("BRE"), "plain zero-hit must not hint, got: {stderr_plain:?}");
+    assert!(
+        !stderr_plain.contains("BRE"),
+        "plain zero-hit must not hint, got: {stderr_plain:?}"
+    );
     // -F: backslashes are genuinely literal — never hint
     let (_, stderr_f, code_f) = run_cli(&project, &["grep", "-F", r"validateToken\|hashPassword"]);
     assert_eq!(code_f, 1);
-    assert!(!stderr_f.contains("BRE"), "-F must suppress the hint, got: {stderr_f:?}");
+    assert!(
+        !stderr_f.contains("BRE"),
+        "-F must suppress the hint, got: {stderr_f:?}"
+    );
 }
 
 #[test]
 fn test_cli_grep_max_columns() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let long = format!("NEEDLE_{}", "x".repeat(1000)); // 1007 chars
     std::fs::write(project.path().join("long.txt"), format!("{long}\n")).unwrap();
     // Default -M 512: the 1007-char line is truncated with a marker.
     let (stdout, _, code) = run_cli(&project, &["grep", "NEEDLE", "long.txt"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("NEEDLE"), "match still shown, got len {}", stdout.len());
-    assert!(stdout.contains("[+") && stdout.contains("chars]"), "truncation marker, got len {}", stdout.len());
+    assert!(
+        stdout.contains("NEEDLE"),
+        "match still shown, got len {}",
+        stdout.len()
+    );
+    assert!(
+        stdout.contains("[+") && stdout.contains("chars]"),
+        "truncation marker, got len {}",
+        stdout.len()
+    );
     let maxlen = stdout.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-    assert!(maxlen < 1007, "emitted line must be capped, got max {maxlen}");
+    assert!(
+        maxlen < 1007,
+        "emitted line must be capped, got max {maxlen}"
+    );
     // -M 0 disables the cap — full line present.
     let (full, _, codef) = run_cli(&project, &["grep", "-M", "0", "NEEDLE", "long.txt"]);
     assert_eq!(codef, 0);
@@ -1136,19 +1766,30 @@ fn test_cli_grep_max_columns() {
     let (jc, _, cj) = run_cli(&project, &["grep", "NEEDLE", "long.txt", "--json"]);
     assert_eq!(cj, 0);
     let v: serde_json::Value = serde_json::from_str(jc.trim()).unwrap();
-    assert!(v[0]["line_truncated"].as_u64().unwrap_or(0) > 0, "line_truncated expected, got: {jc}");
+    assert!(
+        v[0]["line_truncated"].as_u64().unwrap_or(0) > 0,
+        "line_truncated expected, got: {jc}"
+    );
 }
 
 #[test]
 fn test_cli_grep_files_with_matches() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // -l: file names only, no line numbers, no AST arrows (grep parity).
     let (stdout, _, code) = run_cli(&project, &["grep", "-l", "validateToken"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("src/auth.ts") && stdout.contains("src/api.ts"),
-        "both matching files listed, got: {stdout}");
-    assert!(!stdout.contains(':'), "-l output must be bare file paths, got: {stdout}");
+    assert!(
+        stdout.contains("src/auth.ts") && stdout.contains("src/api.ts"),
+        "both matching files listed, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(':'),
+        "-l output must be bare file paths, got: {stdout}"
+    );
     assert!(!stdout.contains('→'), "-l output must have no AST arrows");
     // no match → exit 1, like grep.
     let (_, _, code2) = run_cli(&project, &["grep", "-l", "zzz_nothing"]);
@@ -1160,13 +1801,22 @@ fn test_cli_grep_deterministic_sorted_order() {
     // Regression: ripgrep parallelizes the file walk and emitted results in
     // worker-completion order, so multi-file grep shuffled every run (observed up
     // to 8/8 distinct). `--sort path` must force a stable ascending-path order.
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // Files whose creation order deliberately differs from sorted order, all
     // sharing one unique token so only these files match.
     let names = [
-        "zebra.txt", "mango.txt", "apple.txt", "kiwi.txt",
-        "cherry.txt", "lime.txt", "banana.txt", "orange.txt",
+        "zebra.txt",
+        "mango.txt",
+        "apple.txt",
+        "kiwi.txt",
+        "cherry.txt",
+        "lime.txt",
+        "banana.txt",
+        "orange.txt",
     ];
     for n in names {
         std::fs::write(project.path().join(n), "GREPSORTMARKER\n").unwrap();
@@ -1176,13 +1826,23 @@ fn test_cli_grep_deterministic_sorted_order() {
     let got: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     let mut want = got.clone();
     want.sort_unstable();
-    assert_eq!(got, want, "grep -l output must be ascending-path sorted; got: {got:?}");
+    assert_eq!(
+        got, want,
+        "grep -l output must be ascending-path sorted; got: {got:?}"
+    );
     // Multi-path input passed in NON-sorted arg order must still come back globally
     // sorted. (rg's `--sort path` only orders within each root and preserves arg-group
     // order, so this case guards that we post-sort the merged result set instead.)
     let (mp_out, _, mp_code) = run_cli(
         &project,
-        &["grep", "-l", "GREPSORTMARKER", "zebra.txt", "apple.txt", "mango.txt"],
+        &[
+            "grep",
+            "-l",
+            "GREPSORTMARKER",
+            "zebra.txt",
+            "apple.txt",
+            "mango.txt",
+        ],
     );
     assert_eq!(mp_code, 0);
     let mp: Vec<&str> = mp_out.lines().filter(|l| !l.is_empty()).collect();
@@ -1197,12 +1857,20 @@ fn test_cli_grep_deterministic_sorted_order() {
         let (s, _, _) = run_cli(&project, &["grep", "-l", "GREPSORTMARKER"]);
         seen.insert(s);
     }
-    assert_eq!(seen.len(), 1, "grep -l must be byte-identical across runs; got {} distinct", seen.len());
+    assert_eq!(
+        seen.len(),
+        1,
+        "grep -l must be byte-identical across runs; got {} distinct",
+        seen.len()
+    );
 }
 
 #[test]
 fn test_cli_grep_dedup_overlapping_paths() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // A file passed twice — or overlapping dir args like `grep pat . src` — makes
     // rg scan it once per path instance and emit every match twice; the global
@@ -1215,37 +1883,58 @@ fn test_cli_grep_dedup_overlapping_paths() {
     // (same sorted+deduped set, same AST arrows).
     let (single, _, c1) = run_cli(&project, &["grep", "validateToken", "src/auth.ts"]);
     assert_eq!(c1, 0);
-    let (double, _, c2) =
-        run_cli(&project, &["grep", "validateToken", "src/auth.ts", "src/auth.ts"]);
+    let (double, _, c2) = run_cli(
+        &project,
+        &["grep", "validateToken", "src/auth.ts", "src/auth.ts"],
+    );
     assert_eq!(c2, 0);
-    assert_eq!(double, single,
-        "duplicate path arg must not double content-mode output; got:\n{double}");
+    assert_eq!(
+        double, single,
+        "duplicate path arg must not double content-mode output; got:\n{double}"
+    );
     assert!(double.contains("validateToken"));
 
     // -l mode: overlapping dir args must list each matching file exactly once.
     let (l_out, _, cl) = run_cli(&project, &["grep", "-l", "validateToken", "src", "src"]);
     assert_eq!(cl, 0);
-    assert_eq!(l_out.matches("src/auth.ts").count(), 1,
-        "-l must list a file once under overlapping paths, got: {l_out}");
+    assert_eq!(
+        l_out.matches("src/auth.ts").count(),
+        1,
+        "-l must list a file once under overlapping paths, got: {l_out}"
+    );
 
     // -c mode: a duplicate path must not emit two `path:N` rows for one file.
-    let (c_out, _, cc) =
-        run_cli(&project, &["grep", "-c", "validateToken", "src/api.ts", "src/api.ts"]);
+    let (c_out, _, cc) = run_cli(
+        &project,
+        &["grep", "-c", "validateToken", "src/api.ts", "src/api.ts"],
+    );
     assert_eq!(cc, 0);
-    assert_eq!(c_out.matches("src/api.ts:").count(), 1,
-        "-c must emit one row per file under duplicate paths, got: {c_out}");
+    assert_eq!(
+        c_out.matches("src/api.ts:").count(),
+        1,
+        "-c must emit one row per file under duplicate paths, got: {c_out}"
+    );
 }
 
 #[test]
 fn test_cli_grep_files_with_matches_json() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["grep", "-l", "validateToken", "--json"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let arr = v.as_array().expect("-l --json must be a JSON array");
-    assert!(arr.iter().all(|e| e.is_string()), "-l --json entries are path strings");
-    assert!(arr.iter().any(|e| e.as_str() == Some("src/auth.ts")), "got: {stdout}");
+    assert!(
+        arr.iter().all(|e| e.is_string()),
+        "-l --json entries are path strings"
+    );
+    assert!(
+        arr.iter().any(|e| e.as_str() == Some("src/auth.ts")),
+        "got: {stdout}"
+    );
     // empty contract preserved
     let (stdout2, _, code2) = run_cli(&project, &["grep", "-l", "zzz_nothing", "--json"]);
     assert_eq!(code2, 1);
@@ -1254,45 +1943,82 @@ fn test_cli_grep_files_with_matches_json() {
 
 #[test]
 fn test_cli_grep_context_lines() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
-    std::fs::write(project.path().join("ctx.txt"),
-        "line1\nline2\nNEEDLE_A\nline4\nline5\nline6\nline7\nNEEDLE_B\nline9\n").unwrap();
+    std::fs::write(
+        project.path().join("ctx.txt"),
+        "line1\nline2\nNEEDLE_A\nline4\nline5\nline6\nline7\nNEEDLE_B\nline9\n",
+    )
+    .unwrap();
     let (stdout, _, code) = run_cli(&project, &["grep", "-C", "1", "NEEDLE_", "ctx.txt"]);
     assert_eq!(code, 0);
     // grep-style: matches use `:`, context lines use `-`, gaps separated by `--`.
-    assert!(stdout.contains("ctx.txt:3  NEEDLE_A"), "match line with colon, got: {stdout}");
-    assert!(stdout.contains("ctx.txt-2  line2"), "before-context with dash, got: {stdout}");
-    assert!(stdout.contains("ctx.txt-4  line4"), "after-context with dash, got: {stdout}");
-    assert!(stdout.contains("\n--\n"), "non-contiguous groups separated by --, got: {stdout}");
-    assert!(!stdout.contains("line6"), "-C 1 must not pull distant lines, got: {stdout}");
+    assert!(
+        stdout.contains("ctx.txt:3  NEEDLE_A"),
+        "match line with colon, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("ctx.txt-2  line2"),
+        "before-context with dash, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("ctx.txt-4  line4"),
+        "after-context with dash, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("\n--\n"),
+        "non-contiguous groups separated by --, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("line6"),
+        "-C 1 must not pull distant lines, got: {stdout}"
+    );
 }
 
 #[test]
 fn test_cli_grep_after_before_context() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     std::fs::write(project.path().join("ab.txt"), "before\nNEEDLE\nafter\n").unwrap();
     let (stdout, _, code) = run_cli(&project, &["grep", "-A", "1", "NEEDLE", "ab.txt"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("ab.txt-3  after") && !stdout.contains("before"),
-        "-A 1 shows only the after line, got: {stdout}");
+    assert!(
+        stdout.contains("ab.txt-3  after") && !stdout.contains("before"),
+        "-A 1 shows only the after line, got: {stdout}"
+    );
     let (stdout2, _, code2) = run_cli(&project, &["grep", "-B", "1", "NEEDLE", "ab.txt"]);
     assert_eq!(code2, 0);
-    assert!(stdout2.contains("ab.txt-1  before") && !stdout2.contains("after"),
-        "-B 1 shows only the before line, got: {stdout2}");
+    assert!(
+        stdout2.contains("ab.txt-1  before") && !stdout2.contains("after"),
+        "-B 1 shows only the before line, got: {stdout2}"
+    );
 }
 
 #[test]
 fn test_cli_grep_context_ast_arrow_only_on_matches() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // validateToken sits inside a fn in the indexed fixture; context lines
     // around it must not each get their own AST arrow (annotation spam).
-    let (stdout, _, code) = run_cli(&project, &["grep", "-C", "1", "decoded !== null", "src/auth.ts"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["grep", "-C", "1", "decoded !== null", "src/auth.ts"],
+    );
     assert_eq!(code, 0);
     let arrows = stdout.matches('→').count();
-    assert_eq!(arrows, 1, "exactly one arrow (the match line), got: {stdout}");
+    assert_eq!(
+        arrows, 1,
+        "exactly one arrow (the match line), got: {stdout}"
+    );
 }
 
 /// Extract the start line from the first AST annotation `(lines N-M)`.
@@ -1305,7 +2031,10 @@ fn first_annotation_start(stdout: &str) -> Option<u64> {
 
 #[test]
 fn test_cli_grep_annotation_resyncs_after_edit() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let (out1, _, code1) = run_cli(&project, &["grep", "decoded !== null", "src/auth.ts"]);
     assert_eq!(code1, 0);
@@ -1315,19 +2044,32 @@ fn test_cli_grep_annotation_resyncs_after_edit() {
     // annotation would keep the pre-edit boundaries (the stale-arrow bug).
     let p = project.path().join("src/auth.ts");
     let content = std::fs::read_to_string(&p).unwrap();
-    std::fs::write(&p, format!("// pad\n// pad\n// pad\n// pad\n// pad\n{content}")).unwrap();
+    std::fs::write(
+        &p,
+        format!("// pad\n// pad\n// pad\n// pad\n// pad\n{content}"),
+    )
+    .unwrap();
 
     let (out2, _, code2) = run_cli(&project, &["grep", "decoded !== null", "src/auth.ts"]);
     assert_eq!(code2, 0);
     let start2 = first_annotation_start(&out2).expect("post-edit annotation present");
-    assert_eq!(start2, start1 + 5,
-        "annotation must use post-edit fn boundaries (lazy resync), got: {out2}");
-    assert!(!out2.contains("[stale]"), "synced annotation must not carry a stale marker");
+    assert_eq!(
+        start2,
+        start1 + 5,
+        "annotation must use post-edit fn boundaries (lazy resync), got: {out2}"
+    );
+    assert!(
+        !out2.contains("[stale]"),
+        "synced annotation must not carry a stale marker"
+    );
 }
 
 #[test]
 fn test_cli_grep_stale_marker_when_sync_budget_exhausted() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     // Dirty the file, then forbid syncing (budget 0): the annotation must
     // still appear but carry an honest [stale] marker + a stderr hint.
@@ -1335,22 +2077,34 @@ fn test_cli_grep_stale_marker_when_sync_budget_exhausted() {
     let content = std::fs::read_to_string(&p).unwrap();
     std::fs::write(&p, format!("// pad\n{content}")).unwrap();
 
-    let (stdout, stderr, code) = run_cli_env(&project,
+    let (stdout, stderr, code) = run_cli_env(
+        &project,
         &["grep", "decoded !== null", "src/auth.ts"],
-        &[("CODE_GRAPH_GREP_SYNC_BUDGET", "0")]);
+        &[("CODE_GRAPH_GREP_SYNC_BUDGET", "0")],
+    );
     assert_eq!(code, 0);
-    assert!(stdout.contains("[stale]"), "dirty + no budget → stale marker, got: {stdout}");
-    assert!(stderr.contains("incremental-index"),
-        "stderr must point at the fix, got: {stderr:?}");
+    assert!(
+        stdout.contains("[stale]"),
+        "dirty + no budget → stale marker, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("incremental-index"),
+        "stderr must point at the fix, got: {stderr:?}"
+    );
 
     // JSON shape: container carries "stale": true.
-    let (json_out, _, _) = run_cli_env(&project,
+    let (json_out, _, _) = run_cli_env(
+        &project,
         &["grep", "decoded !== null", "src/auth.ts", "--json"],
-        &[("CODE_GRAPH_GREP_SYNC_BUDGET", "0")]);
+        &[("CODE_GRAPH_GREP_SYNC_BUDGET", "0")],
+    );
     let v: serde_json::Value = serde_json::from_str(json_out.trim()).unwrap();
     let entry = &v.as_array().unwrap()[0];
-    assert_eq!(entry["container"]["stale"], serde_json::json!(true),
-        "JSON container must flag staleness, got: {json_out}");
+    assert_eq!(
+        entry["container"]["stale"],
+        serde_json::json!(true),
+        "JSON container must flag staleness, got: {json_out}"
+    );
 }
 
 /// `show` reads start_line/end_line straight from the index. Without query-time
@@ -1374,7 +2128,11 @@ fn test_cli_show_resyncs_after_edit() {
     // Shift every symbol down by 5 lines.
     let p = project.path().join("src/auth.ts");
     let content = std::fs::read_to_string(&p).unwrap();
-    std::fs::write(&p, format!("// pad\n// pad\n// pad\n// pad\n// pad\n{content}")).unwrap();
+    std::fs::write(
+        &p,
+        format!("// pad\n// pad\n// pad\n// pad\n// pad\n{content}"),
+    )
+    .unwrap();
 
     let (out2, _, code2) = run_cli(&project, &["show", "hashPassword", "--json"]);
     assert_eq!(code2, 0);
@@ -1396,10 +2154,13 @@ fn test_cli_show_resyncs_after_edit() {
 fn json_start_line(out: &str, name: &str) -> i64 {
     let v: serde_json::Value = serde_json::from_str(out.trim())
         .unwrap_or_else(|e| panic!("invalid json: {e}; raw: {out}"));
-    v.as_array().unwrap().iter()
+    v.as_array()
+        .unwrap()
+        .iter()
         .find(|e| e["name"] == name)
-        .unwrap_or_else(|| panic!("{name} not found in: {out}"))
-        ["start_line"].as_i64().unwrap()
+        .unwrap_or_else(|| panic!("{name} not found in: {out}"))["start_line"]
+        .as_i64()
+        .unwrap()
 }
 
 fn prepend_pad(project: &TempDir, rel: &str, lines: usize) {
@@ -1415,10 +2176,14 @@ fn test_cli_refs_resyncs_after_edit() {
     // handleLogin (src/api.ts) calls validateToken, so it is an incoming ref.
     let ref_start = |out: &str| -> i64 {
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-        v["references"].as_array().unwrap().iter()
+        v["references"]
+            .as_array()
+            .unwrap()
+            .iter()
             .find(|r| r["name"] == "handleLogin")
-            .unwrap_or_else(|| panic!("handleLogin ref missing: {out}"))
-            ["start_line"].as_i64().unwrap()
+            .unwrap_or_else(|| panic!("handleLogin ref missing: {out}"))["start_line"]
+            .as_i64()
+            .unwrap()
     };
     let (out1, _, code1) = run_cli(&project, &["refs", "validateToken", "--json"]);
     assert_eq!(code1, 0, "{out1}");
@@ -1427,16 +2192,25 @@ fn test_cli_refs_resyncs_after_edit() {
     prepend_pad(&project, "src/api.ts", 5);
 
     // RED control: budget 0 → no resync → pre-edit line number.
-    let (red, _, _) = run_cli_env(&project, &["refs", "validateToken", "--json"],
-        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
-    assert_eq!(ref_start(&red), s1,
-        "budget 0 must stay stale (proves the resync is load-bearing): {red}");
+    let (red, _, _) = run_cli_env(
+        &project,
+        &["refs", "validateToken", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")],
+    );
+    assert_eq!(
+        ref_start(&red),
+        s1,
+        "budget 0 must stay stale (proves the resync is load-bearing): {red}"
+    );
 
     // GREEN: default budget → post-edit line number.
     let (out2, _, code2) = run_cli(&project, &["refs", "validateToken", "--json"]);
     assert_eq!(code2, 0);
-    assert_eq!(ref_start(&out2), s1 + 5,
-        "refs must report post-edit line numbers (lazy resync): {out2}");
+    assert_eq!(
+        ref_start(&out2),
+        s1 + 5,
+        "refs must report post-edit line numbers (lazy resync): {out2}"
+    );
 }
 
 #[test]
@@ -1448,15 +2222,24 @@ fn test_cli_overview_resyncs_after_edit() {
 
     prepend_pad(&project, "src/auth.ts", 5);
 
-    let (red, _, _) = run_cli_env(&project, &["overview", "src", "--json"],
-        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
-    assert_eq!(json_start_line(&red, "hashPassword"), s1,
-        "budget 0 must stay stale: {red}");
+    let (red, _, _) = run_cli_env(
+        &project,
+        &["overview", "src", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")],
+    );
+    assert_eq!(
+        json_start_line(&red, "hashPassword"),
+        s1,
+        "budget 0 must stay stale: {red}"
+    );
 
     let (out2, _, code2) = run_cli(&project, &["overview", "src", "--json"]);
     assert_eq!(code2, 0);
-    assert_eq!(json_start_line(&out2, "hashPassword"), s1 + 5,
-        "overview must report post-edit line numbers: {out2}");
+    assert_eq!(
+        json_start_line(&out2, "hashPassword"),
+        s1 + 5,
+        "overview must report post-edit line numbers: {out2}"
+    );
 }
 
 #[test]
@@ -1468,15 +2251,24 @@ fn test_cli_search_resyncs_after_edit() {
 
     prepend_pad(&project, "src/auth.ts", 5);
 
-    let (red, _, _) = run_cli_env(&project, &["search", "hashPassword", "--json"],
-        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
-    assert_eq!(json_start_line(&red, "hashPassword"), s1,
-        "budget 0 must stay stale: {red}");
+    let (red, _, _) = run_cli_env(
+        &project,
+        &["search", "hashPassword", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")],
+    );
+    assert_eq!(
+        json_start_line(&red, "hashPassword"),
+        s1,
+        "budget 0 must stay stale: {red}"
+    );
 
     let (out2, _, code2) = run_cli(&project, &["search", "hashPassword", "--json"]);
     assert_eq!(code2, 0);
-    assert_eq!(json_start_line(&out2, "hashPassword"), s1 + 5,
-        "search must report post-edit line numbers: {out2}");
+    assert_eq!(
+        json_start_line(&out2, "hashPassword"),
+        s1 + 5,
+        "search must report post-edit line numbers: {out2}"
+    );
 }
 
 #[test]
@@ -1489,15 +2281,24 @@ fn test_cli_dead_code_resyncs_after_edit() {
 
     prepend_pad(&project, "src/auth.ts", 5);
 
-    let (red, _, _) = run_cli_env(&project, &["dead-code", "--min-lines", "1", "--json"],
-        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
-    assert_eq!(json_start_line(&red, "hashPassword"), s1,
-        "budget 0 must stay stale: {red}");
+    let (red, _, _) = run_cli_env(
+        &project,
+        &["dead-code", "--min-lines", "1", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")],
+    );
+    assert_eq!(
+        json_start_line(&red, "hashPassword"),
+        s1,
+        "budget 0 must stay stale: {red}"
+    );
 
     let (out2, _, code2) = run_cli(&project, &["dead-code", "--min-lines", "1", "--json"]);
     assert_eq!(code2, 0);
-    assert_eq!(json_start_line(&out2, "hashPassword"), s1 + 5,
-        "dead-code must report post-edit line numbers: {out2}");
+    assert_eq!(
+        json_start_line(&out2, "hashPassword"),
+        s1 + 5,
+        "dead-code must report post-edit line numbers: {out2}"
+    );
 }
 
 /// impact prints no line numbers, so freshness is observable as the caller SET:
@@ -1511,7 +2312,11 @@ fn test_cli_impact_resyncs_after_edit() {
     };
     let (out1, _, code1) = run_cli(&project, &["impact", "validateToken", "--json"]);
     assert_eq!(code1, 0, "{out1}");
-    assert_eq!(total(&out1), 1, "baseline: only handleLogin calls validateToken: {out1}");
+    assert_eq!(
+        total(&out1),
+        1,
+        "baseline: only handleLogin calls validateToken: {out1}"
+    );
 
     // Append a second caller to src/api.ts (already a caller file → in the refresh set).
     let p = project.path().join("src/api.ts");
@@ -1520,14 +2325,24 @@ fn test_cli_impact_resyncs_after_edit() {
         "{content}\nexport function handleRefresh(req: Request) {{\n    return validateToken(req.headers.authorization);\n}}\n"
     )).unwrap();
 
-    let (red, _, _) = run_cli_env(&project, &["impact", "validateToken", "--json"],
-        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
-    assert_eq!(total(&red), 1, "budget 0 must stay stale (one caller): {red}");
+    let (red, _, _) = run_cli_env(
+        &project,
+        &["impact", "validateToken", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")],
+    );
+    assert_eq!(
+        total(&red),
+        1,
+        "budget 0 must stay stale (one caller): {red}"
+    );
 
     let (out2, _, code2) = run_cli(&project, &["impact", "validateToken", "--json"]);
     assert_eq!(code2, 0);
-    assert_eq!(total(&out2), 2,
-        "impact must reflect the added caller after resync: {out2}");
+    assert_eq!(
+        total(&out2),
+        2,
+        "impact must reflect the added caller after resync: {out2}"
+    );
 }
 
 /// Partial refresh (budget exhausted) must disclose on stderr only, never in the
@@ -1536,22 +2351,33 @@ fn test_cli_impact_resyncs_after_edit() {
 fn test_cli_resync_partial_discloses_on_stderr() {
     let project = setup_indexed_project();
     let (_, stderr_fresh, _) = run_cli(&project, &["overview", "src", "--json"]);
-    assert!(!stderr_fresh.contains("changed since indexing"),
-        "no disclosure when everything is fresh: {stderr_fresh:?}");
+    assert!(
+        !stderr_fresh.contains("changed since indexing"),
+        "no disclosure when everything is fresh: {stderr_fresh:?}"
+    );
 
     prepend_pad(&project, "src/auth.ts", 1);
 
-    let (stdout, stderr, code) = run_cli_env(&project, &["overview", "src", "--json"],
-        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    let (stdout, stderr, code) = run_cli_env(
+        &project,
+        &["overview", "src", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")],
+    );
     assert_eq!(code, 0);
-    assert!(stderr.contains("changed since indexing"),
-        "partial refresh must disclose on stderr: {stderr:?}");
-    assert!(stderr.contains("incremental-index"),
-        "disclosure must point at the fix: {stderr:?}");
+    assert!(
+        stderr.contains("changed since indexing"),
+        "partial refresh must disclose on stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("incremental-index"),
+        "disclosure must point at the fix: {stderr:?}"
+    );
     serde_json::from_str::<serde_json::Value>(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout must stay clean JSON: {e}; raw: {stdout}"));
-    assert!(!stdout.contains("changed since indexing"),
-        "note must not pollute stdout: {stdout}");
+    assert!(
+        !stdout.contains("changed since indexing"),
+        "note must not pollute stdout: {stdout}"
+    );
 }
 
 fn has_git() -> bool {
@@ -1560,8 +2386,14 @@ fn has_git() -> bool {
 
 #[test]
 fn test_cli_grep_tracked_but_gitignored() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
-    if !has_git() { eprintln!("skipping: git not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
+    if !has_git() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let root = project.path();
     std::fs::create_dir_all(root.join("docs")).unwrap();
@@ -1569,16 +2401,35 @@ fn test_cli_grep_tracked_but_gitignored() {
     std::fs::write(root.join("docs/scratch.md"), "scratch_needle lives here\n").unwrap();
     std::fs::write(root.join(".gitignore"), "docs/\n.code-graph/\n").unwrap();
     let git = |args: &[&str]| {
-        let out = Command::new("git").args(args).current_dir(root).output().unwrap();
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init", "-q"]);
-    git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "-f", "docs/notes.md"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "add",
+        "-f",
+        "docs/notes.md",
+    ]);
 
     // git-grep parity: a tracked file stays searchable even when its directory
     // is gitignored (rg alone skips it — the audited blind spot).
     let (stdout, stderr, code) = run_cli(&project, &["grep", "tracked_needle"]);
-    assert_eq!(code, 0, "tracked-but-gitignored file must be found; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "tracked-but-gitignored file must be found; stderr={stderr}"
+    );
     assert!(stdout.contains("docs/notes.md"), "got: {stdout}");
 
     // Untracked + ignored stays invisible (matches git grep semantics).
@@ -1588,8 +2439,14 @@ fn test_cli_grep_tracked_but_gitignored() {
 
 #[test]
 fn test_cli_grep_supplement_respects_filters() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
-    if !has_git() { eprintln!("skipping: git not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
+    if !has_git() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let root = project.path();
     std::fs::create_dir_all(root.join("docs")).unwrap();
@@ -1602,38 +2459,70 @@ fn test_cli_grep_supplement_respects_filters() {
     std::fs::write(root.join("probe.rs"), "fn p() { /* LEAKPAT */ }\n").unwrap();
     std::fs::write(root.join(".gitignore"), "docs/\n.code-graph/\n").unwrap();
     let git = |args: &[&str]| {
-        let out = Command::new("git").args(args).current_dir(root).output().unwrap();
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init", "-q"]);
-    git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "-f", "docs/leak.md"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "add",
+        "-f",
+        "docs/leak.md",
+    ]);
 
     // Baseline: no filter → supplement brings in the gitignored-but-tracked md.
     let (base, _, bc) = run_cli(&project, &["grep", "LEAKPAT"]);
     assert_eq!(bc, 0);
-    assert!(base.contains("docs/leak.md") && base.contains("probe.rs"),
-        "no filter must find both walk + supplement, got: {base}");
+    assert!(
+        base.contains("docs/leak.md") && base.contains("probe.rs"),
+        "no filter must find both walk + supplement, got: {base}"
+    );
 
     // -t rust must NOT leak the markdown supplement; the rust walk file stays.
     let (t, _, tc) = run_cli(&project, &["grep", "-t", "rust", "LEAKPAT"]);
     assert_eq!(tc, 0, "rust file still matches");
     assert!(t.contains("probe.rs"), "rust walk file kept, got: {t}");
-    assert!(!t.contains("leak.md"), "-t rust must filter the md supplement, got: {t}");
+    assert!(
+        !t.contains("leak.md"),
+        "-t rust must filter the md supplement, got: {t}"
+    );
 
     // -g '!*.md' must exclude the markdown supplement too.
     let (g, _, _gc) = run_cli(&project, &["grep", "-g", "!*.md", "LEAKPAT"]);
-    assert!(g.contains("probe.rs") && !g.contains("leak.md"),
-        "-g '!*.md' must exclude the md supplement, got: {g}");
+    assert!(
+        g.contains("probe.rs") && !g.contains("leak.md"),
+        "-g '!*.md' must exclude the md supplement, got: {g}"
+    );
 
     // -c -t rust must not count the markdown supplement file.
     let (c, _, _cc) = run_cli(&project, &["grep", "-c", "-t", "rust", "LEAKPAT"]);
-    assert!(!c.contains("leak.md"), "-c -t rust must not count the md supplement, got: {c}");
+    assert!(
+        !c.contains("leak.md"),
+        "-c -t rust must not count the md supplement, got: {c}"
+    );
 }
 
 #[test]
 fn test_cli_grep_gitignore_negation_divergence() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
-    if !has_git() { eprintln!("skipping: git not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
+    if !has_git() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let root = project.path();
     // daagu-shape divergence: a bare dir-name pattern (`keep/`, matches at any
@@ -1649,14 +2538,25 @@ fn test_cli_grep_gitignore_negation_divergence() {
     // A tracked hidden file is the third blind-spot class (rg skips hidden).
     std::fs::write(root.join(".hidden-config.md"), "hidden_needle here\n").unwrap();
     let git = |args: &[&str]| {
-        let out = Command::new("git").args(args).current_dir(root).output().unwrap();
-        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init", "-q"]);
     git(&["add", "sub/keep/a.txt", ".hidden-config.md"]);
 
     let (stdout, stderr, code) = run_cli(&project, &["grep", "negation_needle"]);
-    assert_eq!(code, 0, "whitelisted-but-pruned tracked file must be found; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "whitelisted-but-pruned tracked file must be found; stderr={stderr}"
+    );
     assert!(stdout.contains("sub/keep/a.txt"), "got: {stdout}");
 
     let (stdout2, _, code2) = run_cli(&project, &["grep", "hidden_needle"]);
@@ -1665,12 +2565,18 @@ fn test_cli_grep_gitignore_negation_divergence() {
 
     // Path-scoped: supplement must honor the path restriction.
     let (_, _, code3) = run_cli(&project, &["grep", "negation_needle", "src/"]);
-    assert_eq!(code3, 1, "supplement must not leak outside the requested path scope");
+    assert_eq!(
+        code3, 1,
+        "supplement must not leak outside the requested path scope"
+    );
 }
 
 #[test]
 fn test_cli_grep_sigpipe_graceful() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     use std::io::Read;
     let project = setup_indexed_project();
     // >64 KiB of matches so the writer outlives the pipe buffer after the
@@ -1691,10 +2597,21 @@ fn test_cli_grep_sigpipe_graceful() {
     drop(stdout);
     let status = child.wait().unwrap();
     let mut err = String::new();
-    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
-    assert!(!err.contains("Broken pipe"),
-        "EPIPE must be handled silently like grep, got stderr: {err:?}");
-    assert_eq!(status.code(), Some(0), "early reader hangup is not an error");
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(
+        !err.contains("Broken pipe"),
+        "EPIPE must be handled silently like grep, got stderr: {err:?}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "early reader hangup is not an error"
+    );
 }
 
 // ============================================================
@@ -1708,7 +2625,11 @@ fn test_cli_callgraph() {
     assert_eq!(code, 0);
     assert!(stdout.contains("validateToken"), "should show root symbol");
     // handleLogin calls validateToken
-    assert!(stdout.contains("handleLogin"), "should show caller handleLogin, got: {}", stdout);
+    assert!(
+        stdout.contains("handleLogin"),
+        "should show caller handleLogin, got: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -1718,23 +2639,38 @@ fn test_cli_callgraph_compact() {
     assert_eq!(code, 0);
     assert!(stdout.contains("validateToken"));
     // Compact: no [function] type annotation
-    assert!(!stdout.contains("[function]"), "compact should not have type annotation");
+    assert!(
+        !stdout.contains("[function]"),
+        "compact should not have type annotation"
+    );
 }
 
 #[test]
 fn test_cli_callgraph_direction() {
     let project = setup_indexed_project();
-    let (stdout, _, code) = run_cli(&project, &["callgraph", "handleLogin", "--direction", "callees"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["callgraph", "handleLogin", "--direction", "callees"],
+    );
     assert_eq!(code, 0);
-    assert!(stdout.contains("validateToken"), "handleLogin should call validateToken");
+    assert!(
+        stdout.contains("validateToken"),
+        "handleLogin should call validateToken"
+    );
 }
 
 #[test]
 fn test_cli_callgraph_nonexistent() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["callgraph", "nonexistent_fn"]);
-    assert_ne!(code, 0, "nonexistent symbol should return non-zero exit code");
-    assert!(stderr.contains("No call graph results"), "should report not found");
+    assert_ne!(
+        code, 0,
+        "nonexistent symbol should return non-zero exit code"
+    );
+    assert!(
+        stderr.contains("No call graph results"),
+        "should report not found"
+    );
 }
 
 // Regression: `--direction` must be validated at the CLI layer (like cmd_deps does).
@@ -1744,10 +2680,15 @@ fn test_cli_callgraph_nonexistent() {
 #[test]
 fn test_cli_callgraph_invalid_direction_errors_early() {
     let project = setup_indexed_project();
-    let (_, stderr, code) = run_cli(&project, &["callgraph", "validateToken", "--direction", "bogus"]);
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["callgraph", "validateToken", "--direction", "bogus"],
+    );
     assert_eq!(code, 1, "bad --direction should error; stderr={stderr:?}");
-    assert!(stderr.contains("--direction must be one of"),
-        "stderr should explain the valid set; got: {stderr:?}");
+    assert!(
+        stderr.contains("--direction must be one of"),
+        "stderr should explain the valid set; got: {stderr:?}"
+    );
 }
 
 /// R10: enum filters accept case variants (parity with --node-type / --min-confidence
@@ -1757,19 +2698,37 @@ fn test_cli_callgraph_invalid_direction_errors_early() {
 fn test_cli_enum_filters_accept_case_variants() {
     let project = setup_indexed_project();
     // Uppercase valid direction → accepted (not the case-sensitive rejection).
-    let (_, stderr, code) = run_cli(&project, &["callgraph", "validateToken", "--direction", "BOTH"]);
-    assert_eq!(code, 0, "uppercase --direction BOTH should be accepted; stderr={stderr:?}");
-    assert!(!stderr.contains("--direction must be one of"),
-        "BOTH must not hit the case-sensitive rejection; got: {stderr:?}");
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["callgraph", "validateToken", "--direction", "BOTH"],
+    );
+    assert_eq!(
+        code, 0,
+        "uppercase --direction BOTH should be accepted; stderr={stderr:?}"
+    );
+    assert!(
+        !stderr.contains("--direction must be one of"),
+        "BOTH must not hit the case-sensitive rejection; got: {stderr:?}"
+    );
     // Uppercase valid relation → accepted.
     let (_, stderr, _) = run_cli(&project, &["refs", "validateToken", "--relation", "CALLS"]);
-    assert!(!stderr.contains("--relation must be one of"),
-        "CALLS must not hit the case-sensitive rejection; got: {stderr:?}");
+    assert!(
+        !stderr.contains("--relation must be one of"),
+        "CALLS must not hit the case-sensitive rejection; got: {stderr:?}"
+    );
     // Cross-vocab is STILL rejected, case-insensitively (a deps word on callgraph).
-    let (_, stderr, code) = run_cli(&project, &["callgraph", "validateToken", "--direction", "OUTGOING"]);
-    assert_eq!(code, 1, "cross-vocab --direction OUTGOING must still error; stderr={stderr:?}");
-    assert!(stderr.contains("--direction must be one of: callers, callees, both"),
-        "cross-vocab must still be rejected; got: {stderr:?}");
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["callgraph", "validateToken", "--direction", "OUTGOING"],
+    );
+    assert_eq!(
+        code, 1,
+        "cross-vocab --direction OUTGOING must still error; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("--direction must be one of: callers, callees, both"),
+        "cross-vocab must still be rejected; got: {stderr:?}"
+    );
 }
 
 #[test]
@@ -1788,8 +2747,10 @@ fn test_cli_callgraph_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["callgraph", "--help"]);
     assert_eq!(code, 0, "callgraph --help should exit 0 (clap help)");
-    assert!(stdout.contains("call graph") || stdout.contains("--direction"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("call graph") || stdout.contains("--direction"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -1816,14 +2777,23 @@ fn test_cli_impact() {
 fn test_cli_impact_nonexistent() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["impact", "nonexistent_fn"]);
-    assert_ne!(code, 0, "nonexistent symbol should return non-zero exit code");
-    assert!(stderr.contains("Symbol not found"), "should report symbol not found");
+    assert_ne!(
+        code, 0,
+        "nonexistent symbol should return non-zero exit code"
+    );
+    assert!(
+        stderr.contains("Symbol not found"),
+        "should report symbol not found"
+    );
 }
 
 #[test]
 fn test_cli_impact_change_type_remove() {
     let project = setup_indexed_project();
-    let (stdout, _, code) = run_cli(&project, &["impact", "validateToken", "--change-type", "remove"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["impact", "validateToken", "--change-type", "remove"],
+    );
     assert_eq!(code, 0);
     assert!(stdout.contains("Risk:"));
 }
@@ -1831,9 +2801,15 @@ fn test_cli_impact_change_type_remove() {
 #[test]
 fn test_cli_impact_invalid_change_type() {
     let project = setup_indexed_project();
-    let (_, stderr, code) = run_cli(&project, &["impact", "validateToken", "--change-type", "invalid"]);
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["impact", "validateToken", "--change-type", "invalid"],
+    );
     assert_ne!(code, 0, "invalid change-type should fail");
-    assert!(stderr.contains("must be one of"), "should show valid options");
+    assert!(
+        stderr.contains("must be one of"),
+        "should show valid options"
+    );
 }
 
 #[test]
@@ -1845,7 +2821,10 @@ fn test_cli_impact_json() {
     assert!(v["risk"].is_string());
     assert!(v["symbol"].is_string());
     // value_references mirrors the MCP impact tool (CLI/MCP parity) — must be present.
-    assert!(v["value_references"].is_number(), "CLI impact json must expose value_references like MCP");
+    assert!(
+        v["value_references"].is_number(),
+        "CLI impact json must expose value_references like MCP"
+    );
 }
 
 #[test]
@@ -1857,8 +2836,11 @@ fn test_cli_impact_json_reports_value_references() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("app.rs"),
-        "pub fn caller() { register(handler); }\nfn register<F>(_f: F) {}\nfn handler() {}\n").unwrap();
+    std::fs::write(
+        src.join("app.rs"),
+        "pub fn caller() { register(handler); }\nfn register<F>(_f: F) {}\nfn handler() {}\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -1868,13 +2850,18 @@ fn test_cli_impact_json_reports_value_references() {
     let (stdout, _, code) = run_cli(&project, &["impact", "handler", "--json"]);
     assert_eq!(code, 0, "impact handler should succeed; got: {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(v["value_references"].as_u64().unwrap_or(0) >= 1,
-        "CLI impact(handler) must report value_references >= 1 (callback coupling); got: {stdout}");
+    assert!(
+        v["value_references"].as_u64().unwrap_or(0) >= 1,
+        "CLI impact(handler) must report value_references >= 1 (callback coupling); got: {stdout}"
+    );
     // The referencer (`caller`) references but never CALLS `handler`, so it must NOT
     // inflate the direct-caller count — the calls-vs-references separation (migrated
     // from the MCP test_r14). Only a value reference exists, so direct_callers == 0.
-    assert_eq!(v["direct_callers"].as_u64(), Some(0),
-        "a callback referencer must not count as a direct CALLER; got: {stdout}");
+    assert_eq!(
+        v["direct_callers"].as_u64(),
+        Some(0),
+        "a callback referencer must not count as a direct CALLER; got: {stdout}"
+    );
 }
 
 #[test]
@@ -1886,7 +2873,11 @@ fn test_cli_impact_json_struct_returns_unknown_risk() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("models.rs"), "pub struct UserModel { pub id: i64 }\n").unwrap();
+    std::fs::write(
+        src.join("models.rs"),
+        "pub struct UserModel { pub id: i64 }\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -1896,10 +2887,15 @@ fn test_cli_impact_json_struct_returns_unknown_risk() {
     let (stdout, _, code) = run_cli(&project, &["impact", "UserModel", "--json"]);
     assert_eq!(code, 0, "impact UserModel should succeed; got: {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["risk"].as_str(), Some("UNKNOWN"),
-        "non-function struct with no callers must be UNKNOWN risk, not LOW; got: {stdout}");
-    assert!(v["warning"].is_string(),
-        "non-function impact must carry a warning steering to refs/find_references; got: {stdout}");
+    assert_eq!(
+        v["risk"].as_str(),
+        Some("UNKNOWN"),
+        "non-function struct with no callers must be UNKNOWN risk, not LOW; got: {stdout}"
+    );
+    assert!(
+        v["warning"].is_string(),
+        "non-function impact must carry a warning steering to refs/find_references; got: {stdout}"
+    );
 }
 
 #[test]
@@ -1922,10 +2918,14 @@ fn test_cli_impact_json_route_handler_affected_routes() {
     let (stdout, _, code) = run_cli(&project, &["impact", "logAccess", "--json"]);
     assert_eq!(code, 0, "impact logAccess should succeed; got: {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(v["direct_callers"].as_u64().unwrap_or(0) >= 1,
-        "the inline route handler must count as a direct caller of logAccess; got: {stdout}");
-    assert!(v["affected_routes"].as_u64().unwrap_or(0) >= 1,
-        "the materialized handler carries a route, so affected_routes must be >= 1; got: {stdout}");
+    assert!(
+        v["direct_callers"].as_u64().unwrap_or(0) >= 1,
+        "the inline route handler must count as a direct caller of logAccess; got: {stdout}"
+    );
+    assert!(
+        v["affected_routes"].as_u64().unwrap_or(0) >= 1,
+        "the materialized handler carries a route, so affected_routes must be >= 1; got: {stdout}"
+    );
 }
 
 // clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection;
@@ -1935,8 +2935,10 @@ fn test_cli_impact_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["impact", "--help"]);
     assert_eq!(code, 0, "impact --help should exit 0 (clap help)");
-    assert!(stdout.contains("Impact analysis") || stdout.contains("--change-type"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("Impact analysis") || stdout.contains("--change-type"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -1954,7 +2956,9 @@ fn test_cli_impact_unknown_flag_errors() {
 /// impl blocks). `file_path` cannot disambiguate these — only `node_id` can.
 fn setup_same_file_overload_project() -> TempDir {
     let project = TempDir::new().unwrap();
-    std::fs::write(project.path().join("lib.rs"), r#"
+    std::fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub struct Foo;
 pub struct Bar;
 
@@ -1970,7 +2974,9 @@ pub fn make_them() {
     let _ = Foo::new();
     let _ = Bar::new();
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db_path = db_dir.join("index.db");
@@ -1987,13 +2993,20 @@ pub fn make_them() {
 fn test_cli_callgraph_same_file_overload_is_ambiguous() {
     let project = setup_same_file_overload_project();
     let (_, stderr, code) = run_cli(&project, &["callgraph", "new"]);
-    assert_eq!(code, 1, "same-file overload `new` must error, not silently merge; stderr={stderr:?}");
-    assert!(stderr.contains("Ambiguous symbol 'new'"),
-        "should report ambiguity; got: {stderr:?}");
+    assert_eq!(
+        code, 1,
+        "same-file overload `new` must error, not silently merge; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Ambiguous symbol 'new'"),
+        "should report ambiguity; got: {stderr:?}"
+    );
     // The guidance must be accurate for same-file overloads: file_path can't
     // split them, so point at the node_id-capable tools instead.
-    assert!(stderr.contains("same file") && stderr.contains("node-id"),
-        "same-file message must mention 'same file' + a node-id path; got: {stderr:?}");
+    assert!(
+        stderr.contains("same file") && stderr.contains("node-id"),
+        "same-file message must mention 'same file' + a node-id path; got: {stderr:?}"
+    );
 }
 
 #[test]
@@ -2002,13 +3015,24 @@ fn test_cli_callgraph_same_file_overload_is_ambiguous_json() {
     let (stdout, _, code) = run_cli(&project, &["callgraph", "new", "--json"]);
     assert_eq!(code, 1, "same-file overload must error in --json mode too");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(v["error"].as_str().unwrap_or("").contains("Ambiguous"),
-        "json error field should report ambiguity; got: {stdout}");
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("Ambiguous"),
+        "json error field should report ambiguity; got: {stdout}"
+    );
     let sugg = v["suggestions"].as_array().expect("suggestions array");
-    assert!(sugg.len() >= 2, "expected ≥2 node_id suggestions; got: {stdout}");
+    assert!(
+        sugg.len() >= 2,
+        "expected ≥2 node_id suggestions; got: {stdout}"
+    );
     for s in sugg {
-        assert!(s["node_id"].as_i64().is_some(), "suggestion needs node_id: {s}");
-        assert!(s["start_line"].as_i64().is_some(), "suggestion needs start_line: {s}");
+        assert!(
+            s["node_id"].as_i64().is_some(),
+            "suggestion needs node_id: {s}"
+        );
+        assert!(
+            s["start_line"].as_i64().is_some(),
+            "suggestion needs start_line: {s}"
+        );
     }
 }
 
@@ -2016,9 +3040,14 @@ fn test_cli_callgraph_same_file_overload_is_ambiguous_json() {
 fn test_cli_impact_same_file_overload_is_ambiguous() {
     let project = setup_same_file_overload_project();
     let (_, stderr, code) = run_cli(&project, &["impact", "new"]);
-    assert_eq!(code, 1, "same-file overload `new` must error in impact, not merge callers; stderr={stderr:?}");
-    assert!(stderr.contains("Ambiguous symbol 'new'"),
-        "should report ambiguity; got: {stderr:?}");
+    assert_eq!(
+        code, 1,
+        "same-file overload `new` must error in impact, not merge callers; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Ambiguous symbol 'new'"),
+        "should report ambiguity; got: {stderr:?}"
+    );
 }
 
 #[test]
@@ -2033,12 +3062,21 @@ fn test_cli_callgraph_import_disambiguates_same_name() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("db.py"),
-        "def save(record):\n    return _write(record)\n\ndef _write(record):\n    return True\n").unwrap();
-    std::fs::write(src.join("cache.py"),
-        "def save(item):\n    return _store(item)\n\ndef _store(item):\n    return True\n").unwrap();
-    std::fs::write(src.join("app.py"),
-        "from db import save\n\ndef run():\n    return save({\"id\": 1})\n").unwrap();
+    std::fs::write(
+        src.join("db.py"),
+        "def save(record):\n    return _write(record)\n\ndef _write(record):\n    return True\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("cache.py"),
+        "def save(item):\n    return _store(item)\n\ndef _store(item):\n    return True\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("app.py"),
+        "from db import save\n\ndef run():\n    return save({\"id\": 1})\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -2049,7 +3087,16 @@ fn test_cli_callgraph_import_disambiguates_same_name() {
     // The surviving edge is `ambiguous` (target name `save` has 2 same-language
     // defs), so probe with --min-confidence ambiguous: the default floor
     // (inferred) hides the by-name class this resolution-layer test asserts on.
-    let (stdout, _, code) = run_cli(&project, &["callgraph", "run", "--min-confidence", "ambiguous", "--json"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "run",
+            "--min-confidence",
+            "ambiguous",
+            "--json",
+        ],
+    );
     assert_eq!(code, 0, "callgraph run should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let results = v["results"].as_array().expect("results array");
@@ -2057,11 +3104,24 @@ fn test_cli_callgraph_import_disambiguates_same_name() {
         results.iter().filter(|r| r["name"] == "save").collect();
     assert_eq!(save_callees.len(), 1,
         "run must call exactly one save (the imported db.save), not fan out to cache.save; got: {stdout}");
-    assert_eq!(save_callees[0]["file_path"], "src/db.py",
-        "the surviving save edge must be db.save (imported), not cache.save; got: {stdout}");
+    assert_eq!(
+        save_callees[0]["file_path"], "src/db.py",
+        "the surviving save edge must be db.save (imported), not cache.save; got: {stdout}"
+    );
 
     // cache.save must have NO caller — `run` imports from db, not cache.
-    let (stdout2, _, _) = run_cli(&project, &["callgraph", "save", "--file", "src/cache.py", "--min-confidence", "ambiguous", "--json"]);
+    let (stdout2, _, _) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "save",
+            "--file",
+            "src/cache.py",
+            "--min-confidence",
+            "ambiguous",
+            "--json",
+        ],
+    );
     let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
     let cache_results = v2["results"].as_array().cloned().unwrap_or_default();
     assert!(!cache_results.iter().any(|r| r["name"] == "run"),
@@ -2080,8 +3140,11 @@ fn test_cli_callgraph_no_import_tie_keeps_both() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("a.rs"), "pub fn thing() -> i32 { 1 }\n").unwrap();
     std::fs::write(src.join("b.rs"), "pub fn thing() -> i32 { 2 }\n").unwrap();
-    std::fs::write(src.join("main.rs"),
-        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n").unwrap();
+    std::fs::write(
+        src.join("main.rs"),
+        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -2090,7 +3153,16 @@ fn test_cli_callgraph_no_import_tie_keeps_both() {
 
     // Tied `thing` edges are `ambiguous` (2 same-language defs); probe with
     // --min-confidence ambiguous since the default floor hides that class.
-    let (stdout, _, code) = run_cli(&project, &["callgraph", "main", "--min-confidence", "ambiguous", "--json"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "main",
+            "--min-confidence",
+            "ambiguous",
+            "--json",
+        ],
+    );
     assert_eq!(code, 0, "callgraph main should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let results = v["results"].as_array().expect("results array");
@@ -2112,10 +3184,16 @@ fn test_cli_callgraph_prune_keeps_qualified_call_to_same_name() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("db.py"),
-        "def save(r):\n    return _w(r)\n\ndef _w(r):\n    return True\n").unwrap();
-    std::fs::write(src.join("cache.py"),
-        "def save(i):\n    return _s(i)\n\ndef _s(i):\n    return True\n").unwrap();
+    std::fs::write(
+        src.join("db.py"),
+        "def save(r):\n    return _w(r)\n\ndef _w(r):\n    return True\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("cache.py"),
+        "def save(i):\n    return _s(i)\n\ndef _s(i):\n    return True\n",
+    )
+    .unwrap();
     // bare imported call to db.save + qualified call to cache.save — both legit.
     std::fs::write(src.join("app.py"),
         "from db import save\nimport cache\n\ndef run():\n    save({\"id\": 1})\n    return cache.save({\"id\": 2})\n").unwrap();
@@ -2127,18 +3205,32 @@ fn test_cli_callgraph_prune_keeps_qualified_call_to_same_name() {
 
     // Both surviving edges are `ambiguous` (`save` has 2 same-language defs);
     // probe with --min-confidence ambiguous since the default floor hides them.
-    let (stdout, _, code) = run_cli(&project, &["callgraph", "run", "--min-confidence", "ambiguous", "--json"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "run",
+            "--min-confidence",
+            "ambiguous",
+            "--json",
+        ],
+    );
     assert_eq!(code, 0, "callgraph run should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let results = v["results"].as_array().expect("results array");
-    let save_files: std::collections::HashSet<&str> = results.iter()
+    let save_files: std::collections::HashSet<&str> = results
+        .iter()
         .filter(|r| r["name"] == "save")
         .filter_map(|r| r["file_path"].as_str())
         .collect();
-    assert!(save_files.contains("src/db.py"),
-        "the bare imported call must keep run→db.save; got: {stdout}");
-    assert!(save_files.contains("src/cache.py"),
-        "the qualified cache.save() call must NOT be false-pruned; got: {stdout}");
+    assert!(
+        save_files.contains("src/db.py"),
+        "the bare imported call must keep run→db.save; got: {stdout}"
+    );
+    assert!(
+        save_files.contains("src/cache.py"),
+        "the qualified cache.save() call must NOT be false-pruned; got: {stdout}"
+    );
 }
 
 #[test]
@@ -2154,8 +3246,11 @@ fn test_cli_callgraph_hides_ambiguous_fanout_by_default() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("a.rs"), "pub fn thing() -> i32 { 1 }\n").unwrap();
     std::fs::write(src.join("b.rs"), "pub fn thing() -> i32 { 2 }\n").unwrap();
-    std::fs::write(src.join("main.rs"),
-        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n").unwrap();
+    std::fs::write(
+        src.join("main.rs"),
+        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -2167,19 +3262,42 @@ fn test_cli_callgraph_hides_ambiguous_fanout_by_default() {
     assert_eq!(code, 0, "callgraph main should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let results = v["results"].as_array().expect("results array");
-    assert!(!results.iter().any(|r| r["name"] == "thing"),
-        "default floor must hide the ambiguous `thing` fan-out; got: {stdout}");
-    assert_eq!(v["ambiguous_edges_hidden"].as_u64(), Some(2),
-        "default view must disclose the 2 hidden ambiguous edges; got: {stdout}");
+    assert!(
+        !results.iter().any(|r| r["name"] == "thing"),
+        "default floor must hide the ambiguous `thing` fan-out; got: {stdout}"
+    );
+    assert_eq!(
+        v["ambiguous_edges_hidden"].as_u64(),
+        Some(2),
+        "default view must disclose the 2 hidden ambiguous edges; got: {stdout}"
+    );
 
     // Opt-in: --min-confidence ambiguous restores both edges, nothing suppressed.
-    let (stdout2, _, _) = run_cli(&project, &["callgraph", "main", "--min-confidence", "ambiguous", "--json"]);
+    let (stdout2, _, _) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "main",
+            "--min-confidence",
+            "ambiguous",
+            "--json",
+        ],
+    );
     let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
-    let shown = v2["results"].as_array().expect("results array")
-        .iter().filter(|r| r["name"] == "thing").count();
-    assert_eq!(shown, 2, "--min-confidence ambiguous must show both tied edges; got: {stdout2}");
-    assert!(v2.get("ambiguous_edges_hidden").is_none(),
-        "nothing is suppressed at the ambiguous floor; got: {stdout2}");
+    let shown = v2["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .filter(|r| r["name"] == "thing")
+        .count();
+    assert_eq!(
+        shown, 2,
+        "--min-confidence ambiguous must show both tied edges; got: {stdout2}"
+    );
+    assert!(
+        v2.get("ambiguous_edges_hidden").is_none(),
+        "nothing is suppressed at the ambiguous floor; got: {stdout2}"
+    );
 }
 
 #[test]
@@ -2197,8 +3315,11 @@ fn test_cli_impact_folds_ambiguous_callers_but_discloses() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("db.py"), "def save(r):\n    return True\n").unwrap();
     std::fs::write(src.join("cache.py"), "def save(i):\n    return True\n").unwrap();
-    std::fs::write(src.join("app.py"),
-        "def run():\n    return save({\"id\": 1})\n").unwrap();
+    std::fs::write(
+        src.join("app.py"),
+        "def run():\n    return save({\"id\": 1})\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -2208,21 +3329,46 @@ fn test_cli_impact_folds_ambiguous_callers_but_discloses() {
     // Default floor: the ambiguous caller `run` is folded out of the count, but
     // the exclusion is disclosed. --file disambiguates so the exact-name guard
     // doesn't fire.
-    let (stdout, _, code) = run_cli(&project, &["impact", "save", "--file", "src/db.py", "--json"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["impact", "save", "--file", "src/db.py", "--json"],
+    );
     assert_eq!(code, 0, "impact should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["total_callers"].as_u64(), Some(0),
-        "ambiguous caller folded out of the risk count by default; got: {stdout}");
-    assert_eq!(v["ambiguous_callers_excluded"].as_u64(), Some(1),
-        "the folded caller must be disclosed, not silently dropped; got: {stdout}");
+    assert_eq!(
+        v["total_callers"].as_u64(),
+        Some(0),
+        "ambiguous caller folded out of the risk count by default; got: {stdout}"
+    );
+    assert_eq!(
+        v["ambiguous_callers_excluded"].as_u64(),
+        Some(1),
+        "the folded caller must be disclosed, not silently dropped; got: {stdout}"
+    );
 
     // Opt-in: --min-confidence ambiguous counts the ambiguous caller.
-    let (stdout2, _, _) = run_cli(&project, &["impact", "save", "--file", "src/db.py", "--min-confidence", "ambiguous", "--json"]);
+    let (stdout2, _, _) = run_cli(
+        &project,
+        &[
+            "impact",
+            "save",
+            "--file",
+            "src/db.py",
+            "--min-confidence",
+            "ambiguous",
+            "--json",
+        ],
+    );
     let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
-    assert_eq!(v2["total_callers"].as_u64(), Some(1),
-        "--min-confidence ambiguous counts the ambiguous caller; got: {stdout2}");
-    assert!(v2.get("ambiguous_callers_excluded").is_none(),
-        "nothing excluded at the ambiguous floor; got: {stdout2}");
+    assert_eq!(
+        v2["total_callers"].as_u64(),
+        Some(1),
+        "--min-confidence ambiguous counts the ambiguous caller; got: {stdout2}"
+    );
+    assert!(
+        v2.get("ambiguous_callers_excluded").is_none(),
+        "nothing excluded at the ambiguous floor; got: {stdout2}"
+    );
 }
 
 #[test]
@@ -2238,14 +3384,16 @@ fn test_cli_impact_discloses_transitive_ambiguous_callers() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("core.py"), "def uniq_target():\n    return 1\n").unwrap();
     // `amb` (ambiguous — 2 defs) is the clean inferred direct caller of uniq_target.
-    std::fs::write(src.join("a.py"),
-        "from core import uniq_target\n\ndef amb():\n    return uniq_target()\n").unwrap();
+    std::fs::write(
+        src.join("a.py"),
+        "from core import uniq_target\n\ndef amb():\n    return uniq_target()\n",
+    )
+    .unwrap();
     std::fs::write(src.join("a2.py"), "def amb():\n    return 2\n").unwrap();
     // `caller_b` calls amb bare (no import) — a TRANSITIVE caller folded because
     // amb is ambiguous. (Importing amb here would corroborate the edge → inferred,
     // so it would no longer be folded; keep it un-imported to exercise the fold.)
-    std::fs::write(src.join("b.py"),
-        "def caller_b():\n    return amb()\n").unwrap();
+    std::fs::write(src.join("b.py"), "def caller_b():\n    return amb()\n").unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -2255,8 +3403,11 @@ fn test_cli_impact_discloses_transitive_ambiguous_callers() {
     let (stdout, _, code) = run_cli(&project, &["impact", "uniq_target", "--json"]);
     assert_eq!(code, 0, "impact should succeed; {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["total_callers"].as_u64(), Some(1),
-        "inferred direct caller kept, transitive ambiguous one folded; got: {stdout}");
+    assert_eq!(
+        v["total_callers"].as_u64(),
+        Some(1),
+        "inferred direct caller kept, transitive ambiguous one folded; got: {stdout}"
+    );
     assert!(v["ambiguous_callers_excluded"].as_u64().unwrap_or(0) >= 1,
         "the folded TRANSITIVE ambiguous caller must be disclosed (seed-direct excluded is 0 here); got: {stdout}");
 }
@@ -2270,8 +3421,14 @@ fn test_cli_stats_no_data() {
     // Freshly-indexed project has no usage.jsonl yet → handler returns Ok (exit 0).
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["stats"]);
-    assert_eq!(code, 0, "stats with no usage data should exit 0; stderr={stderr:?}");
-    assert!(stderr.contains("No usage data"), "should explain absence; got: {stderr:?}");
+    assert_eq!(
+        code, 0,
+        "stats with no usage data should exit 0; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("No usage data"),
+        "should explain absence; got: {stderr:?}"
+    );
 }
 
 #[test]
@@ -2296,9 +3453,14 @@ fn test_cli_stats_last_valid_parses() {
 fn test_cli_stats_invalid_last_errors() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["stats", "--last", "abc"]);
-    assert_eq!(code, 2, "non-numeric --last must be a clap parse error (exit 2); stderr={stderr:?}");
-    assert!(stderr.contains("invalid value") && stderr.contains("abc"),
-        "clap should name the bad value; got: {stderr:?}");
+    assert_eq!(
+        code, 2,
+        "non-numeric --last must be a clap parse error (exit 2); stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("invalid value") && stderr.contains("abc"),
+        "clap should name the bad value; got: {stderr:?}"
+    );
 }
 
 #[test]
@@ -2306,8 +3468,10 @@ fn test_cli_stats_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["stats", "--help"]);
     assert_eq!(code, 0, "stats --help should exit 0 (clap help)");
-    assert!(stdout.contains("Aggregate session metrics") || stdout.contains("--last"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("Aggregate session metrics") || stdout.contains("--last"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -2323,8 +3487,12 @@ fn test_cli_stats_sigpipe_graceful() {
     // hits EPIPE mid-stream rather than fitting entirely in the buffer.
     let mut line = String::from("{\"tools\":{");
     for i in 0..3000 {
-        if i > 0 { line.push(','); }
-        line.push_str(&format!("\"qa_tool_{i:04}\":{{\"n\":1,\"ms\":1,\"err\":0,\"max_ms\":1}}"));
+        if i > 0 {
+            line.push(',');
+        }
+        line.push_str(&format!(
+            "\"qa_tool_{i:04}\":{{\"n\":1,\"ms\":1,\"err\":0,\"max_ms\":1}}"
+        ));
     }
     line.push_str("}}\n");
     let cg = project.path().join(".code-graph");
@@ -2345,11 +3513,21 @@ fn test_cli_stats_sigpipe_graceful() {
     drop(stdout);
     let status = child.wait().unwrap();
     let mut err = String::new();
-    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
-    assert!(!err.contains("panicked") && !err.contains("Broken pipe"),
-        "EPIPE must be handled silently like grep, got stderr: {err:?}");
-    assert_eq!(status.code(), Some(0),
-        "early reader hangup is not an error (was SIGABRT/134 before the fix); status={status:?}");
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(
+        !err.contains("panicked") && !err.contains("Broken pipe"),
+        "EPIPE must be handled silently like grep, got stderr: {err:?}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "early reader hangup is not an error (was SIGABRT/134 before the fix); status={status:?}"
+    );
 }
 
 #[test]
@@ -2357,9 +3535,16 @@ fn test_cli_stats_unknown_flag_errors() {
     // Flavor-B: clap rejects unknown flags (was: silently ignored).
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["stats", "--bogus"]);
-    assert_eq!(code, 2, "unknown flag must error under clap; stderr={stderr:?}");
-    assert!(stderr.contains("unexpected") || stderr.contains("--bogus") || stderr.contains("unrecognized"),
-        "clap should name the unknown flag; got: {stderr:?}");
+    assert_eq!(
+        code, 2,
+        "unknown flag must error under clap; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("unexpected")
+            || stderr.contains("--bogus")
+            || stderr.contains("unrecognized"),
+        "clap should name the unknown flag; got: {stderr:?}"
+    );
 }
 
 // Dark-metric visibility: when usage data is present but recommendations.jsonl
@@ -2382,8 +3567,10 @@ fn test_cli_stats_recommendations_dark_when_absent() {
     let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
     assert_eq!(jcode, 0);
     let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
-    assert_eq!(v["recommendations"]["state"], "absent",
-        "JSON stats must mark recommendations.state=absent; got: {jstdout:?}");
+    assert_eq!(
+        v["recommendations"]["state"], "absent",
+        "JSON stats must mark recommendations.state=absent; got: {jstdout:?}"
+    );
 }
 
 #[test]
@@ -2399,8 +3586,10 @@ fn test_cli_stats_recommendations_empty_distinct_from_absent() {
     let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
     assert_eq!(jcode, 0);
     let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
-    assert_eq!(v["recommendations"]["state"], "empty",
-        "an empty recommendations.jsonl is 'empty', distinct from 'absent'; got: {jstdout:?}");
+    assert_eq!(
+        v["recommendations"]["state"], "empty",
+        "an empty recommendations.jsonl is 'empty', distinct from 'absent'; got: {jstdout:?}"
+    );
 }
 
 // P1-6: the misleading "Conversion (proxy)" headline (tool_calls / recs = two
@@ -2418,20 +3607,34 @@ fn test_cli_stats_marks_legacy_tool_names_and_volume_label() {
         cg.join("usage.jsonl"),
         "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":2,\"ms\":5,\"err\":0,\"max_ms\":5},\"read_snippet\":{\"n\":3,\"ms\":4,\"err\":0,\"max_ms\":4}}}\n",
     ).unwrap();
-    std::fs::write(cg.join("recommendations.jsonl"), "{\"hook\":\"pre-grep-guide\",\"action\":\"deny\"}\n").unwrap();
+    std::fs::write(
+        cg.join("recommendations.jsonl"),
+        "{\"hook\":\"pre-grep-guide\",\"action\":\"deny\"}\n",
+    )
+    .unwrap();
 
     let (stdout, _, code) = run_cli(&project, &["stats"]);
     assert_eq!(code, 0, "stats should run; stdout={stdout}");
-    assert!(stdout.contains("read_snippet †"),
-        "folded tool name must be flagged legacy; got: {stdout}");
-    assert!(stdout.contains("† not in the current tools/list surface"),
-        "legacy footnote must be present; got: {stdout}");
-    assert!(!stdout.contains("get_call_graph †"),
-        "a live tool must NOT be flagged legacy; got: {stdout}");
-    assert!(stdout.contains("Tool-call volume:") && stdout.contains("not conversion"),
-        "the volume ratio must not be labeled 'Conversion'; got: {stdout}");
-    assert!(!stdout.contains("Conversion (proxy)"),
-        "the old misleading 'Conversion (proxy)' label must be gone; got: {stdout}");
+    assert!(
+        stdout.contains("read_snippet †"),
+        "folded tool name must be flagged legacy; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("† not in the current tools/list surface"),
+        "legacy footnote must be present; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("get_call_graph †"),
+        "a live tool must NOT be flagged legacy; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Tool-call volume:") && stdout.contains("not conversion"),
+        "the volume ratio must not be labeled 'Conversion'; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Conversion (proxy)"),
+        "the old misleading 'Conversion (proxy)' label must be gone; got: {stdout}"
+    );
 }
 
 #[test]
@@ -2442,16 +3645,28 @@ fn test_cli_stats_json_renames_conversion_and_lists_live_tools() {
         cg.join("usage.jsonl"),
         "{\"ts\":\"2026-06-01T00:00:00Z\",\"v\":\"0.45.4\",\"tools\":{\"get_call_graph\":{\"n\":1,\"ms\":5,\"err\":0,\"max_ms\":5}}}\n",
     ).unwrap();
-    std::fs::write(cg.join("recommendations.jsonl"), "{\"hook\":\"pre-grep-guide\",\"action\":\"deny\"}\n").unwrap();
+    std::fs::write(
+        cg.join("recommendations.jsonl"),
+        "{\"hook\":\"pre-grep-guide\",\"action\":\"deny\"}\n",
+    )
+    .unwrap();
     let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
     assert_eq!(jcode, 0);
     let v: serde_json::Value = serde_json::from_str(jstdout.trim()).unwrap();
-    assert!(v["recommendations"]["conversion_ratio"].is_null(),
-        "the misleading conversion_ratio field must be renamed; got: {jstdout}");
-    assert!(v["recommendations"]["tool_calls_per_rec"].is_number(),
-        "tool_calls_per_rec must replace it; got: {jstdout}");
-    assert!(v["live_tools"].as_array().is_some_and(|a| a.iter().any(|t| t == "get_call_graph")),
-        "live_tools must surface the current tools/list set; got: {jstdout}");
+    assert!(
+        v["recommendations"]["conversion_ratio"].is_null(),
+        "the misleading conversion_ratio field must be renamed; got: {jstdout}"
+    );
+    assert!(
+        v["recommendations"]["tool_calls_per_rec"].is_number(),
+        "tool_calls_per_rec must replace it; got: {jstdout}"
+    );
+    assert!(
+        v["live_tools"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|t| t == "get_call_graph")),
+        "live_tools must surface the current tools/list set; got: {jstdout}"
+    );
 }
 
 // Deny→use funnel: stats must print the per-session attribution line when usage
@@ -2468,8 +3683,10 @@ fn test_cli_stats_deny_to_use_funnel() {
     std::fs::write(cg.join("usage.jsonl"), format!("{s1}\n{s2}\n{s3}\n")).unwrap();
     let (stdout, _, code) = run_cli(&project, &["stats"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Deny→use: 2/3 deny-sessions used cg = 67% (mcp 1, cli 1)"),
-        "stats must print the deny→use funnel with mcp/cli legs; got: {stdout:?}");
+    assert!(
+        stdout.contains("Deny→use: 2/3 deny-sessions used cg = 67% (mcp 1, cli 1)"),
+        "stats must print the deny→use funnel with mcp/cli legs; got: {stdout:?}"
+    );
 
     let (jstdout, _, jcode) = run_cli(&project, &["stats", "--json"]);
     assert_eq!(jcode, 0);
@@ -2499,7 +3716,10 @@ fn test_cli_stats_zero_tool_session_with_recs_counts_in_funnel() {
     let funnel = &v["recommendations"]["funnel"];
     assert_eq!(funnel["deny_sessions"], 1);
     assert_eq!(funnel["deny_then_use"], 0);
-    assert_eq!(funnel["deny_conversion"], 0.0, "0% conversion must be observable, not absent");
+    assert_eq!(
+        funnel["deny_conversion"], 0.0,
+        "0% conversion must be observable, not absent"
+    );
 }
 
 // ============================================================
@@ -2518,8 +3738,10 @@ fn test_cli_benchmark_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["benchmark", "--help"]);
     assert_eq!(code, 0, "benchmark --help should exit 0 (clap help)");
-    assert!(stdout.contains("Benchmark") || stdout.contains("--json"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("Benchmark") || stdout.contains("--json"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -2547,7 +3769,10 @@ fn test_cli_show() {
 fn test_cli_show_nonexistent() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["show", "nonexistent_fn"]);
-    assert_ne!(code, 0, "nonexistent symbol should return non-zero exit code");
+    assert_ne!(
+        code, 0,
+        "nonexistent symbol should return non-zero exit code"
+    );
     assert!(stderr.contains("Symbol not found"));
 }
 
@@ -2562,10 +3787,16 @@ fn test_cli_show_qualified_falls_back_to_base_name() {
     // not "Auth.validateToken". Old fallback filter required exact qualified match
     // and silently returned [] when DB had only the base name.
     let (stdout, stderr, code) = run_cli(&project, &["show", "Imaginary.validateToken", "--json"]);
-    assert_eq!(code, 0, "qualified-name with no DB match should fall back to base name; stderr={stderr:?}");
+    assert_eq!(
+        code, 0,
+        "qualified-name with no DB match should fall back to base name; stderr={stderr:?}"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let arr = v.as_array().unwrap();
-    assert!(!arr.is_empty(), "should find validateToken via base-name fallback; got {stdout:?}");
+    assert!(
+        !arr.is_empty(),
+        "should find validateToken via base-name fallback; got {stdout:?}"
+    );
 }
 
 #[test]
@@ -2577,7 +3808,10 @@ fn test_cli_show_json() {
     assert!(v.is_array(), "JSON output should be array");
     let arr = v.as_array().unwrap();
     assert!(!arr.is_empty());
-    assert!(arr[0]["code_content"].is_string(), "should include code_content field");
+    assert!(
+        arr[0]["code_content"].is_string(),
+        "should include code_content field"
+    );
 }
 
 // Regression: `show --impact --json` must disclose how many test callers were
@@ -2589,26 +3823,37 @@ fn test_cli_show_impact_discloses_filtered_test_callers() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("math.ts"), r#"
+    std::fs::write(
+        src.join("math.ts"),
+        r#"
 export function addNumbers(a: number, b: number): number {
     return a + b;
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     // `.test.ts` → is_test; its call to addNumbers is a test caller (excluded from
     // the prod risk count, but counted in test_callers_filtered).
-    std::fs::write(src.join("math.test.ts"), r#"
+    std::fs::write(
+        src.join("math.test.ts"),
+        r#"
 import { addNumbers } from './math';
 test('adds', () => {
     addNumbers(1, 2);
 });
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
     code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
 
     let (stdout, stderr, code) = run_cli(&project, &["show", "addNumbers", "--impact", "--json"]);
-    assert_eq!(code, 0, "show --impact --json should succeed; stderr={stderr:?}");
+    assert_eq!(
+        code, 0,
+        "show --impact --json should succeed; stderr={stderr:?}"
+    );
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let impact = &parsed[0]["impact"];
     assert!(impact["test_callers_filtered"].as_u64().unwrap_or(0) >= 1,
@@ -2623,8 +3868,10 @@ fn test_cli_show_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["show", "--help"]);
     assert_eq!(code, 0, "show --help should exit 0 (clap help)");
-    assert!(stdout.contains("symbol details") || stdout.contains("--node-id"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("symbol details") || stdout.contains("--node-id"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -2640,12 +3887,30 @@ fn test_cli_show_unknown_flag_errors() {
 fn test_cli_show_refs_aliases_equivalent() {
     let project = setup_indexed_project();
     let (out_a, _, code_a) = run_cli(&project, &["show", "validateToken", "--refs", "--json"]);
-    let (out_b, _, code_b) = run_cli(&project, &["show", "validateToken", "--include-refs", "--json"]);
-    let (out_c, _, code_c) = run_cli(&project, &["show", "validateToken", "--include-references", "--json"]);
+    let (out_b, _, code_b) = run_cli(
+        &project,
+        &["show", "validateToken", "--include-refs", "--json"],
+    );
+    let (out_c, _, code_c) = run_cli(
+        &project,
+        &["show", "validateToken", "--include-references", "--json"],
+    );
     assert_eq!(code_a, 0);
-    assert_eq!((code_a, code_b, code_c), (0, 0, 0), "all three --refs spellings must succeed");
-    assert_eq!(out_a.trim(), out_b.trim(), "--refs and --include-refs must be identical");
-    assert_eq!(out_a.trim(), out_c.trim(), "--refs and --include-references must be identical");
+    assert_eq!(
+        (code_a, code_b, code_c),
+        (0, 0, 0),
+        "all three --refs spellings must succeed"
+    );
+    assert_eq!(
+        out_a.trim(),
+        out_b.trim(),
+        "--refs and --include-refs must be identical"
+    );
+    assert_eq!(
+        out_a.trim(),
+        out_c.trim(),
+        "--refs and --include-references must be identical"
+    );
 }
 
 // ============================================================
@@ -2684,8 +3949,10 @@ fn test_cli_map_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["map", "--help"]);
     assert_eq!(code, 0, "map --help should exit 0 (clap help)");
-    assert!(stdout.contains("architecture map") || stdout.contains("--compact"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("architecture map") || stdout.contains("--compact"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -2716,7 +3983,10 @@ fn test_cli_overview_compact() {
     assert_eq!(code, 0);
     assert!(stdout.contains("validateToken"));
     // Compact: no caller counts
-    assert!(!stdout.contains("×)"), "compact should not show caller counts");
+    assert!(
+        !stdout.contains("×)"),
+        "compact should not show caller counts"
+    );
 }
 
 // Regression: two exported classes in one file that share a method name must be
@@ -2727,7 +3997,9 @@ fn test_cli_overview_json_disambiguates_same_named_methods() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("widgets.ts"), r#"
+    std::fs::write(
+        src.join("widgets.ts"),
+        r#"
 export class Animal {
     render(): string { return "animal"; }
 }
@@ -2735,7 +4007,9 @@ export class Animal {
 export class Widget {
     render(): string { return "widget"; }
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -2745,12 +4019,20 @@ export class Widget {
     assert_eq!(code, 0, "overview --json should succeed; stderr={stderr:?}");
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("overview --json must be valid JSON ({e}); got: {stdout:?}"));
-    let qns: Vec<&str> = parsed.as_array().expect("overview --json is an array")
+    let qns: Vec<&str> = parsed
+        .as_array()
+        .expect("overview --json is an array")
         .iter()
         .filter_map(|e| e.get("qualified_name").and_then(|v| v.as_str()))
         .collect();
-    assert!(qns.contains(&"Animal.render"), "Animal.render disambiguated: {qns:?} in {stdout}");
-    assert!(qns.contains(&"Widget.render"), "Widget.render disambiguated: {qns:?} in {stdout}");
+    assert!(
+        qns.contains(&"Animal.render"),
+        "Animal.render disambiguated: {qns:?} in {stdout}"
+    );
+    assert!(
+        qns.contains(&"Widget.render"),
+        "Widget.render disambiguated: {qns:?} in {stdout}"
+    );
 }
 
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection; the
@@ -2761,8 +4043,10 @@ fn test_cli_overview_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["overview", "--help"]);
     assert_eq!(code, 0, "overview --help should exit 0 (clap help)");
-    assert!(stdout.contains("Module overview") || stdout.contains("PATH"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("Module overview") || stdout.contains("PATH"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -2787,8 +4071,10 @@ fn test_cli_overview_dot_means_project_root() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["overview", "."]);
     assert_eq!(code, 0, "overview . should succeed; got stdout={stdout:?}");
-    assert!(stdout.contains("validateToken"),
-        "overview . should list symbols across the project; got: {stdout:?}");
+    assert!(
+        stdout.contains("validateToken"),
+        "overview . should list symbols across the project; got: {stdout:?}"
+    );
 }
 
 // Regression: absolute paths under the project root must normalize to project-relative.
@@ -2800,9 +4086,14 @@ fn test_cli_overview_absolute_path_under_root() {
     let project = setup_indexed_project();
     let abs = project.path().join("src");
     let (stdout, stderr, code) = run_cli(&project, &["overview", abs.to_str().unwrap()]);
-    assert_eq!(code, 0, "absolute path under root should succeed; stderr={stderr:?}");
-    assert!(stdout.contains("validateToken"),
-        "should list symbols just like `overview src`; got: {stdout:?}");
+    assert_eq!(
+        code, 0,
+        "absolute path under root should succeed; stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("validateToken"),
+        "should list symbols just like `overview src`; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -2812,8 +4103,10 @@ fn test_cli_overview_absolute_path_outside_root_errors() {
     let outside = TempDir::new().unwrap();
     let (_, stderr, code) = run_cli(&project, &["overview", outside.path().to_str().unwrap()]);
     assert_eq!(code, 1, "absolute path outside root should error");
-    assert!(stderr.contains("outside the project root"),
-        "stderr should explain the path is outside the project root; got {stderr:?}");
+    assert!(
+        stderr.contains("outside the project root"),
+        "stderr should explain the path is outside the project root; got {stderr:?}"
+    );
 }
 
 #[test]
@@ -2823,10 +4116,14 @@ fn test_cli_deps_absolute_path_under_root() {
     let (stdout, _, code) = run_cli(&project, &["deps", abs.to_str().unwrap(), "--json"]);
     assert_eq!(code, 0);
     // Must surface the relative path in JSON + real depends_on edges (not barrel_scan).
-    assert!(stdout.contains("\"file\":\"src/api.ts\""),
-        "deps JSON should normalize file to project-relative; got {stdout:?}");
-    assert!(!stdout.contains("barrel_scan"),
-        "deps must find tracked edges for abs path, not fall back to barrel_scan; got {stdout:?}");
+    assert!(
+        stdout.contains("\"file\":\"src/api.ts\""),
+        "deps JSON should normalize file to project-relative; got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("barrel_scan"),
+        "deps must find tracked edges for abs path, not fall back to barrel_scan; got {stdout:?}"
+    );
 }
 
 #[test]
@@ -2835,10 +4132,14 @@ fn test_cli_dead_code_absolute_path_under_root_matches_relative() {
     let (rel_stdout, _, rel_code) = run_cli(&project, &["dead-code", "src"]);
     let abs = project.path().join("src");
     let (abs_stdout, _, abs_code) = run_cli(&project, &["dead-code", abs.to_str().unwrap()]);
-    assert_eq!(rel_code, abs_code,
-        "abs path under root should match relative behavior exactly");
-    assert_eq!(rel_stdout, abs_stdout,
-        "abs/rel results must be identical (was: abs silently returned no results)");
+    assert_eq!(
+        rel_code, abs_code,
+        "abs path under root should match relative behavior exactly"
+    );
+    assert_eq!(
+        rel_stdout, abs_stdout,
+        "abs/rel results must be identical (was: abs silently returned no results)"
+    );
 }
 
 // Regression (#4): `--ignore` must take a value (be in VALUE_FLAGS), so its value
@@ -2850,13 +4151,23 @@ fn test_cli_dead_code_ignore_before_path_equals_after() {
     let project = setup_indexed_project();
     // Use an ignore prefix that excludes nothing real, so the two orderings must
     // produce the identical (non-trivially-empty when src has dead code) result.
-    let (before, _, before_code) =
-        run_cli(&project, &["dead-code", "--ignore", "zzz_nonexistent/", "src", "--json"]);
-    let (after, _, after_code) =
-        run_cli(&project, &["dead-code", "src", "--ignore", "zzz_nonexistent/", "--json"]);
-    assert_eq!(before_code, after_code, "exit codes must match regardless of flag order");
-    assert_eq!(before.trim(), after.trim(),
-        "--ignore before vs after the path must yield identical results");
+    let (before, _, before_code) = run_cli(
+        &project,
+        &["dead-code", "--ignore", "zzz_nonexistent/", "src", "--json"],
+    );
+    let (after, _, after_code) = run_cli(
+        &project,
+        &["dead-code", "src", "--ignore", "zzz_nonexistent/", "--json"],
+    );
+    assert_eq!(
+        before_code, after_code,
+        "exit codes must match regardless of flag order"
+    );
+    assert_eq!(
+        before.trim(),
+        after.trim(),
+        "--ignore before vs after the path must yield identical results"
+    );
 }
 
 // Regression (#4): a misspelled --type must error loudly, not fall through to a
@@ -2865,9 +4176,14 @@ fn test_cli_dead_code_ignore_before_path_equals_after() {
 fn test_cli_dead_code_rejects_misspelled_type() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["dead-code", "src", "--type", "fucntion"]);
-    assert_ne!(code, 0, "misspelled --type must error, not exit 0 clean; stderr={stderr:?}");
-    assert!(stderr.contains("Unknown type filter"),
-        "stderr should name the bad type filter; got: {stderr:?}");
+    assert_ne!(
+        code, 0,
+        "misspelled --type must error, not exit 0 clean; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Unknown type filter"),
+        "stderr should name the bad type filter; got: {stderr:?}"
+    );
 }
 
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection. The
@@ -2878,8 +4194,10 @@ fn test_cli_dead_code_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["dead-code", "--help"]);
     assert_eq!(code, 0, "dead-code --help should exit 0 (clap help)");
-    assert!(stdout.contains("unused code") || stdout.contains("--ignore"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("unused code") || stdout.contains("--ignore"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -2897,9 +4215,14 @@ fn test_cli_dead_code_unknown_flag_errors() {
 #[test]
 fn test_cli_dead_code_type_and_node_type_conflict_errors() {
     let project = setup_indexed_project();
-    let (_, _, code) =
-        run_cli(&project, &["dead-code", "src", "--type", "fn", "--node-type", "class"]);
-    assert_eq!(code, 2, "supplying both --type and --node-type must error (clap duplicate-arg)");
+    let (_, _, code) = run_cli(
+        &project,
+        &["dead-code", "src", "--type", "fn", "--node-type", "class"],
+    );
+    assert_eq!(
+        code, 2,
+        "supplying both --type and --node-type must error (clap duplicate-arg)"
+    );
 }
 
 // The --node-type preferred spelling must work identically to its --type alias.
@@ -2908,11 +4231,19 @@ fn test_cli_dead_code_node_type_alias_matches_type() {
     let project = setup_indexed_project();
     let (out_type, _, code_type) =
         run_cli(&project, &["dead-code", "src", "--type", "fn", "--json"]);
-    let (out_node, _, code_node) =
-        run_cli(&project, &["dead-code", "src", "--node-type", "fn", "--json"]);
-    assert_eq!(code_type, code_node, "--type and --node-type must agree on exit code");
-    assert_eq!(out_type.trim(), out_node.trim(),
-        "--type fn and --node-type fn must yield identical results");
+    let (out_node, _, code_node) = run_cli(
+        &project,
+        &["dead-code", "src", "--node-type", "fn", "--json"],
+    );
+    assert_eq!(
+        code_type, code_node,
+        "--type and --node-type must agree on exit code"
+    );
+    assert_eq!(
+        out_type.trim(),
+        out_node.trim(),
+        "--type fn and --node-type fn must yield identical results"
+    );
 }
 
 // Regression (real-user QA): at the default `--min-lines 3`, `dead-code` printed a
@@ -2950,8 +4281,10 @@ fn test_cli_dead_code_hints_at_symbols_below_min_lines() {
     // At min-lines 1 the short orphan surfaces (proving the hint wasn't crying wolf).
     let (stdout1, _, code1) = run_cli(&project, &["dead-code", "--min-lines", "1"]);
     assert_eq!(code1, 0);
-    assert!(stdout1.contains("orphan1"),
-        "min-lines 1 must surface the short orphan; got: {stdout1}");
+    assert!(
+        stdout1.contains("orphan1"),
+        "min-lines 1 must surface the short orphan; got: {stdout1}"
+    );
 }
 
 // Regression: empty `--json` overview must keep stdout clean (`[]`) and avoid the
@@ -2966,11 +4299,18 @@ fn test_cli_overview_json_empty_no_anyhow_prefix() {
     assert_eq!(code, 1, "JSON empty overview exit code; stderr={stderr:?}");
     // v0.99.1: the miss emits a self-describing error object (roadmap §1.3), not `[]`.
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["error"], "No symbols found", "in-band error field; got {stdout:?}");
-    assert!(!stderr.contains("Error:"),
-        "JSON mode must not emit anyhow `Error:` prefix on stderr; got {stderr:?}");
-    assert!(stderr.contains("No symbols found"),
-        "stderr must still surface the human-readable reason; got {stderr:?}");
+    assert_eq!(
+        v["error"], "No symbols found",
+        "in-band error field; got {stdout:?}"
+    );
+    assert!(
+        !stderr.contains("Error:"),
+        "JSON mode must not emit anyhow `Error:` prefix on stderr; got {stderr:?}"
+    );
+    assert!(
+        stderr.contains("No symbols found"),
+        "stderr must still surface the human-readable reason; got {stderr:?}"
+    );
 }
 
 // ============================================================
@@ -2989,11 +4329,17 @@ fn test_cli_deps() {
 #[test]
 fn test_cli_deps_direction() {
     let project = setup_indexed_project();
-    let (stdout, _, code) = run_cli(&project, &["deps", "src/auth.ts", "--direction", "incoming"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["deps", "src/auth.ts", "--direction", "incoming"],
+    );
     assert_eq!(code, 0);
     // api.ts imports from auth.ts, so auth.ts has incoming dependency
-    assert!(stdout.contains("src/api.ts") || stdout.is_empty() || stdout.contains("Depended by"),
-        "should show incoming deps or be empty, got: {}", stdout);
+    assert!(
+        stdout.contains("src/api.ts") || stdout.is_empty() || stdout.contains("Depended by"),
+        "should show incoming deps or be empty, got: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -3022,8 +4368,10 @@ fn test_cli_deps_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["deps", "--help"]);
     assert_eq!(code, 0, "deps --help should exit 0 (clap help)");
-    assert!(stdout.contains("dependency graph") || stdout.contains("--direction"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("dependency graph") || stdout.contains("--direction"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -3041,17 +4389,27 @@ fn test_cli_deps_directory_points_to_overview() {
     let project = setup_indexed_project(); // contains a src/ directory
     let (_out, err, code) = run_cli(&project, &["deps", "src"]);
     assert_ne!(code, 0, "deps on a directory is an error");
-    assert!(err.contains("directory"),
-        "deps on a directory must say it's a directory; got stderr={err:?}");
-    assert!(err.contains("overview"),
-        "deps on a directory must point at `overview`; got stderr={err:?}");
+    assert!(
+        err.contains("directory"),
+        "deps on a directory must say it's a directory; got stderr={err:?}"
+    );
+    assert!(
+        err.contains("overview"),
+        "deps on a directory must point at `overview`; got stderr={err:?}"
+    );
     // --json must still honor the empty-contract: a JSON object with a dir error.
     let (out, _err, code2) = run_cli(&project, &["deps", "src", "--json"]);
     assert_ne!(code2, 0);
-    let v: serde_json::Value = serde_json::from_str(out.trim())
-        .expect("deps --json on a directory must emit valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").to_lowercase().contains("director"),
-        "deps --json directory error should mention directory; got {v:?}");
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).expect("deps --json on a directory must emit valid JSON");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("director"),
+        "deps --json directory error should mention directory; got {v:?}"
+    );
 }
 
 /// A project with a call chain `top`/`side` → `middle` → `bottom`, so `middle`
@@ -3062,12 +4420,16 @@ fn setup_centrality_project() -> TempDir {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("chain.ts"), r#"
+    std::fs::write(
+        src.join("chain.ts"),
+        r#"
 export function bottom(): number { return 1; }
 export function middle(): number { return bottom(); }
 export function top(): number { return middle(); }
 export function side(): number { return middle(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -3085,14 +4447,21 @@ fn test_cli_centrality_limit_zero_not_misleading() {
     // Sanity: a real chokepoint exists, so limit 1 lists it on stdout.
     let (out1, _err1, code1) = run_cli(&project, &["centrality", "--limit", "1"]);
     assert_eq!(code1, 0);
-    assert!(out1.contains("chokepoint"),
-        "fixture must surface a chokepoint at limit 1; got {out1:?}");
+    assert!(
+        out1.contains("chokepoint"),
+        "fixture must surface a chokepoint at limit 1; got {out1:?}"
+    );
     // With a chokepoint present, limit 0 must NOT claim there are none.
     let (out0, err0, code0) = run_cli(&project, &["centrality", "--limit", "0"]);
     assert_eq!(code0, 0);
-    assert!(!err0.contains("no multi-hop call paths"),
-        "centrality --limit 0 must not claim the graph has no chokepoints; stderr={err0:?}");
-    assert_eq!(out0, out1, "--limit 0 must be clamped to 1 (identical output to --limit 1)");
+    assert!(
+        !err0.contains("no multi-hop call paths"),
+        "centrality --limit 0 must not claim the graph has no chokepoints; stderr={err0:?}"
+    );
+    assert_eq!(
+        out0, out1,
+        "--limit 0 must be clamped to 1 (identical output to --limit 1)"
+    );
 }
 
 // ============================================================
@@ -3129,10 +4498,16 @@ fn test_cli_ast_search_excludes_module_external_and_test() {
     // real_fn imports an external module (distinctlibxyz → <external> node); the file
     // itself yields a <module> node; the tests/ file adds a test_ function whose NAME
     // contains the query term so FTS surfaces it (and it must be filtered as a test).
-    std::fs::write(src.join("m.py"),
-        "import distinctlibxyz\n\ndef real_fn():\n    return distinctlibxyz.go()\n").unwrap();
-    std::fs::write(project.path().join("tests/test_m.py"),
-        "def test_distinctlibxyz_marker():\n    assert real_fn() is not None\n").unwrap();
+    std::fs::write(
+        src.join("m.py"),
+        "import distinctlibxyz\n\ndef real_fn():\n    return distinctlibxyz.go()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("tests/test_m.py"),
+        "def test_distinctlibxyz_marker():\n    assert real_fn() is not None\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -3142,18 +4517,30 @@ fn test_cli_ast_search_excludes_module_external_and_test() {
     // Query path: searching the external name must NOT surface <external>/<module>/test.
     let (stdout, _, code) = run_cli(&project, &["ast-search", "distinctlibxyz"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("real_fn"), "the real symbol must appear; got: {stdout}");
-    assert!(!stdout.contains("<external>") && !stdout.contains("<module>"),
-        "ast-search must not leak <module>/<external> placeholder nodes; got: {stdout}");
-    assert!(!stdout.contains("test_distinctlibxyz_marker"),
-        "ast-search must not leak test symbols (query path); got: {stdout}");
+    assert!(
+        stdout.contains("real_fn"),
+        "the real symbol must appear; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("<external>") && !stdout.contains("<module>"),
+        "ast-search must not leak <module>/<external> placeholder nodes; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("test_distinctlibxyz_marker"),
+        "ast-search must not leak test symbols (query path); got: {stdout}"
+    );
 
     // Filter-only path: --type function must exclude the test_ function too.
     let (stdout2, _, code2) = run_cli(&project, &["ast-search", "--type", "function"]);
     assert_eq!(code2, 0);
-    assert!(stdout2.contains("real_fn"), "prod fn must appear under --type function; got: {stdout2}");
-    assert!(!stdout2.contains("test_distinctlibxyz_marker"),
-        "ast-search --type function must exclude test_ functions; got: {stdout2}");
+    assert!(
+        stdout2.contains("real_fn"),
+        "prod fn must appear under --type function; got: {stdout2}"
+    );
+    assert!(
+        !stdout2.contains("test_distinctlibxyz_marker"),
+        "ast-search --type function must exclude test_ functions; got: {stdout2}"
+    );
 }
 
 #[test]
@@ -3165,7 +4552,10 @@ fn test_cli_ast_search_invalid_type() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["ast-search", "--type", "INVALID_TYPE"]);
     assert_ne!(code, 0, "invalid --type should fail");
-    assert!(stderr.contains("Unknown type filter"), "should explain the typo; got: {stderr}");
+    assert!(
+        stderr.contains("Unknown type filter"),
+        "should explain the typo; got: {stderr}"
+    );
 }
 
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection; the
@@ -3176,8 +4566,10 @@ fn test_cli_ast_search_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["ast-search", "--help"]);
     assert_eq!(code, 0, "ast-search --help should exit 0 (clap help)");
-    assert!(stdout.contains("Structured search") || stdout.contains("--returns"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("Structured search") || stdout.contains("--returns"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -3193,9 +4585,14 @@ fn test_cli_ast_search_no_query_no_filter_errors() {
     // required-arg error: the positional is optional, the requirement is semantic.
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["ast-search"]);
-    assert_eq!(code, 1, "no query and no filter must exit 1; stderr={stderr:?}");
-    assert!(stderr.contains("Usage:") || stderr.contains("at least one filter"),
-        "should explain query-or-filter requirement; got: {stderr:?}");
+    assert_eq!(
+        code, 1,
+        "no query and no filter must exit 1; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Usage:") || stderr.contains("at least one filter"),
+        "should explain query-or-filter requirement; got: {stderr:?}"
+    );
 }
 
 #[test]
@@ -3206,16 +4603,25 @@ fn test_cli_overview_empty_path_errors() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["overview", ""]);
     assert_ne!(code, 0, "empty path should fail");
-    assert!(stderr.contains("must not be empty"), "should explain; got: {stderr}");
+    assert!(
+        stderr.contains("must not be empty"),
+        "should explain; got: {stderr}"
+    );
 }
 
 #[test]
 fn test_cli_search_invalid_node_type() {
     // Same regression as ast-search: --node-type INVALID was silently dropped.
     let project = setup_indexed_project();
-    let (_, stderr, code) = run_cli(&project, &["search", "Logger", "--node-type", "INVALID_TYPE"]);
+    let (_, stderr, code) = run_cli(
+        &project,
+        &["search", "Logger", "--node-type", "INVALID_TYPE"],
+    );
     assert_ne!(code, 0, "invalid --node-type should fail");
-    assert!(stderr.contains("Unknown node-type filter"), "should explain the typo; got: {stderr}");
+    assert!(
+        stderr.contains("Unknown node-type filter"),
+        "should explain the typo; got: {stderr}"
+    );
 }
 
 // ============================================================
@@ -3227,12 +4633,17 @@ fn test_cli_trace_no_routes() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["trace", "/api/login"]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("No routes matching"), "should report no routes found");
+    assert!(
+        stderr.contains("No routes matching"),
+        "should report no routes found"
+    );
     // Empty trace must disclose the framework-coverage limit (a Rust/Java project has
     // real routes the extractor never sees) so a bare miss doesn't read as "no such
     // route". Mirrors the richer MCP trace message.
-    assert!(stderr.contains("not yet extracted") && stderr.contains("Flask"),
-        "empty trace must disclose which frameworks route-extraction covers; got: {stderr}");
+    assert!(
+        stderr.contains("not yet extracted") && stderr.contains("Flask"),
+        "empty trace must disclose which frameworks route-extraction covers; got: {stderr}"
+    );
 }
 
 #[test]
@@ -3243,7 +4654,9 @@ fn test_cli_trace_filters_test_symbols_by_default() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("server.ts"), r#"
+    std::fs::write(
+        src.join("server.ts"),
+        r#"
 const app = express();
 function realWork() { return 1; }
 function test_helper() { return 2; }
@@ -3252,7 +4665,9 @@ app.get('/widgets', (req, res) => {
     test_helper();
     res.json([]);
 });
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -3264,14 +4679,30 @@ app.get('/widgets', (req, res) => {
     // Default: the test-named callee is hidden from the chain; the prod one shows.
     let (out, _, code) = run_cli(&project, &["trace", "GET /widgets", "--no-middleware"]);
     assert_eq!(code, 0, "trace should resolve the route; got code {code}");
-    assert!(out.contains("realWork"), "prod callee must appear; got:\n{out}");
-    assert!(!out.contains("test_helper"), "test callee must be hidden by default; got:\n{out}");
+    assert!(
+        out.contains("realWork"),
+        "prod callee must appear; got:\n{out}"
+    );
+    assert!(
+        !out.contains("test_helper"),
+        "test callee must be hidden by default; got:\n{out}"
+    );
 
     // --include-tests shows both.
-    let (out2, _, code2) = run_cli(&project, &["trace", "GET /widgets", "--no-middleware", "--include-tests"]);
+    let (out2, _, code2) = run_cli(
+        &project,
+        &[
+            "trace",
+            "GET /widgets",
+            "--no-middleware",
+            "--include-tests",
+        ],
+    );
     assert_eq!(code2, 0);
-    assert!(out2.contains("realWork") && out2.contains("test_helper"),
-        "--include-tests must show test callees; got:\n{out2}");
+    assert!(
+        out2.contains("realWork") && out2.contains("test_helper"),
+        "--include-tests must show test callees; got:\n{out2}"
+    );
 }
 
 #[test]
@@ -3281,19 +4712,35 @@ fn test_cli_worktree_reads_main_checkout_index() {
     // fall back to the MAIN checkout's index instead of erroring "No index
     // found" (and instead of cold-building a duplicate). Write side is
     // unchanged; a worktree's OWN index still wins (open() checks it first).
-    if !has_git() { eprintln!("skipping: git not installed"); return; }
+    if !has_git() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
     let root = TempDir::new().unwrap();
     let main = root.path().join("main");
     let src = main.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("auth.ts"),
-        "export function hashPassword(p: string): string { return p; }\n").unwrap();
+    std::fs::write(
+        src.join("auth.ts"),
+        "export function hashPassword(p: string): string { return p; }\n",
+    )
+    .unwrap();
     let git = |args: &[&str], cwd: &std::path::Path| {
-        let out = Command::new("git").args(args).current_dir(cwd)
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-            .output().unwrap();
-        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init", "-q"], &main);
     git(&["add", "."], &main);
@@ -3306,17 +4753,31 @@ fn test_cli_worktree_reads_main_checkout_index() {
     drop(db);
     // Linked worktree (its `.git` is a FILE pointing at main/.git/worktrees/<n>).
     let wt = root.path().join("wt");
-    git(&["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"], &main);
-    assert!(wt.join(".git").is_file(), "fixture must be a linked worktree");
+    git(
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"],
+        &main,
+    );
+    assert!(
+        wt.join(".git").is_file(),
+        "fixture must be a linked worktree"
+    );
 
-    let out = Command::new(binary_path()).args(["search", "hashPassword", "--json"])
-        .current_dir(&wt).output().unwrap();
+    let out = Command::new(binary_path())
+        .args(["search", "hashPassword", "--json"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0),
-        "worktree query must fall back to the main index; stderr: {stderr}");
-    assert!(stdout.contains("hashPassword"),
-        "results must come from the main checkout's index; got stdout: {stdout} stderr: {stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "worktree query must fall back to the main index; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("hashPassword"),
+        "results must come from the main checkout's index; got stdout: {stdout} stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -3328,11 +4789,17 @@ fn test_cli_deps_namespace_import_and_star_barrel() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("util.ts"),
-        "export function fmt(x: string): string { return x.trim(); }\n").unwrap();
+    std::fs::write(
+        src.join("util.ts"),
+        "export function fmt(x: string): string { return x.trim(); }\n",
+    )
+    .unwrap();
     std::fs::write(src.join("barrel.ts"), "export * from './util';\n").unwrap();
-    std::fs::write(src.join("app.ts"),
-        "import * as u from './util';\nexport function run(): string { return u.fmt(' hi '); }\n").unwrap();
+    std::fs::write(
+        src.join("app.ts"),
+        "import * as u from './util';\nexport function run(): string { return u.fmt(' hi '); }\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -3340,20 +4807,29 @@ fn test_cli_deps_namespace_import_and_star_barrel() {
     drop(db);
 
     let (barrel_deps, _, code1) = run_cli(&project, &["deps", "src/barrel.ts"]);
-    assert_eq!(code1, 0, "star barrel must have dep edges now; got:\n{barrel_deps}");
-    assert!(barrel_deps.contains("util.ts"),
-        "export * from './util' must show util.ts as a dependency; got:\n{barrel_deps}");
+    assert_eq!(
+        code1, 0,
+        "star barrel must have dep edges now; got:\n{barrel_deps}"
+    );
+    assert!(
+        barrel_deps.contains("util.ts"),
+        "export * from './util' must show util.ts as a dependency; got:\n{barrel_deps}"
+    );
 
     let (app_deps, _, code2) = run_cli(&project, &["deps", "src/app.ts"]);
     assert_eq!(code2, 0);
-    assert!(app_deps.contains("util.ts"),
-        "import * as u from './util' must show util.ts as a dependency; got:\n{app_deps}");
+    assert!(
+        app_deps.contains("util.ts"),
+        "import * as u from './util' must show util.ts as a dependency; got:\n{app_deps}"
+    );
 
     // Member-call binding through the ESM namespace: run → fmt cross-file.
     let (cg, _, code3) = run_cli(&project, &["callgraph", "fmt", "--direction", "callers"]);
     assert_eq!(code3, 0, "fmt must have callers; got:\n{cg}");
-    assert!(cg.contains("run"),
-        "u.fmt() must bind to util.ts fmt (ns_module_map via ns_import); got:\n{cg}");
+    assert!(
+        cg.contains("run"),
+        "u.fmt() must bind to util.ts fmt (ns_module_map via ns_import); got:\n{cg}"
+    );
 }
 
 #[test]
@@ -3365,14 +4841,20 @@ fn test_cli_trace_axum_routes_end_to_end() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("handlers.rs"), r#"
+    std::fs::write(
+        src.join("handlers.rs"),
+        r#"
 pub async fn list_users() -> String {
     fetch_all()
 }
 
 fn fetch_all() -> String { String::new() }
-"#).unwrap();
-    std::fs::write(src.join("main.rs"), r#"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("main.rs"),
+        r#"
 use axum::{routing::get, Router};
 use crate::handlers::list_users;
 
@@ -3383,7 +4865,9 @@ fn app() -> Router {
         .nest("/api", Router::new().route("/users", get(list_users)))
         .route("/health", get(health))
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -3396,9 +4880,18 @@ fn app() -> Router {
 
     // Cross-file handler behind an inline nest prefix, callees traced.
     let (out2, _, code2) = run_cli(&project, &["trace", "GET /api/users"]);
-    assert_eq!(code2, 0, "nested cross-file axum route must resolve; got:\n{out2}");
-    assert!(out2.contains("list_users"), "cross-file handler; got:\n{out2}");
-    assert!(out2.contains("fetch_all"), "handler callees must chain; got:\n{out2}");
+    assert_eq!(
+        code2, 0,
+        "nested cross-file axum route must resolve; got:\n{out2}"
+    );
+    assert!(
+        out2.contains("list_users"),
+        "cross-file handler; got:\n{out2}"
+    );
+    assert!(
+        out2.contains("fetch_all"),
+        "handler callees must chain; got:\n{out2}"
+    );
 }
 
 #[test]
@@ -3417,14 +4910,18 @@ fn test_cli_trace_hides_ambiguous_fanout_by_default() {
     // the handler's bare `thing()` call resolves ambiguously to both (the fan-out class).
     std::fs::write(src.join("a.ts"), "export function thing() { return 1; }\n").unwrap();
     std::fs::write(src.join("b.ts"), "export function thing() { return 2; }\n").unwrap();
-    std::fs::write(src.join("server.ts"), r#"
+    std::fs::write(
+        src.join("server.ts"),
+        r#"
 const app = express();
 function widgetsHandler(req, res) {
     thing();
     res.json([]);
 }
 app.get('/widgets', widgetsHandler);
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -3434,28 +4931,59 @@ app.get('/widgets', widgetsHandler);
     // Default floor: ambiguous `thing` fan-out hidden from BOTH the chain and the
     // one-hop downstream list; the count is disclosed at the top level.
     let (stdout, _, code) = run_cli(&project, &["trace", "GET /widgets", "--json"]);
-    assert_eq!(code, 0, "trace should resolve the route; got code {code}: {stdout}");
+    assert_eq!(
+        code, 0,
+        "trace should resolve the route; got code {code}: {stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let handler = &v["handlers"][0];
     let chain = handler["call_chain"].as_array().expect("call_chain array");
-    assert!(!chain.iter().any(|n| n["name"] == "thing"),
-        "default floor must hide the ambiguous `thing` fan-out from the chain; got: {stdout}");
-    let downstream = handler["downstream_calls"].as_array().expect("downstream_calls array");
+    assert!(
+        !chain.iter().any(|n| n["name"] == "thing"),
+        "default floor must hide the ambiguous `thing` fan-out from the chain; got: {stdout}"
+    );
+    let downstream = handler["downstream_calls"]
+        .as_array()
+        .expect("downstream_calls array");
     assert!(!downstream.iter().any(|n| n == "thing"),
         "default floor must hide the ambiguous fan-out from the one-hop downstream list too; got: {stdout}");
-    assert_eq!(v["ambiguous_edges_hidden"].as_u64(), Some(2),
-        "default view must disclose the 2 hidden ambiguous edges; got: {stdout}");
+    assert_eq!(
+        v["ambiguous_edges_hidden"].as_u64(),
+        Some(2),
+        "default view must disclose the 2 hidden ambiguous edges; got: {stdout}"
+    );
 
     // Opt-in: --min-confidence ambiguous restores the fan-out on the chain, and the
     // disclosure field disappears (nothing suppressed at rank 0).
-    let (stdout2, _, code2) = run_cli(&project, &["trace", "GET /widgets", "--min-confidence", "ambiguous", "--json"]);
-    assert_eq!(code2, 0, "trace --min-confidence ambiguous should succeed; got: {stdout2}");
+    let (stdout2, _, code2) = run_cli(
+        &project,
+        &[
+            "trace",
+            "GET /widgets",
+            "--min-confidence",
+            "ambiguous",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code2, 0,
+        "trace --min-confidence ambiguous should succeed; got: {stdout2}"
+    );
     let v2: serde_json::Value = serde_json::from_str(stdout2.trim()).unwrap();
-    let shown = v2["handlers"][0]["call_chain"].as_array().expect("call_chain array")
-        .iter().filter(|n| n["name"] == "thing").count();
-    assert_eq!(shown, 2, "--min-confidence ambiguous must show both tied `thing` edges in the chain; got: {stdout2}");
-    assert!(v2.get("ambiguous_edges_hidden").is_none(),
-        "nothing is suppressed at the ambiguous floor; got: {stdout2}");
+    let shown = v2["handlers"][0]["call_chain"]
+        .as_array()
+        .expect("call_chain array")
+        .iter()
+        .filter(|n| n["name"] == "thing")
+        .count();
+    assert_eq!(
+        shown, 2,
+        "--min-confidence ambiguous must show both tied `thing` edges in the chain; got: {stdout2}"
+    );
+    assert!(
+        v2.get("ambiguous_edges_hidden").is_none(),
+        "nothing is suppressed at the ambiguous floor; got: {stdout2}"
+    );
 }
 
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection.
@@ -3464,8 +4992,10 @@ fn test_cli_trace_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["trace", "--help"]);
     assert_eq!(code, 0, "trace --help should exit 0 (clap help)");
-    assert!(stdout.contains("Trace HTTP") || stdout.contains("--no-middleware"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("Trace HTTP") || stdout.contains("--no-middleware"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 // User-approved migration decision (audit #4): --no-middleware is the real flag
@@ -3477,10 +5007,19 @@ fn test_cli_trace_no_middleware_accepted_include_middleware_rejected() {
     // --no-middleware is accepted: same no-routes exit 1 as the bare invocation
     // (NOT a clap unknown-flag exit 2).
     let (_, _, code_no) = run_cli(&project, &["trace", "/api/nonexistent", "--no-middleware"]);
-    assert_eq!(code_no, 1, "--no-middleware must be accepted (no-routes exit 1, not unknown-flag 2)");
+    assert_eq!(
+        code_no, 1,
+        "--no-middleware must be accepted (no-routes exit 1, not unknown-flag 2)"
+    );
     // --include-middleware is the dropped phantom: clap unknown-flag exit 2.
-    let (_, _, code_inc) = run_cli(&project, &["trace", "/api/nonexistent", "--include-middleware"]);
-    assert_eq!(code_inc, 2, "dropped phantom --include-middleware must error as unknown flag");
+    let (_, _, code_inc) = run_cli(
+        &project,
+        &["trace", "/api/nonexistent", "--include-middleware"],
+    );
+    assert_eq!(
+        code_inc, 2,
+        "dropped phantom --include-middleware must error as unknown flag"
+    );
 }
 
 // Numeric flags reject a leading-dash value (`--depth -5`): clap reads `-5` as a
@@ -3493,7 +5032,10 @@ fn test_cli_trace_no_middleware_accepted_include_middleware_rejected() {
 fn test_cli_trace_negative_depth_rejected() {
     let project = setup_indexed_project();
     let (_, _, code) = run_cli(&project, &["trace", "/api/x", "--depth", "-5"]);
-    assert_eq!(code, 2, "a negative --depth must error (was: silently clamped to 1)");
+    assert_eq!(
+        code, 2,
+        "a negative --depth must error (was: silently clamped to 1)"
+    );
 }
 
 // ============================================================
@@ -3505,7 +5047,10 @@ fn test_cli_incremental_index() {
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["incremental-index"]);
     assert_eq!(code, 0);
-    assert!(stderr.contains("Incremental index:"), "should show index stats");
+    assert!(
+        stderr.contains("Incremental index:"),
+        "should show index stats"
+    );
 }
 
 // Regression guard for feedback_tracing_invisible_in_cli: CLI subcommands now
@@ -3523,9 +5068,11 @@ fn test_cli_incremental_index_tracing_subscriber_installed() {
     ).unwrap();
     let (_, stderr, code) = run_cli_env(&project, &["incremental-index"], &[("RUST_LOG", "info")]);
     assert_eq!(code, 0, "incremental-index should succeed; stderr={stderr}");
-    assert!(stderr.contains("[incremental]"),
+    assert!(
+        stderr.contains("[incremental]"),
         "RUST_LOG=info must surface the indexer's tracing output on the CLI path \
-         (proves the subscriber is installed); got stderr: {stderr:?}");
+         (proves the subscriber is installed); got stderr: {stderr:?}"
+    );
 
     // Negative control: at "warn" level the info-level "[incremental]" line is
     // filtered out, while the non-tracing "Incremental index:" eprintln still
@@ -3537,12 +5084,17 @@ fn test_cli_incremental_index_tracing_subscriber_installed() {
         project2.path().join("src/auth.ts"),
         "export function validateToken(t: string): boolean { return t.length > 0; }\nexport function freshlyAdded2() { return 7; }\n",
     ).unwrap();
-    let (_, stderr2, code2) = run_cli_env(&project2, &["incremental-index"], &[("RUST_LOG", "warn")]);
+    let (_, stderr2, code2) =
+        run_cli_env(&project2, &["incremental-index"], &[("RUST_LOG", "warn")]);
     assert_eq!(code2, 0);
-    assert!(!stderr2.contains("[incremental]"),
-        "at default warn level the info [incremental] line must be filtered out; got: {stderr2:?}");
-    assert!(stderr2.contains("Incremental index:"),
-        "the non-tracing eprintln summary still prints at warn level; got: {stderr2:?}");
+    assert!(
+        !stderr2.contains("[incremental]"),
+        "at default warn level the info [incremental] line must be filtered out; got: {stderr2:?}"
+    );
+    assert!(
+        stderr2.contains("Incremental index:"),
+        "the non-tracing eprintln summary still prints at warn level; got: {stderr2:?}"
+    );
 }
 
 // clap-migrated (audit #4) contract lock. Flag parsing flipped to clap while the
@@ -3552,9 +5104,14 @@ fn test_cli_incremental_index_tracing_subscriber_installed() {
 fn test_cli_incremental_index_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["incremental-index", "--help"]);
-    assert_eq!(code, 0, "incremental-index --help should exit 0 (clap help)");
-    assert!(stdout.contains("incremental index") || stdout.contains("--quiet"),
-        "help should describe the command; got: {stdout:?}");
+    assert_eq!(
+        code, 0,
+        "incremental-index --help should exit 0 (clap help)"
+    );
+    assert!(
+        stdout.contains("incremental index") || stdout.contains("--quiet"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -3578,8 +5135,14 @@ fn test_cli_reindex_runs() {
     // "Incremental index:" banner pins that contract against the help text.
     let project = setup_indexed_project();
     let (_, stderr, code) = run_cli(&project, &["reindex"]);
-    assert_eq!(code, 0, "reindex should run to completion; stderr={stderr:?}");
-    assert!(stderr.contains("Incremental index:"), "should show index stats; got: {stderr:?}");
+    assert_eq!(
+        code, 0,
+        "reindex should run to completion; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Incremental index:"),
+        "should show index stats; got: {stderr:?}"
+    );
 }
 
 #[test]
@@ -3587,8 +5150,10 @@ fn test_cli_reindex_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["reindex", "--help"]);
     assert_eq!(code, 0, "reindex --help should exit 0 (clap help)");
-    assert!(stdout.contains("snapshot") || stdout.contains("--from-snapshot"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("snapshot") || stdout.contains("--from-snapshot"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -3606,17 +5171,28 @@ fn test_cli_reindex_unknown_flag_errors() {
 #[test]
 fn test_cli_rebuild_index_requires_confirm() {
     let project = setup_indexed_project();
-    let db_path = project.path()
+    let db_path = project
+        .path()
         .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
         .join("index.db");
-    assert!(db_path.exists(), "precondition: indexed project has index.db");
+    assert!(
+        db_path.exists(),
+        "precondition: indexed project has index.db"
+    );
     let pre_size = std::fs::metadata(&db_path).unwrap().len();
 
     // Without --confirm: must bail non-zero AND leave index.db intact.
     let (_, stderr, code) = run_cli(&project, &["rebuild-index"]);
     assert_ne!(code, 0, "rebuild-index without --confirm must fail");
-    assert!(stderr.contains("--confirm"), "stderr should demand --confirm, got: {}", stderr);
-    assert!(db_path.exists(), "index.db must survive a rejected rebuild-index");
+    assert!(
+        stderr.contains("--confirm"),
+        "stderr should demand --confirm, got: {}",
+        stderr
+    );
+    assert!(
+        db_path.exists(),
+        "index.db must survive a rejected rebuild-index"
+    );
     let post_size = std::fs::metadata(&db_path).unwrap().len();
     assert_eq!(pre_size, post_size, "index.db size must be unchanged");
 }
@@ -3624,7 +5200,8 @@ fn test_cli_rebuild_index_requires_confirm() {
 #[test]
 fn test_cli_rebuild_index_with_confirm_rebuilds() {
     let project = setup_indexed_project();
-    let db_path = project.path()
+    let db_path = project
+        .path()
         .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
         .join("index.db");
     assert!(db_path.exists());
@@ -3633,7 +5210,10 @@ fn test_cli_rebuild_index_with_confirm_rebuilds() {
     let (_, stderr, code) = run_cli(&project, &["rebuild-index", "--confirm"]);
     assert_eq!(code, 0, "rebuild-index --confirm failed: {}", stderr);
     assert!(db_path.exists(), "index.db must be recreated");
-    assert!(std::fs::metadata(&db_path).unwrap().len() > 0, "recreated index.db must be non-empty");
+    assert!(
+        std::fs::metadata(&db_path).unwrap().len() > 0,
+        "recreated index.db must be non-empty"
+    );
 }
 
 // The atomic rebuild builds into `index.db.rebuild-<pid>` then renames it over
@@ -3652,15 +5232,22 @@ fn test_cli_rebuild_index_atomic_leaves_no_temp() {
 
     let (_, stderr, code) = run_cli(&project, &["rebuild-index", "--confirm"]);
     assert_eq!(code, 0, "rebuild-index --confirm failed: {}", stderr);
-    assert!(db_path.exists() && std::fs::metadata(&db_path).unwrap().len() > 0,
-        "index.db must be a non-empty rebuilt file");
+    assert!(
+        db_path.exists() && std::fs::metadata(&db_path).unwrap().len() > 0,
+        "index.db must be a non-empty rebuilt file"
+    );
 
-    let leftovers: Vec<String> = std::fs::read_dir(&cg_dir).unwrap()
+    let leftovers: Vec<String> = std::fs::read_dir(&cg_dir)
+        .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("index.db.rebuild-"))
         .collect();
-    assert!(leftovers.is_empty(), "rebuild left temp files behind: {:?}", leftovers);
+    assert!(
+        leftovers.is_empty(),
+        "rebuild left temp files behind: {:?}",
+        leftovers
+    );
 
     // Index still answers after the atomic swap.
     let (_, _, hc_code) = run_cli(&project, &["health-check"]);
@@ -3675,8 +5262,10 @@ fn test_cli_rebuild_index_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["rebuild-index", "--help"]);
     assert_eq!(code, 0, "rebuild-index --help should exit 0 (clap help)");
-    assert!(stdout.contains("Drop and rebuild") || stdout.contains("--confirm"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("Drop and rebuild") || stdout.contains("--confirm"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -3685,7 +5274,10 @@ fn test_cli_rebuild_index_unknown_flag_errors() {
     // --confirm business gate — so --bogus exits 2, not 1.
     let project = setup_indexed_project();
     let (_, _, code) = run_cli(&project, &["rebuild-index", "--bogus"]);
-    assert_eq!(code, 2, "unknown flag must error under clap (exit 2, before confirm gate)");
+    assert_eq!(
+        code, 2,
+        "unknown flag must error under clap (exit 2, before confirm gate)"
+    );
 }
 
 // ============================================================
@@ -3696,19 +5288,33 @@ fn test_cli_rebuild_index_unknown_flag_errors() {
 fn test_cli_refs_node_id_envelope() {
     let project = setup_indexed_project();
     // First resolve a known symbol to a node_id via search --json
-    let (search_out, _, search_code) = run_cli(&project, &["search", "validateToken", "--json", "--limit", "1"]);
+    let (search_out, _, search_code) = run_cli(
+        &project,
+        &["search", "validateToken", "--json", "--limit", "1"],
+    );
     assert_eq!(search_code, 0, "search must succeed");
     let arr: serde_json::Value = serde_json::from_str(search_out.trim()).unwrap();
-    let nid = arr[0]["node_id"].as_i64().expect("search result must expose node_id");
+    let nid = arr[0]["node_id"]
+        .as_i64()
+        .expect("search result must expose node_id");
 
     let (out, _, code) = run_cli(&project, &["refs", "--node-id", &nid.to_string(), "--json"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     // Envelope fields match MCP find_references
     assert!(v["symbol"].is_string(), "envelope must include symbol");
-    assert!(v["total_references"].is_number(), "envelope must include total_references");
-    assert!(v["by_relation"].is_object(), "envelope must include by_relation map");
-    assert!(v["references"].is_array(), "envelope must include references array");
+    assert!(
+        v["total_references"].is_number(),
+        "envelope must include total_references"
+    );
+    assert!(
+        v["by_relation"].is_object(),
+        "envelope must include by_relation map"
+    );
+    assert!(
+        v["references"].is_array(),
+        "envelope must include references array"
+    );
 }
 
 // Regression: `--relation` must be validated at the CLI layer, before opening the
@@ -3720,14 +5326,21 @@ fn test_cli_refs_invalid_relation_errors_early() {
     // Valid symbol, bad relation → relation error.
     let (_, stderr, code) = run_cli(&project, &["refs", "validateToken", "--relation", "bogus"]);
     assert_ne!(code, 0, "bad --relation should error; stderr={stderr:?}");
-    assert!(stderr.contains("--relation must be one of"),
-        "stderr should explain the valid relation set; got: {stderr:?}");
+    assert!(
+        stderr.contains("--relation must be one of"),
+        "stderr should explain the valid relation set; got: {stderr:?}"
+    );
     // Nonexistent symbol + bad relation → still the RELATION error (validation
     // precedes resolution), not "Symbol not found".
-    let (_, stderr2, code2) = run_cli(&project, &["refs", "definitely_absent_xyz", "--relation", "bogus"]);
+    let (_, stderr2, code2) = run_cli(
+        &project,
+        &["refs", "definitely_absent_xyz", "--relation", "bogus"],
+    );
     assert_ne!(code2, 0);
-    assert!(stderr2.contains("--relation must be one of"),
-        "relation validation must precede symbol resolution; got: {stderr2:?}");
+    assert!(
+        stderr2.contains("--relation must be one of"),
+        "relation validation must precede symbol resolution; got: {stderr2:?}"
+    );
 }
 
 // clap-migrated (audit #4 Step 5): clap owns --help + unknown-flag rejection;
@@ -3737,8 +5350,10 @@ fn test_cli_refs_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["refs", "--help"]);
     assert_eq!(code, 0, "refs --help should exit 0 (clap help)");
-    assert!(stdout.contains("references") || stdout.contains("--relation"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("references") || stdout.contains("--relation"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -3760,7 +5375,10 @@ fn test_cli_trace_json_single_object_envelope_on_empty() {
     let v: serde_json::Value = serde_json::from_str(out.trim())
         .expect("trace --json must emit a single parseable JSON object, not JSONL");
     assert!(v.is_object(), "envelope must be an object");
-    assert!(v["handlers"].is_array(), "envelope must have handlers array");
+    assert!(
+        v["handlers"].is_array(),
+        "envelope must have handlers array"
+    );
 }
 
 // ============================================================
@@ -3773,8 +5391,14 @@ fn test_cli_ast_search_json_envelope() {
     let (out, _, code) = run_cli(&project, &["ast-search", "--type", "fn", "--json"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-    assert!(v["results"].is_array(), "ast-search --json must wrap in {{results,count}}");
-    assert!(v["count"].is_number(), "ast-search --json must include count");
+    assert!(
+        v["results"].is_array(),
+        "ast-search --json must wrap in {{results,count}}"
+    );
+    assert!(
+        v["count"].is_number(),
+        "ast-search --json must include count"
+    );
     let count = v["count"].as_u64().unwrap();
     assert_eq!(count, v["results"].as_array().unwrap().len() as u64);
 }
@@ -3817,7 +5441,10 @@ fn test_cli_missing_required_arg() {
     // callgraph without symbol
     let (_, stderr, code) = run_cli(&project, &["callgraph"]);
     assert_ne!(code, 0);
-    assert!(stderr.contains("Usage:"), "should show usage on missing arg");
+    assert!(
+        stderr.contains("Usage:"),
+        "should show usage on missing arg"
+    );
 }
 
 // clap-migrated (audit #4 Step 5, user-approved): a leading-dash numeric value
@@ -3829,7 +5456,10 @@ fn test_cli_missing_required_arg() {
 fn test_cli_callgraph_negative_depth_rejected() {
     let project = setup_indexed_project();
     let (_, _, code) = run_cli(&project, &["callgraph", "validateToken", "--depth", "-5"]);
-    assert_eq!(code, 2, "negative --depth must error (was: clamped to 1 / exit 0)");
+    assert_eq!(
+        code, 2,
+        "negative --depth must error (was: clamped to 1 / exit 0)"
+    );
 }
 
 // ============================================================
@@ -3853,7 +5483,9 @@ fn test_cli_search_limit_not_shrunk_by_test_filter() {
     // as one opaque token and never match a sub-word query).
     let mut real = String::new();
     for i in 0..9 {
-        real.push_str(&format!("export function find_gadget_real_{i}(): number {{ return {i}; }}\n"));
+        real.push_str(&format!(
+            "export function find_gadget_real_{i}(): number {{ return {i}; }}\n"
+        ));
     }
     std::fs::write(src.join("widgets.ts"), real).unwrap();
 
@@ -3861,7 +5493,9 @@ fn test_cli_search_limit_not_shrunk_by_test_filter() {
     // via the `.test.ts` path suffix, so they must NOT crowd out the real results.
     let mut testfns = String::new();
     for i in 0..12 {
-        testfns.push_str(&format!("export function find_gadget_case_{i}(): number {{ return {i}; }}\n"));
+        testfns.push_str(&format!(
+            "export function find_gadget_case_{i}(): number {{ return {i}; }}\n"
+        ));
     }
     std::fs::write(src.join("widgets.test.ts"), testfns).unwrap();
 
@@ -3887,7 +5521,10 @@ fn test_cli_search_limit_not_shrunk_by_test_filter() {
     // None of the returned results may come from the .test.ts file.
     for r in arr {
         let fp = r["file_path"].as_str().unwrap_or("");
-        assert!(!fp.ends_with(".test.ts"), "test-file symbol leaked into results: {fp}");
+        assert!(
+            !fp.ends_with(".test.ts"),
+            "test-file symbol leaked into results: {fp}"
+        );
     }
 }
 
@@ -3896,18 +5533,38 @@ fn test_cli_json_empty_search() {
     let project = setup_indexed_project();
     let (stdout, stderr, code) = run_cli(&project, &["search", "xyznonexistent", "--json"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[]", "JSON search with no results should output []");
-    assert!(stderr.contains("No results"), "stderr should still show hint");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "JSON search with no results should output []"
+    );
+    assert!(
+        stderr.contains("No results"),
+        "stderr should still show hint"
+    );
 }
 
 #[test]
 fn test_cli_json_empty_grep() {
-    if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }
+    if !has_ripgrep() {
+        eprintln!("skipping: rg not installed");
+        return;
+    }
     let project = setup_indexed_project();
     let (stdout, stderr, code) = run_cli(&project, &["grep", "xyznonexistent", "--json"]);
-    assert_eq!(code, 1, "no match exits 1 (grep parity) while keeping the JSON contract");
-    assert_eq!(stdout.trim(), "[]", "JSON grep with no results should output []");
-    assert!(stderr.contains("No matches"), "stderr should still show hint");
+    assert_eq!(
+        code, 1,
+        "no match exits 1 (grep parity) while keeping the JSON contract"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "JSON grep with no results should output []"
+    );
+    assert!(
+        stderr.contains("No matches"),
+        "stderr should still show hint"
+    );
 }
 
 #[test]
@@ -3916,11 +5573,19 @@ fn test_cli_json_empty_callgraph() {
     let (stdout, _, code) = run_cli(&project, &["callgraph", "xyznonexistent", "--json"]);
     assert_eq!(code, 1);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(v.is_object(), "JSON callgraph error should output JSON object");
+    assert!(
+        v.is_object(),
+        "JSON callgraph error should output JSON object"
+    );
     // v0.99.1 (roadmap §1.3): the miss is self-describing in-band, not a bare
     // {"results":[]} indistinguishable from an edge-less symbol under 2>/dev/null.
-    assert!(v["error"].as_str().unwrap_or("").contains("No call graph results"),
-        "in-band error field; got {stdout:?}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("No call graph results"),
+        "in-band error field; got {stdout:?}"
+    );
     assert_eq!(v["results"], serde_json::json!([]));
 }
 
@@ -3932,9 +5597,15 @@ fn test_cli_json_empty_show() {
     // v0.99.1 (roadmap §1.3): self-describing error object with the fuzzy
     // candidates in-band (they were stderr-only, invisible under 2>/dev/null).
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["error"], "Symbol not found", "in-band error; got {stdout:?}");
+    assert_eq!(
+        v["error"], "Symbol not found",
+        "in-band error; got {stdout:?}"
+    );
     assert_eq!(v["symbol"], "xyznonexistent");
-    assert!(v["candidates"].is_array(), "candidates array must be present (may be empty)");
+    assert!(
+        v["candidates"].is_array(),
+        "candidates array must be present (may be empty)"
+    );
 }
 
 #[test]
@@ -3961,7 +5632,10 @@ fn test_cli_json_empty_show_node_id_missing() {
     let (stdout, _, code) = run_cli(&project, &["show", "--node-id", "9999999", "--json"]);
     assert_eq!(code, 1);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["error"], "Node ID not found", "in-band error; got {stdout:?}");
+    assert_eq!(
+        v["error"], "Node ID not found",
+        "in-band error; got {stdout:?}"
+    );
     assert_eq!(v["node_id"], 9999999);
 }
 
@@ -4001,7 +5675,10 @@ fn test_cli_similar_accepts_limit_alias() {
     // both exit 0 — so the guard is: NOT a clap parse error.
     let project = setup_indexed_project();
     let (_stdout, stderr, code) = run_cli(&project, &["similar", "validateToken", "--limit", "3"]);
-    assert_ne!(code, 2, "clap must accept --limit as an alias; stderr: {stderr:?}");
+    assert_ne!(
+        code, 2,
+        "clap must accept --limit as an alias; stderr: {stderr:?}"
+    );
     assert!(
         !stderr.contains("unexpected argument"),
         "--limit must not be an unexpected argument; stderr: {stderr:?}"
@@ -4016,7 +5693,10 @@ fn test_cli_json_empty_overview() {
     // v0.99.1 (roadmap §1.3): self-describing error object instead of a bare `[]`
     // indistinguishable from an empty-but-indexed dir under 2>/dev/null.
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["error"], "No symbols found", "in-band error; got {stdout:?}");
+    assert_eq!(
+        v["error"], "No symbols found",
+        "in-band error; got {stdout:?}"
+    );
     assert_eq!(v["path"], "nonexistent/");
 }
 
@@ -4030,19 +5710,27 @@ fn test_cli_json_empty_dead_code() {
     // --min-lines 1 so the fixture's short dead symbols land in the candidate set
     // and are then ignore-suppressed (ignored_count is counted at the ACTIVE
     // min-lines; at the default 3 the short fixture symbols never reach it).
-    let (stdout, stderr, code) = run_cli(&project, &[
-        "dead-code",
-        "--min-lines", "1",
-        "--ignore", "src/",
-        "--ignore", "tests/",
-        "--json",
-    ]);
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "dead-code",
+            "--min-lines",
+            "1",
+            "--ignore",
+            "src/",
+            "--ignore",
+            "tests/",
+            "--json",
+        ],
+    );
     assert_eq!(code, 0, "dead-code with no matches should exit 0");
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .expect("dead-code --json must emit valid JSON on the ignored-empty path");
     assert_eq!(v["results"], serde_json::json!([]));
-    assert!(v["ignored_count"].as_u64().unwrap_or(0) >= 1,
-        "ignored_count must disclose the suppressed candidates; got {stdout:?}");
+    assert!(
+        v["ignored_count"].as_u64().unwrap_or(0) >= 1,
+        "ignored_count must disclose the suppressed candidates; got {stdout:?}"
+    );
     assert!(
         stderr.contains("No dead code"),
         "stderr should still surface the human-readable reason; got: {stderr}",
@@ -4057,7 +5745,11 @@ fn test_cli_json_empty_similar() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["similar", "xyznonexistent", "--json"]);
     assert_eq!(code, 1);
-    assert_eq!(stdout.trim(), "[]", "JSON similar with unknown symbol should output []");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "JSON similar with unknown symbol should output []"
+    );
 }
 
 #[test]
@@ -4093,11 +5785,23 @@ fn test_cli_json_empty_refs() {
     for args in cases {
         let (stdout, _, code) = run_cli(&project, args);
         assert_eq!(code, 1, "{args:?} should exit 1");
-        let v: serde_json::Value = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|_| panic!("{args:?}: refs --json must output valid JSON even on not-found; got: {stdout:?}"));
-        assert!(v.is_object(), "{args:?}: refs --json not-found should be an object, not a bare array; got: {stdout}");
-        assert!(v["references"].is_array(), "{args:?}: envelope must include references array");
-        assert!(v["by_relation"].is_object(), "{args:?}: envelope must include by_relation map");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+            panic!(
+                "{args:?}: refs --json must output valid JSON even on not-found; got: {stdout:?}"
+            )
+        });
+        assert!(
+            v.is_object(),
+            "{args:?}: refs --json not-found should be an object, not a bare array; got: {stdout}"
+        );
+        assert!(
+            v["references"].is_array(),
+            "{args:?}: envelope must include references array"
+        );
+        assert!(
+            v["by_relation"].is_object(),
+            "{args:?}: envelope must include by_relation map"
+        );
     }
 }
 
@@ -4127,8 +5831,14 @@ fn test_cli_json_empty_impact() {
     assert_eq!(code, 1);
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .expect("impact --json must output valid JSON even on not-found");
-    assert!(v.is_object(), "JSON impact not-found should be an object; got: {stdout}");
-    assert_eq!(v["symbol"], "xyznonexistent", "envelope echoes the queried symbol");
+    assert!(
+        v.is_object(),
+        "JSON impact not-found should be an object; got: {stdout}"
+    );
+    assert_eq!(
+        v["symbol"], "xyznonexistent",
+        "envelope echoes the queried symbol"
+    );
 }
 
 #[test]
@@ -4137,11 +5847,20 @@ fn test_cli_json_empty_ast_search() {
     // still emit the same {results,count} envelope as the populated path.
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["ast-search", "xyznonexistent", "--json"]);
-    assert_eq!(code, 0, "ast-search empty is a structural query success, not an error");
+    assert_eq!(
+        code, 0,
+        "ast-search empty is a structural query success, not an error"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .expect("ast-search --json must output valid JSON even on no-match");
-    assert!(v.is_object(), "ast-search --json empty should be the {{results,count}} envelope");
-    assert!(v["results"].is_array(), "envelope must include results array");
+    assert!(
+        v.is_object(),
+        "ast-search --json empty should be the {{results,count}} envelope"
+    );
+    assert!(
+        v["results"].is_array(),
+        "envelope must include results array"
+    );
     assert_eq!(v["count"], 0, "empty result count is 0");
 }
 
@@ -4152,20 +5871,32 @@ fn test_cli_search_filter_emptied_discloses() {
     // previously a bare `[]`, byte-identical to a true zero-hit under
     // `2>/dev/null`. Text mode gets a stdout line for the same reason.
     let project = setup_indexed_project();
-    let (stdout, _, code) = run_cli(&project, &["search", "validateToken", "--language", "python", "--json"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["search", "validateToken", "--language", "python", "--json"],
+    );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["results"], serde_json::json!([]));
-    assert!(v["filtered_out"].as_u64().unwrap_or(0) >= 1,
-        "filtered_out must disclose the removed candidates; got {stdout:?}");
-    assert!(v["filter"].as_str().unwrap_or("").contains("python"),
-        "active filter must be named; got {stdout:?}");
+    assert!(
+        v["filtered_out"].as_u64().unwrap_or(0) >= 1,
+        "filtered_out must disclose the removed candidates; got {stdout:?}"
+    );
+    assert!(
+        v["filter"].as_str().unwrap_or("").contains("python"),
+        "active filter must be named; got {stdout:?}"
+    );
 
     // Text mode: the disclosure reaches stdout (not only stderr).
-    let (t_stdout, _, t_code) = run_cli(&project, &["search", "validateToken", "--language", "python"]);
+    let (t_stdout, _, t_code) = run_cli(
+        &project,
+        &["search", "validateToken", "--language", "python"],
+    );
     assert_eq!(t_code, 0);
-    assert!(t_stdout.contains("removed by the active filter"),
-        "text mode must disclose on stdout; got {t_stdout:?}");
+    assert!(
+        t_stdout.contains("removed by the active filter"),
+        "text mode must disclose on stdout; got {t_stdout:?}"
+    );
 
     // Negative control: a true zero-hit (no filter) keeps the plain `[]`.
     let (z_stdout, _, _) = run_cli(&project, &["search", "xyznonexistent", "--json"]);
@@ -4177,20 +5908,39 @@ fn test_cli_ast_search_filter_emptied_discloses() {
     // Same disclosure for ast-search's structural filters (§1.1): query hits +
     // an over-selective --returns → envelope carries filtered_out + filter.
     let project = setup_indexed_project();
-    let (stdout, _, code) = run_cli(&project, &["ast-search", "validateToken", "--returns", "zzznope", "--json"]);
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "ast-search",
+            "validateToken",
+            "--returns",
+            "zzznope",
+            "--json",
+        ],
+    );
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["results"], serde_json::json!([]));
     assert_eq!(v["count"], 0);
-    assert!(v["filtered_out"].as_u64().unwrap_or(0) >= 1,
-        "filtered_out must disclose the removed candidates; got {stdout:?}");
-    assert!(v["filter"].as_str().unwrap_or("").contains("returns: zzznope"),
-        "active filter must be named; got {stdout:?}");
+    assert!(
+        v["filtered_out"].as_u64().unwrap_or(0) >= 1,
+        "filtered_out must disclose the removed candidates; got {stdout:?}"
+    );
+    assert!(
+        v["filter"]
+            .as_str()
+            .unwrap_or("")
+            .contains("returns: zzznope"),
+        "active filter must be named; got {stdout:?}"
+    );
 
     // Negative control: a no-hit query (nothing filtered) keeps the bare envelope.
     let (z_stdout, _, _) = run_cli(&project, &["ast-search", "xyznonexistent", "--json"]);
     let z: serde_json::Value = serde_json::from_str(z_stdout.trim()).unwrap();
-    assert!(z.get("filtered_out").is_none(), "no disclosure fields on a true zero-hit");
+    assert!(
+        z.get("filtered_out").is_none(),
+        "no disclosure fields on a true zero-hit"
+    );
 }
 
 #[test]
@@ -4213,14 +5963,18 @@ fn test_cli_dead_code_below_threshold_json_discloses() {
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["results"], serde_json::json!([]));
-    assert!(v["below_threshold_count"].as_u64().unwrap_or(0) >= 1,
-        "below_threshold_count must disclose hidden short symbols; got {stdout:?}");
+    assert!(
+        v["below_threshold_count"].as_u64().unwrap_or(0) >= 1,
+        "below_threshold_count must disclose hidden short symbols; got {stdout:?}"
+    );
     assert_eq!(v["min_lines"], 3, "the active threshold must be named");
 
     // Text mode: the rerun hint reaches stdout too.
     let (t_stdout, _, _) = run_cli(&project, &["dead-code"]);
-    assert!(t_stdout.contains("--min-lines 1"),
-        "text mode must put the rerun hint on stdout; got {t_stdout:?}");
+    assert!(
+        t_stdout.contains("--min-lines 1"),
+        "text mode must put the rerun hint on stdout; got {t_stdout:?}"
+    );
 }
 
 #[test]
@@ -4232,10 +5986,26 @@ fn test_cli_cycles_truncation_discloses() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("a.ts"), "import { b } from './b';\nexport function a(): number { return b(); }\n").unwrap();
-    std::fs::write(src.join("b.ts"), "import { a } from './a';\nexport function b(): number { return a(); }\n").unwrap();
-    std::fs::write(src.join("c.ts"), "import { d } from './d';\nexport function c(): number { return d(); }\n").unwrap();
-    std::fs::write(src.join("d.ts"), "import { c } from './c';\nexport function d(): number { return c(); }\n").unwrap();
+    std::fs::write(
+        src.join("a.ts"),
+        "import { b } from './b';\nexport function a(): number { return b(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("b.ts"),
+        "import { a } from './a';\nexport function b(): number { return a(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("c.ts"),
+        "import { d } from './d';\nexport function c(): number { return d(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("d.ts"),
+        "import { c } from './c';\nexport function d(): number { return c(); }\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -4245,19 +6015,27 @@ fn test_cli_cycles_truncation_discloses() {
     let (stdout, _, code) = run_cli(&project, &["cycles", "--limit", "1", "--json"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(v["truncated"], true, "truncation must be disclosed; got {stdout:?}");
+    assert_eq!(
+        v["truncated"], true,
+        "truncation must be disclosed; got {stdout:?}"
+    );
     assert_eq!(v["total_found"], 2);
     assert_eq!(v["results"].as_array().unwrap().len(), 1);
 
     let (t_stdout, _, _) = run_cli(&project, &["cycles", "--limit", "1"]);
-    assert!(t_stdout.contains("showing 1 of 2"),
-        "text mode must print the pre-truncation total; got {t_stdout:?}");
+    assert!(
+        t_stdout.contains("showing 1 of 2"),
+        "text mode must print the pre-truncation total; got {t_stdout:?}"
+    );
 
     // Untruncated: plain array shape, both cycles present.
     let (full, _, _) = run_cli(&project, &["cycles", "--json"]);
     let fv: serde_json::Value = serde_json::from_str(full.trim()).unwrap();
-    assert_eq!(fv.as_array().map(|a| a.len()), Some(2),
-        "untruncated cycles keeps the plain array; got {full:?}");
+    assert_eq!(
+        fv.as_array().map(|a| a.len()),
+        Some(2),
+        "untruncated cycles keeps the plain array; got {full:?}"
+    );
 }
 
 #[test]
@@ -4268,17 +6046,24 @@ fn test_cli_ast_search_freshness_partial_in_json() {
     let project = setup_indexed_project();
     let (fresh, _, _) = run_cli(&project, &["ast-search", "hashPassword", "--json"]);
     let fv: serde_json::Value = serde_json::from_str(fresh.trim()).unwrap();
-    assert!(fv.get("freshness_partial").is_none(),
-        "fully-fresh run must not carry the marker; got {fresh:?}");
+    assert!(
+        fv.get("freshness_partial").is_none(),
+        "fully-fresh run must not carry the marker; got {fresh:?}"
+    );
 
     prepend_pad(&project, "src/auth.ts", 1);
 
-    let (stale, _, code) = run_cli_env(&project, &["ast-search", "hashPassword", "--json"],
-        &[("CODE_GRAPH_RESYNC_BUDGET", "0")]);
+    let (stale, _, code) = run_cli_env(
+        &project,
+        &["ast-search", "hashPassword", "--json"],
+        &[("CODE_GRAPH_RESYNC_BUDGET", "0")],
+    );
     assert_eq!(code, 0);
     let sv: serde_json::Value = serde_json::from_str(stale.trim()).unwrap();
-    assert_eq!(sv["freshness_partial"], true,
-        "partial resync must be disclosed in-band; got {stale:?}");
+    assert_eq!(
+        sv["freshness_partial"], true,
+        "partial resync must be disclosed in-band; got {stale:?}"
+    );
 }
 
 #[test]
@@ -4288,7 +6073,11 @@ fn test_cli_json_empty_centrality() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("solo.ts"), "export function alone(): number { return 1; }\n").unwrap();
+    std::fs::write(
+        src.join("solo.ts"),
+        "export function alone(): number { return 1; }\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -4296,7 +6085,11 @@ fn test_cli_json_empty_centrality() {
 
     let (stdout, _, code) = run_cli(&project, &["centrality", "--json"]);
     assert_eq!(code, 0, "no chokepoints is success, not an error");
-    assert_eq!(stdout.trim(), "[]", "empty centrality must emit [] per the JSON-empty contract");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "empty centrality must emit [] per the JSON-empty contract"
+    );
 }
 
 #[test]
@@ -4314,10 +6107,23 @@ fn test_cli_json_empty_map() {
     assert_eq!(code, 0, "map exits 0 even for an empty project");
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .expect("map --json must output valid JSON for an empty project");
-    assert!(v.is_object(), "map --json is an object envelope; got: {stdout}");
-    assert!(v["modules"].is_array(), "envelope must include modules array");
-    assert_eq!(v["modules"].as_array().unwrap().len(), 0, "empty project has no modules");
-    assert!(v["hot_functions"].is_array(), "envelope must include hot_functions array");
+    assert!(
+        v.is_object(),
+        "map --json is an object envelope; got: {stdout}"
+    );
+    assert!(
+        v["modules"].is_array(),
+        "envelope must include modules array"
+    );
+    assert_eq!(
+        v["modules"].as_array().unwrap().len(),
+        0,
+        "empty project has no modules"
+    );
+    assert!(
+        v["hot_functions"].is_array(),
+        "envelope must include hot_functions array"
+    );
 }
 
 #[test]
@@ -4326,20 +6132,40 @@ fn test_cli_json_empty_affected() {
     // same-shape object with empty changed/tests/affected_files and the raw input
     // echoed in not_indexed. Exits 0 (structural analysis, not a lookup).
     let project = setup_indexed_project();
-    let (stdout, _, code) = run_cli(&project, &["affected", "src/nonexistent_file_xyz.rs", "--json"]);
-    assert_eq!(code, 0, "affected exits 0 even when no input file is indexed");
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["affected", "src/nonexistent_file_xyz.rs", "--json"],
+    );
+    assert_eq!(
+        code, 0,
+        "affected exits 0 even when no input file is indexed"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .expect("affected --json must output valid JSON even when nothing is affected");
-    assert!(v.is_object(), "affected --json is an object envelope; got: {stdout}");
+    assert!(
+        v.is_object(),
+        "affected --json is an object envelope; got: {stdout}"
+    );
     assert!(
         v["changed"].is_array() && v["changed"].as_array().unwrap().is_empty(),
         "no indexed changed files"
     );
     assert!(v["tests"].is_array(), "envelope must include tests array");
-    assert!(v["affected_files"].is_array(), "envelope must include affected_files array");
+    assert!(
+        v["affected_files"].is_array(),
+        "envelope must include affected_files array"
+    );
     let not_indexed: Vec<&str> = v["not_indexed"]
-        .as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
-    assert_eq!(not_indexed, ["src/nonexistent_file_xyz.rs"], "raw input echoed in not_indexed");
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        not_indexed,
+        ["src/nonexistent_file_xyz.rs"],
+        "raw input echoed in not_indexed"
+    );
 }
 
 #[test]
@@ -4355,11 +6181,13 @@ fn test_index_counts_parse_error_files() {
     std::fs::write(
         src.join("broken.ts"),
         "export function broken( { const x = ;;; @@@ return\n",
-    ).unwrap();
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
-    let result = code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    let result =
+        code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
     assert!(
         result.stats.files_with_parse_errors >= 1,
         "a syntax-error file must be counted; got {}",
@@ -4374,7 +6202,8 @@ fn test_index_clean_project_zero_parse_errors() {
     let project = setup_indexed_project();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
-    let result = code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    let result =
+        code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
     assert_eq!(
         result.stats.files_with_parse_errors, 0,
         "clean fixture must report zero parse errors; got {}",
@@ -4393,8 +6222,9 @@ fn test_cli_similar_node_id_missing_accurate_and_json() {
     let project = setup_indexed_project();
     let (stdout, stderr, code) = run_cli(&project, &["similar", "--node-id", "99999999", "--json"]);
     assert_eq!(code, 1);
-    serde_json::from_str::<serde_json::Value>(stdout.trim())
-        .unwrap_or_else(|_| panic!("similar --node-id missing --json must emit valid JSON; got: {stdout:?}"));
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|_| {
+        panic!("similar --node-id missing --json must emit valid JSON; got: {stdout:?}")
+    });
     assert!(
         stderr.contains("not found"),
         "stderr should state the node_id was not found; got: {stderr}"
@@ -4426,8 +6256,10 @@ fn test_cli_similar_help_exits_zero() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["similar", "--help"]);
     assert_eq!(code, 0, "similar --help should exit 0 (clap help)");
-    assert!(stdout.contains("similar code") || stdout.contains("--top-k"),
-        "help should describe the command; got: {stdout:?}");
+    assert!(
+        stdout.contains("similar code") || stdout.contains("--top-k"),
+        "help should describe the command; got: {stdout:?}"
+    );
 }
 
 #[test]
@@ -4457,8 +6289,14 @@ fn test_cli_callgraph_requested_depth_preserved() {
         v["requested_max_depth"]
     );
     let eff = v["effective_max_depth"].as_i64().unwrap();
-    assert!(eff <= 10, "effective should be capped at CALL_GRAPH_MAX_DEPTH=10, got {eff}");
-    assert!(eff < 99, "effective ({eff}) must be visibly less than requested (99)");
+    assert!(
+        eff <= 10,
+        "effective should be capped at CALL_GRAPH_MAX_DEPTH=10, got {eff}"
+    );
+    assert!(
+        eff < 99,
+        "effective ({eff}) must be visibly less than requested (99)"
+    );
 }
 
 #[test]
@@ -4474,7 +6312,10 @@ fn test_cli_callgraph_json_includes_parent_id() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     let results = v["results"].as_array().expect("results is array");
     let with_parent = results.iter().filter(|r| !r["parent_id"].is_null()).count();
-    let depth_gt_zero = results.iter().filter(|r| r["depth"].as_i64().unwrap_or(0) > 0).count();
+    let depth_gt_zero = results
+        .iter()
+        .filter(|r| r["depth"].as_i64().unwrap_or(0) > 0)
+        .count();
     assert!(
         with_parent > 0 && with_parent == depth_gt_zero,
         "every non-root row must carry parent_id; with_parent={with_parent} depth>0={depth_gt_zero}"
@@ -4496,8 +6337,11 @@ fn setup_tour_project() -> TempDir {
     // NB: export *functions*, not `const`s — top-level const exports are not
     // extracted as symbol nodes, so importing them produces no REL_IMPORTS edge
     // and the cross-module dependency (the whole point here) would silently vanish.
-    mk("src/core", "util.ts",
-        "export function clampLen(x: string): number { return x.length; }\n");
+    mk(
+        "src/core",
+        "util.ts",
+        "export function clampLen(x: string): number { return x.length; }\n",
+    );
     mk("src/store", "store.ts",
         "import { clampLen } from '../core/util';\nexport function saveItem(x: string): boolean { return clampLen(x) < 10; }\n");
     mk("src/api", "handlers.ts",
@@ -4511,8 +6355,12 @@ fn setup_tour_project() -> TempDir {
 }
 
 fn tour_paths(v: &serde_json::Value) -> Vec<String> {
-    v["reading_order"].as_array().unwrap().iter()
-        .map(|e| e["path"].as_str().unwrap().to_string()).collect()
+    v["reading_order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect()
 }
 
 #[test]
@@ -4523,10 +6371,20 @@ fn test_cli_tour_orders_prerequisites_first() {
     assert_eq!(code, 0, "stdout: {stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json envelope");
     let paths = tour_paths(&v);
-    let pos = |p: &str| paths.iter().position(|x| x == p)
-        .unwrap_or_else(|| panic!("module {p} missing from {paths:?}"));
-    assert!(pos("src/core") < pos("src/store"), "core before store; got {paths:?}");
-    assert!(pos("src/store") < pos("src/api"), "store before api; got {paths:?}");
+    let pos = |p: &str| {
+        paths
+            .iter()
+            .position(|x| x == p)
+            .unwrap_or_else(|| panic!("module {p} missing from {paths:?}"))
+    };
+    assert!(
+        pos("src/core") < pos("src/store"),
+        "core before store; got {paths:?}"
+    );
+    assert!(
+        pos("src/store") < pos("src/api"),
+        "store before api; got {paths:?}"
+    );
 }
 
 #[test]
@@ -4535,18 +6393,27 @@ fn test_cli_tour_json_shape() {
     let (stdout, _, code) = run_cli(&project, &["tour", "--json"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json envelope");
-    let arr = v["reading_order"].as_array().expect("reading_order is an array");
+    let arr = v["reading_order"]
+        .as_array()
+        .expect("reading_order is an array");
     assert!(!arr.is_empty());
     let core = arr.iter().find(|e| e["path"] == "src/core").unwrap();
-    assert_eq!(core["role"], "foundational", "core imports nothing in-scope");
+    assert_eq!(
+        core["role"], "foundational",
+        "core imports nothing in-scope"
+    );
     assert_eq!(core["depended_on_by"], 1, "store imports core");
     assert!(core["depends_on"].as_array().unwrap().is_empty());
     assert!(core["in_cycle"].is_boolean());
     assert!(core["key_symbols"].is_array());
     // The dependent module records its in-scope import.
     let store = arr.iter().find(|e| e["path"] == "src/store").unwrap();
-    let store_deps: Vec<&str> = store["depends_on"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap()).collect();
+    let store_deps: Vec<&str> = store["depends_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
     assert_eq!(store_deps, ["src/core"], "store imports core");
 }
 
@@ -4558,7 +6425,11 @@ fn test_cli_tour_path_scope() {
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
     let paths = tour_paths(&v);
-    assert_eq!(paths, ["src/store"], "only the scoped module remains; got {paths:?}");
+    assert_eq!(
+        paths,
+        ["src/store"],
+        "only the scoped module remains; got {paths:?}"
+    );
 }
 
 #[test]
@@ -4567,9 +6438,15 @@ fn test_cli_json_empty_tour() {
     // same-shape object envelope on stdout (not a bare bail to stderr).
     let project = setup_tour_project();
     let (stdout, _, code) = run_cli(&project, &["tour", "zznonexistent/", "--json"]);
-    assert_eq!(code, 0, "empty tour exits 0 (structural overview, not a lookup)");
-    assert_eq!(stdout.trim(), r#"{"reading_order":[]}"#,
-        "empty result must be the same-shape envelope");
+    assert_eq!(
+        code, 0,
+        "empty tour exits 0 (structural overview, not a lookup)"
+    );
+    assert_eq!(
+        stdout.trim(),
+        r#"{"reading_order":[]}"#,
+        "empty result must be the same-shape envelope"
+    );
 }
 
 #[test]
@@ -4578,15 +6455,23 @@ fn test_cli_cycles_detects_circular_imports() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("a.ts"), r#"
+    std::fs::write(
+        src.join("a.ts"),
+        r#"
 import { fromB } from './b';
 export function fromA(): number { return fromB() + 1; }
-"#).unwrap();
-    std::fs::write(src.join("b.ts"), r#"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("b.ts"),
+        r#"
 import { fromA } from './a';
 export function fromB(): number { return 2; }
 export function alsoB(): number { return fromA(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -4597,9 +6482,17 @@ export function alsoB(): number { return fromA(); }
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("cycles --json must emit valid JSON");
     let arr = v.as_array().expect("cycles --json is an array");
-    assert_eq!(arr.len(), 1, "exactly one import cycle expected; got {stdout}");
+    assert_eq!(
+        arr.len(),
+        1,
+        "exactly one import cycle expected; got {stdout}"
+    );
     let files: Vec<&str> = arr[0]["files"]
-        .as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
     assert_eq!(files, ["src/a.ts", "src/b.ts"], "the cycle is a.ts ↔ b.ts");
 }
 
@@ -4610,7 +6503,11 @@ fn test_cli_json_empty_cycles() {
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["cycles", "--json"]);
     assert_eq!(code, 0, "no circular imports is success, not an error");
-    assert_eq!(stdout.trim(), "[]", "empty cycles must emit [] per the JSON-empty contract");
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "empty cycles must emit [] per the JSON-empty contract"
+    );
 }
 
 #[test]
@@ -4621,24 +6518,36 @@ fn test_cli_surprising_detects_cross_module_call() {
     let lib = project.path().join("lib");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&lib).unwrap();
-    std::fs::write(lib.join("b.ts"), "export function helper(): number { return 42; }\n").unwrap();
-    std::fs::write(src.join("a.ts"), r#"
+    std::fs::write(
+        lib.join("b.ts"),
+        "export function helper(): number { return 42; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("a.ts"),
+        r#"
 import { helper } from '../lib/b';
 export function doWork(): number { return helper(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
     code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
 
     let (stdout, stderr, code) = run_cli(&project, &["surprising", "--json"]);
-    assert_eq!(code, 0, "surprising exits 0; stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "surprising exits 0; stdout={stdout} stderr={stderr}"
+    );
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("surprising --json must emit valid JSON");
     let arr = v.as_array().expect("surprising --json is an array");
     assert!(
-        arr.iter().any(|c| c["source"].as_str() == Some("doWork")
-            && c["target"].as_str() == Some("helper")),
+        arr.iter()
+            .any(|c| c["source"].as_str() == Some("doWork")
+                && c["target"].as_str() == Some("helper")),
         "should surface the cross-module doWork → helper call; got {stdout}"
     );
 }
@@ -4649,15 +6558,26 @@ fn test_cli_json_empty_surprising() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("solo.ts"), "export function alone(): number { return 1; }\n").unwrap();
+    std::fs::write(
+        src.join("solo.ts"),
+        "export function alone(): number { return 1; }\n",
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
     code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
 
     let (stdout, _, code) = run_cli(&project, &["surprising", "--json"]);
-    assert_eq!(code, 0, "no surprising connections is success, not an error");
-    assert_eq!(stdout.trim(), "[]", "empty must emit [] per the JSON-empty contract");
+    assert_eq!(
+        code, 0,
+        "no surprising connections is success, not an error"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "[]",
+        "empty must emit [] per the JSON-empty contract"
+    );
 }
 
 #[test]
@@ -4666,14 +6586,22 @@ fn test_cli_report_aggregates_all_sections() {
     let project = TempDir::new().unwrap();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("a.ts"), r#"
+    std::fs::write(
+        src.join("a.ts"),
+        r#"
 import { fromB } from './b';
 export function fromA(): number { return fromB(); }
-"#).unwrap();
-    std::fs::write(src.join("b.ts"), r#"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("b.ts"),
+        r#"
 import { fromA } from './a';
 export function fromB(): number { return fromA(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
     let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
@@ -4686,12 +6614,29 @@ export function fromB(): number { return fromA(); }
 
     // Object envelope with a populated summary and every section present as an array.
     let summary = v.get("summary").expect("report has a summary");
-    assert!(summary["files"].as_i64().unwrap() >= 2, "summary counts files");
-    assert!(summary["confidence"].is_object(), "summary has a confidence breakdown");
-    for key in ["hot_functions", "chokepoints", "import_cycles", "surprising_connections", "dead_code"] {
-        assert!(v.get(key).map(|x| x.is_array()).unwrap_or(false), "section `{key}` is present as an array");
+    assert!(
+        summary["files"].as_i64().unwrap() >= 2,
+        "summary counts files"
+    );
+    assert!(
+        summary["confidence"].is_object(),
+        "summary has a confidence breakdown"
+    );
+    for key in [
+        "hot_functions",
+        "chokepoints",
+        "import_cycles",
+        "surprising_connections",
+        "dead_code",
+    ] {
+        assert!(
+            v.get(key).map(|x| x.is_array()).unwrap_or(false),
+            "section `{key}` is present as an array"
+        );
     }
     // The mutual import is a real cycle, so that section must be non-empty.
-    assert!(!v["import_cycles"].as_array().unwrap().is_empty(),
-        "should report the a.ts <-> b.ts import cycle; got {stdout}");
+    assert!(
+        !v["import_cycles"].as_array().unwrap().is_empty(),
+        "should report the a.ts <-> b.ts import cycle; got {stdout}"
+    );
 }

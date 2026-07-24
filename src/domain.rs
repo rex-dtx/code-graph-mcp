@@ -129,7 +129,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 51; // v51: Rust axum route extraction — `.route(path, get(h).post(h2))` builder chains now emit one routes_to self-edge per (method, handler) pair, with inline `.nest("/prefix", …)` prefix composition (ancestor byte-range walk; cross-variable nest is a documented non-goal — needs dataflow). Named + path-qualified handlers resolve (last `::` segment, same-file + existing cross-file routes_to recovery); closures skipped (no Rust synthetic-handler materializer yet). Scoped STRICTLY to `.route` links so bare `.get()` (reqwest/HashMap) cannot fabricate routes (negative test). actix/rocket/Java Spring remain unextracted and are named in the trace empty-result hint, not silently claimed. // v50: constructor-instantiation call edges — JS/TS/TSX `new Foo()` / `new ns.Foo()` (new_expression), C# `new Foo()` / `new Ns.Bar()` and PHP `new Foo()` / `new Ns\Bar()` (object_creation_expression) now emit a `calls` edge to the class (constructor) name. A `new_expression`/`object_creation_expression` callee never reached the call_expression/invocation arms, and JS/C#/PHP have no type-reference pass firing on a `new` slot, so a class that was ONLY instantiated (never called as `Foo.method()`) had NO incoming edge at all — invisible to callgraph/impact AND false-flagged dead-code. Member/qualified forms (`new ns.Foo()`, `new Ns.Bar()`, `new Ns\Bar()`) bind on the bare class name (JS carries a Receiver qualifier for a simple-identifier receiver, mirroring member call_expressions); generic tails (`new Foo<T>()`) are stripped. Java `object_creation_expression` is deliberately unchanged — its `new` type already emits a `references` edge via extract_java_type_reference (dead-code-safe); Kotlin/Swift/Python/Ruby constructors are plain call/call_expression nodes (already covered); Rust struct_expression / Go composite literals covered by existing passes. Also v50: C# top-level/nested `local_function_statement` is now extracted as a function-kind symbol node (was unextracted, so a top-level `void Greet(){}` invoked via the v49 `<module>` call edge dangled unresolved and the fn was invisible to callgraph/impact/dead-code). Also v50: NUL-byte stripping (NUL→space) now covers the signature triplet `return_type`/`param_types`/`signature` (and the `context_string` built from them in the indexer) across the extract_signature_info / extract_c_signature_info path and the Dart per-language extractors — SQLite stores TEXT as a C-string so a stored NUL silently truncates a `LIKE`/substring match at the NUL; previously only code_content (v48) and doc_comment (v49) were stripped, leaving the sig fields live-truncatable. Also v50 (metadata form only, byte-identical for identifier-only inputs): the rtype (Python receiver-type) and impl_method (Rust trait-impl) edge metadata are now built via serde_json::json! (escapes `"`/`\` in source-derived payloads) instead of format! — the last two format!-built metadata sites, matching serialize_callee_qualifier (b785bd3). Old indexes lack the new call edges + local-fn nodes; bump to rebuild. — v49: top-level/library-level calls now attribute to `<module>` for C# (invocation_expression), Kotlin + Swift (generic call_expression fallback), and Dart (selector) — previously each required Some(active_scope) so a function invoked only from a top-level statement / file-level script had no incoming edge and was false-flagged dead-code (mirrors the php/python/ruby/bash `<module>` fallback; Rust/Go/Java/C stay deliberately excluded — no bare top-level call statements). Also v49: Dart `mixin M {}` is now extracted as a class-kind symbol node (mixin_declaration's name is a positional identifier child, missed by the name-field class arm) so the `class C ... with M` inherits edge survives Phase-2 same-language resolution instead of dropping to `<external>`. Also v49 (metadata form only, byte-identical for identifier-only inputs): callee-qualifier edge metadata is now built via serde_json::json! (escapes `"`/`\` in source-derived payloads); doc_comment now strips NUL bytes (NUL→space, same as code_content since v48) so FTS5 doesn't truncate it. Old indexes lack the new edges/nodes; bump to rebuild. — v48: extracted code_content now strips NUL bytes (truncate_code_content replaces `\0` with a space). SQLite/FTS5 tokenize stored TEXT as a C-string and stop at the first NUL, so a source file with an embedded NUL (mis-detected binary / generated blob) left everything after it unsearchable. Only NUL-containing content changes; normal source is byte-identical. Old indexes keep the truncated FTS until rebuilt. — v47: the import-contradiction call-edge prune (prune_import_contradicted_call_edges) no longer fires when the caller's code_content was truncated (truncate_code_content caps at max_code_content_len=4096 and appends a three-dot sentinel). Its `.name(` qualified-call guard reads code_content, so a qualified call beyond the cap was sliced off → instr false-negative → a real call edge false-pruned. Now: truncated caller (code_content LIKE '%...') keeps the edge (safe direction). Old indexes may have dropped such edges; bump to rebuild. — v46: C/C++ `#include "own.h"` now resolves to the indexed header's <module> node (an IMPORTS edge), mirroring PHP require / JS require — the include arm previously emitted only a bare stem with no path metadata, so a local header include fell to `<external>/<stem>` and deps/cycles/affected/project_map under-reported the dependency. Old indexes lack these header edges; bump to rebuild. — v45: PHP top-level calls (outside any function/method, e.g. a bare `greetPhp();` in a script) now attribute to `<module>` instead of being dropped, mirroring the python/ruby/bash arms — the PHP call arm previously required `Some(active_scope)`, so a function invoked only at the top level had no incoming edge and was false-flagged dead-code. Old indexes lack these edges; bump to rebuild. — v44: `classify_edge_confidence` no longer downgrades type/path-qualifier-resolved cross-file calls (self/stype/rtype/path metadata) to `ambiguous` when the bare name is duplicated — they were precisely resolved by a structural signal, not a bare-name guess, so the default confidence floor was hiding real `self.method()` / `Alpha::foo()` edges from callgraph/impact. Old indexes carry the stale `ambiguous` labels; bump to reclassify. — v43: Java `import` statements are now extracted (`import p.B;`, `import java.util.List;`, static imports → REL_IMPORTS to the last segment; wildcard `import x.*` skipped). Previously `import_declaration` matched only under `config.name == "swift"`, so Java import edges were 0 — `<external>` nodes absent, import-aware call resolution dead for Java, imported classes false-flagged dead-code. Old indexes lack these edges; bump to rebuild. — v42: the pending-call sweep (`resolve_pending_calls`, drains `pending_unresolved_calls` on incremental/watch passes) now applies the SAME callee-qualifier filtering Phase 2 does — a buffered receiver-typed call (Python `w.write()` with `w` inferred `DataWriter`) binds only to `DataWriter.write`, not every same-language `write`. Old indexes carry the wrong bare-name edges (false callers into same-name siblings) until rebuilt, so bump to wipe+rebuild. — v41: TS/JS destructuring exports (`export const { host, port } = getConfig()`, `export const [a, b] = getPair()`) now extract ONE `constant` node per bound identifier instead of a single node named after the literal pattern text (`{ host, port }`). That text is no valid identifier, so `import { host }` dangled to the `<external>` sentinel and the destructured symbols were unusable by name and invisible to show/callgraph/find_references — the v39 const-export import-edge fix silently missed every destructuring form. Common in the wild: Redux `export const { actions, reducer } = slice`, React `export const { Provider } = createContext()`, RTK Query hook exports. Renamed `{ key: local }` binds the local (value) side; defaults (`{ x = 1 }`), rest (`{ ...r }` / `[...r]`), and nested patterns recurse to leaf identifiers (collect_binding_names). Only EXPORTED top-level declarations are affected (the v39 guard is unchanged). Also in v41: TS/JS `export { X, Y } from './mod'` re-exports (barrel / index files) now emit a REL_IMPORTS dependency edge per re-exported name (js_module-stamped like a regular named import, so Phase-2 resolves each to the source file). Previously a re-export produced ZERO edges — a barrel file had no tracked dependency and was invisible to deps/affected/impact/cycles/tour and missed by find-references. `export * from './mod'` wildcards stay module-level-unresolved (a shared limitation with namespace imports `import * as ns`). Existing indexes gain the per-binding nodes + re-export edges only after rebuild, hence the bump. v40: `.h` headers containing C++ constructs are now parsed as C++, not C. `.h` is C-vs-C++ ambiguous by extension so detect_language maps it to C, but the C grammar can't parse `class`/`namespace` — so C++ classes declared in a `.h` header (the MOST common C++ layout: declaration in `.h`, definition in `.cpp`) and their base-class `inherits` edges were silently dropped (the `.cpp` linked fine via is_compatible_lang, but the header's own class SYMBOLS never existed as nodes — overview/callgraph/dead-code/find_references were blind to them). index_files now content-sniffs a `.h` detected as C: if it contains C++ markers (`::`, `public:`/`private:`/`protected:`, `class `, `namespace `, `template<`) it parses as C++ (looks_like_cpp_header), so the classes/structs and their inheritance are captured. Gated on markers so a pure-C header stays C; a false positive is low-harm because the C++ grammar is a near-superset of C. Existing indexes gain the header class nodes only after rebuild, hence the bump. v39: TS/JS top-level `export const/let X = <value>` (config constants, route tables, and widely-imported singletons like `const store = defineStore(...)` / `const logger = createLogger(...)` / `const svc = new Service()`) are now extracted as `constant` symbol nodes, so `import { X } from './mod'` resolves to a real node and forms a REL_IMPORTS edge instead of binding to the `<external>` sentinel — the cross-module dependency was previously invisible to tour/affected/impact/project_map (feedback_const_export_no_import_edge). Only EXPORTED top-level declarations are extracted (a local `const x = 5` in a function body can't be imported cross-file, so extracting it would be pure noise); function-valued consts stay `function` (arrow branch, unchanged). Type mirrors the existing Rust `const_item`/`static_item` extraction — this is TS/JS reaching parity. Scope is TS/JS only: Go package-level `const`/`var`, Python module constants, and Java `static final` fields have different import idioms and remain unextracted (measured: the const-value cross-module import pattern is material in TS/JS — 66 sole-link invisible module deps across 4 sampled projects; other languages await their own evidence). Existing indexes gain the new nodes/edges only after rebuild, hence the bump. v38: method-candidate type filter escapes SQL LIKE metacharacters — a receiver/impl type name containing `_` or `%` (legal identifiers like `my_widget` / `Foo_Bar`) is now matched literally in filter_method_ids (`Data_X.%` no longer also captures `DataYX.run` via the `_` single-char wildcard). Affects the type-restricted resolution paths — Rust `self.method()` (SelfType) and Python constructor-inferred `recv.method()` (rtype, issue #32 cause 2) — which bind only to the genuine type's method during Phase-2 resolution instead of also a sibling type whose name differs only where `_` fell. Existing indexes carry the rare stale false-positive edge until rebuilt, hence the bump. v37: Python receiver-type call resolution (issue #32 cause 2) — a call `recv.method()` whose receiver type is fixed EITHER by a single local `recv = ClassName(...)` constructor assignment OR by an explicit parameter annotation `def f(recv: ClassName)` now carries `{"q":"rtype","v":"ClassName"}` metadata (infer_python_call_receiver_type), so Phase-2 resolution binds it to `ClassName.method` via self_filter_candidates instead of dropping the whole ambiguous by-name fan-out when the method name is shared across classes. Before: `writer.write()` with `write` defined on 3 classes produced NO edge → all 3 reported dead + no callers in callgraph/impact. Conservative: only a provably-single constructor assignment infers a type; a wrong/unknown type fails the candidate filter and drops (never a false cross-type edge). New edges appear only after rebuild. v36: Python decorated `def`/`class` symbols now bind to the enclosing tree-sitter `decorated_definition` wrapper, so `start_line` + `code_content` include the decorator stack instead of starting at `def`/`class` (issue #31 — `@field_validator("lat", mode="before")` and friends were silently dropped, blinding get_ast_node / semantic search to the pydantic contract). That retained decorator text also lets `find_dead_code` exclude framework-registered / attribute-accessed Python methods (pydantic validators, pytest fixtures, `@property`, `@abstractmethod`, `@overload`, NiceGUI handlers — see PYTHON_FRAMEWORK_DECORATORS) that are dispatched dynamically and thus edgeless, eliminating the dominant dead-code false-positive class (issue #32 cause 1). Existing indexes carry the pre-decorator extents (and the stale orphans) until rebuilt, hence the bump. v35: import-corroborated cross-file calls keep visibility — classify_edge_confidence no longer stamps a cross-file `calls`/`references` edge `ambiguous` (which the confidence floor hides) when the caller's file explicitly imports THAT exact target. The import binds the bare name to one node, so the edge is import-resolved (v0.59 bind_calls_to_imported_targets), not a bare-name guess among same-name siblings. Before: any target NAME defined in >=2 same-language files (process/handler/run/init/index…) made a precisely-import-bound call `ambiguous` → callgraph/impact showed NO callee for it by default. Existing indexes carry the stale `ambiguous` labels until rebuilt, hence the bump. v34: Go inheritance generics correctness (code-review fast-follow) — (a) a Go 1.18 interface type-SET constraint (`interface { Signed | Unsigned }`, one `type_elem` with >1 child) no longer emits a bogus `inherits` edge to the first union term; only genuine single-type embedded interfaces do; (b) embedded generic types (`type Sub struct { Base[int] }`, `interface { Container[T] }`) now emit `inherits` on the generic's base name (were silently dropped). v33: C++ base classes now emit `inherits` edges (`class Dog : public Animal` → Dog inherits Animal; multiple/`struct`/qualified `ns::Base`/`template Tmpl<int>` bases all bind on the simple type name; access specifiers public/private/protected skipped; C++ has no interface concept so every base is `inherits`). C has no inheritance concept and C `struct_specifier` never carries a base clause, so nothing changes for C. The C/C++ class/struct/enum dead-code exclusion stays (leaf classes still have no incoming edge). v32: inheritance-extraction parity — (a) Go struct/interface embedding now emits `inherits` edges (Go's idiomatic "is-a": `type Dog struct { Animal }` → Dog inherits Animal; `*Base` and `pkg.Type` bind on the simple type name; embedded interfaces via `type_elem` compose, methods via `method_elem` do not; a normal named field `f Foo` stays has-a) — Go previously produced ZERO inherits edges; (b) Dart mixins (`class C extends Base with M, N`) now emit `inherits` to each mixin (mixin application injects methods), and a `with`-only class no longer produces a malformed `"with M"` target from the text-clean fallback; v31: edge-resolution correctness — (a) structural relations (imports/inherits/implements/exports/routes_to) no longer fall through to the GLOBAL all-language name pool when there is no same-file/same-language target; they bind same-language-only, eliminating cross-language phantom edges (Rust `use anyhow::Result` → a markdown "Result" heading; JS `require('fs')` → a Rust `fs` symbol) that were stamped `extracted` (unfilterable) and polluted deps/project_map/affected/cycles/find_references, and letting unresolved imports/implements reach the `<external>` sentinel instead of being pre-empted; (b) the Phase-2c incremental inbound-edge restore now re-binds a saved cross-file edge only to the same-name node in the ORIGINAL target file (map keyed by (file_id, name)) rather than every same-name node in the batch, so a multi-file incremental no longer over-creates cross-file/cross-language edges a full rebuild wouldn't; v30: Dart fixes — (a) top-level functions (`int helper() {}`) are now extracted as symbols (parsed as a bare function_signature sibling under `program`, never matched before so callgraph/impact/dead-code were blind to them); (b) calls now dispatch on the `selector(argument_part)` node (callee = preceding sibling) instead of only `expression_statement`, so calls in return / assignment / argument / binary-expression positions resolve (were silently dropped — only bare `foo();` statements worked); v29 also: Express routes_to with an IMPORTED named handler (`import {getUser} from './ctrl'; app.get('/x', getUser)`) now resolves the handler cross-file (was matched only against the route file's own nodes → route silently dropped for the most common Express layout; inline + same-file handlers already worked); v29: cross-file call-noise filter is now language-aware — JS/TS `obj.insert()`/`remove()`/`contains()` resolve (not ECMAScript builtins) while genuine builtins (push/pop/get/map/filter...) still drop; PHP `$o->method()` calls are fully exempt (PHP array ops are global functions, not methods, so the Rust-collection list only produced false-positive dead code). Was reporting live JS/TS/PHP methods as dead code + hiding callers; v28: Ruby bare (parens-less) method calls in statement position now produce calls edges via a scope-aware pass that excludes local variables (Ruby's own assigned-vs-call rule), closing a recall gap where `helper` (no parens) was dropped; v27: Python + Ruby top-level (module/class-body) calls now attribute to `<module>` too (same fix as bash v26) so an entry-point function called only at top level isn't reported dead; v26: bash top-level command invocations now attribute to `<module>` (were dropped) so an entry-point function called only at script top level (`run_app "$@"`) is no longer reported dead; external commands still drop at Phase-2 resolution; v25: Flask @app.route(..., methods=['GET']) now derives the HTTP verb from the methods= kwarg (was always "ANY", breaking method-scoped trace); v24: PHP file-include imports (require/require_once/include/include_once → REL_IMPORTS to the bare file stem)
+pub const INDEX_VERSION: i32 = 52; // v52 (audit batch 2026-07-24, two edge-shape changes ride one rebuild): (a) Rust macro token_tree call extraction — calls made only inside macro args / macro_rules bodies (`assert_eq!(foo(x), y)`, fn-local `sout!` bodies) now emit `calls` edges via an identifier-followed-by-token_tree pass (exclusions: `.`/`::`/`$`/definition-keyword prev-tokens, no enclosing scope, and uppercase-initial names — tuple-variant/struct PATTERNS like `matches!(x, Some(y))` are token-identical to calls, and variant/type names are CamelCase while the fn calls this recovers are snake_case; audit-reproduced false `calls → Some` edge without it). Previously such calls were invisible: targets false-flagged dead, impact/callgraph missed the calling fn. (b) Rust `use` declarations with a statically-external root (`std`/`core`/`alloc`/`proc_macro`) are skipped whole — their bare trailing segment entered global bare-name resolution with no qualifier and bound to any single same-family project symbol sharing the name (every `use std::fs;` fabricated an `imports → fn fs` edge onto a #[cfg(test)] helper, polluting 4 module_dependencies pairs in map, one 100% phantom). Old indexes lack the macro-call edges and carry the phantom std-import edges; bump to rebuild. — v51: Rust axum route extraction — `.route(path, get(h).post(h2))` builder chains now emit one routes_to self-edge per (method, handler) pair, with inline `.nest("/prefix", …)` prefix composition (ancestor byte-range walk; cross-variable nest is a documented non-goal — needs dataflow). Named + path-qualified handlers resolve (last `::` segment, same-file + existing cross-file routes_to recovery); closures skipped (no Rust synthetic-handler materializer yet). Scoped STRICTLY to `.route` links so bare `.get()` (reqwest/HashMap) cannot fabricate routes (negative test). actix/rocket/Java Spring remain unextracted and are named in the trace empty-result hint, not silently claimed. // v50: constructor-instantiation call edges — JS/TS/TSX `new Foo()` / `new ns.Foo()` (new_expression), C# `new Foo()` / `new Ns.Bar()` and PHP `new Foo()` / `new Ns\Bar()` (object_creation_expression) now emit a `calls` edge to the class (constructor) name. A `new_expression`/`object_creation_expression` callee never reached the call_expression/invocation arms, and JS/C#/PHP have no type-reference pass firing on a `new` slot, so a class that was ONLY instantiated (never called as `Foo.method()`) had NO incoming edge at all — invisible to callgraph/impact AND false-flagged dead-code. Member/qualified forms (`new ns.Foo()`, `new Ns.Bar()`, `new Ns\Bar()`) bind on the bare class name (JS carries a Receiver qualifier for a simple-identifier receiver, mirroring member call_expressions); generic tails (`new Foo<T>()`) are stripped. Java `object_creation_expression` is deliberately unchanged — its `new` type already emits a `references` edge via extract_java_type_reference (dead-code-safe); Kotlin/Swift/Python/Ruby constructors are plain call/call_expression nodes (already covered); Rust struct_expression / Go composite literals covered by existing passes. Also v50: C# top-level/nested `local_function_statement` is now extracted as a function-kind symbol node (was unextracted, so a top-level `void Greet(){}` invoked via the v49 `<module>` call edge dangled unresolved and the fn was invisible to callgraph/impact/dead-code). Also v50: NUL-byte stripping (NUL→space) now covers the signature triplet `return_type`/`param_types`/`signature` (and the `context_string` built from them in the indexer) across the extract_signature_info / extract_c_signature_info path and the Dart per-language extractors — SQLite stores TEXT as a C-string so a stored NUL silently truncates a `LIKE`/substring match at the NUL; previously only code_content (v48) and doc_comment (v49) were stripped, leaving the sig fields live-truncatable. Also v50 (metadata form only, byte-identical for identifier-only inputs): the rtype (Python receiver-type) and impl_method (Rust trait-impl) edge metadata are now built via serde_json::json! (escapes `"`/`\` in source-derived payloads) instead of format! — the last two format!-built metadata sites, matching serialize_callee_qualifier (b785bd3). Old indexes lack the new call edges + local-fn nodes; bump to rebuild. — v49: top-level/library-level calls now attribute to `<module>` for C# (invocation_expression), Kotlin + Swift (generic call_expression fallback), and Dart (selector) — previously each required Some(active_scope) so a function invoked only from a top-level statement / file-level script had no incoming edge and was false-flagged dead-code (mirrors the php/python/ruby/bash `<module>` fallback; Rust/Go/Java/C stay deliberately excluded — no bare top-level call statements). Also v49: Dart `mixin M {}` is now extracted as a class-kind symbol node (mixin_declaration's name is a positional identifier child, missed by the name-field class arm) so the `class C ... with M` inherits edge survives Phase-2 same-language resolution instead of dropping to `<external>`. Also v49 (metadata form only, byte-identical for identifier-only inputs): callee-qualifier edge metadata is now built via serde_json::json! (escapes `"`/`\` in source-derived payloads); doc_comment now strips NUL bytes (NUL→space, same as code_content since v48) so FTS5 doesn't truncate it. Old indexes lack the new edges/nodes; bump to rebuild. — v48: extracted code_content now strips NUL bytes (truncate_code_content replaces `\0` with a space). SQLite/FTS5 tokenize stored TEXT as a C-string and stop at the first NUL, so a source file with an embedded NUL (mis-detected binary / generated blob) left everything after it unsearchable. Only NUL-containing content changes; normal source is byte-identical. Old indexes keep the truncated FTS until rebuilt. — v47: the import-contradiction call-edge prune (prune_import_contradicted_call_edges) no longer fires when the caller's code_content was truncated (truncate_code_content caps at max_code_content_len=4096 and appends a three-dot sentinel). Its `.name(` qualified-call guard reads code_content, so a qualified call beyond the cap was sliced off → instr false-negative → a real call edge false-pruned. Now: truncated caller (code_content LIKE '%...') keeps the edge (safe direction). Old indexes may have dropped such edges; bump to rebuild. — v46: C/C++ `#include "own.h"` now resolves to the indexed header's <module> node (an IMPORTS edge), mirroring PHP require / JS require — the include arm previously emitted only a bare stem with no path metadata, so a local header include fell to `<external>/<stem>` and deps/cycles/affected/project_map under-reported the dependency. Old indexes lack these header edges; bump to rebuild. — v45: PHP top-level calls (outside any function/method, e.g. a bare `greetPhp();` in a script) now attribute to `<module>` instead of being dropped, mirroring the python/ruby/bash arms — the PHP call arm previously required `Some(active_scope)`, so a function invoked only at the top level had no incoming edge and was false-flagged dead-code. Old indexes lack these edges; bump to rebuild. — v44: `classify_edge_confidence` no longer downgrades type/path-qualifier-resolved cross-file calls (self/stype/rtype/path metadata) to `ambiguous` when the bare name is duplicated — they were precisely resolved by a structural signal, not a bare-name guess, so the default confidence floor was hiding real `self.method()` / `Alpha::foo()` edges from callgraph/impact. Old indexes carry the stale `ambiguous` labels; bump to reclassify. — v43: Java `import` statements are now extracted (`import p.B;`, `import java.util.List;`, static imports → REL_IMPORTS to the last segment; wildcard `import x.*` skipped). Previously `import_declaration` matched only under `config.name == "swift"`, so Java import edges were 0 — `<external>` nodes absent, import-aware call resolution dead for Java, imported classes false-flagged dead-code. Old indexes lack these edges; bump to rebuild. — v42: the pending-call sweep (`resolve_pending_calls`, drains `pending_unresolved_calls` on incremental/watch passes) now applies the SAME callee-qualifier filtering Phase 2 does — a buffered receiver-typed call (Python `w.write()` with `w` inferred `DataWriter`) binds only to `DataWriter.write`, not every same-language `write`. Old indexes carry the wrong bare-name edges (false callers into same-name siblings) until rebuilt, so bump to wipe+rebuild. — v41: TS/JS destructuring exports (`export const { host, port } = getConfig()`, `export const [a, b] = getPair()`) now extract ONE `constant` node per bound identifier instead of a single node named after the literal pattern text (`{ host, port }`). That text is no valid identifier, so `import { host }` dangled to the `<external>` sentinel and the destructured symbols were unusable by name and invisible to show/callgraph/find_references — the v39 const-export import-edge fix silently missed every destructuring form. Common in the wild: Redux `export const { actions, reducer } = slice`, React `export const { Provider } = createContext()`, RTK Query hook exports. Renamed `{ key: local }` binds the local (value) side; defaults (`{ x = 1 }`), rest (`{ ...r }` / `[...r]`), and nested patterns recurse to leaf identifiers (collect_binding_names). Only EXPORTED top-level declarations are affected (the v39 guard is unchanged). Also in v41: TS/JS `export { X, Y } from './mod'` re-exports (barrel / index files) now emit a REL_IMPORTS dependency edge per re-exported name (js_module-stamped like a regular named import, so Phase-2 resolves each to the source file). Previously a re-export produced ZERO edges — a barrel file had no tracked dependency and was invisible to deps/affected/impact/cycles/tour and missed by find-references. `export * from './mod'` wildcards stay module-level-unresolved (a shared limitation with namespace imports `import * as ns`). Existing indexes gain the per-binding nodes + re-export edges only after rebuild, hence the bump. v40: `.h` headers containing C++ constructs are now parsed as C++, not C. `.h` is C-vs-C++ ambiguous by extension so detect_language maps it to C, but the C grammar can't parse `class`/`namespace` — so C++ classes declared in a `.h` header (the MOST common C++ layout: declaration in `.h`, definition in `.cpp`) and their base-class `inherits` edges were silently dropped (the `.cpp` linked fine via is_compatible_lang, but the header's own class SYMBOLS never existed as nodes — overview/callgraph/dead-code/find_references were blind to them). index_files now content-sniffs a `.h` detected as C: if it contains C++ markers (`::`, `public:`/`private:`/`protected:`, `class `, `namespace `, `template<`) it parses as C++ (looks_like_cpp_header), so the classes/structs and their inheritance are captured. Gated on markers so a pure-C header stays C; a false positive is low-harm because the C++ grammar is a near-superset of C. Existing indexes gain the header class nodes only after rebuild, hence the bump. v39: TS/JS top-level `export const/let X = <value>` (config constants, route tables, and widely-imported singletons like `const store = defineStore(...)` / `const logger = createLogger(...)` / `const svc = new Service()`) are now extracted as `constant` symbol nodes, so `import { X } from './mod'` resolves to a real node and forms a REL_IMPORTS edge instead of binding to the `<external>` sentinel — the cross-module dependency was previously invisible to tour/affected/impact/project_map (feedback_const_export_no_import_edge). Only EXPORTED top-level declarations are extracted (a local `const x = 5` in a function body can't be imported cross-file, so extracting it would be pure noise); function-valued consts stay `function` (arrow branch, unchanged). Type mirrors the existing Rust `const_item`/`static_item` extraction — this is TS/JS reaching parity. Scope is TS/JS only: Go package-level `const`/`var`, Python module constants, and Java `static final` fields have different import idioms and remain unextracted (measured: the const-value cross-module import pattern is material in TS/JS — 66 sole-link invisible module deps across 4 sampled projects; other languages await their own evidence). Existing indexes gain the new nodes/edges only after rebuild, hence the bump. v38: method-candidate type filter escapes SQL LIKE metacharacters — a receiver/impl type name containing `_` or `%` (legal identifiers like `my_widget` / `Foo_Bar`) is now matched literally in filter_method_ids (`Data_X.%` no longer also captures `DataYX.run` via the `_` single-char wildcard). Affects the type-restricted resolution paths — Rust `self.method()` (SelfType) and Python constructor-inferred `recv.method()` (rtype, issue #32 cause 2) — which bind only to the genuine type's method during Phase-2 resolution instead of also a sibling type whose name differs only where `_` fell. Existing indexes carry the rare stale false-positive edge until rebuilt, hence the bump. v37: Python receiver-type call resolution (issue #32 cause 2) — a call `recv.method()` whose receiver type is fixed EITHER by a single local `recv = ClassName(...)` constructor assignment OR by an explicit parameter annotation `def f(recv: ClassName)` now carries `{"q":"rtype","v":"ClassName"}` metadata (infer_python_call_receiver_type), so Phase-2 resolution binds it to `ClassName.method` via self_filter_candidates instead of dropping the whole ambiguous by-name fan-out when the method name is shared across classes. Before: `writer.write()` with `write` defined on 3 classes produced NO edge → all 3 reported dead + no callers in callgraph/impact. Conservative: only a provably-single constructor assignment infers a type; a wrong/unknown type fails the candidate filter and drops (never a false cross-type edge). New edges appear only after rebuild. v36: Python decorated `def`/`class` symbols now bind to the enclosing tree-sitter `decorated_definition` wrapper, so `start_line` + `code_content` include the decorator stack instead of starting at `def`/`class` (issue #31 — `@field_validator("lat", mode="before")` and friends were silently dropped, blinding get_ast_node / semantic search to the pydantic contract). That retained decorator text also lets `find_dead_code` exclude framework-registered / attribute-accessed Python methods (pydantic validators, pytest fixtures, `@property`, `@abstractmethod`, `@overload`, NiceGUI handlers — see PYTHON_FRAMEWORK_DECORATORS) that are dispatched dynamically and thus edgeless, eliminating the dominant dead-code false-positive class (issue #32 cause 1). Existing indexes carry the pre-decorator extents (and the stale orphans) until rebuilt, hence the bump. v35: import-corroborated cross-file calls keep visibility — classify_edge_confidence no longer stamps a cross-file `calls`/`references` edge `ambiguous` (which the confidence floor hides) when the caller's file explicitly imports THAT exact target. The import binds the bare name to one node, so the edge is import-resolved (v0.59 bind_calls_to_imported_targets), not a bare-name guess among same-name siblings. Before: any target NAME defined in >=2 same-language files (process/handler/run/init/index…) made a precisely-import-bound call `ambiguous` → callgraph/impact showed NO callee for it by default. Existing indexes carry the stale `ambiguous` labels until rebuilt, hence the bump. v34: Go inheritance generics correctness (code-review fast-follow) — (a) a Go 1.18 interface type-SET constraint (`interface { Signed | Unsigned }`, one `type_elem` with >1 child) no longer emits a bogus `inherits` edge to the first union term; only genuine single-type embedded interfaces do; (b) embedded generic types (`type Sub struct { Base[int] }`, `interface { Container[T] }`) now emit `inherits` on the generic's base name (were silently dropped). v33: C++ base classes now emit `inherits` edges (`class Dog : public Animal` → Dog inherits Animal; multiple/`struct`/qualified `ns::Base`/`template Tmpl<int>` bases all bind on the simple type name; access specifiers public/private/protected skipped; C++ has no interface concept so every base is `inherits`). C has no inheritance concept and C `struct_specifier` never carries a base clause, so nothing changes for C. The C/C++ class/struct/enum dead-code exclusion stays (leaf classes still have no incoming edge). v32: inheritance-extraction parity — (a) Go struct/interface embedding now emits `inherits` edges (Go's idiomatic "is-a": `type Dog struct { Animal }` → Dog inherits Animal; `*Base` and `pkg.Type` bind on the simple type name; embedded interfaces via `type_elem` compose, methods via `method_elem` do not; a normal named field `f Foo` stays has-a) — Go previously produced ZERO inherits edges; (b) Dart mixins (`class C extends Base with M, N`) now emit `inherits` to each mixin (mixin application injects methods), and a `with`-only class no longer produces a malformed `"with M"` target from the text-clean fallback; v31: edge-resolution correctness — (a) structural relations (imports/inherits/implements/exports/routes_to) no longer fall through to the GLOBAL all-language name pool when there is no same-file/same-language target; they bind same-language-only, eliminating cross-language phantom edges (Rust `use anyhow::Result` → a markdown "Result" heading; JS `require('fs')` → a Rust `fs` symbol) that were stamped `extracted` (unfilterable) and polluted deps/project_map/affected/cycles/find_references, and letting unresolved imports/implements reach the `<external>` sentinel instead of being pre-empted; (b) the Phase-2c incremental inbound-edge restore now re-binds a saved cross-file edge only to the same-name node in the ORIGINAL target file (map keyed by (file_id, name)) rather than every same-name node in the batch, so a multi-file incremental no longer over-creates cross-file/cross-language edges a full rebuild wouldn't; v30: Dart fixes — (a) top-level functions (`int helper() {}`) are now extracted as symbols (parsed as a bare function_signature sibling under `program`, never matched before so callgraph/impact/dead-code were blind to them); (b) calls now dispatch on the `selector(argument_part)` node (callee = preceding sibling) instead of only `expression_statement`, so calls in return / assignment / argument / binary-expression positions resolve (were silently dropped — only bare `foo();` statements worked); v29 also: Express routes_to with an IMPORTED named handler (`import {getUser} from './ctrl'; app.get('/x', getUser)`) now resolves the handler cross-file (was matched only against the route file's own nodes → route silently dropped for the most common Express layout; inline + same-file handlers already worked); v29: cross-file call-noise filter is now language-aware — JS/TS `obj.insert()`/`remove()`/`contains()` resolve (not ECMAScript builtins) while genuine builtins (push/pop/get/map/filter...) still drop; PHP `$o->method()` calls are fully exempt (PHP array ops are global functions, not methods, so the Rust-collection list only produced false-positive dead code). Was reporting live JS/TS/PHP methods as dead code + hiding callers; v28: Ruby bare (parens-less) method calls in statement position now produce calls edges via a scope-aware pass that excludes local variables (Ruby's own assigned-vs-call rule), closing a recall gap where `helper` (no parens) was dropped; v27: Python + Ruby top-level (module/class-body) calls now attribute to `<module>` too (same fix as bash v26) so an entry-point function called only at top level isn't reported dead; v26: bash top-level command invocations now attribute to `<module>` (were dropped) so an entry-point function called only at script top level (`run_app "$@"`) is no longer reported dead; external commands still drop at Phase-2 resolution; v25: Flask @app.route(..., methods=['GET']) now derives the HTTP verb from the methods= kwarg (was always "ANY", breaking method-scoped trace); v24: PHP file-include imports (require/require_once/include/include_once → REL_IMPORTS to the bare file stem)
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before
@@ -313,7 +313,11 @@ pub fn parse_timeout_ms() -> u64 {
 /// `is_breaking` is `true` for changes that force every call site to change
 /// (a removal or a signature change), which pins the result to HIGH regardless
 /// of caller count; behaviour-only changes leave it `false` and scale by count.
-pub fn compute_risk_level(prod_callers: usize, affected_routes: usize, is_breaking: bool) -> &'static str {
+pub fn compute_risk_level(
+    prod_callers: usize,
+    affected_routes: usize,
+    is_breaking: bool,
+) -> &'static str {
     if prod_callers > 10 || affected_routes >= 3 || is_breaking {
         "HIGH"
     } else if prod_callers > 3 || affected_routes > 0 {
@@ -346,7 +350,8 @@ pub const NON_FUNCTION_IMPACT_WARNING: &str = "Impact analysis tracks function c
 /// callers inflates impact-analysis risk and corrupts caller_count rankings.
 pub fn is_test_symbol(name: &str, file_path: &str) -> bool {
     name.starts_with("test_")
-        || name.ends_with("Test") || name.ends_with("Tests")
+        || name.ends_with("Test")
+        || name.ends_with("Tests")
         || is_test_path(file_path)
 }
 
@@ -397,8 +402,7 @@ pub fn is_dead_code_exported(
     has_export_edge
         || code_content.starts_with("pub ")
         || code_content.starts_with("pub(")
-        || (file_path.ends_with(".go")
-            && name.chars().next().is_some_and(|c| c.is_uppercase()))
+        || (file_path.ends_with(".go") && name.chars().next().is_some_and(|c| c.is_uppercase()))
 }
 
 /// File-level test classifier (path heuristics only) shared by `is_test_symbol` and
@@ -408,15 +412,22 @@ pub fn is_dead_code_exported(
 /// divergent patterns. See the "Five sites must agree" note below and
 /// feedback_test_classifier_dual_sources.md before changing any one of them.
 pub fn is_test_path(file_path: &str) -> bool {
-    file_path.starts_with("tests/") || file_path.starts_with("test/")
-        || file_path.starts_with("benches/") || file_path.starts_with("bench/")
+    file_path.starts_with("tests/")
+        || file_path.starts_with("test/")
+        || file_path.starts_with("benches/")
+        || file_path.starts_with("bench/")
         || file_path.contains("__tests__/")
         || file_path.ends_with("/tests.rs")
-        || file_path.ends_with("_test.go") || file_path.ends_with("_test.rs")
-        || file_path.ends_with(".test.ts") || file_path.ends_with(".test.js")
-        || file_path.ends_with(".test.tsx") || file_path.ends_with(".test.jsx")
-        || file_path.ends_with(".spec.ts") || file_path.ends_with(".spec.js")
-        || file_path.ends_with(".spec.tsx") || file_path.ends_with(".spec.jsx")
+        || file_path.ends_with("_test.go")
+        || file_path.ends_with("_test.rs")
+        || file_path.ends_with(".test.ts")
+        || file_path.ends_with(".test.js")
+        || file_path.ends_with(".test.tsx")
+        || file_path.ends_with(".test.jsx")
+        || file_path.ends_with(".spec.ts")
+        || file_path.ends_with(".spec.js")
+        || file_path.ends_with(".spec.tsx")
+        || file_path.ends_with(".spec.jsx")
 }
 
 /// SQL predicate mirroring [`is_test_node`] for a node aliased `node_alias` joined to
@@ -492,8 +503,7 @@ pub fn prod_source_join_sql(edges_alias: &str) -> String {
 /// kept in sync with `is_test_symbol`. Caller is expected to splice these
 /// inside a WHERE clause already started with another condition (no leading AND
 /// is added by callers — they prepend ` AND ` themselves) or inside a CASE WHEN.
-pub const PROD_SOURCE_FILTER_AND: &str =
-    "src.is_test = 0 \
+pub const PROD_SOURCE_FILTER_AND: &str = "src.is_test = 0 \
      AND src.name NOT LIKE 'test\\_%' ESCAPE '\\' \
      AND sf.path NOT LIKE 'tests/%' \
      AND sf.path NOT LIKE 'benches/%' \
@@ -503,8 +513,7 @@ pub const PROD_SOURCE_FILTER_AND: &str =
 /// OR-joined inverse of [`PROD_SOURCE_FILTER_AND`] — matches test/bench sources.
 /// Used by SUM/CASE constructs that count test callers separately (e.g.
 /// project_map's hot_functions test_cnt CASE).
-pub const TEST_SOURCE_FILTER_OR: &str =
-    "src.is_test = 1 \
+pub const TEST_SOURCE_FILTER_OR: &str = "src.is_test = 1 \
      OR src.name LIKE 'test\\_%' ESCAPE '\\' \
      OR sf.path LIKE 'tests/%' \
      OR sf.path LIKE 'benches/%' \
@@ -551,20 +560,65 @@ pub fn normalize_type_filter(input: &str) -> Vec<&'static str> {
 // when resolved cross-file by name alone (without type context).
 // These are skipped for cross-file `calls` edge creation.
 pub const CROSS_FILE_CALL_NOISE: &[&str] = &[
-    "new", "default", "from", "into", "as_str", "to_string", "clone",
-    "fmt", "display", "drop", "try_from", "try_into",
-    "as_ref", "as_mut", "borrow", "borrow_mut", "deref", "deref_mut",
-    "eq", "ne", "cmp", "partial_cmp", "hash",
-    "serialize", "deserialize",
-    "next", "iter", "into_iter",
-    "build", "builder",
-    "len", "is_empty",
-    "unwrap", "unwrap_or", "unwrap_or_else", "unwrap_or_default",
-    "expect", "ok", "err", "map", "map_err", "and_then",
-    "or_else", "filter", "flatten",
-    "push", "pop", "insert", "remove", "contains", "get",
-    "to_owned", "to_vec", "collect", "join",
-    "flush", "close", "read", "write",
+    "new",
+    "default",
+    "from",
+    "into",
+    "as_str",
+    "to_string",
+    "clone",
+    "fmt",
+    "display",
+    "drop",
+    "try_from",
+    "try_into",
+    "as_ref",
+    "as_mut",
+    "borrow",
+    "borrow_mut",
+    "deref",
+    "deref_mut",
+    "eq",
+    "ne",
+    "cmp",
+    "partial_cmp",
+    "hash",
+    "serialize",
+    "deserialize",
+    "next",
+    "iter",
+    "into_iter",
+    "build",
+    "builder",
+    "len",
+    "is_empty",
+    "unwrap",
+    "unwrap_or",
+    "unwrap_or_else",
+    "unwrap_or_default",
+    "expect",
+    "ok",
+    "err",
+    "map",
+    "map_err",
+    "and_then",
+    "or_else",
+    "filter",
+    "flatten",
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "contains",
+    "get",
+    "to_owned",
+    "to_vec",
+    "collect",
+    "join",
+    "flush",
+    "close",
+    "read",
+    "write",
 ];
 
 // Names that live in CROSS_FILE_CALL_NOISE because they are Rust/collection
@@ -613,12 +667,42 @@ pub fn is_cross_file_call_noise(name: &str, language: &str) -> bool {
 // but is Python-type-specific. Kept case-sensitive: only the exact stdlib spellings.
 pub const PYTHON_TYPE_REFERENCE_NOISE: &[&str] = &[
     // builtins
-    "str", "int", "float", "bool", "bytes", "None", "object",
-    "list", "dict", "set", "tuple", "frozenset", "complex", "type",
+    "str",
+    "int",
+    "float",
+    "bool",
+    "bytes",
+    "None",
+    "object",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "frozenset",
+    "complex",
+    "type",
     // typing generics / special forms
-    "Any", "List", "Dict", "Set", "Tuple", "FrozenSet", "Optional", "Union",
-    "Callable", "Sequence", "Iterable", "Iterator", "Mapping", "MutableMapping",
-    "Type", "ClassVar", "Final", "Literal", "Annotated", "NoReturn", "Self",
+    "Any",
+    "List",
+    "Dict",
+    "Set",
+    "Tuple",
+    "FrozenSet",
+    "Optional",
+    "Union",
+    "Callable",
+    "Sequence",
+    "Iterable",
+    "Iterator",
+    "Mapping",
+    "MutableMapping",
+    "Type",
+    "ClassVar",
+    "Final",
+    "Literal",
+    "Annotated",
+    "NoReturn",
+    "Self",
 ];
 
 // -- Python framework-registered / attribute-accessed decorators --
@@ -638,19 +722,28 @@ pub const PYTHON_TYPE_REFERENCE_NOISE: &[&str] = &[
 // may be missed) — the safe direction for an LLM-facing "candidates" tool.
 pub const PYTHON_FRAMEWORK_DECORATORS: &[&str] = &[
     // pydantic v2: validators/serializers/computed fields registered on the model.
-    "@field_validator", "@model_validator",
-    "@field_serializer", "@model_serializer", "@computed_field",
+    "@field_validator",
+    "@model_validator",
+    "@field_serializer",
+    "@model_serializer",
+    "@computed_field",
     // pydantic v1
-    "@validator", "@root_validator",
+    "@validator",
+    "@root_validator",
     // pytest fixtures — injected by name into test signatures, not called.
-    "@pytest.fixture", "@fixture",
+    "@pytest.fixture",
+    "@fixture",
     // property-style: accessed as an attribute (`obj.x`) → no call edge emitted.
-    "@property", "@cached_property", "@functools.cached_property",
+    "@property",
+    "@cached_property",
+    "@functools.cached_property",
     // abstract / typing.overload stubs: dispatched via a concrete override or
     // resolved at type-check time; the stub itself carries no incoming call edge.
-    "@abstractmethod", "@overload",
+    "@abstractmethod",
+    "@overload",
     // web/UI framework handlers registered by the framework at import time.
-    "@ui.refreshable", "@ui.page",
+    "@ui.refreshable",
+    "@ui.page",
 ];
 
 // -- Go type-position noise filter --
@@ -666,10 +759,27 @@ pub const PYTHON_FRAMEWORK_DECORATORS: &[&str] = &[
 // intentionally omitted. Kept case-sensitive: only the exact predeclared
 // spellings.
 pub const GO_TYPE_REFERENCE_NOISE: &[&str] = &[
-    "bool", "string", "error", "any", "rune", "byte", "uintptr",
-    "int", "int8", "int16", "int32", "int64",
-    "uint", "uint8", "uint16", "uint32", "uint64",
-    "float32", "float64", "complex64", "complex128",
+    "bool",
+    "string",
+    "error",
+    "any",
+    "rune",
+    "byte",
+    "uintptr",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "float32",
+    "float64",
+    "complex64",
+    "complex128",
     "comparable",
 ];
 
@@ -687,17 +797,45 @@ pub const GO_TYPE_REFERENCE_NOISE: &[&str] = &[
 // to enumerate all of java.* . Kept case-sensitive: only the exact JDK spellings.
 pub const JAVA_TYPE_REFERENCE_NOISE: &[&str] = &[
     // java.lang (auto-imported)
-    "String", "Object", "Integer", "Long", "Double", "Float", "Boolean",
-    "Character", "Byte", "Short", "Number", "Void", "Class",
-    "Exception", "RuntimeException", "Throwable", "Error",
-    "Comparable", "Runnable", "Thread", "Iterable",
+    "String",
+    "Object",
+    "Integer",
+    "Long",
+    "Double",
+    "Float",
+    "Boolean",
+    "Character",
+    "Byte",
+    "Short",
+    "Number",
+    "Void",
+    "Class",
+    "Exception",
+    "RuntimeException",
+    "Throwable",
+    "Error",
+    "Comparable",
+    "Runnable",
+    "Thread",
+    "Iterable",
     // common annotations (java.lang / java.lang.annotation)
-    "Override", "Deprecated", "SuppressWarnings",
+    "Override",
+    "Deprecated",
+    "SuppressWarnings",
     // common java.util collections + utilities
-    "List", "ArrayList", "LinkedList",
-    "Map", "HashMap", "TreeMap", "LinkedHashMap",
-    "Set", "HashSet", "TreeSet",
-    "Collection", "Optional", "Iterator",
+    "List",
+    "ArrayList",
+    "LinkedList",
+    "Map",
+    "HashMap",
+    "TreeMap",
+    "LinkedHashMap",
+    "Set",
+    "HashSet",
+    "TreeSet",
+    "Collection",
+    "Optional",
+    "Iterator",
     // java.util.stream
     "Stream",
 ];
@@ -747,12 +885,20 @@ mod tests {
         assert_eq!(normalize_call_direction("both"), Some("both"));
         assert_eq!(normalize_call_direction("BOTH"), Some("both"));
         assert_eq!(normalize_call_direction("Callers"), Some("callers"));
-        assert_eq!(normalize_call_direction("outgoing"), None, "deps vocab rejected");
+        assert_eq!(
+            normalize_call_direction("outgoing"),
+            None,
+            "deps vocab rejected"
+        );
         assert_eq!(normalize_call_direction("bogus"), None);
         // dep direction: outgoing|incoming|both
         assert_eq!(normalize_dep_direction("INCOMING"), Some("incoming"));
         assert_eq!(normalize_dep_direction("both"), Some("both"));
-        assert_eq!(normalize_dep_direction("callers"), None, "callgraph vocab rejected");
+        assert_eq!(
+            normalize_dep_direction("callers"),
+            None,
+            "callgraph vocab rejected"
+        );
         // relation: calls|imports|inherits|implements|references|all
         assert_eq!(normalize_relation("CALLS"), Some("calls"));
         assert_eq!(normalize_relation("Implements"), Some("implements"));
@@ -769,7 +915,10 @@ mod tests {
         assert!(is_test_symbol("bench_call_graph", "benches/indexing.rs"));
         assert!(is_test_symbol("anything", "bench/foo.rs"));
         // Production code in src/ is unaffected
-        assert!(!is_test_symbol("fts5_search", "src/storage/queries/search.rs"));
+        assert!(!is_test_symbol(
+            "fts5_search",
+            "src/storage/queries/search.rs"
+        ));
         assert!(!is_test_symbol("conn", "src/storage/db.rs"));
     }
 
@@ -790,29 +939,29 @@ mod tests {
         let cases = [
             // Positives — one per leg of is_test_symbol / is_test_path.
             ("test_signup", "tests/test_api.py"),
-            ("test_foo", "src/lib.rs"),      // test_ name leg
-            ("MyTest", "src/lib.rs"),        // *Test
-            ("SuiteTests", "src/lib.rs"),    // *Tests
-            ("run", "tests/foo.rs"),         // tests/
-            ("run", "test/foo.rs"),          // test/
-            ("run", "benches/b.rs"),         // benches/
-            ("run", "bench/b.rs"),           // bench/
-            ("run", "src/__tests__/x.ts"),   // __tests__/
-            ("run", "src/foo/tests.rs"),     // /tests.rs
-            ("run", "pkg/foo_test.go"),      // _test.go
-            ("run", "src/mod_test.rs"),      // _test.rs
-            ("run", "src/a.test.ts"),        // .test.ts
-            ("run", "src/a.test.tsx"),       // .test.tsx
-            ("run", "src/a.spec.jsx"),       // .spec.jsx
+            ("test_foo", "src/lib.rs"),    // test_ name leg
+            ("MyTest", "src/lib.rs"),      // *Test
+            ("SuiteTests", "src/lib.rs"),  // *Tests
+            ("run", "tests/foo.rs"),       // tests/
+            ("run", "test/foo.rs"),        // test/
+            ("run", "benches/b.rs"),       // benches/
+            ("run", "bench/b.rs"),         // bench/
+            ("run", "src/__tests__/x.ts"), // __tests__/
+            ("run", "src/foo/tests.rs"),   // /tests.rs
+            ("run", "pkg/foo_test.go"),    // _test.go
+            ("run", "src/mod_test.rs"),    // _test.rs
+            ("run", "src/a.test.ts"),      // .test.ts
+            ("run", "src/a.test.tsx"),     // .test.tsx
+            ("run", "src/a.spec.jsx"),     // .spec.jsx
             // Negatives — production symbols…
             ("handle_signup", "src/api.py"),
             ("format_greeting", "src/models.py"),
             // …and near-misses a LIKE port would wrongly flag.
-            ("Test_helper", "src/lib.rs"),   // capital T ≠ test_ (case-sensitive)
-            ("mytest", "src/lib.rs"),        // lowercase ≠ *Test
-            ("latest", "src/lib.rs"),        // ends 'test' not 'Test'
-            ("run", "src/mytests.rs"),       // no '/' before tests.rs
-            ("run", "src/attests.py"),       // 'test' substring, no path leg
+            ("Test_helper", "src/lib.rs"), // capital T ≠ test_ (case-sensitive)
+            ("mytest", "src/lib.rs"),      // lowercase ≠ *Test
+            ("latest", "src/lib.rs"),      // ends 'test' not 'Test'
+            ("run", "src/mytests.rs"),     // no '/' before tests.rs
+            ("run", "src/attests.py"),     // 'test' substring, no path leg
         ];
         for (name, path) in cases {
             let got: i64 = conn
@@ -830,7 +979,10 @@ mod tests {
             is_test_node_sql("n", "f")
         );
         let got: i64 = conn.query_row(&flag_sql, [], |r| r.get(0)).unwrap();
-        assert!(got != 0, "is_test flag=1 must classify as test even when name/path heuristic misses");
+        assert!(
+            got != 0,
+            "is_test flag=1 must classify as test even when name/path heuristic misses"
+        );
     }
 
     #[test]
@@ -849,18 +1001,53 @@ mod tests {
     #[test]
     fn test_is_dead_code_exported_covers_all_legs() {
         // Explicit export edge.
-        assert!(is_dead_code_exported(true, "fn hidden() {}", "src/a.rs", "hidden"));
+        assert!(is_dead_code_exported(
+            true,
+            "fn hidden() {}",
+            "src/a.rs",
+            "hidden"
+        ));
         // Rust `pub` / `pub(crate)` visibility from the code content.
-        assert!(is_dead_code_exported(false, "pub fn f() {}", "src/a.rs", "f"));
-        assert!(is_dead_code_exported(false, "pub(crate) fn f() {}", "src/a.rs", "f"));
+        assert!(is_dead_code_exported(
+            false,
+            "pub fn f() {}",
+            "src/a.rs",
+            "f"
+        ));
+        assert!(is_dead_code_exported(
+            false,
+            "pub(crate) fn f() {}",
+            "src/a.rs",
+            "f"
+        ));
         // Go: an uppercase identifier in a .go file is exported. This is the leg the
         // CLI JSON path used to drop — guard it on every surface now.
-        assert!(is_dead_code_exported(false, "func Handler() {}", "pkg/h.go", "Handler"));
+        assert!(is_dead_code_exported(
+            false,
+            "func Handler() {}",
+            "pkg/h.go",
+            "Handler"
+        ));
         // Go lowercase = unexported → orphan; non-Go uppercase is not Go-export.
-        assert!(!is_dead_code_exported(false, "func handler() {}", "pkg/h.go", "handler"));
-        assert!(!is_dead_code_exported(false, "fn Helper() {}", "src/a.rs", "Helper"));
+        assert!(!is_dead_code_exported(
+            false,
+            "func handler() {}",
+            "pkg/h.go",
+            "handler"
+        ));
+        assert!(!is_dead_code_exported(
+            false,
+            "fn Helper() {}",
+            "src/a.rs",
+            "Helper"
+        ));
         // Plain private function with no callers = orphan.
-        assert!(!is_dead_code_exported(false, "fn helper() {}", "src/a.rs", "helper"));
+        assert!(!is_dead_code_exported(
+            false,
+            "fn helper() {}",
+            "src/a.rs",
+            "helper"
+        ));
     }
 
     /// Rust convention: `mod tests;` resolves to `<module>/tests.rs`. Functions
@@ -872,8 +1059,14 @@ mod tests {
     /// them as tests — the two heuristics disagreed.
     #[test]
     fn test_is_test_symbol_classifies_rust_module_tests_rs() {
-        assert!(is_test_symbol("create_writes_meta", "src/snapshot/tests.rs"));
-        assert!(is_test_symbol("open_with_meta_table", "src/snapshot/tests.rs"));
+        assert!(is_test_symbol(
+            "create_writes_meta",
+            "src/snapshot/tests.rs"
+        ));
+        assert!(is_test_symbol(
+            "open_with_meta_table",
+            "src/snapshot/tests.rs"
+        ));
         assert!(is_test_symbol("anything", "src/indexer/pipeline/tests.rs"));
         // Guard against false positives: substring must be the final segment.
         assert!(!is_test_symbol("fts5_search", "src/contests.rs"));
@@ -901,9 +1094,17 @@ mod tests {
     fn is_test_node_trusts_flag_then_heuristic() {
         // The AST flag catches the heuristic-invisible inline unit test
         // (descriptive snake_case name, src/ path) — the v0.79.1 audit case.
-        assert!(is_test_node(true, "two_node_cycle_is_detected", "src/graph/cycles.rs"));
+        assert!(is_test_node(
+            true,
+            "two_node_cycle_is_detected",
+            "src/graph/cycles.rs"
+        ));
         // Flag off + heuristic off ⇒ production.
-        assert!(!is_test_node(false, "two_node_cycle_is_detected", "src/graph/cycles.rs"));
+        assert!(!is_test_node(
+            false,
+            "two_node_cycle_is_detected",
+            "src/graph/cycles.rs"
+        ));
         // Heuristic still classifies when the flag is absent (legacy / unprojected rows).
         assert!(is_test_node(false, "test_login", "src/auth.rs"));
         assert!(is_test_node(false, "anything", "tests/integration.rs"));
