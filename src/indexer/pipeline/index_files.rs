@@ -43,7 +43,7 @@ use crate::storage::queries::{
 use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_REFERENCES, max_file_size, is_cross_file_call_noise};
 use crate::utils::config::detect_language;
 
-use super::{IndexResult, IndexStats, ProgressFn};
+use super::{IndexPhase, IndexResult, IndexStats, ProgressFn};
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
@@ -1332,7 +1332,7 @@ pub(super) fn index_files(
 
         // Report progress after each batch
         if let Some(cb) = progress {
-            cb(all_indexed.len(), files.len());
+            cb(IndexPhase::Files, all_indexed.len(), files.len());
         }
 
         if files.len() > BATCH_SIZE {
@@ -1344,8 +1344,24 @@ pub(super) fn index_files(
         }
     }
 
+    // Finalizing heartbeat: every phase below is a full-graph pass with no
+    // per-file progress, so the last `Files` tick would sit frozen for the whole
+    // tail (minutes on 10k-file repos). Ticking between phases keeps the progress
+    // consumer's mtime fresh — a stale-file gate can then distinguish "long tail
+    // phase" from "indexer was killed". No-op when this run changed nothing, so a
+    // no-diff incremental never (re)creates a progress file it never wrote to.
+    let finalize_tick = || {
+        if all_indexed.is_empty() && delete_paths.is_empty() {
+            return;
+        }
+        if let Some(cb) = progress {
+            cb(IndexPhase::Finalizing, all_indexed.len(), files.len());
+        }
+    };
+
     // Phase 3: Build context strings + embeddings (single transaction, lightweight)
     if !all_indexed.is_empty() {
+        finalize_tick();
         let tx = db.savepoint("idx_context")?;
         let all_node_ids: Vec<i64> = all_indexed.iter()
             .flat_map(|fi| fi.node_ids.iter().copied()).collect();
@@ -1405,6 +1421,7 @@ pub(super) fn index_files(
         );
 
         // Phase 3c: Embed outside the committed tx — recoverable on failure via repair_null_context_strings
+        finalize_tick();
         if let Some(m) = model {
             if db.vec_enabled() {
                 embed_and_store_batch(db, m, &context_updates)?;
@@ -1438,6 +1455,7 @@ pub(super) fn index_files(
     // unconditional: it early-returns on an empty pending table, so it is already
     // cheap on a no-op pass.)
     if !all_indexed.is_empty() || !delete_paths.is_empty() {
+        finalize_tick();
         // Phase 2d-bind: positively resolve bare-name calls to the node an explicit
         // import in the caller's file binds them to. `refine_ambiguous_targets`
         // picks the path-closest same-name node, which can be the wrong file when
@@ -1484,6 +1502,7 @@ pub(super) fn index_files(
 
     // Optimize query planner statistics after bulk writes
     if !all_indexed.is_empty() {
+        finalize_tick();
         let _ = db.run_optimize();
     }
 

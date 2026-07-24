@@ -45,6 +45,63 @@ function handleLogin(req: Request) {
 }
 
 #[test]
+fn test_progress_reports_files_then_finalizing_heartbeats() {
+    // Statusline liveness contract: batch progress arrives as `Files` events with
+    // a moving done-count, and the post-batch full-graph phases emit `Finalizing`
+    // heartbeats. Regression guard for the frozen "indexing N/M (100%)"
+    // statusline — before IndexPhase existed the whole tail was silent, so a
+    // stale-mtime gate couldn't tell "long tail phase" from "indexer died".
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+    fs::write(project_dir.path().join("src/a.ts"),
+        "function alpha(): number { return 1; }\n").unwrap();
+    fs::write(project_dir.path().join("src/b.ts"),
+        "function beta(): number { return alpha(); }\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let events = std::cell::RefCell::new(Vec::new());
+    let cb = |phase: IndexPhase, done: usize, total: usize| {
+        events.borrow_mut().push((phase, done, total));
+    };
+    let result = run_full_index(&db, project_dir.path(), None, Some(&cb)).unwrap();
+    let events = events.into_inner();
+
+    let files_done_max = events.iter()
+        .filter(|(p, _, _)| *p == IndexPhase::Files)
+        .map(|(_, d, _)| *d)
+        .max()
+        .expect("at least one Files event");
+    assert_eq!(files_done_max, result.files_indexed,
+        "Files events should reach the final indexed count");
+
+    assert!(events.iter().filter(|(p, _, _)| *p == IndexPhase::Finalizing).count() >= 2,
+        "tail phases must emit Finalizing heartbeats, got {:?}", events);
+    assert_eq!(events.last().unwrap().0, IndexPhase::Finalizing,
+        "the last event must come from the tail phases, got {:?}", events);
+}
+
+#[test]
+fn test_remove_indexing_status_older_than() {
+    let project_dir = TempDir::new().unwrap();
+    let cg = project_dir.path().join(crate::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&cg).unwrap();
+    let status = cg.join(INDEXING_STATUS_FILE);
+    fs::write(&status, r#"{"s":"indexing","d":5,"t":10}"#).unwrap();
+
+    // Fresh file + generous max_age → kept (a live indexer's file must survive).
+    remove_indexing_status_older_than(project_dir.path(), std::time::Duration::from_secs(3600));
+    assert!(status.exists(), "fresh progress file must not be removed");
+
+    // Zero max_age treats any mtime as stale → removed (the killed-server orphan).
+    remove_indexing_status_older_than(project_dir.path(), std::time::Duration::ZERO);
+    assert!(!status.exists(), "stale progress file must be removed");
+
+    // Absent file → no-op, no panic.
+    remove_indexing_status_older_than(project_dir.path(), std::time::Duration::ZERO);
+}
+
+#[test]
 fn test_full_index_atomic_inside_outer_transaction() {
     // L6: MCP rebuild_index wraps DELETE FROM files + run_full_index in ONE outer
     // transaction so external readers never see the empty mid-rebuild window and a

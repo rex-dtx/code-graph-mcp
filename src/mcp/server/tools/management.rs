@@ -183,7 +183,7 @@ impl McpServer {
         }
 
         self.send_log("info", "Rebuilding index...");
-        let progress_cb = |current: usize, total: usize| {
+        let progress_cb = |_phase: crate::indexer::pipeline::IndexPhase, current: usize, total: usize| {
             self.send_progress("rebuild-index", current, total);
         };
 

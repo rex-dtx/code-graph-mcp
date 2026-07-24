@@ -233,3 +233,49 @@ test('CODE_GRAPH_STATUSLINE_CWD in a subdir walks up to the project root', (t) =
   const out = runStatuslineIn(home, home, { CODE_GRAPH_STATUSLINE_CWD: subdir });
   assert.equal(out, 'code-graph: ✓ 3145 nodes | 205 files');
 });
+
+// --- indexing progress file states ---
+
+function writeProgress(project, payload, { ageMs = 0 } = {}) {
+  const file = path.join(project, '.code-graph', 'indexing-status.json');
+  fs.writeFileSync(file, JSON.stringify(payload));
+  if (ageMs > 0) {
+    const past = (Date.now() - ageMs) / 1000;
+    fs.utimesSync(file, past, past);
+  }
+  return file;
+}
+
+test('fresh indexing progress renders floor percent (skipped files never show 100%)', (t) => {
+  // Skipped files (parse errors, oversized) keep d below t even in the terminal
+  // progress write: 3868/3876 is 99.79%, and Math.round displayed it as a stuck
+  // "100%". floor keeps the not-done state visibly below 100.
+  const home = mkHome(t);
+  const project = mkProject(home);
+  writeProgress(project, { s: 'indexing', d: 3868, t: 3876 });
+  assert.equal(runStatusline(home, project), 'code-graph: ↻ indexing 3868/3876 (99%)');
+});
+
+test('finalizing progress renders an explicit phase label', (t) => {
+  // Post-batch full-graph phases: the count stops moving, so the server writes
+  // s:"finalizing" — render the phase, not a frozen-looking "(100%)" counter.
+  const home = mkHome(t);
+  const project = mkProject(home);
+  writeProgress(project, { s: 'finalizing', d: 2331, t: 2331 });
+  assert.equal(runStatusline(home, project), 'code-graph: ↻ finalizing 2331/2331');
+});
+
+test('stale progress file is ignored — falls through to health check', (t) => {
+  // A killed server (session exit, SIGKILL, MCP connect-timeout kill) skips the
+  // IndexGuard drop that deletes the progress file. A live indexer heartbeats at
+  // least once per batch/finalize phase, so an mtime older than the stale window
+  // proves nobody is writing: the orphan must not pin "indexing N/M" forever.
+  const home = mkHome(t);
+  const project = mkProject(home);
+  installStubBinary(home, {
+    report: { healthy: true, nodes: 30753, files: 2331 },
+    exitCode: 0,
+  });
+  writeProgress(project, { s: 'indexing', d: 2331, t: 2331 }, { ageMs: 10 * 60 * 1000 });
+  assert.equal(runStatusline(home, project), 'code-graph: ✓ 30753 nodes | 2331 files');
+});

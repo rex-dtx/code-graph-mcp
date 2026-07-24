@@ -57,11 +57,29 @@ const codeGraphDir = path.join(root, '.code-graph');
 // Check for background indexing progress file first
 const progressFile = path.join(codeGraphDir, 'indexing-status.json');
 try {
-  const raw = fs.readFileSync(progressFile, 'utf8');
-  const p = JSON.parse(raw);
-  if (p.s === 'indexing' && p.t > 0) {
-    const pct = Math.round((p.d / p.t) * 100);
+  // Staleness gate: the file is normally deleted by the server's IndexGuard, but
+  // a killed process (session exit, SIGKILL, the 30s MCP connect-timeout kill)
+  // skips Drop, and the orphan would pin "indexing N/M" here forever. A LIVE
+  // indexer heartbeats the file at least once per batch and per finalize phase,
+  // so an old mtime proves no indexer is writing it: ignore the file and fall
+  // through to the health check. (Mirrors INDEXING_STATUS_STALE_SECS in
+  // src/indexer/pipeline/mod.rs, which drives server/CLI-side stale cleanup.)
+  const INDEXING_STALE_MS = 120000;
+  const fresh = (Date.now() - fs.statSync(progressFile).mtimeMs) < INDEXING_STALE_MS;
+  const p = fresh ? JSON.parse(fs.readFileSync(progressFile, 'utf8')) : null;
+  if (p && p.s === 'indexing' && p.t > 0) {
+    // floor, not round: skipped files (parse errors, oversized) keep d below t
+    // even in the terminal progress write, and rounding displayed that state as
+    // a confusing stuck "100%".
+    const pct = Math.floor((p.d / p.t) * 100);
     process.stdout.write(`code-graph: \u21BB indexing ${p.d}/${p.t} (${pct}%)`);
+    process.exit(0);
+  }
+  if (p && p.s === 'finalizing' && p.t > 0) {
+    // Post-batch full-graph phases (context strings, import bind/prune, ANALYZE):
+    // the file count no longer moves, so show an explicit phase label instead of
+    // a frozen-looking counter.
+    process.stdout.write(`code-graph: ↻ finalizing ${p.d}/${p.t}`);
     process.exit(0);
   }
 } catch { /* no progress file or parse error — continue to health check */ }
@@ -131,8 +149,14 @@ function statusUnavailable(errText) {
 let report = null;
 let errText = '';
 try {
+  // 1500ms, NOT 3000ms: the composite wrapper kills this whole provider at
+  // 3000ms (statusline-composite.js runProvider), so an inner budget equal to
+  // the outer one guaranteed the OUTER timeout fired first on a slow
+  // health-check (e.g. CPU saturated by the embedding backfill) and the segment
+  // silently vanished. Keeping the inner budget well under the outer one turns
+  // "slow health-check" into a rendered "offline"/"updating" instead of a blank.
   report = parseReport(execFileSync(bin, ['health-check', '--format', 'json'], {
-    timeout: 3000,
+    timeout: 1500,
     stdio: ['pipe', 'pipe', 'pipe'],
     // Run the binary FROM the resolved root so its own project-root resolution
     // lands on the same DB the gate above picked (a subdir cwd would otherwise

@@ -757,6 +757,12 @@ pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     warn_if_index_locked(&project_root.join(CODE_GRAPH_DIR), quiet);
 
+    // The plugin hooks run this command periodically even when no MCP server is
+    // alive — exactly the window where a killed server's indexing-status.json
+    // would otherwise pin the statusline at a phantom "indexing N/M" forever.
+    // Stale-only: a live server's file has a fresh mtime and is left alone.
+    crate::indexer::pipeline::remove_stale_indexing_status(project_root);
+
     // No existing DB → full index. Delegate to build_full_index_at so the
     // full-index + embed path is shared with rebuild-index (no drift).
     if !db_path.exists() {

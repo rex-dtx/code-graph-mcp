@@ -183,7 +183,10 @@ use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 use super::tools::ToolRegistry;
 use crate::domain::CODE_GRAPH_DIR;
 use crate::embedding::model::EmbeddingModel;
-use crate::indexer::pipeline::{embed_and_store_batch, run_full_index, run_incremental_index_cached, IndexStats};
+use crate::indexer::pipeline::{
+    embed_and_store_batch, remove_stale_indexing_status, run_full_index,
+    run_incremental_index_cached, IndexPhase, IndexStats, INDEXING_STATUS_FILE,
+};
 use crate::indexer::watcher::{FileWatcher, WatchEvent};
 use crate::search::fusion::weighted_rrf_fusion;
 use crate::storage::db::Database;
@@ -704,6 +707,10 @@ impl McpServer {
 
             // Secondary instances: skip indexing/watcher, but still do embedding
             if !self.is_primary {
+                // Secondaries never index, so nothing on this path would ever clear
+                // a progress file orphaned by a killed primary. Stale-only removal:
+                // a LIVE primary's file has a fresh mtime and is left untouched.
+                remove_stale_indexing_status(&project_root);
                 let has_data = queries::get_index_status(self.db.conn(), false)
                     .map(|s| s.files_count > 0)
                     .unwrap_or(false);
@@ -782,7 +789,13 @@ impl McpServer {
         let done_signal = Arc::clone(&self.indexing.startup_indexing_done);
         let result_slot = Arc::clone(&self.indexing.startup_index_result);
         let error_slot = Arc::clone(&self.indexing.startup_index_error);
-        let progress_file = project_root.join(CODE_GRAPH_DIR).join("indexing-status.json");
+        let progress_file = project_root.join(CODE_GRAPH_DIR).join(INDEXING_STATUS_FILE);
+        // A progress file left by a killed predecessor (session exit / SIGKILL skips
+        // IndexGuard::drop) would pin the statusline at a phantom "indexing N/M"
+        // until some future run's guard removed it. We hold the primary index lock,
+        // so no other process is writing this file — remove it unconditionally; our
+        // own progress writes recreate it.
+        let _ = std::fs::remove_file(&progress_file);
         let embedding_flag = Arc::clone(&self.indexing.embedding_in_progress);
 
         std::thread::spawn(move || {
@@ -824,8 +837,15 @@ impl McpServer {
                 };
 
                 let pf = progress_file.clone();
-                let progress_cb = move |current: usize, total: usize| {
-                    let json = format!(r#"{{"s":"indexing","d":{},"t":{}}}"#, current, total);
+                let progress_cb = move |phase: IndexPhase, current: usize, total: usize| {
+                    // "finalizing" marks the post-batch full-graph phases where the
+                    // file count no longer moves; each write also refreshes mtime,
+                    // which is the statusline's liveness signal (stale-file gate).
+                    let s = match phase {
+                        IndexPhase::Files => "indexing",
+                        IndexPhase::Finalizing => "finalizing",
+                    };
+                    let json = format!(r#"{{"s":"{}","d":{},"t":{}}}"#, s, current, total);
                     let _ = std::fs::write(&pf, json);
                 };
 
@@ -942,7 +962,7 @@ impl McpServer {
 
         // Safety net: ensure progress file is removed (normally done by IndexGuard)
         if let Some(ref root) = self.project_root {
-            let _ = std::fs::remove_file(root.join(CODE_GRAPH_DIR).join("indexing-status.json"));
+            let _ = std::fs::remove_file(root.join(CODE_GRAPH_DIR).join(INDEXING_STATUS_FILE));
         }
 
         // Start watcher + embedding
@@ -1531,7 +1551,7 @@ impl McpServer {
             let has_existing = queries::get_index_status(self.db.conn(), false)
                 .map(|s| s.files_count > 0)
                 .unwrap_or(false);
-            let progress_cb = |current: usize, total: usize| {
+            let progress_cb = |_phase: IndexPhase, current: usize, total: usize| {
                 self.send_progress("indexing", current, total);
             };
             let result = if has_existing {
@@ -1687,7 +1707,7 @@ impl McpServer {
                         tx.commit()?;
                     }
 
-                    let progress_cb = |current: usize, total: usize| {
+                    let progress_cb = |_phase: IndexPhase, current: usize, total: usize| {
                         self.send_progress("indexing", current, total);
                     };
                     match run_full_index(&self.db, project_root, model, Some(&progress_cb)) {

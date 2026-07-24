@@ -56,8 +56,62 @@ pub struct IndexResult {
     pub stats: IndexStats,
 }
 
-/// Progress callback: called with (files_done, files_total) after each batch.
-pub type ProgressFn<'a> = &'a dyn Fn(usize, usize);
+/// Which stage of an index run a progress event describes.
+/// `Files` fires after each parsed batch with a moving `done` count; `Finalizing`
+/// fires as a heartbeat between the post-batch full-graph phases (context strings,
+/// pending-call sweep, import bind/prune, ANALYZE) where `done` no longer moves.
+/// Consumers use the distinction to render "finalizing" instead of a frozen
+/// `done/total` — and the heartbeat itself keeps the progress file's mtime fresh
+/// so a stale-file gate can tell "long tail phase" apart from "indexer died".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexPhase {
+    Files,
+    Finalizing,
+}
+
+/// Progress callback: called with (phase, files_done, files_total).
+pub type ProgressFn<'a> = &'a dyn Fn(IndexPhase, usize, usize);
+
+/// Name of the statusline progress file under `.code-graph/`, written by the MCP
+/// server's startup indexing thread and read by the plugin statusline.
+pub const INDEXING_STATUS_FILE: &str = "indexing-status.json";
+
+/// Age past which `indexing-status.json` is a leftover from a killed process, not
+/// a live indexer: live runs heartbeat at least once per batch / finalize phase,
+/// orders of magnitude more often than this. The statusline applies the same
+/// threshold (INDEXING_STALE_MS in statusline.js) before trusting the file.
+pub const INDEXING_STATUS_STALE_SECS: u64 = 120;
+
+/// Remove a leftover `.code-graph/indexing-status.json` older than
+/// [`INDEXING_STATUS_STALE_SECS`]. A killed session (SIGKILL, session exit)
+/// skips the IndexGuard drop that normally deletes the file, pinning the
+/// statusline at a phantom "indexing N/M" forever. Safe against a live indexer:
+/// its file is fresh and left alone, and even a racing removal is repaired by
+/// the indexer's next heartbeat write.
+pub fn remove_stale_indexing_status(project_root: &Path) {
+    remove_indexing_status_older_than(
+        project_root,
+        std::time::Duration::from_secs(INDEXING_STATUS_STALE_SECS),
+    );
+}
+
+/// Testable inner: remove the progress file when its mtime is at least `max_age`
+/// old (or unreadable — an mtime we can't read cannot prove liveness).
+pub fn remove_indexing_status_older_than(project_root: &Path, max_age: std::time::Duration) {
+    let path = project_root
+        .join(crate::domain::CODE_GRAPH_DIR)
+        .join(INDEXING_STATUS_FILE);
+    let Ok(meta) = std::fs::metadata(&path) else { return };
+    let stale = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|age| age >= max_age)
+        .unwrap_or(true);
+    if stale {
+        let _ = std::fs::remove_file(&path);
+    }
+}
 
 pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>, progress: Option<ProgressFn>) -> Result<IndexResult> {
     let current_hashes = scan_directory(project_root)?;
@@ -187,6 +241,11 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
     let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files, progress)?;
 
     if !dirty_node_ids.is_empty() {
+        // Heartbeat: context-string regeneration for dirty dependents runs after
+        // index_files' own finalize ticks and can take a while on wide fan-in.
+        if let Some(cb) = progress {
+            cb(IndexPhase::Finalizing, result.files_indexed, to_index.len());
+        }
         regenerate_context_strings(db, &dirty_node_ids, model)?;
     }
 
@@ -243,6 +302,11 @@ pub fn run_incremental_index_cached(
     let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files, progress)?;
 
     if !dirty_node_ids.is_empty() {
+        // Heartbeat: context-string regeneration for dirty dependents runs after
+        // index_files' own finalize ticks and can take a while on wide fan-in.
+        if let Some(cb) = progress {
+            cb(IndexPhase::Finalizing, result.files_indexed, to_index.len());
+        }
         regenerate_context_strings(db, &dirty_node_ids, model)?;
     }
 
