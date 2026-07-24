@@ -5,8 +5,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { globalNodeModulesCandidates, findPlatformBinary, BINARY_NAME,
-        compareVersions, getPackageVersion, isCachedBinaryFresh,
+const { globalNodeModulesCandidates, findPlatformBinary, createVersionGate,
+        BINARY_NAME, compareVersions, getPackageVersion, isCachedBinaryFresh,
         unsupportedPlatformHint } = require('./find-binary');
 
 function mkDir(t, prefix) {
@@ -40,6 +40,31 @@ test('globalNodeModulesCandidates honors NPM_CONFIG_PREFIX', (t) => {
     : path.join('/tmp/fake-npm-prefix', 'lib', 'node_modules');
   assert.ok(candidates.includes(expected),
     `expected NPM_CONFIG_PREFIX-derived path in candidates: ${JSON.stringify(candidates)}`);
+});
+
+test('NPM_CONFIG_PREFIX-derived path ranks BEFORE the execPath derivation', (t) => {
+  // When the user sets NPM_CONFIG_PREFIX, `npm install -g` installs THERE — it
+  // is the authoritative global root and must outrank the execPath-derived
+  // (nvm) prefix. The old order let a stale relic in the nvm prefix shadow the
+  // user's real prefix (and made this file's findPlatformBinary test flaky on
+  // machines with an old global install).
+  const original = process.env.NPM_CONFIG_PREFIX;
+  process.env.NPM_CONFIG_PREFIX = '/tmp/fake-npm-prefix';
+  t.after(() => {
+    if (original === undefined) delete process.env.NPM_CONFIG_PREFIX;
+    else process.env.NPM_CONFIG_PREFIX = original;
+  });
+
+  const candidates = globalNodeModulesCandidates();
+  const envDerived = process.platform === 'win32'
+    ? path.join('/tmp/fake-npm-prefix', 'node_modules')
+    : path.join('/tmp/fake-npm-prefix', 'lib', 'node_modules');
+  const nodeBinDir = path.dirname(process.execPath);
+  const execDerived = process.platform === 'win32'
+    ? path.join(nodeBinDir, 'node_modules')
+    : path.resolve(nodeBinDir, '..', 'lib', 'node_modules');
+  assert.ok(candidates.indexOf(envDerived) < candidates.indexOf(execDerived),
+    `env-derived must precede execPath-derived: ${JSON.stringify(candidates)}`);
 });
 
 test('globalNodeModulesCandidates dedupes overlapping paths', (t) => {
@@ -243,4 +268,60 @@ test('unsupportedPlatformHint returns null for supported platforms', () => {
   assert.equal(unsupportedPlatformHint('darwin', 'arm64', 'glibc'), null);
   assert.equal(unsupportedPlatformHint('darwin', 'x64', 'glibc'), null);
   assert.equal(unsupportedPlatformHint('win32', 'x64', 'glibc'), null);
+});
+
+// --- createVersionGate: the discovery-chain version gate ---
+// The incident it pins: a 0.16.6 `npm install -g` relic in the nvm global
+// node_modules was returned VERBATIM whenever the auto-update cache was one
+// release behind — an ancient server on a modern schema (MCP 30s timeout).
+
+// Real file named code-graph-mcp so isNativeBinary passes; version is injected.
+function mkGateBinary(t, version, versions) {
+  const dir = mkDir(t, 'version-gate-');
+  const bin = path.join(dir, BINARY_NAME);
+  fs.writeFileSync(bin, 'stub');
+  versions.set(bin, version);
+  return bin;
+}
+
+function mkGate(t, pkgVersion) {
+  const versions = new Map();
+  const gate = createVersionGate(pkgVersion, { readVersion: (bin) => versions.get(bin) ?? null });
+  return { gate, mk: (version) => mkGateBinary(t, version, versions) };
+}
+
+test('gate accepts a current-or-newer candidate on the spot', (t) => {
+  const { gate, mk } = mkGate(t, '0.101.0');
+  const current = mk('0.101.0');
+  assert.equal(gate.consider(current), current);
+  const newer = mk('0.102.0');
+  assert.equal(gate.consider(newer), newer);
+});
+
+test('gate accepts an unverifiable candidate (no version readable / no pkg version)', (t) => {
+  const { gate, mk } = mkGate(t, '0.101.0');
+  const unreadable = mk(null);
+  assert.equal(gate.consider(unreadable), unreadable,
+    'a binary that will not report a version must not be refused — it may be the only path');
+
+  const { gate: ungated, mk: mk2 } = mkGate(t, null);
+  const anything = mk2('0.1.0');
+  assert.equal(ungated.consider(anything), anything,
+    'without a pkg version there is nothing to gate against');
+});
+
+test('gate holds back stale candidates; best() yields the NEWEST stale', (t) => {
+  const { gate, mk } = mkGate(t, '0.101.0');
+  const ancient = mk('0.16.6');   // the real-world relic
+  const nearMiss = mk('0.100.0'); // one release behind
+  assert.equal(gate.consider(nearMiss), null, 'stale must not be returned inline');
+  assert.equal(gate.consider(ancient), null);
+  assert.equal(gate.best(), nearMiss,
+    'fallback must be the newest stale candidate, regardless of consideration order');
+});
+
+test('gate ignores non-binaries and best() is null when nothing was considered', (t) => {
+  const { gate } = mkGate(t, '0.101.0');
+  assert.equal(gate.consider(path.join(os.tmpdir(), 'does-not-exist', BINARY_NAME)), null);
+  assert.equal(gate.best(), null);
 });

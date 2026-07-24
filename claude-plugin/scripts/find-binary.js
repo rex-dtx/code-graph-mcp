@@ -87,21 +87,25 @@ function globalNodeModulesCandidates() {
   const out = [];
   const nodeBinDir = path.dirname(process.execPath);
 
-  // 1. Derive from process.execPath. Works for nvm + standard Unix prefixes
+  // 1. NPM_CONFIG_PREFIX env override (users with `~/.npm-global` etc.) FIRST:
+  //    when set, `npm install -g` actually installs THERE, so it is the most
+  //    authoritative location — matching npm's own prefix-resolution order.
+  //    (It also used to rank below the execPath derivation, which let a stale
+  //    relic in the nvm prefix shadow the user's real prefix.)
+  const envPrefix = process.env.NPM_CONFIG_PREFIX || process.env.npm_config_prefix;
+  if (envPrefix) {
+    out.push(PLATFORM === 'win32'
+      ? path.join(envPrefix, 'node_modules')
+      : path.join(envPrefix, 'lib', 'node_modules'));
+  }
+
+  // 2. Derive from process.execPath. Works for nvm + standard Unix prefixes
   //    (`<prefix>/bin/node` → globals at `<prefix>/lib/node_modules`); on
   //    Windows globals sit next to `node.exe`.
   if (PLATFORM === 'win32') {
     out.push(path.join(nodeBinDir, 'node_modules'));
   } else {
     out.push(path.resolve(nodeBinDir, '..', 'lib', 'node_modules'));
-  }
-
-  // 2. NPM_CONFIG_PREFIX env override (set by users using `~/.npm-global` etc.)
-  const envPrefix = process.env.NPM_CONFIG_PREFIX || process.env.npm_config_prefix;
-  if (envPrefix) {
-    out.push(PLATFORM === 'win32'
-      ? path.join(envPrefix, 'node_modules')
-      : path.join(envPrefix, 'lib', 'node_modules'));
   }
 
   // 3. Common no-sudo user prefix
@@ -160,6 +164,10 @@ function isCachedBinaryFresh(cachedPath, pkgVersion) {
  *   auto-update cache → platform npm pkg → bundled (bin/) →
  *   cargo install → PATH → npx cache
  *
+ * Every tier after dev-mode is version-gated (createVersionGate): the first
+ * candidate at/above the pkg version wins; when NONE is current, the newest
+ * stale candidate is returned rather than null.
+ *
  * Returns the absolute path or null if not found.
  */
 function findBinary() {
@@ -200,21 +208,57 @@ function isDevRepo(rootDir) {
  * nvm/standard setups), so a working `npm install -g @sdsrs/code-graph` can
  * still be invisible without the fallback.
  */
-function findPlatformBinary() {
+function platformBinaryCandidates() {
+  const out = [];
   // Fast path: standard module resolution.
   try {
     const pkgPath = require.resolve(`${PLATFORM_PKG}/package.json`);
     const bin = path.join(path.dirname(pkgPath), BINARY_NAME);
-    if (isNativeBinary(bin)) return bin;
+    if (isNativeBinary(bin)) out.push(bin);
   } catch { /* not in node_modules walk-up */ }
 
   // Slow path: explicit global node_modules probe.
   for (const globalRoot of globalNodeModulesCandidates()) {
     const bin = path.join(globalRoot, '@sdsrs', `code-graph-${PLATFORM}-${ARCH}`, BINARY_NAME);
-    if (isNativeBinary(bin)) return bin;
+    if (isNativeBinary(bin)) out.push(bin);
   }
 
-  return null;
+  return out;
+}
+
+function findPlatformBinary() {
+  return platformBinaryCandidates()[0] || null;
+}
+
+/**
+ * Version gate for discovery candidates. `consider(bin)` accepts a candidate
+ * outright when it is current (version >= pkgVersion) or unverifiable (no pkg
+ * version / binary won't report one — don't refuse the only path we may have);
+ * a candidate OLDER than the package is recorded as a stale fallback instead of
+ * being returned, and `best()` yields the NEWEST of those.
+ *
+ * Why: candidates below the auto-update cache had no version check at all, so
+ * a years-old relic (a 0.16.6 `npm install -g` leftover in the nvm global
+ * node_modules) was returned VERBATIM during every post-release window in
+ * which the cache binary was one version behind — an ancient server on a
+ * modern schema, presenting as the MCP 30s connect-timeout. Newest-stale
+ * beats null because every consumer (statusline, hooks, CLI) degrades more
+ * gracefully on a slightly-old binary than on "offline", and the stale-binary
+ * self-heal in auto-update.js re-downloads shortly anyway.
+ */
+function createVersionGate(pkgVersion, { readVersion = readBinaryVersion } = {}) {
+  let bestStale = null;
+  return {
+    consider(bin) {
+      if (!isNativeBinary(bin)) return null;
+      if (!pkgVersion) return bin;
+      const ver = readVersion(bin);
+      if (!ver || compareVersions(ver, pkgVersion) >= 0) return bin;
+      if (!bestStale || compareVersions(ver, bestStale.ver) > 0) bestStale = { bin, ver };
+      return null;
+    },
+    best() { return bestStale ? bestStale.bin : null; },
+  };
 }
 
 function findBinaryUncached() {
@@ -240,24 +284,31 @@ function findBinaryUncached() {
     }
   }
 
+  // Every tier below runs through the version gate: a candidate at or above
+  // the npm pkg version is returned on the spot (tier order = priority, same
+  // as before); an OLDER candidate is only remembered as a fallback. Without
+  // the gate, tiers below the auto-update cache accepted any binary verbatim —
+  // so when the cache was one release behind (every post-release window), an
+  // ancient global-npm relic could shadow it (the 0.16.6-serves-a-modern-DB
+  // incident behind the MCP 30s connect-timeout).
+  const gate = createVersionGate(getPackageVersion());
+
   // --- Auto-update cache (binary downloaded directly from GitHub release) ---
   // Cache wins when its version >= the npm pkg version. After `npm update`
   // refreshes the platform-pkg, an older auto-update cache binary must NOT
   // shadow the freshly-installed one; this version check prevents the
   // upgrade-race where users keep running stale binary until auto-update fires.
   const autoUpdateBin = path.join(os.homedir(), '.cache', 'code-graph', 'bin', BINARY_NAME);
-  if (isNativeBinary(autoUpdateBin)) {
-    const cacheVer = readBinaryVersion(autoUpdateBin);
-    const pkgVer = getPackageVersion();
-    if (!pkgVer || !cacheVer || compareVersions(cacheVer, pkgVer) >= 0) {
-      return autoUpdateBin;
-    }
-    // Cache is older than npm pkg — fall through to platform-pkg.
+  {
+    const hit = gate.consider(autoUpdateBin);
+    if (hit) return hit;
   }
 
   // --- Platform-specific npm package (@sdsrs/code-graph-{os}-{arch}) ---
-  const platformBin = findPlatformBinary();
-  if (platformBin) return platformBin;
+  for (const platformBin of platformBinaryCandidates()) {
+    const hit = gate.consider(platformBin);
+    if (hit) return hit;
+  }
 
   // --- Bundled binary (in same directory as cli.js or plugin scripts) ---
   // Check bin/ directory of the npm package
@@ -267,20 +318,23 @@ function findBinaryUncached() {
   }
   binDirs.add(path.resolve(__dirname, '..', '..', 'bin'));
   for (const dir of binDirs) {
-    const bundled = path.join(dir, BINARY_NAME);
-    if (isNativeBinary(bundled)) return bundled;
+    const hit = gate.consider(path.join(dir, BINARY_NAME));
+    if (hit) return hit;
   }
 
   // --- Cargo install (~/.cargo/bin) ---
-  const cargoBin = path.join(os.homedir(), '.cargo', 'bin', BINARY_NAME);
-  if (isNativeBinary(cargoBin)) return cargoBin;
+  {
+    const hit = gate.consider(path.join(os.homedir(), '.cargo', 'bin', BINARY_NAME));
+    if (hit) return hit;
+  }
 
   // --- PATH lookup (last resort for intentionally installed binaries) ---
   try {
     const which = PLATFORM === 'win32' ? 'where' : 'which';
     const found = execFileSync(which, [BINARY_NAME], { stdio: ['pipe', 'pipe', 'pipe'] })
       .toString().trim().split('\n')[0];
-    if (isNativeBinary(found)) return found;
+    const hit = gate.consider(found);
+    if (hit) return hit;
   } catch { /* not in PATH */ }
 
   // --- npx cache (very last resort — may be outdated) ---
@@ -288,12 +342,15 @@ function findBinaryUncached() {
   try {
     for (const entry of fs.readdirSync(npxDir)) {
       const platDir = path.join(npxDir, entry, 'node_modules', '@sdsrs', `code-graph-${PLATFORM}-${ARCH}`);
-      const platBin = path.join(platDir, BINARY_NAME);
-      if (isNativeBinary(platBin)) return platBin;
+      const hit = gate.consider(path.join(platDir, BINARY_NAME));
+      if (hit) return hit;
     }
   } catch { /* no npx cache */ }
 
-  return null;
+  // Nothing current anywhere: the newest stale candidate (if any) beats null —
+  // consumers degrade better on a slightly-old binary than on "offline", and
+  // auto-update's stale-binary self-heal replaces it shortly.
+  return gate.best();
 }
 
 /**
@@ -306,7 +363,7 @@ function clearCache() {
 
 module.exports = {
   findBinary, findBinaryUncached, clearCache,
-  globalNodeModulesCandidates, findPlatformBinary,
+  globalNodeModulesCandidates, findPlatformBinary, createVersionGate,
   getPackageVersion, compareVersions, isCachedBinaryFresh,
   detectLibc, unsupportedPlatformHint,
   CACHE_FILE, BINARY_NAME, PLATFORM_PKG,

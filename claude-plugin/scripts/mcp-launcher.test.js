@@ -99,12 +99,21 @@ test('mcp-launcher resolves dev binary and forwards MCP JSON-RPC stdin/stdout', 
   assert.equal(resp.result.serverInfo.name, 'code-graph-mcp');
 });
 
-test('mcp-launcher enters dedup stub when project .mcp.json registers a code-graph server', async () => {
-  // REPO_ROOT/.mcp.json registers code-graph-dev → dedup gate fires →
-  // launcher serves a 0-tools stub with a distinctive serverInfo.name.
-  // No need for the release binary; the stub is implemented in the
-  // launcher script itself.
-  const { stdout, stderr } = await runLauncherInitialize();
+test('mcp-launcher enters dedup stub when project .mcp.json registers a code-graph server', async (t) => {
+  // A project whose own .mcp.json registers a code-graph server → dedup gate
+  // fires → launcher serves a 0-tools stub with a distinctive serverInfo.name.
+  // No need for the release binary; the stub is implemented in the launcher
+  // script itself. Self-contained temp project: this test used to rely on an
+  // UNCOMMITTED local REPO_ROOT/.mcp.json (never in git history), so it failed
+  // on every fresh clone once that local file was deleted.
+  const os = require('os');
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-launcher-dedup-'));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(cwd, '.mcp.json'), JSON.stringify({
+    mcpServers: { 'code-graph-dev': { command: 'true', args: [] } },
+  }));
+
+  const { stdout, stderr } = await runLauncherInitialize(15000, {}, cwd);
   const respLine = stdout.trim().split('\n').find((l) => l.includes('"result"'));
   assert.ok(respLine,
     `expected stub JSON-RPC result on stdout, got: ${stdout.slice(0, 400)} | stderr: ${stderr.slice(0, 400)}`);
