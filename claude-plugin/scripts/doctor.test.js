@@ -81,10 +81,14 @@ test('surveyHookCoverage reports clean when all entries are current', () => {
 
 test('surveyHookCoverage flags a present-but-stale hook path', () => {
   const settings = settingsWithCurrentHooks();
-  // Repoint one PreToolUse entry at an old plugin-cache version dir — present,
-  // recognized as ours (description unchanged), but command no longer current.
+  // Repoint one PreToolUse entry at an old, now-pruned plugin-cache version dir —
+  // present, recognized as ours (description unchanged), but the script path no
+  // longer exists on disk. replaceAll (not replace) so BOTH the `if [ -f "…" ]`
+  // guard and the `node "…"` exec path move to the dead dir — a realistic stale
+  // entry (the executed path is what staleness keys off; a half-mutated command
+  // whose exec path stayed current is, correctly, not stale).
   const bash = settings.hooks.PreToolUse.find(e => e.matcher === 'Bash');
-  bash.hooks[0].command = bash.hooks[0].command.replace('/scripts/', '/0.0.1-old/scripts/');
+  bash.hooks[0].command = bash.hooks[0].command.replaceAll('/scripts/', '/0.0.1-old/scripts/');
   const cov = surveyHookCoverage(settings);
   assert.equal(cov.missing.length, 0, 'entry is present, not missing');
   assert.ok(cov.stale.includes('PreToolUse:Bash'),

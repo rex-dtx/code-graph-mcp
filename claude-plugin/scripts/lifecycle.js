@@ -375,13 +375,17 @@ function isOurHookEntry(entry) {
   if (!entry || !entry.hooks) return false;
   // Primary: match by description (immune to path pollution).
   if (entry.description && OUR_DESCRIPTIONS.includes(entry.description)) return true;
-  // Fallback: script name + MARKETPLACE_NAME in path. v0.32.1: tightened from
-  // bare 'code-graph' (which would claim a user's own ~/code-graph/foo.js) to
-  // the actual marketplace dir name 'code-graph-mcp' — Requirement 3 says
-  // foreign-entry strip is unacceptable, so be conservative.
+  // Fallback: script basename + a delivery-surface marker in the path. TWO
+  // surfaces ship these scripts: the marketplace plugin-cache (dir
+  // 'code-graph-mcp') AND the global npm package (dir '@sdsrs/code-graph' — note
+  // NO '-mcp' suffix). v0.32.1 tightened from bare 'code-graph' (which would
+  // claim a user's own ~/code-graph/foo.js) to MARKETPLACE_NAME, but that alone
+  // missed the npm-global surface, so `npm i -g`-delivered hooks were never
+  // evicted and orphan-accumulated across node/version switches (RCA 2026-07-24).
+  // Both markers are specific enough not to claim a user's unrelated file.
   return entry.hooks.some(h =>
     h.command && OUR_HOOK_SCRIPTS.some(s => h.command.includes(s)) &&
-    h.command.includes(MARKETPLACE_NAME)
+    (h.command.includes(MARKETPLACE_NAME) || h.command.includes(SHELL_PKG))
   );
 }
 
@@ -448,6 +452,23 @@ function buildSettingsHookEntries() {
 // re-write it to settings.json.
 function registerHooksToSettings(settings) {
   settings.hooks = settings.hooks || {};
+
+  // Idempotent across delivery surfaces: if every desired (event,matcher) is
+  // already present exactly once, pointing at a current, existing script
+  // (plugin-cache OR global-npm), do nothing. Stops the settings.json ping-pong
+  // where the cache session-init and the npm-global CLI doctor each rewrote the
+  // other's valid entry every run (RCA 2026-07-24). Any missing/stale/dead entry
+  // — or a duplicate ( oursCount > expected) — still triggers evict+rewrite.
+  const survey = surveyHookCoverage(settings);
+  let oursCount = 0;
+  for (const entries of Object.values(settings.hooks)) {
+    if (Array.isArray(entries)) oursCount += entries.filter(isOurHookEntry).length;
+  }
+  if (survey.missing.length === 0 && survey.stale.length === 0
+      && oursCount === survey.expected.length) {
+    return false;
+  }
+
   const before = JSON.stringify(settings.hooks);
 
   // Pass 1: evict our entries across every event.
@@ -465,6 +486,22 @@ function registerHooksToSettings(settings) {
   }
 
   return before !== JSON.stringify(settings.hooks);
+}
+
+// Extract the .js script path a hook command invokes — bare (`node "…"`) or
+// existence-guarded (`if [ -f "…" ]; then node "…"; fi`).
+function hookCmdScript(cmd) {
+  const m = (cmd || '').match(/node "([^"]+\.js)"/) || (cmd || '').match(/"([^"]+\.js)"/);
+  return m ? m[1] : null;
+}
+
+// Version encoded in a plugin-cache path (.../code-graph-mcp/code-graph-mcp/<ver>/scripts/…).
+// Null for in-place installs (global npm), whose path never carries a version
+// dir — npm overwrites the same path on upgrade, so such a path never goes
+// version-stale (only dead-path-stale, caught separately by fs.existsSync).
+function cacheDirVersion(scriptPath) {
+  const m = (scriptPath || '').match(/\/code-graph-mcp\/code-graph-mcp\/(\d+\.\d+\.\d+[^/]*)\//);
+  return m ? m[1] : null;
 }
 
 // Inventory of (event, matcher) tuples we expect to find in settings.json after
@@ -504,10 +541,26 @@ function surveyHookCoverage(settings) {
     }
   }
 
+  const { compareVersions } = require('./version-utils');
   const missing = expected.filter(k => !present.has(k));
-  const stale = expected.filter(k =>
-    present.has(k) && desiredCmd[k] && presentCmd[k] && presentCmd[k] !== desiredCmd[k]
-  );
+  // Version/surface-tolerant staleness. Was an exact command-string compare,
+  // which made two registration authorities (plugin-cache session-init vs
+  // global-npm CLI doctor — different absolute paths) each flag the other's
+  // VALID CURRENT entry stale and rewrite it → settings.json ping-pong on every
+  // alternating run (RCA 2026-07-24). An entry is stale only when its script is
+  // a dead path OR resolves to an OLDER plugin-cache version dir than we'd write
+  // now. A present entry on a different but valid, current surface (npm in-place
+  // install: file exists, no version in path) is NOT stale.
+  const stale = expected.filter(k => {
+    if (!present.has(k) || !presentCmd[k]) return false;
+    const pScript = hookCmdScript(presentCmd[k]);
+    if (!pScript) return false;
+    if (!fs.existsSync(pScript)) return true;             // dead path
+    const pv = cacheDirVersion(pScript);
+    const dv = cacheDirVersion(hookCmdScript(desiredCmd[k]));
+    if (pv && dv) return compareVersions(pv, dv) < 0;     // older cache version dir
+    return false;                                         // in-place/current surface
+  });
   return { expected, present: [...present], missing, stale };
 }
 

@@ -9,7 +9,7 @@ const path = require('path');
 const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
 const { claudeHome } = require('./claude-config');
-const { clearCache: clearBinaryCache, globalNodeModulesCandidates, PLATFORM_PKG, detectLibc } = require('./find-binary');
+const { clearCache: clearBinaryCache, globalNodeModulesCandidates, nvmNodeModulesDirs, PLATFORM_PKG, detectLibc } = require('./find-binary');
 const { readBinaryVersion, compareVersions, isDevMode } = require('./version-utils');
 const { cgTmpDir } = require('./tmp-dir');
 const { npmSpawnOpts } = require('./npm-exec');
@@ -597,6 +597,31 @@ function staleGlobalPkgs(latestVersion, roots = null) {
   return out;
 }
 
+/**
+ * Global installs of ours stranded under a NON-active node version. nvm keeps a
+ * separate global prefix per node; switching the default node leaves the old
+ * prefix's `@sdsrs/code-graph` behind — invisible to selfHealGlobalPkgs (which
+ * only sees, and can only `npm install -g` into, the ACTIVE node's prefix) yet
+ * still able to seed stale settings.json hooks / shadow PATH shims (the
+ * v24.11.1@0.46.0 relic firing beside the active install — RCA 2026-07-24).
+ * Detection-only: returns each relic's package + version + node prefix so doctor
+ * can surface it with manual remediation. `dirs`/`activeDir` injectable for tests.
+ */
+function inactiveNodeGlobalRelics({ dirs = null, activeDir = null } = {}) {
+  const active = path.resolve(activeDir
+    || path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules'));
+  const roots = dirs || nvmNodeModulesDirs();
+  const out = [];
+  for (const dir of roots) {
+    if (path.resolve(dir) === active) continue; // active prefix → not a relic
+    for (const name of [SHELL_PKG, PLATFORM_PKG]) {
+      const version = globalPkgVersion(name, [dir]);
+      if (version) out.push({ name, version, nodeModulesDir: dir });
+    }
+  }
+  return out;
+}
+
 /** One targeted `npm install -g` for the given specs. Resolves true on exit 0. */
 function npmInstallGlobal(specs) {
   return new Promise((resolve) => {
@@ -647,6 +672,21 @@ async function selfHealGlobalPkgs(latest, state, {
   };
 }
 
+// Whether a THROTTLED checkForUpdate should still attempt the global-npm
+// self-heal. The post-fetch heal below only runs on the non-throttle path, but
+// the ONLY context that can SEE a user's nvm/global prefix is a CLI run under
+// that node (globalNodeModulesCandidates is execPath-derived) — and such a run,
+// once binary+shell are current, short-circuits at the throttle early-return and
+// never reaches the heal. That gap stranded a global `code-graph-mcp` shim at
+// 0.101.0 while the binary reached 0.103.0 (RCA 2026-07-24). Cheap local
+// package.json read (readStale) gates the slow, lock-guarded npm path. Split out
+// so the decision is unit-testable without the full checkForUpdate harness.
+function shouldHealGlobalsOnThrottle(state, { readStale = staleGlobalPkgs } = {}) {
+  if (!state || !state.latestVersion) return false;
+  if (process.env.CODE_GRAPH_INSTALL_LOCK_HELD === '1') return false; // parent launcher holds it
+  return readStale(state.latestVersion).length > 0;
+}
+
 async function checkForUpdate({ installMissing = false, force = false } = {}) {
   let installLock = null;
   try {
@@ -670,6 +710,16 @@ async function checkForUpdate({ installMissing = false, force = false } = {}) {
     if (!binaryMissing && !binaryStale && !shouldCheck(state, { force })) {
       if (state.installedVersion !== installedVersion) {
         saveState({ ...state, installedVersion });
+      }
+      // Global-npm shell/platform self-heal reaches the throttle window too (see
+      // shouldHealGlobalsOnThrottle). Cheap local check first; only the actually-
+      // stale case takes the slow, lock-guarded npm path.
+      if (shouldHealGlobalsOnThrottle(state)) {
+        installLock = acquireLock(path.join(CACHE_DIR, 'install.lock'));
+        if (installLock) {
+          const globalHeal = await selfHealGlobalPkgs({ version: state.latestVersion }, state);
+          saveState({ ...readState(), ...globalHeal });
+        }
       }
       if (state.updateAvailable && state.latestVersion
           && compareVersions(state.latestVersion, installedVersion) > 0) {
@@ -776,6 +826,7 @@ module.exports = {
   getPlatformAssetName,
   selfHealStaleBinary,
   selfHealGlobalPkgs, staleGlobalPkgs, globalPkgVersion, npmInstallGlobal,
+  shouldHealGlobalsOnThrottle, inactiveNodeGlobalRelics,
   downloadAndInstall, refreshMarketplaceClone, marketplaceCloneDir,
 };
 

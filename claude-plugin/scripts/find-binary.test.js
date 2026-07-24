@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { globalNodeModulesCandidates, findPlatformBinary, createVersionGate,
+const { globalNodeModulesCandidates, nvmNodeModulesDirs, findPlatformBinary, createVersionGate,
         BINARY_NAME, compareVersions, getPackageVersion, isCachedBinaryFresh,
         unsupportedPlatformHint } = require('./find-binary');
 
@@ -86,6 +86,24 @@ test('globalNodeModulesCandidates dedupes overlapping paths', (t) => {
     assert.ok(!seen.has(c), `duplicate candidate: ${c}`);
     seen.add(c);
   }
+});
+
+// ── nvmNodeModulesDirs: per-node global prefixes (relic detection) ──────────
+
+test('nvmNodeModulesDirs enumerates existing per-node global module dirs (injected base)', (t) => {
+  const base = mkDir(t, 'nvm-base-');
+  fs.mkdirSync(path.join(base, 'v24.18.0', 'lib', 'node_modules'), { recursive: true });
+  fs.mkdirSync(path.join(base, 'v24.11.1', 'lib', 'node_modules'), { recursive: true });
+  fs.writeFileSync(path.join(base, 'alias-file'), 'x'); // non-dir entry → ignored
+  const got = nvmNodeModulesDirs(base).sort();
+  assert.deepEqual(got, [
+    path.join(base, 'v24.11.1', 'lib', 'node_modules'),
+    path.join(base, 'v24.18.0', 'lib', 'node_modules'),
+  ].sort());
+});
+
+test('nvmNodeModulesDirs returns [] when the nvm base is absent (no nvm installed)', () => {
+  assert.deepEqual(nvmNodeModulesDirs('/definitely/not/a/real/nvm/base'), []);
 });
 
 test('findPlatformBinary locates platform pkg in NPM_CONFIG_PREFIX-derived global node_modules', (t) => {

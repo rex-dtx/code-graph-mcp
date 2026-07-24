@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.104.0 — hook-registration dedup + global-shell drift repair
+
+Upgrade notes: no action required. If you switch nvm/node versions, code-graph
+now evicts global-npm-delivered hooks stranded under the old node prefix instead
+of firing them as stale duplicates, and `doctor` gained a **Global npm relics**
+check that surfaces our packages left under a non-active node version. Root-cause
+of an audit finding where a global `code-graph-mcp` CLI shim sat two+ versions
+behind the native binary (RCA 2026-07-24).
+
+### Fixed
+- **Orphan hook accumulation across node/version switches** (`lifecycle.js`):
+  `isOurHookEntry` recognized only the marketplace-cache delivery path (dir
+  `code-graph-mcp`); hooks delivered via `npm i -g` live under the package name
+  `@sdsrs/code-graph` (no `-mcp`) and were never evicted. Every node-version
+  switch or reinstall left a stale bare `node "…"` hook firing beside the current
+  one — Edit/Read/Bash/prompt hooks ran 2–3×, some executing code dozens of
+  versions old. Eviction now recognizes both delivery surfaces.
+- **settings.json hook-registration ping-pong** (`lifecycle.js`):
+  `surveyHookCoverage` computed staleness by exact command-string compare, so the
+  plugin-cache session-init and the global-npm CLI `doctor` — which derive
+  different absolute script paths — each rewrote the other's valid, current entry
+  on every alternating run. Staleness is now version/surface-tolerant (dead path
+  OR an older plugin-cache version dir), and `registerHooksToSettings` is a true
+  no-op when a valid current set is already present on either delivery surface.
+- **Global-npm shell shim stranded at an old version** (`auto-update.js`): the
+  global-package self-heal never ran on the throttle early-return, and the only
+  context that can SEE the user's nvm/global prefix (a CLI run under that node)
+  short-circuits there — so a global `code-graph-mcp` shim could sit at an old
+  version while the native binary self-healed to current. The throttle path now
+  attempts the (lock-guarded, targeted `npm i -g pkg@ver`) heal when a cheap
+  local check finds a stale global.
+
+### Added
+- **`doctor`: "Global npm relics" check** (`doctor.js`, `find-binary.js`,
+  `auto-update.js`): enumerates every nvm-managed node version's global prefix
+  and reports our packages stranded under a non-active node — invisible to the
+  active-node self-heal, yet able to seed stale settings.json hooks. Report-only
+  with exact remediation (`nvm use <ver> && npm rm -g <pkg>`); `npm i -g` cannot
+  target another node's prefix.
+
 ## v0.103.0 — statusline coexistence + uninstall sweep (audit remainder)
 
 Upgrade notes: no action required. New uninstall flag `--unadopt-all` cleans

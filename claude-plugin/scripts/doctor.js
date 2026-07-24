@@ -285,11 +285,29 @@ function runDiagnostics() {
   //    `lifecycle.js uninstall` removes them; without it they are treated as
   //    user-installed and a plugin uninstall leaves them on PATH.
   try {
-    const { globalPkgVersion } = require('./auto-update');
+    const { globalPkgVersion, inactiveNodeGlobalRelics } = require('./auto-update');
     const { PLATFORM_PKG } = require('./find-binary');
     const found = [SHELL_PKG, PLATFORM_PKG]
       .map((name) => ({ name, version: globalPkgVersion(name) }))
       .filter((p) => p.version);
+
+    // Relics stranded under a NON-active node version (nvm keeps a per-node
+    // global prefix). selfHealGlobalPkgs / the check above only see the active
+    // node, so these drift unseen for months and can seed stale settings.json
+    // hooks — the v24.11.1@0.46.0 relic behind the RCA. Report-only: `npm i -g`
+    // can't target another node's prefix, so hand the user the exact remediation.
+    const relics = inactiveNodeGlobalRelics();
+    if (relics.length) {
+      const home = require('os').homedir();
+      results.push({
+        name: 'Global npm relics',
+        status: 'warn',
+        detail: relics.map((r) => `${r.name}@${r.version} (${r.nodeModulesDir.replace(home, '~')})`).join('; ')
+          + ' — installed under a non-active node version; auto-heal cannot reach another node\'s prefix. '
+          + 'Remove each via `nvm use <that node> && npm rm -g <pkg>`, or uninstall the unused node (`nvm uninstall <ver>`).',
+      });
+    }
+
     if (found.length) {
       const marker = !!readJson(GLOBAL_INSTALL_MARKER);
       // Heal-exhausted is otherwise invisible: selfHealGlobalPkgs stops after

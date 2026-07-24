@@ -119,6 +119,22 @@ function globalNodeModulesCandidates() {
   return [...new Set(out)];
 }
 
+// Every nvm-managed node version's global node_modules dir (`~/.nvm/versions/
+// node/*/lib/node_modules`). nvm keeps a SEPARATE global prefix per node
+// version; switching the default node strands the previous version's globals —
+// a global `@sdsrs/code-graph` there is invisible to globalNodeModulesCandidates
+// (execPath-derived → only the ACTIVE node) yet still shadows PATH shims / seeds
+// stale settings.json hooks (the v24.11.1@0.46.0 relic — RCA 2026-07-24). Used
+// for detection/reporting only; `npm install -g` cannot target another node's
+// prefix. `base` is injectable for hermetic tests (never the real ~/.nvm).
+function nvmNodeModulesDirs(base = path.join(os.homedir(), '.nvm', 'versions', 'node')) {
+  let entries;
+  try { entries = fs.readdirSync(base); } catch { return []; }
+  return entries
+    .map((v) => path.join(base, v, 'lib', 'node_modules'))
+    .filter((d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
+}
+
 function isNativeBinary(candidate) {
   if (!candidate) return false;
   try {
@@ -367,7 +383,7 @@ function clearCache() {
 
 module.exports = {
   findBinary, findBinaryUncached, clearCache,
-  globalNodeModulesCandidates, findPlatformBinary, platformBinaryCandidates, createVersionGate,
+  globalNodeModulesCandidates, nvmNodeModulesDirs, findPlatformBinary, platformBinaryCandidates, createVersionGate,
   getPackageVersion, compareVersions, isCachedBinaryFresh,
   detectLibc, unsupportedPlatformHint,
   CACHE_FILE, BINARY_NAME, PLATFORM_PKG,

@@ -43,6 +43,8 @@ const {
   isSilentMode,
   shouldCheck,
   resolveProxy,
+  shouldHealGlobalsOnThrottle,
+  inactiveNodeGlobalRelics,
 } = require('./auto-update');
 
 function mkDir(t, prefix) {
@@ -623,6 +625,70 @@ test('staleGlobalPkgs / globalPkgVersion read top-level global installs from dis
   assert.deepEqual(stale, [{ name: '@sdsrs/code-graph', version: '0.46.0' }]);
   assert.deepEqual(staleGlobalPkgs('0.46.0', [root]), [],
     'a global install matching latest is not stale');
+});
+
+// ── P2.1: throttle-path global heal reach (RCA 2026-07-24) ──────────────────
+// The post-fetch heal never runs on the throttle early-return; the only context
+// that can SEE the user's nvm/global prefix is a throttled CLI run — so a stale
+// global shim (0.101.0 while the binary reached 0.103.0) never healed. This
+// predicate is what lets the throttle path still attempt it.
+
+test('shouldHealGlobalsOnThrottle: true when a target version is known and a global is stale', () => {
+  const yes = shouldHealGlobalsOnThrottle(
+    { latestVersion: '0.103.0' },
+    { readStale: () => [{ name: '@sdsrs/code-graph', version: '0.101.0' }] });
+  assert.equal(yes, true);
+});
+
+test('shouldHealGlobalsOnThrottle: false when nothing of ours is globally stale', () => {
+  const no = shouldHealGlobalsOnThrottle(
+    { latestVersion: '0.103.0' },
+    { readStale: () => [] });
+  assert.equal(no, false, 'no stale global → no npm path on the hot throttle branch');
+});
+
+test('shouldHealGlobalsOnThrottle: false before a latest version is ever known', () => {
+  assert.equal(shouldHealGlobalsOnThrottle({}, { readStale: () => [{ name: 'x', version: '0' }] }), false);
+  assert.equal(shouldHealGlobalsOnThrottle(null, { readStale: () => [] }), false);
+});
+
+test('shouldHealGlobalsOnThrottle: false when the parent launcher already holds the install lock', () => {
+  const prev = process.env.CODE_GRAPH_INSTALL_LOCK_HELD;
+  process.env.CODE_GRAPH_INSTALL_LOCK_HELD = '1';
+  try {
+    assert.equal(shouldHealGlobalsOnThrottle(
+      { latestVersion: '0.103.0' },
+      { readStale: () => [{ name: '@sdsrs/code-graph', version: '0.101.0' }] }), false,
+      'must not contend for the lock the launcher parent already holds (deadlock/double-npm)');
+  } finally {
+    if (prev === undefined) delete process.env.CODE_GRAPH_INSTALL_LOCK_HELD;
+    else process.env.CODE_GRAPH_INSTALL_LOCK_HELD = prev;
+  }
+});
+
+// ── inactiveNodeGlobalRelics: our globals stranded under a non-active node ──
+
+test('inactiveNodeGlobalRelics: reports our global under a non-active node prefix, skips the active one', (t) => {
+  const root = mkDir(t, 'nvm-relics-');
+  const activeDir = path.join(root, 'v24.18.0', 'lib', 'node_modules');
+  const relicDir = path.join(root, 'v24.11.1', 'lib', 'node_modules');
+  for (const [dir, version] of [[activeDir, '0.103.0'], [relicDir, '0.46.0']]) {
+    const pkg = path.join(dir, '@sdsrs', 'code-graph');
+    fs.mkdirSync(pkg, { recursive: true });
+    fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ version }));
+  }
+  const relics = inactiveNodeGlobalRelics({ dirs: [activeDir, relicDir], activeDir });
+  assert.deepEqual(relics, [{ name: '@sdsrs/code-graph', version: '0.46.0', nodeModulesDir: relicDir }],
+    'the active node prefix is not a relic; only the stranded one is reported');
+});
+
+test('inactiveNodeGlobalRelics: empty when our global lives only under the active node', (t) => {
+  const root = mkDir(t, 'nvm-norelic-');
+  const activeDir = path.join(root, 'v24.18.0', 'lib', 'node_modules');
+  const pkg = path.join(activeDir, '@sdsrs', 'code-graph');
+  fs.mkdirSync(pkg, { recursive: true });
+  fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ version: '0.103.0' }));
+  assert.deepEqual(inactiveNodeGlobalRelics({ dirs: [activeDir], activeDir }), []);
 });
 
 // ── getPlatformAssetName: libc gating ───────────────────────────────────────
