@@ -6,10 +6,10 @@
  * MCP JSON-RPC. install-e2e.test.js §4.3 covers find-binary in dev mode but
  * doesn't exercise the launcher's full chain (find → spawn → forward).
  *
- * The negative paths (no binary anywhere → npm install + GitHub fallback +
- * exit 1) are intentionally NOT covered here — the network-bound fallbacks
- * have ~150s timeouts and aren't deterministic in CI sandboxes. End-to-end
- * dev-mode coverage is the highest-leverage gap.
+ * The missing-binary path (stub-first handshake + background install chain)
+ * is covered deterministically in launcher-install.test.js with an injected
+ * spawn; here it gets a static-source guard only — actually exercising it
+ * would need npm/network and isn't deterministic in CI sandboxes.
  *
  * Run: node --test claude-plugin/scripts/mcp-launcher.test.js
  */
@@ -149,6 +149,21 @@ test('mcp-launcher sets _FIND_BINARY_ROOT from __dirname (does not trust CLAUDE_
   // And must NOT read CLAUDE_PLUGIN_ROOT from env.
   assert.doesNotMatch(src, /process\.env\.CLAUDE_PLUGIN_ROOT/,
     'launcher must not trust CLAUDE_PLUGIN_ROOT — it can leak from sibling plugins');
+});
+
+test('mcp-launcher missing-binary path serves the stub first and never installs synchronously', () => {
+  // The regression this pins: the old missing-binary chain ran npm (60s) +
+  // the GitHub fallback (90s) with spawnSync BEFORE answering any MCP
+  // JSON-RPC — Claude Code's 30s connect timeout made every cold install
+  // present as "connection timed out after 30000ms". The launcher must serve
+  // the upgradeable stub and delegate to the async background installer.
+  const src = fs.readFileSync(LAUNCHER, 'utf8');
+  assert.doesNotMatch(src, /spawnSync|execSync|execFileSync/,
+    'launcher must not run any synchronous child_process call (blocks the handshake)');
+  assert.match(src, /installBinaryInBackground\(/,
+    'missing-binary path must delegate to the background installer');
+  assert.match(src, /onInstalled:\s*\(\)\s*=>\s*stub\.attemptUpgrade\(\)/,
+    'a completed install must nudge the stub→real handover immediately');
 });
 
 test('mcp-launcher rejects executable-permission failure with platform-specific hint', () => {

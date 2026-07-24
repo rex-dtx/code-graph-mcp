@@ -7,7 +7,7 @@
  * Used by .mcp.json so the plugin controls binary discovery instead of
  * relying on the binary being in PATH.
  */
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const { isNonProjectCwd } = require('./project-detect');
@@ -86,66 +86,15 @@ if (process.env.CODE_GRAPH_FORCE_PLUGIN_MCP !== '1' && isNonProjectCwd(process.c
 }
 
 const { findBinary, clearCache, unsupportedPlatformHint } = require('./find-binary');
+const { installBinaryInBackground } = require('./launcher-install');
 
-let binary = findBinary();
+const binary = findBinary();
 
-// Auto-install binary if not found (first-time install)
-if (!binary) {
-  let version = 'latest';
-  try {
-    const pj = path.join(__dirname, '..', '.claude-plugin', 'plugin.json');
-    version = JSON.parse(fs.readFileSync(pj, 'utf8')).version || 'latest';
-  } catch { /* use latest */ }
-
-  process.stderr.write(`[code-graph] Binary not found, installing @sdsrs/code-graph@${version}...\n`);
-  const npmResult = spawnSync('npm', ['install', '-g', `@sdsrs/code-graph@${version}`], {
-    timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8',
-  });
-  if (npmResult.error || npmResult.status !== 0) {
-    process.stderr.write('[code-graph] npm install failed.\n');
-    if (npmResult.stderr) {
-      process.stderr.write(npmResult.stderr.trim().split('\n').map(l => `[code-graph][npm] ${l}\n`).join(''));
-    }
-  } else {
-    clearCache();
-    binary = findBinary();
-    if (binary) {
-      process.stderr.write(`[code-graph] Installed at ${binary}\n`);
-    }
-  }
-}
-
-// Fallback: npm install may have succeeded but optionalDependencies for the
-// platform binary can fail silently (npm tolerates OS-mismatch + flaky
-// registry). Pull the platform binary directly from the GitHub release.
-//
-// --install-missing bypasses auto-update.js's isDevMode() short-circuit. The
-// marketplace ships the full repo (including Cargo.toml at the workspace root),
-// so dev-mode heuristics that look for Cargo.toml were misclassifying every
-// marketplace install as dev mode and skipping this fallback (issue #12).
-if (!binary) {
-  process.stderr.write('[code-graph] Falling back to GitHub release download...\n');
-  const result = spawnSync(
-    process.execPath,
-    [path.join(__dirname, 'auto-update.js'), '--silent', '--install-missing'],
-    { timeout: 90000, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }
-  );
-  if (result.stderr && result.stderr.trim()) {
-    process.stderr.write(result.stderr.trim().split('\n').map(l => `[code-graph][auto-update] ${l}\n`).join(''));
-  }
-  if (result.error) {
-    process.stderr.write(`[code-graph] auto-update spawn failed: ${result.error.message}\n`);
-  } else if (result.status !== 0) {
-    process.stderr.write(`[code-graph] auto-update exited with status ${result.status}\n`);
-  }
-  clearCache();
-  binary = findBinary();
-  if (binary) {
-    process.stderr.write(`[code-graph] Installed at ${binary}\n`);
-  }
-}
-
-if (!binary) {
+// Manual-install guidance, printed when the background install chain exhausts
+// both steps without producing a binary. Unlike the old sync path this does NOT
+// exit: the upgradeable stub stays connected (0 tools), so a manual
+// `npm install -g` mid-session still upgrades the live connection.
+function printManualInstallHints() {
   const installedViaMarketplace = fs.existsSync(
     path.join(__dirname, '..', '.claude-plugin', 'plugin.json')
   );
@@ -155,9 +104,9 @@ if (!binary) {
     // npm package does not exist, so the generic "npm install @sdsrs/code-graph-<plat>-<arch>"
     // suggestion below would point at a nonexistent package. Show the source/emulation hint.
     process.stderr.write('[code-graph] Binary not found.\n' + platformHint + '\n');
-    process.exit(1);
+    return;
   }
-  process.stderr.write('[code-graph] Binary not found. Install manually:\n');
+  process.stderr.write('[code-graph] Binary install failed. Install manually:\n');
   if (installedViaMarketplace) {
     process.stderr.write(
       '  # Re-install the plugin via Claude Code marketplace:\n' +
@@ -171,7 +120,55 @@ if (!binary) {
     '  npm install -g @sdsrs/code-graph\n' +
     '  npm install -g @sdsrs/code-graph-' + process.platform + '-' + process.arch + '\n'
   );
-  process.exit(1);
+}
+
+// --- Missing binary: answer the handshake NOW, install in the background ----
+// The old chain ran `npm install -g` (60s timeout) and the GitHub-release
+// fallback (90s) SYNCHRONOUSLY before answering any MCP JSON-RPC. Claude
+// Code's connect timeout is 30s, so a cold install always presented as
+// "MCP server connection timed out after 30000ms" and the tools only appeared
+// on a later reconnect. Serve the upgradeable 0-tool stub first (initialize is
+// answered instantly), run the same install chain in the background, and hand
+// the live connection to the real binary via the same upgrade mechanism the
+// non-project gate uses — no reconnect, no restart.
+//
+// --install-missing bypasses auto-update.js's isDevMode() short-circuit. The
+// marketplace ships the full repo (including Cargo.toml at the workspace root),
+// so dev-mode heuristics that look for Cargo.toml were misclassifying every
+// marketplace install as dev mode and skipping this fallback (issue #12).
+if (!binary) {
+  let version = 'latest';
+  try {
+    const pj = path.join(__dirname, '..', '.claude-plugin', 'plugin.json');
+    version = JSON.parse(fs.readFileSync(pj, 'utf8')).version || 'latest';
+  } catch { /* use latest */ }
+
+  process.stderr.write(
+    `[code-graph] Binary not found — serving 0-tool stub while installing ` +
+    `@sdsrs/code-graph@${version} in the background (tools appear when it lands)...\n`
+  );
+
+  const stub = serveEmptyMcpStub({
+    upgrade: {
+      shouldUpgrade: () => !!findBinary(),
+      spawnReal: () => {
+        const bin = findBinary();
+        if (!bin) return null;
+        process.stderr.write(`[code-graph] binary ready at ${bin} — upgrading plugin MCP to real tools (restart Claude Code for full tool steering)\n`);
+        return spawn(bin, ['serve'], { stdio: ['pipe', 'pipe', 'inherit'], env: process.env });
+      },
+    },
+  });
+
+  installBinaryInBackground({
+    version,
+    findBinary,
+    clearCache,
+    // Nudge the handover immediately instead of waiting for the stub's next poll.
+    onInstalled: () => stub.attemptUpgrade(),
+    onFailed: () => printManualInstallHints(),
+  });
+  return; // top-level function scope of mcp-launcher.js
 }
 
 // Pre-spawn: verify binary is executable (catches macOS quarantine, permission issues)
