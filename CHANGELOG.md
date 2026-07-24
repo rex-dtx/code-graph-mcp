@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.105.0 — macro-call edges + std-import phantom fix (IDX v52), audit-batch hardening
+
+Upgrade notes: first query/index after upgrade triggers a one-time full index
+rebuild (INDEX_VERSION 51→52 — two Rust edge-shape changes below). No config
+changes required. Full audit trail: `docs/AUDIT-REPORT-2026-07-24.md`
+(production-readiness audit, 6 dimensions + same-day disposition log).
+
+### Added
+- **Rust macro token-tree call extraction** (`parser/relations/rust.rs`,
+  IDX v52a): calls made only inside macro args / `macro_rules!` bodies
+  (`assert_eq!(foo(x), y)`, fn-local `sout!` bodies) now emit `calls` edges.
+  tree-sitter parses macro interiors as opaque `token_tree`s — no
+  `call_expression` exists — so such calls were invisible: targets
+  false-flagged dead, impact/callgraph missed the calling fn (field failure:
+  `impact grep_exit` missed `cmd_stats`). Heuristic: identifier directly
+  followed by a `(…)` token_tree; excludes `.`/`::`/`$`/definition-keyword
+  prev-tokens, no-scope top level, and **uppercase-initial names** — tuple
+  patterns (`matches!(x, Some(y))`) are token-identical to calls, and
+  variant/type names are CamelCase while the fn calls this pass recovers are
+  snake_case (audit-reproduced false `calls→Some` edge without the guard).
+- **CI formatting gate**: new `fmt` job (`cargo fmt --check`); repo-wide
+  one-time `cargo fmt` sweep landed alongside (style-only commit).
+- **Release gate: pre-publish version assertion** (`release.yml`): the publish
+  job now execs the built linux-x64 artifact and asserts `--version` == tag
+  BEFORE any publish step — previously a lagging Cargo.toml at tag time was
+  caught only by post-publish smoke, after the packages were public.
+- **mcp-launcher tests rejoined CI + release gates**: their exclusion reason
+  (dedup test depending on the gitignored dev `.mcp.json`) went stale when the
+  test became self-contained; on a bare checkout the binary-forwarding test
+  self-skips, and in release.yml (artifact present) it runs for real — the
+  stub→binary handover finally has automated coverage.
+
+### Fixed
+- **Phantom cross-module import edges from `use std::…`** (`parser/relations/
+  rust.rs`, IDX v52b): the bare trailing segment of a std-rooted `use`
+  (`use std::fs;` → "fs") entered global bare-name resolution with no
+  qualifier metadata and bound to whatever single same-family project symbol
+  shared the name — every `use std::fs;` in this repo fabricated an
+  `imports → fn fs` edge onto a `#[cfg(test)]` helper, polluting 4
+  `module_dependencies` pairs in `map` (one 100% phantom: src/embedding →
+  src/indexer/pipeline). Statically-external roots (`std`/`core`/`alloc`/
+  `proc_macro`) are now skipped whole; verified gone after rebuild.
+- **CI clippy gate was red on committed code**: two `let_and_return` sites in
+  `pipeline/resolve.rs` failed the exact CI command (`clippy -- -D warnings`,
+  exit 101); inlined. Also cleared the `const_is_empty` warning in
+  `effectiveness_bench.rs` so `--all-targets -D warnings` is clean too.
+- **Symlinked source files were silently never indexed** (`indexer/merkle.rs`):
+  the walkers run `follow_links=false`, so a symlinked file failed the
+  `is_file()` guard on the ONLY skip path with no log — monorepo shared-package
+  symlinks vanished with zero observability. Now: one aggregate warn per scan
+  (count + example) + a behavior-pinning test. Following links (cycle/escape
+  protection) is tracked separately (D#15).
+- **Near-miss rebase logic deduplicated** (`cli.rs`): the subdir-cwd
+  path-doubling fix's two hand-copied arms (`normalize_user_path_from` /
+  `cmd_grep`) now share `is_cwd_anchored` + `note_root_rebase` — single source
+  for the exclusion list and disclosure wording; added a same-name-collision
+  regression test pinning the documented existence-heuristic tradeoff.
+- **mtime same-tick blind spot documented** (`scan_directory_cached`): a
+  content edit landing within the same filesystem timestamp tick as the prior
+  scan is invisible to the cached path (interactive flow covered by
+  `ensure_file_indexed`'s full re-hash); now stated at the definition.
+
 ## v0.104.1 — staleness-heal gap from npm/dev authority + release gate hardening
 
 Upgrade notes: no action required. Follow-up to v0.104.0's hook-registration
