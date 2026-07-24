@@ -15,12 +15,16 @@ use super::callgraph::attach_truncation_flags;
 use crate::domain::default_dead_code_ignores;
 
 impl McpServer {
-    pub(in crate::mcp::server) fn tool_trace_http_chain(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_trace_http_chain(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         // Empty/whitespace-only acts like missing — otherwise the substring
         // route match treats "" as a wildcard and returns "no routes found"
         // when the project has no routes, which is indistinguishable from a
         // misspelled route.
-        let route_path_raw = args["route_path"].as_str()
+        let route_path_raw = args["route_path"]
+            .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("route_path is required (e.g. 'GET /api/users')"))?;
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
@@ -34,7 +38,10 @@ impl McpServer {
         let min_conf_tier = match args["min_confidence"].as_str() {
             None | Some("") => crate::domain::CONF_INFERRED,
             Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-                anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+                anyhow!(
+                    "min_confidence must be one of: extracted, inferred, ambiguous (got '{}')",
+                    c
+                )
             })?,
         };
         let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
@@ -52,7 +59,12 @@ impl McpServer {
         // Batch-fetch downstream calls for all handlers in one query
         let downstream_map = if include_middleware {
             let node_ids: Vec<i64> = rows.iter().map(|rm| rm.node_id).collect();
-            queries::get_edge_target_names_batch(self.db.conn(), &node_ids, REL_CALLS, min_conf_rank)?
+            queries::get_edge_target_names_batch(
+                self.db.conn(),
+                &node_ids,
+                REL_CALLS,
+                min_conf_rank,
+            )?
         } else {
             std::collections::HashMap::new()
         };
@@ -73,27 +85,34 @@ impl McpServer {
             apply_inline_handler_metadata(&mut handler, rm.metadata.as_deref());
 
             if include_middleware {
-                let downstream = downstream_map.get(&rm.node_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let downstream = downstream_map.get(&rm.node_id).cloned().unwrap_or_default();
                 handler["downstream_calls"] = json!(downstream);
             }
 
             // Recursive call chain via call graph
             let chain = crate::graph::query::get_call_graph_filtered(
-                self.db.conn(), &rm.handler_name, "callees", depth, Some(&rm.file_path), min_conf_rank,
+                self.db.conn(),
+                &rm.handler_name,
+                "callees",
+                depth,
+                Some(&rm.file_path),
+                min_conf_rank,
             )?;
             ambiguous_hidden += chain.suppressed_ambiguous;
-            let chain_nodes: Vec<serde_json::Value> = chain.nodes.iter()
+            let chain_nodes: Vec<serde_json::Value> = chain
+                .nodes
+                .iter()
                 .filter(|n| n.depth > 0) // exclude root (the handler itself)
                 .filter(|n| !is_test_symbol(&n.name, &n.file_path))
-                .map(|n| json!({
-                    "node_id": n.node_id,
-                    "name": n.name,
-                    "type": n.node_type,
-                    "file_path": n.file_path,
-                    "depth": n.depth,
-                }))
+                .map(|n| {
+                    json!({
+                        "node_id": n.node_id,
+                        "name": n.name,
+                        "type": n.node_type,
+                        "file_path": n.file_path,
+                        "depth": n.depth,
+                    })
+                })
                 .collect();
             handler["call_chain"] = json!(chain_nodes);
             if chain.limit_hit || chain.depth_capped {
@@ -120,16 +139,19 @@ impl McpServer {
         // Compress if result exceeds token threshold
         let tokens = crate::sandbox::compressor::estimate_json_tokens(&result);
         if tokens > COMPRESSION_TOKEN_THRESHOLD {
-            let compressed_handlers: Vec<serde_json::Value> = handlers.iter().map(|h| {
-                json!({
-                    "node_id": h["node_id"],
-                    "handler_name": h["handler_name"],
-                    "file_path": h["file_path"],
-                    "start_line": h["start_line"],
-                    "end_line": h["end_line"],
-                    "chain_count": h["call_chain"].as_array().map_or(0, |a| a.len()),
+            let compressed_handlers: Vec<serde_json::Value> = handlers
+                .iter()
+                .map(|h| {
+                    json!({
+                        "node_id": h["node_id"],
+                        "handler_name": h["handler_name"],
+                        "file_path": h["file_path"],
+                        "start_line": h["start_line"],
+                        "end_line": h["end_line"],
+                        "chain_count": h["call_chain"].as_array().map_or(0, |a| a.len()),
+                    })
                 })
-            }).collect();
+                .collect();
             let mut compressed = json!({
                 "mode": "compressed_http_chain",
                 "message": "HTTP chain exceeded token limit. Use get_ast_node(node_id) or get_call_graph(symbol_name) to expand.",
@@ -149,18 +171,26 @@ impl McpServer {
         Ok(result)
     }
 
-    pub(in crate::mcp::server) fn tool_dependency_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_dependency_graph(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         // Validate required + enum args at tool entry, before any index/freshness
         // work, so a missing file_path or bogus direction errors cleanly instead of
         // after ensure_indexed ran. feedback-enum-validate-at-entry.
-        let file_path = args["file_path"].as_str()
+        let file_path = args["file_path"]
+            .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("file_path is required (relative to project root)"))?;
-        let direction_raw = args.get("direction")
+        let direction_raw = args
+            .get("direction")
             .and_then(|v| v.as_str())
             .unwrap_or("both");
         let direction = crate::domain::normalize_dep_direction(direction_raw).ok_or_else(|| {
-            anyhow!("direction must be one of: outgoing, incoming, both (got '{}')", direction_raw)
+            anyhow!(
+                "direction must be one of: outgoing, incoming, both (got '{}')",
+                direction_raw
+            )
         })?;
 
         if !should_skip_indexing(args) {
@@ -169,7 +199,8 @@ impl McpServer {
             // staleness is the canonical failure mode here.
             self.ensure_file_fresh_opt(Some(file_path))?;
         }
-        let depth = args.get("depth")
+        let depth = args
+            .get("depth")
             .and_then(|v| v.as_i64())
             .unwrap_or(2)
             .clamp(1, 10) as i32;
@@ -180,13 +211,20 @@ impl McpServer {
         if file_nodes.is_empty() {
             let hint = if file_path.ends_with('/') || !file_path.contains('.') {
                 // Looks like a directory — suggest using module_overview instead
-                let dir = if file_path.ends_with('/') { file_path.to_string() } else { format!("{}/", file_path) };
+                let dir = if file_path.ends_with('/') {
+                    file_path.to_string()
+                } else {
+                    format!("{}/", file_path)
+                };
                 format!(
                     "Path '{}' looks like a directory. Use module_overview(path=\"{}\") for directory-level analysis, or specify an exact file (e.g., '{}mod.rs')",
                     file_path, file_path, dir
                 )
             } else {
-                format!("File '{}' not found in index. Check path is relative to project root.", file_path)
+                format!(
+                    "File '{}' not found in index. Check path is relative to project root.",
+                    file_path
+                )
             };
             return Ok(json!({
                 "file": file_path,
@@ -206,7 +244,8 @@ impl McpServer {
         let is_compatible_lang =
             |dep_path: &str| crate::utils::config::is_compatible_lang(file_path, dep_path);
 
-        let outgoing: Vec<serde_json::Value> = deps.iter()
+        let outgoing: Vec<serde_json::Value> = deps
+            .iter()
             .filter(|d| d.direction == "outgoing")
             .filter(|d| is_compatible_lang(&d.file_path))
             .map(|d| {
@@ -224,7 +263,8 @@ impl McpServer {
             })
             .collect();
 
-        let incoming: Vec<serde_json::Value> = deps.iter()
+        let incoming: Vec<serde_json::Value> = deps
+            .iter()
             .filter(|d| d.direction == "incoming")
             .filter(|d| is_compatible_lang(&d.file_path))
             .map(|d| {
@@ -251,7 +291,10 @@ impl McpServer {
         }))
     }
 
-    pub(in crate::mcp::server) fn tool_find_similar_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_find_similar_code(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         self.try_lazy_load_model();
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
@@ -262,7 +305,10 @@ impl McpServer {
         // "Symbol '' not found" which looks like a real lookup miss.
         let node_id = if let Some(id) = args["node_id"].as_i64() {
             id
-        } else if let Some(name) = args["symbol_name"].as_str().filter(|s| !s.trim().is_empty()) {
+        } else if let Some(name) = args["symbol_name"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+        {
             match queries::get_first_node_id_by_name(self.db.conn(), name)? {
                 Some(id) => id,
                 None => return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name, or check spelling.", name)),
@@ -270,17 +316,21 @@ impl McpServer {
         } else {
             return Err(anyhow!("Either node_id or symbol_name is required. Provide symbol_name (e.g. \"my_function\") or node_id (from other tool results)."));
         };
-        let top_k = args.get("top_k")
+        let top_k = args
+            .get("top_k")
             .and_then(|v| v.as_i64())
             .unwrap_or(5)
             .clamp(1, 100);
-        let max_distance = args.get("max_distance")
+        let max_distance = args
+            .get("max_distance")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.8);
 
         // Check if embeddings are available
         if !self.db.vec_enabled() {
-            return Err(anyhow!("Embedding not available. Build with --features embed-model."));
+            return Err(anyhow!(
+                "Embedding not available. Build with --features embed-model."
+            ));
         }
 
         // Check if any embeddings exist at all
@@ -305,24 +355,32 @@ impl McpServer {
 
         // Split raw (self excluded) from cutoff-filtered candidates so we can
         // report whether max_distance is hiding matches.
-        let raw_non_self: Vec<(i64, f64)> = results.iter()
+        let raw_non_self: Vec<(i64, f64)> = results
+            .iter()
             .filter(|(id, _)| *id != node_id)
             .map(|(id, dist)| (*id, *dist))
             .collect();
-        let candidates: Vec<(i64, f64)> = raw_non_self.iter()
+        let candidates: Vec<(i64, f64)> = raw_non_self
+            .iter()
             .filter(|(_, dist)| *dist <= max_distance)
             .copied()
             .collect();
         let cutoff_dropped = raw_non_self.len() - candidates.len();
         let candidate_ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
-        let nodes_with_files = queries::get_nodes_with_files_by_ids(self.db.conn(), &candidate_ids)?;
+        let nodes_with_files =
+            queries::get_nodes_with_files_by_ids(self.db.conn(), &candidate_ids)?;
         let node_map: std::collections::HashMap<i64, &queries::NodeWithFile> =
             nodes_with_files.iter().map(|nf| (nf.node.id, nf)).collect();
 
-        let similar: Vec<serde_json::Value> = candidates.iter()
+        let similar: Vec<serde_json::Value> = candidates
+            .iter()
             .filter_map(|(id, distance)| {
                 let nf = node_map.get(id)?;
-                if crate::domain::is_skippable_result(&nf.node.node_type, &nf.node.name, &nf.file_path) {
+                if crate::domain::is_skippable_result(
+                    &nf.node.node_type,
+                    &nf.node.name,
+                    &nf.file_path,
+                ) {
                     return None;
                 }
                 let similarity = 1.0 / (1.0 + distance);
@@ -357,7 +415,10 @@ impl McpServer {
         Ok(out)
     }
 
-    pub(in crate::mcp::server) fn tool_find_dead_code(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_find_dead_code(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let path = args["path"].as_str();
         let node_type = args["node_type"].as_str();
         // Validate node_type up-front: an unknown alias normalizes to an empty Vec
@@ -373,7 +434,9 @@ impl McpServer {
         // static AST call graph can't track. Pass an empty array to disable.
         let (ignore_prefixes, ignore_was_defaulted) = match args.get("ignore_paths") {
             Some(serde_json::Value::Array(arr)) => (
-                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>(),
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>(),
                 false,
             ),
             _ => (default_dead_code_ignores(), true),
@@ -384,7 +447,12 @@ impl McpServer {
         }
 
         let report = crate::storage::queries::dead_code_report(
-            self.db.conn(), path, node_type, include_tests, min_lines, &ignore_prefixes,
+            self.db.conn(),
+            path,
+            node_type,
+            include_tests,
+            min_lines,
+            &ignore_prefixes,
         )?;
 
         if report.is_empty() {
@@ -427,7 +495,11 @@ impl McpServer {
             if !compact {
                 item["code"] = json!(it.code_content);
             }
-            if it.is_exported { exported_items.push(item); } else { orphan_items.push(item); }
+            if it.is_exported {
+                exported_items.push(item);
+            } else {
+                orphan_items.push(item);
+            }
         }
         let mut all_items = orphan_items.clone();
         all_items.extend(exported_items.iter().cloned());

@@ -1,24 +1,25 @@
 use anyhow::Result;
-use notify::{Watcher, RecursiveMode, Event, EventKind};
 use notify::event::ModifyKind;
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::mpsc;
 
 /// Check if a file system event kind represents a content change (not just metadata/access).
 fn is_content_event(kind: &EventKind) -> bool {
-    matches!(kind,
+    matches!(
+        kind,
         // Bare top-level catch-alls: a degraded/poll backend may report a real
         // content change as Any/Other rather than a specific kind. Treat them as
         // content — an active watcher that silently drops them strands the index
         // stale (ensure_indexed skips the merkle rescan while a watcher is
         // trusted). Over-triggering is safe: the merkle rescan is idempotent.
         EventKind::Any
-        | EventKind::Other
-        | EventKind::Create(_)
-        | EventKind::Remove(_)
-        | EventKind::Modify(ModifyKind::Data(_))
-        | EventKind::Modify(ModifyKind::Name(_))
-        | EventKind::Modify(ModifyKind::Any) // catch-all for platforms that don't distinguish
+            | EventKind::Other
+            | EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Name(_))
+            | EventKind::Modify(ModifyKind::Any) // catch-all for platforms that don't distinguish
     )
 }
 
@@ -63,7 +64,9 @@ impl FileWatcher {
                     }
                     // Convert to relative paths for consistency with the indexer pipeline.
                     // Skip paths that fail strip_prefix (absolute paths never match DB relative paths).
-                    let paths: Vec<String> = event.paths.iter()
+                    let paths: Vec<String> = event
+                        .paths
+                        .iter()
                         .filter_map(|p| {
                             match p.strip_prefix(&root_path) {
                                 // Normalize `\` → `/` on Windows so the downstream
@@ -106,8 +109,8 @@ impl FileWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::{fs, time::Duration};
+    use tempfile::TempDir;
 
     #[test]
     fn test_watcher_detects_file_changes() {
@@ -124,7 +127,8 @@ mod tests {
         // Wait for at least one event. macOS FSEvents (and loaded CI runners
         // in general) can take several seconds to coalesce and emit; 5s was
         // empirically flaky on GH macOS runners, 15s is not.
-        let first = rx.recv_timeout(Duration::from_secs(15))
+        let first = rx
+            .recv_timeout(Duration::from_secs(15))
             .expect("timed out waiting for watcher event");
         let mut events = vec![first];
         // Drain any additional buffered events
@@ -148,19 +152,31 @@ mod tests {
         // self-heals (the no-watcher debounce fallback does not apply when a
         // watcher is active). Over-triggering is safe — the merkle rescan is
         // idempotent.
-        assert!(is_content_event(&EventKind::Any), "bare EventKind::Any must count as content");
-        assert!(is_content_event(&EventKind::Other), "bare EventKind::Other must count as content");
+        assert!(
+            is_content_event(&EventKind::Any),
+            "bare EventKind::Any must count as content"
+        );
+        assert!(
+            is_content_event(&EventKind::Other),
+            "bare EventKind::Other must count as content"
+        );
 
         // Specific content kinds remain detected.
         assert!(is_content_event(&EventKind::Create(CreateKind::Any)));
         assert!(is_content_event(&EventKind::Remove(RemoveKind::Any)));
-        assert!(is_content_event(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
-        assert!(is_content_event(&EventKind::Modify(ModifyKind::Name(RenameMode::Any))));
+        assert!(is_content_event(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(is_content_event(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::Any
+        ))));
         assert!(is_content_event(&EventKind::Modify(ModifyKind::Any)));
 
         // Metadata/access-only events stay excluded — we did not over-broaden to
         // "every event". A chmod/xattr or atime touch must not trigger a rescan.
         assert!(!is_content_event(&EventKind::Access(AccessKind::Any)));
-        assert!(!is_content_event(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))));
+        assert!(!is_content_event(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any
+        ))));
     }
 }

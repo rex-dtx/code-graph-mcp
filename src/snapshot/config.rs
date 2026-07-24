@@ -22,7 +22,7 @@ pub fn load_config(root: &Path) -> Result<CodeGraphConfig> {
     if !path.exists() {
         return Ok(CodeGraphConfig::default());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }

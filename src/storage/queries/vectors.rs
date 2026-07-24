@@ -17,15 +17,10 @@ pub fn insert_node_vectors_batch(conn: &Connection, vectors: &[(i64, Vec<f32>)])
         return Ok(());
     }
     // vec0 virtual tables do not support INSERT OR REPLACE, so delete first.
-    let mut exists_stmt = conn.prepare_cached(
-        "SELECT 1 FROM nodes WHERE id = ?1"
-    )?;
-    let mut del_stmt = conn.prepare_cached(
-        "DELETE FROM node_vectors WHERE node_id = ?1"
-    )?;
-    let mut ins_stmt = conn.prepare_cached(
-        "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)"
-    )?;
+    let mut exists_stmt = conn.prepare_cached("SELECT 1 FROM nodes WHERE id = ?1")?;
+    let mut del_stmt = conn.prepare_cached("DELETE FROM node_vectors WHERE node_id = ?1")?;
+    let mut ins_stmt =
+        conn.prepare_cached("INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)")?;
     for (node_id, embedding) in vectors {
         // Race guard: the background backfill snapshots node_ids, then spends a seconds-long
         // candle-inference window (embed.rs) before reaching this store, on a SEPARATE
@@ -57,9 +52,7 @@ pub fn delete_node_vectors_batch(conn: &Connection, ids: &[i64]) -> Result<()> {
     }
     let tx = conn.unchecked_transaction()?;
     {
-        let mut del_stmt = conn.prepare_cached(
-            "DELETE FROM node_vectors WHERE node_id = ?1"
-        )?;
+        let mut del_stmt = conn.prepare_cached("DELETE FROM node_vectors WHERE node_id = ?1")?;
         for id in ids {
             del_stmt.execute(rusqlite::params![id])?;
         }
@@ -68,7 +61,11 @@ pub fn delete_node_vectors_batch(conn: &Connection, ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
-pub fn vector_search(conn: &Connection, query_embedding: &[f32], limit: i64) -> Result<Vec<(i64, f64)>> {
+pub fn vector_search(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: i64,
+) -> Result<Vec<(i64, f64)>> {
     let bytes: &[u8] = bytemuck::cast_slice(query_embedding);
     let mut stmt = conn.prepare(
         "SELECT node_id, distance FROM node_vectors WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2"
@@ -104,7 +101,7 @@ pub fn get_unembedded_nodes(conn: &Connection, limit: usize) -> Result<Vec<(i64,
          WHERE nv.node_id IS NULL AND n.context_string IS NOT NULL
          GROUP BY n.id
          ORDER BY COUNT(e.target_id) DESC
-         LIMIT ?1"
+         LIMIT ?1",
     )?;
     let rows = stmt.query_map([limit as i64], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -146,7 +143,9 @@ pub fn get_unembedded_nodes_excluding(
 /// Returns (with_vectors, total_embeddable).
 pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
     let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM nodes WHERE context_string IS NOT NULL", [], |r| r.get(0)
+        "SELECT COUNT(*) FROM nodes WHERE context_string IS NOT NULL",
+        [],
+        |r| r.get(0),
     )?;
     // Probe for the vec table explicitly so its ABSENCE (embed-model disabled) returns 0 coverage,
     // while a genuine read error on the count below (e.g. SQLITE_BUSY under writer contention —
@@ -155,7 +154,8 @@ pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
     // `.unwrap_or(0)` on the JOIN would swallow that transient as "nothing embedded".
     let has_vectors_table: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
-        [], |r| r.get(0),
+        [],
+        |r| r.get(0),
     )?;
     if has_vectors_table == 0 {
         return Ok((0, total));
@@ -168,7 +168,9 @@ pub fn count_nodes_with_vectors(conn: &Connection) -> Result<(i64, i64)> {
     // The inner join to nodes drops orphans and caps the numerator at `total`.
     let with_vectors: i64 = conn.query_row(
         "SELECT COUNT(*) FROM nodes n JOIN node_vectors nv ON nv.node_id = n.id \
-         WHERE n.context_string IS NOT NULL", [], |r| r.get(0)
+         WHERE n.context_string IS NOT NULL",
+        [],
+        |r| r.get(0),
     )?;
     Ok((with_vectors, total))
 }
@@ -187,7 +189,8 @@ pub fn count_unembedded_nodes(conn: &Connection) -> Result<i64> {
     // floor on Err — would instead reset its floor to 0 and futilely reload the model.
     let has_vectors_table: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
-        [], |r| r.get(0),
+        [],
+        |r| r.get(0),
     )?;
     if has_vectors_table == 0 {
         return Ok(0);
@@ -196,7 +199,8 @@ pub fn count_unembedded_nodes(conn: &Connection) -> Result<i64> {
         "SELECT COUNT(*) FROM nodes n \
          LEFT JOIN node_vectors nv ON n.id = nv.node_id \
          WHERE nv.node_id IS NULL AND n.context_string IS NOT NULL",
-        [], |r| r.get(0),
+        [],
+        |r| r.get(0),
     )?;
     Ok(n)
 }
@@ -211,7 +215,8 @@ pub fn count_unembedded_nodes(conn: &Connection) -> Result<i64> {
 pub fn reap_orphan_vectors(conn: &Connection) -> Result<usize> {
     let has_vectors_table: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
-        [], |r| r.get(0),
+        [],
+        |r| r.get(0),
     )?;
     if has_vectors_table == 0 {
         return Ok(0);
@@ -243,7 +248,7 @@ pub fn reap_orphan_vectors(conn: &Connection) -> Result<usize> {
     // the only vec0-safe delete form. Anti-join against nodes finds vectors with no live node.
     let orphan_ids: Vec<i64> = {
         let mut stmt = tx.prepare(
-            "SELECT node_id FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)"
+            "SELECT node_id FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -263,10 +268,10 @@ pub fn reap_orphan_vectors(conn: &Connection) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::files::{upsert_file, FileRecord};
     use super::super::helpers::test_db;
     use super::super::nodes::{insert_node, NodeRecord};
+    use super::*;
 
     #[test]
     fn node_delete_reaps_vector_no_orphan_either_path() {
@@ -287,20 +292,43 @@ mod tests {
         use super::super::nodes::delete_nodes_by_file;
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
         let vec_count = |c: &Connection| -> i64 {
-            c.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0)).unwrap()
+            c.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0))
+                .unwrap()
         };
         let add_embedded = |c: &Connection, path: &str| -> i64 {
-            let fid = upsert_file(c, &FileRecord {
-                path: path.into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-            }).unwrap();
-            let nid = insert_node(c, &NodeRecord {
-                file_id: fid, node_type: "function".into(), name: "f".into(),
-                qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
-                signature: None, doc_comment: None, context_string: Some("ctx".into()),
-                name_tokens: None, return_type: None, param_types: None, is_test: false,
-            }).unwrap();
+            let fid = upsert_file(
+                c,
+                &FileRecord {
+                    path: path.into(),
+                    blake3_hash: "h".into(),
+                    last_modified: 1,
+                    language: None,
+                },
+            )
+            .unwrap();
+            let nid = insert_node(
+                c,
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: "f".into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 2,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: Some("ctx".into()),
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap();
             insert_node_vector(c, nid, &vec![0.0f32; crate::domain::EMBEDDING_DIM]).unwrap();
             fid
         };
@@ -309,13 +337,21 @@ mod tests {
         add_embedded(conn, "a.ts");
         assert_eq!(vec_count(conn), 1, "vector inserted");
         delete_files_by_paths(conn, &["a.ts".into()]).unwrap();
-        assert_eq!(vec_count(conn), 0, "FK-cascade delete must reap the vector (no orphan)");
+        assert_eq!(
+            vec_count(conn),
+            0,
+            "FK-cascade delete must reap the vector (no orphan)"
+        );
 
         // Path 2 — direct node delete (the changed-file reindex path) → trigger reaps it.
         let fid2 = add_embedded(conn, "b.ts");
         assert_eq!(vec_count(conn), 1, "vector inserted");
         delete_nodes_by_file(conn, fid2).unwrap();
-        assert_eq!(vec_count(conn), 0, "direct node delete must reap the vector (no orphan)");
+        assert_eq!(
+            vec_count(conn),
+            0,
+            "direct node delete must reap the vector (no orphan)"
+        );
     }
 
     #[test]
@@ -323,41 +359,100 @@ mod tests {
         // Verify that get_unembedded_nodes returns nodes ordered by edge reference count (most referenced first)
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "t.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
 
         // Create 3 nodes with context strings
-        let nid1 = insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "popular".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "function popular() {}".into(),
-            signature: None, doc_comment: None, context_string: Some("function popular".into()),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
-        let nid2 = insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "moderate".into(),
-            qualified_name: None, start_line: 10, end_line: 15,
-            code_content: "function moderate() {}".into(),
-            signature: None, doc_comment: None, context_string: Some("function moderate".into()),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
-        let nid3 = insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "lonely".into(),
-            qualified_name: None, start_line: 20, end_line: 25,
-            code_content: "function lonely() {}".into(),
-            signature: None, doc_comment: None, context_string: Some("function lonely".into()),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let nid1 = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "popular".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "function popular() {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("function popular".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        let nid2 = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "moderate".into(),
+                qualified_name: None,
+                start_line: 10,
+                end_line: 15,
+                code_content: "function moderate() {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("function moderate".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        let nid3 = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "lonely".into(),
+                qualified_name: None,
+                start_line: 20,
+                end_line: 25,
+                code_content: "function lonely() {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("function lonely".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         // Create a caller node (no context string so it won't appear in results)
-        let caller = insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "caller".into(),
-            qualified_name: None, start_line: 30, end_line: 35,
-            code_content: "function caller() {}".into(),
-            signature: None, doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let caller = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "caller".into(),
+                qualified_name: None,
+                start_line: 30,
+                end_line: 35,
+                code_content: "function caller() {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         // "popular" gets 3 incoming edges, "moderate" gets 1, "lonely" gets 0
         for _ in 0..3 {
@@ -366,7 +461,8 @@ mod tests {
             conn.execute(
                 "INSERT OR IGNORE INTO edges (source_id, target_id, relation) VALUES (?1, ?2, ?3)",
                 rusqlite::params![caller, nid1, "calls"],
-            ).unwrap();
+            )
+            .unwrap();
         }
         // Add additional edges with different metadata to make them unique
         conn.execute(
@@ -380,18 +476,27 @@ mod tests {
         conn.execute(
             "INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'calls')",
             rusqlite::params![caller, nid2],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create vec tables for the LEFT JOIN to work
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
 
         let results = get_unembedded_nodes(conn, 10).unwrap();
-        assert_eq!(results.len(), 3, "should return all 3 nodes with context strings");
+        assert_eq!(
+            results.len(),
+            3,
+            "should return all 3 nodes with context strings"
+        );
 
         // First result should be "popular" (most referenced: 3 edges)
         assert_eq!(results[0].0, nid1, "most referenced node should be first");
         // Second should be "moderate" (1 edge)
-        assert_eq!(results[1].0, nid2, "moderately referenced node should be second");
+        assert_eq!(
+            results[1].0, nid2,
+            "moderately referenced node should be second"
+        );
         // Third should be "lonely" (0 edges)
         assert_eq!(results[2].0, nid3, "unreferenced node should be last");
     }
@@ -403,23 +508,49 @@ mod tests {
         // excluding the whole set yields empty (so the loop terminates instead of spinning).
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let mk = |name: &str| insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: name.into(),
-            qualified_name: None, start_line: 1, end_line: 2,
-            code_content: format!("function {name}() {{}}"),
-            signature: None, doc_comment: None, context_string: Some(format!("function {name}")),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "t.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let mk = |name: &str| {
+            insert_node(
+                conn,
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: name.into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 2,
+                    code_content: format!("function {name}() {{}}"),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: Some(format!("function {name}")),
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap()
+        };
         let a = mk("aa");
         let b = mk("bb");
         let c = mk("cc");
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
 
         // No exclusion → all three (delegates to get_unembedded_nodes).
-        assert_eq!(get_unembedded_nodes_excluding(conn, 10, &[]).unwrap().len(), 3);
+        assert_eq!(
+            get_unembedded_nodes_excluding(conn, 10, &[]).unwrap().len(),
+            3
+        );
 
         // Excluding b → only a and c; b never appears though it's still unembedded.
         let got = get_unembedded_nodes_excluding(conn, 10, &[b]).unwrap();
@@ -428,7 +559,9 @@ mod tests {
         assert!(ids.contains(&a) && ids.contains(&c) && !ids.contains(&b));
 
         // Excluding every unembedded node → empty, the backfill loop's termination signal.
-        assert!(get_unembedded_nodes_excluding(conn, 10, &[a, b, c]).unwrap().is_empty());
+        assert!(get_unembedded_nodes_excluding(conn, 10, &[a, b, c])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -444,22 +577,50 @@ mod tests {
         use super::super::nodes::delete_nodes_by_file;
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "a.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let nid = insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "f".into(),
-            qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
-            signature: None, doc_comment: None, context_string: Some("ctx".into()),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "a.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let nid = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "f".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("ctx".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
         // Node deleted mid-inference (its file changed) — trigger fires, no vector yet.
         delete_nodes_by_file(conn, fid).unwrap();
         // Late backfill write for the now-dead node_id.
-        insert_node_vectors_batch(conn, &[(nid, vec![0.0f32; crate::domain::EMBEDDING_DIM])]).unwrap();
-        let vec_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0)).unwrap();
-        assert_eq!(vec_count, 0, "late insert for a deleted node must not create an orphan vector");
+        insert_node_vectors_batch(conn, &[(nid, vec![0.0f32; crate::domain::EMBEDDING_DIM])])
+            .unwrap();
+        let vec_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            vec_count, 0,
+            "late insert for a deleted node must not create an orphan vector"
+        );
     }
 
     #[test]
@@ -469,29 +630,65 @@ mod tests {
         // leaves a live node's vector untouched.
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "a.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let live = insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "f".into(),
-            qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
-            signature: None, doc_comment: None, context_string: Some("ctx".into()),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "a.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let live = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "f".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("ctx".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
         insert_node_vector(conn, live, &vec![0.1f32; crate::domain::EMBEDDING_DIM]).unwrap();
         // Inject two orphans directly (bypass the insert guard) at high ids, like real residue.
         for id in [90001i64, 90002i64] {
             conn.execute(
                 "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)",
-                rusqlite::params![id, bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])],
-            ).unwrap();
+                rusqlite::params![
+                    id,
+                    bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])
+                ],
+            )
+            .unwrap();
         }
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
         let reaped = reap_orphan_vectors(conn).unwrap();
         assert_eq!(reaped, 2, "both orphans reaped");
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
-            "only the live node's vector remains");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "only the live node's vector remains"
+        );
         // Idempotent: a second sweep with no orphans reaps nothing.
         assert_eq!(reap_orphan_vectors(conn).unwrap(), 0, "sweep is idempotent");
     }
@@ -503,16 +700,30 @@ mod tests {
         // transient empty window can never nuke a live vector index and force a full re-embed.
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
         for id in [1i64, 2, 3] {
             conn.execute(
                 "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)",
-                rusqlite::params![id, bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])],
-            ).unwrap();
+                rusqlite::params![
+                    id,
+                    bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])
+                ],
+            )
+            .unwrap();
         }
-        assert_eq!(reap_orphan_vectors(conn).unwrap(), 0, "must not sweep against empty nodes");
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(), 3,
-            "all vectors preserved during the transient empty-nodes window");
+        assert_eq!(
+            reap_orphan_vectors(conn).unwrap(),
+            0,
+            "must not sweep against empty nodes"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3,
+            "all vectors preserved during the transient empty-nodes window"
+        );
     }
 
     #[test]
@@ -522,30 +733,63 @@ mod tests {
         // >100% coverage AND a FALSE "complete" that masks genuinely unembedded nodes.
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "a.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let mk = |name: &str| insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: name.into(),
-            qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
-            signature: None, doc_comment: None, context_string: Some("ctx".into()),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "a.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let mk = |name: &str| {
+            insert_node(
+                conn,
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: name.into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 2,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: Some("ctx".into()),
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap()
+        };
         mk("a");
         mk("b");
         // Three orphan vectors (node_ids that don't exist) — more than the 2 embeddable nodes.
         for id in [90001i64, 90002i64, 90003i64] {
             conn.execute(
                 "INSERT INTO node_vectors(node_id, embedding) VALUES (?1, ?2)",
-                rusqlite::params![id, bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])],
-            ).unwrap();
+                rusqlite::params![
+                    id,
+                    bytemuck::cast_slice(&vec![0.0f32; crate::domain::EMBEDDING_DIM])
+                ],
+            )
+            .unwrap();
         }
         let (with_vectors, total) = count_nodes_with_vectors(conn).unwrap();
         assert_eq!(total, 2, "two embeddable nodes");
-        assert!(with_vectors <= total,
-            "numerator {with_vectors} must not exceed embeddable total {total} (orphans excluded)");
-        assert_eq!(with_vectors, 0, "no real node embedded yet — orphans must not count as coverage");
+        assert!(
+            with_vectors <= total,
+            "numerator {with_vectors} must not exceed embeddable total {total} (orphans excluded)"
+        );
+        assert_eq!(
+            with_vectors, 0,
+            "no real node embedded yet — orphans must not count as coverage"
+        );
     }
 
     #[test]
@@ -557,31 +801,60 @@ mod tests {
         use super::super::helpers::MAX_IN_PARAMS;
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "t.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
 
         let n = MAX_IN_PARAMS + 3; // 503 unembedded nodes
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
-            ids.push(insert_node(conn, &NodeRecord {
-                file_id: fid, node_type: "function".into(), name: format!("f{i}"),
-                qualified_name: None, start_line: i as i64 + 1, end_line: i as i64 + 1,
-                code_content: String::new(), signature: None, doc_comment: None,
-                context_string: Some(format!("ctx{i}")), name_tokens: None,
-                return_type: None, param_types: None, is_test: false,
-            }).unwrap());
+            ids.push(
+                insert_node(
+                    conn,
+                    &NodeRecord {
+                        file_id: fid,
+                        node_type: "function".into(),
+                        name: format!("f{i}"),
+                        qualified_name: None,
+                        start_line: i as i64 + 1,
+                        end_line: i as i64 + 1,
+                        code_content: String::new(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: Some(format!("ctx{i}")),
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    },
+                )
+                .unwrap(),
+            );
         }
 
         // Exclude the first MAX_IN_PARAMS + 1 ids (crosses the old IN-clause cap).
         let exclude = &ids[..MAX_IN_PARAMS + 1];
         let got = get_unembedded_nodes_excluding(conn, 10, exclude).unwrap();
         let got_ids: std::collections::HashSet<i64> = got.iter().map(|(id, _)| *id).collect();
-        let expected: std::collections::HashSet<i64> = ids[MAX_IN_PARAMS + 1..].iter().copied().collect();
-        assert_eq!(got_ids, expected, "exactly the non-excluded nodes must remain");
+        let expected: std::collections::HashSet<i64> =
+            ids[MAX_IN_PARAMS + 1..].iter().copied().collect();
+        assert_eq!(
+            got_ids, expected,
+            "exactly the non-excluded nodes must remain"
+        );
 
         // Excluding everything still terminates with an empty result.
-        assert!(get_unembedded_nodes_excluding(conn, 10, &ids).unwrap().is_empty());
+        assert!(get_unembedded_nodes_excluding(conn, 10, &ids)
+            .unwrap()
+            .is_empty());
     }
 }

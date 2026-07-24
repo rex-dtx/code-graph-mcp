@@ -26,12 +26,19 @@ pub enum CompressedOutput {
 /// `.len()` is UTF-8 byte length — see CHARS_PER_TOKEN doc for why this is
 /// CJK-correct without per-language branching.
 fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
-    let total_bytes: usize = results.iter().map(|r| {
-        r.context_string.as_ref().map_or_else(
-            || r.code_content.len() + r.name.len() + r.signature.as_ref().map_or(0, |s| s.len()),
-            |ctx| ctx.len(),
-        )
-    }).sum();
+    let total_bytes: usize = results
+        .iter()
+        .map(|r| {
+            r.context_string.as_ref().map_or_else(
+                || {
+                    r.code_content.len()
+                        + r.name.len()
+                        + r.signature.as_ref().map_or(0, |s| s.len())
+                },
+                |ctx| ctx.len(),
+            )
+        })
+        .sum();
     total_bytes / crate::domain::CHARS_PER_TOKEN
 }
 
@@ -60,11 +67,17 @@ pub fn compress_if_needed(
     if tokens <= token_threshold {
         Ok(None)
     } else if tokens <= token_threshold * 3 {
-        Ok(Some(CompressedOutput::Nodes(compress_results(results, file_paths)?)))
+        Ok(Some(CompressedOutput::Nodes(compress_results(
+            results, file_paths,
+        )?)))
     } else if tokens <= token_threshold * 8 {
-        Ok(Some(CompressedOutput::Files(compress_by_file(results, file_paths)?)))
+        Ok(Some(CompressedOutput::Files(compress_by_file(
+            results, file_paths,
+        )?)))
     } else {
-        Ok(Some(CompressedOutput::Directories(compress_by_directory(results, file_paths)?)))
+        Ok(Some(CompressedOutput::Directories(compress_by_directory(
+            results, file_paths,
+        )?)))
     }
 }
 
@@ -73,7 +86,10 @@ pub fn compress_results(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> anyhow::Result<Vec<CompressedResult>> {
-    ensure!(results.len() == file_paths.len(), "results and file_paths must have same length");
+    ensure!(
+        results.len() == file_paths.len(),
+        "results and file_paths must have same length"
+    );
     Ok(results
         .iter()
         .enumerate()
@@ -105,11 +121,16 @@ pub fn compress_by_file(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> anyhow::Result<Vec<GroupedResult>> {
-    ensure!(results.len() == file_paths.len(), "results and file_paths must have same length");
+    ensure!(
+        results.len() == file_paths.len(),
+        "results and file_paths must have same length"
+    );
     let mut groups: BTreeMap<String, (Vec<String>, Vec<i64>)> = BTreeMap::new();
     for (i, r) in results.iter().enumerate() {
         let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");
-        let entry = groups.entry(fp.to_string()).or_insert_with(|| (Vec::new(), Vec::new()));
+        let entry = groups
+            .entry(fp.to_string())
+            .or_insert_with(|| (Vec::new(), Vec::new()));
         entry.0.push(format!("{} {}", r.node_type, r.name));
         entry.1.push(r.id);
     }
@@ -132,7 +153,10 @@ pub fn compress_by_directory(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
 ) -> anyhow::Result<Vec<GroupedResult>> {
-    ensure!(results.len() == file_paths.len(), "results and file_paths must have same length");
+    ensure!(
+        results.len() == file_paths.len(),
+        "results and file_paths must have same length"
+    );
     let mut groups: BTreeMap<String, (HashSet<String>, Vec<i64>, usize)> = BTreeMap::new();
     for (i, r) in results.iter().enumerate() {
         let fp = file_paths.get(i).map(|s| s.as_str()).unwrap_or("?");
@@ -140,7 +164,9 @@ pub fn compress_by_directory(
             Some(pos) => &fp[..pos],
             None => ".",
         };
-        let entry = groups.entry(dir.to_string()).or_insert_with(|| (HashSet::new(), Vec::new(), 0));
+        let entry = groups
+            .entry(dir.to_string())
+            .or_insert_with(|| (HashSet::new(), Vec::new(), 0));
         entry.0.insert(fp.to_string());
         entry.1.push(r.id);
         entry.2 += 1;
@@ -337,7 +363,8 @@ mod tests {
         assert!(
             est_ascii < est,
             "1000 CJK chars must estimate higher than 1000 ASCII chars: cjk={} ascii={}",
-            est, est_ascii,
+            est,
+            est_ascii,
         );
     }
 }

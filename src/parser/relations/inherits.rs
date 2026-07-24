@@ -4,8 +4,8 @@
 //! `argument_list`, `superclass`, `delegation_specifiers`, `base_clause`,
 //! `inheritance_specifier`), so each is matched explicitly.
 
-use super::ParsedRelation;
 use super::super::node_text;
+use super::ParsedRelation;
 use crate::domain::REL_IMPLEMENTS;
 
 pub(super) fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Vec<String> {
@@ -24,7 +24,9 @@ pub(super) fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Ve
                         if inner.kind() == "extends_clause" {
                             for k in 0..inner.named_child_count() {
                                 if let Some(type_node) = inner.named_child(k) {
-                                    if type_node.kind() == "identifier" || type_node.kind() == "type_identifier" {
+                                    if type_node.kind() == "identifier"
+                                        || type_node.kind() == "type_identifier"
+                                    {
                                         parents.push(node_text(&type_node, source).to_string());
                                     }
                                 }
@@ -53,8 +55,8 @@ pub(super) fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Ve
                 for k in 0..child.named_child_count() {
                     if let Some(inner) = child.named_child(k) {
                         match inner.kind() {
-                            "type_identifier" | "identifier" | "dotted_name"
-                            | "constant" | "scope_resolution" => {
+                            "type_identifier" | "identifier" | "dotted_name" | "constant"
+                            | "scope_resolution" => {
                                 parents.push(node_text(&inner, source).to_string());
                             }
                             // Dart: `class C extends Base with M, N` — mixin
@@ -125,7 +127,8 @@ pub(super) fn extract_superclasses(node: &tree_sitter::Node, source: &str) -> Ve
                 if let Some(inherits_from) = child.child_by_field_name("inherits_from") {
                     // Walk into user_type to find type_identifier
                     let name = if inherits_from.kind() == "user_type" {
-                        inherits_from.named_child(0)
+                        inherits_from
+                            .named_child(0)
                             .map(|n| node_text(&n, source).to_string())
                     } else {
                         Some(node_text(&inherits_from, source).to_string())
@@ -162,7 +165,9 @@ pub(super) fn extract_implements(
                         if inner.kind() == "implements_clause" {
                             for k in 0..inner.named_child_count() {
                                 if let Some(type_node) = inner.named_child(k) {
-                                    if type_node.kind() == "type_identifier" || type_node.kind() == "identifier" {
+                                    if type_node.kind() == "type_identifier"
+                                        || type_node.kind() == "identifier"
+                                    {
                                         results.push(ParsedRelation {
                                             source_name: class_name.to_string(),
                                             target_name: node_text(&type_node, source).to_string(),
@@ -174,10 +179,13 @@ pub(super) fn extract_implements(
                                     // Handle generic_type: IService<T> -> extract IService
                                     if type_node.kind() == "generic_type" {
                                         if let Some(name_node) = type_node.named_child(0) {
-                                            if name_node.kind() == "type_identifier" || name_node.kind() == "identifier" {
+                                            if name_node.kind() == "type_identifier"
+                                                || name_node.kind() == "identifier"
+                                            {
                                                 results.push(ParsedRelation {
                                                     source_name: class_name.to_string(),
-                                                    target_name: node_text(&name_node, source).to_string(),
+                                                    target_name: node_text(&name_node, source)
+                                                        .to_string(),
                                                     relation: REL_IMPLEMENTS.into(),
                                                     metadata: None,
                                                     source_language: String::new(),
@@ -218,7 +226,9 @@ pub(super) fn extract_implements(
                         if inner.kind() == "type_list" {
                             for k in 0..inner.named_child_count() {
                                 if let Some(type_node) = inner.named_child(k) {
-                                    if type_node.kind() == "type_identifier" || type_node.kind() == "identifier" {
+                                    if type_node.kind() == "type_identifier"
+                                        || type_node.kind() == "identifier"
+                                    {
                                         results.push(ParsedRelation {
                                             source_name: class_name.to_string(),
                                             target_name: node_text(&type_node, source).to_string(),

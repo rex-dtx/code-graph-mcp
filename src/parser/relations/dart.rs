@@ -6,9 +6,9 @@
 //!   tail; method-style chains (`obj.transform()`) take the last
 //!   `unconditional_assignable_selector` identifier as the callee.
 
-use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
+use super::ParsedRelation;
 use crate::domain::{REL_CALLS, REL_IMPORTS};
 
 /// Extract Dart import targets from `import_or_export` nodes.
@@ -21,8 +21,14 @@ pub(super) fn extract_dart_imports(
     fn find_uri_string(node: &tree_sitter::Node, source: &str) -> Option<String> {
         find_uri_string_inner(node, source, 0)
     }
-    fn find_uri_string_inner(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
-        if depth > MAX_SUBTREE_DEPTH { return None; }
+    fn find_uri_string_inner(
+        node: &tree_sitter::Node,
+        source: &str,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > MAX_SUBTREE_DEPTH {
+            return None;
+        }
         if node.kind() == "string_literal" {
             let text = node_text(node, source);
             // Strip quotes: 'dart:async' -> dart:async
@@ -47,13 +53,15 @@ pub(super) fn extract_dart_imports(
             rest.to_string()
         } else if let Some(rest) = uri.strip_prefix("package:") {
             // package:foo/bar.dart -> last segment without .dart
-            rest.rsplit('/').next()
+            rest.rsplit('/')
+                .next()
                 .unwrap_or(rest)
                 .trim_end_matches(".dart")
                 .to_string()
         } else {
             // Relative import: 'src/utils.dart' -> 'utils'
-            uri.rsplit('/').next()
+            uri.rsplit('/')
+                .next()
                 .unwrap_or(&uri)
                 .trim_end_matches(".dart")
                 .to_string()
@@ -145,4 +153,3 @@ fn assignable_selector_name(selector: &tree_sitter::Node, source: &str) -> Optio
     }
     None
 }
-

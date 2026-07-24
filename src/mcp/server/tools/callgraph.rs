@@ -61,7 +61,10 @@ pub(super) fn attach_suppressed_ambiguous(
 }
 
 impl McpServer {
-    pub(in crate::mcp::server) fn tool_get_call_graph(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_get_call_graph(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         // Route mode: when route_path is set, dispatch to HTTP-chain tracer.
         // Folds the former trace_http_chain tool into get_call_graph (v0.18.4).
         // Schema marks symbol_name and route_path mutually exclusive — enforce it
@@ -97,9 +100,13 @@ impl McpServer {
         // underlying graph layer reject it. Two errors for one mistake.
         // normalize_call_direction canonicalizes case so `direction:"Both"` is
         // accepted like the other enum filters.
-        let direction = crate::domain::normalize_call_direction(direction_raw).ok_or_else(|| {
-            anyhow!("direction must be one of: callers, callees, both (got '{}')", direction_raw)
-        })?;
+        let direction =
+            crate::domain::normalize_call_direction(direction_raw).ok_or_else(|| {
+                anyhow!(
+                    "direction must be one of: callers, callees, both (got '{}')",
+                    direction_raw
+                )
+            })?;
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         // Empty file_path is identical to absent — without this the
         // disambiguation/fuzzy path treats Some("") as "filter by this exact
@@ -114,7 +121,10 @@ impl McpServer {
         let min_conf_tier = match args["min_confidence"].as_str() {
             None | Some("") => crate::domain::CONF_INFERRED,
             Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-                anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+                anyhow!(
+                    "min_confidence must be one of: extracted, inferred, ambiguous (got '{}')",
+                    c
+                )
             })?,
         };
         let min_conf_rank = crate::domain::confidence_rank(min_conf_tier);
@@ -141,7 +151,12 @@ impl McpServer {
         }
 
         let results = crate::graph::query::get_call_graph_filtered(
-            self.db.conn(), function_name, direction, depth, file_path, min_conf_rank,
+            self.db.conn(),
+            function_name,
+            direction,
+            depth,
+            file_path,
+            min_conf_rank,
         )?;
 
         // If exact match returns empty (only seed node, no edges), try fuzzy name resolution
@@ -151,9 +166,20 @@ impl McpServer {
             match self.resolve_fuzzy_name(function_name)? {
                 FuzzyResolution::Unique(resolved) => {
                     let results2 = crate::graph::query::get_call_graph_filtered(
-                        self.db.conn(), &resolved, direction, depth, file_path, min_conf_rank,
+                        self.db.conn(),
+                        &resolved,
+                        direction,
+                        depth,
+                        file_path,
+                        min_conf_rank,
                     )?;
-                    return self.format_call_graph_response(&resolved, direction, &results2, compact, include_tests);
+                    return self.format_call_graph_response(
+                        &resolved,
+                        direction,
+                        &results2,
+                        compact,
+                        include_tests,
+                    );
                 }
                 FuzzyResolution::Ambiguous(suggestions) => {
                     return Ok(json!({
@@ -192,7 +218,9 @@ impl McpServer {
             crate::domain::is_test_node(n.is_test, &n.name, &n.file_path)
         };
         let mut seen_nodes = std::collections::HashSet::new();
-        let all_nodes: Vec<serde_json::Value> = results.nodes.iter()
+        let all_nodes: Vec<serde_json::Value> = results
+            .nodes
+            .iter()
             .filter(|n| n.depth > 0 && (include_tests || !is_test(n)))
             // Deduplicate cfg-gated functions (same name+file+depth+direction, different node_id)
             .filter(|n| seen_nodes.insert((&n.name, &n.file_path, n.depth, n.direction.as_str())))
@@ -221,7 +249,9 @@ impl McpServer {
         let test_callers_count = if include_tests {
             0
         } else {
-            results.nodes.iter()
+            results
+                .nodes
+                .iter()
                 .filter(|n| n.depth > 0 && is_test(n))
                 .count()
         };
@@ -252,8 +282,10 @@ impl McpServer {
                 let node_id = node["node_id"].as_i64().unwrap_or(0);
                 let depth = node["depth"].as_i64().unwrap_or(0);
                 let entry = groups.entry((file, dir)).or_insert(Rollup {
-                    names: Vec::new(), node_ids: Vec::new(),
-                    min_depth: depth, max_depth: depth,
+                    names: Vec::new(),
+                    node_ids: Vec::new(),
+                    min_depth: depth,
+                    max_depth: depth,
                 });
                 entry.names.push(name);
                 entry.node_ids.push(node_id);
@@ -270,7 +302,8 @@ impl McpServer {
                 let count = rollup.names.len();
                 let truncated = count > SAMPLE_LIMIT;
                 let names: Vec<String> = rollup.names.iter().take(SAMPLE_LIMIT).cloned().collect();
-                let node_ids: Vec<i64> = rollup.node_ids.iter().take(SAMPLE_LIMIT).copied().collect();
+                let node_ids: Vec<i64> =
+                    rollup.node_ids.iter().take(SAMPLE_LIMIT).copied().collect();
                 let entry = json!({
                     "file": file,
                     "count": count,
@@ -292,8 +325,10 @@ impl McpServer {
             // Sort by count desc so the densest files appear first.
             caller_entries.sort_by_key(|e| std::cmp::Reverse(e.0));
             callee_entries.sort_by_key(|e| std::cmp::Reverse(e.0));
-            let caller_rollups: Vec<serde_json::Value> = caller_entries.into_iter().map(|(_, v)| v).collect();
-            let callee_rollups: Vec<serde_json::Value> = callee_entries.into_iter().map(|(_, v)| v).collect();
+            let caller_rollups: Vec<serde_json::Value> =
+                caller_entries.into_iter().map(|(_, v)| v).collect();
+            let callee_rollups: Vec<serde_json::Value> =
+                callee_entries.into_iter().map(|(_, v)| v).collect();
 
             let mut rollup = json!({
                 "mode": "rollup_call_graph",
@@ -315,10 +350,12 @@ impl McpServer {
             return Ok(rollup);
         }
 
-        let callee_nodes: Vec<&serde_json::Value> = all_nodes.iter()
+        let callee_nodes: Vec<&serde_json::Value> = all_nodes
+            .iter()
             .filter(|n| n["direction"] == "callees")
             .collect();
-        let caller_nodes: Vec<&serde_json::Value> = all_nodes.iter()
+        let caller_nodes: Vec<&serde_json::Value> = all_nodes
+            .iter()
             .filter(|n| n["direction"] == "callers")
             .collect();
 

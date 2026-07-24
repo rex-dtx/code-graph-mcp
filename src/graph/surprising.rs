@@ -222,12 +222,23 @@ mod tests {
         conn.execute("INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (1,2,'imports','extracted')", []).unwrap();
 
         let r = surprising_connections(conn, false, 10).unwrap();
-        assert_eq!(r.len(), 1, "only the cross-file call is a candidate (import excluded); got {r:?}");
         assert_eq!(
-            (r[0].source.as_str(), r[0].target.as_str(), r[0].confidence.as_str()),
+            r.len(),
+            1,
+            "only the cross-file call is a candidate (import excluded); got {r:?}"
+        );
+        assert_eq!(
+            (
+                r[0].source.as_str(),
+                r[0].target.as_str(),
+                r[0].confidence.as_str()
+            ),
             ("callerA", "targetB", "ambiguous"),
         );
-        assert_eq!(r[0].score, 7, "ambiguous(3) + cross-module(2) + sole bridge(2)");
+        assert_eq!(
+            r[0].score, 7,
+            "ambiguous(3) + cross-module(2) + sole bridge(2)"
+        );
     }
 
     #[test]
@@ -241,10 +252,15 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (2,'function','testB',1,2,'',1)", []).unwrap();
         conn.execute("INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (1,2,'calls','inferred')", []).unwrap();
 
-        assert!(surprising_connections(conn, false, 10).unwrap().is_empty(),
-            "edge to a test symbol is excluded by default");
-        assert_eq!(surprising_connections(conn, true, 10).unwrap().len(), 1,
-            "included with include_tests");
+        assert!(
+            surprising_connections(conn, false, 10).unwrap().is_empty(),
+            "edge to a test symbol is excluded by default"
+        );
+        assert_eq!(
+            surprising_connections(conn, true, 10).unwrap().len(),
+            1,
+            "included with include_tests"
+        );
     }
 
     /// Sibling-hole guard: the parser sets `is_test=1` only for AST-level markers
@@ -264,10 +280,15 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (1,'function','test_signup',1,2,'',0)", []).unwrap();
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (2,'function','handle_signup',1,2,'',0)", []).unwrap();
         conn.execute("INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (1,2,'calls','inferred')", []).unwrap();
-        assert!(surprising_connections(conn, false, 10).unwrap().is_empty(),
-            "test_-named source (is_test=0) in tests/ must be excluded by default");
-        assert_eq!(surprising_connections(conn, true, 10).unwrap().len(), 1,
-            "included with include_tests");
+        assert!(
+            surprising_connections(conn, false, 10).unwrap().is_empty(),
+            "test_-named source (is_test=0) in tests/ must be excluded by default"
+        );
+        assert_eq!(
+            surprising_connections(conn, true, 10).unwrap().len(),
+            1,
+            "included with include_tests"
+        );
     }
 
     #[test]
@@ -284,8 +305,10 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content,is_test) VALUES (2,'function','targetB',1,2,'',0)", []).unwrap();
         conn.execute("INSERT INTO edges (source_id,target_id,relation,confidence) VALUES (1,2,'calls','inferred')", []).unwrap();
 
-        assert!(surprising_connections(conn, false, 10).unwrap().is_empty(),
-            "a coupling whose source is the synthetic <module> scope node must be excluded");
+        assert!(
+            surprising_connections(conn, false, 10).unwrap().is_empty(),
+            "a coupling whose source is the synthetic <module> scope node must be excluded"
+        );
     }
 
     fn inp(src: &str, sf: &str, tgt: &str, tf: &str, conf: &str) -> SurpriseInput {
@@ -300,7 +323,9 @@ mod tests {
     }
 
     fn pairs(r: &[SurprisingConnection]) -> Vec<(&str, &str)> {
-        r.iter().map(|c| (c.source.as_str(), c.target.as_str())).collect()
+        r.iter()
+            .map(|c| (c.source.as_str(), c.target.as_str()))
+            .collect()
     }
 
     #[test]
@@ -317,8 +342,11 @@ mod tests {
             inp("e", "src/e.ts", "f", "src/f.ts", "extracted"),
         ];
         let r = find_surprising(&edges, 10);
-        assert_eq!(pairs(&r), [("c", "d"), ("a", "b"), ("e", "f")],
-            "ambiguous > inferred > extracted");
+        assert_eq!(
+            pairs(&r),
+            [("c", "d"), ("a", "b"), ("e", "f")],
+            "ambiguous > inferred > extracted"
+        );
     }
 
     #[test]
@@ -332,18 +360,26 @@ mod tests {
         let r = find_surprising(&edges, 10);
         assert_eq!(r[0].score, 4, "cross-dir non-sole = inferred(2) + cross(2)");
         assert_eq!(r[1].score, 4);
-        assert_eq!((r[2].source.as_str(), r[2].score), ("s", 2), "same-dir edge ranks last");
+        assert_eq!(
+            (r[2].source.as_str(), r[2].score),
+            ("s", 2),
+            "same-dir edge ranks last"
+        );
     }
 
     #[test]
     fn sole_bridge_between_modules_scores_highest() {
         let edges = [
-            inp("a", "src/a.ts", "b", "lib/x.ts", "inferred"),  // sole src|lib → 2+2+2 = 6
+            inp("a", "src/a.ts", "b", "lib/x.ts", "inferred"), // sole src|lib → 2+2+2 = 6
             inp("c", "src/c.ts", "d", "util/p.ts", "inferred"), // src|util #1
             inp("e", "src/e.ts", "f", "util/q.ts", "inferred"), // src|util #2 (count 2) → 4
         ];
         let r = find_surprising(&edges, 10);
-        assert_eq!((r[0].source.as_str(), r[0].score), ("a", 6), "sole bridge ranks first");
+        assert_eq!(
+            (r[0].source.as_str(), r[0].score),
+            ("a", 6),
+            "sole bridge ranks first"
+        );
     }
 
     #[test]
@@ -353,9 +389,18 @@ mod tests {
         let r = find_surprising(&edges, 10);
         assert_eq!(r[0].score, 7);
         let reasons = r[0].reasons.join(" | ").to_lowercase();
-        assert!(reasons.contains("ambiguous"), "explains confidence; got: {reasons}");
-        assert!(reasons.contains("module"), "explains cross-module; got: {reasons}");
-        assert!(reasons.contains("sole"), "explains sole bridge; got: {reasons}");
+        assert!(
+            reasons.contains("ambiguous"),
+            "explains confidence; got: {reasons}"
+        );
+        assert!(
+            reasons.contains("module"),
+            "explains cross-module; got: {reasons}"
+        );
+        assert!(
+            reasons.contains("sole"),
+            "explains sole bridge; got: {reasons}"
+        );
     }
 
     #[test]

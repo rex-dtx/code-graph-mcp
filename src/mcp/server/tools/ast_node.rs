@@ -6,7 +6,10 @@
 use super::super::*;
 
 impl McpServer {
-    pub(in crate::mcp::server) fn tool_get_ast_node(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_get_ast_node(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         // Validate min_confidence at entry, BEFORE any index/freshness work, so a
         // bad value errors cleanly instead of after a possible reindex (and isn't
         // preempted by a freshness error) — enum-validate-at-entry. Used by the
@@ -16,7 +19,10 @@ impl McpServer {
             let tier = match args["min_confidence"].as_str() {
                 None | Some("") => crate::domain::CONF_INFERRED,
                 Some(c) => crate::domain::normalize_confidence(c).ok_or_else(|| {
-                    anyhow!("min_confidence must be one of: extracted, inferred, ambiguous (got '{}')", c)
+                    anyhow!(
+                        "min_confidence must be one of: extracted, inferred, ambiguous (got '{}')",
+                        c
+                    )
                 })?,
             };
             crate::domain::confidence_rank(tier)
@@ -41,7 +47,15 @@ impl McpServer {
         if let Some(nid) = args["node_id"].as_i64() {
             // When called with node_id, default context_lines=3
             let ctx = args["context_lines"].as_i64().unwrap_or(3).clamp(0, 100) as usize;
-            let mut out = self.ast_node_by_id(nid, include_refs, include_tests, include_impact, ctx, compact, impact_conf_rank)?;
+            let mut out = self.ast_node_by_id(
+                nid,
+                include_refs,
+                include_tests,
+                include_impact,
+                ctx,
+                compact,
+                impact_conf_rank,
+            )?;
             if include_similar {
                 self.attach_similar(&mut out, nid, similar_top_k)?;
             }
@@ -52,13 +66,16 @@ impl McpServer {
 
         // Empty/whitespace-only symbol_name behaves like absent — prevents
         // "Symbol '' not found" and accidental fuzzy hits on the only candidate.
-        let symbol_name = args["symbol_name"].as_str().filter(|s| !s.trim().is_empty());
+        let symbol_name = args["symbol_name"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty());
         let file_path = args["file_path"].as_str();
 
         // If only symbol_name provided (no file_path), resolve by name lookup
         if let (Some(sym), None) = (symbol_name, file_path) {
             let candidates = queries::get_nodes_with_files_by_name(self.db.conn(), sym)?;
-            let non_test: Vec<_> = candidates.iter()
+            let non_test: Vec<_> = candidates
+                .iter()
                 .filter(|nf| !is_test_symbol(&nf.node.name, &nf.file_path))
                 .collect();
             return match non_test.len() {
@@ -89,10 +106,11 @@ impl McpServer {
             };
         }
 
-        let file_path = file_path
-            .ok_or_else(|| anyhow!("Either node_id, symbol_name, or file_path+symbol_name is required"))?;
-        let symbol_name = symbol_name
-            .ok_or_else(|| anyhow!("symbol_name is required when using file_path"))?;
+        let file_path = file_path.ok_or_else(|| {
+            anyhow!("Either node_id, symbol_name, or file_path+symbol_name is required")
+        })?;
+        let symbol_name =
+            symbol_name.ok_or_else(|| anyhow!("symbol_name is required when using file_path"))?;
 
         let nodes = queries::get_nodes_by_file_path(self.db.conn(), file_path)?;
         if nodes.is_empty() {
@@ -115,7 +133,9 @@ impl McpServer {
 
                 // Include source code: prefer context view, fall back to stored code_content
                 if context_lines > 0 {
-                    if let Some(code) = self.read_source_context(file_path, n.start_line, n.end_line, context_lines) {
+                    if let Some(code) =
+                        self.read_source_context(file_path, n.start_line, n.end_line, context_lines)
+                    {
                         result["code_content"] = json!(code);
                     } else {
                         result["code_content"] = json!(n.code_content);
@@ -126,9 +146,14 @@ impl McpServer {
 
                 if include_refs {
                     use crate::domain::REL_CALLS as CALLS;
-                    let callees = queries::get_edge_targets_with_files(self.db.conn(), n.id, CALLS)?;
-                    let callers = queries::get_edge_sources_with_files(self.db.conn(), n.id, CALLS)?;
-                    result["calls"] = json!(callees.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+                    let callees =
+                        queries::get_edge_targets_with_files(self.db.conn(), n.id, CALLS)?;
+                    let callers =
+                        queries::get_edge_sources_with_files(self.db.conn(), n.id, CALLS)?;
+                    result["calls"] = json!(callees
+                        .into_iter()
+                        .map(|(name, file)| json!({"name": name, "file": file}))
+                        .collect::<Vec<_>>());
                     let (filtered, test_count) = if include_tests {
                         // Stable sort prod-first: downstream truncation in centralized_compress
                         // keeps first 10 + last 5; without this, test-heavy SQL row order can
@@ -138,20 +163,30 @@ impl McpServer {
                         (all, 0)
                     } else {
                         let total = callers.len();
-                        let prod: Vec<_> = callers.into_iter()
+                        let prod: Vec<_> = callers
+                            .into_iter()
                             .filter(|(n, f, t)| !crate::domain::is_test_node(*t, n, f))
                             .collect();
                         let tc = total - prod.len();
                         (prod, tc)
                     };
-                    result["called_by"] = json!(filtered.into_iter().map(|(name, file, _)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+                    result["called_by"] = json!(filtered
+                        .into_iter()
+                        .map(|(name, file, _)| json!({"name": name, "file": file}))
+                        .collect::<Vec<_>>());
                     if test_count > 0 {
                         result["test_callers_hidden"] = json!(test_count);
                     }
                 }
 
                 if include_impact {
-                    self.append_impact_summary(&mut result, &n.name, file_path, &n.node_type, impact_conf_rank)?;
+                    self.append_impact_summary(
+                        &mut result,
+                        &n.name,
+                        file_path,
+                        &n.node_type,
+                        impact_conf_rank,
+                    )?;
                 }
 
                 if include_similar {
@@ -176,9 +211,18 @@ impl McpServer {
                         "Code content omitted ({} lines, ~{} tokens). Use Read tool on {}:{}-{} to view source.",
                         n.end_line.saturating_sub(n.start_line) + 1, tokens, file_path, n.start_line, n.end_line
                     ));
-                    result["summary"] = json!(format!("{} {} in {} (lines {}-{}){}",
-                        n.node_type, n.name, file_path, n.start_line, n.end_line,
-                        n.signature.as_ref().map(|s| format!(" {}", s)).unwrap_or_default()));
+                    result["summary"] = json!(format!(
+                        "{} {} in {} (lines {}-{}){}",
+                        n.node_type,
+                        n.name,
+                        file_path,
+                        n.start_line,
+                        n.end_line,
+                        n.signature
+                            .as_ref()
+                            .map(|s| format!(" {}", s))
+                            .unwrap_or_default()
+                    ));
                     return Ok(result);
                 }
 
@@ -186,7 +230,8 @@ impl McpServer {
             }
             None => {
                 // List available symbols to help the user
-                let available: Vec<String> = nodes.iter()
+                let available: Vec<String> = nodes
+                    .iter()
                     .filter(|n| n.name != "<module>")
                     .take(10)
                     .map(|n| format!("{} ({})", n.name, n.node_type))
@@ -196,14 +241,28 @@ impl McpServer {
                 } else {
                     format!(". Available symbols: {}", available.join(", "))
                 };
-                Err(anyhow!("Symbol '{}' not found in '{}'{}", symbol_name, file_path, hint))
+                Err(anyhow!(
+                    "Symbol '{}' not found in '{}'{}",
+                    symbol_name,
+                    file_path,
+                    hint
+                ))
             }
         }
     }
 
     /// Lookup AST node by node_id.
     #[allow(clippy::too_many_arguments)] // flag-driven introspection: 7 independent display toggles + the impact-summary confidence floor; a struct would just relocate the same fields
-    pub(in crate::mcp::server) fn ast_node_by_id(&self, node_id: i64, include_refs: bool, include_tests: bool, include_impact: bool, context_lines: usize, compact: bool, min_confidence_rank: u8) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn ast_node_by_id(
+        &self,
+        node_id: i64,
+        include_refs: bool,
+        include_tests: bool,
+        include_impact: bool,
+        context_lines: usize,
+        compact: bool,
+        min_confidence_rank: u8,
+    ) -> Result<serde_json::Value> {
         let nf = queries::get_node_with_file_by_id(self.db.conn(), node_id)?
             .ok_or_else(|| anyhow!(
                 "Node {} not found in index. node_ids are rebuild-scoped — a reindex (file change, incremental update, or rebuild_index) may have renumbered nodes. Re-resolve by calling get_ast_node(symbol_name, file_path) or semantic_code_search to obtain a current node_id.",
@@ -227,7 +286,12 @@ impl McpServer {
         if !compact {
             // Include source code: prefer context view when requested, fall back to stored code_content
             if context_lines > 0 {
-                if let Some(code) = self.read_source_context(&file_path, node.start_line, node.end_line, context_lines) {
+                if let Some(code) = self.read_source_context(
+                    &file_path,
+                    node.start_line,
+                    node.end_line,
+                    context_lines,
+                ) {
                     result["code_content"] = json!(code);
                 } else {
                     result["code_content"] = json!(node.code_content);
@@ -241,7 +305,10 @@ impl McpServer {
             use crate::domain::REL_CALLS as CALLS;
             let callees = queries::get_edge_targets_with_files(self.db.conn(), node.id, CALLS)?;
             let callers = queries::get_edge_sources_with_files(self.db.conn(), node.id, CALLS)?;
-            result["calls"] = json!(callees.into_iter().map(|(name, file)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+            result["calls"] = json!(callees
+                .into_iter()
+                .map(|(name, file)| json!({"name": name, "file": file}))
+                .collect::<Vec<_>>());
             let (filtered, test_count) = if include_tests {
                 // Stable sort prod-first: downstream truncation in centralized_compress
                 // keeps first 10 + last 5; without this, test-heavy SQL row order can
@@ -251,20 +318,30 @@ impl McpServer {
                 (all, 0)
             } else {
                 let total = callers.len();
-                let prod: Vec<_> = callers.into_iter()
+                let prod: Vec<_> = callers
+                    .into_iter()
                     .filter(|(n, f, t)| !crate::domain::is_test_node(*t, n, f))
                     .collect();
                 let tc = total - prod.len();
                 (prod, tc)
             };
-            result["called_by"] = json!(filtered.into_iter().map(|(name, file, _)| json!({"name": name, "file": file})).collect::<Vec<_>>());
+            result["called_by"] = json!(filtered
+                .into_iter()
+                .map(|(name, file, _)| json!({"name": name, "file": file}))
+                .collect::<Vec<_>>());
             if test_count > 0 {
                 result["test_callers_hidden"] = json!(test_count);
             }
         }
 
         if include_impact {
-            self.append_impact_summary(&mut result, &node.name, &file_path, &node.node_type, min_confidence_rank)?;
+            self.append_impact_summary(
+                &mut result,
+                &node.name,
+                &file_path,
+                &node.node_type,
+                min_confidence_rank,
+            )?;
         }
 
         Ok(result)
@@ -275,9 +352,20 @@ impl McpServer {
     /// `node_type` is required so that impact on non-function symbols (constant /
     /// struct / enum / trait / ...) with zero callers reports `risk_level: UNKNOWN`
     /// plus a warning, rather than a misleading LOW.
-    pub(in crate::mcp::server) fn append_impact_summary(&self, result: &mut serde_json::Value, symbol_name: &str, file_path: &str, node_type: &str, min_confidence_rank: u8) -> Result<()> {
+    pub(in crate::mcp::server) fn append_impact_summary(
+        &self,
+        result: &mut serde_json::Value,
+        symbol_name: &str,
+        file_path: &str,
+        node_type: &str,
+        min_confidence_rank: u8,
+    ) -> Result<()> {
         let callers = crate::graph::routes::get_callers_with_route_info(
-            self.db.conn(), symbol_name, Some(file_path), 3, min_confidence_rank
+            self.db.conn(),
+            symbol_name,
+            Some(file_path),
+            3,
+            min_confidence_rank,
         )?;
         let callers: Vec<_> = callers.into_iter().filter(|c| c.depth > 0).collect();
         // Direct ambiguous callers folded out of the risk count by the floor —
@@ -287,9 +375,16 @@ impl McpServer {
         // transitive ambiguous caller is disclosed too (not just seed-direct).
         let caller_ids: Vec<i64> = callers.iter().map(|c| c.node_id).collect();
         let ambiguous_callers_excluded = crate::graph::query::count_suppressed_seed_edges(
-            self.db.conn(), symbol_name, Some(file_path),
-            crate::graph::query::Direction::Callers, min_confidence_rank,
-        )? + crate::graph::query::count_suppressed_into(self.db.conn(), &caller_ids, min_confidence_rank)?;
+            self.db.conn(),
+            symbol_name,
+            Some(file_path),
+            crate::graph::query::Direction::Callers,
+            min_confidence_rank,
+        )? + crate::graph::query::count_suppressed_into(
+            self.db.conn(),
+            &caller_ids,
+            min_confidence_rank,
+        )?;
         // Shared prod/test partition + route + risk classification (graph::impact) —
         // the single source that also drives `cmd_impact`. Trusts the AST `is_test`
         // flag (catches inline `#[cfg(test)]` unit tests whose descriptive names the
@@ -359,7 +454,13 @@ impl McpServer {
 
     /// Read source code with context lines from the project file system.
     /// Uses BufReader to avoid loading entire file into memory.
-    pub(in crate::mcp::server) fn read_source_context(&self, file_path: &str, start_line: i64, end_line: i64, context_lines: usize) -> Option<String> {
+    pub(in crate::mcp::server) fn read_source_context(
+        &self,
+        file_path: &str,
+        start_line: i64,
+        end_line: i64,
+        context_lines: usize,
+    ) -> Option<String> {
         use std::io::BufRead;
         let root = self.project_root.as_ref()?;
         let abs_path = root.join(file_path);
@@ -401,26 +502,57 @@ mod tests {
         // `#[cfg(test)]` unit tests (is_test=1, name with no `test` substring in a
         // src/ file) to the back — only the AST flag catches those.
         let mut callers: Vec<(String, String, bool)> = vec![
-            ("test_v1_to_v2_migration".into(), "src/storage/db.rs".into(), false),
-            ("test_init_creates_db_and_tables".into(), "src/storage/db.rs".into(), false),
+            (
+                "test_v1_to_v2_migration".into(),
+                "src/storage/db.rs".into(),
+                false,
+            ),
+            (
+                "test_init_creates_db_and_tables".into(),
+                "src/storage/db.rs".into(),
+                false,
+            ),
             ("cmd_health_check".into(), "src/cli.rs".into(), false),
-            ("run_full_index".into(), "src/indexer/pipeline/mod.rs".into(), false),
-            ("tool_module_overview".into(), "src/mcp/server/tools/overview.rs".into(), false),
-            ("test_camelcase_search_finds_split_tokens".into(), "tests/integration.rs".into(), false),
+            (
+                "run_full_index".into(),
+                "src/indexer/pipeline/mod.rs".into(),
+                false,
+            ),
+            (
+                "tool_module_overview".into(),
+                "src/mcp/server/tools/overview.rs".into(),
+                false,
+            ),
+            (
+                "test_camelcase_search_finds_split_tokens".into(),
+                "tests/integration.rs".into(),
+                false,
+            ),
             // inline unit test: heuristic-invisible name + src/ path, only is_test=1 classifies it
-            ("two_node_cycle_is_detected".into(), "src/graph/cycles.rs".into(), true),
+            (
+                "two_node_cycle_is_detected".into(),
+                "src/graph/cycles.rs".into(),
+                true,
+            ),
         ];
         callers.sort_by_key(|(n, f, t)| is_test_node(*t, n, f));
 
-        let prod_count = callers.iter().take_while(|(n, f, t)| !is_test_node(*t, n, f)).count();
+        let prod_count = callers
+            .iter()
+            .take_while(|(n, f, t)| !is_test_node(*t, n, f))
+            .count();
         assert_eq!(prod_count, 3, "prod callers must occupy contiguous prefix");
-        let prod_names: std::collections::HashSet<&str> =
-            callers[..prod_count].iter().map(|(n, _, _)| n.as_str()).collect();
+        let prod_names: std::collections::HashSet<&str> = callers[..prod_count]
+            .iter()
+            .map(|(n, _, _)| n.as_str())
+            .collect();
         assert!(prod_names.contains("cmd_health_check"));
         assert!(prod_names.contains("run_full_index"));
         assert!(prod_names.contains("tool_module_overview"));
         // The inline unit test must NOT sit in the prod prefix — the flag drives it back.
-        assert!(!prod_names.contains("two_node_cycle_is_detected"),
-            "inline unit test (is_test=1) leaked into the prod prefix");
+        assert!(
+            !prod_names.contains("two_node_cycle_is_detected"),
+            "inline unit test (is_test=1) leaked into the prod prefix"
+        );
     }
 }

@@ -4,20 +4,29 @@
 use super::super::*;
 
 impl McpServer {
-    pub(in crate::mcp::server) fn tool_ast_search(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_ast_search(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
         }
 
-        let query = args["query"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+        let query = args["query"]
+            .as_str()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
         let type_filter = args["type"].as_str();
         let returns_filter = args["returns"].as_str();
         let params_filter = args["params"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
 
-        let has_filters = type_filter.is_some() || returns_filter.is_some() || params_filter.is_some();
+        let has_filters =
+            type_filter.is_some() || returns_filter.is_some() || params_filter.is_some();
         if query.is_none() && !has_filters {
-            return Err(anyhow!("Either query or at least one filter (type, returns, params) is required."));
+            return Err(anyhow!(
+                "Either query or at least one filter (type, returns, params) is required."
+            ));
         }
 
         // Validate type up-front: unknown aliases normalize to an empty Vec,
@@ -42,11 +51,16 @@ impl McpServer {
             let all = queries::get_nodes_with_files_by_ids(self.db.conn(), &node_ids)?;
 
             // Preserve FTS5 rank order
-            let id_order: std::collections::HashMap<i64, usize> = node_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+            let id_order: std::collections::HashMap<i64, usize> = node_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (*id, i))
+                .collect();
             let mut sorted = all;
             sorted.sort_by_key(|nwf| id_order.get(&nwf.node.id).copied().unwrap_or(usize::MAX));
 
-            sorted.into_iter()
+            sorted
+                .into_iter()
                 .filter(|nwf| {
                     let n = &nwf.node;
                     // Skip <module>/<external> placeholders and test symbols, consistent
@@ -63,13 +77,21 @@ impl McpServer {
                     }
                     if let Some(rf) = returns_filter {
                         match &n.return_type {
-                            Some(rt) => if !rt.to_lowercase().contains(&rf.to_lowercase()) { return false; },
+                            Some(rt) => {
+                                if !rt.to_lowercase().contains(&rf.to_lowercase()) {
+                                    return false;
+                                }
+                            }
                             None => return false,
                         }
                     }
                     if let Some(pf) = params_filter {
                         match &n.param_types {
-                            Some(pt) => if !pt.to_lowercase().contains(&pf.to_lowercase()) { return false; },
+                            Some(pt) => {
+                                if !pt.to_lowercase().contains(&pf.to_lowercase()) {
+                                    return false;
+                                }
+                            }
                             None => return false,
                         }
                     }
@@ -80,29 +102,36 @@ impl McpServer {
         } else {
             // Filter-only: direct SQL
             let normalized = type_filter.map(normalize_type_filter_mcp);
-            let type_refs: Option<Vec<&str>> = normalized.as_ref()
+            let type_refs: Option<Vec<&str>> = normalized
+                .as_ref()
                 .map(|v| v.iter().map(|s| s.as_str()).collect());
             queries::get_nodes_with_files_by_filters(
                 self.db.conn(),
                 type_refs.as_deref(),
-                returns_filter, params_filter, None, limit,
+                returns_filter,
+                params_filter,
+                None,
+                limit,
             )?
         };
 
-        let items: Vec<serde_json::Value> = results.iter().map(|nwf| {
-            let n = &nwf.node;
-            json!({
-                "node_id": n.id,
-                "name": n.qualified_name.as_deref().unwrap_or(&n.name),
-                "type": n.node_type,
-                "file_path": nwf.file_path,
-                "start_line": n.start_line,
-                "end_line": n.end_line,
-                "signature": n.signature,
-                "return_type": n.return_type,
-                "param_types": n.param_types,
+        let items: Vec<serde_json::Value> = results
+            .iter()
+            .map(|nwf| {
+                let n = &nwf.node;
+                json!({
+                    "node_id": n.id,
+                    "name": n.qualified_name.as_deref().unwrap_or(&n.name),
+                    "type": n.node_type,
+                    "file_path": nwf.file_path,
+                    "start_line": n.start_line,
+                    "end_line": n.end_line,
+                    "signature": n.signature,
+                    "return_type": n.return_type,
+                    "param_types": n.param_types,
+                })
             })
-        }).collect();
+            .collect();
 
         let mut response = json!({
             "results": items,
@@ -119,27 +148,35 @@ impl McpServer {
             if let Some(q) = query {
                 if is_identifier_like(q) {
                     let normalized = type_filter.map(normalize_type_filter_mcp);
-                    let type_refs: Option<Vec<&str>> = normalized.as_ref()
+                    let type_refs: Option<Vec<&str>> = normalized
+                        .as_ref()
                         .map(|v| v.iter().map(|s| s.as_str()).collect());
                     let retry = queries::get_nodes_with_files_by_filters(
-                        self.db.conn(), type_refs.as_deref(),
-                        returns_filter, params_filter, Some(q), limit,
+                        self.db.conn(),
+                        type_refs.as_deref(),
+                        returns_filter,
+                        params_filter,
+                        Some(q),
+                        limit,
                     )?;
                     if !retry.is_empty() {
-                        let retry_items: Vec<serde_json::Value> = retry.iter().map(|nwf| {
-                            let n = &nwf.node;
-                            json!({
-                                "node_id": n.id,
-                                "name": n.qualified_name.as_deref().unwrap_or(&n.name),
-                                "type": n.node_type,
-                                "file_path": nwf.file_path,
-                                "start_line": n.start_line,
-                                "end_line": n.end_line,
-                                "signature": n.signature,
-                                "return_type": n.return_type,
-                                "param_types": n.param_types,
+                        let retry_items: Vec<serde_json::Value> = retry
+                            .iter()
+                            .map(|nwf| {
+                                let n = &nwf.node;
+                                json!({
+                                    "node_id": n.id,
+                                    "name": n.qualified_name.as_deref().unwrap_or(&n.name),
+                                    "type": n.node_type,
+                                    "file_path": nwf.file_path,
+                                    "start_line": n.start_line,
+                                    "end_line": n.end_line,
+                                    "signature": n.signature,
+                                    "return_type": n.return_type,
+                                    "param_types": n.param_types,
+                                })
                             })
-                        }).collect();
+                            .collect();
                         response["results"] = json!(retry_items);
                         response["count"] = json!(retry_items.len());
                         response["hint"] = json!(format!(
@@ -157,11 +194,16 @@ impl McpServer {
             if let Some(rf) = returns_filter {
                 if let Some(inner) = strip_outer_generic(rf) {
                     let normalized = type_filter.map(normalize_type_filter_mcp);
-                    let type_refs: Option<Vec<&str>> = normalized.as_ref()
+                    let type_refs: Option<Vec<&str>> = normalized
+                        .as_ref()
                         .map(|v| v.iter().map(|s| s.as_str()).collect());
                     let retry = queries::get_nodes_with_files_by_filters(
-                        self.db.conn(), type_refs.as_deref(),
-                        Some(&inner), params_filter, None, 100,
+                        self.db.conn(),
+                        type_refs.as_deref(),
+                        Some(&inner),
+                        params_filter,
+                        None,
+                        100,
                     )?;
                     if !retry.is_empty() {
                         let n = retry.len();
@@ -172,9 +214,15 @@ impl McpServer {
                         ));
                         let mut suggested = serde_json::Map::new();
                         suggested.insert("returns".to_string(), json!(inner));
-                        if let Some(tf) = type_filter { suggested.insert("type".to_string(), json!(tf)); }
-                        if let Some(pf) = params_filter { suggested.insert("params".to_string(), json!(pf)); }
-                        if let Some(q) = query { suggested.insert("query".to_string(), json!(q)); }
+                        if let Some(tf) = type_filter {
+                            suggested.insert("type".to_string(), json!(tf));
+                        }
+                        if let Some(pf) = params_filter {
+                            suggested.insert("params".to_string(), json!(pf));
+                        }
+                        if let Some(q) = query {
+                            suggested.insert("query".to_string(), json!(q));
+                        }
                         response["suggested_query"] = serde_json::Value::Object(suggested);
                     }
                 }

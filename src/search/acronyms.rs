@@ -13,21 +13,21 @@
 /// Static dictionary. Keys are lowercase ASCII; expansion terms are lowercase
 /// individual words (each ≥ 2 chars to survive the FTS length filter).
 const ACRONYMS: &[(&str, &[&str])] = &[
-    ("rrf",  &["reciprocal", "rank", "fusion"]),
+    ("rrf", &["reciprocal", "rank", "fusion"]),
     ("bm25", &["best", "match"]),
-    ("fts",  &["full", "text", "search"]),
+    ("fts", &["full", "text", "search"]),
     ("fts5", &["full", "text", "search"]),
-    ("ast",  &["abstract", "syntax", "tree"]),
-    ("cst",  &["concrete", "syntax", "tree"]),
-    ("lsp",  &["language", "server", "protocol"]),
-    ("mcp",  &["model", "context", "protocol"]),
-    ("rpc",  &["remote", "procedure", "call"]),
-    ("sql",  &["structured", "query", "language"]),
-    ("orm",  &["object", "relational", "mapping"]),
-    ("cte",  &["common", "table", "expression"]),
-    ("jwt",  &["json", "web", "token"]),
-    ("ttl",  &["time", "live"]),
-    ("dag",  &["directed", "acyclic", "graph"]),
+    ("ast", &["abstract", "syntax", "tree"]),
+    ("cst", &["concrete", "syntax", "tree"]),
+    ("lsp", &["language", "server", "protocol"]),
+    ("mcp", &["model", "context", "protocol"]),
+    ("rpc", &["remote", "procedure", "call"]),
+    ("sql", &["structured", "query", "language"]),
+    ("orm", &["object", "relational", "mapping"]),
+    ("cte", &["common", "table", "expression"]),
+    ("jwt", &["json", "web", "token"]),
+    ("ttl", &["time", "live"]),
+    ("dag", &["directed", "acyclic", "graph"]),
     ("rbac", &["role", "based", "access", "control"]),
     ("crud", &["create", "read", "update", "delete"]),
     ("cors", &["cross", "origin", "resource", "sharing"]),
@@ -59,7 +59,10 @@ mod tests {
     fn unknown_returns_empty() {
         assert!(expand_acronym("xyz").is_empty());
         assert!(expand_acronym("").is_empty());
-        assert!(expand_acronym("fusion").is_empty(), "non-acronym common words skipped");
+        assert!(
+            expand_acronym("fusion").is_empty(),
+            "non-acronym common words skipped"
+        );
     }
 
     #[test]
@@ -74,7 +77,12 @@ mod tests {
         // accidentally adding entries that get silently filtered.
         for &(key, expansion) in ACRONYMS {
             for term in expansion {
-                assert!(term.len() >= 2, "acronym '{}' has sub-2-char term '{}'", key, term);
+                assert!(
+                    term.len() >= 2,
+                    "acronym '{}' has sub-2-char term '{}'",
+                    key,
+                    term
+                );
             }
         }
     }

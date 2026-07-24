@@ -5,10 +5,8 @@ use rusqlite::Connection;
 
 fn open_with_meta_table() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
-    )
-    .unwrap();
+    conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);")
+        .unwrap();
     conn
 }
 
@@ -47,13 +45,37 @@ use tempfile::TempDir;
 fn init_git_fixture() -> TempDir {
     let dir = TempDir::new().unwrap();
     let p = dir.path();
-    Command::new("git").args(["init", "-q"]).current_dir(p).status().unwrap();
-    Command::new("git").args(["config", "user.email", "t@t"]).current_dir(p).status().unwrap();
-    Command::new("git").args(["config", "user.name", "t"]).current_dir(p).status().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "t@t"])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "t"])
+        .current_dir(p)
+        .status()
+        .unwrap();
     std::fs::create_dir_all(p.join("src")).unwrap();
-    std::fs::write(p.join("src/lib.rs"), "pub fn hello() {}\npub fn world() { hello(); }\n").unwrap();
-    Command::new("git").args(["add", "."]).current_dir(p).status().unwrap();
-    Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(p).status().unwrap();
+    std::fs::write(
+        p.join("src/lib.rs"),
+        "pub fn hello() {}\npub fn world() { hello(); }\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-q", "-m", "init"])
+        .current_dir(p)
+        .status()
+        .unwrap();
     dir
 }
 
@@ -63,16 +85,23 @@ fn create_writes_meta_and_drops_vec_table() {
     let out = fixture.path().join("snapshot.db");
     crate::snapshot::create(fixture.path(), &out, false).unwrap();
 
-    assert!(out.exists(), "snapshot db should exist at {}", out.display());
+    assert!(
+        out.exists(),
+        "snapshot db should exist at {}",
+        out.display()
+    );
 
     let db = Database::open(&out).unwrap();
     let conn = db.conn();
 
     // node_vectors must NOT exist when include_vec is false
-    let has_vec: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
-        [], |r| r.get(0),
-    ).unwrap();
+    let has_vec: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(has_vec, 0, "node_vectors should be dropped");
 
     // Five producer-side meta keys present and non-empty
@@ -83,9 +112,14 @@ fn create_writes_meta_and_drops_vec_table() {
         META_SNAPSHOT_INCLUDES_VEC,
     ] {
         let v = snap_read_meta(conn, key).unwrap();
-        assert!(v.is_some() && !v.as_ref().unwrap().is_empty(), "meta {key} missing");
+        assert!(
+            v.is_some() && !v.as_ref().unwrap().is_empty(),
+            "meta {key} missing"
+        );
     }
-    let inc = snap_read_meta(conn, META_SNAPSHOT_INCLUDES_VEC).unwrap().unwrap();
+    let inc = snap_read_meta(conn, META_SNAPSHOT_INCLUDES_VEC)
+        .unwrap()
+        .unwrap();
     assert_eq!(inc, "false");
 }
 
@@ -125,9 +159,13 @@ fn config_load_parses_snapshot_url() {
     std::fs::write(
         dir.path().join(".code-graph.toml"),
         "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
-    ).unwrap();
+    )
+    .unwrap();
     let cfg = load_config(dir.path()).unwrap();
-    assert_eq!(cfg.snapshot.url.as_deref(), Some("https://example.com/x.db.zst"));
+    assert_eq!(
+        cfg.snapshot.url.as_deref(),
+        Some("https://example.com/x.db.zst")
+    );
     assert!(!cfg.snapshot.disabled);
 }
 
@@ -137,7 +175,8 @@ fn config_load_parses_disabled() {
     std::fs::write(
         dir.path().join(".code-graph.toml"),
         "[snapshot]\ndisabled = true\n",
-    ).unwrap();
+    )
+    .unwrap();
     let cfg = load_config(dir.path()).unwrap();
     assert!(cfg.snapshot.disabled);
 }
@@ -147,13 +186,17 @@ fn config_load_rejects_malformed_toml() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join(".code-graph.toml"), "not = valid = toml").unwrap();
     let err = load_config(dir.path()).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("parse")
-        || err.to_string().to_lowercase().contains("expected")
-        || err.to_string().to_lowercase().contains("invalid"),
-        "got error message: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("parse")
+            || err.to_string().to_lowercase().contains("expected")
+            || err.to_string().to_lowercase().contains("invalid"),
+        "got error message: {err}"
+    );
 }
 
-use crate::snapshot::install::{gate_origin_url, resolve_snapshot_source, resolve_snapshot_source_impl, try_install};
+use crate::snapshot::install::{
+    gate_origin_url, resolve_snapshot_source, resolve_snapshot_source_impl, try_install,
+};
 use crate::snapshot::meta::{META_SNAPSHOT_FETCHED_AT, META_SNAPSHOT_SOURCE_URL};
 
 #[test]
@@ -171,7 +214,8 @@ fn resolve_rejects_untrusted_url_override() {
     std::fs::write(
         dir.path().join(".code-graph.toml"),
         "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
-    ).unwrap();
+    )
+    .unwrap();
     // url_trusted=false (env var absent) → override ignored.
     assert_eq!(resolve_snapshot_source_impl(dir.path(), false, false), None);
 }
@@ -182,7 +226,8 @@ fn resolve_returns_url_from_trusted_override() {
     std::fs::write(
         dir.path().join(".code-graph.toml"),
         "[snapshot]\nurl = \"https://example.com/x.db.zst\"\n",
-    ).unwrap();
+    )
+    .unwrap();
     // url_trusted=true (developer set CODE_GRAPH_SNAPSHOT_TRUST_URL=1) → honored.
     // origin_trusted is irrelevant here — the toml url branch returns first.
     assert_eq!(
@@ -196,13 +241,21 @@ fn resolve_returns_url_from_trusted_override() {
 // untrusted repo (cloned to review) must NOT auto-install its published snapshot.
 #[test]
 fn origin_snapshot_is_gated_behind_trust() {
-    let url = Some("https://github.com/o/r/releases/download/v1/code-graph-snapshot-x.db.zst".to_string());
+    let url = Some(
+        "https://github.com/o/r/releases/download/v1/code-graph-snapshot-x.db.zst".to_string(),
+    );
     // Untrusted (no CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN, no pin) → install skipped.
-    assert_eq!(gate_origin_url(url.clone(), false), None,
-        "an untrusted repo's published snapshot must not auto-install");
+    assert_eq!(
+        gate_origin_url(url.clone(), false),
+        None,
+        "an untrusted repo's published snapshot must not auto-install"
+    );
     // Trusted (developer opted in, or a pin is set) → install proceeds.
-    assert_eq!(gate_origin_url(url.clone(), true), url,
-        "an opt-in / pinned origin snapshot installs");
+    assert_eq!(
+        gate_origin_url(url.clone(), true),
+        url,
+        "an opt-in / pinned origin snapshot installs"
+    );
     // No published snapshot → None either way (no spurious hint for normal repos).
     assert_eq!(gate_origin_url(None, false), None);
     assert_eq!(gate_origin_url(None, true), None);
@@ -214,7 +267,8 @@ fn resolve_returns_none_when_disabled() {
     std::fs::write(
         dir.path().join(".code-graph.toml"),
         "[snapshot]\ndisabled = true\n",
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(resolve_snapshot_source(dir.path()), None);
 }
 
@@ -235,14 +289,22 @@ fn install_round_trip_file_url() {
 
     // Wipe .code-graph/ so install is the only path that creates it
     let target_root = TempDir::new().unwrap();
-    Command::new("git").args(["init", "-q"]).current_dir(target_root.path()).status().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(target_root.path())
+        .status()
+        .unwrap();
 
     let url = format!("file://{}", zst.display());
     let commit = try_install(&url, target_root.path()).unwrap();
     assert!(!commit.is_empty(), "expected non-empty source commit");
 
     let installed = target_root.path().join(".code-graph").join("index.db");
-    assert!(installed.exists(), "expected installed at {}", installed.display());
+    assert!(
+        installed.exists(),
+        "expected installed at {}",
+        installed.display()
+    );
 
     let db = crate::storage::db::Database::open(&installed).unwrap();
     let conn = db.conn();
@@ -253,7 +315,9 @@ fn install_round_trip_file_url() {
 
     // No leftover .partial files
     let entries: Vec<_> = std::fs::read_dir(target_root.path().join(".code-graph"))
-        .unwrap().flatten().collect();
+        .unwrap()
+        .flatten()
+        .collect();
     for entry in &entries {
         let n = entry.file_name();
         let s = n.to_string_lossy();
@@ -265,13 +329,20 @@ fn install_round_trip_file_url() {
 fn install_rejects_http_url() {
     let target_root = TempDir::new().unwrap();
     let err = try_install("http://example.com/x.db.zst", target_root.path()).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("https"), "got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("https"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn install_rejects_corrupt_archive() {
     let target_root = TempDir::new().unwrap();
-    Command::new("git").args(["init", "-q"]).current_dir(target_root.path()).status().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(target_root.path())
+        .status()
+        .unwrap();
 
     let bad = TempDir::new().unwrap();
     let bad_path = bad.path().join("bad.db.zst");
@@ -279,17 +350,21 @@ fn install_rejects_corrupt_archive() {
     let url = format!("file://{}", bad_path.display());
 
     let err = try_install(&url, target_root.path()).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("zstd")
+    assert!(
+        err.to_string().to_lowercase().contains("zstd")
             || err.to_string().to_lowercase().contains("decode"),
-        "got: {err}");
+        "got: {err}"
+    );
 
     // Clean state — no index.db, no .partial
     let cg_dir = target_root.path().join(".code-graph");
     if cg_dir.exists() {
         for entry in std::fs::read_dir(&cg_dir).unwrap().flatten() {
             let s = entry.file_name().to_string_lossy().into_owned();
-            assert!(s != "index.db" && !s.ends_with(".partial"),
-                "leftover after failure: {s}");
+            assert!(
+                s != "index.db" && !s.ends_with(".partial"),
+                "leftover after failure: {s}"
+            );
         }
     }
 }
@@ -300,7 +375,8 @@ fn resolve_rejects_http_url_from_toml() {
     std::fs::write(
         dir.path().join(".code-graph.toml"),
         "[snapshot]\nurl = \"http://example.com/x.db.zst\"\n",
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(resolve_snapshot_source(dir.path()), None);
 }
 
@@ -351,9 +427,7 @@ fn inspect_rejects_garbage_with_clear_error() {
     let err = crate::snapshot::inspect(&bad).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("not a code-graph snapshot")
-            && msg.contains(".db.zst")
-            && msg.contains(".db"),
+        msg.contains("not a code-graph snapshot") && msg.contains(".db.zst") && msg.contains(".db"),
         "expected helpful error, got: {msg}"
     );
 }
@@ -367,8 +441,16 @@ fn create_auto_compresses_when_out_endswith_db_zst() {
     crate::snapshot::create(fixture.path(), &zst_out, false).unwrap();
 
     // First 4 bytes must be the zstd magic.
-    let head: Vec<u8> = std::fs::read(&zst_out).unwrap().into_iter().take(4).collect();
-    assert_eq!(head, vec![0x28, 0xB5, 0x2F, 0xFD], "expected zstd magic, got {head:?}");
+    let head: Vec<u8> = std::fs::read(&zst_out)
+        .unwrap()
+        .into_iter()
+        .take(4)
+        .collect();
+    assert_eq!(
+        head,
+        vec![0x28, 0xB5, 0x2F, 0xFD],
+        "expected zstd magic, got {head:?}"
+    );
 
     // Round-trip through inspect on the .db.zst itself.
     let meta = crate::snapshot::inspect(&zst_out).unwrap();
@@ -384,8 +466,16 @@ fn create_writes_raw_db_when_out_endswith_db() {
     let db_out = fixture.path().join("snap.db");
     crate::snapshot::create(fixture.path(), &db_out, false).unwrap();
 
-    let head: Vec<u8> = std::fs::read(&db_out).unwrap().into_iter().take(16).collect();
-    assert_eq!(&head[..], b"SQLite format 3\0", "expected raw SQLite header");
+    let head: Vec<u8> = std::fs::read(&db_out)
+        .unwrap()
+        .into_iter()
+        .take(16)
+        .collect();
+    assert_eq!(
+        &head[..],
+        b"SQLite format 3\0",
+        "expected raw SQLite header"
+    );
 }
 
 // Integrity: compressed-output snapshots get a `.blake3` sidecar the consumer
@@ -397,10 +487,19 @@ fn create_writes_blake3_sidecar_for_compressed_output() {
     crate::snapshot::create(fixture.path(), &zst_out, false).unwrap();
 
     let sidecar = fixture.path().join("snap.db.zst.blake3");
-    assert!(sidecar.exists(), "producer must write a .blake3 sidecar next to the .db.zst");
+    assert!(
+        sidecar.exists(),
+        "producer must write a .blake3 sidecar next to the .db.zst"
+    );
     let recorded = std::fs::read_to_string(&sidecar).unwrap();
-    let actual = blake3::hash(&std::fs::read(&zst_out).unwrap()).to_hex().to_string();
-    assert_eq!(recorded.trim(), actual, "sidecar must hold the blake3 of the compressed artifact");
+    let actual = blake3::hash(&std::fs::read(&zst_out).unwrap())
+        .to_hex()
+        .to_string();
+    assert_eq!(
+        recorded.trim(),
+        actual,
+        "sidecar must hold the blake3 of the compressed artifact"
+    );
 }
 
 #[test]
@@ -410,6 +509,8 @@ fn create_no_sidecar_for_raw_db_output() {
     let fixture = init_git_fixture();
     let db_out = fixture.path().join("snap.db");
     crate::snapshot::create(fixture.path(), &db_out, false).unwrap();
-    assert!(!fixture.path().join("snap.db.blake3").exists(),
-        "raw .db output must not get a .blake3 sidecar");
+    assert!(
+        !fixture.path().join("snap.db.blake3").exists(),
+        "raw .db output must not get a .blake3 sidecar"
+    );
 }

@@ -111,10 +111,19 @@ pub fn insert_node_cached(conn: &Connection, node: &NodeRecord) -> Result<i64> {
     )?;
     let id: i64 = stmt.query_row(
         (
-            node.file_id, &node.node_type, &node.name, &node.qualified_name,
-            node.start_line, node.end_line, &node.code_content,
-            &node.signature, &node.doc_comment, &node.context_string,
-            &node.name_tokens, &node.return_type, &node.param_types,
+            node.file_id,
+            &node.node_type,
+            &node.name,
+            &node.qualified_name,
+            node.start_line,
+            node.end_line,
+            &node.code_content,
+            &node.signature,
+            &node.doc_comment,
+            &node.context_string,
+            &node.name_tokens,
+            &node.return_type,
+            &node.param_types,
             node.is_test as i32,
         ),
         |row| row.get(0),
@@ -123,9 +132,10 @@ pub fn insert_node_cached(conn: &Connection, node: &NodeRecord) -> Result<i64> {
 }
 
 pub fn get_nodes_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeResult>> {
-    let mut stmt = conn.prepare(
-        &format!("SELECT {} FROM nodes WHERE name = ?1", NODE_SELECT)
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM nodes WHERE name = ?1",
+        NODE_SELECT
+    ))?;
     let rows = stmt.query_map([name], map_node_row)?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
     Ok(results)
@@ -155,13 +165,16 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
 /// - target is in the given file (will be deleted)
 /// - source is NOT in the given file (would lose edge on cascade delete)
 #[allow(clippy::type_complexity)]
-pub fn get_inbound_cross_file_edges(conn: &Connection, file_id: i64) -> Result<Vec<(i64, i64, String, String, Option<String>)>> {
+pub fn get_inbound_cross_file_edges(
+    conn: &Connection,
+    file_id: i64,
+) -> Result<Vec<(i64, i64, String, String, Option<String>)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT e.source_id, ns.file_id, nt.name, e.relation, e.metadata
          FROM edges e
          JOIN nodes nt ON nt.id = e.target_id
          JOIN nodes ns ON ns.id = e.source_id
-         WHERE nt.file_id = ?1 AND ns.file_id != ?1"
+         WHERE nt.file_id = ?1 AND ns.file_id != ?1",
     )?;
     let rows = stmt.query_map([file_id], |row| {
         Ok((
@@ -201,7 +214,7 @@ pub fn get_inbound_calls_for_pending(
          JOIN nodes ns ON ns.id = e.source_id
          JOIN files fs ON fs.id = ns.file_id
          WHERE nt.file_id = ?1 AND ns.file_id != ?1 AND e.relation = 'calls'
-           AND fs.language IS NOT NULL"
+           AND fs.language IS NOT NULL",
     )?;
     let rows = stmt.query_map([file_id], |row| {
         Ok((
@@ -228,9 +241,7 @@ pub fn update_context_string(conn: &Connection, node_id: i64, context_string: &s
 
 /// Batch update context strings using a single prepared statement.
 pub fn update_context_strings_batch(conn: &Connection, updates: &[(i64, String)]) -> Result<()> {
-    let mut stmt = conn.prepare_cached(
-        "UPDATE nodes SET context_string = ?1 WHERE id = ?2"
-    )?;
+    let mut stmt = conn.prepare_cached("UPDATE nodes SET context_string = ?1 WHERE id = ?2")?;
     for (node_id, ctx) in updates {
         stmt.execute((ctx.as_str(), node_id))?;
     }
@@ -241,13 +252,19 @@ pub fn update_context_strings_batch(conn: &Connection, updates: &[(i64, String)]
 
 /// Get all node (name, id, file_path) tuples excluding nodes belonging to specified files.
 /// Used for building cross-batch name resolution maps with file path awareness.
-pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file_ids: &[i64]) -> Result<Vec<(String, i64, String)>> {
+pub fn get_node_names_with_paths_excluding_files(
+    conn: &Connection,
+    exclude_file_ids: &[i64],
+) -> Result<Vec<(String, i64, String)>> {
     if exclude_file_ids.is_empty() {
-        let mut stmt = conn.prepare(
-            "SELECT n.name, n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id"
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT n.name, n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         return Ok(rows.collect::<Result<Vec<_>, _>>()?);
     }
@@ -257,12 +274,20 @@ pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file
         let placeholders = make_placeholders(1, exclude_file_ids.len());
         let sql = format!(
             "SELECT n.name, n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id \
-             WHERE n.file_id NOT IN ({})", placeholders
+             WHERE n.file_id NOT IN ({})",
+            placeholders
         );
-        let params: Vec<&dyn rusqlite::types::ToSql> = exclude_file_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = exclude_file_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         return Ok(rows.collect::<Result<Vec<_>, _>>()?);
     }
@@ -270,10 +295,15 @@ pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file
     // For large exclude sets, filter in Rust with HashSet
     let exclude_set: std::collections::HashSet<i64> = exclude_file_ids.iter().copied().collect();
     let mut stmt = conn.prepare(
-        "SELECT n.name, n.id, n.file_id, f.path FROM nodes n JOIN files f ON f.id = n.file_id"
+        "SELECT n.name, n.id, n.file_id, f.path FROM nodes n JOIN files f ON f.id = n.file_id",
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
     })?;
     let mut results = Vec::new();
     for row in rows {
@@ -292,7 +322,7 @@ pub fn get_node_names_with_paths_excluding_files(conn: &Connection, exclude_file
 /// to a JS `function update`).
 pub fn get_all_node_names_with_ids(conn: &Connection) -> Result<HashMap<String, Vec<NameEntry>>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT n.id, n.name, f.path, f.language FROM nodes n JOIN files f ON n.file_id = f.id"
+        "SELECT n.id, n.name, f.path, f.language FROM nodes n JOIN files f ON n.file_id = f.id",
     )?;
     let mut map: HashMap<String, Vec<(i64, String, Option<String>)>> = HashMap::new();
     let rows = stmt.query_map([], |row| {
@@ -330,9 +360,7 @@ pub fn get_first_node_id_by_name(conn: &Connection, name: &str) -> Result<Option
 }
 
 pub fn get_node_by_id(conn: &Connection, node_id: i64) -> Result<Option<NodeResult>> {
-    let mut stmt = conn.prepare(
-        &format!("SELECT {} FROM nodes WHERE id = ?1", NODE_SELECT)
-    )?;
+    let mut stmt = conn.prepare(&format!("SELECT {} FROM nodes WHERE id = ?1", NODE_SELECT))?;
     let rows = stmt.query_map([node_id], map_node_row)?;
     Ok(first_row(rows)?)
 }
@@ -369,9 +397,11 @@ pub fn get_nodes_with_files_by_filters(
     let mut param_idx = 1;
 
     if let Some(types) = type_filter {
-        let placeholders: Vec<String> = types.iter().enumerate().map(|(i, _)| {
-            format!("?{}", param_idx + i)
-        }).collect();
+        let placeholders: Vec<String> = types
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", param_idx + i))
+            .collect();
         conditions.push(format!("n.type IN ({})", placeholders.join(",")));
         for t in types {
             params.push(Box::new(t.to_string()));
@@ -382,13 +412,19 @@ pub fn get_nodes_with_files_by_filters(
     // in code identifiers like `get_node`) matches literally instead of as a single-
     // char / any-run wildcard. Mirrors find_functions_by_fuzzy_name's escaping.
     if let Some(rt) = returns_filter {
-        conditions.push(format!("LOWER(n.return_type) LIKE ?{} ESCAPE '\\'", param_idx));
+        conditions.push(format!(
+            "LOWER(n.return_type) LIKE ?{} ESCAPE '\\'",
+            param_idx
+        ));
         let escaped = escape_like(&rt.to_lowercase());
         params.push(Box::new(format!("%{}%", escaped)));
         param_idx += 1;
     }
     if let Some(pt) = params_filter {
-        conditions.push(format!("LOWER(n.param_types) LIKE ?{} ESCAPE '\\'", param_idx));
+        conditions.push(format!(
+            "LOWER(n.param_types) LIKE ?{} ESCAPE '\\'",
+            param_idx
+        ));
         let escaped = escape_like(&pt.to_lowercase());
         params.push(Box::new(format!("%{}%", escaped)));
         param_idx += 1;
@@ -503,15 +539,22 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
         );
 
         let doubled: Vec<i64> = chunk.iter().chain(chunk.iter()).copied().collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = doubled.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = doubled
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
 
         let mut stmt = conn.prepare(&sql_callers)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
-        for row in rows { results.push(row?); }
+        for row in rows {
+            results.push(row?);
+        }
 
         let mut stmt = conn.prepare(&sql_callees)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
-        for row in rows { results.push(row?); }
+        for row in rows {
+            results.push(row?);
+        }
     }
 
     results.sort();
@@ -523,7 +566,10 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
 
 /// Batch-fetch nodes with their file path and language by node IDs.
 /// Avoids N+1 queries when loading search results.
-pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<NodeWithFile>> {
+pub fn get_nodes_with_files_by_ids(
+    conn: &Connection,
+    node_ids: &[i64],
+) -> Result<Vec<NodeWithFile>> {
     if node_ids.is_empty() {
         return Ok(vec![]);
     }
@@ -535,8 +581,10 @@ pub fn get_nodes_with_files_by_ids(conn: &Connection, node_ids: &[i64]) -> Resul
             NODE_SELECT_ALIASED, placeholders
         );
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(params.as_slice(), |row| {
             Ok(NodeWithFile {
                 node: map_node_row(row)?,
@@ -570,8 +618,10 @@ pub fn get_node_paths_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<Hash
             placeholders
         );
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(params.as_slice(), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -604,8 +654,10 @@ pub fn get_node_qualified_names_by_ids(
             placeholders
         );
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(params.as_slice(), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -650,8 +702,10 @@ pub fn filter_method_ids(
             chunk.len() + 1
         );
         let mut stmt = conn.prepare(&sql)?;
-        let mut params: Vec<&dyn rusqlite::types::ToSql> =
-            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         params.push(&like as &dyn rusqlite::types::ToSql);
         let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
         for row in rows {
@@ -669,27 +723,35 @@ pub fn get_nodes_missing_context(conn: &Connection) -> Result<Vec<i64>> {
          JOIN files f ON f.id = n.file_id
          WHERE n.context_string IS NULL
          AND f.path != '<external>'
-         LIMIT 10000"
+         LIMIT 10000",
     )?;
-    let ids: Vec<i64> = stmt.query_map([], |row| row.get(0))?
+    let ids: Vec<i64> = stmt
+        .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ids)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::edges::insert_edge;
     use super::super::files::{upsert_file, FileRecord};
     use super::super::helpers::test_db;
     use super::super::search::fts5_search;
+    use super::*;
 
     #[test]
     fn test_insert_and_query_node() {
         let (db, _tmp) = test_db();
-        let file_id = upsert_file(db.conn(), &FileRecord {
-            path: "test.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: Some("typescript".into()),
-        }).unwrap();
+        let file_id = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let node = NodeRecord {
             file_id,
@@ -718,16 +780,36 @@ mod tests {
     #[test]
     fn test_update_context_string() {
         let (db, _tmp) = test_db();
-        let fid = upsert_file(db.conn(), &FileRecord {
-            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let nid = insert_node(db.conn(), &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "foo".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "fn foo(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "t.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let nid = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "foo".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "fn foo(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         update_context_string(db.conn(), nid, "function foo\ncalls: bar, baz").unwrap();
 
@@ -742,37 +824,97 @@ mod tests {
         let conn = db.conn();
 
         // Create 3 files with 1 node each
-        let fid1 = upsert_file(conn, &FileRecord {
-            path: "a.ts".into(), blake3_hash: "h1".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let fid2 = upsert_file(conn, &FileRecord {
-            path: "b.ts".into(), blake3_hash: "h2".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let fid3 = upsert_file(conn, &FileRecord {
-            path: "c.ts".into(), blake3_hash: "h3".into(), last_modified: 1, language: None,
-        }).unwrap();
+        let fid1 = upsert_file(
+            conn,
+            &FileRecord {
+                path: "a.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let fid2 = upsert_file(
+            conn,
+            &FileRecord {
+                path: "b.ts".into(),
+                blake3_hash: "h2".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let fid3 = upsert_file(
+            conn,
+            &FileRecord {
+                path: "c.ts".into(),
+                blake3_hash: "h3".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
 
-        insert_node(conn, &NodeRecord {
-            file_id: fid1, node_type: "function".into(), name: "alpha".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "fn alpha(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
-        insert_node(conn, &NodeRecord {
-            file_id: fid2, node_type: "function".into(), name: "beta".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "fn beta(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
-        insert_node(conn, &NodeRecord {
-            file_id: fid3, node_type: "function".into(), name: "gamma".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "fn gamma(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid1,
+                node_type: "function".into(),
+                name: "alpha".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "fn alpha(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid2,
+                node_type: "function".into(),
+                name: "beta".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "fn beta(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid3,
+                node_type: "function".into(),
+                name: "gamma".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "fn gamma(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         // Exclude 2 files → only 3rd file's node remains
         let result = get_node_names_with_paths_excluding_files(conn, &[fid1, fid2]).unwrap();
@@ -801,26 +943,49 @@ mod tests {
         // MAX_IN_PARAMS boundary in a single logical lookup.
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "src/big.rs".into(), blake3_hash: "h".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/big.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
 
         let n = MAX_IN_PARAMS + 1; // force >1 chunk
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
-            let id = insert_node(conn, &NodeRecord {
-                file_id: fid, node_type: "function".into(), name: format!("f{i}"),
-                qualified_name: None, start_line: i as i64 + 1, end_line: i as i64 + 1,
-                code_content: String::new(), signature: None, doc_comment: None,
-                context_string: None, name_tokens: None, return_type: None,
-                param_types: None, is_test: false,
-            }).unwrap();
+            let id = insert_node(
+                conn,
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: format!("f{i}"),
+                    qualified_name: None,
+                    start_line: i as i64 + 1,
+                    end_line: i as i64 + 1,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap();
             ids.push(id);
         }
 
         let map = get_node_paths_by_ids(conn, &ids).unwrap();
-        assert_eq!(map.len(), n, "all ids across the chunk boundary must resolve");
+        assert_eq!(
+            map.len(),
+            n,
+            "all ids across the chunk boundary must resolve"
+        );
         for id in &ids {
             assert_eq!(map.get(id).map(String::as_str), Some("src/big.rs"));
         }
@@ -837,28 +1002,52 @@ mod tests {
         // the MAX_IN_PARAMS boundary.
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "src/big.rs".into(), blake3_hash: "h".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/big.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
 
         // > MAX_IN_PARAMS methods of type "T", plus two free functions (no dot).
         let n_methods = MAX_IN_PARAMS + 1;
         let mut method_ids = Vec::with_capacity(n_methods);
         let mut all_ids = Vec::with_capacity(n_methods + 2);
         let mk = |name: String, qn: Option<String>, line: i64| NodeRecord {
-            file_id: fid, node_type: "function".into(), name, qualified_name: qn,
-            start_line: line, end_line: line, code_content: String::new(),
-            signature: None, doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
+            file_id: fid,
+            node_type: "function".into(),
+            name,
+            qualified_name: qn,
+            start_line: line,
+            end_line: line,
+            code_content: String::new(),
+            signature: None,
+            doc_comment: None,
+            context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
+            is_test: false,
         };
         for i in 0..n_methods {
-            let id = insert_node(conn, &mk(format!("m{i}"), Some(format!("T.m{i}")), i as i64 + 1)).unwrap();
+            let id = insert_node(
+                conn,
+                &mk(format!("m{i}"), Some(format!("T.m{i}")), i as i64 + 1),
+            )
+            .unwrap();
             method_ids.push(id);
             all_ids.push(id);
         }
         for i in 0..2 {
-            let id = insert_node(conn, &mk(format!("free{i}"), None, n_methods as i64 + i as i64 + 1)).unwrap();
+            let id = insert_node(
+                conn,
+                &mk(format!("free{i}"), None, n_methods as i64 + i as i64 + 1),
+            )
+            .unwrap();
             all_ids.push(id);
         }
 
@@ -872,7 +1061,10 @@ mod tests {
         methods.sort_unstable();
         let mut expected = method_ids.clone();
         expected.sort_unstable();
-        assert_eq!(methods, expected, "method gate must span the chunk boundary");
+        assert_eq!(
+            methods, expected,
+            "method gate must span the chunk boundary"
+        );
 
         // Some("T") gate keeps only T.* — same set here.
         let mut of_type = filter_method_ids(conn, &all_ids, Some("T")).unwrap();
@@ -880,9 +1072,13 @@ mod tests {
         assert_eq!(of_type, expected);
 
         // A non-matching type keeps nothing; empty input is a no-op.
-        assert!(filter_method_ids(conn, &all_ids, Some("Other")).unwrap().is_empty());
+        assert!(filter_method_ids(conn, &all_ids, Some("Other"))
+            .unwrap()
+            .is_empty());
         assert!(filter_method_ids(conn, &[], None).unwrap().is_empty());
-        assert!(get_node_qualified_names_by_ids(conn, &[]).unwrap().is_empty());
+        assert!(get_node_qualified_names_by_ids(conn, &[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -894,16 +1090,31 @@ mod tests {
         // call to a sibling type's method. The type gate must match literally.
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "src/w.py".into(), blake3_hash: "h".into(),
-            last_modified: 1, language: Some("python".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/w.py".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("python".into()),
+            },
+        )
+        .unwrap();
         let mk = |name: &str, qn: &str, line: i64| NodeRecord {
-            file_id: fid, node_type: "function".into(), name: name.into(),
-            qualified_name: Some(qn.into()), start_line: line, end_line: line,
-            code_content: String::new(), signature: None, doc_comment: None,
-            context_string: None, name_tokens: None, return_type: None,
-            param_types: None, is_test: false,
+            file_id: fid,
+            node_type: "function".into(),
+            name: name.into(),
+            qualified_name: Some(qn.into()),
+            start_line: line,
+            end_line: line,
+            code_content: String::new(),
+            signature: None,
+            doc_comment: None,
+            context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
+            is_test: false,
         };
         let target = insert_node(conn, &mk("run", "Data_X.run", 1)).unwrap();
         let _sibling = insert_node(conn, &mk("run", "DataYX.run", 2)).unwrap();
@@ -911,7 +1122,11 @@ mod tests {
         // `Data_X` must keep ONLY Data_X.run — the `_` is a literal, not a
         // wildcard that also captures DataYX.run.
         let kept = filter_method_ids(conn, &[target, _sibling], Some("Data_X")).unwrap();
-        assert_eq!(kept, vec![target], "type filter must treat `_` literally, not as a LIKE wildcard");
+        assert_eq!(
+            kept,
+            vec![target],
+            "type filter must treat `_` literally, not as a LIKE wildcard"
+        );
     }
 
     #[test]
@@ -920,42 +1135,99 @@ mod tests {
         let conn = db.conn();
 
         // Create a normal file and an external pseudo-file
-        let fid = upsert_file(conn, &FileRecord {
-            path: "src/app.ts".into(), blake3_hash: "h1".into(), last_modified: 1, language: Some("typescript".into()),
-        }).unwrap();
-        let fid_ext = upsert_file(conn, &FileRecord {
-            path: "<external>".into(), blake3_hash: "ext".into(), last_modified: 0, language: None,
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/app.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
+        let fid_ext = upsert_file(
+            conn,
+            &FileRecord {
+                path: "<external>".into(),
+                blake3_hash: "ext".into(),
+                last_modified: 0,
+                language: None,
+            },
+        )
+        .unwrap();
 
         // Node with context_string set (healthy)
-        insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "healthy".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "function healthy() {}".into(), signature: None,
-            doc_comment: None, context_string: Some("function healthy".into()),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "healthy".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "function healthy() {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: Some("function healthy".into()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         // Node with NULL context_string (broken -- should be found)
-        let broken_id = insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "broken".into(),
-            qualified_name: None, start_line: 6, end_line: 10,
-            code_content: "function broken() {}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let broken_id = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "broken".into(),
+                qualified_name: None,
+                start_line: 6,
+                end_line: 10,
+                code_content: "function broken() {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         // External pseudo-node with NULL context_string (should be excluded)
-        insert_node(conn, &NodeRecord {
-            file_id: fid_ext, node_type: "function".into(), name: "ext_func".into(),
-            qualified_name: None, start_line: 0, end_line: 0,
-            code_content: "".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid_ext,
+                node_type: "function".into(),
+                name: "ext_func".into(),
+                qualified_name: None,
+                start_line: 0,
+                end_line: 0,
+                code_content: "".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         let missing = get_nodes_missing_context(conn).unwrap();
-        assert_eq!(missing.len(), 1, "should find exactly 1 broken node (not external)");
+        assert_eq!(
+            missing.len(),
+            1,
+            "should find exactly 1 broken node (not external)"
+        );
         assert_eq!(missing[0], broken_id);
     }
 
@@ -965,35 +1237,88 @@ mod tests {
         let conn = db.conn();
 
         // Create 2 files with nodes
-        let fid1 = upsert_file(conn, &FileRecord {
-            path: "src/a.ts".into(), blake3_hash: "h1".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let fid2 = upsert_file(conn, &FileRecord {
-            path: "src/b.ts".into(), blake3_hash: "h2".into(), last_modified: 1, language: None,
-        }).unwrap();
+        let fid1 = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/a.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let fid2 = upsert_file(
+            conn,
+            &FileRecord {
+                path: "src/b.ts".into(),
+                blake3_hash: "h2".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
 
-        let nid1 = insert_node(conn, &NodeRecord {
-            file_id: fid1, node_type: "function".into(), name: "alpha".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "fn alpha(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
-        let nid2 = insert_node(conn, &NodeRecord {
-            file_id: fid2, node_type: "function".into(), name: "beta".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "fn beta(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let nid1 = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid1,
+                node_type: "function".into(),
+                name: "alpha".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "fn alpha(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        let nid2 = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid2,
+                node_type: "function".into(),
+                name: "beta".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "fn beta(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
         // Same name in different file
-        let nid3 = insert_node(conn, &NodeRecord {
-            file_id: fid2, node_type: "function".into(), name: "alpha".into(),
-            qualified_name: None, start_line: 6, end_line: 10,
-            code_content: "fn alpha(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let nid3 = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid2,
+                node_type: "function".into(),
+                name: "alpha".into(),
+                qualified_name: None,
+                start_line: 6,
+                end_line: 10,
+                code_content: "fn alpha(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         let map = get_all_node_names_with_ids(conn).unwrap();
         // "alpha" should have 2 entries (from both files)
@@ -1020,64 +1345,117 @@ mod tests {
         // Regression: alphabetical ORDER BY silently truncated high-caller-count
         // symbols in late-path files. New ranking is caller_count DESC, path ASC.
         let (db, _tmp) = test_db();
-        let early = upsert_file(db.conn(), &FileRecord {
-            path: "a/early.rs".into(), blake3_hash: "h1".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
-        let late = upsert_file(db.conn(), &FileRecord {
-            path: "z/late.rs".into(), blake3_hash: "h2".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
+        let early = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "a/early.rs".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let late = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "z/late.rs".into(),
+                blake3_hash: "h2".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
 
         // Uncalled Result-fn in alphabetically-first file
-        let cold = insert_node(db.conn(), &NodeRecord {
-            file_id: early, node_type: "function".into(), name: "cold_fn".into(),
-            qualified_name: None, start_line: 1, end_line: 3,
-            code_content: "fn cold_fn() -> Result<()> {}".into(),
-            signature: None, doc_comment: None, context_string: None,
-            name_tokens: None, return_type: Some("Result<()>".into()),
-            param_types: None, is_test: false,
-        }).unwrap();
+        let cold = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: early,
+                node_type: "function".into(),
+                name: "cold_fn".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 3,
+                code_content: "fn cold_fn() -> Result<()> {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: Some("Result<()>".into()),
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         // Hot Result-fn in alphabetically-last file, called 3×
-        let hot = insert_node(db.conn(), &NodeRecord {
-            file_id: late, node_type: "function".into(), name: "hot_fn".into(),
-            qualified_name: None, start_line: 1, end_line: 3,
-            code_content: "fn hot_fn() -> Result<i32> {}".into(),
-            signature: None, doc_comment: None, context_string: None,
-            name_tokens: None, return_type: Some("Result<i32>".into()),
-            param_types: None, is_test: false,
-        }).unwrap();
+        let hot = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: late,
+                node_type: "function".into(),
+                name: "hot_fn".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 3,
+                code_content: "fn hot_fn() -> Result<i32> {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: Some("Result<i32>".into()),
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         for i in 0..3 {
-            let caller = insert_node(db.conn(), &NodeRecord {
-                file_id: early, node_type: "function".into(),
-                name: format!("caller_{}", i), qualified_name: None,
-                start_line: 10 + i as i64, end_line: 12 + i as i64,
-                code_content: "fn c() {}".into(), signature: None,
-                doc_comment: None, context_string: None, name_tokens: None,
-                return_type: None, param_types: None, is_test: false,
-            }).unwrap();
+            let caller = insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id: early,
+                    node_type: "function".into(),
+                    name: format!("caller_{}", i),
+                    qualified_name: None,
+                    start_line: 10 + i as i64,
+                    end_line: 12 + i as i64,
+                    code_content: "fn c() {}".into(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap();
             insert_edge(db.conn(), caller, hot, "calls", None).unwrap();
         }
         insert_edge(db.conn(), cold, cold, "calls", None).unwrap(); // self-loop still = 1 caller
 
         let types: &[&str] = &["function"];
-        let results = get_nodes_with_files_by_filters(
-            db.conn(), Some(types), Some("Result"), None, None, 10,
-        ).unwrap();
+        let results =
+            get_nodes_with_files_by_filters(db.conn(), Some(types), Some("Result"), None, None, 10)
+                .unwrap();
 
-        assert_eq!(results[0].node.id, hot, "hot_fn (3 callers) must outrank cold_fn (1)");
+        assert_eq!(
+            results[0].node.id, hot,
+            "hot_fn (3 callers) must outrank cold_fn (1)"
+        );
         assert_eq!(results[0].file_path, "z/late.rs");
         assert_eq!(results[1].node.id, cold);
 
         // With limit=1, hot_fn still wins even though alphabetically-first file exists
-        let top1 = get_nodes_with_files_by_filters(
-            db.conn(), Some(types), Some("Result"), None, None, 1,
-        ).unwrap();
+        let top1 =
+            get_nodes_with_files_by_filters(db.conn(), Some(types), Some("Result"), None, None, 1)
+                .unwrap();
         assert_eq!(top1.len(), 1);
-        assert_eq!(top1[0].node.id, hot,
-            "limit=1 with alphabetical ORDER BY would return cold_fn — regression guard");
+        assert_eq!(
+            top1[0].node.id, hot,
+            "limit=1 with alphabetical ORDER BY would return cold_fn — regression guard"
+        );
     }
 
     #[test]
@@ -1086,101 +1464,219 @@ mod tests {
         // ranking subquery must filter test/bench source nodes so test-only utility
         // wrappers (e.g. extract_relations 0 prod / 64 test) don't out-rank prod hot fns.
         let (db, _tmp) = test_db();
-        let prod_file = upsert_file(db.conn(), &FileRecord {
-            path: "src/prod.rs".into(), blake3_hash: "h1".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
-        let test_file = upsert_file(db.conn(), &FileRecord {
-            path: "src/prod_tests.rs".into(), blake3_hash: "h2".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
-        let bench_file = upsert_file(db.conn(), &FileRecord {
-            path: "benches/foo.rs".into(), blake3_hash: "h3".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
-        let integ_file = upsert_file(db.conn(), &FileRecord {
-            path: "tests/integration.rs".into(), blake3_hash: "h4".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
+        let prod_file = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "src/prod.rs".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let test_file = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "src/prod_tests.rs".into(),
+                blake3_hash: "h2".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let bench_file = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "benches/foo.rs".into(),
+                blake3_hash: "h3".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let integ_file = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "tests/integration.rs".into(),
+                blake3_hash: "h4".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
 
         // Target #1: real prod hot fn (1 prod caller)
-        let real_hot = insert_node(db.conn(), &NodeRecord {
-            file_id: prod_file, node_type: "function".into(), name: "real_hot".into(),
-            qualified_name: None, start_line: 1, end_line: 3,
-            code_content: "fn real_hot() -> Result<()> {}".into(),
-            signature: None, doc_comment: None, context_string: None,
-            name_tokens: None, return_type: Some("Result<()>".into()),
-            param_types: None, is_test: false,
-        }).unwrap();
+        let real_hot = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: prod_file,
+                node_type: "function".into(),
+                name: "real_hot".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 3,
+                code_content: "fn real_hot() -> Result<()> {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: Some("Result<()>".into()),
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
         // Target #2: test-only wrapper (0 prod, 4 test/bench callers)
-        let fake_hot = insert_node(db.conn(), &NodeRecord {
-            file_id: prod_file, node_type: "function".into(), name: "fake_hot".into(),
-            qualified_name: None, start_line: 5, end_line: 7,
-            code_content: "fn fake_hot() -> Result<()> {}".into(),
-            signature: None, doc_comment: None, context_string: None,
-            name_tokens: None, return_type: Some("Result<()>".into()),
-            param_types: None, is_test: false,
-        }).unwrap();
+        let fake_hot = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: prod_file,
+                node_type: "function".into(),
+                name: "fake_hot".into(),
+                qualified_name: None,
+                start_line: 5,
+                end_line: 7,
+                code_content: "fn fake_hot() -> Result<()> {}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: Some("Result<()>".into()),
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         // 1 prod caller for real_hot
-        let prod_caller = insert_node(db.conn(), &NodeRecord {
-            file_id: prod_file, node_type: "function".into(), name: "prod_caller".into(),
-            qualified_name: None, start_line: 10, end_line: 12,
-            code_content: "fn prod_caller(){}".into(), signature: None,
-            doc_comment: None, context_string: None, name_tokens: None,
-            return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let prod_caller = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: prod_file,
+                node_type: "function".into(),
+                name: "prod_caller".into(),
+                qualified_name: None,
+                start_line: 10,
+                end_line: 12,
+                code_content: "fn prod_caller(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
         insert_edge(db.conn(), prod_caller, real_hot, "calls", None).unwrap();
 
         // 4 callers for fake_hot — all test/bench sources
-        let inline_test = insert_node(db.conn(), &NodeRecord {
-            file_id: prod_file, node_type: "function".into(), name: "inline_test".into(),
-            qualified_name: None, start_line: 20, end_line: 22,
-            code_content: "fn inline_test(){}".into(), signature: None,
-            doc_comment: None, context_string: None, name_tokens: None,
-            return_type: None, param_types: None, is_test: true, // AST-flag inline test
-        }).unwrap();
-        let test_prefix = insert_node(db.conn(), &NodeRecord {
-            file_id: test_file, node_type: "function".into(), name: "test_foo".into(),
-            qualified_name: None, start_line: 1, end_line: 3,
-            code_content: "fn test_foo(){}".into(), signature: None,
-            doc_comment: None, context_string: None, name_tokens: None,
-            return_type: None, param_types: None, is_test: false,
-        }).unwrap();
-        let bench_caller = insert_node(db.conn(), &NodeRecord {
-            file_id: bench_file, node_type: "function".into(), name: "bench_foo".into(),
-            qualified_name: None, start_line: 1, end_line: 3,
-            code_content: "fn bench_foo(){}".into(), signature: None,
-            doc_comment: None, context_string: None, name_tokens: None,
-            return_type: None, param_types: None, is_test: false,
-        }).unwrap();
-        let integ_caller = insert_node(db.conn(), &NodeRecord {
-            file_id: integ_file, node_type: "function".into(), name: "verify_path".into(),
-            qualified_name: None, start_line: 1, end_line: 3,
-            code_content: "fn verify_path(){}".into(), signature: None,
-            doc_comment: None, context_string: None, name_tokens: None,
-            return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let inline_test = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: prod_file,
+                node_type: "function".into(),
+                name: "inline_test".into(),
+                qualified_name: None,
+                start_line: 20,
+                end_line: 22,
+                code_content: "fn inline_test(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: true, // AST-flag inline test
+            },
+        )
+        .unwrap();
+        let test_prefix = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: test_file,
+                node_type: "function".into(),
+                name: "test_foo".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 3,
+                code_content: "fn test_foo(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        let bench_caller = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: bench_file,
+                node_type: "function".into(),
+                name: "bench_foo".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 3,
+                code_content: "fn bench_foo(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        let integ_caller = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: integ_file,
+                node_type: "function".into(),
+                name: "verify_path".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 3,
+                code_content: "fn verify_path(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
         insert_edge(db.conn(), inline_test, fake_hot, "calls", None).unwrap();
         insert_edge(db.conn(), test_prefix, fake_hot, "calls", None).unwrap();
         insert_edge(db.conn(), bench_caller, fake_hot, "calls", None).unwrap();
         insert_edge(db.conn(), integ_caller, fake_hot, "calls", None).unwrap();
 
         let types: &[&str] = &["function"];
-        let results = get_nodes_with_files_by_filters(
-            db.conn(), Some(types), Some("Result"), None, None, 10,
-        ).unwrap();
+        let results =
+            get_nodes_with_files_by_filters(db.conn(), Some(types), Some("Result"), None, None, 10)
+                .unwrap();
 
         // Both targets returned but real_hot (1 prod) outranks fake_hot (4 test/bench)
-        let real_pos = results.iter().position(|nf| nf.node.id == real_hot)
+        let real_pos = results
+            .iter()
+            .position(|nf| nf.node.id == real_hot)
             .expect("real_hot must appear");
-        let fake_pos = results.iter().position(|nf| nf.node.id == fake_hot)
+        let fake_pos = results
+            .iter()
+            .position(|nf| nf.node.id == fake_hot)
             .expect("fake_hot must appear");
         assert!(
             real_pos < fake_pos,
             "real_hot (1 prod caller) must rank above fake_hot (4 test/bench callers); \
              got positions real={} fake={}",
-            real_pos, fake_pos,
+            real_pos,
+            fake_pos,
         );
     }
 
@@ -1193,40 +1689,71 @@ mod tests {
     #[test]
     fn test_get_nodes_with_files_by_filters_excludes_module_external_test() {
         let (db, _tmp) = test_db();
-        let src = upsert_file(db.conn(), &FileRecord {
-            path: "src/lib.rs".into(), blake3_hash: "h1".into(), last_modified: 1,
-            language: Some("rust".into()),
-        }).unwrap();
-        let ext = upsert_file(db.conn(), &FileRecord {
-            path: "<external>".into(), blake3_hash: "h2".into(), last_modified: 1,
-            language: Some("rust".into()),
-        }).unwrap();
-        let tests = upsert_file(db.conn(), &FileRecord {
-            path: "tests/mod_test.rs".into(), blake3_hash: "h3".into(), last_modified: 1,
-            language: Some("rust".into()),
-        }).unwrap();
+        let src = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "src/lib.rs".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let ext = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "<external>".into(),
+                blake3_hash: "h2".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let tests = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "tests/mod_test.rs".into(),
+                blake3_hash: "h3".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
         let mk = |file_id: i64, name: &str, ty: &str, is_test: bool| {
-            insert_node(db.conn(), &NodeRecord {
-                file_id, node_type: ty.into(), name: name.into(),
-                qualified_name: None, start_line: 1, end_line: 1,
-                code_content: String::new(), signature: None,
-                doc_comment: None, context_string: None, name_tokens: None,
-                return_type: None, param_types: None, is_test,
-            }).unwrap()
+            insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id,
+                    node_type: ty.into(),
+                    name: name.into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 1,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test,
+                },
+            )
+            .unwrap()
         };
-        mk(src, "module_loader", "function", false);     // the ONLY keeper
-        mk(src, "<module>", "module", false);            // <module> placeholder
-        mk(ext, "modulejs", "external_module", false);   // <external> stub (path leg)
+        mk(src, "module_loader", "function", false); // the ONLY keeper
+        mk(src, "<module>", "module", false); // <module> placeholder
+        mk(ext, "modulejs", "external_module", false); // <external> stub (path leg)
         mk(tests, "test_module_helper", "function", false); // test_ name + tests/ path
-        mk(src, "InlineModuleTest", "function", true);   // AST is_test flag leg
+        mk(src, "InlineModuleTest", "function", true); // AST is_test flag leg
 
         // name LIKE %module% matches ALL five; only the prod fn must survive.
-        let r = get_nodes_with_files_by_filters(
-            db.conn(), None, None, None, Some("module"), 20,
-        ).unwrap();
+        let r = get_nodes_with_files_by_filters(db.conn(), None, None, None, Some("module"), 20)
+            .unwrap();
         let names: Vec<&str> = r.iter().map(|nwf| nwf.node.name.as_str()).collect();
         assert_eq!(
-            names, vec!["module_loader"],
+            names,
+            vec!["module_loader"],
             "only the real prod symbol survives; <module>/<external>/test excluded, got: {names:?}"
         );
     }
@@ -1238,19 +1765,38 @@ mod tests {
     #[test]
     fn test_get_nodes_with_files_by_filters_name_filter() {
         let (db, _tmp) = test_db();
-        let file_id = upsert_file(db.conn(), &FileRecord {
-            path: "src/lib.rs".into(), blake3_hash: "h".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
+        let file_id = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "src/lib.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
 
         let mk = |name: &str, ty: &str| -> i64 {
-            insert_node(db.conn(), &NodeRecord {
-                file_id, node_type: ty.into(), name: name.into(),
-                qualified_name: None, start_line: 1, end_line: 1,
-                code_content: String::new(), signature: None,
-                doc_comment: None, context_string: None, name_tokens: None,
-                return_type: None, param_types: None, is_test: false,
-            }).unwrap()
+            insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id,
+                    node_type: ty.into(),
+                    name: name.into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 1,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap()
         };
         let idx_struct = mk("IndexResult", "struct");
         let cg_struct = mk("CallGraphResult", "struct");
@@ -1259,8 +1805,14 @@ mod tests {
 
         let struct_types: &[&str] = &["struct"];
         let r = get_nodes_with_files_by_filters(
-            db.conn(), Some(struct_types), None, None, Some("Result"), 10,
-        ).unwrap();
+            db.conn(),
+            Some(struct_types),
+            None,
+            None,
+            Some("Result"),
+            10,
+        )
+        .unwrap();
         let ids: Vec<i64> = r.iter().map(|nwf| nwf.node.id).collect();
         assert!(ids.contains(&idx_struct));
         assert!(ids.contains(&cg_struct));
@@ -1268,16 +1820,32 @@ mod tests {
 
         // Case-insensitive
         let r_lower = get_nodes_with_files_by_filters(
-            db.conn(), Some(struct_types), None, None, Some("result"), 10,
-        ).unwrap();
+            db.conn(),
+            Some(struct_types),
+            None,
+            None,
+            Some("result"),
+            10,
+        )
+        .unwrap();
         assert_eq!(r_lower.len(), 2, "name_filter must be case-insensitive");
 
         // type=function + same name_filter excludes structs
         let fn_types: &[&str] = &["function"];
         let r_fn = get_nodes_with_files_by_filters(
-            db.conn(), Some(fn_types), None, None, Some("Result"), 10,
-        ).unwrap();
-        assert_eq!(r_fn.len(), 1, "type=function + name=Result matches only compress_results");
+            db.conn(),
+            Some(fn_types),
+            None,
+            None,
+            Some("Result"),
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            r_fn.len(),
+            1,
+            "type=function + name=Result matches only compress_results"
+        );
     }
 
     /// Regression: LIKE-escape helpers must escape the backslash ITSELF before the
@@ -1290,19 +1858,38 @@ mod tests {
     #[test]
     fn test_get_nodes_with_files_by_filters_name_filter_escapes_backslash() {
         let (db, _tmp) = test_db();
-        let file_id = upsert_file(db.conn(), &FileRecord {
-            path: "src/lib.rs".into(), blake3_hash: "h".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
+        let file_id = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "src/lib.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
 
         let mk = |name: &str| -> i64 {
-            insert_node(db.conn(), &NodeRecord {
-                file_id, node_type: "function".into(), name: name.into(),
-                qualified_name: None, start_line: 1, end_line: 1,
-                code_content: String::new(), signature: None,
-                doc_comment: None, context_string: None, name_tokens: None,
-                return_type: None, param_types: None, is_test: false,
-            }).unwrap()
+            insert_node(
+                db.conn(),
+                &NodeRecord {
+                    file_id,
+                    node_type: "function".into(),
+                    name: name.into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 1,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap()
         };
         let backslash_node = mk("a\\b"); // literal name: a, backslash, b
         let plain_node = mk("ab");
@@ -1313,29 +1900,39 @@ mod tests {
         // Query `a\b` must match the literal `a\b` node and NOT `ab`. Pre-fix the
         // pattern degraded to `%a\b%` where `\b` = literal `b`, matching `ab` instead.
         let r = get_nodes_with_files_by_filters(
-            db.conn(), Some(fn_types), None, None, Some("a\\b"), 10,
-        ).unwrap();
+            db.conn(),
+            Some(fn_types),
+            None,
+            None,
+            Some("a\\b"),
+            10,
+        )
+        .unwrap();
         let ids: Vec<i64> = r.iter().map(|nwf| nwf.node.id).collect();
-        assert!(ids.contains(&backslash_node),
-            "query `a\\b` must match the literal `a\\b` node; got ids {ids:?}");
+        assert!(
+            ids.contains(&backslash_node),
+            "query `a\\b` must match the literal `a\\b` node; got ids {ids:?}"
+        );
         assert!(!ids.contains(&plain_node),
             "query `a\\b` must NOT match `ab` (the backslash is a literal, not an escape); got ids {ids:?}");
 
         // Trailing backslash: query `x\` must match `x\`. Pre-fix `%x\%` escaped the
         // closing wildcard (`\%` = literal `%`) and matched nothing.
-        let r_tail = get_nodes_with_files_by_filters(
-            db.conn(), Some(fn_types), None, None, Some("x\\"), 10,
-        ).unwrap();
+        let r_tail =
+            get_nodes_with_files_by_filters(db.conn(), Some(fn_types), None, None, Some("x\\"), 10)
+                .unwrap();
         let tail_ids: Vec<i64> = r_tail.iter().map(|nwf| nwf.node.id).collect();
         assert!(tail_ids.contains(&trailing_node),
             "query `x\\` (trailing backslash) must match the literal `x\\` node; got ids {tail_ids:?}");
 
         // Control: a wildcard-free query `ab` matches only `ab`, never `a\b`.
-        let r_plain = get_nodes_with_files_by_filters(
-            db.conn(), Some(fn_types), None, None, Some("ab"), 10,
-        ).unwrap();
+        let r_plain =
+            get_nodes_with_files_by_filters(db.conn(), Some(fn_types), None, None, Some("ab"), 10)
+                .unwrap();
         let plain_ids: Vec<i64> = r_plain.iter().map(|nwf| nwf.node.id).collect();
-        assert!(plain_ids.contains(&plain_node) && !plain_ids.contains(&backslash_node),
-            "query `ab` must match `ab` and not `a\\b`; got ids {plain_ids:?}");
+        assert!(
+            plain_ids.contains(&plain_node) && !plain_ids.contains(&backslash_node),
+            "query `ab` must match `ab` and not `a\\b`; got ids {plain_ids:?}"
+        );
     }
 }

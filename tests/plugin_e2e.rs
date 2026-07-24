@@ -139,8 +139,13 @@ fn test_stdio_initialize_and_tools_list() {
     let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to tools/list");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let tools = parsed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), code_graph_mcp::mcp::tools::TOOL_COUNT,
-        "expected {} tools, got {}", code_graph_mcp::mcp::tools::TOOL_COUNT, tools.len());
+    assert_eq!(
+        tools.len(),
+        code_graph_mcp::mcp::tools::TOOL_COUNT,
+        "expected {} tools, got {}",
+        code_graph_mcp::mcp::tools::TOOL_COUNT,
+        tools.len()
+    );
 
     // Verify each tool has name, description, and inputSchema
     for tool in tools {
@@ -157,7 +162,9 @@ fn test_stdio_initialize_and_tools_list() {
 fn test_stdio_full_workflow() {
     let project = TempDir::new().unwrap();
     std::fs::create_dir_all(project.path().join("src")).unwrap();
-    std::fs::write(project.path().join("src/auth.ts"), r#"
+    std::fs::write(
+        project.path().join("src/auth.ts"),
+        r#"
 function validateToken(token: string): boolean {
     return token.length > 0;
 }
@@ -167,7 +174,9 @@ function handleLogin(req: Request) {
         return { ok: true };
     }
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let mut child = spawn_server(project.path());
     let mut stdin = child.stdin.take().unwrap();
@@ -178,24 +187,40 @@ function handleLogin(req: Request) {
     let _ = read_with_timeout(&rx, TIMEOUT).expect("no response to initialize");
 
     // semantic_code_search — triggers indexing (may produce progress notifications)
-    send(&mut stdin, &tool_call_msg(2, "semantic_code_search", serde_json::json!({
-        "query": "validateToken", "top_k": 5
-    })));
+    send(
+        &mut stdin,
+        &tool_call_msg(
+            2,
+            "semantic_code_search",
+            serde_json::json!({
+                "query": "validateToken", "top_k": 5
+            }),
+        ),
+    );
     let resp = read_response(&rx, TIMEOUT).expect("no response to semantic_code_search");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
     let results: serde_json::Value = serde_json::from_str(text).unwrap();
     // hybrid → bare array; FTS5-only (no embedding model in CI) → {results, vector_available}
-    let arr = results.as_array().cloned()
+    let arr = results
+        .as_array()
+        .cloned()
         .or_else(|| results.get("results").and_then(|r| r.as_array()).cloned())
         .expect("search should return an array or a results object");
     assert!(!arr.is_empty(), "search should return results");
 
     // get_ast_node
-    send(&mut stdin, &tool_call_msg(3, "get_ast_node", serde_json::json!({
-        "file_path": "src/auth.ts",
-        "symbol_name": "validateToken"
-    })));
+    send(
+        &mut stdin,
+        &tool_call_msg(
+            3,
+            "get_ast_node",
+            serde_json::json!({
+                "file_path": "src/auth.ts",
+                "symbol_name": "validateToken"
+            }),
+        ),
+    );
     let resp = read_response(&rx, TIMEOUT).expect("no response to get_ast_node");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
@@ -204,9 +229,16 @@ function handleLogin(req: Request) {
     let node_id = node["node_id"].as_i64().unwrap();
 
     // read_snippet
-    send(&mut stdin, &tool_call_msg(4, "read_snippet", serde_json::json!({
-        "node_id": node_id
-    })));
+    send(
+        &mut stdin,
+        &tool_call_msg(
+            4,
+            "read_snippet",
+            serde_json::json!({
+                "node_id": node_id
+            }),
+        ),
+    );
     let resp = read_response(&rx, TIMEOUT).expect("no response to read_snippet");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
@@ -230,7 +262,10 @@ fn test_stdio_protocol_endpoints() {
     let _ = read_with_timeout(&rx, TIMEOUT).unwrap();
 
     // resources/list
-    send(&mut stdin, &jsonrpc_request(2, "resources/list", serde_json::json!({})));
+    send(
+        &mut stdin,
+        &jsonrpc_request(2, "resources/list", serde_json::json!({})),
+    );
     let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to resources/list");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let resources = parsed["result"]["resources"].as_array().unwrap();
@@ -238,8 +273,14 @@ fn test_stdio_protocol_endpoints() {
     assert_eq!(resources[0]["uri"], "code-graph://project-summary");
 
     // resources/read
-    send(&mut stdin, &jsonrpc_request(3, "resources/read",
-        serde_json::json!({"uri": "code-graph://project-summary"})));
+    send(
+        &mut stdin,
+        &jsonrpc_request(
+            3,
+            "resources/read",
+            serde_json::json!({"uri": "code-graph://project-summary"}),
+        ),
+    );
     let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to resources/read");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let text = parsed["result"]["contents"][0]["text"].as_str().unwrap();
@@ -247,20 +288,32 @@ fn test_stdio_protocol_endpoints() {
     assert!(summary["schema_version"].is_number());
 
     // prompts/list
-    send(&mut stdin, &jsonrpc_request(4, "prompts/list", serde_json::json!({})));
+    send(
+        &mut stdin,
+        &jsonrpc_request(4, "prompts/list", serde_json::json!({})),
+    );
     let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to prompts/list");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let prompts = parsed["result"]["prompts"].as_array().unwrap();
     assert_eq!(prompts.len(), 3);
 
     // prompts/get
-    send(&mut stdin, &jsonrpc_request(5, "prompts/get", serde_json::json!({
-        "name": "impact-analysis",
-        "arguments": { "symbol_name": "foo" }
-    })));
+    send(
+        &mut stdin,
+        &jsonrpc_request(
+            5,
+            "prompts/get",
+            serde_json::json!({
+                "name": "impact-analysis",
+                "arguments": { "symbol_name": "foo" }
+            }),
+        ),
+    );
     let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to prompts/get");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let text = parsed["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+    let text = parsed["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
     assert!(text.contains("foo"));
     assert!(text.contains("get_ast_node"));
 
@@ -284,7 +337,8 @@ fn test_stdio_malformed_input() {
 
     // Verify process still works after error
     send(&mut stdin, &initialize_msg());
-    let resp = read_with_timeout(&rx, TIMEOUT).expect("process should still respond after parse error");
+    let resp =
+        read_with_timeout(&rx, TIMEOUT).expect("process should still respond after parse error");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(parsed["result"]["protocolVersion"], "2024-11-05");
 
@@ -308,11 +362,16 @@ fn test_stdio_graceful_eof() {
         let _ = tx.send(status);
     });
 
-    let status = rx.recv_timeout(Duration::from_secs(5))
+    let status = rx
+        .recv_timeout(Duration::from_secs(5))
         .expect("process should exit within 5 seconds on EOF")
         .expect("wait should succeed");
 
-    assert!(status.success(), "process should exit cleanly on EOF, got: {:?}", status);
+    assert!(
+        status.success(),
+        "process should exit cleanly on EOF, got: {:?}",
+        status
+    );
 }
 
 #[test]
@@ -326,15 +385,24 @@ fn test_stdio_unknown_tool() {
     let _ = read_with_timeout(&rx, TIMEOUT).unwrap();
 
     // Call nonexistent tool
-    send(&mut stdin, &tool_call_msg(2, "nonexistent_tool", serde_json::json!({})));
+    send(
+        &mut stdin,
+        &tool_call_msg(2, "nonexistent_tool", serde_json::json!({})),
+    );
     let resp = read_with_timeout(&rx, TIMEOUT).expect("no response to unknown tool");
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
     // Server wraps unknown tool in MCP content with isError: true
-    assert!(parsed["result"]["isError"].as_bool().unwrap_or(false),
-        "unknown tool should have isError: true");
+    assert!(
+        parsed["result"]["isError"].as_bool().unwrap_or(false),
+        "unknown tool should have isError: true"
+    );
     let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("Error"), "should contain error message, got: {}", text);
+    assert!(
+        text.contains("Error"),
+        "should contain error message, got: {}",
+        text
+    );
 
     drop(stdin);
     let _ = child.wait();
@@ -362,7 +430,10 @@ fn test_stdio_metrics_isolated_from_ancestor_repo() {
     send(&mut stdin, &initialize_msg());
     let _ = read_response(&rx, TIMEOUT).expect("no response to initialize");
     // One (error) tool call makes the session non-empty so flush_metrics writes.
-    send(&mut stdin, &tool_call_msg(2, "nonexistent_tool", serde_json::json!({})));
+    send(
+        &mut stdin,
+        &tool_call_msg(2, "nonexistent_tool", serde_json::json!({})),
+    );
     let _ = read_response(&rx, TIMEOUT);
 
     drop(stdin);

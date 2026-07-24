@@ -41,7 +41,13 @@ pub struct IncomingReference {
 // --- Edge CRUD ---
 
 /// Insert an edge, ignoring duplicates. Returns true if a new row was actually inserted.
-pub fn insert_edge(conn: &Connection, source_id: i64, target_id: i64, relation: &str, metadata: Option<&str>) -> Result<bool> {
+pub fn insert_edge(
+    conn: &Connection,
+    source_id: i64,
+    target_id: i64,
+    relation: &str,
+    metadata: Option<&str>,
+) -> Result<bool> {
     conn.execute(
         "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
          VALUES (?1, ?2, ?3, ?4)",
@@ -51,10 +57,16 @@ pub fn insert_edge(conn: &Connection, source_id: i64, target_id: i64, relation: 
 }
 
 /// Insert an edge using a cached prepared statement. Returns true if new row inserted.
-pub fn insert_edge_cached(conn: &Connection, source_id: i64, target_id: i64, relation: &str, metadata: Option<&str>) -> Result<bool> {
+pub fn insert_edge_cached(
+    conn: &Connection,
+    source_id: i64,
+    target_id: i64,
+    relation: &str,
+    metadata: Option<&str>,
+) -> Result<bool> {
     let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
-         VALUES (?1, ?2, ?3, ?4)"
+         VALUES (?1, ?2, ?3, ?4)",
     )?;
     let rows = stmt.execute((source_id, target_id, relation, metadata))?;
     Ok(rows > 0)
@@ -84,15 +96,17 @@ pub fn list_pending_unresolved_calls(conn: &Connection) -> Result<Vec<PendingCal
     let mut stmt = conn.prepare(
         "SELECT id, source_id, target_name, source_language, metadata FROM pending_unresolved_calls"
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(PendingCallRow {
-            id: row.get(0)?,
-            source_id: row.get(1)?,
-            target_name: row.get(2)?,
-            source_language: row.get(3)?,
-            metadata: row.get(4)?,
-        })
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(PendingCallRow {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                target_name: row.get(2)?,
+                source_language: row.get(3)?,
+                metadata: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -112,7 +126,10 @@ pub fn delete_pending_unresolved_call(conn: &Connection, id: i64) -> Result<()> 
 /// A re-parse of the caller file resets the clock naturally: cascade delete +
 /// re-buffer inserts a fresh row with attempts = 0.
 pub fn age_and_evict_pending_unresolved_calls(conn: &Connection) -> Result<usize> {
-    conn.execute("UPDATE pending_unresolved_calls SET attempts = attempts + 1", [])?;
+    conn.execute(
+        "UPDATE pending_unresolved_calls SET attempts = attempts + 1",
+        [],
+    )?;
     let evicted = conn.execute(
         "DELETE FROM pending_unresolved_calls WHERE attempts >= ?1",
         [crate::domain::PENDING_CALL_MAX_ATTEMPTS],
@@ -123,17 +140,16 @@ pub fn age_and_evict_pending_unresolved_calls(conn: &Connection) -> Result<usize
 /// Diagnostic: number of buffered unresolved calls. Useful in tests + a future
 /// `code-graph-mcp health-check` warning when the table grows unbounded.
 pub fn count_pending_unresolved_calls(conn: &Connection) -> Result<i64> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pending_unresolved_calls",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pending_unresolved_calls", [], |row| {
+            row.get(0)
+        })?;
     Ok(count)
 }
 
 pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT source_id, target_id, relation, metadata FROM edges WHERE source_id = ?1"
+        "SELECT source_id, target_id, relation, metadata FROM edges WHERE source_id = ?1",
     )?;
     let rows = stmt.query_map([node_id], |row| {
         Ok(EdgeRecord {
@@ -149,10 +165,14 @@ pub fn get_edges_from(conn: &Connection, node_id: i64) -> Result<Vec<EdgeRecord>
 
 // --- Graph query helpers ---
 
-pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<String>> {
+pub fn get_edge_target_names(
+    conn: &Connection,
+    source_id: i64,
+    relation: &str,
+) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT n.name FROM edges e JOIN nodes n ON n.id = e.target_id
-         WHERE e.source_id = ?1 AND e.relation = ?2"
+         WHERE e.source_id = ?1 AND e.relation = ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![source_id, relation], |row| {
         row.get::<_, String>(0)
@@ -163,7 +183,12 @@ pub fn get_edge_target_names(conn: &Connection, source_id: i64, relation: &str) 
 
 /// Batch-fetch edge target names for multiple source IDs in one query.
 /// Returns a map from source_id to list of target names.
-pub fn get_edge_target_names_batch(conn: &Connection, source_ids: &[i64], relation: &str, min_confidence_rank: u8) -> Result<HashMap<i64, Vec<String>>> {
+pub fn get_edge_target_names_batch(
+    conn: &Connection,
+    source_ids: &[i64],
+    relation: &str,
+    min_confidence_rank: u8,
+) -> Result<HashMap<i64, Vec<String>>> {
     let mut result: HashMap<i64, Vec<String>> = HashMap::new();
     if source_ids.is_empty() {
         return Ok(result);
@@ -184,7 +209,8 @@ pub fn get_edge_target_names_batch(conn: &Connection, source_ids: &[i64], relati
              WHERE e.source_id IN ({placeholders}) AND e.relation = ?1 {conf_gate}"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&relation as &dyn rusqlite::types::ToSql];
+        let mut params: Vec<&dyn rusqlite::types::ToSql> =
+            vec![&relation as &dyn rusqlite::types::ToSql];
         for id in chunk {
             params.push(id as &dyn rusqlite::types::ToSql);
         }
@@ -199,10 +225,14 @@ pub fn get_edge_target_names_batch(conn: &Connection, source_ids: &[i64], relati
     Ok(result)
 }
 
-pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) -> Result<Vec<String>> {
+pub fn get_edge_source_names(
+    conn: &Connection,
+    target_id: i64,
+    relation: &str,
+) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT n.name FROM edges e JOIN nodes n ON n.id = e.source_id
-         WHERE e.target_id = ?1 AND e.relation = ?2"
+         WHERE e.target_id = ?1 AND e.relation = ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![target_id, relation], |row| {
         row.get::<_, String>(0)
@@ -212,12 +242,16 @@ pub fn get_edge_source_names(conn: &Connection, target_id: i64, relation: &str) 
 }
 
 /// Like get_edge_target_names but also returns the file path for each target node.
-pub fn get_edge_targets_with_files(conn: &Connection, source_id: i64, relation: &str) -> Result<Vec<(String, String)>> {
+pub fn get_edge_targets_with_files(
+    conn: &Connection,
+    source_id: i64,
+    relation: &str,
+) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT n.name, COALESCE(f.path, '') FROM edges e
          JOIN nodes n ON n.id = e.target_id
          LEFT JOIN files f ON f.id = n.file_id
-         WHERE e.source_id = ?1 AND e.relation = ?2"
+         WHERE e.source_id = ?1 AND e.relation = ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![source_id, relation], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -230,15 +264,23 @@ pub fn get_edge_targets_with_files(conn: &Connection, source_id: i64, relation: 
 /// The flag lets caller-partitioning surfaces (`show --refs`, `get_ast_node`
 /// references) exclude inline unit tests the `is_test_symbol` name heuristic misses —
 /// pair with [`crate::domain::is_test_node`].
-pub fn get_edge_sources_with_files(conn: &Connection, target_id: i64, relation: &str) -> Result<Vec<(String, String, bool)>> {
+pub fn get_edge_sources_with_files(
+    conn: &Connection,
+    target_id: i64,
+    relation: &str,
+) -> Result<Vec<(String, String, bool)>> {
     let mut stmt = conn.prepare(
         "SELECT n.name, COALESCE(f.path, ''), n.is_test FROM edges e
          JOIN nodes n ON n.id = e.source_id
          LEFT JOIN files f ON f.id = n.file_id
-         WHERE e.target_id = ?1 AND e.relation = ?2"
+         WHERE e.target_id = ?1 AND e.relation = ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![target_id, relation], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+        ))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -297,7 +339,10 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
 
     for chunk in node_ids.chunks(MAX_IN_PARAMS) {
         let placeholders = make_placeholders(1, chunk.len());
-        let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
 
         // Outgoing edges: node is source
         let sql_out = format!(
@@ -306,11 +351,19 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
         );
         let mut stmt = conn.prepare(&sql_out)?;
         let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
         })?;
         for row in rows {
             let (source_id, relation, name, metadata) = row?;
-            result.entry(source_id).or_default().push((relation, "out".into(), name, metadata));
+            result
+                .entry(source_id)
+                .or_default()
+                .push((relation, "out".into(), name, metadata));
         }
 
         // Incoming edges: node is target
@@ -320,11 +373,19 @@ pub fn get_edges_batch(conn: &Connection, node_ids: &[i64]) -> Result<HashMap<i6
         );
         let mut stmt = conn.prepare(&sql_in)?;
         let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
         })?;
         for row in rows {
             let (target_id, relation, name, metadata) = row?;
-            result.entry(target_id).or_default().push((relation, "in".into(), name, metadata));
+            result
+                .entry(target_id)
+                .or_default()
+                .push((relation, "in".into(), name, metadata));
         }
     }
 
@@ -357,7 +418,11 @@ pub fn resolution_stats(conn: &Connection) -> Result<ResolutionStats> {
          GROUP BY lang, e.relation",
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
     })?;
 
     let mut by_lang: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
@@ -365,36 +430,72 @@ pub fn resolution_stats(conn: &Connection) -> Result<ResolutionStats> {
         let (lang, rel, cnt) = row?;
         by_lang.entry(lang).or_default().insert(rel, cnt);
     }
-    Ok(ResolutionStats { pending_unresolved_calls: pending, edges_by_language: by_lang })
+    Ok(ResolutionStats {
+        pending_unresolved_calls: pending,
+        edges_by_language: by_lang,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::files::{delete_files_by_paths, upsert_file, FileRecord};
     use super::super::helpers::test_db;
     use super::super::nodes::{insert_node, NodeRecord};
+    use super::*;
 
     #[test]
     fn test_insert_edge_and_cascade_delete() {
         let (db, _tmp) = test_db();
-        let fid = upsert_file(db.conn(), &FileRecord {
-            path: "t.ts".into(), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
-        let n1 = insert_node(db.conn(), &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "a".into(),
-            qualified_name: None, start_line: 1, end_line: 5,
-            code_content: "fn a(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
-        let n2 = insert_node(db.conn(), &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "b".into(),
-            qualified_name: None, start_line: 6, end_line: 10,
-            code_content: "fn b(){}".into(), signature: None,
-            doc_comment: None, context_string: None,
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "t.ts".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        let n1 = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "a".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 5,
+                code_content: "fn a(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
+        let n2 = insert_node(
+            db.conn(),
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "b".into(),
+                qualified_name: None,
+                start_line: 6,
+                end_line: 10,
+                code_content: "fn b(){}".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
 
         insert_edge(db.conn(), n1, n2, "calls", None).unwrap();
 
@@ -412,17 +513,36 @@ mod tests {
     fn resolution_stats_counts_edges_by_language() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "a.rs".into(), blake3_hash: "h".into(), last_modified: 1,
-            language: Some("rust".into()),
-        }).unwrap();
-        let n1 = insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: "f".into(),
-            qualified_name: None, start_line: 1, end_line: 2,
-            code_content: "".into(), signature: None, doc_comment: None,
-            context_string: None, name_tokens: None, return_type: None,
-            param_types: None, is_test: false,
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "a.rs".into(),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
+        let n1 = insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: "f".into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: "".into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap();
         insert_edge(conn, n1, n1, "calls", None).unwrap();
 
         let stats = resolution_stats(conn).unwrap();

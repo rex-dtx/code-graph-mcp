@@ -56,7 +56,10 @@ impl DependencyCycle {
         if loop_files >= self.size {
             format!("{}-file cycle: {}", self.size, arrows)
         } else {
-            format!("{}-file cyclic group (shortest loop: {})", self.size, arrows)
+            format!(
+                "{}-file cyclic group (shortest loop: {})",
+                self.size, arrows
+            )
         }
     }
 }
@@ -131,7 +134,11 @@ pub fn find_cycles(edges: &[(String, String)]) -> Vec<DependencyCycle> {
         .collect();
 
     // 4. Deterministic order: largest component first, ties by first file name.
-    cycles.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.files[0].cmp(&b.files[0])));
+    cycles.sort_by(|a, b| {
+        b.size
+            .cmp(&a.size)
+            .then_with(|| a.files[0].cmp(&b.files[0]))
+    });
     cycles
 }
 
@@ -301,7 +308,10 @@ mod tests {
     #[test]
     fn self_edge_is_not_a_cross_file_cycle() {
         let cycles = find_cycles(&[edge("a", "a")]);
-        assert!(cycles.is_empty(), "a file importing itself is not a dependency cycle");
+        assert!(
+            cycles.is_empty(),
+            "a file importing itself is not a dependency cycle"
+        );
     }
 
     #[test]
@@ -317,14 +327,21 @@ mod tests {
         // x imports a, but nothing imports x back — x is not in the cycle.
         let cycles = find_cycles(&[edge("a", "b"), edge("b", "a"), edge("x", "a")]);
         assert_eq!(cycles.len(), 1);
-        assert_eq!(files_of(&cycles[0]), ["a", "b"], "x must not be part of the SCC");
+        assert_eq!(
+            files_of(&cycles[0]),
+            ["a", "b"],
+            "x must not be part of the SCC"
+        );
     }
 
     #[test]
     fn larger_scc_groups_all_mutually_reachable_files() {
         // a↔b and b↔c ⇒ {a,b,c} is one SCC even though a and c aren't directly linked.
         let cycles = find_cycles(&[
-            edge("a", "b"), edge("b", "a"), edge("b", "c"), edge("c", "b"),
+            edge("a", "b"),
+            edge("b", "a"),
+            edge("b", "c"),
+            edge("c", "b"),
         ]);
         assert_eq!(cycles.len(), 1);
         assert_eq!(files_of(&cycles[0]), ["a", "b", "c"]);
@@ -337,8 +354,11 @@ mod tests {
     fn disjoint_cycles_sorted_by_size_then_name() {
         // One 3-cycle {b,c,d}, one 2-cycle {a,e}. Bigger first; equal size by name.
         let cycles = find_cycles(&[
-            edge("a", "e"), edge("e", "a"),
-            edge("b", "c"), edge("c", "d"), edge("d", "b"),
+            edge("a", "e"),
+            edge("e", "a"),
+            edge("b", "c"),
+            edge("c", "d"),
+            edge("d", "b"),
         ]);
         assert_eq!(cycles.len(), 2);
         assert_eq!(files_of(&cycles[0]), ["b", "c", "d"], "larger SCC first");
@@ -352,10 +372,19 @@ mod tests {
         let cycles = find_cycles(&[
             edge("src/parser/relations/mod.rs", "src/parser/relations/cpp.rs"),
             edge("src/parser/relations/cpp.rs", "src/parser/relations/mod.rs"),
-            edge("src/storage/queries/edges.rs", "src/storage/queries/nodes.rs"),
-            edge("src/storage/queries/nodes.rs", "src/storage/queries/edges.rs"),
+            edge(
+                "src/storage/queries/edges.rs",
+                "src/storage/queries/nodes.rs",
+            ),
+            edge(
+                "src/storage/queries/nodes.rs",
+                "src/storage/queries/edges.rs",
+            ),
         ]);
-        assert!(cycles.is_empty(), "Rust intra-crate import cycles must not be reported");
+        assert!(
+            cycles.is_empty(),
+            "Rust intra-crate import cycles must not be reported"
+        );
     }
 
     #[test]
@@ -368,25 +397,39 @@ mod tests {
             edge("scripts/lifecycle.js", "scripts/doctor.js"),
         ]);
         assert_eq!(cycles.len(), 1, "only the JS cycle should remain");
-        assert_eq!(files_of(&cycles[0]), ["scripts/doctor.js", "scripts/lifecycle.js"]);
+        assert_eq!(
+            files_of(&cycles[0]),
+            ["scripts/doctor.js", "scripts/lifecycle.js"]
+        );
     }
 
     #[test]
     fn cross_language_cycle_with_rust_endpoint_is_kept() {
         // Only same-`.rs` edges are dropped; a `.rs`↔`.py` cycle is cross-language
         // and genuinely worth surfacing, so it must still be reported.
-        let cycles = find_cycles(&[
-            edge("src/a.rs", "src/b.py"),
-            edge("src/b.py", "src/a.rs"),
-        ]);
-        assert_eq!(cycles.len(), 1, "a cross-language cycle is not a benign intra-crate cycle");
+        let cycles = find_cycles(&[edge("src/a.rs", "src/b.py"), edge("src/b.py", "src/a.rs")]);
+        assert_eq!(
+            cycles.len(),
+            1,
+            "a cross-language cycle is not a benign intra-crate cycle"
+        );
         assert_eq!(files_of(&cycles[0]), ["src/a.rs", "src/b.py"]);
     }
 
     #[test]
     fn output_is_deterministic_regardless_of_edge_order() {
-        let forward = find_cycles(&[edge("a", "b"), edge("b", "a"), edge("c", "d"), edge("d", "c")]);
-        let shuffled = find_cycles(&[edge("d", "c"), edge("b", "a"), edge("c", "d"), edge("a", "b")]);
+        let forward = find_cycles(&[
+            edge("a", "b"),
+            edge("b", "a"),
+            edge("c", "d"),
+            edge("d", "c"),
+        ]);
+        let shuffled = find_cycles(&[
+            edge("d", "c"),
+            edge("b", "a"),
+            edge("c", "d"),
+            edge("a", "b"),
+        ]);
         assert_eq!(forward, shuffled);
     }
 }

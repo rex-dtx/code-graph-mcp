@@ -53,15 +53,49 @@ pub fn build_context_string(info: &NodeContext) -> String {
     // 4. Graph relations (structural signals that survive truncation)
     const MAX_RELATIONS: usize = 10;
     if !info.routes.is_empty() {
-        parts.push(format!("routes: {}", info.routes.iter().take(MAX_RELATIONS).cloned().collect::<Vec<_>>().join(", ")));
+        parts.push(format!(
+            "routes: {}",
+            info.routes
+                .iter()
+                .take(MAX_RELATIONS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if !info.callees.is_empty() {
-        let suffix = if info.callees.len() > MAX_RELATIONS { format!(" (+{})", info.callees.len() - MAX_RELATIONS) } else { String::new() };
-        parts.push(format!("calls: {}{}", info.callees.iter().take(MAX_RELATIONS).cloned().collect::<Vec<_>>().join(", "), suffix));
+        let suffix = if info.callees.len() > MAX_RELATIONS {
+            format!(" (+{})", info.callees.len() - MAX_RELATIONS)
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "calls: {}{}",
+            info.callees
+                .iter()
+                .take(MAX_RELATIONS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            suffix
+        ));
     }
     if !info.callers.is_empty() {
-        let suffix = if info.callers.len() > MAX_RELATIONS { format!(" (+{})", info.callers.len() - MAX_RELATIONS) } else { String::new() };
-        parts.push(format!("called_by: {}{}", info.callers.iter().take(MAX_RELATIONS).cloned().collect::<Vec<_>>().join(", "), suffix));
+        let suffix = if info.callers.len() > MAX_RELATIONS {
+            format!(" (+{})", info.callers.len() - MAX_RELATIONS)
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "called_by: {}{}",
+            info.callers
+                .iter()
+                .take(MAX_RELATIONS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            suffix
+        ));
     }
     if !info.inherits.is_empty() {
         parts.push(format!("inherits: {}", info.inherits.join(", ")));
@@ -104,7 +138,9 @@ mod tests {
             signature: Some("(token: string) -> Promise<User | null>".into()),
             return_type: Some("Promise<User | null>".into()),
             param_types: Some("(token: string)".into()),
-            code_content: Some("function validateToken(token: string) { return jwt.verify(token); }".into()),
+            code_content: Some(
+                "function validateToken(token: string) { return jwt.verify(token); }".into(),
+            ),
             routes: vec!["POST /api/login".into(), "GET /api/profile".into()],
             callees: vec!["jwt.verify".into(), "UserRepo.findById".into()],
             callers: vec!["authMiddleware".into(), "handleLogin".into()],
@@ -156,7 +192,10 @@ mod tests {
         // Priority: signature → identity → graph relations → doc → code (code last, truncation-safe)
         assert!(sig_pos < identity_pos, "signature before identity");
         assert!(identity_pos < calls_pos, "identity before calls");
-        assert!(calls_pos < code_pos, "calls before code (code last for truncation safety)");
+        assert!(
+            calls_pos < code_pos,
+            "calls before code (code last for truncation safety)"
+        );
     }
 
     #[test]

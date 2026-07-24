@@ -15,25 +15,35 @@ fn write(dir: &std::path::Path, rel: &str, content: &str) {
 }
 
 fn callers_of(db: &Database, target_name: &str) -> Vec<String> {
-    let mut stmt = db.conn().prepare(
-        "SELECT COALESCE(src.qualified_name, src.name) FROM edges e
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COALESCE(src.qualified_name, src.name) FROM edges e
          JOIN nodes tgt ON tgt.id = e.target_id
          JOIN nodes src ON src.id = e.source_id
-         WHERE e.relation = 'calls' AND tgt.name = ?"
-    ).unwrap();
-    let rows = stmt.query_map([target_name], |r| r.get::<_, String>(0)).unwrap();
+         WHERE e.relation = 'calls' AND tgt.name = ?",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([target_name], |r| r.get::<_, String>(0))
+        .unwrap();
     rows.filter_map(|r| r.ok()).collect()
 }
 
 fn callers_of_in_file(db: &Database, target_name: &str, file_rel: &str) -> Vec<String> {
-    let mut stmt = db.conn().prepare(
-        "SELECT COALESCE(src.qualified_name, src.name) FROM edges e
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COALESCE(src.qualified_name, src.name) FROM edges e
          JOIN nodes tgt ON tgt.id = e.target_id
          JOIN nodes src ON src.id = e.source_id
          JOIN files f ON f.id = tgt.file_id
-         WHERE e.relation = 'calls' AND tgt.name = ? AND f.path = ?"
-    ).unwrap();
-    let rows = stmt.query_map([target_name, file_rel], |r| r.get::<_, String>(0)).unwrap();
+         WHERE e.relation = 'calls' AND tgt.name = ? AND f.path = ?",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([target_name, file_rel], |r| r.get::<_, String>(0))
+        .unwrap();
     rows.filter_map(|r| r.ok()).collect()
 }
 
@@ -46,12 +56,16 @@ fn chain_builder_drops_intermediate_callers() {
     write(root, "src/snapshot/mod.rs", "pub fn create() {}\n");
     // Caller does a builder chain — `.create(true)` is a method on OpenOptions,
     // NOT the project's snapshot::create.
-    write(root, "src/caller.rs", r#"
+    write(
+        root,
+        "src/caller.rs",
+        r#"
         use std::fs::OpenOptions;
         pub fn caller() {
             OpenOptions::new().create(true).open("/tmp/x").ok();
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -75,10 +89,14 @@ fn bare_name_qualifier_drops_phantom_callers_for_file_create() {
     write(root, "src/snapshot/mod.rs", "pub fn create() {}\n");
     // Caller calls std::fs::File::create — Path qualifier with first segment
     // "File" which is NOT a project module → drop.
-    write(root, "src/caller.rs", r#"
+    write(
+        root,
+        "src/caller.rs",
+        r#"
         use std::fs::File;
         pub fn caller() { let _ = File::create("/tmp/x"); }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -102,9 +120,13 @@ fn path_qualifier_picks_module_specific_candidate() {
     write(root, "src/snapshot/mod.rs", "pub fn create() {}\n");
     write(root, "src/builder/mod.rs", "pub fn create() {}\n");
     // Caller explicitly targets snapshot::create.
-    write(root, "src/caller.rs", r#"
+    write(
+        root,
+        "src/caller.rs",
+        r#"
         pub fn caller() { crate::snapshot::create(); }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -115,10 +137,16 @@ fn path_qualifier_picks_module_specific_candidate() {
     let snap = callers_of_in_file(&db, "create", "src/snapshot/mod.rs");
     let bld = callers_of_in_file(&db, "create", "src/builder/mod.rs");
 
-    assert!(snap.iter().any(|c| c.contains("caller")),
-        "snapshot::create should have caller, got: {:?}", snap);
-    assert!(!bld.iter().any(|c| c.contains("caller")),
-        "builder::create should NOT have caller (qualifier was snapshot), got: {:?}", bld);
+    assert!(
+        snap.iter().any(|c| c.contains("caller")),
+        "snapshot::create should have caller, got: {:?}",
+        snap
+    );
+    assert!(
+        !bld.iter().any(|c| c.contains("caller")),
+        "builder::create should NOT have caller (qualifier was snapshot), got: {:?}",
+        bld
+    );
 }
 
 #[test]
@@ -126,20 +154,28 @@ fn self_method_within_impl_uses_correct_type() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
-    write(root, "src/db.rs", r#"
+    write(
+        root,
+        "src/db.rs",
+        r#"
         pub struct Db;
         impl Db {
             pub fn caller(&self) { self.helper(); }
             pub fn helper(&self) {}
         }
-    "#);
+    "#,
+    );
     // Sibling type with same-named method — must NOT win.
-    write(root, "src/other.rs", r#"
+    write(
+        root,
+        "src/other.rs",
+        r#"
         pub struct Other;
         impl Other {
             pub fn helper(&self) {}
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -149,10 +185,16 @@ fn self_method_within_impl_uses_correct_type() {
     let db_helper = callers_of_in_file(&db, "helper", "src/db.rs");
     let other_helper = callers_of_in_file(&db, "helper", "src/other.rs");
 
-    assert!(db_helper.iter().any(|c| c.contains("caller")),
-        "Db::helper should have Db::caller, got: {:?}", db_helper);
-    assert!(!other_helper.iter().any(|c| c.contains("caller")),
-        "Other::helper should NOT have Db::caller, got: {:?}", other_helper);
+    assert!(
+        db_helper.iter().any(|c| c.contains("caller")),
+        "Db::helper should have Db::caller, got: {:?}",
+        db_helper
+    );
+    assert!(
+        !other_helper.iter().any(|c| c.contains("caller")),
+        "Other::helper should NOT have Db::caller, got: {:?}",
+        other_helper
+    );
 }
 
 #[test]
@@ -161,17 +203,25 @@ fn self_method_resolves_across_split_impl_blocks() {
     let root = tmp.path();
 
     // Db's caller is in db_a.rs; Db's helper is in db_b.rs (impl block split).
-    write(root, "src/db_a.rs", r#"
+    write(
+        root,
+        "src/db_a.rs",
+        r#"
         pub struct Db;
         impl Db {
             pub fn caller(&self) { self.helper(); }
         }
-    "#);
-    write(root, "src/db_b.rs", r#"
+    "#,
+    );
+    write(
+        root,
+        "src/db_b.rs",
+        r#"
         impl crate::db_a::Db {
             pub fn helper(&self) {}
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -179,9 +229,11 @@ fn self_method_resolves_across_split_impl_blocks() {
     run_full_index(&db, root, None, None).unwrap();
 
     let helpers = callers_of_in_file(&db, "helper", "src/db_b.rs");
-    assert!(helpers.iter().any(|c| c.contains("caller")),
+    assert!(
+        helpers.iter().any(|c| c.contains("caller")),
         "Db::helper in db_b.rs should have Db::caller from db_a.rs, got: {:?}",
-        helpers);
+        helpers
+    );
 }
 
 #[test]
@@ -190,26 +242,36 @@ fn non_rust_callgraph_unchanged() {
     let root = tmp.path();
 
     // JS file with simple function call — must not be qualifier-filtered.
-    write(root, "src/util.js", r#"
+    write(
+        root,
+        "src/util.js",
+        r#"
         function helper() {}
         function caller() { helper(); }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = Database::open(&db_path).unwrap();
     run_full_index(&db, root, None, None).unwrap();
 
-    let mut stmt = db.conn().prepare(
-        "SELECT COUNT(*) FROM edges e
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COUNT(*) FROM edges e
          JOIN nodes src ON src.id = e.source_id
          JOIN nodes tgt ON tgt.id = e.target_id
          WHERE e.relation = 'calls'
            AND src.name = 'caller'
-           AND tgt.name = 'helper'"
-    ).unwrap();
+           AND tgt.name = 'helper'",
+        )
+        .unwrap();
     let count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
-    assert_eq!(count, 1, "JS caller→helper edge must survive (no qualifier filtering for non-Rust)");
+    assert_eq!(
+        count, 1,
+        "JS caller→helper edge must survive (no qualifier filtering for non-Rust)"
+    );
 }
 
 #[test]
@@ -221,14 +283,22 @@ fn path_qualifier_resolves_single_file_rust_mod() {
     // the target as dead code. Accept `<last_seg>.rs` suffix too.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "src/domain.rs", r#"
+    write(
+        root,
+        "src/domain.rs",
+        r#"
         pub fn helper_in_domain() -> i32 { 42 }
-    "#);
-    write(root, "src/main.rs", r#"
+    "#,
+    );
+    write(
+        root,
+        "src/main.rs",
+        r#"
         pub fn caller() -> i32 {
             crate::domain::helper_in_domain()
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -253,7 +323,10 @@ fn same_file_generic_impl_method_edges_dont_fan_out() {
     // filters method candidates by qualified_name LIKE "<Type>.%".
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "src/lib.rs", r#"
+    write(
+        root,
+        "src/lib.rs",
+        r#"
         pub trait DoWork { fn run(&self); }
         pub struct A;
         impl DoWork for A { fn run(&self) {} }
@@ -261,35 +334,54 @@ fn same_file_generic_impl_method_edges_dont_fan_out() {
         impl<T: Clone> DoWork for B<T> { fn run(&self) {} }
         pub struct C<'a, U>(&'a U);
         impl<'a, U: Default> DoWork for C<'a, U> { fn run(&self) {} }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = Database::open(&db_path).unwrap();
     run_full_index(&db, root, None, None).unwrap();
 
-    let mut stmt = db.conn().prepare(
-        "SELECT src.name, tgt.qualified_name
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT src.name, tgt.qualified_name
          FROM edges e
          JOIN nodes src ON src.id = e.source_id
          JOIN nodes tgt ON tgt.id = e.target_id
          WHERE e.relation = 'implements'
            AND tgt.name = 'run'
-         ORDER BY src.name"
-    ).unwrap();
-    let pairs: Vec<(String, String)> = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+         ORDER BY src.name",
+        )
+        .unwrap();
+    let pairs: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
 
     // Each struct must implement only its own method (3 edges, not 9).
-    assert_eq!(pairs.len(), 3,
-        "expected one implements edge per (struct, its-own-run) pair; got {:?}", pairs);
-    assert!(pairs.contains(&("A".to_string(), "A.run".to_string())),
-        "A should implement A.run; got {:?}", pairs);
-    assert!(pairs.contains(&("B".to_string(), "B.run".to_string())),
-        "B should implement B.run (bare, no <T>); got {:?}", pairs);
-    assert!(pairs.contains(&("C".to_string(), "C.run".to_string())),
-        "C should implement C.run (bare, no <'a, U>); got {:?}", pairs);
+    assert_eq!(
+        pairs.len(),
+        3,
+        "expected one implements edge per (struct, its-own-run) pair; got {:?}",
+        pairs
+    );
+    assert!(
+        pairs.contains(&("A".to_string(), "A.run".to_string())),
+        "A should implement A.run; got {:?}",
+        pairs
+    );
+    assert!(
+        pairs.contains(&("B".to_string(), "B.run".to_string())),
+        "B should implement B.run (bare, no <T>); got {:?}",
+        pairs
+    );
+    assert!(
+        pairs.contains(&("C".to_string(), "C.run".to_string())),
+        "C should implement C.run (bare, no <'a, U>); got {:?}",
+        pairs
+    );
 }
 
 #[test]
@@ -303,7 +395,10 @@ fn path_qualifier_keeps_same_file_target() {
     // never matched in a single-file project.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "src/lib.rs", r#"
+    write(
+        root,
+        "src/lib.rs",
+        r#"
         pub struct Foo;
         impl Foo {
             pub fn helper() -> i32 { 42 }
@@ -311,7 +406,8 @@ fn path_qualifier_keeps_same_file_target() {
         pub fn caller() -> i32 {
             Foo::helper()
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -337,7 +433,10 @@ fn receiver_call_resolves_unique_method() {
     // `file_exists` / `validate` were dropped this way.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "src/lib.rs", r#"
+    write(
+        root,
+        "src/lib.rs",
+        r#"
         pub struct Foo;
         impl Foo {
             pub fn new() -> Self { Foo }
@@ -347,7 +446,8 @@ fn receiver_call_resolves_unique_method() {
             let f = Foo::new();
             f.unique_method()
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -372,7 +472,10 @@ fn receiver_call_resolves_method_not_free_function_same_name() {
     // the method, and NOT to the free function.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "src/req.rs", r#"
+    write(
+        root,
+        "src/req.rs",
+        r#"
         pub struct Req;
         impl Req {
             pub fn validate(&self) -> bool { true }
@@ -382,12 +485,17 @@ fn receiver_call_resolves_method_not_free_function_same_name() {
             r.validate()
         }
         fn make_req() -> Req { Req }
-    "#);
+    "#,
+    );
     // Free function with the SAME bare name in another module — must NOT
     // receive the receiver-call edge.
-    write(root, "src/install.rs", r#"
+    write(
+        root,
+        "src/install.rs",
+        r#"
         pub fn validate(path: &str) -> bool { !path.is_empty() }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -416,23 +524,35 @@ fn receiver_call_with_ambiguous_method_name_stays_unresolved() {
     // the edge is dropped (no false-positive impact inflation).
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "src/a.rs", r#"
+    write(
+        root,
+        "src/a.rs",
+        r#"
         pub struct A;
         impl A {
             pub fn ambiguous(&self) -> i32 { 1 }
         }
-    "#);
-    write(root, "src/b.rs", r#"
+    "#,
+    );
+    write(
+        root,
+        "src/b.rs",
+        r#"
         pub struct B;
         impl B {
             pub fn ambiguous(&self) -> i32 { 2 }
         }
-    "#);
-    write(root, "src/caller.rs", r#"
+    "#,
+    );
+    write(
+        root,
+        "src/caller.rs",
+        r#"
         pub fn caller(x: SomeOpaque) -> i32 {
             x.ambiguous()
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -458,7 +578,10 @@ fn receiver_call_prefers_same_file_method_over_cross_file_ambiguity() {
     // it, locality breaks the tie toward the in-file method.)
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "src/a.rs", r#"
+    write(
+        root,
+        "src/a.rs",
+        r#"
         pub struct A;
         impl A {
             pub fn process(&self) -> i32 { 1 }
@@ -466,13 +589,18 @@ fn receiver_call_prefers_same_file_method_over_cross_file_ambiguity() {
         pub fn caller(a: A) -> i32 {
             a.process()
         }
-    "#);
-    write(root, "src/b.rs", r#"
+    "#,
+    );
+    write(
+        root,
+        "src/b.rs",
+        r#"
         pub struct B;
         impl B {
             pub fn process(&self) -> i32 { 2 }
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -504,27 +632,39 @@ fn js_method_call_resolves_non_ecmascript_builtin_name() {
     // callers from impact/callers. They must resolve to the unique project method.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "db.ts", r#"
+    write(
+        root,
+        "db.ts",
+        r#"
         export const db = {
           findOne(id: string) { return { id }; },
           insert(obj: any) { return obj; },
           remove(id: string) { return id; },
           contains(id: string) { return !!id; },
         };
-    "#);
-    write(root, "handlers.ts", r#"
+    "#,
+    );
+    write(
+        root,
+        "handlers.ts",
+        r#"
         import { db } from './db';
         export function createUser(body: any) { return db.insert(body); }
         export function deleteUser(id: string) { return db.remove(id); }
         export function hasUser(id: string) { return db.contains(id); }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = Database::open(&db_path).unwrap();
     run_full_index(&db, root, None, None).unwrap();
 
-    for (method, caller) in [("insert", "createUser"), ("remove", "deleteUser"), ("contains", "hasUser")] {
+    for (method, caller) in [
+        ("insert", "createUser"),
+        ("remove", "deleteUser"),
+        ("contains", "hasUser"),
+    ] {
         let callers = callers_of(&db, method);
         assert!(
             callers.iter().any(|c| c.contains(caller)),
@@ -543,17 +683,25 @@ fn js_method_call_still_drops_real_ecmascript_builtin() {
     // exemption narrow (only non-builtin names like `insert`/`remove`/`contains`).
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "store.ts", r#"
+    write(
+        root,
+        "store.ts",
+        r#"
         export const store = {
           push(item: any) { return item; },
           get(key: string) { return key; },
         };
-    "#);
-    write(root, "use.ts", r#"
+    "#,
+    );
+    write(
+        root,
+        "use.ts",
+        r#"
         import { store } from './store';
         export function add(x: any) { return store.push(x); }
         export function read(k: string) { return store.get(k); }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -580,15 +728,22 @@ fn php_method_call_resolves_collection_verb_names() {
     // reporting live PHP methods as dead code. They must resolve.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "repo.php", r#"<?php
+    write(
+        root,
+        "repo.php",
+        r#"<?php
         class Repo {
             public function insert($x) { return $x; }
             public function remove($x) { return $x; }
             public function get($x) { return $x; }
             public function findOne($x) { return $x; }
         }
-    "#);
-    write(root, "service.php", r#"<?php
+    "#,
+    );
+    write(
+        root,
+        "service.php",
+        r#"<?php
         class Service {
             private $repo;
             public function createThing($d) { return $this->repo->insert($d); }
@@ -596,7 +751,8 @@ fn php_method_call_resolves_collection_verb_names() {
             public function fetchById($id) { return $this->repo->get($id); }
             public function getOne($id) { return $this->repo->findOne($id); }
         }
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -620,13 +776,18 @@ fn php_method_call_resolves_collection_verb_names() {
 
 fn routes_to_handlers(db: &Database) -> Vec<(String, String)> {
     // (handler_node_name, file_path) for every routes_to edge.
-    let mut stmt = db.conn().prepare(
-        "SELECT t.name, f.path FROM edges e
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT t.name, f.path FROM edges e
          JOIN nodes t ON t.id = e.target_id
          JOIN files f ON f.id = t.file_id
-         WHERE e.relation = 'routes_to'"
-    ).unwrap();
-    let rows = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))).unwrap();
+         WHERE e.relation = 'routes_to'",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap();
     rows.filter_map(|r| r.ok()).collect()
 }
 
@@ -642,18 +803,26 @@ fn express_route_with_imported_handler_produces_routes_to_edge() {
     // real-world Express structure. The handler must carry a routes_to edge.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "handlers.ts", r#"
+    write(
+        root,
+        "handlers.ts",
+        r#"
         export function getUser(req: any, res: any) { res.json({}); }
         export function createUser(req: any, res: any) { res.json({}); }
-    "#);
-    write(root, "server.ts", r#"
+    "#,
+    );
+    write(
+        root,
+        "server.ts",
+        r#"
         import express from 'express';
         import { getUser, createUser } from './handlers';
         const app = express();
         app.get('/users/:id', getUser);
         app.post('/users', createUser);
         app.listen(3000);
-    "#);
+    "#,
+    );
 
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -672,12 +841,14 @@ fn express_route_with_imported_handler_produces_routes_to_edge() {
 
 /// Incoming `calls` edge count to the node whose `qualified_name` == `qn`.
 fn incoming_calls_by_qualified_name(db: &Database, qn: &str) -> i64 {
-    db.conn().query_row(
-        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id = e.target_id
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id = e.target_id
          WHERE e.relation = 'calls' AND t.qualified_name = ?",
-        [qn],
-        |r| r.get(0),
-    ).unwrap()
+            [qn],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
 /// Issue #32 cause 2: a Python receiver whose type is fixed by a single local
@@ -688,7 +859,10 @@ fn incoming_calls_by_qualified_name(db: &Database, qn: &str) -> i64 {
 fn python_receiver_type_resolves_to_constructor_type() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "writers.py", r#"
+    write(
+        root,
+        "writers.py",
+        r#"
 class DataWriter:
     def write(self, id, items):
         return len(items)
@@ -704,29 +878,34 @@ class ScenarioWriter:
 def save(id, conflicts):
     writer = DataWriter()
     writer.write(id, conflicts)
-"#);
+"#,
+    );
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = Database::open(&db_path).unwrap();
     run_full_index(&db, root, None, None).unwrap();
 
     assert_eq!(
-        incoming_calls_by_qualified_name(&db, "DataWriter.write"), 1,
+        incoming_calls_by_qualified_name(&db, "DataWriter.write"),
+        1,
         "save() must resolve `writer.write()` to DataWriter.write (writer = DataWriter())"
     );
     assert_eq!(
-        incoming_calls_by_qualified_name(&db, "ProfileWriter.write"), 0,
+        incoming_calls_by_qualified_name(&db, "ProfileWriter.write"),
+        0,
         "ProfileWriter.write must NOT receive a false cross-type edge"
     );
     assert_eq!(
-        incoming_calls_by_qualified_name(&db, "ScenarioWriter.write"), 0,
+        incoming_calls_by_qualified_name(&db, "ScenarioWriter.write"),
+        0,
         "ScenarioWriter.write must NOT receive a false cross-type edge"
     );
     // The precise resolution also unblocks callgraph/impact: the caller is visible.
     let callers = callers_of(&db, "write");
     assert!(
         callers.iter().any(|c| c.contains("save")),
-        "save must be a caller of the resolved write method; got: {:?}", callers
+        "save must be a caller of the resolved write method; got: {:?}",
+        callers
     );
 }
 
@@ -739,7 +918,10 @@ def save(id, conflicts):
 fn python_receiver_type_inherited_method_still_resolves() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "models.py", r#"
+    write(
+        root,
+        "models.py",
+        r#"
 class Base:
     def process(self, x):
         return x + 1
@@ -750,7 +932,8 @@ class Derived(Base):
 def run(x):
     d = Derived()
     d.process(x)
-"#);
+"#,
+    );
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = Database::open(&db_path).unwrap();
@@ -759,13 +942,15 @@ def run(x):
     // Derived has no own `process`; it's inherited from Base. rtype=Derived
     // filters to empty and falls through to the unique bare match Base.process.
     assert_eq!(
-        incoming_calls_by_qualified_name(&db, "Base.process"), 1,
+        incoming_calls_by_qualified_name(&db, "Base.process"),
+        1,
         "inherited d.process() must fall through to Base.process, not drop"
     );
     let callers = callers_of(&db, "process");
     assert!(
         callers.iter().any(|c| c.contains("run")),
-        "run must be a caller of the inherited process method; got: {:?}", callers
+        "run must be a caller of the inherited process method; got: {:?}",
+        callers
     );
 }
 
@@ -777,7 +962,10 @@ def run(x):
 fn python_receiver_type_from_parameter_annotation_resolves() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(root, "writers.py", r#"
+    write(
+        root,
+        "writers.py",
+        r#"
 class DataWriter:
     def write(self, id, items):
         return len(items)
@@ -792,22 +980,26 @@ class ScenarioWriter:
 
 def save(writer: DataWriter, id, conflicts):
     writer.write(id, conflicts)
-"#);
+"#,
+    );
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = Database::open(&db_path).unwrap();
     run_full_index(&db, root, None, None).unwrap();
 
     assert_eq!(
-        incoming_calls_by_qualified_name(&db, "DataWriter.write"), 1,
+        incoming_calls_by_qualified_name(&db, "DataWriter.write"),
+        1,
         "param-annotated `writer: DataWriter` must resolve writer.write() to DataWriter.write"
     );
     assert_eq!(
-        incoming_calls_by_qualified_name(&db, "ProfileWriter.write"), 0,
+        incoming_calls_by_qualified_name(&db, "ProfileWriter.write"),
+        0,
         "ProfileWriter.write must NOT receive a false cross-type edge"
     );
     assert_eq!(
-        incoming_calls_by_qualified_name(&db, "ScenarioWriter.write"), 0,
+        incoming_calls_by_qualified_name(&db, "ScenarioWriter.write"),
+        0,
         "ScenarioWriter.write must NOT receive a false cross-type edge"
     );
 }
@@ -816,22 +1008,27 @@ def save(writer: DataWriter, id, conflicts):
 /// (source_name, target_qualified_name, target_file, confidence), sorted so
 /// batch/iteration order never affects comparison.
 fn persist_item_call_edges(db: &Database) -> Vec<(String, String, String, String)> {
-    let mut stmt = db.conn().prepare(
-        "SELECT src.name, COALESCE(tgt.qualified_name, tgt.name), f.path, edges.confidence
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT src.name, COALESCE(tgt.qualified_name, tgt.name), f.path, edges.confidence
          FROM edges
          JOIN nodes src ON src.id = edges.source_id
          JOIN nodes tgt ON tgt.id = edges.target_id
          JOIN files f ON f.id = tgt.file_id
-         WHERE edges.relation = 'calls' AND tgt.name = 'persist_item'"
-    ).unwrap();
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    }).unwrap();
+         WHERE edges.relation = 'calls' AND tgt.name = 'persist_item'",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap();
     let mut edges: Vec<(String, String, String, String)> = rows.filter_map(Result::ok).collect();
     edges.sort();
     edges

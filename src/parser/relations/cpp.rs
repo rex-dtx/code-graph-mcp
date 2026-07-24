@@ -11,10 +11,10 @@
 //! field (that value IS the reference we want to keep). Without this a bare local
 //! passed as an argument would fabricate an edge to a same-named global function.
 
-use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
-use crate::domain::{REL_REFERENCES, REL_INHERITS};
+use super::ParsedRelation;
+use crate::domain::{REL_INHERITS, REL_REFERENCES};
 
 /// C++ base classes → `inherits` edges. Called on a `class_specifier` /
 /// `struct_specifier`. C++ has no separate interface concept, so every base is
@@ -24,7 +24,10 @@ use crate::domain::{REL_REFERENCES, REL_INHERITS};
 /// `template_type` (`Tmpl<int>` → the template `name`). A class/struct with no
 /// `base_class_clause` — all of C, and plain C++ aggregates — yields nothing, so
 /// this needs no language gate (C `struct_specifier` never carries a base clause).
-pub(super) fn extract_cpp_inheritance(node: &tree_sitter::Node, source: &str) -> Vec<ParsedRelation> {
+pub(super) fn extract_cpp_inheritance(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> Vec<ParsedRelation> {
     let class_name = match node.child_by_field_name("name") {
         Some(n) => node_text(&n, source),
         None => return Vec::new(),
@@ -49,9 +52,9 @@ pub(super) fn extract_cpp_inheritance(node: &tree_sitter::Node, source: &str) ->
         let name = match base.kind() {
             "type_identifier" => Some(node_text(&base, source)),
             // ns::Base → the `name` tail; Tmpl<int> → the template `name`.
-            "qualified_identifier" | "template_type" => {
-                base.child_by_field_name("name").map(|n| node_text(&n, source))
-            }
+            "qualified_identifier" | "template_type" => base
+                .child_by_field_name("name")
+                .map(|n| node_text(&n, source)),
             // access_specifier / virtual / anything else: not a base type name.
             _ => None,
         };
@@ -94,9 +97,7 @@ pub(super) fn extract_cpp_value_reference(
             parent.child_by_field_name("right").map(|v| v.id()) == Some(node.id())
         }
         // Init-declarator RHS (`fn_t cb = handler`).
-        "init_declarator" => {
-            parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id())
-        }
+        "init_declarator" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
         "return_statement" => true,
         // `&fn` — only when the address-of sits in one of the value positions above.
         "pointer_expression" => parent
@@ -138,7 +139,10 @@ pub(super) fn extract_cpp_value_reference(
 /// parameters + body declarations of the nearest enclosing `function_definition`.
 /// Both surface as `parameter_declaration` / `declaration` nodes; the declared NAME
 /// is taken from the declarator chain (`c_declared_name`), never the init `value`.
-fn c_enclosing_fn_local_names(node: &tree_sitter::Node, source: &str) -> std::collections::HashSet<String> {
+fn c_enclosing_fn_local_names(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     let mut cur = node.parent();
     while let Some(n) = cur {
@@ -190,12 +194,10 @@ fn c_declared_name(node: &tree_sitter::Node, source: &str, depth: usize) -> Opti
     }
     match node.kind() {
         "identifier" | "field_identifier" => Some(node_text(node, source).to_string()),
-        "init_declarator"
-        | "pointer_declarator"
-        | "array_declarator"
-        | "function_declarator" => node
-            .child_by_field_name("declarator")
-            .and_then(|d| c_declared_name(&d, source, depth + 1)),
+        "init_declarator" | "pointer_declarator" | "array_declarator" | "function_declarator" => {
+            node.child_by_field_name("declarator")
+                .and_then(|d| c_declared_name(&d, source, depth + 1))
+        }
         "parenthesized_declarator" => (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
             .find_map(|c| c_declared_name(&c, source, depth + 1)),

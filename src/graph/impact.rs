@@ -183,9 +183,9 @@ mod tests {
     #[test]
     fn excludes_root_and_partitions_prod_vs_test() {
         let callers = vec![
-            caller("target", "src/a.rs", 0, None), // root — excluded
-            caller("handler", "src/a.rs", 1, None), // prod direct
-            caller("helper", "src/b.rs", 2, None), // prod transitive
+            caller("target", "src/a.rs", 0, None),       // root — excluded
+            caller("handler", "src/a.rs", 1, None),      // prod direct
+            caller("helper", "src/b.rs", 2, None),       // prod transitive
             caller("test_thing", "tests/a.rs", 1, None), // test
         ];
         let c = classify_impact(&callers, "behavior", true);
@@ -254,12 +254,20 @@ mod tests {
         // surfaces can render (the parseable subset) diverge on corrupt/legacy
         // metadata. One valid route + one corrupt → exactly one counted route.
         let callers = vec![
-            caller("good", "src/a.rs", 1, Some(r#"{"method":"GET","path":"/ok"}"#)),
+            caller(
+                "good",
+                "src/a.rs",
+                1,
+                Some(r#"{"method":"GET","path":"/ok"}"#),
+            ),
             caller("bad", "src/b.rs", 1, Some("not json{")),
         ];
         let c = classify_impact(&callers, "behavior", true);
         assert_eq!(c.route_callers.len(), 1, "only the parseable route counts");
-        assert_eq!(c.route_callers[0].name, "good", "the corrupt-metadata route is dropped");
+        assert_eq!(
+            c.route_callers[0].name, "good",
+            "the corrupt-metadata route is dropped"
+        );
     }
 
     #[test]
@@ -292,8 +300,14 @@ mod tests {
         // matching `remove`. Previously `signature` was a silent alias of
         // `behavior` and reported LOW here.
         let callers = vec![caller("one", "src/a.rs", 1, None)];
-        assert_eq!(classify_impact(&callers, "behavior", true).risk_level, "LOW");
-        assert_eq!(classify_impact(&callers, "signature", true).risk_level, "HIGH");
+        assert_eq!(
+            classify_impact(&callers, "behavior", true).risk_level,
+            "LOW"
+        );
+        assert_eq!(
+            classify_impact(&callers, "signature", true).risk_level,
+            "HIGH"
+        );
         assert_eq!(classify_impact(&callers, "remove", true).risk_level, "HIGH");
     }
 
@@ -304,10 +318,10 @@ mod tests {
         // not just a count. classify_impact must retain them, deduped, with the
         // list length equal to test_count (single source of truth).
         let callers = vec![
-            caller("target", "src/a.rs", 0, None), // root — excluded
+            caller("target", "src/a.rs", 0, None),       // root — excluded
             caller("prod_handler", "src/a.rs", 1, None), // prod caller — not a test
             caller("test_alpha", "tests/a.rs", 1, None), // test caller (direct)
-            caller("test_beta", "tests/b.rs", 2, None), // test caller (transitive)
+            caller("test_beta", "tests/b.rs", 2, None),  // test caller (transitive)
             caller("test_alpha", "tests/a.rs", 1, None), // exact dup — counted once
         ];
         let c = classify_impact(&callers, "behavior", true);
@@ -347,15 +361,30 @@ mod tests {
             caller("target", "src/graph/cycles.rs", 0, None), // root — excluded
             caller("cmd_cycles", "src/cli.rs", 1, None),      // genuine prod caller
             // inline unit tests — heuristic-invisible, but is_test=true:
-            caller_t("two_node_cycle_is_detected", "src/graph/cycles.rs", 1, None, true),
-            caller_t("headline_matches_arrows", "src/graph/cycles.rs", 1, None, true),
+            caller_t(
+                "two_node_cycle_is_detected",
+                "src/graph/cycles.rs",
+                1,
+                None,
+                true,
+            ),
+            caller_t(
+                "headline_matches_arrows",
+                "src/graph/cycles.rs",
+                1,
+                None,
+                true,
+            ),
         ];
         let c = classify_impact(&callers, "behavior", true);
         assert_eq!(
             c.prod_callers.len(),
             1,
             "only cmd_cycles is a prod caller; got {:?}",
-            c.prod_callers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()
+            c.prod_callers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
         );
         assert_eq!(c.test_count, 2, "both inline unit tests counted as tests");
         assert_eq!(c.risk_level, "LOW", "1 prod caller ⇒ LOW, not HIGH");

@@ -1,11 +1,11 @@
-use super::*;
 use super::python_modules::build_python_module_map;
-use crate::storage::queries::{
-    get_nodes_by_file_path, get_nodes_by_name, get_edges_from, get_import_tree,
-};
+use super::*;
 use crate::domain::REL_CALLS;
-use tempfile::TempDir;
+use crate::storage::queries::{
+    get_edges_from, get_import_tree, get_nodes_by_file_path, get_nodes_by_name,
+};
 use std::fs;
+use tempfile::TempDir;
 
 #[test]
 fn test_full_index_pipeline() {
@@ -13,7 +13,9 @@ fn test_full_index_pipeline() {
     let db_dir = TempDir::new().unwrap();
 
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
-    fs::write(project_dir.path().join("src/auth.ts"), r#"
+    fs::write(
+        project_dir.path().join("src/auth.ts"),
+        r#"
 function validateToken(token: string): boolean {
     return jwt.verify(token);
 }
@@ -23,7 +25,9 @@ function handleLogin(req: Request) {
         return createSession(req.userId);
     }
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
@@ -38,10 +42,16 @@ function handleLogin(req: Request) {
 
     // Verify edges: handleLogin → calls → validateToken
     let edges = get_edges_from(db.conn(), nodes[0].id).unwrap();
-    assert!(edges.iter().any(|e| e.relation == REL_CALLS), "should have call edges");
+    assert!(
+        edges.iter().any(|e| e.relation == REL_CALLS),
+        "should have call edges"
+    );
 
     // Verify context string was built
-    assert!(nodes[0].context_string.is_some(), "context string should be set after Phase 3");
+    assert!(
+        nodes[0].context_string.is_some(),
+        "context string should be set after Phase 3"
+    );
 }
 
 #[test]
@@ -54,10 +64,16 @@ fn test_progress_reports_files_then_finalizing_heartbeats() {
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
-    fs::write(project_dir.path().join("src/a.ts"),
-        "function alpha(): number { return 1; }\n").unwrap();
-    fs::write(project_dir.path().join("src/b.ts"),
-        "function beta(): number { return alpha(); }\n").unwrap();
+    fs::write(
+        project_dir.path().join("src/a.ts"),
+        "function alpha(): number { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/b.ts"),
+        "function beta(): number { return alpha(); }\n",
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     let events = std::cell::RefCell::new(Vec::new());
@@ -67,18 +83,32 @@ fn test_progress_reports_files_then_finalizing_heartbeats() {
     let result = run_full_index(&db, project_dir.path(), None, Some(&cb)).unwrap();
     let events = events.into_inner();
 
-    let files_done_max = events.iter()
+    let files_done_max = events
+        .iter()
         .filter(|(p, _, _)| *p == IndexPhase::Files)
         .map(|(_, d, _)| *d)
         .max()
         .expect("at least one Files event");
-    assert_eq!(files_done_max, result.files_indexed,
-        "Files events should reach the final indexed count");
+    assert_eq!(
+        files_done_max, result.files_indexed,
+        "Files events should reach the final indexed count"
+    );
 
-    assert!(events.iter().filter(|(p, _, _)| *p == IndexPhase::Finalizing).count() >= 2,
-        "tail phases must emit Finalizing heartbeats, got {:?}", events);
-    assert_eq!(events.last().unwrap().0, IndexPhase::Finalizing,
-        "the last event must come from the tail phases, got {:?}", events);
+    assert!(
+        events
+            .iter()
+            .filter(|(p, _, _)| *p == IndexPhase::Finalizing)
+            .count()
+            >= 2,
+        "tail phases must emit Finalizing heartbeats, got {:?}",
+        events
+    );
+    assert_eq!(
+        events.last().unwrap().0,
+        IndexPhase::Finalizing,
+        "the last event must come from the tail phases, got {:?}",
+        events
+    );
 }
 
 #[test]
@@ -113,10 +143,14 @@ fn test_full_index_atomic_inside_outer_transaction() {
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
-    fs::write(project_dir.path().join("src/a.ts"), r#"
+    fs::write(
+        project_dir.path().join("src/a.ts"),
+        r#"
 function alpha(): number { return beta(); }
 function beta(): number { return 1; }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     // Seed an "old" index so the DELETE below actually clears prior state.
@@ -124,10 +158,14 @@ function beta(): number { return 1; }
     assert!(!get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty());
 
     // Rewrite the source so the rebuild produces different symbols.
-    fs::write(project_dir.path().join("src/a.ts"), r#"
+    fs::write(
+        project_dir.path().join("src/a.ts"),
+        r#"
 function gamma(): number { return delta(); }
 function delta(): number { return 2; }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Exactly what tool_rebuild_index does: one outer transaction around
     // DELETE FROM files + run_full_index (its phase savepoints nest inside it).
@@ -141,8 +179,14 @@ function delta(): number { return 2; }
     assert!(result.nodes_created > 0);
 
     // New symbols present, old ones gone — the rebuild committed atomically.
-    assert!(!get_nodes_by_name(db.conn(), "gamma").unwrap().is_empty(), "rebuilt node present");
-    assert!(get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty(), "old node cleared");
+    assert!(
+        !get_nodes_by_name(db.conn(), "gamma").unwrap().is_empty(),
+        "rebuilt node present"
+    );
+    assert!(
+        get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty(),
+        "old node cleared"
+    );
 }
 
 #[test]
@@ -156,7 +200,9 @@ fn test_duplicate_inline_route_handlers_resolve_per_occurrence() {
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
 
-    fs::write(project_dir.path().join("routes.js"), r#"
+    fs::write(
+        project_dir.path().join("routes.js"),
+        r#"
 const express = require('express');
 const app = express();
 function logA() { console.log('a'); }
@@ -164,21 +210,39 @@ function logB() { console.log('b'); }
 app.get('/dup', (req, res) => { logA(); res.send('1'); });
 app.get('/dup', (req, res) => { logB(); res.send('2'); });
 app.get('/unique', (req, res) => { logA(); });
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
     let conn = db.conn();
 
     // Two distinct handler nodes for the same /dup route (per-occurrence identity).
-    let dup_nodes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM nodes WHERE name LIKE 'GET /dup%'", [], |r| r.get(0)).unwrap();
-    assert_eq!(dup_nodes, 2, "each /dup registration is its own handler node");
+    let dup_nodes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE name LIKE 'GET /dup%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        dup_nodes, 2,
+        "each /dup registration is its own handler node"
+    );
 
     // routes_to: exactly one self-edge per registration (3), NOT a cartesian fan-out.
-    let routes_to: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM edges WHERE relation = 'routes_to'", [], |r| r.get(0)).unwrap();
-    assert_eq!(routes_to, 3, "one routes_to per registration; no same-name cartesian fan-out");
+    let routes_to: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE relation = 'routes_to'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        routes_to, 3,
+        "one routes_to per registration; no same-name cartesian fan-out"
+    );
 
     // calls must not cross-link: exactly one /dup handler calls logA (the first),
     // exactly one calls logB (the second) — 1 each, not 2 each.
@@ -187,10 +251,21 @@ app.get('/unique', (req, res) => { logA(); });
             "SELECT COUNT(*) FROM edges e \
              JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id \
              WHERE e.relation = 'calls' AND s.name LIKE 'GET /dup%' AND t.name = ?1",
-            [callee], |r| r.get(0)).unwrap()
+            [callee],
+            |r| r.get(0),
+        )
+        .unwrap()
     };
-    assert_eq!(dup_to("logA"), 1, "only the first /dup handler calls logA (no cross-link)");
-    assert_eq!(dup_to("logB"), 1, "only the second /dup handler calls logB (no cross-link)");
+    assert_eq!(
+        dup_to("logA"),
+        1,
+        "only the first /dup handler calls logA (no cross-link)"
+    );
+    assert_eq!(
+        dup_to("logB"),
+        1,
+        "only the second /dup handler calls logB (no cross-link)"
+    );
 }
 
 #[test]
@@ -204,54 +279,72 @@ fn test_cross_language_bare_name_call_resolution() {
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
     fs::create_dir_all(project_dir.path().join("scripts")).unwrap();
 
-    fs::write(project_dir.path().join("src/hasher.rs"), r#"
+    fs::write(
+        project_dir.path().join("src/hasher.rs"),
+        r#"
 pub fn caller_rs() {
     let mut h = Hasher::new();
     h.update(&[1, 2, 3]);
     h.finalize();
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project_dir.path().join("scripts/helper.js"), r#"
+    fs::write(
+        project_dir.path().join("scripts/helper.js"),
+        r#"
 function update() { return 1; }
 function caller_js() { update(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
-    let rust_caller = crate::storage::queries::get_nodes_with_files_by_name(
-        db.conn(), "caller_rs",
-    ).unwrap();
-    let rust_caller = rust_caller.iter()
+    let rust_caller =
+        crate::storage::queries::get_nodes_with_files_by_name(db.conn(), "caller_rs").unwrap();
+    let rust_caller = rust_caller
+        .iter()
         .find(|n| n.file_path == "src/hasher.rs")
         .expect("Rust caller_rs should be indexed");
     let edges = get_edges_from(db.conn(), rust_caller.node.id).unwrap();
     for e in &edges {
-        if e.relation != REL_CALLS { continue; }
-        let tgt_path: Option<String> = db.conn().query_row(
-            "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
-            [e.target_id], |row| row.get(0),
-        ).ok();
+        if e.relation != REL_CALLS {
+            continue;
+        }
+        let tgt_path: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
+                [e.target_id],
+                |row| row.get(0),
+            )
+            .ok();
         assert!(
             !tgt_path.as_deref().unwrap_or("").ends_with(".js"),
-            "Rust caller must not resolve calls into JS; got edge → {:?}", tgt_path,
+            "Rust caller must not resolve calls into JS; got edge → {:?}",
+            tgt_path,
         );
     }
 
-    let js_caller = crate::storage::queries::get_nodes_with_files_by_name(
-        db.conn(), "caller_js",
-    ).unwrap();
-    let js_caller = js_caller.iter()
+    let js_caller =
+        crate::storage::queries::get_nodes_with_files_by_name(db.conn(), "caller_js").unwrap();
+    let js_caller = js_caller
+        .iter()
         .find(|n| n.file_path == "scripts/helper.js")
         .expect("JS caller_js should be indexed");
     let js_edges = get_edges_from(db.conn(), js_caller.node.id).unwrap();
-    let js_call_targets: Vec<i64> = js_edges.iter()
+    let js_call_targets: Vec<i64> = js_edges
+        .iter()
         .filter(|e| e.relation == REL_CALLS)
         .map(|e| e.target_id)
         .collect();
-    assert!(!js_call_targets.is_empty(),
-        "JS caller_js → update edge within same file should still resolve");
+    assert!(
+        !js_call_targets.is_empty(),
+        "JS caller_js → update edge within same file should still resolve"
+    );
 }
 
 #[test]
@@ -266,39 +359,62 @@ fn test_intra_class_method_call_edges_resolve() {
     let db_dir = TempDir::new().unwrap();
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
 
-    fs::write(project_dir.path().join("src/svc.py"), r#"
+    fs::write(
+        project_dir.path().join("src/svc.py"),
+        r#"
 class UserSvc:
     def get_user(self, uid):
         return self._fetch(uid)
     def _fetch(self, uid):
         return uid
-"#).unwrap();
-    fs::write(project_dir.path().join("src/Svc.java"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/Svc.java"),
+        r#"
 class Svc {
     void run() { helper(); }
     void helper() {}
 }
-"#).unwrap();
-    fs::write(project_dir.path().join("src/svc.ts"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/svc.ts"),
+        r#"
 class TsSvc {
     outer(): void { this.inner(); }
     inner(): void {}
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Each outer method must have a calls edge to its sibling.
-    for (caller, callee) in [("get_user", "_fetch"), ("run", "helper"), ("outer", "inner")] {
+    for (caller, callee) in [
+        ("get_user", "_fetch"),
+        ("run", "helper"),
+        ("outer", "inner"),
+    ] {
         let nodes = get_nodes_by_name(db.conn(), caller).unwrap();
-        let node = nodes.first().unwrap_or_else(|| panic!("{caller} should be indexed"));
+        let node = nodes
+            .first()
+            .unwrap_or_else(|| panic!("{caller} should be indexed"));
         let edges = get_edges_from(db.conn(), node.id).unwrap();
         let has_call = edges.iter().any(|e| {
-            if e.relation != REL_CALLS { return false; }
-            let tgt: Option<String> = db.conn().query_row(
-                "SELECT name FROM nodes WHERE id = ?1", [e.target_id], |r| r.get(0),
-            ).ok();
+            if e.relation != REL_CALLS {
+                return false;
+            }
+            let tgt: Option<String> = db
+                .conn()
+                .query_row("SELECT name FROM nodes WHERE id = ?1", [e.target_id], |r| {
+                    r.get(0)
+                })
+                .ok();
             tgt.as_deref() == Some(callee)
         });
         assert!(has_call, "{caller} → {callee} method-call edge was dropped");
@@ -309,31 +425,51 @@ class TsSvc {
 fn test_js_require_creates_external_import_edges() {
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
-    fs::write(project_dir.path().join("app.js"), r#"
+    fs::write(
+        project_dir.path().join("app.js"),
+        r#"
 const fs = require('fs');
 const path = require('path');
 const lifecycle = require('./lifecycle');
 
 function main() { fs.readFileSync('x'); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
-    let imports: Vec<String> = db.conn().prepare(
-        "SELECT DISTINCT n2.name FROM edges e
+    let imports: Vec<String> = db
+        .conn()
+        .prepare(
+            "SELECT DISTINCT n2.name FROM edges e
          JOIN nodes n ON n.id = e.source_id
          JOIN files f ON f.id = n.file_id
          JOIN nodes n2 ON n2.id = e.target_id
-         WHERE f.path = 'app.js' AND e.relation = 'imports'"
-    ).unwrap()
-     .query_map([], |row| row.get::<_, String>(0)).unwrap()
-     .filter_map(Result::ok)
-     .collect();
+         WHERE f.path = 'app.js' AND e.relation = 'imports'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
 
-    assert!(imports.contains(&"fs".to_string()),        "imports: {:?}", imports);
-    assert!(imports.contains(&"path".to_string()),      "imports: {:?}", imports);
-    assert!(imports.contains(&"lifecycle".to_string()), "imports: {:?}", imports);
+    assert!(
+        imports.contains(&"fs".to_string()),
+        "imports: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"path".to_string()),
+        "imports: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"lifecycle".to_string()),
+        "imports: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -350,52 +486,72 @@ fn test_js_same_name_cross_file_prefers_closest_path() {
     fs::create_dir_all(project_dir.path().join("pkg/scripts")).unwrap();
     fs::create_dir_all(project_dir.path().join("tests")).unwrap();
 
-    fs::write(project_dir.path().join("pkg/scripts/lifecycle.js"), r#"
+    fs::write(
+        project_dir.path().join("pkg/scripts/lifecycle.js"),
+        r#"
 function readJson(p) { return 1; }
 module.exports = { readJson };
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project_dir.path().join("pkg/scripts/session-init.js"), r#"
+    fs::write(
+        project_dir.path().join("pkg/scripts/session-init.js"),
+        r#"
 function syncLifecycleConfig() { readJson('x'); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project_dir.path().join("tests/helpers.test.js"), r#"
+    fs::write(
+        project_dir.path().join("tests/helpers.test.js"),
+        r#"
 function readJson(p) { return 2; }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Find the caller node
-    let caller = crate::storage::queries::get_nodes_with_files_by_name(
-        db.conn(), "syncLifecycleConfig",
-    ).unwrap();
-    let caller = caller.iter()
+    let caller =
+        crate::storage::queries::get_nodes_with_files_by_name(db.conn(), "syncLifecycleConfig")
+            .unwrap();
+    let caller = caller
+        .iter()
         .find(|n| n.file_path == "pkg/scripts/session-init.js")
         .expect("syncLifecycleConfig should be indexed");
 
     let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
-    let call_edges: Vec<i64> = edges.iter()
+    let call_edges: Vec<i64> = edges
+        .iter()
         .filter(|e| e.relation == REL_CALLS)
         .map(|e| e.target_id)
         .collect();
 
     // Resolve target paths
-    let target_paths: Vec<String> = call_edges.iter().filter_map(|tid| {
-        db.conn().query_row(
+    let target_paths: Vec<String> =
+        call_edges
+            .iter()
+            .filter_map(|tid| {
+                db.conn().query_row(
             "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
             [*tid], |row| row.get(0)
         ).ok()
-    }).collect();
+            })
+            .collect();
 
     // Must pick exactly the same-dir candidate, not fan out to the test file.
     assert!(
         target_paths.iter().any(|p| p == "pkg/scripts/lifecycle.js"),
-        "should resolve to same-dir readJson; got {:?}", target_paths
+        "should resolve to same-dir readJson; got {:?}",
+        target_paths
     );
     assert!(
         !target_paths.iter().any(|p| p == "tests/helpers.test.js"),
-        "should NOT fan out to unrelated test-file readJson; got {:?}", target_paths
+        "should NOT fan out to unrelated test-file readJson; got {:?}",
+        target_paths
     );
 }
 
@@ -406,21 +562,46 @@ fn test_prune_keeps_edge_when_caller_content_truncated() {
     // at 4096 and appends a "..." sentinel, so a qualified call beyond the cap is
     // sliced off → instr=0 false negative → the real edge is false-pruned. The fix
     // skips pruning when the caller's content is truncated (ends in the sentinel).
-    use crate::storage::queries::{insert_node, insert_edge, upsert_file, NodeRecord, FileRecord};
     use crate::domain::{REL_CALLS, REL_IMPORTS};
+    use crate::storage::queries::{insert_edge, insert_node, upsert_file, FileRecord, NodeRecord};
     let db_dir = TempDir::new().unwrap();
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     let conn = db.conn();
 
-    let mk_file = |path: &str| upsert_file(conn, &FileRecord {
-        path: path.into(), blake3_hash: path.into(), last_modified: 1, language: Some("python".into()),
-    }).unwrap();
-    let mk_fn = |file_id: i64, name: &str, code: &str| insert_node(conn, &NodeRecord {
-        file_id, node_type: "function".into(), name: name.into(),
-        qualified_name: None, start_line: 1, end_line: 2, code_content: code.into(),
-        signature: None, doc_comment: None, context_string: None,
-        name_tokens: None, return_type: None, param_types: None, is_test: false,
-    }).unwrap();
+    let mk_file = |path: &str| {
+        upsert_file(
+            conn,
+            &FileRecord {
+                path: path.into(),
+                blake3_hash: path.into(),
+                last_modified: 1,
+                language: Some("python".into()),
+            },
+        )
+        .unwrap()
+    };
+    let mk_fn = |file_id: i64, name: &str, code: &str| {
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id,
+                node_type: "function".into(),
+                name: name.into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: code.into(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap()
+    };
 
     // Two same-name targets in different files (the ambiguity the prune arbitrates).
     let f_a = mk_file("a.py");
@@ -431,7 +612,11 @@ fn test_prune_keeps_edge_when_caller_content_truncated() {
     // Caller whose code_content is TRUNCATED (ends in the "..." sentinel) and does
     // NOT literally contain ".save(" — the qualified call was sliced off by the cap.
     let f_caller = mk_file("caller.py");
-    let run_trunc = mk_fn(f_caller, "run", "def run():\n    a_very_long_body_that_was_cut_off...");
+    let run_trunc = mk_fn(
+        f_caller,
+        "run",
+        "def run():\n    a_very_long_body_that_was_cut_off...",
+    );
     // Caller file imports `save` bound to save_b (a DIFFERENT node than the call target).
     insert_edge(conn, run_trunc, save_b, REL_IMPORTS, None).unwrap();
     // The (import-contradicted) call edge run -> save_a we must NOT false-prune.
@@ -450,13 +635,22 @@ fn test_prune_keeps_edge_when_caller_content_truncated() {
             "SELECT COUNT(*) FROM edges WHERE source_id=?1 AND target_id=?2 AND relation=?3",
             rusqlite::params![src, tgt, REL_CALLS],
             |row| row.get::<_, i64>(0),
-        ).unwrap() > 0
+        )
+        .unwrap()
+            > 0
     };
-    assert!(edge_exists(run_trunc, save_a),
-        "truncated caller: the call edge must be KEPT (instr can't see beyond the 4096 cap)");
-    assert!(!edge_exists(run_ok, save_a),
-        "non-truncated caller: the genuinely import-contradicted edge must still be pruned");
-    assert_eq!(removed, 1, "exactly the non-truncated control edge is pruned");
+    assert!(
+        edge_exists(run_trunc, save_a),
+        "truncated caller: the call edge must be KEPT (instr can't see beyond the 4096 cap)"
+    );
+    assert!(
+        !edge_exists(run_ok, save_a),
+        "non-truncated caller: the genuinely import-contradicted edge must still be pruned"
+    );
+    assert_eq!(
+        removed, 1,
+        "exactly the non-truncated control edge is pruned"
+    );
 }
 
 #[test]
@@ -477,43 +671,58 @@ fn test_import_binding_resolves_call_over_path_proximity() {
     fs::create_dir_all(project_dir.path().join("app/util")).unwrap();
 
     // Path-closest same-name def — the WRONG target for the call below.
-    fs::write(project_dir.path().join("app/core/helper.py"), r#"
+    fs::write(
+        project_dir.path().join("app/core/helper.py"),
+        r#"
 def process():
     return 1
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Imported same-name def — the RIGHT target, farther by path prefix.
-    fs::write(project_dir.path().join("app/util/helper.py"), r#"
+    fs::write(
+        project_dir.path().join("app/util/helper.py"),
+        r#"
 def process():
     return 2
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Caller sits next to app/core/helper.py but explicitly imports the util one.
-    fs::write(project_dir.path().join("app/core/caller.py"), r#"
+    fs::write(
+        project_dir.path().join("app/core/caller.py"),
+        r#"
 from app.util.helper import process
 
 def run():
     return process()
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
-    let caller = crate::storage::queries::get_nodes_with_files_by_name(
-        db.conn(), "run",
-    ).unwrap();
-    let caller = caller.iter()
+    let caller = crate::storage::queries::get_nodes_with_files_by_name(db.conn(), "run").unwrap();
+    let caller = caller
+        .iter()
         .find(|n| n.file_path == "app/core/caller.py")
         .expect("run should be indexed");
 
     let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
-    let call_target_paths: Vec<String> = edges.iter()
-        .filter(|e| e.relation == REL_CALLS)
-        .filter_map(|e| db.conn().query_row(
+    let call_target_paths: Vec<String> =
+        edges
+            .iter()
+            .filter(|e| e.relation == REL_CALLS)
+            .filter_map(|e| {
+                db.conn().query_row(
             "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
             [e.target_id], |row| row.get(0),
-        ).ok())
-        .collect();
+        ).ok()
+            })
+            .collect();
 
     assert!(
         call_target_paths.iter().any(|p| p == "app/util/helper.py"),
@@ -539,39 +748,57 @@ fn test_js_named_import_resolves_via_module_specifier() {
     fs::create_dir_all(project_dir.path().join("src/core")).unwrap();
     fs::create_dir_all(project_dir.path().join("src/util")).unwrap();
 
-    fs::write(project_dir.path().join("src/core/helper.ts"),
-        "export function process() { return 1; }\n").unwrap();
-    fs::write(project_dir.path().join("src/util/helper.ts"),
-        "export function process() { return 2; }\n").unwrap();
-    fs::write(project_dir.path().join("src/core/caller.ts"), r#"
+    fs::write(
+        project_dir.path().join("src/core/helper.ts"),
+        "export function process() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/util/helper.ts"),
+        "export function process() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/core/caller.ts"),
+        r#"
 import { process } from '../util/helper';
 
 export function run() { return process(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
-    let import_target_paths: Vec<String> = db.conn().prepare(
-        "SELECT tf.path FROM edges e
+    let import_target_paths: Vec<String> = db
+        .conn()
+        .prepare(
+            "SELECT tf.path FROM edges e
          JOIN nodes sn ON sn.id = e.source_id
          JOIN files sf ON sf.id = sn.file_id
          JOIN nodes tn ON tn.id = e.target_id
          JOIN files tf ON tf.id = tn.file_id
          WHERE e.relation = 'imports' AND sf.path = 'src/core/caller.ts'
-           AND tn.name = 'process'"
-    ).unwrap()
-     .query_map([], |r| r.get::<_, String>(0)).unwrap()
-     .filter_map(Result::ok)
-     .collect();
+           AND tn.name = 'process'",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
 
     assert!(
-        import_target_paths.iter().any(|p| p == "src/util/helper.ts"),
+        import_target_paths
+            .iter()
+            .any(|p| p == "src/util/helper.ts"),
         "import must resolve via specifier to src/util/helper.ts; got {:?}",
         import_target_paths
     );
     assert!(
-        !import_target_paths.iter().any(|p| p == "src/core/helper.ts"),
+        !import_target_paths
+            .iter()
+            .any(|p| p == "src/core/helper.ts"),
         "import must NOT bind to the path-closest src/core/helper.ts; got {:?}",
         import_target_paths
     );
@@ -588,46 +815,84 @@ fn test_exported_const_value_forms_import_edge() {
     let db_dir = TempDir::new().unwrap();
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
 
-    fs::write(project_dir.path().join("src/config.ts"), r#"
+    fs::write(
+        project_dir.path().join("src/config.ts"),
+        r#"
 export const API_URL = "https://example.com";
 export const DEFAULT_CONFIG = { timeout: 5000, retries: 3 };
 
 const NOT_EXPORTED = 42;
-"#).unwrap();
-    fs::write(project_dir.path().join("src/api.ts"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/api.ts"),
+        r#"
 import { API_URL, DEFAULT_CONFIG } from './config';
 
 export function fetchData() { return API_URL + DEFAULT_CONFIG.timeout; }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // The exported value const is a real `constant` node; the non-exported one is not.
-    let const_types: Vec<String> = db.conn().prepare(
-        "SELECT n.type FROM nodes n JOIN files f ON f.id = n.file_id
-         WHERE n.name = 'API_URL' AND f.path = 'src/config.ts'"
-    ).unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap()
-     .filter_map(Result::ok).collect();
-    assert_eq!(const_types, vec!["constant".to_string()],
-        "export const value must be extracted as exactly one `constant` node");
+    let const_types: Vec<String> = db
+        .conn()
+        .prepare(
+            "SELECT n.type FROM nodes n JOIN files f ON f.id = n.file_id
+         WHERE n.name = 'API_URL' AND f.path = 'src/config.ts'",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(
+        const_types,
+        vec!["constant".to_string()],
+        "export const value must be extracted as exactly one `constant` node"
+    );
 
-    let not_exported: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM nodes WHERE name = 'NOT_EXPORTED'", [], |r| r.get(0)).unwrap();
-    assert_eq!(not_exported, 0, "a non-exported top-level const must not be extracted");
+    let not_exported: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE name = 'NOT_EXPORTED'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        not_exported, 0,
+        "a non-exported top-level const must not be extracted"
+    );
 
     // `import { API_URL }` resolves to the const node in its defining file, not <external>.
-    let resolved_targets: Vec<String> = db.conn().prepare(
-        "SELECT tf.path FROM edges e
+    let resolved_targets: Vec<String> = db
+        .conn()
+        .prepare(
+            "SELECT tf.path FROM edges e
          JOIN nodes tn ON tn.id = e.target_id
          JOIN files tf ON tf.id = tn.file_id
-         WHERE e.relation = 'imports' AND tn.name = 'API_URL'"
-    ).unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap()
-     .filter_map(Result::ok).collect();
-    assert!(resolved_targets.iter().any(|p| p == "src/config.ts"),
-        "import {{ API_URL }} must resolve to the const in src/config.ts; got {:?}", resolved_targets);
-    assert!(!resolved_targets.iter().any(|p| p.contains("external")),
-        "import must NOT bind to the <external> sentinel; got {:?}", resolved_targets);
+         WHERE e.relation = 'imports' AND tn.name = 'API_URL'",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        resolved_targets.iter().any(|p| p == "src/config.ts"),
+        "import {{ API_URL }} must resolve to the const in src/config.ts; got {:?}",
+        resolved_targets
+    );
+    assert!(
+        !resolved_targets.iter().any(|p| p.contains("external")),
+        "import must NOT bind to the <external> sentinel; got {:?}",
+        resolved_targets
+    );
 }
 
 #[test]
@@ -640,34 +905,47 @@ fn test_js_import_binds_call_over_path_proximity() {
     fs::create_dir_all(project_dir.path().join("src/core")).unwrap();
     fs::create_dir_all(project_dir.path().join("src/util")).unwrap();
 
-    fs::write(project_dir.path().join("src/core/helper.ts"),
-        "export function process() { return 1; }\n").unwrap();
-    fs::write(project_dir.path().join("src/util/helper.ts"),
-        "export function process() { return 2; }\n").unwrap();
-    fs::write(project_dir.path().join("src/core/caller.ts"), r#"
+    fs::write(
+        project_dir.path().join("src/core/helper.ts"),
+        "export function process() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/util/helper.ts"),
+        "export function process() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/core/caller.ts"),
+        r#"
 import { process } from '../util/helper';
 
 export function run() { return process(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
-    let caller = crate::storage::queries::get_nodes_with_files_by_name(
-        db.conn(), "run",
-    ).unwrap();
-    let caller = caller.iter()
+    let caller = crate::storage::queries::get_nodes_with_files_by_name(db.conn(), "run").unwrap();
+    let caller = caller
+        .iter()
         .find(|n| n.file_path == "src/core/caller.ts")
         .expect("run should be indexed");
 
     let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
-    let call_target_paths: Vec<String> = edges.iter()
-        .filter(|e| e.relation == REL_CALLS)
-        .filter_map(|e| db.conn().query_row(
+    let call_target_paths: Vec<String> =
+        edges
+            .iter()
+            .filter(|e| e.relation == REL_CALLS)
+            .filter_map(|e| {
+                db.conn().query_row(
             "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
             [e.target_id], |row| row.get(0),
-        ).ok())
-        .collect();
+        ).ok()
+            })
+            .collect();
 
     assert!(
         call_target_paths.iter().any(|p| p == "src/util/helper.ts"),
@@ -693,34 +971,47 @@ fn test_commonjs_destructured_require_binds_call() {
     fs::create_dir_all(project_dir.path().join("src/core")).unwrap();
     fs::create_dir_all(project_dir.path().join("src/util")).unwrap();
 
-    fs::write(project_dir.path().join("src/core/helper.js"),
-        "function process() { return 1; }\nmodule.exports = { process };\n").unwrap();
-    fs::write(project_dir.path().join("src/util/helper.js"),
-        "function process() { return 2; }\nmodule.exports = { process };\n").unwrap();
-    fs::write(project_dir.path().join("src/core/caller.js"), r#"
+    fs::write(
+        project_dir.path().join("src/core/helper.js"),
+        "function process() { return 1; }\nmodule.exports = { process };\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/util/helper.js"),
+        "function process() { return 2; }\nmodule.exports = { process };\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/core/caller.js"),
+        r#"
 const { process } = require('../util/helper');
 
 function run() { return process(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
-    let caller = crate::storage::queries::get_nodes_with_files_by_name(
-        db.conn(), "run",
-    ).unwrap();
-    let caller = caller.iter()
+    let caller = crate::storage::queries::get_nodes_with_files_by_name(db.conn(), "run").unwrap();
+    let caller = caller
+        .iter()
         .find(|n| n.file_path == "src/core/caller.js")
         .expect("run should be indexed");
 
     let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
-    let call_target_paths: Vec<String> = edges.iter()
-        .filter(|e| e.relation == REL_CALLS)
-        .filter_map(|e| db.conn().query_row(
+    let call_target_paths: Vec<String> =
+        edges
+            .iter()
+            .filter(|e| e.relation == REL_CALLS)
+            .filter_map(|e| {
+                db.conn().query_row(
             "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
             [e.target_id], |row| row.get(0),
-        ).ok())
-        .collect();
+        ).ok()
+            })
+            .collect();
 
     assert!(
         call_target_paths.iter().any(|p| p == "src/util/helper.js"),
@@ -747,34 +1038,47 @@ fn test_commonjs_namespace_require_binds_member_call() {
     fs::create_dir_all(project_dir.path().join("src/core")).unwrap();
     fs::create_dir_all(project_dir.path().join("src/util")).unwrap();
 
-    fs::write(project_dir.path().join("src/core/helper.js"),
-        "function process() { return 1; }\nmodule.exports = { process };\n").unwrap();
-    fs::write(project_dir.path().join("src/util/helper.js"),
-        "function process() { return 2; }\nmodule.exports = { process };\n").unwrap();
-    fs::write(project_dir.path().join("src/core/caller.js"), r#"
+    fs::write(
+        project_dir.path().join("src/core/helper.js"),
+        "function process() { return 1; }\nmodule.exports = { process };\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/util/helper.js"),
+        "function process() { return 2; }\nmodule.exports = { process };\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/core/caller.js"),
+        r#"
 const helper = require('../util/helper');
 
 function run() { return helper.process(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
-    let caller = crate::storage::queries::get_nodes_with_files_by_name(
-        db.conn(), "run",
-    ).unwrap();
-    let caller = caller.iter()
+    let caller = crate::storage::queries::get_nodes_with_files_by_name(db.conn(), "run").unwrap();
+    let caller = caller
+        .iter()
         .find(|n| n.file_path == "src/core/caller.js")
         .expect("run should be indexed");
 
     let edges = get_edges_from(db.conn(), caller.node.id).unwrap();
-    let call_target_paths: Vec<String> = edges.iter()
-        .filter(|e| e.relation == REL_CALLS)
-        .filter_map(|e| db.conn().query_row(
+    let call_target_paths: Vec<String> =
+        edges
+            .iter()
+            .filter(|e| e.relation == REL_CALLS)
+            .filter_map(|e| {
+                db.conn().query_row(
             "SELECT f.path FROM nodes n JOIN files f ON n.file_id = f.id WHERE n.id = ?1",
             [e.target_id], |row| row.get(0),
-        ).ok())
-        .collect();
+        ).ok()
+            })
+            .collect();
 
     assert!(
         call_target_paths.iter().any(|p| p == "src/util/helper.js"),
@@ -799,7 +1103,9 @@ fn test_js_module_level_test_callback_calls_resolve() {
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
 
-    fs::write(project_dir.path().join("helpers.test.js"), r#"
+    fs::write(
+        project_dir.path().join("helpers.test.js"),
+        r#"
 function mkHome() { return '/tmp/x'; }
 function writeJson(p, v) { }
 
@@ -807,23 +1113,32 @@ test('uses helpers', () => {
     const h = mkHome();
     writeJson(h, { a: 1 });
 });
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Both helper names must have at least one incoming call edge.
     for helper in ["mkHome", "writeJson"] {
-        let cnt: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM edges e
+        let cnt: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM edges e
              JOIN nodes tn ON tn.id = e.target_id
              JOIN files tf ON tf.id = tn.file_id
              WHERE tn.name = ?1 AND tf.path = 'helpers.test.js' AND e.relation = 'calls'",
-            [helper], |row| row.get(0),
-        ).unwrap();
-        assert!(cnt >= 1,
+                [helper],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            cnt >= 1,
             "{} should have at least one incoming call edge from the test callback, got {}",
-            helper, cnt);
+            helper,
+            cnt
+        );
     }
 }
 
@@ -858,7 +1173,11 @@ fn test_incremental_propagates_dirty_context() {
 
     // Initial: B (in b.ts) calls A (in a.ts)
     fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
-    fs::write(project_dir.path().join("b.ts"), "function beta() { alpha(); }").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function beta() { alpha(); }",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     let beta_nodes = get_nodes_by_name(db.conn(), "beta").unwrap();
@@ -866,14 +1185,21 @@ fn test_incremental_propagates_dirty_context() {
     let beta_ctx_before = beta_nodes[0].context_string.clone().unwrap_or_default();
 
     // Change A: rename function (alpha -> alphaRenamed)
-    fs::write(project_dir.path().join("a.ts"), "function alphaRenamed() {}").unwrap();
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "function alphaRenamed() {}",
+    )
+    .unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
     // beta's context_string should be updated (calls list changed because
     // the old alpha node is gone and edge was cascade-deleted)
     let beta_nodes_after = get_nodes_by_name(db.conn(), "beta").unwrap();
     assert_eq!(beta_nodes_after.len(), 1);
-    let beta_ctx_after = beta_nodes_after[0].context_string.clone().unwrap_or_default();
+    let beta_ctx_after = beta_nodes_after[0]
+        .context_string
+        .clone()
+        .unwrap_or_default();
     assert_ne!(beta_ctx_before, beta_ctx_after);
 }
 
@@ -892,7 +1218,11 @@ fn test_edge_flip_invalidates_caller_vector() {
 
     // beta (b.ts) calls alpha (a.ts)
     fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
-    fs::write(project_dir.path().join("b.ts"), "function beta() { alpha(); }").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function beta() { alpha(); }",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     let beta_nodes = get_nodes_by_name(db.conn(), "beta").unwrap();
@@ -902,24 +1232,37 @@ fn test_edge_flip_invalidates_caller_vector() {
     // Seed a fake vector for beta (indexing ran with model=None, so no real embed).
     let fake: Vec<f32> = vec![0.1; crate::domain::EMBEDDING_DIM];
     crate::storage::queries::insert_node_vector(db.conn(), beta_id, &fake).unwrap();
-    assert!(crate::storage::queries::get_node_embedding(db.conn(), beta_id).is_ok(),
-        "fake vector must be present before the edge flip");
+    assert!(
+        crate::storage::queries::get_node_embedding(db.conn(), beta_id).is_ok(),
+        "fake vector must be present before the edge flip"
+    );
 
     // Flip the edge: rename alpha → alphaRenamed. beta is a cross-file caller, so
     // its context_string is regenerated (callee set changed) but its node row is NOT
     // deleted (b.ts unchanged) — exactly the case the AFTER DELETE trigger misses.
-    fs::write(project_dir.path().join("a.ts"), "function alphaRenamed() {}").unwrap();
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "function alphaRenamed() {}",
+    )
+    .unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
     let beta_after = get_nodes_by_name(db.conn(), "beta").unwrap();
     assert_eq!(beta_after.len(), 1);
-    assert_eq!(beta_after[0].id, beta_id, "beta node id stays stable (not recreated)");
+    assert_eq!(
+        beta_after[0].id, beta_id,
+        "beta node id stays stable (not recreated)"
+    );
     // Its stale vector must be gone, and beta re-selectable by the background embedder.
-    assert!(crate::storage::queries::get_node_embedding(db.conn(), beta_id).is_err(),
-        "stale vector for cross-file dirty node must be invalidated when model=None");
+    assert!(
+        crate::storage::queries::get_node_embedding(db.conn(), beta_id).is_err(),
+        "stale vector for cross-file dirty node must be invalidated when model=None"
+    );
     let unembedded = crate::storage::queries::get_unembedded_nodes(db.conn(), 50).unwrap();
-    assert!(unembedded.iter().any(|(id, _)| *id == beta_id),
-        "beta must be re-selectable by the background embedder after invalidation");
+    assert!(
+        unembedded.iter().any(|(id, _)| *id == beta_id),
+        "beta must be re-selectable by the background embedder after invalidation"
+    );
 }
 
 #[test]
@@ -936,13 +1279,19 @@ fn test_cross_language_structural_edges_isolated() {
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
 
     // Rust `use anyhow::Result` (import target_name "Result") + a Rust fn `fs`.
-    fs::write(project_dir.path().join("src/lib.rs"),
-        "use anyhow::Result;\npub fn foo() -> Result<()> { Ok(()) }\npub fn fs() {}\n").unwrap();
+    fs::write(
+        project_dir.path().join("src/lib.rs"),
+        "use anyhow::Result;\npub fn foo() -> Result<()> { Ok(()) }\npub fn fs() {}\n",
+    )
+    .unwrap();
     // Markdown heading "Result" — the cross-language collision target.
     fs::write(project_dir.path().join("README.md"), "# Result\n\nDocs.\n").unwrap();
     // JS `require('fs')` (import target_name "fs") collides with the Rust `fs` fn.
-    fs::write(project_dir.path().join("app.js"),
-        "const fs = require('fs');\nfunction g() { return fs; }\n").unwrap();
+    fs::write(
+        project_dir.path().join("app.js"),
+        "const fs = require('fs');\nfunction g() { return fs; }\n",
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
@@ -950,24 +1299,38 @@ fn test_cross_language_structural_edges_isolated() {
 
     // Sanity: the markdown collision target exists (so a passing test can't be a
     // false pass from the heading simply not being indexed).
-    let md_result: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id \
-         WHERE n.name = 'Result' AND f.language = 'markdown'", [], |r| r.get(0)).unwrap();
-    assert_eq!(md_result, 1, "markdown 'Result' heading must be indexed (the collision target)");
+    let md_result: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id \
+         WHERE n.name = 'Result' AND f.language = 'markdown'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        md_result, 1,
+        "markdown 'Result' heading must be indexed (the collision target)"
+    );
 
     // No structural edge may cross language to a NON-external target. The
     // `<external>` sentinel (language 'external') is the only allowed
     // not-same-language import/implements target.
-    let cross_lang_structural: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM edges e \
+    let cross_lang_structural: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e \
          JOIN nodes s ON s.id = e.source_id JOIN files fs ON fs.id = s.file_id \
          JOIN nodes t ON t.id = e.target_id JOIN files ft ON ft.id = t.file_id \
          WHERE e.relation IN ('imports','inherits','implements','exports','routes_to') \
            AND fs.language IS NOT ft.language \
            AND COALESCE(ft.language,'') != 'external'",
-        [], |r| r.get(0)).unwrap();
-    assert_eq!(cross_lang_structural, 0,
-        "structural edges must bind same-language only; got {cross_lang_structural} cross-language");
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cross_lang_structural, 0,
+        "structural edges must bind same-language only; got {cross_lang_structural} cross-language"
+    );
 }
 
 #[test]
@@ -983,41 +1346,71 @@ fn test_cross_family_structural_edges_preserved() {
     let db_dir = TempDir::new().unwrap();
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
 
-    fs::write(project_dir.path().join("src/base.ts"), "export class Base {}\n").unwrap();
-    fs::write(project_dir.path().join("src/iface.ts"), "export interface Iface { go(): void; }\n").unwrap();
-    fs::write(project_dir.path().join("src/comp.tsx"),
-        "class DerTsx extends Base {}\nclass ImplTsx implements Iface { go() {} }\n").unwrap();
+    fs::write(
+        project_dir.path().join("src/base.ts"),
+        "export class Base {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/iface.ts"),
+        "export interface Iface { go(): void; }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/comp.tsx"),
+        "class DerTsx extends Base {}\nclass ImplTsx implements Iface { go() {} }\n",
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
     let conn = db.conn();
 
     // inherits: DerTsx(.tsx) -> Base(.ts) binds to the REAL ts node (not dropped).
-    let inherits_to_base: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM edges e \
+    let inherits_to_base: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e \
          JOIN nodes s ON s.id = e.source_id \
          JOIN nodes t ON t.id = e.target_id JOIN files ft ON ft.id = t.file_id \
          WHERE e.relation = 'inherits' AND s.name = 'DerTsx' \
            AND t.name = 'Base' AND ft.path = 'src/base.ts'",
-        [], |r| r.get(0)).unwrap();
-    assert_eq!(inherits_to_base, 1,
-        "cross-family inherits (.tsx -> .ts) must bind to the real base class");
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        inherits_to_base, 1,
+        "cross-family inherits (.tsx -> .ts) must bind to the real base class"
+    );
 
     // implements: ImplTsx(.tsx) -> Iface(.ts) binds to the real node, not <external>.
-    let implements_to_iface: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM edges e \
+    let implements_to_iface: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges e \
          JOIN nodes s ON s.id = e.source_id \
          JOIN nodes t ON t.id = e.target_id JOIN files ft ON ft.id = t.file_id \
          WHERE e.relation = 'implements' AND s.name = 'ImplTsx' \
            AND t.name = 'Iface' AND ft.path = 'src/iface.ts'",
-        [], |r| r.get(0)).unwrap();
-    assert_eq!(implements_to_iface, 1,
-        "cross-family implements (.tsx -> .ts) must bind to the real interface");
-    let external_iface: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id \
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        implements_to_iface, 1,
+        "cross-family implements (.tsx -> .ts) must bind to the real interface"
+    );
+    let external_iface: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id \
          WHERE n.name = 'Iface' AND f.path = '<external>'",
-        [], |r| r.get(0)).unwrap();
-    assert_eq!(external_iface, 0, "no phantom <external>/Iface when the real interface exists");
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        external_iface, 0,
+        "no phantom <external>/Iface when the real interface exists"
+    );
 }
 
 #[test]
@@ -1034,34 +1427,72 @@ fn test_phase2c_restore_binds_only_original_target_file() {
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
-    fs::write(project_dir.path().join("src/caller.ts"), "function caller() { target(); }").unwrap();
-    fs::write(project_dir.path().join("src/target.ts"), "function target() {}").unwrap();
-    fs::write(project_dir.path().join("src/other.ts"), "function unrelated() {}").unwrap();
+    fs::write(
+        project_dir.path().join("src/caller.ts"),
+        "function caller() { target(); }",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/target.ts"),
+        "function target() {}",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/other.ts"),
+        "function unrelated() {}",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     let count_caller_to = |path: &str| -> i64 {
-        db.conn().query_row(
-            "SELECT COUNT(*) FROM edges e \
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
              JOIN nodes s ON s.id = e.source_id JOIN files fs ON fs.id = s.file_id \
              JOIN nodes t ON t.id = e.target_id JOIN files ft ON ft.id = t.file_id \
              WHERE e.relation = 'calls' AND s.name = 'caller' AND t.name = 'target' \
                AND fs.path = 'src/caller.ts' AND ft.path = ?1",
-            [path], |r| r.get(0)).unwrap()
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
     };
-    assert_eq!(count_caller_to("src/target.ts"), 1, "initial: caller → target.ts:target");
-    assert_eq!(count_caller_to("src/other.ts"), 0, "initial: other.ts has no target yet");
+    assert_eq!(
+        count_caller_to("src/target.ts"),
+        1,
+        "initial: caller → target.ts:target"
+    );
+    assert_eq!(
+        count_caller_to("src/other.ts"),
+        0,
+        "initial: other.ts has no target yet"
+    );
 
     // Re-index BOTH target.ts (keep `target`) and other.ts (ADD a `target`) in one batch.
-    fs::write(project_dir.path().join("src/target.ts"), "function target() { return 1; }").unwrap();
-    fs::write(project_dir.path().join("src/other.ts"), "function unrelated() {}\nfunction target() {}").unwrap();
+    fs::write(
+        project_dir.path().join("src/target.ts"),
+        "function target() { return 1; }",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/other.ts"),
+        "function unrelated() {}\nfunction target() {}",
+    )
+    .unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
     // Happy path: the cascade-deleted edge was restored to the NEW target.ts node.
-    assert_eq!(count_caller_to("src/target.ts"), 1,
-        "restore must rebind caller → target.ts:target to the new node id");
+    assert_eq!(
+        count_caller_to("src/target.ts"),
+        1,
+        "restore must rebind caller → target.ts:target to the new node id"
+    );
     // Over-creation guard: must NOT fan out to other.ts's same-name target.
-    assert_eq!(count_caller_to("src/other.ts"), 0,
-        "restore must NOT bind caller → other.ts:target (cross-file fan-out a rebuild never makes)");
+    assert_eq!(
+        count_caller_to("src/other.ts"),
+        0,
+        "restore must NOT bind caller → other.ts:target (cross-file fan-out a rebuild never makes)"
+    );
 }
 
 #[test]
@@ -1090,13 +1521,25 @@ fn test_build_python_module_map() {
     let map = build_python_module_map(&paths);
 
     // Full dotted path
-    assert!(map.get("myapp.utils").unwrap().contains(&"myapp/utils.py".to_string()));
+    assert!(map
+        .get("myapp.utils")
+        .unwrap()
+        .contains(&"myapp/utils.py".to_string()));
     // Suffix path
-    assert!(map.get("utils").unwrap().contains(&"myapp/utils.py".to_string()));
+    assert!(map
+        .get("utils")
+        .unwrap()
+        .contains(&"myapp/utils.py".to_string()));
     // __init__.py maps to package
-    assert!(map.get("myapp").unwrap().contains(&"myapp/__init__.py".to_string()));
+    assert!(map
+        .get("myapp")
+        .unwrap()
+        .contains(&"myapp/__init__.py".to_string()));
     // Nested with src/ prefix
-    assert!(map.get("myapp.models").unwrap().contains(&"src/myapp/models.py".to_string()));
+    assert!(map
+        .get("myapp.models")
+        .unwrap()
+        .contains(&"src/myapp/models.py".to_string()));
 }
 
 #[test]
@@ -1110,11 +1553,13 @@ fn test_python_from_import_resolution() {
     fs::write(
         project_dir.path().join("myapp/utils.py"),
         "def helper():\n    return 42\n",
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(
         project_dir.path().join("myapp/main.py"),
         "from myapp.utils import helper\n\ndef main():\n    helper()\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
     assert!(result.edges_created > 0, "should create import edges");
@@ -1138,11 +1583,13 @@ fn test_python_import_module_resolution() {
     fs::write(
         project_dir.path().join("myutils.py"),
         "def do_something():\n    pass\n",
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(
         project_dir.path().join("main.py"),
         "import myutils\n\ndef main():\n    myutils.do_something()\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
     assert!(result.edges_created > 0, "should create import edges");
@@ -1174,9 +1621,21 @@ fn test_python_external_import_creates_virtual_nodes() {
     // Verify <external> file was created with virtual nodes
     let ext_nodes = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
     let ext_names: Vec<&str> = ext_nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(ext_names.contains(&"os"), "should have virtual node for 'os', got: {:?}", ext_names);
-    assert!(ext_names.contains(&"collections"), "should have virtual node for 'collections', got: {:?}", ext_names);
-    assert!(ext_names.contains(&"flask"), "should have virtual node for 'flask', got: {:?}", ext_names);
+    assert!(
+        ext_names.contains(&"os"),
+        "should have virtual node for 'os', got: {:?}",
+        ext_names
+    );
+    assert!(
+        ext_names.contains(&"collections"),
+        "should have virtual node for 'collections', got: {:?}",
+        ext_names
+    );
+    assert!(
+        ext_names.contains(&"flask"),
+        "should have virtual node for 'flask', got: {:?}",
+        ext_names
+    );
 
     // Verify dependency_graph shows <external> as a dependency
     let deps = get_import_tree(db.conn(), "app.py", "outgoing", 1).unwrap();
@@ -1198,7 +1657,8 @@ fn test_python_mixed_internal_external_imports() {
     fs::write(
         project_dir.path().join("myapp/utils.py"),
         "def helper():\n    return 42\n",
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(
         project_dir.path().join("myapp/main.py"),
         "import os\nfrom myapp.utils import helper\nfrom flask import Flask\n\ndef main():\n    helper()\n",
@@ -1210,10 +1670,18 @@ fn test_python_mixed_internal_external_imports() {
     // Should have internal dependency
     let deps = get_import_tree(db.conn(), "myapp/main.py", "outgoing", 1).unwrap();
     let dep_files: Vec<&str> = deps.iter().map(|d| d.file_path.as_str()).collect();
-    assert!(dep_files.contains(&"myapp/utils.py"), "should depend on internal utils.py, got: {:?}", dep_files);
+    assert!(
+        dep_files.contains(&"myapp/utils.py"),
+        "should depend on internal utils.py, got: {:?}",
+        dep_files
+    );
 
     // Should also have external dependency
-    assert!(dep_files.contains(&"<external>"), "should depend on <external>, got: {:?}", dep_files);
+    assert!(
+        dep_files.contains(&"<external>"),
+        "should depend on <external>, got: {:?}",
+        dep_files
+    );
 }
 
 #[test]
@@ -1232,7 +1700,10 @@ fn test_index_stats_skipped_large_file() {
 
     let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
     assert_eq!(result.files_indexed, 1, "should index the small file");
-    assert_eq!(result.stats.files_skipped_size, 1, "should track the large file skip");
+    assert_eq!(
+        result.stats.files_skipped_size, 1,
+        "should track the large file skip"
+    );
 }
 
 #[test]
@@ -1275,23 +1746,31 @@ fn test_python_external_survives_incremental_index() {
     fs::write(
         project_dir.path().join("app.py"),
         "import os\n\ndef main():\n    pass\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Full index → creates <external> with "os" node
     run_full_index(&db, project_dir.path(), None, None).unwrap();
     let ext_before = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
-    assert!(!ext_before.is_empty(), "should have external nodes after full index");
+    assert!(
+        !ext_before.is_empty(),
+        "should have external nodes after full index"
+    );
 
     // Modify file slightly
     fs::write(
         project_dir.path().join("app.py"),
         "import os\n\ndef main():\n    return 1\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Incremental index → <external> should survive
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
     let ext_after = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
-    assert!(!ext_after.is_empty(), "external nodes should survive incremental index");
+    assert!(
+        !ext_after.is_empty(),
+        "external nodes should survive incremental index"
+    );
 
     // Verify dependency still visible
     let deps = get_import_tree(db.conn(), "app.py", "outgoing", 1).unwrap();
@@ -1308,27 +1787,42 @@ fn test_repair_null_context_strings() {
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
     // Index a file so nodes get context strings
-    fs::write(project_dir.path().join("a.ts"), r#"
+    fs::write(
+        project_dir.path().join("a.ts"),
+        r#"
 function alpha() { return 1; }
 function beta() { alpha(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Verify context strings exist after index
     let alpha_nodes = get_nodes_by_name(db.conn(), "alpha").unwrap();
     assert_eq!(alpha_nodes.len(), 1);
-    assert!(alpha_nodes[0].context_string.is_some(), "alpha should have context_string after index");
+    assert!(
+        alpha_nodes[0].context_string.is_some(),
+        "alpha should have context_string after index"
+    );
 
     let beta_nodes = get_nodes_by_name(db.conn(), "beta").unwrap();
     assert_eq!(beta_nodes.len(), 1);
-    assert!(beta_nodes[0].context_string.is_some(), "beta should have context_string after index");
+    assert!(
+        beta_nodes[0].context_string.is_some(),
+        "beta should have context_string after index"
+    );
 
     // Simulate Phase 3 failure: NULL out context_strings
-    db.conn().execute("UPDATE nodes SET context_string = NULL", []).unwrap();
+    db.conn()
+        .execute("UPDATE nodes SET context_string = NULL", [])
+        .unwrap();
 
     // Verify they are now NULL
     let alpha_after_null = get_nodes_by_name(db.conn(), "alpha").unwrap();
-    assert!(alpha_after_null[0].context_string.is_none(), "alpha context_string should be NULL after simulated failure");
+    assert!(
+        alpha_after_null[0].context_string.is_none(),
+        "alpha context_string should be NULL after simulated failure"
+    );
 
     // Run repair
     let repaired = repair_null_context_strings(&db, None).unwrap();
@@ -1336,10 +1830,16 @@ function beta() { alpha(); }
 
     // Verify context strings were restored
     let alpha_repaired = get_nodes_by_name(db.conn(), "alpha").unwrap();
-    assert!(alpha_repaired[0].context_string.is_some(), "alpha should have context_string after repair");
+    assert!(
+        alpha_repaired[0].context_string.is_some(),
+        "alpha should have context_string after repair"
+    );
 
     let beta_repaired = get_nodes_by_name(db.conn(), "beta").unwrap();
-    assert!(beta_repaired[0].context_string.is_some(), "beta should have context_string after repair");
+    assert!(
+        beta_repaired[0].context_string.is_some(),
+        "beta should have context_string after repair"
+    );
 }
 
 #[test]
@@ -1348,7 +1848,9 @@ fn test_rust_implements_creates_sentinel_for_external_trait() {
     let db_dir = TempDir::new().unwrap();
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
-    fs::write(project_dir.path().join("main.rs"), r#"
+    fs::write(
+        project_dir.path().join("main.rs"),
+        r#"
 use std::io::{self, Write};
 use std::fmt;
 
@@ -1364,7 +1866,9 @@ impl fmt::Display for MyWriter {
         write!(f, "MyWriter")
     }
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
     assert!(result.files_indexed > 0);
@@ -1372,29 +1876,50 @@ impl fmt::Display for MyWriter {
     // Verify sentinel nodes created for external traits
     let ext_nodes = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
     let ext_names: Vec<&str> = ext_nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(ext_names.contains(&"Write"), "should have sentinel for Write, got: {:?}", ext_names);
+    assert!(
+        ext_names.contains(&"Write"),
+        "should have sentinel for Write, got: {:?}",
+        ext_names
+    );
     // fmt::Display keeps path prefix (as parsed by tree-sitter)
-    assert!(ext_names.contains(&"fmt::Display"), "should have sentinel for fmt::Display, got: {:?}", ext_names);
+    assert!(
+        ext_names.contains(&"fmt::Display"),
+        "should have sentinel for fmt::Display, got: {:?}",
+        ext_names
+    );
 
     // Verify sentinel type is "trait"
     let write_node = ext_nodes.iter().find(|n| n.name == "Write").unwrap();
-    assert_eq!(write_node.node_type, "trait", "sentinel should be type 'trait'");
+    assert_eq!(
+        write_node.node_type, "trait",
+        "sentinel should be type 'trait'"
+    );
 
     // Verify implements edges exist: MyWriter → Write, MyWriter → Display
-    let edges: Vec<(String, String)> = db.conn().prepare(
-        "SELECT ns.name, nt.name FROM edges e
+    let edges: Vec<(String, String)> = db
+        .conn()
+        .prepare(
+            "SELECT ns.name, nt.name FROM edges e
          JOIN nodes ns ON ns.id = e.source_id
          JOIN nodes nt ON nt.id = e.target_id
-         WHERE e.relation = 'implements'"
-    ).unwrap()
-    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-    .unwrap()
-    .collect::<Result<Vec<_>, _>>().unwrap();
+         WHERE e.relation = 'implements'",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
-    assert!(edges.contains(&("MyWriter".into(), "Write".into())),
-        "should have MyWriter→Write implements edge, got: {:?}", edges);
-    assert!(edges.contains(&("MyWriter".into(), "fmt::Display".into())),
-        "should have MyWriter→fmt::Display implements edge, got: {:?}", edges);
+    assert!(
+        edges.contains(&("MyWriter".into(), "Write".into())),
+        "should have MyWriter→Write implements edge, got: {:?}",
+        edges
+    );
+    assert!(
+        edges.contains(&("MyWriter".into(), "fmt::Display".into())),
+        "should have MyWriter→fmt::Display implements edge, got: {:?}",
+        edges
+    );
 }
 
 /// ensure_file_indexed must (a) be a no-op when on-disk hash matches the
@@ -1411,7 +1936,10 @@ fn test_ensure_file_indexed_picks_up_post_edit_changes() {
     fs::write(project_dir.path().join("a.ts"), "function alpha() {}\n").unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
     let names_before: Vec<String> = get_nodes_by_name(db.conn(), "alpha")
-        .unwrap().into_iter().map(|n| n.name).collect();
+        .unwrap()
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
     assert_eq!(names_before, vec!["alpha".to_string()]);
 
     // No-op when hashes match
@@ -1424,10 +1952,16 @@ fn test_ensure_file_indexed_picks_up_post_edit_changes() {
     assert!(did2, "hash mismatch must trigger a reindex");
 
     // alpha gone, beta present — post-Edit query would now see fresh state
-    assert!(get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty(),
-        "old alpha must be evicted by single-file reindex");
+    assert!(
+        get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty(),
+        "old alpha must be evicted by single-file reindex"
+    );
     let beta = get_nodes_by_name(db.conn(), "beta").unwrap();
-    assert_eq!(beta.len(), 1, "new beta must appear after single-file reindex");
+    assert_eq!(
+        beta.len(),
+        1,
+        "new beta must appear after single-file reindex"
+    );
     assert_eq!(beta[0].name, "beta");
 
     // Calling again with no on-disk change is a no-op
@@ -1438,8 +1972,10 @@ fn test_ensure_file_indexed_picks_up_post_edit_changes() {
     fs::remove_file(project_dir.path().join("a.ts")).unwrap();
     let did4 = ensure_file_indexed(&db, project_dir.path(), "a.ts", None).unwrap();
     assert!(did4, "missing file must trigger row cleanup");
-    assert!(get_nodes_by_name(db.conn(), "beta").unwrap().is_empty(),
-        "beta must be cascade-deleted with its file");
+    assert!(
+        get_nodes_by_name(db.conn(), "beta").unwrap().is_empty(),
+        "beta must be cascade-deleted with its file"
+    );
 }
 
 /// Root-cause test for `feedback_incremental_edge_timing.md`: file B
@@ -1460,44 +1996,74 @@ fn test_pending_unresolved_call_resolves_when_callee_added_later() {
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
     // Step 1: B exists alone with bare-name call to foo (foo undefined).
-    fs::write(project_dir.path().join("b.ts"),
-        "function caller_b() { foo(); }\n").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { foo(); }\n",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Phase 2 dropped the edge (no same-file/same-language target) and
     // buffered the row instead.
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
-        "B's call to undefined foo must land in pending_unresolved_calls");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        1,
+        "B's call to undefined foo must land in pending_unresolved_calls"
+    );
 
-    let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b").unwrap()
-        .into_iter().next().expect("caller_b must exist").0;
+    let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("caller_b must exist")
+        .0;
 
     // Verify NO edge yet (foo doesn't exist in DB).
     let pre_edges = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
-    assert!(pre_edges.iter().all(|e| e.relation != REL_CALLS),
-        "no calls edge should exist yet — foo is undefined");
+    assert!(
+        pre_edges.iter().all(|e| e.relation != REL_CALLS),
+        "no calls edge should exist yet — foo is undefined"
+    );
 
     // Step 2: A is added with foo(). Incremental index picks it up; the
     // pending sweep at end of index_files promotes B's buffered call into
     // a real edge.
-    fs::write(project_dir.path().join("a.ts"),
-        "export function foo() {}\n").unwrap();
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "export function foo() {}\n",
+    )
+    .unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
-    let foo_id = get_node_ids_by_name(db.conn(), "foo").unwrap()
-        .into_iter().next().expect("foo must exist after A indexed").0;
+    let foo_id = get_node_ids_by_name(db.conn(), "foo")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("foo must exist after A indexed")
+        .0;
 
     let post_edges = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
-    let calls_to_foo: Vec<_> = post_edges.iter()
+    let calls_to_foo: Vec<_> = post_edges
+        .iter()
         .filter(|e| e.relation == REL_CALLS && e.target_id == foo_id)
         .collect();
-    assert_eq!(calls_to_foo.len(), 1,
+    assert_eq!(
+        calls_to_foo.len(),
+        1,
         "incremental index must promote pending call → calls edge caller_b → foo; \
-         got edges: {:?}", post_edges.iter().map(|e| (&e.relation, e.target_id)).collect::<Vec<_>>());
+         got edges: {:?}",
+        post_edges
+            .iter()
+            .map(|e| (&e.relation, e.target_id))
+            .collect::<Vec<_>>()
+    );
 
     // Pending row must be drained after successful resolution.
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
-        "resolved pending row must be deleted after edge insertion");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        0,
+        "resolved pending row must be deleted after edge insertion"
+    );
 }
 
 /// Bounded retention (SCHEMA v10, D#77): a pending row that fails to resolve
@@ -1515,8 +2081,11 @@ fn test_pending_evicted_after_max_failed_sweeps() {
     let db_dir = TempDir::new().unwrap();
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
-    fs::write(project_dir.path().join("b.ts"),
-        "function caller_b() { neverDefinedAnywhere(); }\n").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { neverDefinedAnywhere(); }\n",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
     assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
 
@@ -1525,13 +2094,19 @@ fn test_pending_evicted_after_max_failed_sweeps() {
     for _ in 0..(PENDING_CALL_MAX_ATTEMPTS - 2) {
         resolve_pending_calls(&db).unwrap();
     }
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
-        "row must survive below PENDING_CALL_MAX_ATTEMPTS failed sweeps");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        1,
+        "row must survive below PENDING_CALL_MAX_ATTEMPTS failed sweeps"
+    );
 
     // The threshold-crossing sweep evicts it.
     resolve_pending_calls(&db).unwrap();
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
-        "row must be evicted once it has failed PENDING_CALL_MAX_ATTEMPTS sweeps");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        0,
+        "row must be evicted once it has failed PENDING_CALL_MAX_ATTEMPTS sweeps"
+    );
 }
 
 /// Boundary guard for the incremental-edge-timing guarantee under bounded
@@ -1548,8 +2123,11 @@ fn test_pending_at_eviction_boundary_still_resolves() {
     let db_dir = TempDir::new().unwrap();
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
-    fs::write(project_dir.path().join("b.ts"),
-        "function caller_b() { lateFoo(); }\n").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { lateFoo(); }\n",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Age to the brink: attempts = MAX - 1 (full index swept once already).
@@ -1559,17 +2137,32 @@ fn test_pending_at_eviction_boundary_still_resolves() {
     assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
 
     // Callee arrives — the incremental pass's sweep must resolve, not evict.
-    fs::write(project_dir.path().join("a.ts"),
-        "export function lateFoo() {}\n").unwrap();
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "export function lateFoo() {}\n",
+    )
+    .unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
-    let caller_id = get_node_ids_by_name(db.conn(), "caller_b").unwrap()
-        .into_iter().next().expect("caller_b must exist").0;
-    let foo_id = get_node_ids_by_name(db.conn(), "lateFoo").unwrap()
-        .into_iter().next().expect("lateFoo must exist").0;
+    let caller_id = get_node_ids_by_name(db.conn(), "caller_b")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("caller_b must exist")
+        .0;
+    let foo_id = get_node_ids_by_name(db.conn(), "lateFoo")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("lateFoo must exist")
+        .0;
     let edges = crate::storage::queries::get_edges_from(db.conn(), caller_id).unwrap();
-    assert!(edges.iter().any(|e| e.relation == REL_CALLS && e.target_id == foo_id),
-        "a row at the eviction boundary must still resolve when the callee arrives");
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.relation == REL_CALLS && e.target_id == foo_id),
+        "a row at the eviction boundary must still resolve when the callee arrives"
+    );
     assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0);
 }
 
@@ -1587,19 +2180,24 @@ fn test_pending_unresolved_call_does_not_cross_language() {
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
     // TS file with bare-name call to `update`
-    fs::write(project_dir.path().join("client.ts"),
-        "function caller_ts() { update(); }\n").unwrap();
+    fs::write(
+        project_dir.path().join("client.ts"),
+        "function caller_ts() { update(); }\n",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
     assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
 
     // Rust file with `update` — different language, must NOT match.
-    fs::write(project_dir.path().join("hasher.rs"),
-        "fn update() {}\n").unwrap();
+    fs::write(project_dir.path().join("hasher.rs"), "fn update() {}\n").unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
     // Pending row stays — sweep refused cross-language resolution.
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
-        "cross-language target must NOT resolve a TS pending call to a Rust fn");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        1,
+        "cross-language target must NOT resolve a TS pending call to a Rust fn"
+    );
 }
 
 /// One caller with N undefined references must produce N pending rows;
@@ -1615,29 +2213,52 @@ fn test_pending_resolves_multiple_calls_in_same_caller() {
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
     // B has three undefined call targets — foo, bar, baz.
-    fs::write(project_dir.path().join("b.ts"),
-        "function caller_b() { foo(); bar(); baz(); }\n").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { foo(); bar(); baz(); }\n",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 3,
-        "three bare-name calls must produce three pending rows");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        3,
+        "three bare-name calls must produce three pending rows"
+    );
 
     // A defines all three.
-    fs::write(project_dir.path().join("a.ts"),
-        "export function foo() {}\nexport function bar() {}\nexport function baz() {}\n").unwrap();
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "export function foo() {}\nexport function bar() {}\nexport function baz() {}\n",
+    )
+    .unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
-        "all three pending rows must drain once their targets exist");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        0,
+        "all three pending rows must drain once their targets exist"
+    );
 
     // All three resolved into real edges.
-    let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b").unwrap()
-        .into_iter().next().unwrap().0;
+    let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .0;
     let edges = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
     let calls_count = edges.iter().filter(|e| e.relation == REL_CALLS).count();
-    assert_eq!(calls_count, 3,
+    assert_eq!(
+        calls_count,
+        3,
         "caller_b must have exactly three calls edges (foo, bar, baz); got {} edges total: {:?}",
-        calls_count, edges.iter().map(|e| (&e.relation, e.target_id)).collect::<Vec<_>>());
+        calls_count,
+        edges
+            .iter()
+            .map(|e| (&e.relation, e.target_id))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// When the caller's source file is reindexed (e.g. user edits B), the
@@ -1655,20 +2276,29 @@ fn test_pending_cascade_deletes_when_caller_file_reindexed() {
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
     // B with undefined target → pending row created.
-    fs::write(project_dir.path().join("b.ts"),
-        "function caller_b() { undefined_target(); }\n").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { undefined_target(); }\n",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
     assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
 
     // Edit B to remove the call entirely. caller_b's old node gets
     // cascade-deleted on reindex (Phase 1 deletes prior rows), and its
     // pending row must follow it via ON DELETE CASCADE on source_id.
-    fs::write(project_dir.path().join("b.ts"),
-        "function caller_b() { /* call removed */ }\n").unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { /* call removed */ }\n",
+    )
+    .unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
-        "pending row must be cascade-deleted when its source caller is removed/reindexed");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        0,
+        "pending row must be cascade-deleted when its source caller is removed/reindexed"
+    );
 }
 
 /// Inverse-direction symmetry test for `feedback_incremental_edge_timing.md`:
@@ -1686,23 +2316,44 @@ fn test_pending_buffers_on_callee_file_deletion() {
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
 
     // Initial: A defines foo, B calls foo — edge B.caller_b → A.foo exists.
-    fs::write(project_dir.path().join("a.ts"),
-        "export function foo() {}\n").unwrap();
-    fs::write(project_dir.path().join("b.ts"),
-        "function caller_b() { foo(); }\n").unwrap();
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "export function foo() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { foo(); }\n",
+    )
+    .unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // No pending rows yet — call resolved at index time.
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
-        "fully-resolvable call must not produce a pending row");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        0,
+        "fully-resolvable call must not produce a pending row"
+    );
 
-    let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b").unwrap()
-        .into_iter().next().unwrap().0;
-    let foo_id_pre = get_node_ids_by_name(db.conn(), "foo").unwrap()
-        .into_iter().next().unwrap().0;
+    let caller_b_id = get_node_ids_by_name(db.conn(), "caller_b")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .0;
+    let foo_id_pre = get_node_ids_by_name(db.conn(), "foo")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .0;
     let edges_pre = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
-    assert!(edges_pre.iter().any(|e| e.relation == REL_CALLS && e.target_id == foo_id_pre),
-        "edge caller_b → foo must exist pre-deletion");
+    assert!(
+        edges_pre
+            .iter()
+            .any(|e| e.relation == REL_CALLS && e.target_id == foo_id_pre),
+        "edge caller_b → foo must exist pre-deletion"
+    );
 
     // Delete A. Phase 0 must buffer B's now-orphaned call into pending
     // BEFORE cascade strips the edge.
@@ -1710,26 +2361,45 @@ fn test_pending_buffers_on_callee_file_deletion() {
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
     // foo is gone.
-    assert!(get_node_ids_by_name(db.conn(), "foo").unwrap().is_empty(),
-        "foo must be cascade-deleted with file a.ts");
+    assert!(
+        get_node_ids_by_name(db.conn(), "foo").unwrap().is_empty(),
+        "foo must be cascade-deleted with file a.ts"
+    );
 
     // B's edge to old foo is gone, but pending row holds the call.
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1,
-        "Phase 0 must buffer the orphaned inbound call into pending");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        1,
+        "Phase 0 must buffer the orphaned inbound call into pending"
+    );
 
     // Re-add A — pending sweep promotes the buffered call to a fresh edge.
-    fs::write(project_dir.path().join("a.ts"),
-        "export function foo() {}\n").unwrap();
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "export function foo() {}\n",
+    )
+    .unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
 
-    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 0,
-        "pending must drain once foo reappears");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        0,
+        "pending must drain once foo reappears"
+    );
 
-    let foo_id_post = get_node_ids_by_name(db.conn(), "foo").unwrap()
-        .into_iter().next().unwrap().0;
+    let foo_id_post = get_node_ids_by_name(db.conn(), "foo")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .0;
     let edges_post = crate::storage::queries::get_edges_from(db.conn(), caller_b_id).unwrap();
-    assert!(edges_post.iter().any(|e| e.relation == REL_CALLS && e.target_id == foo_id_post),
-        "edge caller_b → foo must reappear post re-add via pending sweep");
+    assert!(
+        edges_post
+            .iter()
+            .any(|e| e.relation == REL_CALLS && e.target_id == foo_id_post),
+        "edge caller_b → foo must reappear post re-add via pending sweep"
+    );
 }
 
 #[test]
@@ -1740,7 +2410,7 @@ fn test_is_safe_relative_path() {
     assert!(is_safe_relative_path("./src/x.rs"));
     assert!(is_safe_relative_path("a/b/../c.rs")); // net depth stays >= 0
     assert!(is_safe_relative_path("")); // empty → downstream treats as no-op
-    // Unsafe: absolute root, leading `..`, or a `..` that climbs above the root.
+                                        // Unsafe: absolute root, leading `..`, or a `..` that climbs above the root.
     assert!(!is_safe_relative_path("/etc/passwd"));
     assert!(!is_safe_relative_path("../outside.ts"));
     assert!(!is_safe_relative_path("../../etc/passwd"));
@@ -1784,14 +2454,23 @@ fn test_ensure_file_indexed_rejects_out_of_root_path() {
     assert!(!did_abs, "an absolute out-of-root path must be a no-op");
 
     // Neither external symbol leaked into the project DB.
-    assert!(get_nodes_by_name(db.conn(), "secret").unwrap().is_empty(),
-        "a `..`-escaping file must not be indexed into the project DB");
-    assert!(get_nodes_by_name(db.conn(), "absSecret").unwrap().is_empty(),
-        "an absolute out-of-root file must not be indexed into the project DB");
+    assert!(
+        get_nodes_by_name(db.conn(), "secret").unwrap().is_empty(),
+        "a `..`-escaping file must not be indexed into the project DB"
+    );
+    assert!(
+        get_nodes_by_name(db.conn(), "absSecret")
+            .unwrap()
+            .is_empty(),
+        "an absolute out-of-root file must not be indexed into the project DB"
+    );
 
     // The guard must not over-block: a legitimate in-root edit still reindexes.
     fs::write(project_root.join("ok.ts"), "function inRootEdited() {}\n").unwrap();
     let did_ok = ensure_file_indexed(&db, &project_root, "ok.ts", None).unwrap();
     assert!(did_ok, "an in-root edited file must still reindex");
-    assert_eq!(get_nodes_by_name(db.conn(), "inRootEdited").unwrap().len(), 1);
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "inRootEdited").unwrap().len(),
+        1
+    );
 }

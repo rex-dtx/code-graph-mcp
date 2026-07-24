@@ -74,7 +74,10 @@ mod tests {
 
     #[test]
     fn test_camel_case() {
-        assert_eq!(split_identifier("validateToken"), "validate Token validateToken");
+        assert_eq!(
+            split_identifier("validateToken"),
+            "validate Token validateToken"
+        );
     }
 
     #[test]
@@ -84,7 +87,10 @@ mod tests {
 
     #[test]
     fn test_snake_case() {
-        assert_eq!(split_identifier("get_user_by_id"), "get user by id get_user_by_id");
+        assert_eq!(
+            split_identifier("get_user_by_id"),
+            "get user by id get_user_by_id"
+        );
     }
 
     #[test]

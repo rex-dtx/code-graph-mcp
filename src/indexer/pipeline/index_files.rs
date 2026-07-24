@@ -23,32 +23,37 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
+use crate::domain::{
+    is_cross_file_call_noise, max_file_size, REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS,
+    REL_REFERENCES, REL_ROUTES_TO,
+};
 use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::hash_file;
 use crate::parser::relations::extract_relations_from_tree;
-use crate::parser::treesitter::{parse_tree, extract_nodes_from_tree};
+use crate::parser::treesitter::{extract_nodes_from_tree, parse_tree};
 use crate::search::tokenizer::split_identifier;
 use crate::storage::db::Database;
 use crate::storage::queries::{
-    delete_files_by_paths, delete_nodes_by_file,
-    get_all_node_names_with_ids, get_edges_batch,
-    get_inbound_cross_file_edges,
-    get_nodes_by_file_path,
-    get_nodes_with_files_by_ids,
-    insert_edge_cached, insert_node_cached,
-    update_context_strings_batch, upsert_file,
-    FileRecord, NodeRecord, NodeResult,
+    delete_files_by_paths, delete_nodes_by_file, get_all_node_names_with_ids, get_edges_batch,
+    get_inbound_cross_file_edges, get_nodes_by_file_path, get_nodes_with_files_by_ids,
+    insert_edge_cached, insert_node_cached, update_context_strings_batch, upsert_file, FileRecord,
+    NodeRecord, NodeResult,
 };
-use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_REFERENCES, max_file_size, is_cross_file_call_noise};
 use crate::utils::config::detect_language;
 
-use super::{IndexPhase, IndexResult, IndexStats, ProgressFn};
 use super::context::{categorize_edges, format_route_from_metadata};
 use super::embed::embed_and_store_batch;
+use super::js_modules::{
+    resolve_c_include_path, resolve_js_module_targets, resolve_js_specifier_path,
+    resolve_php_include_path,
+};
 use super::python_modules::{build_python_module_map, resolve_python_module_targets};
-use super::js_modules::{resolve_c_include_path, resolve_js_module_targets, resolve_js_specifier_path, resolve_php_include_path};
-use super::resolve::{bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges, refine_ambiguous_targets, resolve_pending_calls};
+use super::resolve::{
+    bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
+    refine_ambiguous_targets, resolve_pending_calls,
+};
+use super::{IndexPhase, IndexResult, IndexStats, ProgressFn};
 
 /// Heuristic: does a `.h` header contain C++-specific constructs? `.h` is C-vs-C++
 /// ambiguous by extension (detect_language maps it to C), and the C grammar cannot
@@ -136,11 +141,12 @@ pub(super) fn index_files(
         // query inbound calls before cascade fires.
         let mut deleted_file_ids: Vec<i64> = Vec::with_capacity(delete_paths.len());
         for path in delete_paths {
-            if let Ok(Some(fid)) = db.conn().query_row(
-                "SELECT id FROM files WHERE path = ?1",
-                [path],
-                |row| row.get::<_, Option<i64>>(0),
-            ) {
+            if let Ok(Some(fid)) =
+                db.conn()
+                    .query_row("SELECT id FROM files WHERE path = ?1", [path], |row| {
+                        row.get::<_, Option<i64>>(0)
+                    })
+            {
                 deleted_file_ids.push(fid);
             }
         }
@@ -162,7 +168,8 @@ pub(super) fn index_files(
         if buffered > 0 {
             tracing::info!(
                 "[index] Phase 0: buffered {} inbound calls before cascade-deleting {} file(s)",
-                buffered, deleted_file_ids.len()
+                buffered,
+                deleted_file_ids.len()
             );
         }
 
@@ -182,12 +189,15 @@ pub(super) fn index_files(
     }
 
     // Pre-build Python module map once (used in all batches for import resolution)
-    let mut all_python_paths: HashSet<String> = files.iter()
+    let mut all_python_paths: HashSet<String> = files
+        .iter()
         .filter(|f| f.ends_with(".py"))
         .cloned()
         .collect();
     {
-        let mut stmt = db.conn().prepare("SELECT path FROM files WHERE path LIKE '%.py'")?;
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT path FROM files WHERE path LIKE '%.py'")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {
             all_python_paths.insert(row?);
@@ -343,18 +353,22 @@ pub(super) fn index_files(
         // re-binds ONLY to the new same-name node in THAT file, not every same-name
         // node in the batch (which fanned out cross-file / cross-language).
         #[allow(clippy::type_complexity)]
-        let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> = Vec::new();
+        let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> =
+            Vec::new();
         // Track file_ids in this batch to filter intra-batch edges in Phase 2c
         let mut batch_file_ids: HashSet<i64> = HashSet::new();
 
         // --- Phase 1b: Sequential DB inserts ---
         for pp in pre_parsed {
-            let file_id = upsert_file(db.conn(), &FileRecord {
-                path: pp.rel_path.clone(),
-                blake3_hash: pp.hash,
-                last_modified: pp.last_modified,
-                language: Some(pp.language.clone()),
-            })?;
+            let file_id = upsert_file(
+                db.conn(),
+                &FileRecord {
+                    path: pp.rel_path.clone(),
+                    blake3_hash: pp.hash,
+                    last_modified: pp.last_modified,
+                    language: Some(pp.language.clone()),
+                },
+            )?;
 
             // Save cross-file inbound edges before cascade delete destroys them.
             // file_id IS the target file these edges point into — attach it so the
@@ -362,7 +376,9 @@ pub(super) fn index_files(
             saved_inbound_edges.extend(
                 get_inbound_cross_file_edges(db.conn(), file_id)?
                     .into_iter()
-                    .map(|(src, src_file, tname, rel, meta)| (src, src_file, file_id, tname, rel, meta)),
+                    .map(|(src, src_file, tname, rel, meta)| {
+                        (src, src_file, file_id, tname, rel, meta)
+                    }),
             );
             batch_file_ids.insert(file_id);
 
@@ -373,22 +389,25 @@ pub(super) fn index_files(
             let mut node_qualified_names: Vec<Option<String>> = Vec::new();
             let mut node_types: Vec<String> = Vec::new();
 
-            let module_node_id = insert_node_cached(db.conn(), &NodeRecord {
-                file_id,
-                node_type: "module".into(),
-                name: "<module>".into(),
-                qualified_name: Some(pp.rel_path.clone()),
-                start_line: 1,
-                end_line: pp.source.lines().count() as i64,
-                code_content: String::new(),
-                signature: None,
-                doc_comment: None,
-                context_string: None,
-                name_tokens: None,
-                return_type: None,
-                param_types: None,
-                is_test: false,
-            })?;
+            let module_node_id = insert_node_cached(
+                db.conn(),
+                &NodeRecord {
+                    file_id,
+                    node_type: "module".into(),
+                    name: "<module>".into(),
+                    qualified_name: Some(pp.rel_path.clone()),
+                    start_line: 1,
+                    end_line: pp.source.lines().count() as i64,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )?;
             node_ids.push(module_node_id);
             node_names.push("<module>".into());
             // <module> resolves by its bare name; no qualified form.
@@ -398,22 +417,25 @@ pub(super) fn index_files(
 
             for pn in &pp.parsed_nodes {
                 let name_tokens = split_identifier(&pn.name);
-                let node_id = insert_node_cached(db.conn(), &NodeRecord {
-                    file_id,
-                    node_type: pn.node_type.clone(),
-                    name: pn.name.clone(),
-                    qualified_name: pn.qualified_name.clone(),
-                    start_line: pn.start_line as i64,
-                    end_line: pn.end_line as i64,
-                    code_content: pn.code_content.clone(),
-                    signature: pn.signature.clone(),
-                    doc_comment: pn.doc_comment.clone(),
-                    context_string: None,
-                    name_tokens: Some(name_tokens),
-                    return_type: pn.return_type.clone(),
-                    param_types: pn.param_types.clone(),
-                    is_test: pn.is_test,
-                })?;
+                let node_id = insert_node_cached(
+                    db.conn(),
+                    &NodeRecord {
+                        file_id,
+                        node_type: pn.node_type.clone(),
+                        name: pn.name.clone(),
+                        qualified_name: pn.qualified_name.clone(),
+                        start_line: pn.start_line as i64,
+                        end_line: pn.end_line as i64,
+                        code_content: pn.code_content.clone(),
+                        signature: pn.signature.clone(),
+                        doc_comment: pn.doc_comment.clone(),
+                        context_string: None,
+                        name_tokens: Some(name_tokens),
+                        return_type: pn.return_type.clone(),
+                        param_types: pn.param_types.clone(),
+                        is_test: pn.is_test,
+                    },
+                )?;
                 node_ids.push(node_id);
                 node_names.push(pn.name.clone());
                 node_qualified_names.push(pn.qualified_name.clone());
@@ -437,8 +459,8 @@ pub(super) fn index_files(
         // --- Phase 2: Extract relations + insert edges ---
         // Build per-batch name_to_ids and node_id_to_path from the pre-loaded global map,
         // excluding files in the current batch (their old nodes were deleted in Phase 1b).
-        let batch_file_paths: HashSet<&str> = batch_parsed.iter()
-            .map(|pf| pf.rel_path.as_str()).collect();
+        let batch_file_paths: HashSet<&str> =
+            batch_parsed.iter().map(|pf| pf.rel_path.as_str()).collect();
 
         let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
         let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
@@ -487,14 +509,21 @@ pub(super) fn index_files(
             // bind to the required module in the call-resolution pass below.
             let mut ns_module_map: HashMap<String, String> = HashMap::new();
             for rel in &relations {
-                if rel.relation != REL_IMPORTS { continue; }
+                if rel.relation != REL_IMPORTS {
+                    continue;
+                }
                 if let Some(meta_str) = rel.metadata.as_deref() {
                     if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
                         // ESM `import * as ns` (q:"ns_import", v51) binds member
                         // calls exactly like the CJS require-namespace form.
-                        if matches!(meta.get("q").and_then(|v| v.as_str()), Some("ns_require") | Some("ns_import")) {
+                        if matches!(
+                            meta.get("q").and_then(|v| v.as_str()),
+                            Some("ns_require") | Some("ns_import")
+                        ) {
                             if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
-                                if let Some(file) = resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths) {
+                                if let Some(file) =
+                                    resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths)
+                                {
                                     ns_module_map.insert(rel.target_name.clone(), file);
                                 }
                             }
@@ -514,7 +543,8 @@ pub(super) fn index_files(
                     anyhow::bail!(
                         "ParsedRelation.source_language ({}) does not match file language ({}); \
                          parser regressed the source_language contract",
-                        rel.source_language, pf.language
+                        rel.source_language,
+                        pf.language
                     );
                 }
 
@@ -559,14 +589,20 @@ pub(super) fn index_files(
                 if rel.relation == REL_ROUTES_TO && source_ids.is_empty() {
                     let same_lang: Vec<i64> = name_to_ids
                         .get(&rel.source_name)
-                        .map(|ids| ids.iter().copied()
-                            .filter(|id| matches!(
-                                node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                Some(l) if l == pf.language.as_str()
-                            ))
-                            .collect())
+                        .map(|ids| {
+                            ids.iter()
+                                .copied()
+                                .filter(|id| {
+                                    matches!(
+                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                        Some(l) if l == pf.language.as_str()
+                                    )
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    source_ids = refine_ambiguous_targets(&same_lang, &pf.rel_path, &node_id_to_path);
+                    source_ids =
+                        refine_ambiguous_targets(&same_lang, &pf.rel_path, &node_id_to_path);
                 }
 
                 // Module-level import markers (v51, roadmap §2.3): namespace
@@ -588,17 +624,36 @@ pub(super) fn index_files(
                                 Some("ns_require") | Some("ns_import") | Some("star_reexport")
                             ) {
                                 if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
-                                    if let Some(file) = resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths) {
+                                    if let Some(file) = resolve_js_specifier_path(
+                                        spec,
+                                        &pf.rel_path,
+                                        &all_file_paths,
+                                    ) {
                                         let module_targets: Vec<i64> = name_to_ids
                                             .get("<module>")
-                                            .map(|ids| ids.iter().copied()
-                                                .filter(|id| node_id_to_path.get(id).map(|p| p == &file).unwrap_or(false))
-                                                .collect())
+                                            .map(|ids| {
+                                                ids.iter()
+                                                    .copied()
+                                                    .filter(|id| {
+                                                        node_id_to_path
+                                                            .get(id)
+                                                            .map(|p| p == &file)
+                                                            .unwrap_or(false)
+                                                    })
+                                                    .collect()
+                                            })
                                             .unwrap_or_default();
                                         for &src_id in &source_ids {
                                             for &tgt_id in &module_targets {
                                                 if src_id != tgt_id
-                                                    && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                    && insert_edge_cached(
+                                                        db.conn(),
+                                                        src_id,
+                                                        tgt_id,
+                                                        &rel.relation,
+                                                        rel.metadata.as_deref(),
+                                                    )?
+                                                {
                                                     total_edges_created += 1;
                                                 }
                                             }
@@ -615,19 +670,34 @@ pub(super) fn index_files(
                 if rel.relation == REL_IMPORTS {
                     if let Some(ref meta_str) = rel.metadata {
                         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if let Some(python_module) = meta.get("python_module").and_then(|v| v.as_str()) {
-                                let is_module_import = meta.get("is_module_import")
-                                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                            if let Some(python_module) =
+                                meta.get("python_module").and_then(|v| v.as_str())
+                            {
+                                let is_module_import = meta
+                                    .get("is_module_import")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
                                 if python_module_map.contains_key(python_module) {
                                     // Internal module — try constrained resolution
                                     if let Some(module_targets) = resolve_python_module_targets(
-                                        python_module, is_module_import, &rel.target_name,
-                                        &python_module_map, &node_id_to_path, &name_to_ids,
+                                        python_module,
+                                        is_module_import,
+                                        &rel.target_name,
+                                        &python_module_map,
+                                        &node_id_to_path,
+                                        &name_to_ids,
                                     ) {
                                         for &src_id in &source_ids {
                                             for &tgt_id in &module_targets {
                                                 if src_id != tgt_id
-                                                    && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                    && insert_edge_cached(
+                                                        db.conn(),
+                                                        src_id,
+                                                        tgt_id,
+                                                        &rel.relation,
+                                                        rel.metadata.as_deref(),
+                                                    )?
+                                                {
                                                     total_edges_created += 1;
                                                 }
                                             }
@@ -640,7 +710,8 @@ pub(super) fn index_files(
                                     // For `from X import Y`, we track the module-level dependency (X),
                                     // not the individual symbol (Y), since we can't index external code.
                                     for &src_id in &source_ids {
-                                        external_python_imports.push((src_id, python_module.to_string()));
+                                        external_python_imports
+                                            .push((src_id, python_module.to_string()));
                                     }
                                     continue; // No point in default resolution for external imports
                                 }
@@ -660,15 +731,27 @@ pub(super) fn index_files(
                 if rel.relation == REL_IMPORTS {
                     if let Some(ref meta_str) = rel.metadata {
                         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str()) {
+                            if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str())
+                            {
                                 if let Some(targets) = resolve_js_module_targets(
-                                    js_module, &pf.rel_path, &rel.target_name,
-                                    &all_file_paths, &name_to_ids, &node_id_to_path,
+                                    js_module,
+                                    &pf.rel_path,
+                                    &rel.target_name,
+                                    &all_file_paths,
+                                    &name_to_ids,
+                                    &node_id_to_path,
                                 ) {
                                     for &src_id in &source_ids {
                                         for &tgt_id in &targets {
                                             if src_id != tgt_id
-                                                && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                && insert_edge_cached(
+                                                    db.conn(),
+                                                    src_id,
+                                                    tgt_id,
+                                                    &rel.relation,
+                                                    rel.metadata.as_deref(),
+                                                )?
+                                            {
                                                 total_edges_created += 1;
                                             }
                                         }
@@ -703,7 +786,10 @@ pub(super) fn index_files(
                                             ids.iter()
                                                 .copied()
                                                 .filter(|id| {
-                                                    node_id_to_path.get(id).map(|p| p == &file).unwrap_or(false)
+                                                    node_id_to_path
+                                                        .get(id)
+                                                        .map(|p| p == &file)
+                                                        .unwrap_or(false)
                                                 })
                                                 .collect()
                                         })
@@ -712,7 +798,14 @@ pub(super) fn index_files(
                                         for &src_id in &source_ids {
                                             for &tgt_id in &module_targets {
                                                 if src_id != tgt_id
-                                                    && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                    && insert_edge_cached(
+                                                        db.conn(),
+                                                        src_id,
+                                                        tgt_id,
+                                                        &rel.relation,
+                                                        rel.metadata.as_deref(),
+                                                    )?
+                                                {
                                                     total_edges_created += 1;
                                                 }
                                             }
@@ -746,7 +839,10 @@ pub(super) fn index_files(
                                             ids.iter()
                                                 .copied()
                                                 .filter(|id| {
-                                                    node_id_to_path.get(id).map(|p| p == &file).unwrap_or(false)
+                                                    node_id_to_path
+                                                        .get(id)
+                                                        .map(|p| p == &file)
+                                                        .unwrap_or(false)
                                                 })
                                                 .collect()
                                         })
@@ -755,7 +851,14 @@ pub(super) fn index_files(
                                         for &src_id in &source_ids {
                                             for &tgt_id in &module_targets {
                                                 if src_id != tgt_id
-                                                    && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                    && insert_edge_cached(
+                                                        db.conn(),
+                                                        src_id,
+                                                        tgt_id,
+                                                        &rel.relation,
+                                                        rel.metadata.as_deref(),
+                                                    )?
+                                                {
                                                     total_edges_created += 1;
                                                 }
                                             }
@@ -781,7 +884,10 @@ pub(super) fn index_files(
                             if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method") {
                                 if let Some(impl_type) = meta.get("v").and_then(|v| v.as_str()) {
                                     use super::resolve::self_filter_candidates;
-                                    let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                                    let all = name_to_ids
+                                        .get(&rel.target_name)
+                                        .cloned()
+                                        .unwrap_or_default();
                                     let filtered = self_filter_candidates(impl_type, &all, db)?;
                                     if filtered.is_empty() {
                                         // No project method belongs to this type — drop
@@ -791,7 +897,14 @@ pub(super) fn index_files(
                                     for &src_id in &source_ids {
                                         for &tgt_id in &filtered {
                                             if src_id != tgt_id
-                                                && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                && insert_edge_cached(
+                                                    db.conn(),
+                                                    src_id,
+                                                    tgt_id,
+                                                    &rel.relation,
+                                                    rel.metadata.as_deref(),
+                                                )?
+                                            {
                                                 total_edges_created += 1;
                                             }
                                         }
@@ -808,10 +921,16 @@ pub(super) fn index_files(
                 // chain. See spec
                 // docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
                 if rel.relation == REL_CALLS {
-                    use super::resolve::{method_candidates, parse_callee_metadata, path_filter_candidates, self_filter_candidates, CalleeMeta};
+                    use super::resolve::{
+                        method_candidates, parse_callee_metadata, path_filter_candidates,
+                        self_filter_candidates, CalleeMeta,
+                    };
                     match parse_callee_metadata(rel.metadata.as_deref()) {
                         Some(CalleeMeta::Receiver(recv))
-                            if matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx") =>
+                            if matches!(
+                                pf.language.as_str(),
+                                "javascript" | "typescript" | "tsx"
+                            ) =>
                         {
                             // Cycle 4: `m.foo()` where `const m = require('./x')` —
                             // bind the method to the required module file. Only JS
@@ -822,17 +941,32 @@ pub(super) fn index_files(
                             // through to the default resolution below — identical to
                             // the pre-Cycle-4 Bare path — by NOT continuing.
                             if let Some(module_file) = ns_module_map.get(&recv) {
-                                let targets: Vec<i64> = name_to_ids.get(&rel.target_name)
-                                    .map(|ids| ids.iter().copied()
-                                        .filter(|id| node_id_to_path.get(id)
-                                            .map(|p| p == module_file).unwrap_or(false))
-                                        .collect())
+                                let targets: Vec<i64> = name_to_ids
+                                    .get(&rel.target_name)
+                                    .map(|ids| {
+                                        ids.iter()
+                                            .copied()
+                                            .filter(|id| {
+                                                node_id_to_path
+                                                    .get(id)
+                                                    .map(|p| p == module_file)
+                                                    .unwrap_or(false)
+                                            })
+                                            .collect()
+                                    })
                                     .unwrap_or_default();
                                 if !targets.is_empty() {
                                     for &src_id in &source_ids {
                                         for &tgt_id in &targets {
                                             if src_id != tgt_id
-                                                && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                                && insert_edge_cached(
+                                                    db.conn(),
+                                                    src_id,
+                                                    tgt_id,
+                                                    &rel.relation,
+                                                    rel.metadata.as_deref(),
+                                                )?
+                                            {
                                                 total_edges_created += 1;
                                             }
                                         }
@@ -857,12 +991,18 @@ pub(super) fn index_files(
                             if is_cross_file_call_noise(&rel.target_name, pf.language.as_str()) {
                                 continue;
                             }
-                            let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
-                            let same_lang: Vec<i64> = all.iter()
-                                .filter(|id| matches!(
-                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                    Some(l) if l == pf.language.as_str()
-                                ))
+                            let all = name_to_ids
+                                .get(&rel.target_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let same_lang: Vec<i64> = all
+                                .iter()
+                                .filter(|id| {
+                                    matches!(
+                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                        Some(l) if l == pf.language.as_str()
+                                    )
+                                })
                                 .copied()
                                 .collect();
                             // A receiver call can only target a method, never a
@@ -871,7 +1011,8 @@ pub(super) fn index_files(
                             // Prefer a same-file method if present (strongest
                             // locality signal); otherwise require a globally
                             // unique method.
-                            let same_file_methods: Vec<i64> = methods.iter()
+                            let same_file_methods: Vec<i64> = methods
+                                .iter()
                                 .copied()
                                 .filter(|id| local_ids.contains(id))
                                 .collect();
@@ -886,7 +1027,14 @@ pub(super) fn index_files(
                                 Some(tgt_id) => {
                                     for &src_id in &source_ids {
                                         if src_id != tgt_id
-                                            && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                            && insert_edge_cached(
+                                                db.conn(),
+                                                src_id,
+                                                tgt_id,
+                                                &rel.relation,
+                                                rel.metadata.as_deref(),
+                                            )?
+                                        {
                                             total_edges_created += 1;
                                         }
                                     }
@@ -905,14 +1053,20 @@ pub(super) fn index_files(
                             }
                             continue;
                         }
-                        Some(CalleeMeta::SelfRecv(impl_type)) | Some(CalleeMeta::SelfType(impl_type)) => {
-                            let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                        Some(CalleeMeta::SelfRecv(impl_type))
+                        | Some(CalleeMeta::SelfType(impl_type)) => {
+                            let all = name_to_ids
+                                .get(&rel.target_name)
+                                .cloned()
+                                .unwrap_or_default();
                             let same_lang: Vec<i64> = all
                                 .iter()
-                                .filter(|id| matches!(
-                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                    Some(l) if l == pf.language.as_str()
-                                ))
+                                .filter(|id| {
+                                    matches!(
+                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                        Some(l) if l == pf.language.as_str()
+                                    )
+                                })
                                 .copied()
                                 .collect();
                             let filtered = self_filter_candidates(&impl_type, &same_lang, db)?;
@@ -925,7 +1079,13 @@ pub(super) fn index_files(
                             for &src_id in &source_ids {
                                 for &tgt_id in &filtered {
                                     if src_id != tgt_id
-                                        && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())?
+                                        && insert_edge_cached(
+                                            db.conn(),
+                                            src_id,
+                                            tgt_id,
+                                            &rel.relation,
+                                            rel.metadata.as_deref(),
+                                        )?
                                     {
                                         total_edges_created += 1;
                                     }
@@ -953,13 +1113,18 @@ pub(super) fn index_files(
                             // which drop on empty: a Rust `self.m()` whose `m` isn't
                             // on the impl type is a compile error, not an inherited
                             // hit, so there is nothing to fall back to.)
-                            let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                            let all = name_to_ids
+                                .get(&rel.target_name)
+                                .cloned()
+                                .unwrap_or_default();
                             let same_lang: Vec<i64> = all
                                 .iter()
-                                .filter(|id| matches!(
-                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                    Some(l) if l == pf.language.as_str()
-                                ))
+                                .filter(|id| {
+                                    matches!(
+                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                        Some(l) if l == pf.language.as_str()
+                                    )
+                                })
                                 .copied()
                                 .collect();
                             let filtered = self_filter_candidates(&recv_type, &same_lang, db)?;
@@ -967,7 +1132,13 @@ pub(super) fn index_files(
                                 for &src_id in &source_ids {
                                     for &tgt_id in &filtered {
                                         if src_id != tgt_id
-                                            && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())?
+                                            && insert_edge_cached(
+                                                db.conn(),
+                                                src_id,
+                                                tgt_id,
+                                                &rel.relation,
+                                                rel.metadata.as_deref(),
+                                            )?
                                         {
                                             total_edges_created += 1;
                                         }
@@ -979,7 +1150,10 @@ pub(super) fn index_files(
                             // (inherited method / unique bare match / pending buffer).
                         }
                         Some(CalleeMeta::Path(segments)) => {
-                            let all = name_to_ids.get(&rel.target_name).cloned().unwrap_or_default();
+                            let all = name_to_ids
+                                .get(&rel.target_name)
+                                .cloned()
+                                .unwrap_or_default();
                             // Same-file candidates take precedence per the bare-name
                             // qualifier design ("same-file matches still take precedence").
                             // Previously this filtered them out, so `Foo::helper()` in the
@@ -987,11 +1161,14 @@ pub(super) fn index_files(
                             // the same-file pool was excluded before the Path filter,
                             // and the cross-file Path filter (which scans /Foo/ in the
                             // path) couldn't match a single-file project either.
-                            let same_lang: Vec<i64> = all.iter()
-                                .filter(|id| matches!(
-                                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                    Some(l) if l == pf.language.as_str()
-                                ))
+                            let same_lang: Vec<i64> = all
+                                .iter()
+                                .filter(|id| {
+                                    matches!(
+                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                                        Some(l) if l == pf.language.as_str()
+                                    )
+                                })
                                 .copied()
                                 .collect();
                             let filtered = path_filter_candidates(
@@ -1013,7 +1190,14 @@ pub(super) fn index_files(
                             for &src_id in &source_ids {
                                 for &tgt_id in &final_targets {
                                     if src_id != tgt_id
-                                        && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                        && insert_edge_cached(
+                                            db.conn(),
+                                            src_id,
+                                            tgt_id,
+                                            &rel.relation,
+                                            rel.metadata.as_deref(),
+                                        )?
+                                    {
                                         total_edges_created += 1;
                                     }
                                 }
@@ -1028,22 +1212,27 @@ pub(super) fn index_files(
                 // Tier order: same-file → same-language → (calls: drop) / (other: global).
                 // Dropping calls without a same-language match prevents Rust `hasher.update()`
                 // binding to an unrelated JS `function update()` via bare-name collision.
-                let all_target_ids = name_to_ids.get(&rel.target_name)
+                let all_target_ids = name_to_ids
+                    .get(&rel.target_name)
                     .cloned()
                     .unwrap_or_default();
 
-                let same_file_targets: Vec<i64> = all_target_ids.iter()
+                let same_file_targets: Vec<i64> = all_target_ids
+                    .iter()
                     .filter(|id| local_ids.contains(id))
                     .copied()
                     .collect();
 
                 let source_lang = pf.language.as_str();
-                let same_language_targets: Vec<i64> = all_target_ids.iter()
+                let same_language_targets: Vec<i64> = all_target_ids
+                    .iter()
                     .filter(|id| !local_ids.contains(id))
-                    .filter(|id| matches!(
-                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                        Some(l) if l == source_lang
-                    ))
+                    .filter(|id| {
+                        matches!(
+                            node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                            Some(l) if l == source_lang
+                        )
+                    })
                     .copied()
                     .collect();
 
@@ -1066,11 +1255,7 @@ pub(super) fn index_files(
                     // caller file. See `refine_ambiguous_targets` for fallback
                     // policy (keeps remaining pool on ambiguity to avoid
                     // regressing dead-code on bare-name Rust scoped calls).
-                    refine_ambiguous_targets(
-                        &same_language_targets,
-                        &pf.rel_path,
-                        &node_id_to_path,
-                    )
+                    refine_ambiguous_targets(&same_language_targets, &pf.rel_path, &node_id_to_path)
                 } else if rel.relation == REL_CALLS {
                     // No same-file, no same-language candidate → buffer in
                     // pending_unresolved_calls instead of silently dropping.
@@ -1137,13 +1322,24 @@ pub(super) fn index_files(
                     // ES-import binding). Phase 2b-ext creates `<external>/<name>`
                     // sentinel nodes so the dependency graph shows the link.
                     for &src_id in &source_ids {
-                        unresolved_externals.push((src_id, rel.target_name.clone(), rel.relation.clone()));
+                        unresolved_externals.push((
+                            src_id,
+                            rel.target_name.clone(),
+                            rel.relation.clone(),
+                        ));
                     }
                 } else {
                     for &src_id in &source_ids {
                         for &tgt_id in &target_ids {
                             if (src_id != tgt_id || rel.relation == REL_ROUTES_TO)
-                                && insert_edge_cached(db.conn(), src_id, tgt_id, &rel.relation, rel.metadata.as_deref())? {
+                                && insert_edge_cached(
+                                    db.conn(),
+                                    src_id,
+                                    tgt_id,
+                                    &rel.relation,
+                                    rel.metadata.as_deref(),
+                                )?
+                            {
                                 total_edges_created += 1;
                             }
                         }
@@ -1154,12 +1350,15 @@ pub(super) fn index_files(
 
         // Phase 2b: Create virtual nodes for external Python imports
         if !external_python_imports.is_empty() {
-            let ext_file_id = upsert_file(db.conn(), &FileRecord {
-                path: "<external>".into(),
-                blake3_hash: "external".into(),
-                last_modified: 0,
-                language: Some("external".into()),
-            })?;
+            let ext_file_id = upsert_file(
+                db.conn(),
+                &FileRecord {
+                    path: "<external>".into(),
+                    blake3_hash: "external".into(),
+                    last_modified: 0,
+                    language: Some("external".into()),
+                },
+            )?;
 
             // Load existing external module nodes to avoid duplicates
             let existing_ext_nodes: HashMap<String, i64> =
@@ -1168,28 +1367,33 @@ pub(super) fn index_files(
                     .map(|n| (n.name.clone(), n.id))
                     .collect();
 
-            let unique_modules: HashSet<String> = external_python_imports.iter()
-                .map(|(_, m)| m.clone()).collect();
+            let unique_modules: HashSet<String> = external_python_imports
+                .iter()
+                .map(|(_, m)| m.clone())
+                .collect();
 
             let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
             for module_name in &unique_modules {
                 if !ext_node_ids.contains_key(module_name) {
-                    let node_id = insert_node_cached(db.conn(), &NodeRecord {
-                        file_id: ext_file_id,
-                        node_type: "external_module".into(),
-                        name: module_name.clone(),
-                        qualified_name: Some(format!("<external>/{}", module_name)),
-                        start_line: 0,
-                        end_line: 0,
-                        code_content: String::new(),
-                        signature: None,
-                        doc_comment: None,
-                        context_string: None,
-                        name_tokens: None,
-                        return_type: None,
-                        param_types: None,
-                        is_test: false,
-                    })?;
+                    let node_id = insert_node_cached(
+                        db.conn(),
+                        &NodeRecord {
+                            file_id: ext_file_id,
+                            node_type: "external_module".into(),
+                            name: module_name.clone(),
+                            qualified_name: Some(format!("<external>/{}", module_name)),
+                            start_line: 0,
+                            end_line: 0,
+                            code_content: String::new(),
+                            signature: None,
+                            doc_comment: None,
+                            context_string: None,
+                            name_tokens: None,
+                            return_type: None,
+                            param_types: None,
+                            is_test: false,
+                        },
+                    )?;
                     ext_node_ids.insert(module_name.clone(), node_id);
                     total_nodes_created += 1;
                 }
@@ -1207,12 +1411,15 @@ pub(super) fn index_files(
         // Phase 2b-ext: Create sentinel nodes for unresolved external symbols
         // (e.g., Rust `impl Write for SharedStdout` where Write is from std::io)
         if !unresolved_externals.is_empty() {
-            let ext_file_id = upsert_file(db.conn(), &FileRecord {
-                path: "<external>".into(),
-                blake3_hash: "external".into(),
-                last_modified: 0,
-                language: Some("external".into()),
-            })?;
+            let ext_file_id = upsert_file(
+                db.conn(),
+                &FileRecord {
+                    path: "<external>".into(),
+                    blake3_hash: "external".into(),
+                    last_modified: 0,
+                    language: Some("external".into()),
+                },
+            )?;
 
             let existing_ext_nodes: HashMap<String, i64> =
                 get_nodes_by_file_path(db.conn(), "<external>")?
@@ -1223,31 +1430,39 @@ pub(super) fn index_files(
             let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
 
             // Collect unique targets with inferred type
-            let unique_targets: HashMap<&str, &str> = unresolved_externals.iter()
+            let unique_targets: HashMap<&str, &str> = unresolved_externals
+                .iter()
                 .map(|(_, name, rel)| {
-                    let node_type = if rel == REL_IMPLEMENTS { "trait" } else { "module" };
+                    let node_type = if rel == REL_IMPLEMENTS {
+                        "trait"
+                    } else {
+                        "module"
+                    };
                     (name.as_str(), node_type)
                 })
                 .collect();
 
             for (&name, &node_type) in &unique_targets {
                 if !ext_node_ids.contains_key(name) {
-                    let node_id = insert_node_cached(db.conn(), &NodeRecord {
-                        file_id: ext_file_id,
-                        node_type: node_type.into(),
-                        name: name.into(),
-                        qualified_name: Some(format!("<external>/{}", name)),
-                        start_line: 0,
-                        end_line: 0,
-                        code_content: String::new(),
-                        signature: None,
-                        doc_comment: None,
-                        context_string: None,
-                        name_tokens: None,
-                        return_type: None,
-                        param_types: None,
-                        is_test: false,
-                    })?;
+                    let node_id = insert_node_cached(
+                        db.conn(),
+                        &NodeRecord {
+                            file_id: ext_file_id,
+                            node_type: node_type.into(),
+                            name: name.into(),
+                            qualified_name: Some(format!("<external>/{}", name)),
+                            start_line: 0,
+                            end_line: 0,
+                            code_content: String::new(),
+                            signature: None,
+                            doc_comment: None,
+                            context_string: None,
+                            name_tokens: None,
+                            return_type: None,
+                            param_types: None,
+                            is_test: false,
+                        },
+                    )?;
                     ext_node_ids.insert(name.into(), node_id);
                     total_nodes_created += 1;
                 }
@@ -1275,23 +1490,37 @@ pub(super) fn index_files(
             let mut batch_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
             for pf in &batch_parsed {
                 for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
-                    batch_name_to_ids.entry((pf.file_id, name.as_str())).or_default().push(*id);
+                    batch_name_to_ids
+                        .entry((pf.file_id, name.as_str()))
+                        .or_default()
+                        .push(*id);
                 }
             }
 
             let mut restored = 0usize;
             let mut skipped_intra_batch = 0usize;
-            for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in &saved_inbound_edges {
+            for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in
+                &saved_inbound_edges
+            {
                 // Source file is also in this batch — source_id is stale (deleted + re-created).
                 // Phase 2 already resolves cross-file edges for intra-batch files.
                 if batch_file_ids.contains(source_file_id) {
                     skipped_intra_batch += 1;
                     continue;
                 }
-                if let Some(new_target_ids) = batch_name_to_ids.get(&(*target_file_id, target_name.as_str())) {
+                if let Some(new_target_ids) =
+                    batch_name_to_ids.get(&(*target_file_id, target_name.as_str()))
+                {
                     for &new_tgt_id in new_target_ids {
                         if *source_id != new_tgt_id
-                            && insert_edge_cached(db.conn(), *source_id, new_tgt_id, relation, metadata.as_deref())? {
+                            && insert_edge_cached(
+                                db.conn(),
+                                *source_id,
+                                new_tgt_id,
+                                relation,
+                                metadata.as_deref(),
+                            )?
+                        {
                             total_edges_created += 1;
                             restored += 1;
                         }
@@ -1299,7 +1528,11 @@ pub(super) fn index_files(
                 }
             }
             if restored > 0 || skipped_intra_batch > 0 {
-                tracing::debug!("[index] Restored {} cross-file inbound edges, skipped {} intra-batch", restored, skipped_intra_batch);
+                tracing::debug!(
+                    "[index] Restored {} cross-file inbound edges, skipped {} intra-batch",
+                    restored,
+                    skipped_intra_batch
+                );
             }
         }
 
@@ -1318,9 +1551,11 @@ pub(super) fn index_files(
             // Add newly committed nodes to the global map
             let pf_lang = Some(pf.language.clone());
             for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
-                global_name_map.entry(name.clone())
-                    .or_default()
-                    .push((*id, pf.rel_path.clone(), pf_lang.clone()));
+                global_name_map.entry(name.clone()).or_default().push((
+                    *id,
+                    pf.rel_path.clone(),
+                    pf_lang.clone(),
+                ));
             }
             all_indexed.push(FileIndexed {
                 rel_path: pf.rel_path,
@@ -1338,8 +1573,11 @@ pub(super) fn index_files(
         if files.len() > BATCH_SIZE {
             tracing::info!(
                 "[index] batch {}/{}: {} files ({} nodes, {} edges)",
-                all_indexed.len(), files.len(),
-                batch_file_count, total_nodes_created, total_edges_created
+                all_indexed.len(),
+                files.len(),
+                batch_file_count,
+                total_nodes_created,
+                total_edges_created
             );
         }
     }
@@ -1363,17 +1601,23 @@ pub(super) fn index_files(
     if !all_indexed.is_empty() {
         finalize_tick();
         let tx = db.savepoint("idx_context")?;
-        let all_node_ids: Vec<i64> = all_indexed.iter()
-            .flat_map(|fi| fi.node_ids.iter().copied()).collect();
+        let all_node_ids: Vec<i64> = all_indexed
+            .iter()
+            .flat_map(|fi| fi.node_ids.iter().copied())
+            .collect();
         let all_edges = get_edges_batch(db.conn(), &all_node_ids)?;
         let all_node_details: HashMap<i64, (NodeResult, Option<String>)> = {
             let nodes = get_nodes_with_files_by_ids(db.conn(), &all_node_ids)?;
-            nodes.into_iter().map(|nwf| (nwf.node.id, (nwf.node, nwf.language))).collect()
+            nodes
+                .into_iter()
+                .map(|nwf| (nwf.node.id, (nwf.node, nwf.language)))
+                .collect()
         };
 
         // Phase 3a: Build all context strings (CPU-bound, parallelized with rayon)
         // Flatten to (node_id, node_name, file_path) tuples for parallel iteration
-        let node_tasks: Vec<(i64, &str, &str)> = all_indexed.iter()
+        let node_tasks: Vec<(i64, &str, &str)> = all_indexed
+            .iter()
             .flat_map(|fi| {
                 fi.node_ids.iter().enumerate().map(move |(idx, &node_id)| {
                     (node_id, fi.node_names[idx].as_str(), fi.rel_path.as_str())
@@ -1381,14 +1625,17 @@ pub(super) fn index_files(
             })
             .collect();
 
-        let context_updates: Vec<(i64, String)> = node_tasks.par_iter()
+        let context_updates: Vec<(i64, String)> = node_tasks
+            .par_iter()
             .map(|&(node_id, node_name, file_path)| {
                 let edges = all_edges.get(&node_id);
                 let cat = categorize_edges(edges, format_route_from_metadata);
                 let node_detail = all_node_details.get(&node_id);
 
                 let ctx = build_context_string(&NodeContext {
-                    node_type: node_detail.map(|(n, _)| n.node_type.clone()).unwrap_or_default(),
+                    node_type: node_detail
+                        .map(|(n, _)| n.node_type.clone())
+                        .unwrap_or_default(),
                     name: node_name.to_string(),
                     qualified_name: node_detail.and_then(|(n, _)| n.qualified_name.clone()),
                     file_path: file_path.to_string(),
@@ -1531,19 +1778,31 @@ mod tests {
     #[test]
     fn cpp_header_detection_upgrades_only_real_cpp() {
         // C++ markers → parse the `.h` as C++ (so class symbols aren't dropped).
-        assert!(looks_like_cpp_header("class Shape {\npublic:\n  void f();\n};"));
-        assert!(looks_like_cpp_header("struct S { int x; };\nnamespace ns { int g(); }"));
+        assert!(looks_like_cpp_header(
+            "class Shape {\npublic:\n  void f();\n};"
+        ));
+        assert!(looks_like_cpp_header(
+            "struct S { int x; };\nnamespace ns { int g(); }"
+        ));
         assert!(looks_like_cpp_header("template<typename T> T id(T x);"));
         assert!(looks_like_cpp_header("template <class T> struct Box {};"));
         assert!(looks_like_cpp_header("int Foo::bar() { return 1; }")); // scope resolution
-        assert!(looks_like_cpp_header("class Widget {\nprivate:\n  int id;\n};"));
-        assert!(looks_like_cpp_header("class Base {\nprotected:\n  int n;\n};"));
+        assert!(looks_like_cpp_header(
+            "class Widget {\nprivate:\n  int id;\n};"
+        ));
+        assert!(looks_like_cpp_header(
+            "class Base {\nprotected:\n  int n;\n};"
+        ));
 
         // Pure C headers have none of these → stay C (no over-eager upgrade).
         assert!(!looks_like_cpp_header(
             "#ifndef FOO_H\n#define FOO_H\nint add(int a, int b);\nstruct Point { int x; int y; };\n#endif"
         ));
-        assert!(!looks_like_cpp_header("typedef struct { int fd; } handle_t;\nvoid close_handle(handle_t*);"));
-        assert!(!looks_like_cpp_header("#define MAX(a,b) ((a)>(b)?(a):(b))\nextern int errno;"));
+        assert!(!looks_like_cpp_header(
+            "typedef struct { int fd; } handle_t;\nvoid close_handle(handle_t*);"
+        ));
+        assert!(!looks_like_cpp_header(
+            "#define MAX(a,b) ((a)>(b)?(a):(b))\nextern int errno;"
+        ));
     }
 }

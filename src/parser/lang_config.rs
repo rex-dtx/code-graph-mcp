@@ -107,7 +107,7 @@ impl LanguageConfig {
                     has_class_context: true,
                     interface_by_prefix: false,
                 }
-            },
+            }
         }
     }
 }

@@ -2,8 +2,8 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use std::path::Path;
 use tempfile::TempDir;
 
-use code_graph_mcp::storage::db::Database;
 use code_graph_mcp::indexer::pipeline;
+use code_graph_mcp::storage::db::Database;
 
 fn generate_test_files(dir: &Path, count: usize) {
     for i in 0..count {
@@ -68,13 +68,17 @@ fn bench_call_graph(c: &mut Criterion) {
     let mut group = c.benchmark_group("graph");
     group.bench_function("call_graph_depth_5", |b| {
         b.iter(|| {
-            code_graph_mcp::graph::query::get_call_graph(
-                db.conn(), "func0", "both", 5, None,
-            ).unwrap();
+            code_graph_mcp::graph::query::get_call_graph(db.conn(), "func0", "both", 5, None)
+                .unwrap();
         });
     });
     group.finish();
 }
 
-criterion_group!(benches, bench_full_index, bench_fts5_search, bench_call_graph);
+criterion_group!(
+    benches,
+    bench_full_index,
+    bench_fts5_search,
+    bench_call_graph
+);
 criterion_main!(benches);

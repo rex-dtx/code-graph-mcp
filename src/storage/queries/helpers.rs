@@ -15,7 +15,9 @@ pub(super) fn first_row<T>(
 /// literal `\` in the input would otherwise consume the following char (`a\b` wrongly
 /// matches `ab`, a trailing `\` matches nothing). Order is load-bearing: `\` → `%` → `_`.
 pub(super) fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 pub(super) fn make_placeholders(start: usize, count: usize) -> String {

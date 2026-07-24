@@ -34,12 +34,20 @@ fn setup_fixture_project() -> TempDir {
 
     // Target with 3 prod callers in src/cli.rs
     std::fs::write(src.join("target.rs"), "pub fn target_fn() -> i32 { 42 }\n").unwrap();
-    std::fs::write(src.join("lib.rs"), "pub mod target;\npub mod cli;\npub mod inline_tests;\n").unwrap();
-    std::fs::write(src.join("cli.rs"), r#"use crate::target::target_fn;
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod target;\npub mod cli;\npub mod inline_tests;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("cli.rs"),
+        r#"use crate::target::target_fn;
 pub fn prod_caller_a() -> i32 { target_fn() }
 pub fn prod_caller_b() -> i32 { target_fn() + 1 }
 pub fn prod_caller_c() -> i32 { target_fn() + 2 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // 25 inline tests in src/inline_tests.rs (trigger compression > 20-element cap)
     let mut inline = String::from("use crate::target::target_fn;\n");
@@ -60,18 +68,25 @@ pub fn prod_caller_c() -> i32 { target_fn() + 2 }
     std::fs::write(tests_dir.join("integration.rs"), integ).unwrap();
 
     // 1 bench
-    std::fs::write(benches_dir.join("bench_target.rs"),
-        "fn bench_target() { let _ = fixture_lib::target::target_fn(); }\n").unwrap();
+    std::fs::write(
+        benches_dir.join("bench_target.rs"),
+        "fn bench_target() { let _ = fixture_lib::target::target_fn(); }\n",
+    )
+    .unwrap();
 
     // Cargo.toml so the indexer picks the right language root
-    std::fs::write(project.path().join("Cargo.toml"), r#"[package]
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        r#"[package]
 name = "fixture_lib"
 version = "0.0.0"
 edition = "2021"
 
 [lib]
 path = "src/lib.rs"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     // Index in-process (faster + deterministic than letting the spawned
     // server do it on first call).
@@ -102,8 +117,11 @@ fn setup_ambiguous_fanout_project() -> TempDir {
     // Rust: ambiguous callee fan-out.
     std::fs::write(src.join("a.rs"), "pub fn thing() -> i32 { 1 }\n").unwrap();
     std::fs::write(src.join("b.rs"), "pub fn thing() -> i32 { 2 }\n").unwrap();
-    std::fs::write(src.join("main.rs"),
-        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n").unwrap();
+    std::fs::write(
+        src.join("main.rs"),
+        "mod a;\nmod b;\nfn main() {\n    let x = thing();\n    println!(\"{}\", x);\n}\n",
+    )
+    .unwrap();
 
     // Python: ambiguous caller fan-out. `run` calls `save` WITHOUT importing
     // either def, so the by-name edge is genuinely ambiguous (2 tied candidates).
@@ -111,12 +129,18 @@ fn setup_ambiguous_fanout_project() -> TempDir {
     // not folded (resolve::confidence::classify_import_corroborated_duplicate_stays_visible).
     std::fs::write(src.join("db.py"), "def save(r):\n    return True\n").unwrap();
     std::fs::write(src.join("cache.py"), "def save(i):\n    return True\n").unwrap();
-    std::fs::write(src.join("app.py"),
-        "def run():\n    return save({\"id\": 1})\n").unwrap();
+    std::fs::write(
+        src.join("app.py"),
+        "def run():\n    return save({\"id\": 1})\n",
+    )
+    .unwrap();
 
     // Project marker so the spawned server serves the full catalog.
-    std::fs::write(project.path().join("Cargo.toml"),
-        "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
 
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -151,14 +175,23 @@ impl McpClient {
             .expect("spawn mcp server");
         let stdout = child.stdout.take().expect("stdout piped");
         let reader = BufReader::new(stdout);
-        let mut client = Self { child, next_id: 1, reader, init_response: Value::Null };
+        let mut client = Self {
+            child,
+            next_id: 1,
+            reader,
+            init_response: Value::Null,
+        };
 
         // Initialize handshake — required before tools/list or tools/call
-        let init = client.request("initialize", json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "stdio-test", "version": "0.0.0"},
-        }), Duration::from_secs(15));
+        let init = client.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "stdio-test", "version": "0.0.0"},
+            }),
+            Duration::from_secs(15),
+        );
         assert!(
             init.get("result").is_some(),
             "initialize failed: {:?}",
@@ -207,9 +240,11 @@ impl McpClient {
     }
 
     fn call_tool(&mut self, name: &str, args: Value) -> Value {
-        self.request("tools/call",
+        self.request(
+            "tools/call",
             json!({"name": name, "arguments": args}),
-            Duration::from_secs(30))
+            Duration::from_secs(30),
+        )
     }
 
     /// Fire-and-forget JSON-RPC notification (no id, no response expected).
@@ -273,7 +308,11 @@ fn mcp_non_project_cwd_serves_zero_tool_stub() {
     );
 
     // unknown method → -32601 stub error
-    let err = client.request("tools/call", json!({"name": "get_call_graph"}), Duration::from_secs(10));
+    let err = client.request(
+        "tools/call",
+        json!({"name": "get_call_graph"}),
+        Duration::from_secs(10),
+    );
     assert_eq!(
         err["error"]["code"].as_i64(),
         Some(-32601),
@@ -307,7 +346,11 @@ fn mcp_force_plugin_mcp_overrides_non_project_gate() {
     let stdin = child.stdin.as_mut().expect("stdin piped");
 
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#).unwrap();
-    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .unwrap();
     stdin.flush().unwrap();
 
     let start = Instant::now();
@@ -344,15 +387,19 @@ fn mcp_get_ast_node_called_by_prod_first_under_truncation() {
     let project = setup_fixture_project();
     let mut client = McpClient::spawn(project.path());
 
-    let resp = client.call_tool("get_ast_node", json!({
-        "symbol_name": "target_fn",
-        "include_references": true,
-        "include_tests": true,
-        "compact": true,
-    }));
+    let resp = client.call_tool(
+        "get_ast_node",
+        json!({
+            "symbol_name": "target_fn",
+            "include_references": true,
+            "include_tests": true,
+            "compact": true,
+        }),
+    );
 
     let body = extract_tool_payload(&resp);
-    let called_by = body["called_by"].as_array()
+    let called_by = body["called_by"]
+        .as_array()
         .unwrap_or_else(|| panic!("called_by is not an array: {}", body));
 
     assert!(
@@ -362,16 +409,20 @@ fn mcp_get_ast_node_called_by_prod_first_under_truncation() {
 
     // Look at the first 3 entries — these should be the 3 prod callers
     // (post-sort, prod come first; tests at tail).
-    let first_three_names: Vec<&str> = called_by.iter().take(3)
+    let first_three_names: Vec<&str> = called_by
+        .iter()
+        .take(3)
         .filter_map(|x| x["name"].as_str())
         .collect();
-    let prod_count = first_three_names.iter()
+    let prod_count = first_three_names
+        .iter()
         .filter(|n| n.starts_with("prod_caller_"))
         .count();
     assert!(
         prod_count >= 2,
         "first 3 of called_by should include >=2 prod_caller_*; got {:?} (full body: {})",
-        first_three_names, body
+        first_three_names,
+        body
     );
 }
 
@@ -381,20 +432,27 @@ fn mcp_find_references_default_prod_first() {
     let project = setup_fixture_project();
     let mut client = McpClient::spawn(project.path());
 
-    let resp = client.call_tool("find_references", json!({
-        "symbol_name": "target_fn",
-        "compact": true,
-    }));
+    let resp = client.call_tool(
+        "find_references",
+        json!({
+            "symbol_name": "target_fn",
+            "compact": true,
+        }),
+    );
 
     let body = extract_tool_payload(&resp);
-    let refs = body["references"].as_array()
+    let refs = body["references"]
+        .as_array()
         .unwrap_or_else(|| panic!("references not array: {}", body));
     assert!(!refs.is_empty(), "references must have entries");
 
-    let first_three_names: Vec<&str> = refs.iter().take(3)
+    let first_three_names: Vec<&str> = refs
+        .iter()
+        .take(3)
         .filter_map(|x| x["name"].as_str())
         .collect();
-    let prod_count = first_three_names.iter()
+    let prod_count = first_three_names
+        .iter()
         .filter(|n| n.starts_with("prod_caller_"))
         .count();
     assert!(
@@ -413,13 +471,17 @@ fn mcp_caller_count_prod_only_and_test_symbol_error_explains() {
 
     // module_overview src — target_fn must have caller_count == 3 (prod-only),
     // not 31 (3 prod + 25 inline test + 5 tests/ + 1 bench, target reachable).
-    let overview = client.call_tool("module_overview", json!({
-        "path": "src",
-        "compact": true,
-    }));
+    let overview = client.call_tool(
+        "module_overview",
+        json!({
+            "path": "src",
+            "compact": true,
+        }),
+    );
     let body = extract_tool_payload(&overview);
     let active = body["active"].as_array().expect("active array");
-    let target = active.iter()
+    let target = active
+        .iter()
         .find(|e| e["name"].as_str() == Some("target_fn"))
         .unwrap_or_else(|| panic!("target_fn missing from active exports: {}", body));
     let caller_count = target["caller_count"].as_i64().expect("caller_count i64");
@@ -433,16 +495,22 @@ fn mcp_caller_count_prod_only_and_test_symbol_error_explains() {
     // A fix: find_references on a test-only symbol should error with
     // "exists but all matches are in test/bench paths" rather than the old
     // misleading "not found".
-    let resp = client.call_tool("find_references", json!({
-        "symbol_name": "test_inline_00_calls_target",
-    }));
+    let resp = client.call_tool(
+        "find_references",
+        json!({
+            "symbol_name": "test_inline_00_calls_target",
+        }),
+    );
     // Tool errors come back either as JSON-RPC error or as result.isError=true with text.
-    let err_text = resp.get("error")
+    let err_text = resp
+        .get("error")
         .and_then(|e| e["message"].as_str())
         .or_else(|| {
             if resp["result"]["isError"].as_bool() == Some(true) {
                 resp["result"]["content"][0]["text"].as_str()
-            } else { None }
+            } else {
+                None
+            }
         })
         .unwrap_or_else(|| panic!("expected error response, got: {}", resp));
 
@@ -465,49 +533,82 @@ fn mcp_enum_args_validated_at_tool_entry() {
 
     let tool_err = |resp: &Value| -> String {
         if resp["result"]["isError"].as_bool() == Some(true) {
-            resp["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
         } else {
             panic!("expected isError=true, got: {}", resp);
         }
     };
 
     // get_call_graph direction enum
-    let r = client.call_tool("get_call_graph", json!({
-        "symbol_name": "target_fn", "direction": "sideways",
-    }));
-    assert!(tool_err(&r).contains("direction must be one of: callers, callees, both"),
-        "get_call_graph should reject bad direction at entry; got: {}", tool_err(&r));
+    let r = client.call_tool(
+        "get_call_graph",
+        json!({
+            "symbol_name": "target_fn", "direction": "sideways",
+        }),
+    );
+    assert!(
+        tool_err(&r).contains("direction must be one of: callers, callees, both"),
+        "get_call_graph should reject bad direction at entry; got: {}",
+        tool_err(&r)
+    );
 
     // dependency_graph direction enum
-    let r = client.call_tool("dependency_graph", json!({
-        "file_path": "src/lib.rs", "direction": "upside_down",
-    }));
-    assert!(tool_err(&r).contains("direction must be one of: outgoing, incoming, both"),
-        "dependency_graph should reject bad direction at entry; got: {}", tool_err(&r));
+    let r = client.call_tool(
+        "dependency_graph",
+        json!({
+            "file_path": "src/lib.rs", "direction": "upside_down",
+        }),
+    );
+    assert!(
+        tool_err(&r).contains("direction must be one of: outgoing, incoming, both"),
+        "dependency_graph should reject bad direction at entry; got: {}",
+        tool_err(&r)
+    );
 
     // module_overview deps_direction enum (this was silently swallowed before)
-    let r = client.call_tool("module_overview", json!({
-        "path": "src/lib.rs", "include_deps": true, "deps_direction": "upside_down",
-    }));
-    assert!(tool_err(&r).contains("deps_direction must be one of"),
-        "module_overview should reject bad deps_direction at entry; got: {}", tool_err(&r));
+    let r = client.call_tool(
+        "module_overview",
+        json!({
+            "path": "src/lib.rs", "include_deps": true, "deps_direction": "upside_down",
+        }),
+    );
+    assert!(
+        tool_err(&r).contains("deps_direction must be one of"),
+        "module_overview should reject bad deps_direction at entry; got: {}",
+        tool_err(&r)
+    );
 
     // module_overview deps_direction must be validated UNCONDITIONALLY — even
     // without include_deps and for a directory path. Before the fix the check was
     // gated inside `if include_deps { if path-is-file {...} }`, so this path never
     // validated and returned a normal OK overview, hiding the typo.
-    let r = client.call_tool("module_overview", json!({
-        "path": "src", "deps_direction": "upside_down",
-    }));
-    assert!(tool_err(&r).contains("deps_direction must be one of"),
-        "module_overview must reject bad deps_direction even without include_deps; got: {}", tool_err(&r));
+    let r = client.call_tool(
+        "module_overview",
+        json!({
+            "path": "src", "deps_direction": "upside_down",
+        }),
+    );
+    assert!(
+        tool_err(&r).contains("deps_direction must be one of"),
+        "module_overview must reject bad deps_direction even without include_deps; got: {}",
+        tool_err(&r)
+    );
 
     // find_references relation enum typo
-    let r = client.call_tool("find_references", json!({
-        "symbol_name": "target_fn", "relation": "call",
-    }));
-    assert!(tool_err(&r).contains("Unknown relation filter"),
-        "find_references should reject bad relation at entry; got: {}", tool_err(&r));
+    let r = client.call_tool(
+        "find_references",
+        json!({
+            "symbol_name": "target_fn", "relation": "call",
+        }),
+    );
+    assert!(
+        tool_err(&r).contains("Unknown relation filter"),
+        "find_references should reject bad relation at entry; got: {}",
+        tool_err(&r)
+    );
 }
 
 /// Contract: `impact_analysis` was removed as an MCP tool — it was the lone orphaned
@@ -521,11 +622,16 @@ fn mcp_impact_analysis_tool_is_removed() {
     let project = setup_fixture_project();
     let mut client = McpClient::spawn(project.path());
     let resp = client.call_tool("impact_analysis", json!({ "symbol_name": "target_fn" }));
-    assert_eq!(resp["result"]["isError"].as_bool(), Some(true),
-        "the removed impact_analysis tool name must return isError; got: {resp}");
+    assert_eq!(
+        resp["result"]["isError"].as_bool(),
+        Some(true),
+        "the removed impact_analysis tool name must return isError; got: {resp}"
+    );
     let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text.contains("Unknown tool"),
-        "calling the removed impact_analysis name must report Unknown tool; got: {text}");
+    assert!(
+        text.contains("Unknown tool"),
+        "calling the removed impact_analysis name must report Unknown tool; got: {text}"
+    );
 }
 
 /// Regression: `relation` must be validated BEFORE symbol resolution, so a bogus
@@ -535,16 +641,25 @@ fn mcp_impact_analysis_tool_is_removed() {
 fn mcp_find_references_invalid_relation_precedes_resolution() {
     let project = setup_fixture_project();
     let mut client = McpClient::spawn(project.path());
-    let r = client.call_tool("find_references", json!({
-        "symbol_name": "definitely_absent_symbol_xyz", "relation": "bogus",
-    }));
+    let r = client.call_tool(
+        "find_references",
+        json!({
+            "symbol_name": "definitely_absent_symbol_xyz", "relation": "bogus",
+        }),
+    );
     let text = if r["result"]["isError"].as_bool() == Some(true) {
-        r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+        r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
     } else {
         panic!("expected isError=true, got: {}", r);
     };
-    assert!(text.contains("Unknown relation filter"),
-        "relation must be validated before symbol resolution; got: '{}'", text);
+    assert!(
+        text.contains("Unknown relation filter"),
+        "relation must be validated before symbol resolution; got: '{}'",
+        text
+    );
 }
 
 /// Regression (#4): find_dead_code must reject an unknown node_type loudly rather
@@ -555,12 +670,18 @@ fn mcp_find_dead_code_rejects_unknown_node_type() {
     let mut client = McpClient::spawn(project.path());
     let r = client.call_tool("find_dead_code", json!({ "node_type": "fucntion" }));
     let text = if r["result"]["isError"].as_bool() == Some(true) {
-        r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+        r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
     } else {
         panic!("expected isError=true, got: {}", r);
     };
-    assert!(text.contains("Unknown type filter"),
-        "find_dead_code must reject unknown node_type; got: '{}'", text);
+    assert!(
+        text.contains("Unknown type filter"),
+        "find_dead_code must reject unknown node_type; got: '{}'",
+        text
+    );
 }
 
 /// Regression: an "edit-only" session that issues NO code-graph tool call must
@@ -582,13 +703,18 @@ fn mcp_startup_embeds_without_any_tool_call() {
     // where the model is ALREADY cached (a local `cargo test --features embed-model`);
     // in CI it skips. It needs real weights to observe embedding; skip loudly when
     // absent rather than false-fail.
-    if code_graph_mcp::embedding::model::EmbeddingModel::load().ok().flatten().is_none() {
+    if code_graph_mcp::embedding::model::EmbeddingModel::load()
+        .ok()
+        .flatten()
+        .is_none()
+    {
         eprintln!("[skip] embedding model weights unavailable; cannot observe backfill");
         return;
     }
 
     let project = setup_fixture_project();
-    let db_path = project.path()
+    let db_path = project
+        .path()
         .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
         .join("index.db");
 
@@ -597,8 +723,14 @@ fn mcp_startup_embeds_without_any_tool_call() {
     {
         let db = Database::open_with_vec(&db_path).unwrap();
         let (with_vectors, total) = count_nodes_with_vectors(db.conn()).unwrap();
-        assert!(total > 0, "fixture must have embeddable nodes (got total={total})");
-        assert_eq!(with_vectors, 0, "fixture must start with 0 vectors (got {with_vectors})");
+        assert!(
+            total > 0,
+            "fixture must have embeddable nodes (got total={total})"
+        );
+        assert_eq!(
+            with_vectors, 0,
+            "fixture must start with 0 vectors (got {with_vectors})"
+        );
     }
 
     // Drive ONLY the lifecycle handshake: initialize (in spawn) + the initialized
@@ -640,7 +772,11 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
     use code_graph_mcp::storage::db::Database;
     use code_graph_mcp::storage::queries::{count_nodes_with_vectors, count_unembedded_nodes};
 
-    if code_graph_mcp::embedding::model::EmbeddingModel::load().ok().flatten().is_none() {
+    if code_graph_mcp::embedding::model::EmbeddingModel::load()
+        .ok()
+        .flatten()
+        .is_none()
+    {
         eprintln!("[skip] embedding model weights unavailable; cannot observe backfill");
         return;
     }
@@ -671,7 +807,10 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(90) {
         std::thread::sleep(Duration::from_millis(1000));
-        let db = match Database::open_with_vec(&db_path) { Ok(d) => d, Err(_) => continue };
+        let db = match Database::open_with_vec(&db_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
         let (with_vectors, _) = count_nodes_with_vectors(db.conn()).unwrap_or((0, 0));
         let unembedded = count_unembedded_nodes(db.conn()).unwrap_or(i64::MAX);
         if with_vectors > 0 && unembedded == 0 {
@@ -679,7 +818,10 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
             break;
         }
     }
-    assert!(base_vectors > 0, "startup must fully drain the initial embeddings before the out-of-band test");
+    assert!(
+        base_vectors > 0,
+        "startup must fully drain the initial embeddings before the out-of-band test"
+    );
 
     // Add an embeddable node OUT OF BAND, by DIRECT DB insert and NO filesystem write —
     // this is the stranded state a CLI/hook `ensure_file_indexed` (model=None) leaves
@@ -687,12 +829,18 @@ fn mcp_periodic_backfill_embeds_out_of_band_nodes() {
     // drain it. Inserting via the DB (not a file write) also keeps the server's file
     // watcher entirely out of the picture, so ONLY a DB-polling embedder can pick it up.
     {
-        use code_graph_mcp::storage::queries::{upsert_file, FileRecord, insert_node, NodeRecord};
+        use code_graph_mcp::storage::queries::{insert_node, upsert_file, FileRecord, NodeRecord};
         let db = Database::open_with_vec(&db_path).unwrap();
-        let fid = upsert_file(db.conn(), &FileRecord {
-            path: "src/out_of_band.rs".into(), blake3_hash: "oob-hash".into(),
-            last_modified: 1, language: Some("rust".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: "src/out_of_band.rs".into(),
+                blake3_hash: "oob-hash".into(),
+                last_modified: 1,
+                language: Some("rust".into()),
+            },
+        )
+        .unwrap();
         insert_node(db.conn(), &NodeRecord {
             file_id: fid, node_type: "function".into(), name: "periodically_backfilled_fn".into(),
             qualified_name: None, start_line: 1, end_line: 3,
@@ -747,54 +895,89 @@ fn mcp_confidence_floor_disclosure_over_wire() {
     let project = setup_ambiguous_fanout_project();
     let mut client = McpClient::spawn(project.path());
 
-    let thing_callees = |b: &Value| b["callees"].as_array()
-        .map(|a| a.iter().filter(|c| c["name"].as_str() == Some("thing")).count())
-        .unwrap_or(0);
+    let thing_callees = |b: &Value| {
+        b["callees"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|c| c["name"].as_str() == Some("thing"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
 
     // get_call_graph: ambiguous callee fan-out hidden + disclosed by default.
     // file_path pins the seed so the all-suppressed result routes straight to
     // format_call_graph_response (not the fuzzy-resolve fallback that can return
     // a bare object without the disclosure).
-    let body = extract_tool_payload(&client.call_tool("get_call_graph", json!({
-        "symbol_name": "main", "file_path": "src/main.rs", "direction": "callees",
-    })));
+    let body = extract_tool_payload(&client.call_tool(
+        "get_call_graph",
+        json!({
+            "symbol_name": "main", "file_path": "src/main.rs", "direction": "callees",
+        }),
+    ));
     assert_eq!(
         body["ambiguous_edges_hidden"].as_u64(), Some(2),
         "get_call_graph default floor must disclose the 2 hidden ambiguous `thing` edges over the wire; got: {body}"
     );
-    assert_eq!(thing_callees(&body), 0,
-        "default floor must hide the ambiguous `thing` fan-out from callees; got: {body}");
+    assert_eq!(
+        thing_callees(&body),
+        0,
+        "default floor must hide the ambiguous `thing` fan-out from callees; got: {body}"
+    );
 
     // Opt-in restores the edges and drops the disclosure field.
-    let body = extract_tool_payload(&client.call_tool("get_call_graph", json!({
-        "symbol_name": "main", "file_path": "src/main.rs", "direction": "callees",
-        "min_confidence": "ambiguous",
-    })));
-    assert!(body.get("ambiguous_edges_hidden").is_none(),
-        "nothing is suppressed at the ambiguous floor; got: {body}");
-    assert_eq!(thing_callees(&body), 2,
-        "min_confidence:\"ambiguous\" must show both tied `thing` edges over the wire; got: {body}");
+    let body = extract_tool_payload(&client.call_tool(
+        "get_call_graph",
+        json!({
+            "symbol_name": "main", "file_path": "src/main.rs", "direction": "callees",
+            "min_confidence": "ambiguous",
+        }),
+    ));
+    assert!(
+        body.get("ambiguous_edges_hidden").is_none(),
+        "nothing is suppressed at the ambiguous floor; got: {body}"
+    );
+    assert_eq!(
+        thing_callees(&body),
+        2,
+        "min_confidence:\"ambiguous\" must show both tied `thing` edges over the wire; got: {body}"
+    );
 
     // get_ast_node include_impact: ambiguous caller folded + disclosed by default.
     // file_path disambiguates the seed to the db.py `save` def.
-    let body = extract_tool_payload(&client.call_tool("get_ast_node", json!({
-        "symbol_name": "save", "file_path": "src/db.py",
-        "include_impact": true, "compact": true,
-    })));
+    let body = extract_tool_payload(&client.call_tool(
+        "get_ast_node",
+        json!({
+            "symbol_name": "save", "file_path": "src/db.py",
+            "include_impact": true, "compact": true,
+        }),
+    ));
     assert_eq!(body["impact"]["ambiguous_callers_excluded"].as_u64(), Some(1),
         "get_ast_node include_impact must disclose the 1 folded ambiguous caller over the wire; got: {body}");
-    assert_eq!(body["impact"]["direct_callers"].as_u64(), Some(0),
-        "the ambiguous caller is folded out of the default risk count; got: {body}");
+    assert_eq!(
+        body["impact"]["direct_callers"].as_u64(),
+        Some(0),
+        "the ambiguous caller is folded out of the default risk count; got: {body}"
+    );
 
     // Opt-in counts the caller and drops the disclosure field.
-    let body = extract_tool_payload(&client.call_tool("get_ast_node", json!({
-        "symbol_name": "save", "file_path": "src/db.py",
-        "include_impact": true, "compact": true, "min_confidence": "ambiguous",
-    })));
-    assert!(body["impact"].get("ambiguous_callers_excluded").is_none(),
-        "nothing excluded at the ambiguous floor; got: {body}");
-    assert_eq!(body["impact"]["direct_callers"].as_u64(), Some(1),
-        "min_confidence:\"ambiguous\" must count the ambiguous caller over the wire; got: {body}");
+    let body = extract_tool_payload(&client.call_tool(
+        "get_ast_node",
+        json!({
+            "symbol_name": "save", "file_path": "src/db.py",
+            "include_impact": true, "compact": true, "min_confidence": "ambiguous",
+        }),
+    ));
+    assert!(
+        body["impact"].get("ambiguous_callers_excluded").is_none(),
+        "nothing excluded at the ambiguous floor; got: {body}"
+    );
+    assert_eq!(
+        body["impact"]["direct_callers"].as_u64(),
+        Some(1),
+        "min_confidence:\"ambiguous\" must count the ambiguous caller over the wire; got: {body}"
+    );
 }
 
 /// Read stdout lines until one carries JSON-RPC `id == id`, or the timeout /
@@ -885,7 +1068,10 @@ fn mcp_oversized_multibyte_message_does_not_kill_session() {
     let resp = got.expect(
         "serve was killed by the oversized multibyte message: no id:2 response (H3 regression)",
     );
-    let tools = resp["result"]["tools"].as_array().map(|a| a.len()).unwrap_or(0);
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
     assert!(
         tools > 0,
         "follow-up tools/list must return the catalog after the oversized message; got: {resp}"
@@ -1001,8 +1187,11 @@ fn setup_route_ambiguous_fanout_project() -> TempDir {
     std::fs::write(src.join("server.ts"), "\nconst app = express();\nfunction widgetsHandler(req, res) {\n    thing();\n    res.json([]);\n}\napp.get('/widgets', widgetsHandler);\n").unwrap();
 
     // Project marker so the spawned server resolves the root (language-agnostic).
-    std::fs::write(project.path().join("Cargo.toml"),
-        "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture_lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
 
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -1025,25 +1214,49 @@ fn mcp_trace_confidence_floor_over_wire() {
     let project = setup_route_ambiguous_fanout_project();
     let mut client = McpClient::spawn(project.path());
 
-    let chain_things = |b: &Value| b["handlers"][0]["call_chain"].as_array()
-        .map(|a| a.iter().filter(|n| n["name"].as_str() == Some("thing")).count())
-        .unwrap_or(0);
+    let chain_things = |b: &Value| {
+        b["handlers"][0]["call_chain"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|n| n["name"].as_str() == Some("thing"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
 
     // Default floor: ambiguous `thing` fan-out hidden from the trace chain + disclosed.
-    let body = extract_tool_payload(&client.call_tool("get_call_graph", json!({
-        "route_path": "GET /widgets",
-    })));
-    assert_eq!(chain_things(&body), 0,
-        "trace default floor must hide the ambiguous `thing` fan-out over the wire; got: {body}");
-    assert_eq!(body["ambiguous_edges_hidden"].as_u64(), Some(2),
-        "trace default floor must disclose the 2 hidden ambiguous edges over the wire; got: {body}");
+    let body = extract_tool_payload(&client.call_tool(
+        "get_call_graph",
+        json!({
+            "route_path": "GET /widgets",
+        }),
+    ));
+    assert_eq!(
+        chain_things(&body),
+        0,
+        "trace default floor must hide the ambiguous `thing` fan-out over the wire; got: {body}"
+    );
+    assert_eq!(
+        body["ambiguous_edges_hidden"].as_u64(),
+        Some(2),
+        "trace default floor must disclose the 2 hidden ambiguous edges over the wire; got: {body}"
+    );
 
     // Opt-in restores the fan-out and drops the disclosure field.
-    let body = extract_tool_payload(&client.call_tool("get_call_graph", json!({
-        "route_path": "GET /widgets", "min_confidence": "ambiguous",
-    })));
-    assert_eq!(chain_things(&body), 2,
-        "min_confidence:\"ambiguous\" must show both tied `thing` edges over the wire; got: {body}");
-    assert!(body.get("ambiguous_edges_hidden").is_none(),
-        "nothing is suppressed at the ambiguous floor; got: {body}");
+    let body = extract_tool_payload(&client.call_tool(
+        "get_call_graph",
+        json!({
+            "route_path": "GET /widgets", "min_confidence": "ambiguous",
+        }),
+    ));
+    assert_eq!(
+        chain_things(&body),
+        2,
+        "min_confidence:\"ambiguous\" must show both tied `thing` edges over the wire; got: {body}"
+    );
+    assert!(
+        body.get("ambiguous_edges_hidden").is_none(),
+        "nothing is suppressed at the ambiguous floor; got: {body}"
+    );
 }

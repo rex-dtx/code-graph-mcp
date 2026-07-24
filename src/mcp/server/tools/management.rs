@@ -11,7 +11,9 @@ impl McpServer {
                 "message": "This instance is in secondary (read-only) mode. File watching is handled by the primary instance."
             }));
         }
-        let project_root = self.project_root.as_ref()
+        let project_root = self
+            .project_root
+            .as_ref()
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
         let mut watcher_guard = lock_or_recover(&self.watcher, "watcher");
@@ -57,9 +59,10 @@ impl McpServer {
     }
 
     pub(in crate::mcp::server) fn tool_get_index_status(&self) -> Result<serde_json::Value> {
-        let mut status = serde_json::to_value(
-            queries::get_index_status(self.db.conn(), self.is_watching())?
-        )?;
+        let mut status = serde_json::to_value(queries::get_index_status(
+            self.db.conn(),
+            self.is_watching(),
+        )?)?;
 
         // Add embedding status fields
         let model_available = lock_or_recover(&self.embedding_model, "embedding_model").is_some();
@@ -83,7 +86,10 @@ impl McpServer {
 
         if let Some(obj) = status.as_object_mut() {
             obj.insert("embedding_status".into(), json!(embedding_status));
-            obj.insert("embedding_progress".into(), json!(format!("{}/{}", vectors_done, vectors_total)));
+            obj.insert(
+                "embedding_progress".into(),
+                json!(format!("{}/{}", vectors_done, vectors_total)),
+            );
             obj.insert("model_available".into(), json!(model_available));
             // coverage_pct: integer for status-at-a-glance; avoid rounding to 0 when
             // real progress exists (embedding_status == "in_progress" with small fraction)
@@ -91,42 +97,66 @@ impl McpServer {
             let coverage_pct = if vectors_total > 0 {
                 let ratio = vectors_done as f64 / vectors_total as f64;
                 let rounded = (ratio * 100.0).round() as i64;
-                if rounded == 0 && vectors_done > 0 { 1 } else { rounded }
+                if rounded == 0 && vectors_done > 0 {
+                    1
+                } else {
+                    rounded
+                }
             } else {
                 0
             };
             obj.insert("embedding_coverage_pct".into(), json!(coverage_pct));
-            obj.insert("search_mode".into(), json!(if model_available && vectors_done > 0 {
-                "hybrid"
-            } else {
-                "fts_only"
-            }));
+            obj.insert(
+                "search_mode".into(),
+                json!(if model_available && vectors_done > 0 {
+                    "hybrid"
+                } else {
+                    "fts_only"
+                }),
+            );
 
             // Add indexing observability stats (skipped files, truncations)
             let stats = lock_or_recover(&self.last_index_stats, "last_index_stats").clone();
-            let skipped_total = stats.files_skipped_size + stats.files_skipped_parse
-                + stats.files_skipped_read + stats.files_skipped_hash;
+            let skipped_total = stats.files_skipped_size
+                + stats.files_skipped_parse
+                + stats.files_skipped_read
+                + stats.files_skipped_hash;
             if skipped_total > 0 {
-                obj.insert("skipped_files".into(), json!({
-                    "total": skipped_total,
-                    "too_large": stats.files_skipped_size,
-                    "parse_error": stats.files_skipped_parse,
-                    "read_error": stats.files_skipped_read,
-                    "hash_error": stats.files_skipped_hash,
-                }));
+                obj.insert(
+                    "skipped_files".into(),
+                    json!({
+                        "total": skipped_total,
+                        "too_large": stats.files_skipped_size,
+                        "parse_error": stats.files_skipped_parse,
+                        "read_error": stats.files_skipped_read,
+                        "hash_error": stats.files_skipped_hash,
+                    }),
+                );
             }
             if stats.files_skipped_language > 0 {
-                obj.insert("files_skipped_unsupported_language".into(), json!(stats.files_skipped_language));
+                obj.insert(
+                    "files_skipped_unsupported_language".into(),
+                    json!(stats.files_skipped_language),
+                );
             }
-            obj.insert("instance_mode".into(), json!(if self.is_primary { "primary" } else { "secondary" }));
+            obj.insert(
+                "instance_mode".into(),
+                json!(if self.is_primary {
+                    "primary"
+                } else {
+                    "secondary"
+                }),
+            );
 
             // Health and age fields (consistent with CLI health-check)
             let expected_schema = crate::storage::schema::SCHEMA_VERSION;
-            let schema_ok = obj.get("schema_version")
+            let schema_ok = obj
+                .get("schema_version")
                 .and_then(|v| v.as_i64())
                 .map(|v| v == expected_schema as i64)
                 .unwrap_or(false);
-            let has_data = obj.get("nodes_count")
+            let has_data = obj
+                .get("nodes_count")
                 .and_then(|v| v.as_i64())
                 .map(|v| v > 0)
                 .unwrap_or(false);
@@ -136,10 +166,15 @@ impl McpServer {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64 - ts)
                     .unwrap_or(0);
-                let age = if elapsed < 60 { format!("{}s ago", elapsed) }
-                    else if elapsed < 3600 { format!("{}m ago", elapsed / 60) }
-                    else if elapsed < 86400 { format!("{}h ago", elapsed / 3600) }
-                    else { format!("{}d ago", elapsed / 86400) };
+                let age = if elapsed < 60 {
+                    format!("{}s ago", elapsed)
+                } else if elapsed < 3600 {
+                    format!("{}m ago", elapsed / 60)
+                } else if elapsed < 86400 {
+                    format!("{}h ago", elapsed / 3600)
+                } else {
+                    format!("{}d ago", elapsed / 86400)
+                };
                 obj.insert("index_age".into(), json!(age));
             }
         }
@@ -147,7 +182,10 @@ impl McpServer {
         Ok(status)
     }
 
-    pub(in crate::mcp::server) fn tool_rebuild_index(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_rebuild_index(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         if !self.is_primary {
             return Ok(json!({
                 "status": "secondary",
@@ -159,7 +197,9 @@ impl McpServer {
             return Err(anyhow!("Must pass confirm: true to rebuild index"));
         }
 
-        let project_root = self.project_root.as_ref()
+        let project_root = self
+            .project_root
+            .as_ref()
             .ok_or_else(|| anyhow!("No project root configured"))?;
 
         // Wait for background embedding to finish before clearing data
@@ -183,9 +223,10 @@ impl McpServer {
         }
 
         self.send_log("info", "Rebuilding index...");
-        let progress_cb = |_phase: crate::indexer::pipeline::IndexPhase, current: usize, total: usize| {
-            self.send_progress("rebuild-index", current, total);
-        };
+        let progress_cb =
+            |_phase: crate::indexer::pipeline::IndexPhase, current: usize, total: usize| {
+                self.send_progress("rebuild-index", current, total);
+            };
 
         // Atomic rebuild: the DELETE and the full re-index run inside ONE outer
         // transaction. In WAL mode, external fresh-connection readers (a CLI `grep`,
@@ -204,7 +245,7 @@ impl McpServer {
         let result = {
             let tx = self.db.conn().unchecked_transaction()?;
             tx.execute("DELETE FROM files", [])?; // CASCADE handles nodes→edges
-            // Skip inline embedding; the background thread (spawned below) handles it.
+                                                  // Skip inline embedding; the background thread (spawned below) handles it.
             let result = run_full_index(&self.db, project_root, None, Some(&progress_cb))?;
             tx.commit()?;
             result

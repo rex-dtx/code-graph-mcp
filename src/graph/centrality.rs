@@ -77,7 +77,12 @@ pub fn betweenness_centrality(
             continue;
         }
         index_of.insert(node_id, metas.len());
-        metas.push(NodeMeta { node_id, name, node_type, file_path });
+        metas.push(NodeMeta {
+            node_id,
+            name,
+            node_type,
+            file_path,
+        });
     }
 
     let n = metas.len();
@@ -97,7 +102,8 @@ pub fn betweenness_centrality(
         let t: i64 = row.get(1)?;
         Ok((s, t))
     })?;
-    let mut seen_edges: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut seen_edges: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
     for row in edge_rows {
         let (s, t) = row?;
         let (Some(&u), Some(&v)) = (index_of.get(&s), index_of.get(&t)) else {
@@ -273,7 +279,10 @@ mod tests {
         let result = betweenness_centrality(conn, false, 10).unwrap();
 
         // Top node must be C (the geometric middle of the chain).
-        assert_eq!(result[0].name, "C", "middle node C must be the top chokepoint");
+        assert_eq!(
+            result[0].name, "C",
+            "middle node C must be the top chokepoint"
+        );
 
         // A and E (endpoints) lie on no shortest path → score 0 → filtered out.
         let names: Vec<&str> = result.iter().map(|r| r.name.as_str()).collect();
@@ -316,7 +325,10 @@ mod tests {
         // X has exactly one caller (L1) ...
         assert_eq!(x_node.caller_count, 1, "bridge X has a single caller");
         // ... yet it is the top chokepoint despite the low degree.
-        assert_eq!(result[0].name, "X", "single-caller bridge must outrank by betweenness");
+        assert_eq!(
+            result[0].name, "X",
+            "single-caller bridge must outrank by betweenness"
+        );
     }
 
     /// Test nodes are excluded by default (both endpoints and intermediate hops),

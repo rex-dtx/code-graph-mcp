@@ -1,11 +1,11 @@
+use super::lang_config::LanguageConfig;
+use super::languages::get_language;
+use super::node_text;
+use crate::domain::{max_code_content_len, parse_timeout_ms, MAX_AST_DEPTH};
 use anyhow::{anyhow, Result};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use super::lang_config::LanguageConfig;
-use super::languages::get_language;
-use super::node_text;
-use crate::domain::{MAX_AST_DEPTH, max_code_content_len, parse_timeout_ms};
 
 pub struct ParsedNode {
     pub node_type: String,
@@ -30,8 +30,8 @@ thread_local! {
 
 /// Parse source code into a Tree-sitter tree. Shared by node extraction and relation extraction.
 pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
-    let lang = get_language(language)
-        .ok_or_else(|| anyhow!("unsupported language: {}", language))?;
+    let lang =
+        get_language(language).ok_or_else(|| anyhow!("unsupported language: {}", language))?;
 
     PARSER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -41,7 +41,8 @@ pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree> {
             p.set_language(&lang)?;
             cache.insert(language.to_string(), p);
         }
-        let parser = cache.get_mut(language)
+        let parser = cache
+            .get_mut(language)
             .ok_or_else(|| anyhow!("parser cache inconsistency for {}", language))?;
         match parser.parse(source, None) {
             Some(tree) => Ok(tree),
@@ -59,10 +60,23 @@ pub fn parse_code(source: &str, language: &str) -> Result<Vec<ParsedNode>> {
 }
 
 /// Extract nodes from a pre-parsed tree (avoids re-parsing).
-pub fn extract_nodes_from_tree(tree: &tree_sitter::Tree, source: &str, language: &str) -> Vec<ParsedNode> {
+pub fn extract_nodes_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    language: &str,
+) -> Vec<ParsedNode> {
     let mut nodes = Vec::new();
     let config = LanguageConfig::for_language(language);
-    extract_nodes(tree.root_node(), source, language, &config, None, &mut nodes, 0, false);
+    extract_nodes(
+        tree.root_node(),
+        source,
+        language,
+        &config,
+        None,
+        &mut nodes,
+        0,
+        false,
+    );
     nodes
 }
 
@@ -96,21 +110,31 @@ fn extract_nodes(
     depth: usize,
     in_test_context: bool,
 ) {
-    if depth > MAX_AST_DEPTH { return; }
+    if depth > MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
 
     // Detect Rust mod items (e.g., `mod tests { ... }`)
     if kind == "mod_item" {
-        let mod_name = node.child_by_field_name("name")
+        let mod_name = node
+            .child_by_field_name("name")
             .map(|n| node_text(&n, source).to_string());
-        let is_test_mod = mod_name.as_deref() == Some("tests")
-            || has_test_attribute(&node, source);
+        let is_test_mod = mod_name.as_deref() == Some("tests") || has_test_attribute(&node, source);
         // Recurse into the module body with updated test context
         if let Some(body) = node.child_by_field_name("body") {
             for i in 0..body.named_child_count() {
                 if let Some(child) = body.named_child(i) {
-                    extract_nodes(child, source, language, config, parent_class, results, depth + 1,
-                        in_test_context || is_test_mod);
+                    extract_nodes(
+                        child,
+                        source,
+                        language,
+                        config,
+                        parent_class,
+                        results,
+                        depth + 1,
+                        in_test_context || is_test_mod,
+                    );
                 }
             }
         }
@@ -129,17 +153,38 @@ fn extract_nodes(
             let fn_text = node_text(&fn_node, source);
             // Match bare names and member forms like `describe.only`, `it.skip`, `test.each`.
             let head = fn_text.split('.').next().unwrap_or(fn_text);
-            let is_test_block = matches!(head,
-                "describe" | "it" | "test" | "suite" | "context" |
-                "beforeEach" | "beforeAll" | "afterEach" | "afterAll" |
-                "before" | "after" | "fdescribe" | "xdescribe" | "fit" | "xit"
+            let is_test_block = matches!(
+                head,
+                "describe"
+                    | "it"
+                    | "test"
+                    | "suite"
+                    | "context"
+                    | "beforeEach"
+                    | "beforeAll"
+                    | "afterEach"
+                    | "afterAll"
+                    | "before"
+                    | "after"
+                    | "fdescribe"
+                    | "xdescribe"
+                    | "fit"
+                    | "xit"
             );
             if is_test_block {
                 if let Some(args) = node.child_by_field_name("arguments") {
                     for i in 0..args.named_child_count() {
                         if let Some(child) = args.named_child(i) {
-                            extract_nodes(child, source, language, config, parent_class,
-                                results, depth + 1, true);
+                            extract_nodes(
+                                child,
+                                source,
+                                language,
+                                config,
+                                parent_class,
+                                results,
+                                depth + 1,
+                                true,
+                            );
                         }
                     }
                 }
@@ -149,24 +194,36 @@ fn extract_nodes(
     }
 
     // Check if this specific node has #[test] or #[cfg(test)] attributes
-    let node_is_test = in_test_context || (config.has_test_attributes && has_test_attribute(&node, source));
+    let node_is_test =
+        in_test_context || (config.has_test_attributes && has_test_attribute(&node, source));
 
     match kind {
         // Functions: shared across TS/JS/Go (function_declaration), Python/C/C++ (function_definition)
         "function_declaration" | "function" => {
-            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class) {
+            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
+            {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
             } else if let Some(name) = super::route_handler_name(&node, source) {
                 // Anonymous `function (req, res) { ... }` used as an inline route
                 // handler (no name field → extract_function_node returns None):
                 // materialize it like the arrow / function_expression case below.
-                results.push(make_simple_node("function", name, &node, source, node_is_test));
+                results.push(make_simple_node(
+                    "function",
+                    name,
+                    &node,
+                    source,
+                    node_is_test,
+                ));
             }
         }
         // Python async functions
         "async_function_definition" => {
-            let nt = if parent_class.is_some() { "method" } else { "function" };
+            let nt = if parent_class.is_some() {
+                "method"
+            } else {
+                "function"
+            };
             if let Some(mut parsed) = extract_function_node(&node, source, nt, parent_class) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
@@ -182,8 +239,7 @@ fn extract_nodes(
                 if let Some(declarator) = node.child_by_field_name("declarator") {
                     let gtest_name = extract_gtest_test_name(&declarator, source);
                     let is_gtest = gtest_name.is_some();
-                    let name = gtest_name
-                        .or_else(|| extract_declarator_name(&declarator, source));
+                    let name = gtest_name.or_else(|| extract_declarator_name(&declarator, source));
                     if let Some(name) = name {
                         let sig_info = extract_c_signature_info(&node, source);
                         // C/C++ method scope. gtest macro names ("Suite.Name")
@@ -207,7 +263,8 @@ fn extract_nodes(
                             qualified_name: Some(qual),
                             start_line: node.start_position().row as u32 + 1,
                             end_line: node.end_position().row as u32 + 1,
-                            code_content: truncate_code_content(node_text(&node, source)).into_owned(),
+                            code_content: truncate_code_content(node_text(&node, source))
+                                .into_owned(),
                             signature: sig_info.signature,
                             doc_comment: get_preceding_comment(&node, source),
                             return_type: sig_info.return_type,
@@ -218,7 +275,11 @@ fn extract_nodes(
                 }
             } else {
                 // Python and others: name is in "name" field
-                let nt = if parent_class.is_some() { "method" } else { "function" };
+                let nt = if parent_class.is_some() {
+                    "method"
+                } else {
+                    "function"
+                };
                 if let Some(mut parsed) = extract_function_node(&node, source, nt, parent_class) {
                     parsed.is_test = node_is_test;
                     results.push(parsed);
@@ -227,7 +288,8 @@ fn extract_nodes(
         }
         "function_item" => {
             // Rust functions
-            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class) {
+            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
+            {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
             }
@@ -272,7 +334,16 @@ fn extract_nodes(
                     param_types: None,
                     is_test: node_is_test,
                 });
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
@@ -290,8 +361,23 @@ fn extract_nodes(
                 .filter_map(|i| node.named_child(i))
                 .find(|c| c.kind() == "identifier");
             if let Some(name) = name_node.map(|n| node_text(&n, source).to_string()) {
-                results.push(make_simple_node("class", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                results.push(make_simple_node(
+                    "class",
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
@@ -320,7 +406,11 @@ fn extract_nodes(
         // arm's parent_class convention). name/params come from the
         // `name`/`parameters` fields, which extract_signature_info already reads.
         "local_function_statement" if config.name == "csharp" => {
-            let nt = if parent_class.is_some() { "method" } else { "function" };
+            let nt = if parent_class.is_some() {
+                "method"
+            } else {
+                "function"
+            };
             if let Some(mut parsed) = extract_function_node(&node, source, nt, parent_class) {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
@@ -367,8 +457,23 @@ fn extract_nodes(
         // Ruby modules — mapped to "interface" type
         "module" if config.name == "ruby" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                results.push(make_simple_node(
+                    "interface",
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
@@ -376,8 +481,23 @@ fn extract_nodes(
         // Swift protocol → interface
         "protocol_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                results.push(make_simple_node(
+                    "interface",
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
@@ -393,8 +513,23 @@ fn extract_nodes(
         // Interfaces (TS/Java/PHP)
         "interface_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                results.push(make_simple_node(
+                    "interface",
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
@@ -402,8 +537,23 @@ fn extract_nodes(
         // PHP traits — mapped to "interface" type
         "trait_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                results.push(make_simple_node(
+                    "interface",
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
@@ -425,8 +575,23 @@ fn extract_nodes(
         // C# struct
         "struct_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("struct", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                results.push(make_simple_node(
+                    "struct",
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
@@ -434,15 +599,31 @@ fn extract_nodes(
         // Kotlin object declaration (singleton)
         "object_declaration" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("class", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                results.push(make_simple_node(
+                    "class",
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
 
         // C# constructor
         "constructor_declaration" => {
-            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class) {
+            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
+            {
                 parsed.is_test = node_is_test;
                 results.push(parsed);
             }
@@ -451,9 +632,28 @@ fn extract_nodes(
         // C++ class/struct
         "class_specifier" | "struct_specifier" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                let nt = if kind == "class_specifier" { "class" } else { "struct" };
-                results.push(make_simple_node(nt, name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                let nt = if kind == "class_specifier" {
+                    "class"
+                } else {
+                    "struct"
+                };
+                results.push(make_simple_node(
+                    nt,
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
@@ -479,7 +679,8 @@ fn extract_nodes(
                                 qualified_name: Some(name),
                                 start_line: child.start_position().row as u32 + 1,
                                 end_line: child.end_position().row as u32 + 1,
-                                code_content: truncate_code_content(node_text(&child, source)).into_owned(),
+                                code_content: truncate_code_content(node_text(&child, source))
+                                    .into_owned(),
                                 signature: None,
                                 doc_comment: get_preceding_comment(&child, source),
                                 return_type: None,
@@ -495,7 +696,13 @@ fn extract_nodes(
         // Rust-specific
         "struct_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("struct", name, &node, source, node_is_test));
+                results.push(make_simple_node(
+                    "struct",
+                    name,
+                    &node,
+                    source,
+                    node_is_test,
+                ));
             }
         }
         "enum_item" => {
@@ -520,20 +727,45 @@ fn extract_nodes(
                 // keeping the impl name bare avoids a LIKE mismatch that would
                 // drop every method-level implements edge.
                 let impl_name = impl_name.split('<').next().unwrap_or(impl_name).trim();
-                extract_children(node, source, language, config, Some(impl_name), results, depth, node_is_test);
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(impl_name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
         "trait_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                results.push(make_simple_node("interface", name.clone(), &node, source, node_is_test));
-                extract_children(node, source, language, config, Some(&name), results, depth, node_is_test);
+                results.push(make_simple_node(
+                    "interface",
+                    name.clone(),
+                    &node,
+                    source,
+                    node_is_test,
+                ));
+                extract_children(
+                    node,
+                    source,
+                    language,
+                    config,
+                    Some(&name),
+                    results,
+                    depth,
+                    node_is_test,
+                );
                 return;
             }
         }
         "const_item" | "static_item" => {
             if let Some(name) = get_child_by_field(&node, "name", source) {
-                let type_annotation = node.child_by_field_name("type")
+                let type_annotation = node
+                    .child_by_field_name("type")
                     .map(|t| node_text(&t, source).to_string());
                 let mut pn = make_simple_node("constant", name, &node, source, node_is_test);
                 pn.return_type = type_annotation;
@@ -620,7 +852,13 @@ fn extract_nodes(
         // the same synthetic name. (INDEX_VERSION bumped in domain.rs.)
         "arrow_function" | "function_expression" => {
             if let Some(name) = super::route_handler_name(&node, source) {
-                results.push(make_simple_node("function", name, &node, source, node_is_test));
+                results.push(make_simple_node(
+                    "function",
+                    name,
+                    &node,
+                    source,
+                    node_is_test,
+                ));
             }
             // fall through to extract_children below so nested fns still extract
         }
@@ -628,7 +866,16 @@ fn extract_nodes(
     }
 
     // Recurse into children
-    extract_children(node, source, language, config, parent_class, results, depth, node_is_test);
+    extract_children(
+        node,
+        source,
+        language,
+        config,
+        parent_class,
+        results,
+        depth,
+        node_is_test,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -644,7 +891,16 @@ fn extract_children(
 ) {
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            extract_nodes(child, source, language, config, parent_class, results, depth + 1, in_test_context);
+            extract_nodes(
+                child,
+                source,
+                language,
+                config,
+                parent_class,
+                results,
+                depth + 1,
+                in_test_context,
+            );
         }
     }
 }
@@ -685,10 +941,22 @@ fn truncate_code_content(content: &str) -> Cow<'_, str> {
 /// (byte-length preserving, all other bytes unchanged). Fast path: no allocation
 /// when the value is absent or NUL-free (the overwhelming common case).
 fn strip_nul_field(s: Option<String>) -> Option<String> {
-    s.map(|v| if v.contains('\0') { v.replace('\0', " ") } else { v })
+    s.map(|v| {
+        if v.contains('\0') {
+            v.replace('\0', " ")
+        } else {
+            v
+        }
+    })
 }
 
-fn make_simple_node(node_type: &str, name: String, node: &tree_sitter::Node, source: &str, is_test: bool) -> ParsedNode {
+fn make_simple_node(
+    node_type: &str,
+    name: String,
+    node: &tree_sitter::Node,
+    source: &str,
+    is_test: bool,
+) -> ParsedNode {
     ParsedNode {
         node_type: node_type.into(),
         name: name.clone(),
@@ -858,13 +1126,14 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
                 // an importable symbol. Common in the wild: Redux `export const {
                 // actions, reducer } = slice`, React `export const { Provider } =
                 // createContext()`. A plain identifier yields the single name unchanged.
-                let names: Vec<String> = if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
-                    let mut v = Vec::new();
-                    collect_binding_names(&name_node, source, &mut v);
-                    v
-                } else {
-                    vec![name.clone()]
-                };
+                let names: Vec<String> =
+                    if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
+                        let mut v = Vec::new();
+                        collect_binding_names(&name_node, source, &mut v);
+                        v
+                    } else {
+                        vec![name.clone()]
+                    };
                 for nm in names {
                     out.push(ParsedNode {
                         node_type: "constant".into(),
@@ -893,14 +1162,16 @@ struct SignatureInfo {
 }
 
 fn extract_signature_info(node: &tree_sitter::Node, source: &str) -> SignatureInfo {
-    let params = node.child_by_field_name("parameters")
+    let params = node
+        .child_by_field_name("parameters")
         .map(|p| node_text(&p, source).to_string());
     // For TS/JS the return_type field maps to a `type_annotation` node whose
     // text starts with the literal `:` (e.g. `: string`). For Python/Rust/Go
     // it's the bare type (e.g. `str`, `Result<()>`). Strip a single leading
     // colon + whitespace so all languages produce shape-consistent values
     // (no-op when the leading char isn't `:`).
-    let ret = node.child_by_field_name("return_type")
+    let ret = node
+        .child_by_field_name("return_type")
         .map(|r| node_text(&r, source).to_string())
         .map(|s| s.trim_start_matches(':').trim_start().to_string())
         .filter(|s| !s.is_empty());
@@ -921,11 +1192,19 @@ fn extract_signature_info(node: &tree_sitter::Node, source: &str) -> SignatureIn
 fn extract_c_signature_info(node: &tree_sitter::Node, source: &str) -> SignatureInfo {
     let declarator = match node.child_by_field_name("declarator") {
         Some(d) => d,
-        None => return SignatureInfo { signature: None, return_type: None, param_types: None },
+        None => {
+            return SignatureInfo {
+                signature: None,
+                return_type: None,
+                param_types: None,
+            }
+        }
     };
-    let params = declarator.child_by_field_name("parameters")
+    let params = declarator
+        .child_by_field_name("parameters")
         .map(|p| node_text(&p, source).to_string());
-    let ret_type = node.child_by_field_name("type")
+    let ret_type = node
+        .child_by_field_name("type")
         .map(|t| node_text(&t, source).to_string());
 
     let signature = match (&ret_type, &params) {
@@ -951,22 +1230,34 @@ fn extract_declarator_name(node: &tree_sitter::Node, source: &str) -> Option<Str
 /// declarator is `TEST` and parameters are two type_identifiers.
 /// Returns `Some("Suite.Name")` when the macro matches; None otherwise.
 fn extract_gtest_test_name(declarator: &tree_sitter::Node, source: &str) -> Option<String> {
-    if declarator.kind() != "function_declarator" { return None; }
+    if declarator.kind() != "function_declarator" {
+        return None;
+    }
     let inner = declarator.child_by_field_name("declarator")?;
-    if !matches!(inner.kind(), "identifier" | "field_identifier") { return None; }
+    if !matches!(inner.kind(), "identifier" | "field_identifier") {
+        return None;
+    }
     let macro_name = node_text(&inner, source);
     const GTEST_MACROS: &[&str] = &[
-        "TEST", "TEST_F", "TEST_P", "TEST_CASE",
-        "TYPED_TEST", "TYPED_TEST_P",
+        "TEST",
+        "TEST_F",
+        "TEST_P",
+        "TEST_CASE",
+        "TYPED_TEST",
+        "TYPED_TEST_P",
     ];
-    if !GTEST_MACROS.contains(&macro_name) { return None; }
+    if !GTEST_MACROS.contains(&macro_name) {
+        return None;
+    }
 
     let params = declarator.child_by_field_name("parameters")?;
     let mut suite: Option<String> = None;
     let mut test: Option<String> = None;
     let mut idx = 0;
     for i in 0..params.named_child_count() {
-        let Some(param) = params.named_child(i) else { continue };
+        let Some(param) = params.named_child(i) else {
+            continue;
+        };
         // parameter_declaration > type_identifier (gtest args parsed as types)
         let id_text = (0..param.named_child_count())
             .filter_map(|j| param.named_child(j))
@@ -987,14 +1278,20 @@ fn extract_gtest_test_name(declarator: &tree_sitter::Node, source: &str) -> Opti
     }
 }
 
-fn extract_declarator_name_inner(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
-    if depth > MAX_AST_DEPTH { return None; }
+fn extract_declarator_name_inner(
+    node: &tree_sitter::Node,
+    source: &str,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_AST_DEPTH {
+        return None;
+    }
     // C/C++ function_declarator -> identifier
     if node.kind() == "function_declarator" {
-        return get_child_by_field(node, "declarator", source)
-            .or_else(|| {
-                node.named_child(0).map(|c| node_text(&c, source).to_string())
-            });
+        return get_child_by_field(node, "declarator", source).or_else(|| {
+            node.named_child(0)
+                .map(|c| node_text(&c, source).to_string())
+        });
     }
     // Might be a pointer_declarator wrapping a function_declarator
     for i in 0..node.named_child_count() {
@@ -1016,7 +1313,10 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
     let mut comments = Vec::new();
     let mut current = node.prev_sibling();
     while let Some(prev) = current {
-        if prev.kind() == "comment" || prev.kind() == "line_comment" || prev.kind() == "block_comment" {
+        if prev.kind() == "comment"
+            || prev.kind() == "line_comment"
+            || prev.kind() == "block_comment"
+        {
             comments.push(node_text(&prev, source).to_string());
             current = prev.prev_sibling();
         } else {
@@ -1059,7 +1359,8 @@ fn extract_dart_method_signature(
                         Some(cls) => Some(format!("{}.{}", cls, name)),
                         None => Some(name.clone()),
                     };
-                    let params = child.child_by_field_name("parameters")
+                    let params = child
+                        .child_by_field_name("parameters")
                         .or_else(|| {
                             // function_signature doesn't use field name for formal_parameter_list
                             (0..child.named_child_count())
@@ -1070,7 +1371,9 @@ fn extract_dart_method_signature(
                     // Return type: first type_identifier, void_type, or function_type child
                     let ret = (0..child.named_child_count())
                         .filter_map(|j| child.named_child(j))
-                        .find(|c| matches!(c.kind(), "type_identifier" | "void_type" | "function_type"))
+                        .find(|c| {
+                            matches!(c.kind(), "type_identifier" | "void_type" | "function_type")
+                        })
                         .map(|r| node_text(&r, source).to_string());
                     // Include type_arguments (e.g. <String>) with the return type
                     let ret_with_args = ret.map(|r| {
@@ -1113,8 +1416,11 @@ fn extract_dart_method_signature(
                         Some(cls) => Some(format!("{}.{}", cls, name)),
                         None => Some(name.clone()),
                     };
-                    let params = strip_nul_field(child.child_by_field_name("parameters")
-                        .map(|p| node_text(&p, source).to_string()));
+                    let params = strip_nul_field(
+                        child
+                            .child_by_field_name("parameters")
+                            .map(|p| node_text(&p, source).to_string()),
+                    );
                     return Some(ParsedNode {
                         node_type: "function".into(),
                         name,
@@ -1148,7 +1454,11 @@ fn extract_dart_top_level_function(
     parent_class: Option<&str>,
 ) -> Option<ParsedNode> {
     let name = get_child_by_field(sig, "name", source)?;
-    let node_type = if parent_class.is_some() { "method" } else { "function" };
+    let node_type = if parent_class.is_some() {
+        "method"
+    } else {
+        "function"
+    };
     let qualified_name = match parent_class {
         Some(cls) => Some(format!("{}.{}", cls, name)),
         None => Some(name.clone()),
@@ -1172,10 +1482,13 @@ fn extract_dart_top_level_function(
         _ => None,
     };
     // Span = signature .. function_body sibling (block `{...}` or arrow `=> e;`).
-    let end_node = sig.next_named_sibling()
+    let end_node = sig
+        .next_named_sibling()
         .filter(|s| s.kind() == "function_body")
         .unwrap_or(*sig);
-    let code = source.get(sig.start_byte()..end_node.end_byte()).unwrap_or("");
+    let code = source
+        .get(sig.start_byte()..end_node.end_byte())
+        .unwrap_or("");
     Some(ParsedNode {
         node_type: node_type.into(),
         name,
@@ -1202,7 +1515,11 @@ fn extract_dart_declaration(
             match child.kind() {
                 "function_signature" => {
                     let name = get_child_by_field(&child, "name", source)?;
-                    let node_type = if parent_class.is_some() { "method" } else { "function" };
+                    let node_type = if parent_class.is_some() {
+                        "method"
+                    } else {
+                        "function"
+                    };
                     let qualified_name = match parent_class {
                         Some(cls) => Some(format!("{}.{}", cls, name)),
                         None => Some(name.clone()),
@@ -1213,7 +1530,9 @@ fn extract_dart_declaration(
                         .map(|p| node_text(&p, source).to_string());
                     let ret = (0..child.named_child_count())
                         .filter_map(|j| child.named_child(j))
-                        .find(|c| matches!(c.kind(), "type_identifier" | "void_type" | "function_type"))
+                        .find(|c| {
+                            matches!(c.kind(), "type_identifier" | "void_type" | "function_type")
+                        })
                         .map(|r| node_text(&r, source).to_string());
                     let ret_with_args = ret.map(|r| {
                         let type_args = (0..child.named_child_count())
@@ -1255,8 +1574,11 @@ fn extract_dart_declaration(
                         Some(cls) => Some(format!("{}.{}", cls, name)),
                         None => Some(name.clone()),
                     };
-                    let params = strip_nul_field(child.child_by_field_name("parameters")
-                        .map(|p| node_text(&p, source).to_string()));
+                    let params = strip_nul_field(
+                        child
+                            .child_by_field_name("parameters")
+                            .map(|p| node_text(&p, source).to_string()),
+                    );
                     return Some(ParsedNode {
                         node_type: "function".into(),
                         name,
@@ -1290,10 +1612,16 @@ mod tests {
     fn test_truncate_code_content_strips_nul_bytes() {
         let got = truncate_code_content("alpha\0betaGamma");
         assert!(!got.contains('\0'), "NUL must be stripped, got {got:?}");
-        assert!(got.contains("betaGamma"), "text after the NUL must survive, got {got:?}");
+        assert!(
+            got.contains("betaGamma"),
+            "text after the NUL must survive, got {got:?}"
+        );
         assert_eq!(got, "alpha betaGamma");
         // Non-NUL short content stays byte-identical on the borrow fast path.
-        assert!(matches!(truncate_code_content("plain code"), std::borrow::Cow::Borrowed("plain code")));
+        assert!(matches!(
+            truncate_code_content("plain code"),
+            std::borrow::Cow::Borrowed("plain code")
+        ));
     }
 
     #[test]
@@ -1317,17 +1645,42 @@ beforeEach(() => {
 });
 "#;
         let nodes = parse_code(code, "javascript").unwrap();
-        let by_name: std::collections::HashMap<&str, bool> = nodes.iter()
-            .map(|n| (n.name.as_str(), n.is_test))
-            .collect();
-        assert_eq!(by_name.get("prodFn").copied(), Some(false),
+        let by_name: std::collections::HashMap<&str, bool> =
+            nodes.iter().map(|n| (n.name.as_str(), n.is_test)).collect();
+        assert_eq!(
+            by_name.get("prodFn").copied(),
+            Some(false),
             "prodFn outside describe must NOT be is_test; nodes: {:?}",
-            nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
-        assert_eq!(by_name.get("helper").copied(), Some(true), "helper inside describe → is_test");
-        assert_eq!(by_name.get("arrow").copied(), Some(true), "arrow inside describe → is_test");
-        assert_eq!(by_name.get("innerFn").copied(), Some(true), "innerFn inside it → is_test");
-        assert_eq!(by_name.get("skippedFn").copied(), Some(true), "skippedFn inside it.skip → is_test");
-        assert_eq!(by_name.get("setupFn").copied(), Some(true), "setupFn inside beforeEach → is_test");
+            nodes
+                .iter()
+                .map(|n| (&n.name, n.is_test))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            by_name.get("helper").copied(),
+            Some(true),
+            "helper inside describe → is_test"
+        );
+        assert_eq!(
+            by_name.get("arrow").copied(),
+            Some(true),
+            "arrow inside describe → is_test"
+        );
+        assert_eq!(
+            by_name.get("innerFn").copied(),
+            Some(true),
+            "innerFn inside it → is_test"
+        );
+        assert_eq!(
+            by_name.get("skippedFn").copied(),
+            Some(true),
+            "skippedFn inside it.skip → is_test"
+        );
+        assert_eq!(
+            by_name.get("setupFn").copied(),
+            Some(true),
+            "setupFn inside beforeEach → is_test"
+        );
     }
 
     #[test]
@@ -1343,12 +1696,18 @@ describe('Widget', () => {
 });
 "#;
         let nodes = parse_code(code, "tsx").unwrap();
-        let by_name: std::collections::HashMap<&str, bool> = nodes.iter()
-            .map(|n| (n.name.as_str(), n.is_test)).collect();
+        let by_name: std::collections::HashMap<&str, bool> =
+            nodes.iter().map(|n| (n.name.as_str(), n.is_test)).collect();
         assert_eq!(by_name.get("prodFn").copied(), Some(false));
-        assert_eq!(by_name.get("helper").copied(), Some(true),
+        assert_eq!(
+            by_name.get("helper").copied(),
+            Some(true),
             "tsx helper inside describe → is_test; nodes: {:?}",
-            nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
+            nodes
+                .iter()
+                .map(|n| (&n.name, n.is_test))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(by_name.get("inner").copied(), Some(true));
     }
 
@@ -1356,32 +1715,57 @@ describe('Widget', () => {
     fn test_parse_markdown_headings() {
         let code = "# Project Overview\n\nIntro.\n\n## Module Layout\n\ndetails\n\n### Important Patterns\n\nSubsection X\n--------------\n";
         let nodes = parse_code(code, "markdown").unwrap();
-        let by_name: std::collections::HashMap<&str, &str> = nodes.iter()
+        let by_name: std::collections::HashMap<&str, &str> = nodes
+            .iter()
             .map(|n| (n.name.as_str(), n.node_type.as_str()))
             .collect();
-        assert_eq!(by_name.get("Project Overview").copied(), Some("h1"),
-            "nodes: {:?}", nodes.iter().map(|n| (&n.name, &n.node_type)).collect::<Vec<_>>());
+        assert_eq!(
+            by_name.get("Project Overview").copied(),
+            Some("h1"),
+            "nodes: {:?}",
+            nodes
+                .iter()
+                .map(|n| (&n.name, &n.node_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(by_name.get("Module Layout").copied(), Some("h2"));
         assert_eq!(by_name.get("Important Patterns").copied(), Some("h3"));
-        assert_eq!(by_name.get("Subsection X").copied(), Some("h2"),
-            "setext h2 (dashes) should be detected");
+        assert_eq!(
+            by_name.get("Subsection X").copied(),
+            Some("h2"),
+            "setext h2 (dashes) should be detected"
+        );
     }
 
     #[test]
     fn test_parse_cpp_gtest_marks_is_test() {
         let code = "#include <gtest/gtest.h>\n\nTEST(MathSuite, Addition) {\n    EXPECT_EQ(1 + 1, 2);\n}\n\nTEST_F(FixtureSuite, ScopedTest) {\n    EXPECT_TRUE(true);\n}\n\nint regular_func() { return 0; }\n";
         let nodes = parse_code(code, "cpp").unwrap();
-        let by_name: std::collections::HashMap<&str, bool> = nodes.iter()
-            .map(|n| (n.name.as_str(), n.is_test))
-            .collect();
-        assert_eq!(by_name.get("MathSuite.Addition").copied(), Some(true),
+        let by_name: std::collections::HashMap<&str, bool> =
+            nodes.iter().map(|n| (n.name.as_str(), n.is_test)).collect();
+        assert_eq!(
+            by_name.get("MathSuite.Addition").copied(),
+            Some(true),
             "TEST(MathSuite, Addition) should yield Suite.Name + is_test=true; nodes: {:?}",
-            nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
-        assert_eq!(by_name.get("FixtureSuite.ScopedTest").copied(), Some(true),
+            nodes
+                .iter()
+                .map(|n| (&n.name, n.is_test))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            by_name.get("FixtureSuite.ScopedTest").copied(),
+            Some(true),
             "TEST_F should also be detected, got: {:?}",
-            nodes.iter().map(|n| (&n.name, n.is_test)).collect::<Vec<_>>());
-        assert_eq!(by_name.get("regular_func").copied(), Some(false),
-            "non-gtest function should not be is_test");
+            nodes
+                .iter()
+                .map(|n| (&n.name, n.is_test))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            by_name.get("regular_func").copied(),
+            Some(false),
+            "non-gtest function should not be is_test"
+        );
     }
 
     #[test]
@@ -1391,17 +1775,40 @@ describe('Widget', () => {
         // "Class.method"; free functions stay bare.
         let code = "class Calculator {\n    int add(int a, int b) { return a + b; }\n};\nint Calculator::multiply(int a, int b) { return a * b; }\nint free_fn() { return 0; }\n";
         let nodes = parse_code(code, "cpp").unwrap();
-        let dump: Vec<_> = nodes.iter()
-            .map(|n| (n.name.clone(), n.node_type.clone(), n.qualified_name.clone()))
+        let dump: Vec<_> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.name.clone(),
+                    n.node_type.clone(),
+                    n.qualified_name.clone(),
+                )
+            })
             .collect();
-        let find = |name: &str| nodes.iter().find(|n| n.name == name)
-            .map(|n| (n.node_type.as_str(), n.qualified_name.as_deref()));
-        assert_eq!(find("add"), Some(("method", Some("Calculator.add"))),
-            "in-class method should be Calculator.add; got: {:?}", dump);
-        assert_eq!(find("multiply"), Some(("method", Some("Calculator.multiply"))),
-            "out-of-class def should be Calculator.multiply; got: {:?}", dump);
-        assert_eq!(find("free_fn"), Some(("function", Some("free_fn"))),
-            "free function should stay bare; got: {:?}", dump);
+        let find = |name: &str| {
+            nodes
+                .iter()
+                .find(|n| n.name == name)
+                .map(|n| (n.node_type.as_str(), n.qualified_name.as_deref()))
+        };
+        assert_eq!(
+            find("add"),
+            Some(("method", Some("Calculator.add"))),
+            "in-class method should be Calculator.add; got: {:?}",
+            dump
+        );
+        assert_eq!(
+            find("multiply"),
+            Some(("method", Some("Calculator.multiply"))),
+            "out-of-class def should be Calculator.multiply; got: {:?}",
+            dump
+        );
+        assert_eq!(
+            find("free_fn"),
+            Some(("function", Some("free_fn"))),
+            "free function should stay bare; got: {:?}",
+            dump
+        );
     }
 
     #[test]
@@ -1410,8 +1817,11 @@ describe('Widget', () => {
         let nodes = parse_code(code, "bash").unwrap();
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"greet"), "missing greet, got: {:?}", names);
-        assert!(names.contains(&"backup_files"),
-            "missing backup_files, got: {:?}", names);
+        assert!(
+            names.contains(&"backup_files"),
+            "missing backup_files, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1419,11 +1829,17 @@ describe('Widget', () => {
         // JSON has no function/class concept; we verify the grammar links + parses
         // without panicking. Empty symbol list is the expected, correct outcome —
         // file still gets file-level indexing for FTS via the indexer.
-        let code = "{\n  \"name\": \"foo\",\n  \"version\": \"1.0.0\",\n  \"deps\": [\"a\", \"b\"]\n}\n";
+        let code =
+            "{\n  \"name\": \"foo\",\n  \"version\": \"1.0.0\",\n  \"deps\": [\"a\", \"b\"]\n}\n";
         let nodes = parse_code(code, "json").unwrap();
-        assert!(nodes.is_empty(),
+        assert!(
+            nodes.is_empty(),
             "json should yield no symbol nodes, got: {:?}",
-            nodes.iter().map(|n| (&n.name, &n.node_type)).collect::<Vec<_>>());
+            nodes
+                .iter()
+                .map(|n| (&n.name, &n.node_type))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1446,10 +1862,26 @@ class UserService {
 "#;
         let nodes = parse_code(code, "typescript").unwrap();
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(names.contains(&"handleLogin"), "missing handleLogin, got: {:?}", names);
-        assert!(names.contains(&"processPayment"), "missing processPayment, got: {:?}", names);
-        assert!(names.contains(&"UserService"), "missing UserService, got: {:?}", names);
-        assert!(names.contains(&"findUser"), "missing findUser, got: {:?}", names);
+        assert!(
+            names.contains(&"handleLogin"),
+            "missing handleLogin, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"processPayment"),
+            "missing processPayment, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"UserService"),
+            "missing UserService, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"findUser"),
+            "missing findUser, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1470,9 +1902,14 @@ class UserService {
 
     #[test]
     fn test_parse_go_functions() {
-        let code = "package main\nfunc handleRequest(w http.ResponseWriter, r *http.Request) {\n}\n";
+        let code =
+            "package main\nfunc handleRequest(w http.ResponseWriter, r *http.Request) {\n}\n";
         let nodes = parse_code(code, "go").unwrap();
-        assert!(nodes.iter().any(|n| n.name == "handleRequest"), "got: {:?}", nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+        assert!(
+            nodes.iter().any(|n| n.name == "handleRequest"),
+            "got: {:?}",
+            nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1486,7 +1923,8 @@ class UserService {
 
     #[test]
     fn test_parse_rust_functions() {
-        let code = "pub fn calculate(x: i32, y: i32) -> i32 { x + y }\nstruct Config { name: String }\n";
+        let code =
+            "pub fn calculate(x: i32, y: i32) -> i32 { x + y }\nstruct Config { name: String }\n";
         let nodes = parse_code(code, "rust").unwrap();
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"calculate"), "got: {:?}", names);
@@ -1505,7 +1943,11 @@ class UserService {
     fn test_parse_c_functions() {
         let code = "int main(int argc, char *argv[]) { return 0; }\n";
         let nodes = parse_code(code, "c").unwrap();
-        assert!(nodes.iter().any(|n| n.name == "main"), "got: {:?}", nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+        assert!(
+            nodes.iter().any(|n| n.name == "main"),
+            "got: {:?}",
+            nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1528,8 +1970,16 @@ function Container() {
 "#;
         let nodes = parse_code(code, "tsx").unwrap();
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(names.contains(&"App"), "TSX function with JSX should be parsed, got: {:?}", names);
-        assert!(names.contains(&"Container"), "TSX function with complex JSX should be parsed, got: {:?}", names);
+        assert!(
+            names.contains(&"App"),
+            "TSX function with JSX should be parsed, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Container"),
+            "TSX function with complex JSX should be parsed, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1549,7 +1999,14 @@ function Container() {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"Comparable"), "got: {:?}", names);
         assert!(names.contains(&"Color"), "got: {:?}", names);
-        assert!(nodes.iter().find(|n| n.name == "Comparable").unwrap().node_type == "interface");
+        assert!(
+            nodes
+                .iter()
+                .find(|n| n.name == "Comparable")
+                .unwrap()
+                .node_type
+                == "interface"
+        );
         assert!(nodes.iter().find(|n| n.name == "Color").unwrap().node_type == "enum");
     }
 
@@ -1560,7 +2017,14 @@ function Container() {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"MyClass"), "got: {:?}", names);
         assert!(names.contains(&"Point"), "got: {:?}", names);
-        assert!(nodes.iter().find(|n| n.name == "MyClass").unwrap().node_type == "class");
+        assert!(
+            nodes
+                .iter()
+                .find(|n| n.name == "MyClass")
+                .unwrap()
+                .node_type
+                == "class"
+        );
         assert!(nodes.iter().find(|n| n.name == "Point").unwrap().node_type == "struct");
     }
 
@@ -1616,40 +2080,65 @@ class Config:
 "#;
         let nodes = parse_code(code, "python").unwrap();
         let by_name = |n: &str| -> &ParsedNode {
-            nodes.iter().find(|x| x.name == n)
-                .unwrap_or_else(|| panic!("{n} not extracted; got: {:?}",
-                    nodes.iter().map(|x| &x.name).collect::<Vec<_>>()))
+            nodes.iter().find(|x| x.name == n).unwrap_or_else(|| {
+                panic!(
+                    "{n} not extracted; got: {:?}",
+                    nodes.iter().map(|x| &x.name).collect::<Vec<_>>()
+                )
+            })
         };
 
         // Decorated classmethod: full decorator stack + start at first decorator.
         let pv = by_name("pre_validate");
-        assert!(pv.code_content.contains("@field_validator(\"lat\", mode=\"before\")"),
-            "code_content must include the pydantic decorator (issue #31); got: {:?}", pv.code_content);
-        assert!(pv.code_content.contains("@classmethod"),
-            "code_content must include the FULL decorator stack; got: {:?}", pv.code_content);
-        assert_eq!(pv.start_line, 7,
-            "start_line must point at the first decorator, not `def`; got: {}", pv.start_line);
+        assert!(
+            pv.code_content
+                .contains("@field_validator(\"lat\", mode=\"before\")"),
+            "code_content must include the pydantic decorator (issue #31); got: {:?}",
+            pv.code_content
+        );
+        assert!(
+            pv.code_content.contains("@classmethod"),
+            "code_content must include the FULL decorator stack; got: {:?}",
+            pv.code_content
+        );
+        assert_eq!(
+            pv.start_line, 7,
+            "start_line must point at the first decorator, not `def`; got: {}",
+            pv.start_line
+        );
         assert_eq!(pv.node_type, "method");
 
         // @property method (issue #31 secondary): decorator retained.
         let label = by_name("label");
-        assert!(label.code_content.contains("@property"),
-            "property decorator must be retained; got: {:?}", label.code_content);
+        assert!(
+            label.code_content.contains("@property"),
+            "property decorator must be retained; got: {:?}",
+            label.code_content
+        );
 
         // Decorated async staticmethod.
         let refresh = by_name("refresh");
-        assert!(refresh.code_content.contains("@staticmethod"),
-            "async method decorator must be retained; got: {:?}", refresh.code_content);
+        assert!(
+            refresh.code_content.contains("@staticmethod"),
+            "async method decorator must be retained; got: {:?}",
+            refresh.code_content
+        );
 
         // Top-level decorated function.
         let health = by_name("health");
-        assert!(health.code_content.contains("@app.route(\"/health\")"),
-            "top-level function decorator must be retained; got: {:?}", health.code_content);
+        assert!(
+            health.code_content.contains("@app.route(\"/health\")"),
+            "top-level function decorator must be retained; got: {:?}",
+            health.code_content
+        );
 
         // Decorated class.
         let config = by_name("Config");
-        assert!(config.code_content.contains("@dataclass"),
-            "class decorator must be retained; got: {:?}", config.code_content);
+        assert!(
+            config.code_content.contains("@dataclass"),
+            "class decorator must be retained; got: {:?}",
+            config.code_content
+        );
         assert_eq!(config.node_type, "class");
     }
 
@@ -1691,13 +2180,29 @@ const NAMES: &[&str] = &["a", "b"];
 "#;
         let nodes = parse_code(code, "rust").unwrap();
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(names.contains(&"MAX_SIZE"), "should parse const, got: {:?}", names);
-        assert!(names.contains(&"DB_PATH"), "should parse static, got: {:?}", names);
-        assert!(names.contains(&"NAMES"), "should parse const array, got: {:?}", names);
+        assert!(
+            names.contains(&"MAX_SIZE"),
+            "should parse const, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"DB_PATH"),
+            "should parse static, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"NAMES"),
+            "should parse const array, got: {:?}",
+            names
+        );
 
         let max_size = nodes.iter().find(|n| n.name == "MAX_SIZE").unwrap();
         assert_eq!(max_size.node_type, "constant");
-        assert_eq!(max_size.return_type.as_deref(), Some("usize"), "should capture type annotation");
+        assert_eq!(
+            max_size.return_type.as_deref(),
+            Some("usize"),
+            "should capture type annotation"
+        );
 
         let db_path = nodes.iter().find(|n| n.name == "DB_PATH").unwrap();
         assert_eq!(db_path.node_type, "constant");
@@ -1732,17 +2237,37 @@ function scope() {
         let by = |n: &str| nodes.iter().find(|x| x.name == n);
 
         // Value literals, objects, and call-result singletons → `constant`.
-        assert_eq!(by("API_URL").expect("exported value const").node_type, "constant");
-        assert_eq!(by("DEFAULT_CONFIG").expect("multi-line object const").node_type, "constant");
-        assert_eq!(by("authStore").expect("singleton const").node_type, "constant");
+        assert_eq!(
+            by("API_URL").expect("exported value const").node_type,
+            "constant"
+        );
+        assert_eq!(
+            by("DEFAULT_CONFIG")
+                .expect("multi-line object const")
+                .node_type,
+            "constant"
+        );
+        assert_eq!(
+            by("authStore").expect("singleton const").node_type,
+            "constant"
+        );
 
         // Arrow-valued const and plain function stay `function` (unchanged).
         assert_eq!(by("buildUrl").expect("arrow const").node_type, "function");
-        assert_eq!(by("handler").expect("export function").node_type, "function");
+        assert_eq!(
+            by("handler").expect("export function").node_type,
+            "function"
+        );
 
         // Non-exported consts are never extracted (can't be imported → noise).
-        assert!(by("NOT_EXPORTED").is_none(), "non-exported top-level const must not be a symbol");
-        assert!(by("localOnly").is_none(), "function-local const must not be a symbol");
+        assert!(
+            by("NOT_EXPORTED").is_none(),
+            "non-exported top-level const must not be a symbol"
+        );
+        assert!(
+            by("localOnly").is_none(),
+            "function-local const must not be a symbol"
+        );
     }
 
     #[test]
@@ -1767,24 +2292,47 @@ const { notExported } = getObj();
 
         // Object-shorthand and array bindings each become their own constant.
         for name in ["host", "port", "first", "second", "keep", "theRest"] {
-            let n = by(name).unwrap_or_else(|| panic!("destructured binding `{name}` should be a constant node"));
-            assert_eq!(n.node_type, "constant", "binding `{name}` should be a constant");
+            let n = by(name).unwrap_or_else(|| {
+                panic!("destructured binding `{name}` should be a constant node")
+            });
+            assert_eq!(
+                n.node_type, "constant",
+                "binding `{name}` should be a constant"
+            );
         }
 
         // Renamed `{ renamedFrom: localName }` binds the LOCAL name (the exported one),
         // not the source property key.
-        assert!(by("localName").is_some(), "renamed destructure binds the local name");
-        assert!(by("renamedFrom").is_none(), "the source key is not a binding");
+        assert!(
+            by("localName").is_some(),
+            "renamed destructure binds the local name"
+        );
+        assert!(
+            by("renamedFrom").is_none(),
+            "the source key is not a binding"
+        );
 
         // Default `{ withDefault = 10 }` binds `withDefault`.
-        assert!(by("withDefault").is_some(), "default-valued destructure binds the name");
+        assert!(
+            by("withDefault").is_some(),
+            "default-valued destructure binds the name"
+        );
 
         // The literal pattern text must NEVER become a node name.
-        assert!(by("{ host, port }").is_none(), "pattern text must not be a symbol name");
-        assert!(by("[first, second]").is_none(), "array pattern text must not be a symbol name");
+        assert!(
+            by("{ host, port }").is_none(),
+            "pattern text must not be a symbol name"
+        );
+        assert!(
+            by("[first, second]").is_none(),
+            "array pattern text must not be a symbol name"
+        );
 
         // Plain identifier export still works; non-exported destructure is not extracted.
         assert_eq!(by("SIMPLE").expect("plain const").node_type, "constant");
-        assert!(by("notExported").is_none(), "non-exported destructure must not be a symbol");
+        assert!(
+            by("notExported").is_none(),
+            "non-exported destructure must not be a symbol"
+        );
     }
 }

@@ -13,9 +13,9 @@
 //! naturally excluded. JavaScript has no type annotations, so this is a no-op
 //! there — the gate is `language == "typescript" || language == "tsx"`.
 
-use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
+use super::ParsedRelation;
 use crate::domain::REL_REFERENCES;
 
 /// Emit a `references` edge for a `type_identifier` used in type position.
@@ -106,22 +106,19 @@ pub(super) fn extract_js_value_reference(
         }
         // Phase 2: object property value (`{ onClick: handler }`) — `value` field
         // only, never the property key.
-        "pair" => {
-            parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id())
-        }
+        "pair" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
         // Phase 2: explicit `return handler;`.
         "return_statement" => true,
         // Phase 2: arrow implicit-return body (`() => handler`) — the `body` field.
-        "arrow_function" => {
-            parent.child_by_field_name("body").map(|b| b.id()) == Some(node.id())
-        }
+        "arrow_function" => parent.child_by_field_name("body").map(|b| b.id()) == Some(node.id()),
         // Phase 3b: JSX attribute callback (`onClick={handleClick}`) — a bare
         // identifier inside a `jsx_expression` container whose parent is a
         // `jsx_attribute`. JSX children expressions (`<div>{x}</div>`) are excluded
         // (their `jsx_expression` parent is a jsx element, not an attribute).
-        "jsx_expression" => {
-            parent.parent().map(|gp| gp.kind() == "jsx_attribute").unwrap_or(false)
-        }
+        "jsx_expression" => parent
+            .parent()
+            .map(|gp| gp.kind() == "jsx_attribute")
+            .unwrap_or(false),
         _ => false,
     };
     if !in_value_position {
@@ -154,16 +151,23 @@ pub(super) fn extract_js_value_reference(
 /// captured by an inner closure are a documented Phase-1 residual, outer *params*
 /// are still covered. Default-value expressions over-collect, which only suppresses
 /// a candidate (precision-safe).
-fn js_enclosing_fn_local_names(node: &tree_sitter::Node, source: &str) -> std::collections::HashSet<String> {
+fn js_enclosing_fn_local_names(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     let mut nearest_fn_vars_done = false;
     let mut cur = node.parent();
     while let Some(n) = cur {
         if matches!(
             n.kind(),
-            "function_declaration" | "function_expression" | "arrow_function"
-                | "method_definition" | "generator_function_declaration"
-                | "generator_function" | "function"
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "generator_function_declaration"
+                | "generator_function"
+                | "function"
         ) {
             if let Some(p) = n.child_by_field_name("parameters") {
                 collect_js_param_idents(&p, source, &mut names, 0);

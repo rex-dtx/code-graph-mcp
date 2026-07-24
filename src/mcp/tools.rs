@@ -150,9 +150,13 @@ impl ToolRegistry {
             },
         ];
 
-        debug_assert_eq!(tools.len(), TOOL_COUNT,
+        debug_assert_eq!(
+            tools.len(),
+            TOOL_COUNT,
             "TOOL_COUNT ({}) does not match actual tool count ({}). Update TOOL_COUNT in tools.rs.",
-            TOOL_COUNT, tools.len());
+            TOOL_COUNT,
+            tools.len()
+        );
         Self { tools }
     }
 
@@ -174,12 +178,19 @@ mod tests {
     #[test]
     fn test_tool_registry_has_all_tools() {
         let registry = ToolRegistry::new();
-        let names: Vec<&str> = registry.list_tools().iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = registry
+            .list_tools()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
         for expected in [
-            "semantic_code_search", "get_call_graph",
-            "get_ast_node", "project_map",
+            "semantic_code_search",
+            "get_call_graph",
+            "get_ast_node",
+            "project_map",
             "module_overview",
-            "ast_search", "find_references",
+            "ast_search",
+            "find_references",
         ] {
             assert!(names.contains(&expected), "missing tool: {}", expected);
         }
@@ -204,16 +215,23 @@ mod tests {
         let live: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         let expected: std::collections::BTreeSet<&str> =
             crate::domain::LIVE_MCP_TOOLS.iter().copied().collect();
-        assert_eq!(live, expected, "tools/list must equal domain::LIVE_MCP_TOOLS");
+        assert_eq!(
+            live, expected,
+            "tools/list must equal domain::LIVE_MCP_TOOLS"
+        );
     }
 
     #[test]
     fn test_descriptions_are_concise() {
         let registry = ToolRegistry::new();
         for tool in registry.list_tools() {
-            assert!(tool.description.len() <= 200,
+            assert!(
+                tool.description.len() <= 200,
                 "Tool {} description too long ({} chars): '{}'",
-                tool.name, tool.description.len(), tool.description);
+                tool.name,
+                tool.description.len(),
+                tool.description
+            );
         }
     }
 }

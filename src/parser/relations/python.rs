@@ -25,10 +25,10 @@
 //!   (already an inherits edge);
 //! - value identifiers, attribute reads, call names.
 
-use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
-use crate::domain::{REL_REFERENCES, PYTHON_TYPE_REFERENCE_NOISE};
+use super::ParsedRelation;
+use crate::domain::{PYTHON_TYPE_REFERENCE_NOISE, REL_REFERENCES};
 
 /// True if `node` is the type NAME of an annotation, i.e. it sits in a position
 /// that tree-sitter-python wraps in a `type` node. The gate walks up a small,
@@ -56,14 +56,15 @@ fn is_annotation_type_name(node: &tree_sitter::Node) -> bool {
         if parent.kind() == "attribute" {
             // Only the tail (`attribute` field) is the type name; the `object`
             // segment (`mod`) is a module path, not a project type usage.
-            let is_tail = parent
-                .child_by_field_name("attribute")
-                .map(|n| n.id())
-                == Some(node.id());
+            let is_tail =
+                parent.child_by_field_name("attribute").map(|n| n.id()) == Some(node.id());
             if !is_tail {
                 return false;
             }
-            return parent.parent().map(|gp| gp.kind() == "type").unwrap_or(false);
+            return parent
+                .parent()
+                .map(|gp| gp.kind() == "type")
+                .unwrap_or(false);
         }
     }
 
@@ -115,10 +116,7 @@ pub(super) fn extract_python_type_reference(
         return None;
     }
     let name = node_text(node, source);
-    if name.is_empty()
-        || name == "_"
-        || PYTHON_TYPE_REFERENCE_NOISE.contains(&name)
-    {
+    if name.is_empty() || name == "_" || PYTHON_TYPE_REFERENCE_NOISE.contains(&name) {
         return None;
     }
     Some(ParsedRelation {
@@ -153,8 +151,13 @@ pub(super) fn extract_python_value_reference(
 ) -> Option<ParsedRelation> {
     let parent = node.parent()?;
     let in_value_position = match parent.kind() {
-        "argument_list" => parent.parent().map(|gp| gp.kind() == "call").unwrap_or(false),
-        "keyword_argument" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
+        "argument_list" => parent
+            .parent()
+            .map(|gp| gp.kind() == "call")
+            .unwrap_or(false),
+        "keyword_argument" => {
+            parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id())
+        }
         "assignment" => parent.child_by_field_name("right").map(|v| v.id()) == Some(node.id()),
         "return_statement" => true,
         "pair" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
@@ -163,7 +166,9 @@ pub(super) fn extract_python_value_reference(
         "expression_list" => match parent.parent() {
             Some(gp) => match gp.kind() {
                 "return_statement" => true,
-                "assignment" => gp.child_by_field_name("right").map(|r| r.id()) == Some(parent.id()),
+                "assignment" => {
+                    gp.child_by_field_name("right").map(|r| r.id()) == Some(parent.id())
+                }
                 _ => false,
             },
             None => false,
@@ -194,7 +199,10 @@ pub(super) fn extract_python_value_reference(
 /// scope) + assignment / for targets in the nearest function body. Used for
 /// M2/M2.5 exclusion. Over-collection (param type names, default-value idents) is
 /// precision-safe — it only suppresses a candidate.
-fn py_enclosing_fn_local_names(node: &tree_sitter::Node, source: &str) -> std::collections::HashSet<String> {
+fn py_enclosing_fn_local_names(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     let mut nearest_body_done = false;
     let mut cur = node.parent();

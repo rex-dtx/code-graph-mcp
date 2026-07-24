@@ -4,23 +4,34 @@
 use super::super::*;
 
 impl McpServer {
-    pub(in crate::mcp::server) fn tool_module_overview(&self, args: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn tool_module_overview(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         // Validate deps_direction UNCONDITIONALLY at tool entry. It is only consumed
         // when `include_deps` folds in dependency_graph for a single-file path, but
         // validating it here — before ensure_indexed, regardless of include_deps or
         // path shape — stops a bogus value from being silently swallowed into the
         // `dependencies_unavailable` field (directory paths / include_deps:false
         // never reached the old gated check). feedback-enum-validate-at-entry.
-        let deps_direction_raw = args.get("deps_direction").and_then(|v| v.as_str()).unwrap_or("both");
-        let deps_direction = crate::domain::normalize_dep_direction(deps_direction_raw).ok_or_else(|| {
-            anyhow!("deps_direction must be one of: outgoing, incoming, both (got '{}')", deps_direction_raw)
-        })?;
+        let deps_direction_raw = args
+            .get("deps_direction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("both");
+        let deps_direction = crate::domain::normalize_dep_direction(deps_direction_raw)
+            .ok_or_else(|| {
+                anyhow!(
+                    "deps_direction must be one of: outgoing, incoming, both (got '{}')",
+                    deps_direction_raw
+                )
+            })?;
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
         }
 
-        let raw_path = args["path"].as_str()
+        let raw_path = args["path"]
+            .as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
         // Reject empty-string path explicitly: it normalizes to the "match all"
         // prefix the same way "." does, but is almost always a variable-substitution
@@ -81,23 +92,22 @@ impl McpServer {
         let exports = queries::get_module_exports(self.db.conn(), path)?;
 
         // Filter out test functions — they add noise to module overviews
-        let exports: Vec<_> = exports.into_iter()
+        let exports: Vec<_> = exports
+            .into_iter()
             .filter(|e| !is_test_symbol(&e.name, &e.file_path))
             .collect();
 
         // Get import/dependency info at file level
-        let files: std::collections::HashSet<&str> = exports.iter()
-            .map(|e| e.file_path.as_str()).collect();
+        let files: std::collections::HashSet<&str> =
+            exports.iter().map(|e| e.file_path.as_str()).collect();
 
         // Split exports into active (called by others) and inactive to save tokens.
-        let (active, inactive): (Vec<_>, Vec<_>) = exports.iter()
-            .partition(|e| e.caller_count > 0);
+        let (active, inactive): (Vec<_>, Vec<_>) = exports.iter().partition(|e| e.caller_count > 0);
 
-        let mut hot_candidates: Vec<_> = exports.iter()
-            .filter(|e| e.caller_count > 0)
-            .collect();
+        let mut hot_candidates: Vec<_> = exports.iter().filter(|e| e.caller_count > 0).collect();
         hot_candidates.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
-        let hot_paths: Vec<serde_json::Value> = hot_candidates.iter()
+        let hot_paths: Vec<serde_json::Value> = hot_candidates
+            .iter()
             .take(5)
             .map(|e| {
                 let mut obj = json!({
@@ -118,7 +128,8 @@ impl McpServer {
         let active_capped = active.len() > MAX_ACTIVE;
         let mut active_sorted = active.clone();
         active_sorted.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
-        let active_exports: Vec<serde_json::Value> = active_sorted.iter()
+        let active_exports: Vec<serde_json::Value> = active_sorted
+            .iter()
             .take(MAX_ACTIVE)
             .map(|e| {
                 let mut obj = json!({
@@ -141,13 +152,18 @@ impl McpServer {
             .collect();
 
         // Compact summary for inactive symbols — just counts by type
-        let mut inactive_by_type: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+        let mut inactive_by_type: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
         for e in &inactive {
             // Show `Class.method` for members so two same-named methods of different
             // classes don't both surface as a bare, indistinguishable `render`.
-            inactive_by_type.entry(e.node_type.as_str()).or_default().push(e.display_name());
+            inactive_by_type
+                .entry(e.node_type.as_str())
+                .or_default()
+                .push(e.display_name());
         }
-        let inactive_summary: Vec<serde_json::Value> = inactive_by_type.iter()
+        let inactive_summary: Vec<serde_json::Value> = inactive_by_type
+            .iter()
             .map(|(typ, names)| {
                 let display: Vec<&&str> = names.iter().take(8).collect();
                 let mut obj = json!({
@@ -186,14 +202,18 @@ impl McpServer {
             let mut cache = lock_or_recover(&self.cache.cached_module_overviews, "cached_movw");
             if cache.len() >= 10 {
                 // Evict oldest entry
-                if let Some(oldest_key) = cache.iter()
+                if let Some(oldest_key) = cache
+                    .iter()
                     .min_by_key(|(_, (ts, _))| *ts)
                     .map(|(k, _)| k.to_string())
                 {
                     cache.remove(&oldest_key);
                 }
             }
-            cache.insert(path.to_string(), (std::time::Instant::now(), result.clone()));
+            cache.insert(
+                path.to_string(),
+                (std::time::Instant::now(), result.clone()),
+            );
         }
 
         // include_deps: when path is a single file, fold in dependency_graph output.
@@ -230,7 +250,10 @@ impl McpServer {
         // include_dead: append unreferenced symbols under this path.
         // Folds the former find_dead_code tool (v0.18.4).
         if include_dead {
-            let min_lines = args.get("dead_min_lines").and_then(|v| v.as_i64()).unwrap_or(3);
+            let min_lines = args
+                .get("dead_min_lines")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(3);
             let dead_args = json!({
                 "path": path,
                 "min_lines": min_lines,
@@ -258,31 +281,38 @@ impl McpServer {
         Ok(result)
     }
 
-    pub(in crate::mcp::server) fn compact_module_overview(&self, full: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(in crate::mcp::server) fn compact_module_overview(
+        &self,
+        full: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         // Compact: keep node_id for chaining, drop signature.
         // Field name `caller_count` matches the non-compact envelope and the
         // CLI `overview --json` output (parity across surfaces).
-        let active: Vec<serde_json::Value> = full["active_exports"].as_array()
-            .map(|arr| arr.iter().map(|e| {
-                let mut obj = json!({
-                    "node_id": e["node_id"],
-                    "name": e["name"],
-                    "type": e["type"],
-                    "file": e["file"],
-                    "caller_count": e["caller_count"],
-                });
-                // Forward the method disambiguator when the full envelope carries it.
-                if let Some(qn) = e.get("qualified_name") {
-                    obj["qualified_name"] = qn.clone();
-                }
-                obj
-            }).collect())
+        let active: Vec<serde_json::Value> = full["active_exports"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        let mut obj = json!({
+                            "node_id": e["node_id"],
+                            "name": e["name"],
+                            "type": e["type"],
+                            "file": e["file"],
+                            "caller_count": e["caller_count"],
+                        });
+                        // Forward the method disambiguator when the full envelope carries it.
+                        if let Some(qn) = e.get("qualified_name") {
+                            obj["qualified_name"] = qn.clone();
+                        }
+                        obj
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
-        let inactive_count: usize = full["inactive_summary"].as_array()
-            .map(|arr| arr.iter()
-                .filter_map(|s| s["count"].as_u64())
-                .sum::<u64>() as usize)
+        let inactive_count: usize = full["inactive_summary"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|s| s["count"].as_u64()).sum::<u64>() as usize)
             .unwrap_or(0);
 
         let mut result = json!({

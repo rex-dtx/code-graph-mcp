@@ -16,9 +16,21 @@ use tempfile::TempDir;
 fn build_medium_fixture(target_files: usize) -> TempDir {
     let dir = TempDir::new().unwrap();
     let p = dir.path();
-    Command::new("git").args(["init", "-q"]).current_dir(p).status().unwrap();
-    Command::new("git").args(["config", "user.email", "t@t"]).current_dir(p).status().unwrap();
-    Command::new("git").args(["config", "user.name", "t"]).current_dir(p).status().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "t@t"])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "t"])
+        .current_dir(p)
+        .status()
+        .unwrap();
     std::fs::create_dir_all(p.join("src")).unwrap();
 
     // ~25 fns per file → ~5000 nodes at 200 files
@@ -27,12 +39,20 @@ fn build_medium_fixture(target_files: usize) -> TempDir {
         for j in 0..25 {
             content.push_str(&format!(
                 "pub fn fn_{i}_{j}() -> i32 {{ {} }}\n",
-                if j > 0 { format!("fn_{i}_{}() + 1", j - 1) } else { "0".into() }
+                if j > 0 {
+                    format!("fn_{i}_{}() + 1", j - 1)
+                } else {
+                    "0".into()
+                }
             ));
         }
         std::fs::write(p.join(format!("src/m_{i}.rs")), &content).unwrap();
     }
-    Command::new("git").args(["add", "."]).current_dir(p).status().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(p)
+        .status()
+        .unwrap();
     Command::new("git")
         .args(["commit", "-q", "-m", "fixture"])
         .current_dir(p)
@@ -65,7 +85,10 @@ fn bench_create_size_and_time() {
     let zst_size = compressed.len() as u64;
 
     println!("create: {elapsed:?}, raw {raw_size} bytes, zst {zst_size} bytes");
-    assert!(elapsed.as_secs() < 5, "create took {elapsed:?} (target <5s)");
+    assert!(
+        elapsed.as_secs() < 5,
+        "create took {elapsed:?} (target <5s)"
+    );
     assert!(
         zst_size < 2 * 1024 * 1024,
         "zst size {zst_size} exceeds 2 MiB target"
@@ -130,11 +153,7 @@ fn bench_node_count_parity_full_vs_snapshot() {
         .current_dir(target.path())
         .status()
         .unwrap();
-    snapshot::try_install(
-        &format!("file://{}", zst.display()),
-        target.path(),
-    )
-    .unwrap();
+    snapshot::try_install(&format!("file://{}", zst.display()), target.path()).unwrap();
     let nodes_snap = count_nodes(&target.path().join(".code-graph").join("index.db"));
 
     println!("nodes full={nodes_full} snapshot={nodes_snap}");

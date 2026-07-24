@@ -211,8 +211,7 @@ pub fn gc_embedding_cache(conn: &Connection) -> Result<usize> {
         return Ok(0);
     }
     {
-        let mut del =
-            tx.prepare_cached("DELETE FROM embedding_cache WHERE context_hash = ?1")?;
+        let mut del = tx.prepare_cached("DELETE FROM embedding_cache WHERE context_hash = ?1")?;
         for h in &stale {
             del.execute([h])?;
         }
@@ -268,39 +267,64 @@ pub fn seed_embedding_cache_from_vectors(conn: &Connection) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::files::{upsert_file, FileRecord};
     use super::super::helpers::test_db;
     use super::super::nodes::{insert_node, NodeRecord};
     use super::super::vectors::insert_node_vector;
+    use super::*;
 
     fn mk_node(conn: &Connection, name: &str, ctx: Option<&str>) -> i64 {
-        let fid = upsert_file(conn, &FileRecord {
-            path: format!("{name}.ts"), blake3_hash: "h".into(), last_modified: 1, language: None,
-        }).unwrap();
-        insert_node(conn, &NodeRecord {
-            file_id: fid, node_type: "function".into(), name: name.into(),
-            qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
-            signature: None, doc_comment: None, context_string: ctx.map(|s| s.to_string()),
-            name_tokens: None, return_type: None, param_types: None, is_test: false,
-        }).unwrap()
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: format!("{name}.ts"),
+                blake3_hash: "h".into(),
+                last_modified: 1,
+                language: None,
+            },
+        )
+        .unwrap();
+        insert_node(
+            conn,
+            &NodeRecord {
+                file_id: fid,
+                node_type: "function".into(),
+                name: name.into(),
+                qualified_name: None,
+                start_line: 1,
+                end_line: 2,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: ctx.map(|s| s.to_string()),
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
     fn partition_splits_hits_and_misses_and_round_trips() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
         // Seed the cache for context "A" with a distinctive vector.
-        let sentinel: Vec<f32> = (0..crate::domain::EMBEDDING_DIM).map(|i| i as f32 * 0.01).collect();
+        let sentinel: Vec<f32> = (0..crate::domain::EMBEDDING_DIM)
+            .map(|i| i as f32 * 0.01)
+            .collect();
         cache_put_embeddings(conn, &[(cache_key("ctx-A"), sentinel.clone())]).unwrap();
-        let (hits, misses) = partition_by_cache(
-            conn,
-            &[(1, "ctx-A".into()), (2, "ctx-B".into())],
-        ).unwrap();
+        let (hits, misses) =
+            partition_by_cache(conn, &[(1, "ctx-A".into()), (2, "ctx-B".into())]).unwrap();
         assert_eq!(hits.len(), 1, "ctx-A is a cache hit");
         assert_eq!(hits[0].0, 1);
-        assert_eq!(hits[0].1, sentinel, "hit round-trips the exact embedding bytes");
+        assert_eq!(
+            hits[0].1, sentinel,
+            "hit round-trips the exact embedding bytes"
+        );
         assert_eq!(misses.len(), 1, "ctx-B is a miss");
         assert_eq!(misses[0], (2, "ctx-B".to_string()));
     }
@@ -319,9 +343,19 @@ mod tests {
     fn ensure_valid_clears_on_model_change_only() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
-        cache_put_embeddings(conn, &[(cache_key("A"), vec![0.0; crate::domain::EMBEDDING_DIM])]).unwrap();
-        let count = |c: &Connection| c.query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r.get::<_, i64>(0)).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        cache_put_embeddings(
+            conn,
+            &[(cache_key("A"), vec![0.0; crate::domain::EMBEDDING_DIM])],
+        )
+        .unwrap();
+        let count = |c: &Connection| {
+            c.query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
         // First call records the fingerprint, clears nothing.
         assert!(!ensure_embedding_cache_valid(conn, "model-v1").unwrap());
         assert_eq!(count(conn), 1, "first call must not clear");
@@ -337,14 +371,23 @@ mod tests {
     fn gc_prunes_orphaned_content_keeps_live() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
         // A live node with context "live"; cache entries for "live" and a stale "gone".
         mk_node(conn, "n", Some("live"));
-        cache_put_embeddings(conn, &[
-            (cache_key("live"), vec![0.0; crate::domain::EMBEDDING_DIM]),
-            (cache_key("gone"), vec![0.0; crate::domain::EMBEDDING_DIM]),
-        ]).unwrap();
-        assert_eq!(gc_embedding_cache(conn).unwrap(), 1, "prunes the one orphaned entry");
+        cache_put_embeddings(
+            conn,
+            &[
+                (cache_key("live"), vec![0.0; crate::domain::EMBEDDING_DIM]),
+                (cache_key("gone"), vec![0.0; crate::domain::EMBEDDING_DIM]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            gc_embedding_cache(conn).unwrap(),
+            1,
+            "prunes the one orphaned entry"
+        );
         // Idempotent + kept the live one.
         assert_eq!(gc_embedding_cache(conn).unwrap(), 0);
         let (hits, _) = partition_by_cache(conn, &[(1, "live".into())]).unwrap();
@@ -358,19 +401,32 @@ mod tests {
         // re-embedding. Idempotent, and the seeded content is reusable via partition.
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
         let a = mk_node(conn, "a", Some("ctx-a"));
         let b = mk_node(conn, "b", Some("ctx-b"));
         insert_node_vector(conn, a, &vec![0.1; crate::domain::EMBEDDING_DIM]).unwrap();
         insert_node_vector(conn, b, &vec![0.2; crate::domain::EMBEDDING_DIM]).unwrap();
         // Cache empty → seed populates from the two surviving vectors.
-        assert_eq!(seed_embedding_cache_from_vectors(conn).unwrap(), 2, "seeds both vectors");
+        assert_eq!(
+            seed_embedding_cache_from_vectors(conn).unwrap(),
+            2,
+            "seeds both vectors"
+        );
         // Idempotent: a populated cache is not re-seeded.
-        assert_eq!(seed_embedding_cache_from_vectors(conn).unwrap(), 0, "no-op once populated");
+        assert_eq!(
+            seed_embedding_cache_from_vectors(conn).unwrap(),
+            0,
+            "no-op once populated"
+        );
         // Seeded content is reusable with the exact stored embedding.
         let (hits, misses) = partition_by_cache(conn, &[(a, "ctx-a".into())]).unwrap();
         assert_eq!(hits.len(), 1, "seeded content is a cache hit");
-        assert_eq!(hits[0].1, vec![0.1; crate::domain::EMBEDDING_DIM], "exact embedding round-trips");
+        assert_eq!(
+            hits[0].1,
+            vec![0.1; crate::domain::EMBEDDING_DIM],
+            "exact embedding round-trips"
+        );
         assert!(misses.is_empty());
     }
 
@@ -380,10 +436,24 @@ mod tests {
         // cache — that would turn the next rebuild back into a full re-embed.
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql()).unwrap();
-        cache_put_embeddings(conn, &[(cache_key("A"), vec![0.0; crate::domain::EMBEDDING_DIM])]).unwrap();
-        assert_eq!(gc_embedding_cache(conn).unwrap(), 0, "must not prune against empty nodes");
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
-            "cache preserved during the transient empty-nodes window");
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        cache_put_embeddings(
+            conn,
+            &[(cache_key("A"), vec![0.0; crate::domain::EMBEDDING_DIM])],
+        )
+        .unwrap();
+        assert_eq!(
+            gc_embedding_cache(conn).unwrap(),
+            0,
+            "must not prune against empty nodes"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "cache preserved during the transient empty-nodes window"
+        );
     }
 }

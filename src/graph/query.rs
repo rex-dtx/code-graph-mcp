@@ -119,24 +119,80 @@ pub fn get_call_graph_filtered(
     let depth_capped = max_depth > CALL_GRAPH_MAX_DEPTH;
 
     let (nodes, limit_hit) = match direction {
-        "callees" => query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callees, min_confidence_rank)?,
-        "callers" => query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callers, min_confidence_rank)?,
+        "callees" => query_direction(
+            conn,
+            function_name,
+            effective_max_depth,
+            file_path,
+            Direction::Callees,
+            min_confidence_rank,
+        )?,
+        "callers" => query_direction(
+            conn,
+            function_name,
+            effective_max_depth,
+            file_path,
+            Direction::Callers,
+            min_confidence_rank,
+        )?,
         "both" => {
-            let (callees, c1) = query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callees, min_confidence_rank)?;
-            let (callers, c2) = query_direction(conn, function_name, effective_max_depth, file_path, Direction::Callers, min_confidence_rank)?;
+            let (callees, c1) = query_direction(
+                conn,
+                function_name,
+                effective_max_depth,
+                file_path,
+                Direction::Callees,
+                min_confidence_rank,
+            )?;
+            let (callers, c2) = query_direction(
+                conn,
+                function_name,
+                effective_max_depth,
+                file_path,
+                Direction::Callers,
+                min_confidence_rank,
+            )?;
             (merge_results(callees, callers), c1 || c2)
         }
-        other => return Err(anyhow!("invalid direction '{}': must be callers, callees, or both", other)),
+        other => {
+            return Err(anyhow!(
+                "invalid direction '{}': must be callers, callees, or both",
+                other
+            ))
+        }
     };
 
     // Disclose, rather than silently drop, the pruned fan-out: count the seed's
     // direct sub-threshold edges in the queried direction(s).
     let suppressed_ambiguous = match direction {
-        "callees" => count_suppressed_seed_edges(conn, function_name, file_path, Direction::Callees, min_confidence_rank)?,
-        "callers" => count_suppressed_seed_edges(conn, function_name, file_path, Direction::Callers, min_confidence_rank)?,
+        "callees" => count_suppressed_seed_edges(
+            conn,
+            function_name,
+            file_path,
+            Direction::Callees,
+            min_confidence_rank,
+        )?,
+        "callers" => count_suppressed_seed_edges(
+            conn,
+            function_name,
+            file_path,
+            Direction::Callers,
+            min_confidence_rank,
+        )?,
         "both" => {
-            count_suppressed_seed_edges(conn, function_name, file_path, Direction::Callees, min_confidence_rank)?
-                + count_suppressed_seed_edges(conn, function_name, file_path, Direction::Callers, min_confidence_rank)?
+            count_suppressed_seed_edges(
+                conn,
+                function_name,
+                file_path,
+                Direction::Callees,
+                min_confidence_rank,
+            )? + count_suppressed_seed_edges(
+                conn,
+                function_name,
+                file_path,
+                Direction::Callers,
+                min_confidence_rank,
+            )?
         }
         _ => 0,
     };
@@ -163,7 +219,7 @@ fn query_direction(
     min_confidence_rank: u8,
 ) -> Result<(Vec<CallGraphNode>, bool)> {
     let max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH); // Hard cap to prevent CTE blowup on highly connected graphs
-    // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
+                                                         // Use NULL sentinel: when file_path is None, pass NULL and the filter is always true
     let file_filter = "AND (?2 IS NULL OR f.path = ?2)";
     let file_path_param: Option<&str> = file_path;
 
@@ -262,7 +318,16 @@ fn query_direction(
     };
 
     let results: Vec<CallGraphNode> = stmt
-        .query_map(rusqlite::params![function_name, file_path_param, max_depth, REL_CALLS, min_confidence_rank as i64], map_row)?
+        .query_map(
+            rusqlite::params![
+                function_name,
+                file_path_param,
+                max_depth,
+                REL_CALLS,
+                min_confidence_rank as i64
+            ],
+            map_row,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
 
     let limit_hit = results.len() == CALL_GRAPH_ROW_LIMIT;
@@ -305,7 +370,12 @@ pub fn count_suppressed_seed_edges(
     );
     let count: i64 = conn.query_row(
         &sql,
-        rusqlite::params![function_name, file_path, REL_CALLS, min_confidence_rank as i64],
+        rusqlite::params![
+            function_name,
+            file_path,
+            REL_CALLS,
+            min_confidence_rank as i64
+        ],
         |row| row.get(0),
     )?;
     Ok(count as usize)
@@ -328,7 +398,9 @@ pub fn count_suppressed_into(
     if min_confidence_rank == 0 || target_ids.is_empty() {
         return Ok(0);
     }
-    let placeholders = std::iter::repeat_n("?", target_ids.len()).collect::<Vec<_>>().join(",");
+    let placeholders = std::iter::repeat_n("?", target_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
     // CASE mirrors domain::confidence_rank (extracted=2, inferred=1, else=0), same
     // as query_direction's conf_gate; `< rank` is the complement of the `>= rank`
     // traversal gate, so this counts exactly the edges that gate pruned.
@@ -342,8 +414,10 @@ pub fn count_suppressed_into(
     );
     let rel_param: &dyn rusqlite::types::ToSql = &REL_CALLS;
     let rank_param: i64 = min_confidence_rank as i64;
-    let mut params: Vec<&dyn rusqlite::types::ToSql> =
-        target_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+    let mut params: Vec<&dyn rusqlite::types::ToSql> = target_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
     params.push(rel_param);
     params.push(&rank_param);
     let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
@@ -368,7 +442,10 @@ pub fn count_suppressed_into(
 /// the DEFAULT `callgraph <symbol>` (direction=both, both CLI and MCP) print the
 /// same caller/callee set in a different order on every run, and left the JSON
 /// `results[]` order unstable — defeating diff/reproducibility.
-fn merge_results(mut callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -> Vec<CallGraphNode> {
+fn merge_results(
+    mut callees: Vec<CallGraphNode>,
+    callers: Vec<CallGraphNode>,
+) -> Vec<CallGraphNode> {
     callees.extend(callers);
     callees.sort_by_key(|n| n.depth);
     callees
@@ -377,9 +454,9 @@ fn merge_results(mut callees: Vec<CallGraphNode>, callers: Vec<CallGraphNode>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::db::Database;
-    use crate::storage::queries::{upsert_file, insert_node, insert_edge, FileRecord, NodeRecord};
     use crate::domain::REL_CALLS;
+    use crate::storage::db::Database;
+    use crate::storage::queries::{insert_edge, insert_node, upsert_file, FileRecord, NodeRecord};
     use tempfile::TempDir;
 
     fn test_db() -> (Database, TempDir) {
@@ -414,12 +491,16 @@ mod tests {
         let (db, _tmp) = test_db();
         let conn = db.conn();
 
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let a = insert_node(conn, &node("A", fid)).unwrap();
         let b = insert_node(conn, &node("B", fid)).unwrap();
@@ -437,7 +518,10 @@ mod tests {
         assert!(names.contains(&"A"), "should contain root node A");
         assert!(names.contains(&"B"), "should contain callee B");
         assert!(names.contains(&"C"), "should contain callee C");
-        assert!(!names.contains(&"D"), "should NOT contain D (not a callee of A)");
+        assert!(
+            !names.contains(&"D"),
+            "should NOT contain D (not a callee of A)"
+        );
 
         // Verify depths
         let a_node = result.nodes.iter().find(|n| n.name == "A").unwrap();
@@ -454,12 +538,16 @@ mod tests {
         let (db, _tmp) = test_db();
         let conn = db.conn();
 
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let a = insert_node(conn, &node("A", fid)).unwrap();
         let b = insert_node(conn, &node("B", fid)).unwrap();
@@ -476,7 +564,10 @@ mod tests {
         assert!(names.contains(&"B"), "should contain root node B");
         assert!(names.contains(&"A"), "should contain caller A");
         assert!(names.contains(&"D"), "should contain caller D");
-        assert!(!names.contains(&"C"), "should NOT contain C (C is a callee, not caller)");
+        assert!(
+            !names.contains(&"C"),
+            "should NOT contain C (C is a callee, not caller)"
+        );
 
         // Verify depths
         let b_node = result.nodes.iter().find(|n| n.name == "B").unwrap();
@@ -493,12 +584,16 @@ mod tests {
         let (db, _tmp) = test_db();
         let conn = db.conn();
 
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let a = insert_node(conn, &node("A", fid)).unwrap();
         let b = insert_node(conn, &node("B", fid)).unwrap();
@@ -509,7 +604,11 @@ mod tests {
         let result = get_call_graph(conn, "A", "callees", 10, None).unwrap();
 
         // Should terminate and contain at most A and B
-        assert!(result.nodes.len() <= 2, "cycle detection should limit results to <=2, got {}", result.nodes.len());
+        assert!(
+            result.nodes.len() <= 2,
+            "cycle detection should limit results to <=2, got {}",
+            result.nodes.len()
+        );
 
         let names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"A"));
@@ -522,12 +621,16 @@ mod tests {
         let (db, _tmp) = test_db();
         let conn = db.conn();
 
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let a = insert_node(conn, &node("A", fid)).unwrap();
         let b = insert_node(conn, &node("B", fid)).unwrap();
@@ -559,12 +662,16 @@ mod tests {
         let (db, _tmp) = test_db();
         let conn = db.conn();
 
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let a = insert_node(conn, &node("A", fid)).unwrap();
         let b = insert_node(conn, &node("B", fid)).unwrap();
@@ -581,12 +688,24 @@ mod tests {
         assert_eq!(c_node.parent_id, None, "root must have no parent");
 
         let b_node = result.nodes.iter().find(|n| n.name == "B").unwrap();
-        assert_eq!(b_node.parent_id, Some(c), "depth-1 caller B's parent is the root C");
+        assert_eq!(
+            b_node.parent_id,
+            Some(c),
+            "depth-1 caller B's parent is the root C"
+        );
 
         let a_node = result.nodes.iter().find(|n| n.name == "A").unwrap();
-        assert_eq!(a_node.parent_id, Some(b), "depth-2 caller A's parent is depth-1 B (NOT C)");
+        assert_eq!(
+            a_node.parent_id,
+            Some(b),
+            "depth-2 caller A's parent is depth-1 B (NOT C)"
+        );
         let d_node = result.nodes.iter().find(|n| n.name == "D").unwrap();
-        assert_eq!(d_node.parent_id, Some(b), "depth-2 caller D's parent is depth-1 B (NOT C)");
+        assert_eq!(
+            d_node.parent_id,
+            Some(b),
+            "depth-2 caller D's parent is depth-1 B (NOT C)"
+        );
     }
 
     /// Within a single depth, results are ordered by caller_count DESC so
@@ -599,12 +718,16 @@ mod tests {
         let (db, _tmp) = test_db();
         let conn = db.conn();
 
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let r = insert_node(conn, &node("R", fid)).unwrap();
         let a1 = insert_node(conn, &node("A1", fid)).unwrap();
@@ -627,12 +750,17 @@ mod tests {
         let result = get_call_graph(conn, "R", "callees", 1, None).unwrap();
 
         // Filter to depth=1 only (R itself is depth=0).
-        let depth_1: Vec<&str> = result.nodes.iter()
+        let depth_1: Vec<&str> = result
+            .nodes
+            .iter()
             .filter(|n| n.depth == 1)
             .map(|n| n.name.as_str())
             .collect();
-        assert_eq!(depth_1, vec!["A1", "A2", "A3"],
-            "depth-1 callees must be ordered by caller_count DESC: A1(6) > A2(2) > A3(1)");
+        assert_eq!(
+            depth_1,
+            vec!["A1", "A2", "A3"],
+            "depth-1 callees must be ordered by caller_count DESC: A1(6) > A2(2) > A3(1)"
+        );
     }
 
     /// requested depth > CALL_GRAPH_MAX_DEPTH must set depth_capped and clamp
@@ -641,12 +769,16 @@ mod tests {
     fn test_depth_capped_signal() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
         let a = insert_node(conn, &node("A", fid)).unwrap();
         let b = insert_node(conn, &node("B", fid)).unwrap();
         insert_edge(conn, a, b, REL_CALLS, None).unwrap();
@@ -655,7 +787,10 @@ mod tests {
         assert!(result.depth_capped, "depth=99 must trip the cap");
         assert_eq!(result.requested_max_depth, 99);
         assert_eq!(result.effective_max_depth, CALL_GRAPH_MAX_DEPTH);
-        assert!(!result.limit_hit, "this fixture has only 2 nodes, must not trigger row limit");
+        assert!(
+            !result.limit_hit,
+            "this fixture has only 2 nodes, must not trigger row limit"
+        );
 
         let small = get_call_graph(conn, "A", "callees", 5, None).unwrap();
         assert!(!small.depth_capped, "depth=5 must not trip the cap");
@@ -682,12 +817,16 @@ mod tests {
     fn test_min_confidence_filters_ambiguous_edges() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let s = insert_node(conn, &node("S", fid)).unwrap();
         let b = insert_node(conn, &node("B", fid)).unwrap();
@@ -709,27 +848,54 @@ mod tests {
         // Callees at default threshold: B kept, C (ambiguous) pruned.
         let callees = get_call_graph_filtered(conn, "S", "callees", 2, None, inferred).unwrap();
         let cn: Vec<&str> = callees.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(cn.contains(&"B"), "inferred callee kept at default threshold");
-        assert!(!cn.contains(&"C"), "ambiguous callee pruned at default threshold");
-        assert_eq!(callees.suppressed_ambiguous, 1, "one ambiguous direct callee hidden");
+        assert!(
+            cn.contains(&"B"),
+            "inferred callee kept at default threshold"
+        );
+        assert!(
+            !cn.contains(&"C"),
+            "ambiguous callee pruned at default threshold"
+        );
+        assert_eq!(
+            callees.suppressed_ambiguous, 1,
+            "one ambiguous direct callee hidden"
+        );
 
         // Callers at default threshold: ambiguous caller P pruned.
         let callers = get_call_graph_filtered(conn, "S", "callers", 2, None, inferred).unwrap();
         let rn: Vec<&str> = callers.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(!rn.contains(&"P"), "ambiguous caller pruned at default threshold");
-        assert_eq!(callers.suppressed_ambiguous, 1, "one ambiguous direct caller hidden");
+        assert!(
+            !rn.contains(&"P"),
+            "ambiguous caller pruned at default threshold"
+        );
+        assert_eq!(
+            callers.suppressed_ambiguous, 1,
+            "one ambiguous direct caller hidden"
+        );
 
         // Lowering the threshold to ambiguous restores everything; nothing suppressed.
         let all = get_call_graph_filtered(conn, "S", "both", 2, None, show_all).unwrap();
         let an: Vec<&str> = all.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(an.contains(&"C"), "ambiguous callee shown when threshold lowered to ambiguous");
-        assert!(an.contains(&"P"), "ambiguous caller shown when threshold lowered to ambiguous");
-        assert_eq!(all.suppressed_ambiguous, 0, "no edges below an ambiguous threshold");
+        assert!(
+            an.contains(&"C"),
+            "ambiguous callee shown when threshold lowered to ambiguous"
+        );
+        assert!(
+            an.contains(&"P"),
+            "ambiguous caller shown when threshold lowered to ambiguous"
+        );
+        assert_eq!(
+            all.suppressed_ambiguous, 0,
+            "no edges below an ambiguous threshold"
+        );
 
         // Back-compat: the bare get_call_graph wrapper shows all (rank 0).
         let compat = get_call_graph(conn, "S", "callees", 2, None).unwrap();
         let kn: Vec<&str> = compat.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(kn.contains(&"C"), "bare get_call_graph preserves show-all behavior");
+        assert!(
+            kn.contains(&"C"),
+            "bare get_call_graph preserves show-all behavior"
+        );
     }
 
     /// Pins the `extracted` tier of the SQL rank CASE (the leg
@@ -741,12 +907,16 @@ mod tests {
     fn test_min_confidence_extracted_tier_parity() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
         let s = insert_node(conn, &node("S", fid)).unwrap();
         let x = insert_node(conn, &node("X", fid)).unwrap();
         let y = insert_node(conn, &node("Y", fid)).unwrap();
@@ -761,16 +931,27 @@ mod tests {
         // inferred floor (rank 1): extracted(2) and inferred(1) both survive.
         let at_inferred = get_call_graph_filtered(conn, "S", "callees", 2, None, inferred).unwrap();
         let n1: Vec<&str> = at_inferred.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(n1.contains(&"X") && n1.contains(&"Y"),
-            "inferred floor keeps both extracted and inferred edges; got {n1:?}");
+        assert!(
+            n1.contains(&"X") && n1.contains(&"Y"),
+            "inferred floor keeps both extracted and inferred edges; got {n1:?}"
+        );
 
         // extracted floor (rank 2): only extracted(2) survives; inferred(1) dropped + counted.
-        let at_extracted = get_call_graph_filtered(conn, "S", "callees", 2, None, extracted).unwrap();
+        let at_extracted =
+            get_call_graph_filtered(conn, "S", "callees", 2, None, extracted).unwrap();
         let n2: Vec<&str> = at_extracted.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(n2.contains(&"X"), "extracted floor keeps the extracted edge; got {n2:?}");
-        assert!(!n2.contains(&"Y"), "extracted floor drops the inferred edge; got {n2:?}");
-        assert_eq!(at_extracted.suppressed_ambiguous, 1,
-            "the inferred edge counts as suppressed at the extracted floor");
+        assert!(
+            n2.contains(&"X"),
+            "extracted floor keeps the extracted edge; got {n2:?}"
+        );
+        assert!(
+            !n2.contains(&"Y"),
+            "extracted floor drops the inferred edge; got {n2:?}"
+        );
+        assert_eq!(
+            at_extracted.suppressed_ambiguous, 1,
+            "the inferred edge counts as suppressed at the extracted floor"
+        );
     }
 
     /// Regression: `direction="both"` output MUST be deterministic and preserve
@@ -786,12 +967,16 @@ mod tests {
     fn test_both_direction_deterministic_and_relevance_ordered() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
 
         let s = insert_node(conn, &node("S", fid)).unwrap();
         // Five callers of S, each given a distinct caller_count (K_i has i extra
@@ -814,18 +999,26 @@ mod tests {
         insert_edge(conn, s, m2, REL_CALLS, None).unwrap();
 
         let full_order = |r: &CallGraphResult| -> Vec<(String, &'static str, i32)> {
-            r.nodes.iter().map(|n| (n.name.clone(), n.direction.as_str(), n.depth)).collect()
+            r.nodes
+                .iter()
+                .map(|n| (n.name.clone(), n.direction.as_str(), n.depth))
+                .collect()
         };
 
         let run1 = get_call_graph(conn, "S", "both", 1, None).unwrap();
         let run2 = get_call_graph(conn, "S", "both", 1, None).unwrap();
 
         // Determinism: two identical queries → identical node order.
-        assert_eq!(full_order(&run1), full_order(&run2),
-            "direction=both must be deterministic across calls");
+        assert_eq!(
+            full_order(&run1),
+            full_order(&run2),
+            "direction=both must be deterministic across calls"
+        );
 
         // Relevance preserved through merge: depth-1 callers in caller_count-DESC order.
-        let got: Vec<&str> = run1.nodes.iter()
+        let got: Vec<&str> = run1
+            .nodes
+            .iter()
             .filter(|n| n.depth == 1 && matches!(n.direction, Direction::Callers))
             .map(|n| n.name.as_str())
             .collect();
@@ -846,12 +1039,16 @@ mod tests {
     fn test_tie_band_orders_by_node_id() {
         let (db, _tmp) = test_db();
         let conn = db.conn();
-        let fid = upsert_file(conn, &FileRecord {
-            path: "test.ts".into(),
-            blake3_hash: "h1".into(),
-            last_modified: 1,
-            language: Some("typescript".into()),
-        }).unwrap();
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "test.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
         let s = insert_node(conn, &node("S", fid)).unwrap();
         // Insert out of alphabetical order to prove node_id (insertion order), not
         // name, is the tiebreaker; each is called only by S → caller_count == 1.
@@ -861,13 +1058,17 @@ mod tests {
         }
 
         let result = get_call_graph(conn, "S", "callees", 1, None).unwrap();
-        let ids: Vec<i64> = result.nodes.iter()
+        let ids: Vec<i64> = result
+            .nodes
+            .iter()
             .filter(|n| n.depth == 1)
             .map(|n| n.node_id)
             .collect();
         let mut ascending = ids.clone();
         ascending.sort_unstable();
-        assert_eq!(ids, ascending,
-            "equal-caller_count callees must be ordered by node_id ASC; got {ids:?}");
+        assert_eq!(
+            ids, ascending,
+            "equal-caller_count callees must be ordered by node_id ASC; got {ids:?}"
+        );
     }
 }

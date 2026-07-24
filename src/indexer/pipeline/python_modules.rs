@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 /// Build mapping from Python dotted module paths to file paths.
 /// Registers both full paths and suffix paths for flexible matching.
 /// e.g., "src/myapp/utils.py" matches "src.myapp.utils", "myapp.utils", and "utils".
-pub(super) fn build_python_module_map(python_paths: &HashSet<String>) -> HashMap<String, Vec<String>> {
+pub(super) fn build_python_module_map(
+    python_paths: &HashSet<String>,
+) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for path in python_paths {
         let stripped = if let Some(s) = path.strip_suffix("/__init__.py") {
@@ -59,15 +61,25 @@ pub(super) fn resolve_python_module_targets(
     // dependency analysis than missing real dependencies.
     let module_files = python_module_map.get(python_module)?;
 
-    let lookup_name = if is_module_import { "<module>" } else { target_name };
+    let lookup_name = if is_module_import {
+        "<module>"
+    } else {
+        target_name
+    };
     let all_ids = name_to_ids.get(lookup_name)?;
-    let targets: Vec<i64> = all_ids.iter()
+    let targets: Vec<i64> = all_ids
+        .iter()
         .filter(|nid| {
-            node_id_to_path.get(nid)
+            node_id_to_path
+                .get(nid)
                 .map(|p| module_files.contains(p))
                 .unwrap_or(false)
         })
         .copied()
         .collect();
-    if targets.is_empty() { None } else { Some(targets) }
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets)
+    }
 }

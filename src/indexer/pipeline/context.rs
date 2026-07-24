@@ -11,6 +11,9 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
+use crate::domain::{
+    REL_CALLS, REL_EXPORTS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO,
+};
 use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
 use crate::storage::db::Database;
@@ -18,7 +21,6 @@ use crate::storage::queries::{
     delete_node_vectors_batch, get_edges_batch, get_nodes_missing_context,
     get_nodes_with_files_by_ids, update_context_strings_batch, EdgeInfo, NodeResult,
 };
-use crate::domain::{REL_CALLS, REL_IMPORTS, REL_INHERITS, REL_ROUTES_TO, REL_IMPLEMENTS, REL_EXPORTS};
 
 use super::embed::embed_and_store_batch;
 
@@ -45,7 +47,10 @@ pub(super) struct CategorizedEdges {
     pub exports: Vec<String>,
 }
 
-pub(super) fn categorize_edges(edges: Option<&Vec<EdgeInfo>>, format_route: impl Fn(Option<&str>, &str) -> String) -> CategorizedEdges {
+pub(super) fn categorize_edges(
+    edges: Option<&Vec<EdgeInfo>>,
+    format_route: impl Fn(Option<&str>, &str) -> String,
+) -> CategorizedEdges {
     let mut result = CategorizedEdges {
         callees: Vec::new(),
         callers: Vec::new(),
@@ -75,13 +80,19 @@ pub(super) fn categorize_edges(edges: Option<&Vec<EdgeInfo>>, format_route: impl
 }
 
 /// Regenerate context strings (and embeddings) for the given set of dirty nodes.
-pub(super) fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>, model: Option<&EmbeddingModel>) -> Result<()> {
+pub(super) fn regenerate_context_strings(
+    db: &Database,
+    dirty_ids: &HashSet<i64>,
+    model: Option<&EmbeddingModel>,
+) -> Result<()> {
     let tx = db.conn().unchecked_transaction()?;
     let id_vec: Vec<i64> = dirty_ids.iter().copied().collect();
     let all_edges = get_edges_batch(db.conn(), &id_vec)?;
     let all_nodes: HashMap<i64, (NodeResult, String, Option<String>)> = {
         let nwfs = get_nodes_with_files_by_ids(db.conn(), &id_vec)?;
-        nwfs.into_iter().map(|nwf| (nwf.node.id, (nwf.node, nwf.file_path, nwf.language))).collect()
+        nwfs.into_iter()
+            .map(|nwf| (nwf.node.id, (nwf.node, nwf.file_path, nwf.language)))
+            .collect()
     };
 
     // Build all context strings first
@@ -142,16 +153,16 @@ pub(super) fn regenerate_context_strings(db: &Database, dirty_ids: &HashSet<i64>
 
 /// Repair nodes that have NULL context_string (likely from a failed Phase 3).
 /// This is called at startup after index verification.
-pub fn repair_null_context_strings(
-    db: &Database,
-    model: Option<&EmbeddingModel>,
-) -> Result<usize> {
+pub fn repair_null_context_strings(db: &Database, model: Option<&EmbeddingModel>) -> Result<usize> {
     let missing_ids = get_nodes_missing_context(db.conn())?;
     if missing_ids.is_empty() {
         return Ok(0);
     }
 
-    tracing::info!("[repair] Found {} nodes with NULL context_string, rebuilding...", missing_ids.len());
+    tracing::info!(
+        "[repair] Found {} nodes with NULL context_string, rebuilding...",
+        missing_ids.len()
+    );
 
     // Load node details with file paths
     let nodes_with_files = get_nodes_with_files_by_ids(db.conn(), &missing_ids)?;

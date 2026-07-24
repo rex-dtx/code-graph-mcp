@@ -13,22 +13,20 @@ use std::path::Path;
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::{compute_diff, scan_directory, scan_directory_cached, DirectoryCache};
 use crate::storage::db::Database;
-use crate::storage::queries::{
-    delete_files_by_paths, get_all_file_hashes, get_dirty_node_ids,
-};
+use crate::storage::queries::{delete_files_by_paths, get_all_file_hashes, get_dirty_node_ids};
 
-mod embed;
 mod context;
-mod python_modules;
-mod js_modules;
-mod resolve;
+mod embed;
 mod index_files;
+mod js_modules;
+mod python_modules;
+mod resolve;
 
 #[cfg(test)]
 mod tests;
 
-pub use embed::embed_and_store_batch;
 pub use context::repair_null_context_strings;
+pub use embed::embed_and_store_batch;
 
 use context::regenerate_context_strings;
 use index_files::index_files;
@@ -101,7 +99,9 @@ pub fn remove_indexing_status_older_than(project_root: &Path, max_age: std::time
     let path = project_root
         .join(crate::domain::CODE_GRAPH_DIR)
         .join(INDEXING_STATUS_FILE);
-    let Ok(meta) = std::fs::metadata(&path) else { return };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
     let stale = meta
         .modified()
         .ok()
@@ -113,10 +113,23 @@ pub fn remove_indexing_status_older_than(project_root: &Path, max_age: std::time
     }
 }
 
-pub fn run_full_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>, progress: Option<ProgressFn>) -> Result<IndexResult> {
+pub fn run_full_index(
+    db: &Database,
+    project_root: &Path,
+    model: Option<&EmbeddingModel>,
+    progress: Option<ProgressFn>,
+) -> Result<IndexResult> {
     let current_hashes = scan_directory(project_root)?;
     let files: Vec<String> = current_hashes.keys().cloned().collect();
-    index_files(db, project_root, &files, &current_hashes, model, &[], progress)
+    index_files(
+        db,
+        project_root,
+        &files,
+        &current_hashes,
+        model,
+        &[],
+        progress,
+    )
 }
 
 /// Reindex a single file when its on-disk hash differs from the stored hash.
@@ -175,11 +188,12 @@ pub fn ensure_file_indexed(
 
     // Missing-file path: drop stale row so future queries don't return phantom nodes.
     if !abs_path.is_file() {
-        let exists_in_db: Option<i64> = db.conn().query_row(
-            "SELECT id FROM files WHERE path = ?1",
-            [rel_path],
-            |row| row.get(0),
-        ).ok();
+        let exists_in_db: Option<i64> = db
+            .conn()
+            .query_row("SELECT id FROM files WHERE path = ?1", [rel_path], |row| {
+                row.get(0)
+            })
+            .ok();
         if exists_in_db.is_some() {
             let tx = db.conn().unchecked_transaction()?;
             delete_files_by_paths(db.conn(), &[rel_path.to_string()])?;
@@ -195,11 +209,14 @@ pub fn ensure_file_indexed(
     }
 
     let on_disk_hash = crate::indexer::merkle::hash_file(&abs_path)?;
-    let stored_hash: Option<String> = db.conn().query_row(
-        "SELECT blake3_hash FROM files WHERE path = ?1",
-        [rel_path],
-        |row| row.get(0),
-    ).ok();
+    let stored_hash: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT blake3_hash FROM files WHERE path = ?1",
+            [rel_path],
+            |row| row.get(0),
+        )
+        .ok();
 
     if stored_hash.as_deref() == Some(&on_disk_hash) {
         return Ok(false);
@@ -220,14 +237,21 @@ pub fn ensure_file_indexed(
     Ok(true)
 }
 
-pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&EmbeddingModel>, progress: Option<ProgressFn>) -> Result<IndexResult> {
+pub fn run_incremental_index(
+    db: &Database,
+    project_root: &Path,
+    model: Option<&EmbeddingModel>,
+    progress: Option<ProgressFn>,
+) -> Result<IndexResult> {
     let start = std::time::Instant::now();
     let stored_hashes = get_all_file_hashes(db.conn())?;
     let current_hashes = scan_directory(project_root)?;
     let diff = compute_diff(&stored_hashes, &current_hashes);
 
     // Preserve <external> pseudo-file across incremental indexes
-    let deleted_files: Vec<String> = diff.deleted_files.into_iter()
+    let deleted_files: Vec<String> = diff
+        .deleted_files
+        .into_iter()
         .filter(|p| p != "<external>")
         .collect();
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
@@ -238,7 +262,15 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
         HashSet::new()
     };
 
-    let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files, progress)?;
+    let result = index_files(
+        db,
+        project_root,
+        &to_index,
+        &current_hashes,
+        model,
+        &deleted_files,
+        progress,
+    )?;
 
     if !dirty_node_ids.is_empty() {
         // Heartbeat: context-string regeneration for dirty dependents runs after
@@ -252,8 +284,10 @@ pub fn run_incremental_index(db: &Database, project_root: &Path, model: Option<&
     if result.files_indexed > 0 || !deleted_files.is_empty() {
         tracing::info!(
             "[incremental] {} files changed, {} deleted, {} nodes, {} edges, {:.1}s",
-            result.files_indexed, deleted_files.len(),
-            result.nodes_created, result.edges_created,
+            result.files_indexed,
+            deleted_files.len(),
+            result.nodes_created,
+            result.edges_created,
             start.elapsed().as_secs_f64()
         );
     }
@@ -288,7 +322,9 @@ pub fn run_incremental_index_cached(
     let diff = compute_diff(&stored_hashes, &current_hashes);
 
     // Preserve <external> pseudo-file across incremental indexes
-    let deleted_files: Vec<String> = diff.deleted_files.into_iter()
+    let deleted_files: Vec<String> = diff
+        .deleted_files
+        .into_iter()
         .filter(|p| p != "<external>")
         .collect();
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
@@ -299,7 +335,15 @@ pub fn run_incremental_index_cached(
         HashSet::new()
     };
 
-    let result = index_files(db, project_root, &to_index, &current_hashes, model, &deleted_files, progress)?;
+    let result = index_files(
+        db,
+        project_root,
+        &to_index,
+        &current_hashes,
+        model,
+        &deleted_files,
+        progress,
+    )?;
 
     if !dirty_node_ids.is_empty() {
         // Heartbeat: context-string regeneration for dirty dependents runs after
@@ -313,8 +357,10 @@ pub fn run_incremental_index_cached(
     if result.files_indexed > 0 || !deleted_files.is_empty() {
         tracing::info!(
             "[incremental] {} files changed, {} deleted, {} nodes, {} edges, {:.1}s",
-            result.files_indexed, deleted_files.len(),
-            result.nodes_created, result.edges_created,
+            result.files_indexed,
+            deleted_files.len(),
+            result.nodes_created,
+            result.edges_created,
             start.elapsed().as_secs_f64()
         );
     }
@@ -327,11 +373,12 @@ pub fn run_incremental_index_cached(
 fn collect_dirty_node_ids(db: &Database, changed_paths: &[String]) -> Result<HashSet<i64>> {
     let mut changed_file_ids = Vec::new();
     for path in changed_paths {
-        let file_id: Option<i64> = db.conn().query_row(
-            "SELECT id FROM files WHERE path = ?1",
-            [path],
-            |row| row.get(0),
-        ).ok();
+        let file_id: Option<i64> = db
+            .conn()
+            .query_row("SELECT id FROM files WHERE path = ?1", [path], |row| {
+                row.get(0)
+            })
+            .ok();
         if let Some(id) = file_id {
             changed_file_ids.push(id);
         }

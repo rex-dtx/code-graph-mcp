@@ -43,8 +43,7 @@ impl ErrKind {
     pub fn classify(err_msg: &str) -> Self {
         if err_msg.contains("FOREIGN KEY constraint failed") {
             Self::FkConstraint
-        } else if err_msg.contains("Indexing in progress")
-            || err_msg.contains("retry your request")
+        } else if err_msg.contains("Indexing in progress") || err_msg.contains("retry your request")
         {
             Self::Timeout
         } else if err_msg.contains("Ambiguous symbol") {
@@ -129,7 +128,9 @@ pub struct SessionMetrics {
 }
 
 impl Default for SessionMetrics {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionMetrics {
@@ -244,22 +245,26 @@ impl SessionMetrics {
 
         // Build tools map. `err_kinds` is additive — older readers ignore it;
         // we only emit when non-empty to keep lines compact for success-only sessions.
-        let tools_json: serde_json::Map<String, serde_json::Value> = self.tools.iter().map(|(name, stats)| {
-            let mut obj = serde_json::json!({
-                "n": stats.count,
-                "ms": stats.total_ms,
-                "err": stats.errors,
-                "max_ms": stats.max_ms,
-            });
-            if !stats.err_kinds.is_empty() {
-                obj["err_kinds"] = serde_json::json!(stats.err_kinds);
-            }
-            // Additive — present only when an `other`-bucket error was sampled.
-            if let Some(sample) = &stats.other_sample {
-                obj["other_sample"] = serde_json::json!(sample);
-            }
-            (name.clone(), obj)
-        }).collect();
+        let tools_json: serde_json::Map<String, serde_json::Value> = self
+            .tools
+            .iter()
+            .map(|(name, stats)| {
+                let mut obj = serde_json::json!({
+                    "n": stats.count,
+                    "ms": stats.total_ms,
+                    "err": stats.errors,
+                    "max_ms": stats.max_ms,
+                });
+                if !stats.err_kinds.is_empty() {
+                    obj["err_kinds"] = serde_json::json!(stats.err_kinds);
+                }
+                // Additive — present only when an `other`-bucket error was sampled.
+                if let Some(sample) = &stats.other_sample {
+                    obj["other_sample"] = serde_json::json!(sample);
+                }
+                (name.clone(), obj)
+            })
+            .collect();
 
         let avg_quality = if self.search.total_queries > 0 {
             ((self.search.quality_sum / self.search.total_queries as f64) * 100.0).round() / 100.0
@@ -450,11 +455,15 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// delay the caller. Mirrored in `claude-plugin/scripts/recommendation-log.js`
 /// (recommendations.jsonl is also written by the JS PreToolUse hooks).
 pub(crate) fn rotate_jsonl_if_over(path: &Path, max_bytes: u64, keep_bytes: usize) {
-    let Ok(meta) = std::fs::metadata(path) else { return }; // missing → nothing to do
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    }; // missing → nothing to do
     if meta.len() <= max_bytes {
         return; // under threshold → leave it
     }
-    let Ok(content) = std::fs::read(path) else { return };
+    let Ok(content) = std::fs::read(path) else {
+        return;
+    };
     let start = content.len().saturating_sub(keep_bytes);
     // Advance to the first newline at/after `start` so the kept region begins on
     // a whole line (drop the partial line `start` may have landed inside).
@@ -499,14 +508,25 @@ not json
         let c = count_recs_in_window(content, "2026-06-10T01:00:00Z");
         assert_eq!(
             c,
-            RecWindowCounts { deny: 2, hint: 2, cli_use: 1, bypass: 1 },
+            RecWindowCounts {
+                deny: 2,
+                hint: 2,
+                cli_use: 1,
+                bypass: 1
+            },
             "in-window counts per action, pre-window excluded, malformed skipped"
         );
 
         // Window after everything → nothing in range.
-        assert_eq!(count_recs_in_window(content, "2026-06-10T03:00:00Z"), RecWindowCounts::default());
+        assert_eq!(
+            count_recs_in_window(content, "2026-06-10T03:00:00Z"),
+            RecWindowCounts::default()
+        );
         // Empty content → zero, no panic.
-        assert_eq!(count_recs_in_window("", "2026-06-10T01:00:00Z"), RecWindowCounts::default());
+        assert_eq!(
+            count_recs_in_window("", "2026-06-10T01:00:00Z"),
+            RecWindowCounts::default()
+        );
     }
 
     #[test]
@@ -520,14 +540,19 @@ not json
         let future_ts = "2999-01-01T00:00:00Z";
         std::fs::write(
             tmp.join("recommendations.jsonl"),
-            format!("{{\"ts\":\"{}\",\"hook\":\"grep\",\"action\":\"deny\"}}\n", future_ts),
-        ).unwrap();
+            format!(
+                "{{\"ts\":\"{}\",\"hook\":\"grep\",\"action\":\"deny\"}}\n",
+                future_ts
+            ),
+        )
+        .unwrap();
         assert!(m.has_recs_in_window(&tmp));
         // Only pre-window recs → false.
         std::fs::write(
             tmp.join("recommendations.jsonl"),
             "{\"ts\":\"2000-01-01T00:00:00Z\",\"hook\":\"grep\",\"action\":\"deny\"}\n",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(!m.has_recs_in_window(&tmp));
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -604,7 +629,10 @@ not json
         m.flush(&usage_path, "0.5.26");
 
         let mut content = String::new();
-        std::fs::File::open(&usage_path).unwrap().read_to_string(&mut content).unwrap();
+        std::fs::File::open(&usage_path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 1);
 
@@ -688,8 +716,16 @@ not json
 
         let size_after = std::fs::metadata(&usage_path).unwrap().len();
         // After rotation, file should be around 512KB + the new line
-        assert!(size_after < 600_000, "File should be rotated down, got {} bytes", size_after);
-        assert!(size_after > 500_000, "File should retain ~512KB, got {} bytes", size_after);
+        assert!(
+            size_after < 600_000,
+            "File should be rotated down, got {} bytes",
+            size_after
+        );
+        assert!(
+            size_after > 500_000,
+            "File should retain ~512KB, got {} bytes",
+            size_after
+        );
 
         // Last line should be valid JSON from our flush
         let content = std::fs::read_to_string(&usage_path).unwrap();
@@ -722,7 +758,11 @@ not json
         // No partial first line: it begins with the 8-digit counter + '|'.
         let content = std::fs::read_to_string(&path).unwrap();
         let first = content.lines().next().unwrap();
-        assert_eq!(&first[8..9], "|", "first surviving line must start on a whole-line boundary: {first:.16}");
+        assert_eq!(
+            &first[8..9],
+            "|",
+            "first surviving line must start on a whole-line boundary: {first:.16}"
+        );
 
         // Under threshold → untouched.
         let small = dir.path().join("small.jsonl");
@@ -737,7 +777,10 @@ not json
         m.record_tool_call("get_call_graph", 5, None, None);
         // No env/FS — build_record takes the flag directly (race-free).
         let plain = m.build_record("0.0.0", false);
-        assert!(plain.get("dogfood").is_none(), "no dogfood field when not flagged");
+        assert!(
+            plain.get("dogfood").is_none(),
+            "no dogfood field when not flagged"
+        );
         let tagged = m.build_record("0.0.0", true);
         assert_eq!(tagged["dogfood"], serde_json::json!(true),
             "CODE_GRAPH_DOGFOOD sessions must be tagged so they can be filtered from adoption metrics");
@@ -804,8 +847,14 @@ not json
             NotFound,
         );
         assert_eq!(ErrKind::classify("query must not be empty"), EmptyInput);
-        assert_eq!(ErrKind::classify("Must pass confirm: true to rebuild index"), EmptyInput);
-        assert_eq!(ErrKind::classify("symbol_name or route_path is required"), EmptyInput);
+        assert_eq!(
+            ErrKind::classify("Must pass confirm: true to rebuild index"),
+            EmptyInput
+        );
+        assert_eq!(
+            ErrKind::classify("symbol_name or route_path is required"),
+            EmptyInput
+        );
         assert_eq!(
             ErrKind::classify("direction must be one of: callers, callees, both (got 'x')"),
             BadParam,
@@ -823,7 +872,7 @@ not json
         m.record_tool_call("get_ast_node", 120, Some(ErrKind::Ambiguous), None);
         m.record_tool_call("get_ast_node", 90, Some(ErrKind::NotFound), None);
         m.record_tool_call("get_ast_node", 80, None, None); // success
-        // Tool with no errors — err_kinds must be omitted from output.
+                                                            // Tool with no errors — err_kinds must be omitted from output.
         m.record_tool_call("project_map", 2000, None, None);
         m.flush(&usage_path, "test");
 
@@ -833,9 +882,11 @@ not json
         assert_eq!(rec["tools"]["get_ast_node"]["err_kinds"]["ambiguous"], 2);
         assert_eq!(rec["tools"]["get_ast_node"]["err_kinds"]["not_found"], 1);
         // Success-only tool omits err_kinds entirely.
-        assert!(rec["tools"]["project_map"]["err_kinds"].is_null(),
+        assert!(
+            rec["tools"]["project_map"]["err_kinds"].is_null(),
             "err_kinds must not appear for success-only tool, got: {}",
-            rec["tools"]["project_map"]);
+            rec["tools"]["project_map"]
+        );
     }
 
     #[test]
@@ -847,13 +898,25 @@ not json
         // First `other` message wins; a later one must NOT overwrite it. These are
         // genuinely-unclassified strings (no classify() keyword) — the residual the
         // sample is meant to surface after not_found/bad_param/etc. are split out.
-        m.record_tool_call("get_call_graph", 5, Some(ErrKind::Other),
-            Some("internal error: call graph query failed unexpectedly"));
-        m.record_tool_call("get_call_graph", 6, Some(ErrKind::Other),
-            Some("some later unexpected failure"));
+        m.record_tool_call(
+            "get_call_graph",
+            5,
+            Some(ErrKind::Other),
+            Some("internal error: call graph query failed unexpectedly"),
+        );
+        m.record_tool_call(
+            "get_call_graph",
+            6,
+            Some(ErrKind::Other),
+            Some("some later unexpected failure"),
+        );
         // A classified (non-other) error must NOT produce a sample.
-        m.record_tool_call("get_ast_node", 7, Some(ErrKind::NotFound),
-            Some("Symbol 'zzz' not found in index."));
+        m.record_tool_call(
+            "get_ast_node",
+            7,
+            Some(ErrKind::NotFound),
+            Some("Symbol 'zzz' not found in index."),
+        );
         m.flush(&usage_path, "test");
 
         let rec: serde_json::Value =
@@ -861,7 +924,8 @@ not json
         assert_eq!(
             rec["tools"]["get_call_graph"]["other_sample"],
             "internal error: call graph query failed unexpectedly",
-            "first `other` message is sampled, later ones do not overwrite it");
+            "first `other` message is sampled, later ones do not overwrite it"
+        );
         assert!(rec["tools"]["get_ast_node"]["other_sample"].is_null(),
             "a not_found error must not populate other_sample (classified kinds are self-describing)");
     }
@@ -877,19 +941,27 @@ not json
         // Invalid value / bad combination → BadParam.
         assert_eq!(
             ErrKind::classify("direction must be one of: callers, callees, both (got 'up')"),
-            BadParam);
+            BadParam
+        );
         assert_eq!(
-            ErrKind::classify("min_confidence must be one of: extracted, inferred, ambiguous (got 'high')"),
-            BadParam);
+            ErrKind::classify(
+                "min_confidence must be one of: extracted, inferred, ambiguous (got 'high')"
+            ),
+            BadParam
+        );
         assert_eq!(
-            ErrKind::classify("symbol_name and route_path are mutually exclusive — pass exactly one"),
-            BadParam);
+            ErrKind::classify(
+                "symbol_name and route_path are mutually exclusive — pass exactly one"
+            ),
+            BadParam
+        );
         assert_eq!(
             ErrKind::classify("Unknown relation filter: 'x'. Valid: calls, imports, inherits, implements, references, all"),
             BadParam);
         // Missing required param → EmptyInput (not a wrong value).
         assert_eq!(
             ErrKind::classify("symbol_name or route_path is required"),
-            EmptyInput);
+            EmptyInput
+        );
     }
 }

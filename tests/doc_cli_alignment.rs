@@ -367,7 +367,11 @@ fn detail_doc_and_instructions_match_cli() {
     errs.extend(check("MCP instructions (noisy)", INSTRUCTIONS_NOISY, &cli));
     errs.extend(check("MCP instructions (quiet)", INSTRUCTIONS_QUIET, &cli));
     for pt in BLOCK_PROJECT_TYPES {
-        errs.extend(check(&format!("CLAUDE.md block ({pt})"), &build_block(pt), &cli));
+        errs.extend(check(
+            &format!("CLAUDE.md block ({pt})"),
+            &build_block(pt),
+            &cli,
+        ));
     }
 
     errs.sort();
@@ -393,7 +397,8 @@ fn detail_doc_and_instructions_match_cli() {
 fn checker_rejects_fabricated_and_misattributed() {
     let cli = cli_surface();
 
-    let bad = "run `code-graph-mcp frobnicate X`, then `code-graph-mcp grep pat --nonexistent-flag`.";
+    let bad =
+        "run `code-graph-mcp frobnicate X`, then `code-graph-mcp grep pat --nonexistent-flag`.";
     let errs = check("synthetic", bad, &cli);
     assert!(
         errs.iter().any(|e| e.contains("frobnicate")),

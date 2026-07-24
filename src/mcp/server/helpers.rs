@@ -7,7 +7,8 @@ use super::COMPRESSION_TOKEN_THRESHOLD;
 
 /// Extract a required string argument, trimming whitespace and rejecting empty values.
 pub(super) fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
-    let s = args[key].as_str()
+    let s = args[key]
+        .as_str()
         .ok_or_else(|| anyhow!("{} is required", key))?
         .trim();
     if s.is_empty() {
@@ -31,12 +32,20 @@ pub(super) fn parse_route_input(input: &str) -> (Option<String>, &str) {
 }
 
 /// Filter route matches by HTTP method from metadata JSON.
-pub(super) fn filter_routes_by_method(rows: &mut Vec<queries::RouteMatch>, method: &Option<String>) {
+pub(super) fn filter_routes_by_method(
+    rows: &mut Vec<queries::RouteMatch>,
+    method: &Option<String>,
+) {
     if let Some(method) = method {
         rows.retain(|r| {
             r.metadata.as_ref().is_some_and(|m| {
-                serde_json::from_str::<serde_json::Value>(m).ok()
-                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                serde_json::from_str::<serde_json::Value>(m)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("method")
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .is_some_and(|rm| rm == *method)
             })
         });
@@ -44,10 +53,17 @@ pub(super) fn filter_routes_by_method(rows: &mut Vec<queries::RouteMatch>, metho
 }
 
 /// For inline handlers, override handler_name and start/end lines from metadata.
-pub(super) fn apply_inline_handler_metadata(handler: &mut serde_json::Value, metadata: Option<&str>) {
+pub(super) fn apply_inline_handler_metadata(
+    handler: &mut serde_json::Value,
+    metadata: Option<&str>,
+) {
     if let Some(meta_str) = metadata {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-            if meta.get("inline").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if meta
+                .get("inline")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 handler["handler_name"] = json!(format!(
                     "{} {} (inline)",
                     meta.get("method").and_then(|v| v.as_str()).unwrap_or("?"),
@@ -66,7 +82,9 @@ pub(super) fn apply_inline_handler_metadata(handler: &mut serde_json::Value, met
 
 /// Check if the caller requested to skip indexing (read-only mode).
 pub(super) fn should_skip_indexing(args: &serde_json::Value) -> bool {
-    args.get("skip_indexing").and_then(|v| v.as_bool()).unwrap_or(false)
+    args.get("skip_indexing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Normalize user-facing type filter aliases to internal AST node types.
@@ -123,7 +141,10 @@ pub(super) fn centralized_compress(value: serde_json::Value) -> serde_json::Valu
 
 /// Recursively truncate string values in a JSON value to stay within a token budget.
 /// Adds a `_truncated` key to the top-level object when truncation occurs.
-pub(super) fn truncate_large_strings(value: serde_json::Value, token_budget: usize) -> serde_json::Value {
+pub(super) fn truncate_large_strings(
+    value: serde_json::Value,
+    token_budget: usize,
+) -> serde_json::Value {
     // Target: reduce to roughly token_budget * CHARS_PER_TOKEN chars total
     let target_chars = token_budget * crate::domain::CHARS_PER_TOKEN;
     let serialized = serde_json::to_string(&value).unwrap_or_default();
@@ -134,8 +155,10 @@ pub(super) fn truncate_large_strings(value: serde_json::Value, token_budget: usi
     let mut result = truncate_value(value, target_chars);
     if let Some(obj) = result.as_object_mut() {
         obj.insert("_truncated".to_string(), json!(true));
-        obj.insert("_truncation_hint".to_string(),
-            json!("Result exceeded token limit. Use get_ast_node(node_id) to read specific nodes."));
+        obj.insert(
+            "_truncation_hint".to_string(),
+            json!("Result exceeded token limit. Use get_ast_node(node_id) to read specific nodes."),
+        );
     }
     result
 }
@@ -153,19 +176,34 @@ pub(super) fn truncate_value(value: serde_json::Value, budget: usize) -> serde_j
     truncate_value_inner(value, budget, 0)
 }
 
-fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -> serde_json::Value {
-    if depth > MAX_TRUNCATE_DEPTH { return value; }
+fn truncate_value_inner(
+    value: serde_json::Value,
+    budget: usize,
+    depth: usize,
+) -> serde_json::Value {
+    if depth > MAX_TRUNCATE_DEPTH {
+        return value;
+    }
     match value {
         serde_json::Value::Object(map) => {
             // Calculate total size of large string fields eligible for truncation
-            let large_fields: usize = map.values()
-                .filter_map(|v| v.as_str().filter(|s| s.len() > TRUNCATE_MIN_LEN).map(|s| s.len()))
+            let large_fields: usize = map
+                .values()
+                .filter_map(|v| {
+                    v.as_str()
+                        .filter(|s| s.len() > TRUNCATE_MIN_LEN)
+                        .map(|s| s.len())
+                })
                 .sum();
-            let small_fields_size: usize = map.iter()
-                .map(|(k, v)| k.len() + match v {
-                    serde_json::Value::String(s) if s.len() <= TRUNCATE_MIN_LEN => s.len(),
-                    serde_json::Value::String(_) => 0,
-                    _ => serde_json::to_string(v).map(|s| s.len()).unwrap_or(0),
+            let small_fields_size: usize = map
+                .iter()
+                .map(|(k, v)| {
+                    k.len()
+                        + match v {
+                            serde_json::Value::String(s) if s.len() <= TRUNCATE_MIN_LEN => s.len(),
+                            serde_json::Value::String(_) => 0,
+                            _ => serde_json::to_string(v).map(|s| s.len()).unwrap_or(0),
+                        }
                 })
                 .sum();
             let large_budget = budget.saturating_sub(small_fields_size);
@@ -175,12 +213,14 @@ fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -
             let mut array_truncations: serde_json::Map<String, serde_json::Value> =
                 serde_json::Map::new();
 
-            let truncated: serde_json::Map<String, serde_json::Value> = map.into_iter()
+            let truncated: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
                 .map(|(k, v)| {
                     let tv = match &v {
                         serde_json::Value::String(s) if s.len() > TRUNCATE_MIN_LEN => {
                             let field_budget = if large_fields > 0 {
-                                (large_budget as f64 * s.len() as f64 / large_fields as f64) as usize
+                                (large_budget as f64 * s.len() as f64 / large_fields as f64)
+                                    as usize
                             } else {
                                 large_budget
                             };
@@ -194,13 +234,16 @@ fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -
                         serde_json::Value::Array(arr) if arr.len() > 20 => {
                             let original = arr.len();
                             let mut kept: Vec<serde_json::Value> = arr[..10].to_vec();
-                            kept.extend_from_slice(&arr[arr.len()-5..]);
+                            kept.extend_from_slice(&arr[arr.len() - 5..]);
                             // Keep array homogeneous — consumers can read
                             // `_array_truncations[k]` for the original length.
-                            array_truncations.insert(k.clone(), json!({
-                                "original": original,
-                                "kept": kept.len(),
-                            }));
+                            array_truncations.insert(
+                                k.clone(),
+                                json!({
+                                    "original": original,
+                                    "kept": kept.len(),
+                                }),
+                            );
                             serde_json::Value::Array(kept)
                         }
                         serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
@@ -226,16 +269,14 @@ fn truncate_value_inner(value: serde_json::Value, budget: usize, depth: usize) -
             // `truncate_large_strings` wrapper adds `_truncated` metadata only
             // when the root is an object; top-level arrays cannot carry it.
             let mut kept: Vec<serde_json::Value> = arr[..10].to_vec();
-            kept.extend_from_slice(&arr[arr.len()-5..]);
+            kept.extend_from_slice(&arr[arr.len() - 5..]);
             serde_json::Value::Array(kept)
         }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(
-                arr.into_iter()
-                    .map(|v| truncate_value_inner(v, budget, depth + 1))
-                    .collect()
-            )
-        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(|v| truncate_value_inner(v, budget, depth + 1))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -246,9 +287,13 @@ mod tests {
 
     #[test]
     fn truncate_array_keeps_items_homogeneous_and_records_original_len() {
-        let items: Vec<serde_json::Value> = (0..50).map(|i| json!({
-            "id": i, "name": format!("item_{}", i),
-        })).collect();
+        let items: Vec<serde_json::Value> = (0..50)
+            .map(|i| {
+                json!({
+                    "id": i, "name": format!("item_{}", i),
+                })
+            })
+            .collect();
         let value = json!({
             "count": 50,
             "results": items,
@@ -276,19 +321,27 @@ mod tests {
         let out = truncate_large_strings(value, 50);
         let arr = out["results"].as_array().unwrap();
         assert_eq!(arr.len(), 10);
-        assert!(out.get("_array_truncations").is_none(),
-            "_array_truncations should only appear when arrays truncated");
+        assert!(
+            out.get("_array_truncations").is_none(),
+            "_array_truncations should only appear when arrays truncated"
+        );
     }
 
     #[test]
     fn strip_outer_generic_simple() {
-        assert_eq!(strip_outer_generic("Vec<Relation>"), Some("Relation".into()));
+        assert_eq!(
+            strip_outer_generic("Vec<Relation>"),
+            Some("Relation".into())
+        );
         assert_eq!(strip_outer_generic("Option<T>"), Some("T".into()));
     }
 
     #[test]
     fn strip_outer_generic_nested_picks_innermost() {
-        assert_eq!(strip_outer_generic("Result<Vec<Relation>>"), Some("Relation".into()));
+        assert_eq!(
+            strip_outer_generic("Result<Vec<Relation>>"),
+            Some("Relation".into())
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 pub mod lang_config;
 pub mod languages;
-pub mod treesitter;
 pub mod relations;
+pub mod treesitter;
 
 /// Safely extract the text corresponding to a tree-sitter node from the source string.
 /// Returns `""` if the byte range is out of bounds.
@@ -24,7 +24,10 @@ pub(crate) fn express_route_method_path(
     }
     let object = function.child_by_field_name("object")?;
     let property = function.child_by_field_name("property")?;
-    if !matches!(node_text(&object, source), "app" | "router" | "server" | "fastify") {
+    if !matches!(
+        node_text(&object, source),
+        "app" | "router" | "server" | "fastify"
+    ) {
         return None;
     }
     let method = match node_text(&property, source) {
@@ -65,7 +68,10 @@ pub(crate) fn synthetic_route_handler_name(method: &str, path: &str) -> Option<S
 /// walker (Phase 2) so the handler node, its scoped calls, and the routes_to edge
 /// all share one name.
 pub(crate) fn route_handler_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
-    if !matches!(node.kind(), "arrow_function" | "function_expression" | "function") {
+    if !matches!(
+        node.kind(),
+        "arrow_function" | "function_expression" | "function"
+    ) {
         return None;
     }
     let args = node.parent().filter(|p| p.kind() == "arguments")?;

@@ -85,7 +85,11 @@ pub(super) fn resolve_js_module_targets(
         .filter(|id| node_id_to_path.get(id).map(|p| p == &file).unwrap_or(false))
         .copied()
         .collect();
-    if targets.is_empty() { None } else { Some(targets) }
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets)
+    }
 }
 
 /// Resolve a PHP `require`/`include` path to the indexed file it refers to.
@@ -104,7 +108,9 @@ pub(super) fn resolve_php_include_path(
     // Strip a leading `./` or `/` (the latter from `__DIR__ . '/x.php'`) so the
     // join stays repo-relative. Absolute filesystem includes can't be resolved
     // against the index, so a bare `/etc/...` simply won't match file_set.
-    let rel = include_path.trim_start_matches("./").trim_start_matches('/');
+    let rel = include_path
+        .trim_start_matches("./")
+        .trim_start_matches('/');
     if rel.is_empty() {
         return None;
     }
@@ -196,7 +202,11 @@ mod tests {
 
     #[test]
     fn resolves_parent_relative_with_ts_extension() {
-        let files = fs(&["src/util/helper.ts", "src/core/caller.ts", "src/core/helper.ts"]);
+        let files = fs(&[
+            "src/util/helper.ts",
+            "src/core/caller.ts",
+            "src/core/helper.ts",
+        ]);
         assert_eq!(
             resolve_js_specifier_path("../util/helper", "src/core/caller.ts", &files),
             Some("src/util/helper.ts".to_string())
@@ -224,18 +234,28 @@ mod tests {
     #[test]
     fn bare_specifier_is_unresolved() {
         let files = fs(&["src/core/caller.ts", "node_modules/react/index.js"]);
-        assert_eq!(resolve_js_specifier_path("react", "src/core/caller.ts", &files), None);
+        assert_eq!(
+            resolve_js_specifier_path("react", "src/core/caller.ts", &files),
+            None
+        );
     }
 
     #[test]
     fn escaping_root_is_none() {
         let files = fs(&["caller.ts"]);
-        assert_eq!(resolve_js_specifier_path("../../x", "caller.ts", &files), None);
+        assert_eq!(
+            resolve_js_specifier_path("../../x", "caller.ts", &files),
+            None
+        );
     }
 
     #[test]
     fn ts_preferred_over_js() {
-        let files = fs(&["src/util/helper.js", "src/util/helper.ts", "src/core/caller.ts"]);
+        let files = fs(&[
+            "src/util/helper.js",
+            "src/util/helper.ts",
+            "src/core/caller.ts",
+        ]);
         assert_eq!(
             resolve_js_specifier_path("../util/helper", "src/core/caller.ts", &files),
             Some("src/util/helper.ts".to_string())
@@ -281,6 +301,9 @@ mod tests {
     fn php_include_unindexed_is_none() {
         // Vendored/third-party include not in the index → unresolved (→ <external>).
         let files = fs(&["src/app.php"]);
-        assert_eq!(resolve_php_include_path("vendor/autoload.php", "src/app.php", &files), None);
+        assert_eq!(
+            resolve_php_include_path("vendor/autoload.php", "src/app.php", &files),
+            None
+        );
     }
 }

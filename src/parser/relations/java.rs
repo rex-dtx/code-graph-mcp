@@ -47,9 +47,9 @@
 //! tail (last named child) of its STI parent. A segment that is ever a `scope`
 //! (`named_child(0)`) child is rejected.
 
-use super::ParsedRelation;
 use super::super::node_text;
-use crate::domain::{REL_REFERENCES, JAVA_TYPE_REFERENCE_NOISE};
+use super::ParsedRelation;
+use crate::domain::{JAVA_TYPE_REFERENCE_NOISE, REL_REFERENCES};
 
 /// True if `node` (a `type_identifier`) is the tail of a `scoped_type_identifier`
 /// chain — i.e. the rightmost segment of a qualified type like `pkg.Sub.Deep`
@@ -141,7 +141,10 @@ pub(super) fn extract_java_type_reference(
     }
     // Qualified-type package-path segments are `type_identifier`s under a
     // `scoped_type_identifier`; only the chain tail is a real type usage.
-    if node.parent().map(|p| p.kind() == "scoped_type_identifier").unwrap_or(false)
+    if node
+        .parent()
+        .map(|p| p.kind() == "scoped_type_identifier")
+        .unwrap_or(false)
         && !is_scoped_type_tail(node)
     {
         return None;

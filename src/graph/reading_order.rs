@@ -199,7 +199,11 @@ mod tests {
 
     /// `from` imports `to`.
     fn dep(from: &str, to: &str) -> ModuleDep {
-        ModuleDep { from: from.to_string(), to: to.to_string(), import_count: 1 }
+        ModuleDep {
+            from: from.to_string(),
+            to: to.to_string(),
+            import_count: 1,
+        }
     }
 
     fn main_entry(file: &str) -> EntryPoint {
@@ -249,7 +253,11 @@ mod tests {
         let deps = [dep("a", "b"), dep("b", "a")];
         let order = compute_reading_order(&modules, &deps, &[]);
         assert_eq!(order.len(), 2, "every module emitted exactly once");
-        assert_eq!(paths(&order), ["a", "b"], "deterministic cycle break (lex smallest first)");
+        assert_eq!(
+            paths(&order),
+            ["a", "b"],
+            "deterministic cycle break (lex smallest first)"
+        );
         assert!(order[0].in_cycle, "cut point flagged");
         assert_eq!(
             order.iter().filter(|e| e.in_cycle).count(),
@@ -277,9 +285,19 @@ mod tests {
         // u1:   imports hub, depended-on-by 0             → Mid
         // src:  owns src/main.rs                          → Entry (precedence over Foundational)
         let modules = [
-            module("leaf"), module("hub"), module("u1"), module("u2"), module("u3"), module("src"),
+            module("leaf"),
+            module("hub"),
+            module("u1"),
+            module("u2"),
+            module("u3"),
+            module("src"),
         ];
-        let deps = [dep("hub", "leaf"), dep("u1", "hub"), dep("u2", "hub"), dep("u3", "hub")];
+        let deps = [
+            dep("hub", "leaf"),
+            dep("u1", "hub"),
+            dep("u2", "hub"),
+            dep("u3", "hub"),
+        ];
         let eps = [main_entry("src/main.rs")];
         let order = compute_reading_order(&modules, &deps, &eps);
         let role = |p: &str| order.iter().find(|e| e.path == p).unwrap().role;

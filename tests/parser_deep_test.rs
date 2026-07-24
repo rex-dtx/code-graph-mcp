@@ -1,20 +1,33 @@
-use code_graph_mcp::parser::treesitter::parse_code;
 use code_graph_mcp::parser::relations::extract_relations;
+use code_graph_mcp::parser::treesitter::parse_code;
 
 #[test]
 fn test_java_inheritance_parsing() {
     let code = "public class Dog extends Animal { public void bark() {} }";
     let nodes = parse_code(code, "java").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"Dog"), "Java class should be parsed, got: {:?}", names);
-    assert!(names.contains(&"bark"), "Java method should be parsed, got: {:?}", names);
+    assert!(
+        names.contains(&"Dog"),
+        "Java class should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"bark"),
+        "Java method should be parsed, got: {:?}",
+        names
+    );
 
     let relations = extract_relations(code, "java").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "inherits")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"Animal"), "Java inheritance should be extracted, got: {:?}", inherits);
+    assert!(
+        inherits.contains(&"Animal"),
+        "Java inheritance should be extracted, got: {:?}",
+        inherits
+    );
 }
 
 #[test]
@@ -34,9 +47,21 @@ class UserService {
 "#;
     let nodes = parse_code(code, "typescript").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"UserService"), "TS class should be parsed, got: {:?}", names);
-    assert!(names.contains(&"getUser"), "TS method should be parsed, got: {:?}", names);
-    assert!(names.contains(&"deleteUser"), "TS method should be parsed, got: {:?}", names);
+    assert!(
+        names.contains(&"UserService"),
+        "TS class should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"getUser"),
+        "TS method should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"deleteUser"),
+        "TS method should be parsed, got: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -54,8 +79,16 @@ def create_animal(name):
 "#;
     let nodes = parse_code(code, "python").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"Animal"), "Python class should be parsed, got: {:?}", names);
-    assert!(names.contains(&"create_animal"), "Python function should be parsed, got: {:?}", names);
+    assert!(
+        names.contains(&"Animal"),
+        "Python class should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"create_animal"),
+        "Python function should be parsed, got: {:?}",
+        names
+    );
     assert!(!nodes.is_empty(), "Should produce nodes from Python code");
 }
 
@@ -76,8 +109,16 @@ func main() {
 "#;
     let nodes = parse_code(code, "go").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"greet"), "Go function should be parsed, got: {:?}", names);
-    assert!(names.contains(&"main"), "Go main should be parsed, got: {:?}", names);
+    assert!(
+        names.contains(&"greet"),
+        "Go function should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"main"),
+        "Go main should be parsed, got: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -100,8 +141,16 @@ impl Config {
 "#;
     let nodes = parse_code(code, "rust").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"Config"), "Rust struct should be parsed, got: {:?}", names);
-    assert!(names.contains(&"create_config"), "Rust function should be parsed, got: {:?}", names);
+    assert!(
+        names.contains(&"Config"),
+        "Rust struct should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"create_config"),
+        "Rust function should be parsed, got: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -120,8 +169,16 @@ int main() {
 "#;
     let nodes = parse_code(code, "c").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"add"), "C function should be parsed, got: {:?}", names);
-    assert!(names.contains(&"main"), "C main should be parsed, got: {:?}", names);
+    assert!(
+        names.contains(&"add"),
+        "C function should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"main"),
+        "C main should be parsed, got: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -139,13 +196,26 @@ function processRequest(req: Request) {
 }
 "#;
     let relations = extract_relations(code, "typescript").unwrap();
-    let calls: Vec<&str> = relations.iter()
+    let calls: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "calls")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(calls.contains(&"validateInput"), "Should extract call to validateInput, got: {:?}", calls);
-    assert!(calls.contains(&"saveToDatabase"), "Should extract call to saveToDatabase, got: {:?}", calls);
-    assert!(calls.contains(&"sendNotification"), "Should extract call to sendNotification, got: {:?}", calls);
+    assert!(
+        calls.contains(&"validateInput"),
+        "Should extract call to validateInput, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"saveToDatabase"),
+        "Should extract call to saveToDatabase, got: {:?}",
+        calls
+    );
+    assert!(
+        calls.contains(&"sendNotification"),
+        "Should extract call to sendNotification, got: {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -160,14 +230,31 @@ def process():
     return path
 "#;
     let relations = extract_relations(code, "python").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "imports")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"os"), "Should extract 'import os', got: {:?}", imports);
-    assert!(imports.contains(&"Path"), "Should extract 'from pathlib import Path', got: {:?}", imports);
-    assert!(imports.contains(&"OrderedDict"), "Should extract OrderedDict import, got: {:?}", imports);
-    assert!(imports.contains(&"defaultdict"), "Should extract defaultdict import, got: {:?}", imports);
+    assert!(
+        imports.contains(&"os"),
+        "Should extract 'import os', got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"Path"),
+        "Should extract 'from pathlib import Path', got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"OrderedDict"),
+        "Should extract OrderedDict import, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"defaultdict"),
+        "Should extract defaultdict import, got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -188,16 +275,33 @@ public interface IUserService {
 "#;
     let nodes = parse_code(code, "csharp").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"UserService"), "C# class should be parsed, got: {:?}", names);
-    assert!(names.contains(&"GetUser"), "C# method should be parsed, got: {:?}", names);
-    assert!(names.contains(&"IUserService"), "C# interface should be parsed, got: {:?}", names);
+    assert!(
+        names.contains(&"UserService"),
+        "C# class should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"GetUser"),
+        "C# method should be parsed, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"IUserService"),
+        "C# interface should be parsed, got: {:?}",
+        names
+    );
 
     let relations = extract_relations(code, "csharp").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "imports")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(!imports.is_empty(), "C# using should create imports, got: {:?}", imports);
+    assert!(
+        !imports.is_empty(),
+        "C# using should create imports, got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -218,21 +322,42 @@ interface UserRepository {
 "#;
     let nodes = parse_code(code, "kotlin").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"UserService"), "Kotlin class, got: {:?}", names);
+    assert!(
+        names.contains(&"UserService"),
+        "Kotlin class, got: {:?}",
+        names
+    );
     assert!(names.contains(&"findById"), "Kotlin fun, got: {:?}", names);
-    assert!(names.contains(&"UserRepository"), "Kotlin interface, got: {:?}", names);
+    assert!(
+        names.contains(&"UserRepository"),
+        "Kotlin interface, got: {:?}",
+        names
+    );
 
     // Verify interface is typed correctly
     let repo = nodes.iter().find(|n| n.name == "UserRepository").unwrap();
-    assert_eq!(repo.node_type, "interface", "Kotlin interface should have type 'interface', got: {:?}", repo.node_type);
+    assert_eq!(
+        repo.node_type, "interface",
+        "Kotlin interface should have type 'interface', got: {:?}",
+        repo.node_type
+    );
 
     let relations = extract_relations(code, "kotlin").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "imports")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(!imports.is_empty(), "Kotlin imports should be extracted, got: {:?}", imports);
-    assert!(imports.contains(&"Flow"), "Should import Flow, got: {:?}", imports);
+    assert!(
+        !imports.is_empty(),
+        "Kotlin imports should be extracted, got: {:?}",
+        imports
+    );
+    assert!(
+        imports.contains(&"Flow"),
+        "Should import Flow, got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -259,16 +384,25 @@ end
 "#;
     let nodes = parse_code(code, "ruby").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"UserController"), "Ruby class, got: {:?}", names);
+    assert!(
+        names.contains(&"UserController"),
+        "Ruby class, got: {:?}",
+        names
+    );
     assert!(names.contains(&"index"), "Ruby method, got: {:?}", names);
     assert!(names.contains(&"Helpers"), "Ruby module, got: {:?}", names);
 
     let relations = extract_relations(code, "ruby").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "inherits")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"ApplicationController"), "Ruby inheritance, got: {:?}", inherits);
+    assert!(
+        inherits.contains(&"ApplicationController"),
+        "Ruby inheritance, got: {:?}",
+        inherits
+    );
 }
 
 #[test]
@@ -291,24 +425,46 @@ interface Authenticatable {
 "#;
     let nodes = parse_code(code, "php").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"UserController"), "PHP class, got: {:?}", names);
+    assert!(
+        names.contains(&"UserController"),
+        "PHP class, got: {:?}",
+        names
+    );
     assert!(names.contains(&"index"), "PHP method, got: {:?}", names);
     assert!(names.contains(&"show"), "PHP method, got: {:?}", names);
-    assert!(names.contains(&"Authenticatable"), "PHP interface, got: {:?}", names);
-    assert!(names.contains(&"getAuthIdentifier"), "PHP interface method, got: {:?}", names);
+    assert!(
+        names.contains(&"Authenticatable"),
+        "PHP interface, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"getAuthIdentifier"),
+        "PHP interface method, got: {:?}",
+        names
+    );
 
     let relations = extract_relations(code, "php").unwrap();
-    let inherits: Vec<&str> = relations.iter()
+    let inherits: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "inherits")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(inherits.contains(&"Controller"), "PHP extends, got: {:?}", inherits);
+    assert!(
+        inherits.contains(&"Controller"),
+        "PHP extends, got: {:?}",
+        inherits
+    );
 
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "imports")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"User"), "PHP use import, got: {:?}", imports);
+    assert!(
+        imports.contains(&"User"),
+        "PHP use import, got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -341,24 +497,49 @@ enum UserRole {
 "#;
     let nodes = parse_code(code, "swift").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"UserRepository"), "Swift protocol, got: {:?}", names);
-    assert!(names.contains(&"UserService"), "Swift class, got: {:?}", names);
+    assert!(
+        names.contains(&"UserRepository"),
+        "Swift protocol, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"UserService"),
+        "Swift class, got: {:?}",
+        names
+    );
     assert!(names.contains(&"User"), "Swift struct, got: {:?}", names);
 
     // Verify node types
     let repo = nodes.iter().find(|n| n.name == "UserRepository").unwrap();
-    assert_eq!(repo.node_type, "interface", "Swift protocol should be 'interface', got: {:?}", repo.node_type);
+    assert_eq!(
+        repo.node_type, "interface",
+        "Swift protocol should be 'interface', got: {:?}",
+        repo.node_type
+    );
     let user = nodes.iter().find(|n| n.name == "User").unwrap();
-    assert_eq!(user.node_type, "struct", "Swift struct type, got: {:?}", user.node_type);
+    assert_eq!(
+        user.node_type, "struct",
+        "Swift struct type, got: {:?}",
+        user.node_type
+    );
     let role = nodes.iter().find(|n| n.name == "UserRole").unwrap();
-    assert_eq!(role.node_type, "enum", "Swift enum type, got: {:?}", role.node_type);
+    assert_eq!(
+        role.node_type, "enum",
+        "Swift enum type, got: {:?}",
+        role.node_type
+    );
 
     let relations = extract_relations(code, "swift").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "imports")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(imports.contains(&"Foundation"), "Swift import, got: {:?}", imports);
+    assert!(
+        imports.contains(&"Foundation"),
+        "Swift import, got: {:?}",
+        imports
+    );
 }
 
 #[test]
@@ -387,16 +568,29 @@ enum UserRole { admin, viewer }
 "#;
     let nodes = parse_code(code, "dart").unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
-    assert!(names.contains(&"UserRepository"), "Dart abstract class, got: {:?}", names);
-    assert!(names.contains(&"UserService"), "Dart class, got: {:?}", names);
+    assert!(
+        names.contains(&"UserRepository"),
+        "Dart abstract class, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"UserService"),
+        "Dart class, got: {:?}",
+        names
+    );
     assert!(names.contains(&"User"), "Dart class, got: {:?}", names);
 
     let relations = extract_relations(code, "dart").unwrap();
-    let imports: Vec<&str> = relations.iter()
+    let imports: Vec<&str> = relations
+        .iter()
         .filter(|r| r.relation == "imports")
         .map(|r| r.target_name.as_str())
         .collect();
-    assert!(!imports.is_empty(), "Dart imports should be extracted, got: {:?}", imports);
+    assert!(
+        !imports.is_empty(),
+        "Dart imports should be extracted, got: {:?}",
+        imports
+    );
 }
 
 // ============================================================
@@ -465,10 +659,7 @@ fn test_unicode_identifiers_go() {
 #[test]
 fn test_cjk_identifiers_java() {
     // Java supports Unicode identifiers
-    let class_name = format!(
-        "{}{}{}{}",
-        '\u{30e6}', '\u{30fc}', '\u{30b6}', '\u{30fc}'
-    );
+    let class_name = format!("{}{}{}{}", '\u{30e6}', '\u{30fc}', '\u{30b6}', '\u{30fc}');
     let method_name = format!("{}{}", '\u{691c}', '\u{7d22}');
     let code = format!(
         "public class {} {{\n    public void {}() {{}}\n}}\n",
@@ -496,11 +687,22 @@ fn test_unicode_does_not_panic_or_truncate() {
     let korean = format!("{}{}", '\u{c548}', '\u{b155}');
 
     let cases = vec![
-        ("python", format!("def {}():\n    pass\n", greek), greek.clone()),
-        ("python", format!("def {}():\n    pass\n", cyrillic), cyrillic.clone()),
+        (
+            "python",
+            format!("def {}():\n    pass\n", greek),
+            greek.clone(),
+        ),
+        (
+            "python",
+            format!("def {}():\n    pass\n", cyrillic),
+            cyrillic.clone(),
+        ),
         (
             "go",
-            format!("package main\n\nfunc {}(x int) int {{ return x }}\n", korean),
+            format!(
+                "package main\n\nfunc {}(x int) int {{ return x }}\n",
+                korean
+            ),
             korean.clone(),
         ),
     ];

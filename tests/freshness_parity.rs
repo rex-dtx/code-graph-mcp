@@ -119,7 +119,9 @@ fn compact_allowlist(compact_region: &str) -> Vec<String> {
         .find(anchor)
         .expect("compact allowlist `for key in [` not found — did the forwarder shape change?");
     let after = &compact_region[start + anchor.len()..];
-    let end = after.find(']').expect("unterminated compact allowlist array");
+    let end = after
+        .find(']')
+        .expect("unterminated compact allowlist array");
     after[..end]
         .split(',')
         .map(|s| s.trim().trim_matches('"').to_string())

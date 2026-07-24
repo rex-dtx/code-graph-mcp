@@ -72,7 +72,11 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
 
         meta::write_meta(conn, meta::META_SNAPSHOT_SOURCE_COMMIT, &source_commit)?;
         meta::write_meta(conn, meta::META_SNAPSHOT_CREATED_AT, &now.to_string())?;
-        meta::write_meta(conn, meta::META_SNAPSHOT_TOOL_VERSION, env!("CARGO_PKG_VERSION"))?;
+        meta::write_meta(
+            conn,
+            meta::META_SNAPSHOT_TOOL_VERSION,
+            env!("CARGO_PKG_VERSION"),
+        )?;
         meta::write_meta(
             conn,
             meta::META_SNAPSHOT_SCHEMA_VERSION,
@@ -139,8 +143,8 @@ pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
         .with_context(|| format!("stat snapshot file '{}'", file.display()))?
         .len();
 
-    let raw_bytes = std::fs::read(file)
-        .with_context(|| format!("read snapshot file '{}'", file.display()))?;
+    let raw_bytes =
+        std::fs::read(file).with_context(|| format!("read snapshot file '{}'", file.display()))?;
 
     // zstd magic = 0x28 0xB5 0x2F 0xFD; SQLite = "SQLite format 3\0".
     let db_bytes = if raw_bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
@@ -161,7 +165,8 @@ pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
     let db = Database::open(&decompressed)?;
     let conn = db.conn();
 
-    let source_commit = meta::read_meta(conn, meta::META_SNAPSHOT_SOURCE_COMMIT)?.unwrap_or_default();
+    let source_commit =
+        meta::read_meta(conn, meta::META_SNAPSHOT_SOURCE_COMMIT)?.unwrap_or_default();
     let source_url = meta::read_meta(conn, meta::META_SNAPSHOT_SOURCE_URL)?;
     let created_at = meta::read_meta(conn, meta::META_SNAPSHOT_CREATED_AT)?
         .and_then(|s| s.parse::<i64>().ok())
@@ -184,8 +189,8 @@ pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
     let includes_vec = meta::read_meta(conn, meta::META_SNAPSHOT_INCLUDES_VEC)?
         .map(|s| s == "true")
         .unwrap_or(false);
-    let fetched_at = meta::read_meta(conn, meta::META_SNAPSHOT_FETCHED_AT)?
-        .and_then(|s| s.parse::<i64>().ok());
+    let fetched_at =
+        meta::read_meta(conn, meta::META_SNAPSHOT_FETCHED_AT)?.and_then(|s| s.parse::<i64>().ok());
 
     let node_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))

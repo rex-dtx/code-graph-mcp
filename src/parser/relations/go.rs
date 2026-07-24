@@ -28,10 +28,10 @@
 //! GO_TYPE_REFERENCE_NOISE — otherwise `var x int` would emit a reference to
 //! `int`.
 
-use super::ParsedRelation;
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
-use crate::domain::{REL_REFERENCES, REL_INHERITS, GO_TYPE_REFERENCE_NOISE};
+use super::ParsedRelation;
+use crate::domain::{GO_TYPE_REFERENCE_NOISE, REL_INHERITS, REL_REFERENCES};
 
 /// Emit a `references` edge for a `type_identifier` used in type position. Skips
 /// the cases already covered by another edge (or that aren't usages) so the
@@ -87,7 +87,10 @@ pub(super) fn extract_go_type_reference(
 /// A NORMAL named field (`f Foo`) is has-a, not embedding — distinguished
 /// structurally: an embedded `field_declaration` has NO `name` field. Interface
 /// METHODS are `method_elem`; only embedded interfaces (`type_elem`) compose.
-pub(super) fn extract_go_inheritance(type_spec: &tree_sitter::Node, source: &str) -> Vec<ParsedRelation> {
+pub(super) fn extract_go_inheritance(
+    type_spec: &tree_sitter::Node,
+    source: &str,
+) -> Vec<ParsedRelation> {
     let type_name = match type_spec.child_by_field_name("name") {
         Some(n) => node_text(&n, source),
         None => return Vec::new(),
@@ -103,7 +106,10 @@ pub(super) fn extract_go_inheritance(type_spec: &tree_sitter::Node, source: &str
     match body.kind() {
         "struct_type" => {
             // struct_type → field_declaration_list → field_declaration*
-            if let Some(list) = body.named_child(0).filter(|n| n.kind() == "field_declaration_list") {
+            if let Some(list) = body
+                .named_child(0)
+                .filter(|n| n.kind() == "field_declaration_list")
+            {
                 for i in 0..list.named_child_count() {
                     let field = match list.named_child(i) {
                         Some(f) if f.kind() == "field_declaration" => f,
@@ -170,11 +176,17 @@ pub(super) fn extract_go_inheritance(type_spec: &tree_sitter::Node, source: &str
 fn go_embedded_type_name<'a>(ty: &tree_sitter::Node, source: &'a str) -> Option<&'a str> {
     match ty.kind() {
         "type_identifier" => Some(node_text(ty, source)),
-        "qualified_type" => ty.child_by_field_name("name").map(|n| node_text(&n, source)),
+        "qualified_type" => ty
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, source)),
         // tree-sitter-go may also elide `*` to an anonymous token with `type`
         // pointing straight at the inner type — that path hits the arms above.
-        "pointer_type" => ty.named_child(0).and_then(|inner| go_embedded_type_name(&inner, source)),
-        "generic_type" => ty.child_by_field_name("type").and_then(|inner| go_embedded_type_name(&inner, source)),
+        "pointer_type" => ty
+            .named_child(0)
+            .and_then(|inner| go_embedded_type_name(&inner, source)),
+        "generic_type" => ty
+            .child_by_field_name("type")
+            .and_then(|inner| go_embedded_type_name(&inner, source)),
         _ => None,
     }
 }
@@ -252,12 +264,18 @@ pub(super) fn extract_go_value_reference(
 /// parameters + receiver of every enclosing func (declaration / literal — func
 /// literals capture outer scope) + `:=` / `var` / `range` / `=` targets in the
 /// nearest function body. M2/M2.5 exclusion; over-collection is precision-safe.
-fn go_enclosing_fn_local_names(node: &tree_sitter::Node, source: &str) -> std::collections::HashSet<String> {
+fn go_enclosing_fn_local_names(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     let mut nearest_body_done = false;
     let mut cur = node.parent();
     while let Some(n) = cur {
-        if matches!(n.kind(), "function_declaration" | "method_declaration" | "func_literal") {
+        if matches!(
+            n.kind(),
+            "function_declaration" | "method_declaration" | "func_literal"
+        ) {
             for field in ["parameters", "receiver"] {
                 if let Some(p) = n.child_by_field_name(field) {
                     collect_go_idents(&p, source, &mut names, 0);

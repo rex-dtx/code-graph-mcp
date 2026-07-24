@@ -4,7 +4,7 @@ pub use crate::domain::EMBEDDING_DIM;
 #[cfg(feature = "embed-model")]
 mod inner {
     use anyhow::Result;
-    use candle_core::{Device, DType, Tensor};
+    use candle_core::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
     use candle_transformers::models::bert::{BertModel, Config};
     use tokenizers::Tokenizer;
@@ -25,7 +25,10 @@ mod inner {
                     Ok(Some(m))
                 }
                 Err(e) => {
-                    tracing::warn!("Embedding model not available, falling back to FTS5-only: {}", e);
+                    tracing::warn!(
+                        "Embedding model not available, falling back to FTS5-only: {}",
+                        e
+                    );
                     Ok(None)
                 }
             }
@@ -51,7 +54,11 @@ mod inner {
                 }))
                 .map_err(|e| anyhow::anyhow!("truncation config error: {}", e))?;
 
-            Ok(Self { model, tokenizer, device })
+            Ok(Self {
+                model,
+                tokenizer,
+                device,
+            })
         }
 
         fn load_model_data() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
@@ -96,7 +103,9 @@ mod inner {
             let mut buf = vec![0u8; 1 << 20];
             loop {
                 let n = f.read(&mut buf)?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 hasher.update(&buf[..n]);
             }
             Ok(hasher.finalize().to_hex().to_string())
@@ -114,7 +123,8 @@ mod inner {
                 let _ = std::fs::remove_file(dir.join(Self::MODEL_ID_MARKER));
                 anyhow::bail!(
                     "model.safetensors content mismatch (blake3 {} != expected {}) — rejected",
-                    actual, expected
+                    actual,
+                    expected
                 );
             }
             // Correct weights are necessary but NOT sufficient — the loader also needs the
@@ -124,7 +134,10 @@ mod inner {
             for f in Self::REQUIRED_COMPANION_FILES {
                 if !dir.join(f).exists() {
                     let _ = std::fs::remove_file(dir.join(Self::MODEL_ID_MARKER));
-                    anyhow::bail!("model dir incomplete: missing {} (partial download?) — rejected", f);
+                    anyhow::bail!(
+                        "model dir incomplete: missing {} (partial download?) — rejected",
+                        f
+                    );
                 }
             }
             std::fs::write(dir.join(Self::MODEL_ID_MARKER), expected)?;
@@ -146,7 +159,10 @@ mod inner {
                 return false;
             }
             // "Current" must imply "loadable": a complete dir needs the companions too.
-            if !Self::REQUIRED_COMPANION_FILES.iter().all(|f| dir.join(f).exists()) {
+            if !Self::REQUIRED_COMPANION_FILES
+                .iter()
+                .all(|f| dir.join(f).exists())
+            {
                 return false;
             }
             let marker = dir.join(Self::MODEL_ID_MARKER);
@@ -193,8 +209,13 @@ mod inner {
         /// A testable seam: production passes `MODEL_CONTENT_BLAKE3`; tests pass the blake3 of
         /// their fixture weights so the success-promote path can be exercised without the real
         /// (un-forgeable-hash) model. `pub` only so the sibling test module can drive it.
-        pub(crate) fn extract_and_promote(body: &[u8], dest_dir: &std::path::Path, expected: &str) -> Result<()> {
-            let parent = dest_dir.parent()
+        pub(crate) fn extract_and_promote(
+            body: &[u8],
+            dest_dir: &std::path::Path,
+            expected: &str,
+        ) -> Result<()> {
+            let parent = dest_dir
+                .parent()
                 .ok_or_else(|| anyhow::anyhow!("model cache dir has no parent: {:?}", dest_dir))?;
             std::fs::create_dir_all(parent)?;
 
@@ -212,7 +233,9 @@ mod inner {
                     let name = ent.file_name();
                     let name = name.to_string_lossy();
                     if name.starts_with(".models-staging.") || name.starts_with(".models-old.") {
-                        let orphaned = ent.metadata().ok()
+                        let orphaned = ent
+                            .metadata()
+                            .ok()
                             .and_then(|m| m.modified().ok())
                             .and_then(|t| now.duration_since(t).ok())
                             .is_some_and(|age| age > ORPHAN_MAX_AGE);
@@ -231,7 +254,9 @@ mod inner {
             // interleave writes into one shared dir and tear the weights.
             struct StagingGuard<'a>(&'a std::path::Path);
             impl Drop for StagingGuard<'_> {
-                fn drop(&mut self) { let _ = std::fs::remove_dir_all(self.0); }
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(self.0);
+                }
             }
             let _ = std::fs::remove_dir_all(&staging); // clear any aborted prior staging
             std::fs::create_dir_all(&staging)?;
@@ -245,7 +270,10 @@ mod inner {
                 let mut entry = entry?;
                 let path = entry.path()?;
                 // Reject entries with path traversal components
-                if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                if path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
                     anyhow::bail!("Tar entry contains path traversal: {:?}", path);
                 }
                 entry.unpack_in(&staging)?;
@@ -272,10 +300,14 @@ mod inner {
                 let _ = std::fs::remove_dir_all(&old);
                 std::fs::rename(dest_dir, &old)?;
                 match std::fs::rename(&staging, dest_dir) {
-                    Ok(()) => { let _ = std::fs::remove_dir_all(&old); }
+                    Ok(()) => {
+                        let _ = std::fs::remove_dir_all(&old);
+                    }
                     Err(e) => {
                         let _ = std::fs::rename(&old, dest_dir); // restore previous cache
-                        return Err(anyhow::Error::from(e).context("promoting staged model into cache"));
+                        return Err(
+                            anyhow::Error::from(e).context("promoting staged model into cache")
+                        );
                     }
                 }
             } else {
@@ -294,10 +326,11 @@ mod inner {
             let agent = ureq::Agent::new_with_config(
                 ureq::config::Config::builder()
                     .timeout_global(Some(std::time::Duration::from_secs(120)))
-                    .build()
+                    .build(),
             );
 
-            let mut response = agent.get(url)
+            let mut response = agent
+                .get(url)
                 .call()
                 .map_err(|e| anyhow::anyhow!("Model download failed: {}", e))?;
 
@@ -307,14 +340,20 @@ mod inner {
 
             // Read body into memory (model is ~30MB compressed, cap at 200MB)
             let mut body = Vec::new();
-            response.body_mut().as_reader()
+            response
+                .body_mut()
+                .as_reader()
                 .take(200 * 1024 * 1024)
                 .read_to_end(&mut body)?;
 
             // Extract + verify + atomically promote (see `extract_and_promote`).
             Self::extract_and_promote(&body, dest_dir, Self::MODEL_CONTENT_BLAKE3)?;
 
-            tracing::info!("[model] Model extracted and verified at {:?} ({} bytes)", dest_dir, body.len());
+            tracing::info!(
+                "[model] Model extracted and verified at {:?} ({} bytes)",
+                dest_dir,
+                body.len()
+            );
             Ok(())
         }
 
@@ -323,10 +362,16 @@ mod inner {
             if let Ok(custom_dir) = std::env::var("CODE_GRAPH_MODEL_DIR") {
                 let custom = std::path::PathBuf::from(&custom_dir);
                 if custom.join("model.safetensors").exists() {
-                    tracing::info!("[model] Using custom model from CODE_GRAPH_MODEL_DIR={}", custom_dir);
+                    tracing::info!(
+                        "[model] Using custom model from CODE_GRAPH_MODEL_DIR={}",
+                        custom_dir
+                    );
                     return Ok(custom);
                 }
-                tracing::warn!("[model] CODE_GRAPH_MODEL_DIR={} set but model.safetensors not found there", custom_dir);
+                tracing::warn!(
+                    "[model] CODE_GRAPH_MODEL_DIR={} set but model.safetensors not found there",
+                    custom_dir
+                );
             }
 
             // 1. Check relative to current working directory (dev environment)
@@ -368,7 +413,9 @@ mod inner {
         /// Uses masked mean pooling (consistent with embed_batch) to avoid
         /// diluting signal with padding zeros for texts shorter than 512 tokens.
         pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-            let encoding = self.tokenizer.encode(text, true)
+            let encoding = self
+                .tokenizer
+                .encode(text, true)
                 .map_err(|e| anyhow::anyhow!("tokenize error: {}", e))?;
 
             let ids = encoding.get_ids();
@@ -381,7 +428,9 @@ mod inner {
             let attention_vec: Vec<f32> = vec![1.0; seq_len];
             let attention_mask = Tensor::from_vec(attention_vec, (1, seq_len), &self.device)?;
 
-            let embeddings = self.model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+            let embeddings =
+                self.model
+                    .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
 
             // Masked mean pooling: only average over real tokens
             let attention_3d = attention_mask.unsqueeze(2)?;
@@ -410,9 +459,13 @@ mod inner {
             }
 
             // Pre-tokenize to get lengths, sort by length to minimize padding
-            let encodings: Vec<_> = texts.iter()
-                .map(|t| self.tokenizer.encode(*t, true)
-                    .map_err(|e| anyhow::anyhow!("tokenize error: {}", e)))
+            let encodings: Vec<_> = texts
+                .iter()
+                .map(|t| {
+                    self.tokenizer
+                        .encode(*t, true)
+                        .map_err(|e| anyhow::anyhow!("tokenize error: {}", e))
+                })
                 .collect::<Result<Vec<_>>>()?;
 
             // Build (original_index, encoding) pairs sorted by token count
@@ -434,8 +487,15 @@ mod inner {
             Ok(results_with_idx.into_iter().map(|(_, v)| v).collect())
         }
 
-        fn embed_batch_chunk_pre_tokenized(&self, encodings: &[&tokenizers::Encoding]) -> Result<Vec<Vec<f32>>> {
-            let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        fn embed_batch_chunk_pre_tokenized(
+            &self,
+            encodings: &[&tokenizers::Encoding],
+        ) -> Result<Vec<Vec<f32>>> {
+            let max_len = encodings
+                .iter()
+                .map(|e| e.get_ids().len())
+                .max()
+                .unwrap_or(0);
             let batch_size = encodings.len();
             if max_len == 0 {
                 // All encodings are empty — return zero vectors
@@ -460,11 +520,15 @@ mod inner {
             }
 
             let input_ids = Tensor::from_vec(all_ids, (batch_size, max_len), &self.device)?;
-            let token_type_ids = Tensor::from_vec(all_type_ids, (batch_size, max_len), &self.device)?;
-            let attention_mask = Tensor::from_vec(all_attention, (batch_size, max_len), &self.device)?;
+            let token_type_ids =
+                Tensor::from_vec(all_type_ids, (batch_size, max_len), &self.device)?;
+            let attention_mask =
+                Tensor::from_vec(all_attention, (batch_size, max_len), &self.device)?;
 
             // Single forward pass for entire batch (pass attention mask for correct padding handling)
-            let embeddings = self.model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+            let embeddings =
+                self.model
+                    .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
 
             // Masked mean pooling per sequence
             let attention_3d = attention_mask.unsqueeze(2)?; // (batch, seq, 1)
@@ -545,18 +609,24 @@ mod tests {
         let expected = blake3::hash(b"fake-weights-bytes").to_hex().to_string();
 
         // Weights match the pin but companions are missing → reject + don't bless.
-        assert!(EmbeddingModel::verify_model_dir(dir.path(), &expected).is_err(),
-            "incomplete dir (no tokenizer/config) must be rejected by verify");
-        assert!(!EmbeddingModel::cached_model_matches(dir.path(), &expected),
-            "an incomplete dir must not be reported as the current cached model");
+        assert!(
+            EmbeddingModel::verify_model_dir(dir.path(), &expected).is_err(),
+            "incomplete dir (no tokenizer/config) must be rejected by verify"
+        );
+        assert!(
+            !EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "an incomplete dir must not be reported as the current cached model"
+        );
 
         // Complete the dir → verify succeeds and the dir is now blessed.
         fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
         fs::write(dir.path().join("config.json"), b"{}").unwrap();
         EmbeddingModel::verify_model_dir(dir.path(), &expected)
             .expect("a complete, hash-matching dir must verify");
-        assert!(EmbeddingModel::cached_model_matches(dir.path(), &expected),
-            "a complete, verified dir must be reported as current");
+        assert!(
+            EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "a complete, verified dir must be reported as current"
+        );
     }
 
     /// The no-marker fallback in `cached_model_matches` (pre-marker caches / partial
@@ -570,16 +640,22 @@ mod tests {
         let expected = blake3::hash(b"weights-v1").to_hex().to_string();
 
         // Correct weights, no marker, companions missing → must NOT bless.
-        assert!(!EmbeddingModel::cached_model_matches(dir.path(), &expected),
-            "weights-only dir (no marker, no companions) must not be treated as current");
+        assert!(
+            !EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "weights-only dir (no marker, no companions) must not be treated as current"
+        );
 
         // Add companions → fallback blesses and writes the marker; short-circuit then holds.
         fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
         fs::write(dir.path().join("config.json"), b"{}").unwrap();
-        assert!(EmbeddingModel::cached_model_matches(dir.path(), &expected),
-            "complete dir must be treated as current");
-        assert!(EmbeddingModel::cached_model_matches(dir.path(), &expected),
-            "marker short-circuit must also report current on the second call");
+        assert!(
+            EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "complete dir must be treated as current"
+        );
+        assert!(
+            EmbeddingModel::cached_model_matches(dir.path(), &expected),
+            "marker short-circuit must also report current on the second call"
+        );
     }
 
     /// I1 end-to-end: drive the real extract → verify → atomic-promote path with an
@@ -590,8 +666,8 @@ mod tests {
     #[cfg(feature = "embed-model")]
     #[test]
     fn test_extract_and_promote_is_atomic_and_rejects_incomplete() {
-        use std::fs;
         use inner::EmbeddingModel as M;
+        use std::fs;
 
         fn put(b: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>, name: &str, data: &[u8]) {
             let mut h = tar::Header::new_gnu();
@@ -620,27 +696,46 @@ mod tests {
         M::extract_and_promote(&make_targz(w1, true), &dest, &id1).unwrap();
         assert!(dest.join("model.safetensors").exists());
         assert!(dest.join("tokenizer.json").exists() && dest.join("config.json").exists());
-        assert!(M::cached_model_matches(&dest, &id1), "promoted dir must be current");
+        assert!(
+            M::cached_model_matches(&dest, &id1),
+            "promoted dir must be current"
+        );
 
         // (2) Incomplete archive (no companions) is rejected; the good v1 cache survives.
         let w2 = b"fixture-weights-v2";
         let id2 = blake3::hash(w2).to_hex().to_string();
-        assert!(M::extract_and_promote(&make_targz(w2, false), &dest, &id2).is_err(),
-            "an archive missing companion files must be rejected");
-        assert!(M::cached_model_matches(&dest, &id1),
-            "a rejected partial download must leave the previous good cache intact");
+        assert!(
+            M::extract_and_promote(&make_targz(w2, false), &dest, &id2).is_err(),
+            "an archive missing companion files must be rejected"
+        );
+        assert!(
+            M::cached_model_matches(&dest, &id1),
+            "a rejected partial download must leave the previous good cache intact"
+        );
 
         // (3) New complete archive atomically replaces the old one.
         M::extract_and_promote(&make_targz(w2, true), &dest, &id2).unwrap();
-        assert!(M::cached_model_matches(&dest, &id2), "new model must replace old");
-        assert!(!M::cached_model_matches(&dest, &id1), "old model id must no longer match");
+        assert!(
+            M::cached_model_matches(&dest, &id2),
+            "new model must replace old"
+        );
+        assert!(
+            !M::cached_model_matches(&dest, &id1),
+            "old model id must no longer match"
+        );
 
         // No staging/old residue — only the live cache dir remains in the parent.
-        let mut names: Vec<_> = fs::read_dir(root.path()).unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut names: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         names.sort();
-        assert_eq!(names, vec!["models".to_string()],
-            "staging/old dirs must be cleaned up, found: {:?}", names);
+        assert_eq!(
+            names,
+            vec!["models".to_string()],
+            "staging/old dirs must be cleaned up, found: {:?}",
+            names
+        );
     }
 
     #[cfg(feature = "embed-model")]
@@ -648,12 +743,18 @@ mod tests {
     fn test_embed_produces_correct_dims() {
         let model = EmbeddingModel::load().unwrap();
         if let Some(model) = model {
-            let embedding = model.embed("function validateToken handles JWT auth").unwrap();
+            let embedding = model
+                .embed("function validateToken handles JWT auth")
+                .unwrap();
             assert_eq!(embedding.len(), EMBEDDING_DIM);
 
             // Verify L2 normalization: ||v|| ≈ 1.0
             let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 0.01, "norm should be ~1.0, got {}", norm);
+            assert!(
+                (norm - 1.0).abs() < 0.01,
+                "norm should be ~1.0, got {}",
+                norm
+            );
         }
     }
 
@@ -682,16 +783,19 @@ mod tests {
                 "function handleLogin with a much longer context string that tests padding behavior in batched inference",
             ];
             // Get sequential results
-            let sequential: Vec<Vec<f32>> = texts.iter()
-                .map(|t| model.embed(t).unwrap())
-                .collect();
+            let sequential: Vec<Vec<f32>> = texts.iter().map(|t| model.embed(t).unwrap()).collect();
             // Get batched results
             let batched = model.embed_batch(&texts).unwrap();
 
             assert_eq!(sequential.len(), batched.len());
             for (i, (seq, bat)) in sequential.iter().zip(batched.iter()).enumerate() {
                 let sim = cosine_sim(seq, bat);
-                assert!(sim > 0.99, "batch vs sequential similarity for text {}: {} (should be >0.99)", i, sim);
+                assert!(
+                    sim > 0.99,
+                    "batch vs sequential similarity for text {}: {} (should be >0.99)",
+                    i,
+                    sim
+                );
             }
         }
     }
@@ -701,9 +805,15 @@ mod tests {
     fn test_similar_texts_closer() {
         let model = EmbeddingModel::load().unwrap();
         if let Some(model) = model {
-            let auth = model.embed("function validateToken JWT authentication").unwrap();
-            let login = model.embed("function handleLogin user authentication").unwrap();
-            let sort = model.embed("function bubbleSort array sorting algorithm").unwrap();
+            let auth = model
+                .embed("function validateToken JWT authentication")
+                .unwrap();
+            let login = model
+                .embed("function handleLogin user authentication")
+                .unwrap();
+            let sort = model
+                .embed("function bubbleSort array sorting algorithm")
+                .unwrap();
 
             let sim_auth_login = cosine_sim(&auth, &login);
             let sim_auth_sort = cosine_sim(&auth, &sort);
@@ -711,7 +821,8 @@ mod tests {
             assert!(
                 sim_auth_login > sim_auth_sort,
                 "auth-login similarity ({}) should be > auth-sort similarity ({})",
-                sim_auth_login, sim_auth_sort
+                sim_auth_login,
+                sim_auth_sort
             );
         }
     }
@@ -742,8 +853,11 @@ mod tests {
         let dir = inner::EmbeddingModel::cache_models_dir();
         assert!(dir.is_ok(), "cache dir should resolve: {:?}", dir);
         let dir = dir.unwrap();
-        assert!(dir.to_str().unwrap().contains("code-graph"),
-            "cache dir should contain 'code-graph': {:?}", dir);
+        assert!(
+            dir.to_str().unwrap().contains("code-graph"),
+            "cache dir should contain 'code-graph': {:?}",
+            dir
+        );
     }
 
     #[cfg(feature = "embed-model")]
@@ -761,10 +875,16 @@ mod tests {
     #[test]
     fn test_model_download_url_contains_version() {
         let url = inner::EmbeddingModel::model_download_url();
-        assert!(url.contains(env!("CARGO_PKG_VERSION")),
-            "URL should contain package version: {}", url);
-        assert!(url.contains("models.tar.gz"),
-            "URL should point to models.tar.gz: {}", url);
+        assert!(
+            url.contains(env!("CARGO_PKG_VERSION")),
+            "URL should contain package version: {}",
+            url
+        );
+        assert!(
+            url.contains("models.tar.gz"),
+            "URL should point to models.tar.gz: {}",
+            url
+        );
     }
 
     // ── cached_model_matches / verify_model_dir (model-pin guard) ──────────
@@ -784,10 +904,14 @@ mod tests {
         // Weights present but companions missing (partial extraction) → NOT current,
         // and no marker written — the dir is unloadable until completed.
         std::fs::write(dir.join("model.safetensors"), content).unwrap();
-        assert!(!M::cached_model_matches(dir, &expected),
-            "weights-only dir without tokenizer/config must not be blessed");
-        assert!(!dir.join(".model-id").exists(),
-            "an incomplete dir must not get a blessing marker");
+        assert!(
+            !M::cached_model_matches(dir, &expected),
+            "weights-only dir without tokenizer/config must not be blessed"
+        );
+        assert!(
+            !dir.join(".model-id").exists(),
+            "an incomplete dir must not get a blessing marker"
+        );
 
         // Pre-v0.50 cache (no marker) that is COMPLETE: matching content → current,
         // marker written by the one-time hash fallback.
@@ -795,7 +919,9 @@ mod tests {
         std::fs::write(dir.join("config.json"), b"{}").unwrap();
         assert!(M::cached_model_matches(dir, &expected));
         assert_eq!(
-            std::fs::read_to_string(dir.join(".model-id")).unwrap().trim(),
+            std::fs::read_to_string(dir.join(".model-id"))
+                .unwrap()
+                .trim(),
             expected,
             "one-time hash must persist the marker"
         );
@@ -805,8 +931,10 @@ mod tests {
 
         // Binary now expects different weights (new pinned model) → stale.
         let other = blake3::hash(b"new-model").to_hex().to_string();
-        assert!(!M::cached_model_matches(dir, &other),
-            "stale cached model must be reported as not current");
+        assert!(
+            !M::cached_model_matches(dir, &other),
+            "stale cached model must be reported as not current"
+        );
     }
 
     #[cfg(feature = "embed-model")]
@@ -817,14 +945,17 @@ mod tests {
         // the pinned weights (dev machines; CI release runners don't), assert
         // the constant matches the real file. Skips silently otherwise.
         let local = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("models").join("model.safetensors");
+            .join("models")
+            .join("model.safetensors");
         if !local.exists() {
             return;
         }
         let dir = local.parent().unwrap();
         assert!(
             inner::EmbeddingModel::cached_model_matches(
-                dir, inner::EmbeddingModel::MODEL_CONTENT_BLAKE3),
+                dir,
+                inner::EmbeddingModel::MODEL_CONTENT_BLAKE3
+            ),
             "MODEL_CONTENT_BLAKE3 does not match models/model.safetensors — \
              constant typo or local models/ dir drifted from the pinned HF revision"
         );
@@ -841,8 +972,10 @@ mod tests {
         let expected = blake3::hash(b"genuine").to_hex().to_string();
         let result = M::verify_model_dir(dir, &expected);
         assert!(result.is_err(), "mismatched weights must be rejected");
-        assert!(!dir.join("model.safetensors").exists(),
-            "rejected weights must be removed so a poisoned cache can't load later");
+        assert!(
+            !dir.join("model.safetensors").exists(),
+            "rejected weights must be removed so a poisoned cache can't load later"
+        );
 
         // Matching content in a COMPLETE dir verifies and writes the marker.
         std::fs::write(dir.join("model.safetensors"), b"genuine").unwrap();
@@ -850,7 +983,9 @@ mod tests {
         std::fs::write(dir.join("config.json"), b"{}").unwrap();
         M::verify_model_dir(dir, &expected).unwrap();
         assert_eq!(
-            std::fs::read_to_string(dir.join(".model-id")).unwrap().trim(),
+            std::fs::read_to_string(dir.join(".model-id"))
+                .unwrap()
+                .trim(),
             expected
         );
     }

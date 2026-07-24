@@ -22,7 +22,12 @@ pub fn get_callers_with_route_info(
     min_confidence_rank: u8,
 ) -> Result<Vec<CallerWithRouteInfo>> {
     let callers = get_call_graph_filtered(
-        conn, symbol_name, "callers", max_depth, file_path, min_confidence_rank,
+        conn,
+        symbol_name,
+        "callers",
+        max_depth,
+        file_path,
+        min_confidence_rank,
     )?;
     if callers.nodes.is_empty() {
         return Ok(vec![]);

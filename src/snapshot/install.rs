@@ -20,7 +20,10 @@ pub fn resolve_snapshot_source(root: &Path) -> Option<String> {
 /// injection (the audit's top finding): the auto-detected GitHub-release path
 /// (origin remote) stays opt-out, but an arbitrary url override requires consent.
 fn url_override_trusted() -> bool {
-    std::env::var("CODE_GRAPH_SNAPSHOT_TRUST_URL").ok().as_deref() == Some("1")
+    std::env::var("CODE_GRAPH_SNAPSHOT_TRUST_URL")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 /// Out-of-band trust for the auto-detected origin GitHub-release snapshot path.
@@ -33,13 +36,23 @@ fn url_override_trusted() -> bool {
 /// is set (the pin makes a poisoned download fail content verification, so an
 /// auto-fetch is safe).
 fn origin_trusted() -> bool {
-    std::env::var("CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN").ok().as_deref() == Some("1")
-        || std::env::var("CODE_GRAPH_SNAPSHOT_PIN").ok().filter(|s| !s.is_empty()).is_some()
+    std::env::var("CODE_GRAPH_SNAPSHOT_TRUST_ORIGIN")
+        .ok()
+        .as_deref()
+        == Some("1")
+        || std::env::var("CODE_GRAPH_SNAPSHOT_PIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some()
 }
 
 /// Testable core of [`resolve_snapshot_source`]: `url_trusted` is the out-of-band
 /// consent for a toml url override (env-read in the public wrapper).
-pub(crate) fn resolve_snapshot_source_impl(root: &Path, url_trusted: bool, origin_trusted: bool) -> Option<String> {
+pub(crate) fn resolve_snapshot_source_impl(
+    root: &Path,
+    url_trusted: bool,
+    origin_trusted: bool,
+) -> Option<String> {
     let cfg = load_config(root).ok()?;
     if cfg.snapshot.disabled {
         return None;
@@ -155,8 +168,8 @@ fn fetch_latest_snapshot_asset_url(owner: &str, repo: &str) -> Option<String> {
 use anyhow::Context;
 
 const MAX_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
-// Cap the COMPRESSED payload too — a snapshot zst is single-digit MB in practice,
-// but a missing/lying Content-Length must not let a huge body exhaust memory/disk.
+                                                       // Cap the COMPRESSED payload too — a snapshot zst is single-digit MB in practice,
+                                                       // but a missing/lying Content-Length must not let a huge body exhaust memory/disk.
 const MAX_COMPRESSED_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 
 /// Wait up to `cap` for the child to exit; SIGTERM it on Unix if it doesn't,
@@ -188,7 +201,9 @@ fn wait_with_watchdog(
             // safety. `pid` is our own spawned child's id; SIGTERM (not SIGKILL)
             // asks the slow/hung `gh` subprocess to exit and is a no-op if it
             // already died. The cancel flag makes a recycled-PID race impossible.
-            unsafe { libc::kill(pid, libc::SIGTERM); }
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
         });
         let result = child.wait_with_output().ok().filter(|o| o.status.success());
         cancel.store(true, Ordering::Relaxed);
@@ -218,13 +233,12 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
     // each other's in-progress partials.  The final atomic rename serialises who
     // wins; the loser's rename simply replaces what the winner wrote (both files
     // are valid, so the last rename wins cleanly).
-    static INSTALL_COUNTER: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static INSTALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = INSTALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id() as u64;
     let id: u64 = pid.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(seq);
     let zst_partial = cg_dir.join(format!(".snapshot-{id:016x}.db.zst.partial"));
-    let db_partial  = cg_dir.join(format!(".snapshot-{id:016x}.db.partial"));
+    let db_partial = cg_dir.join(format!(".snapshot-{id:016x}.db.partial"));
     // WAL sidecars SQLite creates next to db_partial; cleaned on every exit path.
     let wal_partial = cg_dir.join(format!(".snapshot-{id:016x}.db.partial-wal"));
     let shm_partial = cg_dir.join(format!(".snapshot-{id:016x}.db.partial-shm"));
@@ -253,7 +267,11 @@ pub fn try_install(url: &str, root: &Path) -> Result<String> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            super::meta::write_meta(conn, super::meta::META_SNAPSHOT_FETCHED_AT, &now.to_string())?;
+            super::meta::write_meta(
+                conn,
+                super::meta::META_SNAPSHOT_FETCHED_AT,
+                &now.to_string(),
+            )?;
             let commit = super::meta::read_meta(conn, super::meta::META_SNAPSHOT_SOURCE_COMMIT)?
                 .unwrap_or_default();
             // Fold the WAL into the main file so the rename moves a complete DB and
@@ -406,7 +424,9 @@ fn verify_checksum_impl(url: &str, artifact: &Path, pin: Option<String>) -> Resu
                  {pin}, got {actual} — refusing to install"
             );
         }
-        tracing::debug!("snapshot checksum verified against CODE_GRAPH_SNAPSHOT_PIN (blake3 {actual})");
+        tracing::debug!(
+            "snapshot checksum verified against CODE_GRAPH_SNAPSHOT_PIN (blake3 {actual})"
+        );
         return Ok(());
     }
 
@@ -466,7 +486,11 @@ struct CapWriter<'a, W: std::io::Write> {
 
 impl<'a, W: std::io::Write> CapWriter<'a, W> {
     fn new(inner: &'a mut W, cap: u64) -> Self {
-        Self { inner, written: 0, cap }
+        Self {
+            inner,
+            written: 0,
+            cap,
+        }
     }
 }
 
@@ -567,7 +591,8 @@ mod tests {
                     .nth(1)
                     .unwrap_or("/");
                 let resp = if path.contains("evil") {
-                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nevil".to_string()
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nevil"
+                        .to_string()
                 } else {
                     format!("HTTP/1.1 302 Found\r\nLocation: {evil_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 };
@@ -645,8 +670,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let artifact = tmp.path().join("snap.db.zst");
         std::fs::write(&artifact, b"genuine").unwrap();
-        let err = verify_checksum_impl("https://x.invalid/x.db.zst", &artifact, Some("0".repeat(64)))
-            .unwrap_err();
+        let err = verify_checksum_impl(
+            "https://x.invalid/x.db.zst",
+            &artifact,
+            Some("0".repeat(64)),
+        )
+        .unwrap_err();
         let chain = format!("{err:#}");
         assert!(
             chain.contains("mismatch") && chain.contains("CODE_GRAPH_SNAPSHOT_PIN"),
@@ -660,8 +689,12 @@ mod tests {
         let artifact = tmp.path().join("snap.db.zst");
         std::fs::write(&artifact, b"x").unwrap();
         // Too short + non-hex → loud rejection, not a confusing "mismatch".
-        let err = verify_checksum_impl("https://x.invalid/x.db.zst", &artifact, Some("nothex".into()))
-            .unwrap_err();
+        let err = verify_checksum_impl(
+            "https://x.invalid/x.db.zst",
+            &artifact,
+            Some("nothex".into()),
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("CODE_GRAPH_SNAPSHOT_PIN"),
             "a malformed pin must name the env var: {err:?}"

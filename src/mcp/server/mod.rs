@@ -7,8 +7,8 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 
 /// MCP `instructions` field (quiet variant) returned by `initialize` when
 /// `CODE_GRAPH_QUIET_HOOKS=1` — a one-line pointer to the full decision table.
@@ -66,7 +66,12 @@ fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .map_err(|e| tracing::warn!("Could not open index lock: {} — running in secondary mode", e))
+        .map_err(|e| {
+            tracing::warn!(
+                "Could not open index lock: {} — running in secondary mode",
+                e
+            )
+        })
         .ok()?;
 
     // Non-blocking flock: LOCK_EX | LOCK_NB — fails immediately if another process holds it
@@ -74,7 +79,9 @@ fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
     // valid, live fd for the duration of the call; flock has no other precondition.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        tracing::info!("Another instance holds the index lock — running in secondary (read-only) mode");
+        tracing::info!(
+            "Another instance holds the index lock — running in secondary (read-only) mode"
+        );
         return None;
     }
 
@@ -94,14 +101,21 @@ fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
     let lock_path = code_graph_dir.join("index.lock");
     let my_pid = std::process::id();
 
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
         Ok(mut f) => {
             let _ = f.write_all(my_pid.to_string().as_bytes());
             return Some(f);
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => {
-            tracing::warn!("Could not write index lock: {} — running in secondary mode", e);
+            tracing::warn!(
+                "Could not write index lock: {} — running in secondary mode",
+                e
+            );
             return None;
         }
     }
@@ -118,7 +132,11 @@ fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
         }
     }
 
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
         Ok(mut f) => {
             let _ = f.write_all(my_pid.to_string().as_bytes());
             Some(f)
@@ -200,7 +218,10 @@ pub(super) fn is_test_symbol(name: &str, file_path: &str) -> bool {
 /// Lock a Mutex, recovering from poison but logging a warning.
 pub(super) fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|e| {
-        tracing::warn!("Recovering poisoned mutex ({}): prior panic in critical section", label);
+        tracing::warn!(
+            "Recovering poisoned mutex ({}): prior panic in critical section",
+            label
+        );
         e.into_inner()
     })
 }
@@ -392,7 +413,8 @@ pub(super) struct CacheState {
     /// Cached project_map result: (timestamp, json_value). Invalidated on re-index.
     pub(super) cached_project_map: Mutex<Option<(std::time::Instant, serde_json::Value)>>,
     /// Cached module_overview results: path -> (timestamp, json_value). Invalidated on re-index.
-    pub(super) cached_module_overviews: Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>,
+    pub(super) cached_module_overviews:
+        Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>,
 }
 
 impl CacheState {
@@ -484,7 +506,8 @@ impl McpServer {
             anyhow::anyhow!(
                 "Secondary read-only open failed at {}: {}. \
                  Primary may be mid-bootstrap — retry in a moment.",
-                db_path.display(), e
+                db_path.display(),
+                e
             )
         })
     }
@@ -544,7 +567,9 @@ impl McpServer {
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
-            last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
+            last_incremental_check: Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            ),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
             indexing: IndexingState::new(),
@@ -602,12 +627,17 @@ impl McpServer {
             Ok(commit) => {
                 self.send_log(
                     "info",
-                    &format!("snapshot installed at commit {commit}, will run incremental drift-check"),
+                    &format!(
+                        "snapshot installed at commit {commit}, will run incremental drift-check"
+                    ),
                 );
                 true
             }
             Err(e) => {
-                self.send_log("warn", &format!("snapshot install failed ({e}), running full index"));
+                self.send_log(
+                    "warn",
+                    &format!("snapshot install failed ({e}), running full index"),
+                );
                 false
             }
         }
@@ -624,7 +654,9 @@ impl McpServer {
             project_root: None,
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
-            last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
+            last_incremental_check: Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            ),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
             indexing: IndexingState::new(),
@@ -649,7 +681,9 @@ impl McpServer {
             project_root: Some(project_root.to_path_buf()),
             indexed: Mutex::new(false),
             watcher: Mutex::new(None),
-            last_incremental_check: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
+            last_incremental_check: Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            ),
             dir_cache: Mutex::new(None),
             notify_writer: Mutex::new(None),
             indexing: IndexingState::new(),
@@ -693,7 +727,10 @@ impl McpServer {
     pub fn run_startup_tasks(&self) {
         // Phase 1: On notifications/initialized, spawn background indexing
         let pending = {
-            let mut guard = lock_or_recover(&self.indexing.startup_index_pending, "startup_index_pending");
+            let mut guard = lock_or_recover(
+                &self.indexing.startup_index_pending,
+                "startup_index_pending",
+            );
             let was_pending = *guard;
             *guard = false;
             was_pending
@@ -716,7 +753,10 @@ impl McpServer {
                     .unwrap_or(false);
                 if has_data {
                     *lock_or_recover(&self.indexed, "indexed") = true;
-                    self.send_log("info", "Secondary instance: using existing index (read-only).");
+                    self.send_log(
+                        "info",
+                        "Secondary instance: using existing index (read-only).",
+                    );
                     // Embedding uses its own DB connection and is append-only — safe for secondary
                     self.spawn_background_embedding();
                 } else {
@@ -776,7 +816,10 @@ impl McpServer {
         }
 
         // Reset condvar done flag for this indexing session
-        *lock_or_recover(&self.indexing.startup_indexing_done.0, "startup_indexing_done") = false;
+        *lock_or_recover(
+            &self.indexing.startup_indexing_done.0,
+            "startup_indexing_done",
+        ) = false;
 
         if has_existing_index {
             self.send_log("info", "Updating index in background (incremental)...");
@@ -852,13 +895,15 @@ impl McpServer {
                 let index_start = std::time::Instant::now();
                 let result = if has_existing_index {
                     run_incremental_index_cached(
-                        &db, &project_root, None,
+                        &db,
+                        &project_root,
+                        None,
                         dir_cache.as_ref(),
                         Some(&progress_cb),
-                    ).map(|(r, cache)| (r, Some(cache)))
+                    )
+                    .map(|(r, cache)| (r, Some(cache)))
                 } else {
-                    run_full_index(&db, &project_root, None, Some(&progress_cb))
-                        .map(|r| (r, None))
+                    run_full_index(&db, &project_root, None, Some(&progress_cb)).map(|r| (r, None))
                 };
 
                 match result {
@@ -866,7 +911,9 @@ impl McpServer {
                         let elapsed_ms = index_start.elapsed().as_millis() as u64;
                         tracing::info!(
                             "Background indexing complete: {} files, {} nodes in {}ms",
-                            result.files_indexed, result.nodes_created, elapsed_ms
+                            result.files_indexed,
+                            result.nodes_created,
+                            elapsed_ms
                         );
                         match result_slot.lock() {
                             Ok(mut slot) => {
@@ -880,7 +927,9 @@ impl McpServer {
                                     stats: result.stats,
                                 });
                             }
-                            Err(e) => tracing::error!("Background indexing: result slot poisoned: {}", e),
+                            Err(e) => {
+                                tracing::error!("Background indexing: result slot poisoned: {}", e)
+                            }
                         }
                     }
                     Err(e) => {
@@ -920,7 +969,9 @@ impl McpServer {
         }
 
         // Check for indexing errors and surface them to the MCP client
-        if let Some(err_msg) = lock_or_recover(&self.indexing.startup_index_error, "startup_error").take() {
+        if let Some(err_msg) =
+            lock_or_recover(&self.indexing.startup_index_error, "startup_error").take()
+        {
             self.send_log("error", &err_msg);
         }
 
@@ -952,10 +1003,13 @@ impl McpServer {
         );
 
         if r.files_indexed > 0 {
-            self.send_log("info", &format!(
-                "Indexed {} files ({} nodes, {} edges).",
-                r.files_indexed, r.nodes_created, r.edges_created
-            ));
+            self.send_log(
+                "info",
+                &format!(
+                    "Indexed {} files ({} nodes, {} edges).",
+                    r.files_indexed, r.nodes_created, r.edges_created
+                ),
+            );
         } else {
             self.send_log("info", "Index is up to date.");
         }
@@ -1017,7 +1071,11 @@ impl McpServer {
         if !self.is_primary {
             return;
         }
-        if self.indexing.startup_repair_done.swap(true, Ordering::AcqRel) {
+        if self
+            .indexing
+            .startup_repair_done
+            .swap(true, Ordering::AcqRel)
+        {
             return; // already ran this session
         }
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
@@ -1028,7 +1086,8 @@ impl McpServer {
                 let model = EmbeddingModel::load().ok().flatten();
                 #[cfg(not(feature = "embed-model"))]
                 let model: Option<EmbeddingModel> = None;
-                let repaired = crate::indexer::pipeline::repair_null_context_strings(&db, model.as_ref())?;
+                let repaired =
+                    crate::indexer::pipeline::repair_null_context_strings(&db, model.as_ref())?;
                 // Sweep orphan vectors (vectors whose node was deleted) accumulated across index
                 // generations — the backfill-race residue now prevented at the insert site, plus
                 // any predating that guard (daagu carried 157 at rowids past the live range). Runs
@@ -1047,7 +1106,10 @@ impl McpServer {
                     db.conn(),
                     EmbeddingModel::MODEL_CONTENT_BLAKE3,
                 ) {
-                    tracing::warn!("[embed-cache] startup validity check failed (continuing): {}", e);
+                    tracing::warn!(
+                        "[embed-cache] startup validity check failed (continuing): {}",
+                        e
+                    );
                 }
                 // Seed the content-hash cache from existing vectors (once) so an already-embedded
                 // index reuses on its NEXT version bump instead of paying one more full re-embed.
@@ -1075,7 +1137,9 @@ impl McpServer {
     /// to avoid blocking the main stdio loop.
     pub(super) fn spawn_background_embedding(&self) {
         // Guard: only spawn if model and vec are available
-        if lock_or_recover(&self.embedding_model, "embedding_model").is_none() || !self.db.vec_enabled() {
+        if lock_or_recover(&self.embedding_model, "embedding_model").is_none()
+            || !self.db.vec_enabled()
+        {
             return;
         }
 
@@ -1113,7 +1177,11 @@ impl McpServer {
         if !self.is_primary {
             return;
         }
-        if self.indexing.periodic_backfill_started.swap(true, Ordering::AcqRel) {
+        if self
+            .indexing
+            .periodic_backfill_started
+            .swap(true, Ordering::AcqRel)
+        {
             return; // already spawned this session
         }
         // Gate only on vector storage — NOT on `self.embedding_model`, which stays None
@@ -1288,8 +1356,11 @@ impl McpServer {
         }
 
         if total_embedded > 0 {
-            tracing::info!("[embed-bg] Complete: {} nodes now embedded (some may be cache reuse) in {:.1}s",
-                total_embedded, t0.elapsed().as_secs_f64());
+            tracing::info!(
+                "[embed-bg] Complete: {} nodes now embedded (some may be cache reuse) in {:.1}s",
+                total_embedded,
+                t0.elapsed().as_secs_f64()
+            );
         }
         if !failed.is_empty() {
             tracing::warn!(
@@ -1303,7 +1374,9 @@ impl McpServer {
         let outcome = if failed.is_empty() {
             BackfillOutcome::Drained
         } else {
-            BackfillOutcome::Stalled { progressed: total_embedded > 0 }
+            BackfillOutcome::Stalled {
+                progressed: total_embedded > 0,
+            }
         };
         Ok(outcome)
     }
@@ -1327,7 +1400,11 @@ impl McpServer {
         // test harness `McpClient::spawn`) disables only the AUTO-DOWNLOAD; a model
         // already cached is still loaded and used, so local embed tests with a
         // cached model are unaffected.
-        if std::env::var("CODE_GRAPH_DISABLE_MODEL_DOWNLOAD").ok().as_deref() == Some("1") {
+        if std::env::var("CODE_GRAPH_DISABLE_MODEL_DOWNLOAD")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             return;
         }
 
@@ -1361,15 +1438,26 @@ impl McpServer {
             for attempt in 1..=MAX_ATTEMPTS {
                 match EmbeddingModel::download_model_to(&url, &cache_dir) {
                     Ok(()) => {
-                        tracing::info!("[model-dl] Model downloaded successfully (attempt {}/{})", attempt, MAX_ATTEMPTS);
+                        tracing::info!(
+                            "[model-dl] Model downloaded successfully (attempt {}/{})",
+                            attempt,
+                            MAX_ATTEMPTS
+                        );
                         downloaded = true;
                         break;
                     }
                     Err(e) => {
-                        tracing::warn!("[model-dl] Download attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, e);
+                        tracing::warn!(
+                            "[model-dl] Download attempt {}/{} failed: {}",
+                            attempt,
+                            MAX_ATTEMPTS,
+                            e
+                        );
                         if attempt < MAX_ATTEMPTS {
                             // Exponential backoff: 4s, then 8s (background thread — sleeping is fine).
-                            std::thread::sleep(std::time::Duration::from_secs(4u64 * (1u64 << (attempt - 1))));
+                            std::thread::sleep(std::time::Duration::from_secs(
+                                4u64 * (1u64 << (attempt - 1)),
+                            ));
                         }
                     }
                 }
@@ -1415,19 +1503,31 @@ impl McpServer {
         if exact.len() > 1 {
             // Same name in multiple files — still ambiguous, but scope suggestions
             // to the exact matches so callers disambiguate the real collision.
-            let suggestions = exact.iter().map(|c| json!({
-                "name": c.name, "file_path": c.file_path, "type": c.node_type,
-                "node_id": c.node_id, "start_line": c.start_line,
-            })).collect();
+            let suggestions = exact
+                .iter()
+                .map(|c| {
+                    json!({
+                        "name": c.name, "file_path": c.file_path, "type": c.node_type,
+                        "node_id": c.node_id, "start_line": c.start_line,
+                    })
+                })
+                .collect();
             return Ok(FuzzyResolution::Ambiguous(suggestions));
         }
         if candidates.len() == 1 {
-            Ok(FuzzyResolution::Unique(candidates.into_iter().next().unwrap().name))
+            Ok(FuzzyResolution::Unique(
+                candidates.into_iter().next().unwrap().name,
+            ))
         } else if !candidates.is_empty() {
-            let suggestions = candidates.iter().map(|c| json!({
-                "name": c.name, "file_path": c.file_path, "type": c.node_type,
-                "node_id": c.node_id, "start_line": c.start_line,
-            })).collect();
+            let suggestions = candidates
+                .iter()
+                .map(|c| {
+                    json!({
+                        "name": c.name, "file_path": c.file_path, "type": c.node_type,
+                        "node_id": c.node_id, "start_line": c.start_line,
+                    })
+                })
+                .collect();
             Ok(FuzzyResolution::Ambiguous(suggestions))
         } else {
             Ok(FuzzyResolution::NotFound)
@@ -1469,20 +1569,26 @@ impl McpServer {
 
     /// Send MCP progress notification.
     pub(super) fn send_progress(&self, token: &str, current: usize, total: usize) {
-        self.send_notification("notifications/progress", json!({
-            "progressToken": token,
-            "progress": current,
-            "total": total,
-        }));
+        self.send_notification(
+            "notifications/progress",
+            json!({
+                "progressToken": token,
+                "progress": current,
+                "total": total,
+            }),
+        );
     }
 
     /// Send MCP log notification.
     pub(super) fn send_log(&self, level: &str, message: &str) {
-        self.send_notification("notifications/message", json!({
-            "level": level,
-            "logger": "code-graph",
-            "data": message,
-        }));
+        self.send_notification(
+            "notifications/message",
+            json!({
+                "level": level,
+                "logger": "code-graph",
+                "data": message,
+            }),
+        );
     }
 
     /// Ensure index is up-to-date. On first call, runs full index.
@@ -1555,7 +1661,10 @@ impl McpServer {
                 self.send_progress("indexing", current, total);
             };
             let result = if has_existing {
-                self.send_log("info", "Snapshot data present — running incremental drift-check...");
+                self.send_log(
+                    "info",
+                    "Snapshot data present — running incremental drift-check...",
+                );
                 use crate::indexer::pipeline::run_incremental_index;
                 run_incremental_index(&self.db, &project_root, None, Some(&progress_cb))?
             } else {
@@ -1585,8 +1694,11 @@ impl McpServer {
                 let has_watcher = lock_or_recover(&self.watcher, "watcher").is_some();
                 if !has_watcher {
                     // No watcher active — debounce to avoid rescanning on every tool call
-                    let mut last_check = lock_or_recover(&self.last_incremental_check, "last_incremental_check");
-                    if last_check.elapsed() > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS) {
+                    let mut last_check =
+                        lock_or_recover(&self.last_incremental_check, "last_incremental_check");
+                    if last_check.elapsed()
+                        > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS)
+                    {
                         self.run_incremental_with_cache_restore(&project_root, None)?;
                         *last_check = std::time::Instant::now();
                     }
@@ -1612,22 +1724,32 @@ impl McpServer {
         if !self.is_primary {
             return Ok(());
         }
-        let Some(rel_path) = path else { return Ok(()); };
+        let Some(rel_path) = path else {
+            return Ok(());
+        };
         if rel_path.is_empty() || rel_path.ends_with('/') {
             return Ok(());
         }
-        let Some(root) = self.project_root.as_deref() else { return Ok(()); };
+        let Some(root) = self.project_root.as_deref() else {
+            return Ok(());
+        };
 
         let did_reindex = {
             let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
             crate::indexer::pipeline::ensure_file_indexed(
-                &self.db, root, rel_path, model_guard.as_ref(),
+                &self.db,
+                root,
+                rel_path,
+                model_guard.as_ref(),
             )?
         };
         if did_reindex {
             *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
             lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
-            tracing::debug!("[fresh] sync-reindexed {} on query-time freshness", rel_path);
+            tracing::debug!(
+                "[fresh] sync-reindexed {} on query-time freshness",
+                rel_path
+            );
         }
         Ok(())
     }
@@ -1637,15 +1759,22 @@ impl McpServer {
     /// If background embedding is in progress, waits briefly for it to finish
     /// to avoid a race condition where the embedding thread inserts vectors for
     /// node IDs that are being deleted and re-inserted by the incremental index.
-    fn run_incremental_with_cache_restore(&self, project_root: &Path, model: Option<&EmbeddingModel>) -> Result<()> {
+    fn run_incremental_with_cache_restore(
+        &self,
+        project_root: &Path,
+        model: Option<&EmbeddingModel>,
+    ) -> Result<()> {
         // Mark an incremental owed for the whole attempt, cleared only on success below.
         // The caller (`ensure_indexed`) already drained the watcher event that triggered
         // us, so this flag is the sole surviving record of the change. Arming up front (vs
         // only on the embedding-skip path) means a hard error ALSO leaves the obligation
         // recorded, so the next `ensure_indexed` retries instead of stranding the change.
-        self.indexing.pending_incremental.store(true, Ordering::Release);
+        self.indexing
+            .pending_incremental
+            .store(true, Ordering::Release);
         if self.indexing.embedding_in_progress.load(Ordering::Acquire) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(EMBEDDING_WAIT_SECS);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(EMBEDDING_WAIT_SECS);
             while self.indexing.embedding_in_progress.load(Ordering::Acquire) {
                 if std::time::Instant::now() > deadline {
                     // Embedding still holds the write path — skip; the incremental stays owed
@@ -1680,7 +1809,9 @@ impl McpServer {
                 *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
                 *lock_or_recover(&self.dir_cache, "dir_cache") = Some(new_cache);
                 // Authoritative merkle scan completed — any owed incremental is now satisfied.
-                self.indexing.pending_incremental.store(false, Ordering::Release);
+                self.indexing
+                    .pending_incremental
+                    .store(false, Ordering::Release);
                 Ok(())
             }
             Err(e) => {
@@ -1712,11 +1843,14 @@ impl McpServer {
                     };
                     match run_full_index(&self.db, project_root, model, Some(&progress_cb)) {
                         Ok(result) => {
-                            *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
+                            *lock_or_recover(&self.last_index_stats, "last_index_stats") =
+                                result.stats;
                             *lock_or_recover(&self.indexed, "indexed") = true;
                             self.spawn_background_embedding();
                             // Full rebuild captured current on-disk state — clear owed flag.
-                            self.indexing.pending_incremental.store(false, Ordering::Release);
+                            self.indexing
+                                .pending_incremental
+                                .store(false, Ordering::Release);
                             tracing::info!("Full re-index recovery successful");
                             Ok(())
                         }
@@ -1769,14 +1903,21 @@ impl McpServer {
         // Per JSON-RPC 2.0, notifications (no id) must never receive a response
         if req.id.is_none() {
             if req.validate().is_ok() && req.method == "notifications/initialized" {
-                *lock_or_recover(&self.indexing.startup_index_pending, "startup_index_pending") = true;
+                *lock_or_recover(
+                    &self.indexing.startup_index_pending,
+                    "startup_index_pending",
+                ) = true;
             }
             return Ok(None);
         }
 
         // Validate JSON-RPC version (only for requests with id)
         if let Err(msg) = req.validate() {
-            let resp = JsonRpcResponse::error(req.id, super::protocol::JSONRPC_INVALID_REQUEST, msg.to_string());
+            let resp = JsonRpcResponse::error(
+                req.id,
+                super::protocol::JSONRPC_INVALID_REQUEST,
+                msg.to_string(),
+            );
             return Ok(Some(serde_json::to_string(&resp)?));
         }
 
@@ -1807,11 +1948,7 @@ impl McpServer {
     /// (JSON-RPC 2.0 §5). A malformed message with no `id` member is treated as
     /// a Notification and receives no reply, matching the spec rule that
     /// Notifications are never answered.
-    fn reject_unparsable(
-        &self,
-        line: &str,
-        fast_err: serde_json::Error,
-    ) -> Result<Option<String>> {
+    fn reject_unparsable(&self, line: &str, fast_err: serde_json::Error) -> Result<Option<String>> {
         let value: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => {
@@ -1866,43 +2003,71 @@ impl McpServer {
         // rules live in the project's .claude/plugin_code_graph_mcp.md (the
         // CLAUDE.md managed block points to it; auto-installed on plugin SessionStart).
         let quiet = std::env::var("CODE_GRAPH_QUIET_HOOKS").ok().as_deref() == Some("1");
-        let instructions = if quiet { INSTRUCTIONS_QUIET } else { INSTRUCTIONS_NOISY };
-        JsonRpcResponse::success(id, json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": { "listChanged": false },
-                "resources": { "subscribe": false, "listChanged": false },
-                "prompts": { "listChanged": false }
-            },
-            "serverInfo": {
-                "name": "code-graph-mcp",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "instructions": instructions
-        }))
+        let instructions = if quiet {
+            INSTRUCTIONS_QUIET
+        } else {
+            INSTRUCTIONS_NOISY
+        };
+        JsonRpcResponse::success(
+            id,
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": { "listChanged": false },
+                    "resources": { "subscribe": false, "listChanged": false },
+                    "prompts": { "listChanged": false }
+                },
+                "serverInfo": {
+                    "name": "code-graph-mcp",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "instructions": instructions
+            }),
+        )
     }
 
     fn handle_tools_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
-        let tools: Vec<serde_json::Value> = self.registry.list_tools().iter().map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.input_schema,
+        let tools: Vec<serde_json::Value> = self
+            .registry
+            .list_tools()
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                })
             })
-        }).collect();
+            .collect();
 
         JsonRpcResponse::success(id, json!({ "tools": tools }))
     }
 
-    fn handle_tools_call(&self, id: Option<serde_json::Value>, params: Option<serde_json::Value>) -> JsonRpcResponse {
+    fn handle_tools_call(
+        &self,
+        id: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
+    ) -> JsonRpcResponse {
         let params = match params {
             Some(p) => p,
-            None => return JsonRpcResponse::error(id, super::protocol::JSONRPC_INVALID_PARAMS, "Missing params".into()),
+            None => {
+                return JsonRpcResponse::error(
+                    id,
+                    super::protocol::JSONRPC_INVALID_PARAMS,
+                    "Missing params".into(),
+                )
+            }
         };
 
         let tool_name = match params["name"].as_str() {
             Some(name) => name,
-            None => return JsonRpcResponse::error(id, super::protocol::JSONRPC_INVALID_PARAMS, "Missing or invalid 'name' in tool call params".into()),
+            None => {
+                return JsonRpcResponse::error(
+                    id,
+                    super::protocol::JSONRPC_INVALID_PARAMS,
+                    "Missing or invalid 'name' in tool call params".into(),
+                )
+            }
         };
         let arguments = &params["arguments"];
 
@@ -1910,12 +2075,15 @@ impl McpServer {
             Ok(result) => {
                 let text = serde_json::to_string(&result)
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
-                JsonRpcResponse::success(id, json!({
-                    "content": [{
-                        "type": "text",
-                        "text": text
-                    }]
-                }))
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": text
+                        }]
+                    }),
+                )
             }
             Err(e) => {
                 tracing::warn!("[tool-error] {}: {}", tool_name, e);
@@ -1929,36 +2097,47 @@ impl McpServer {
                         " Note: this code-graph instance is in read-only secondary mode \
                          (another instance holds the index lock) and does not reindex on \
                          its own — if you recently edited files, the symbol may not be \
-                         indexed here yet; the primary instance will pick it up shortly."
+                         indexed here yet; the primary instance will pick it up shortly.",
                     );
                 }
-                JsonRpcResponse::success(id, json!({
-                    "content": [{
-                        "type": "text",
-                        "text": text
-                    }],
-                    "isError": true
-                }))
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": text
+                        }],
+                        "isError": true
+                    }),
+                )
             }
         }
     }
 
     fn handle_resources_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
-        JsonRpcResponse::success(id, json!({
-            "resources": [{
-                "uri": "code-graph://project-summary",
-                "name": "Code Graph Project Summary",
-                "description": "Overview of the indexed codebase: file count, node count, edge count, languages, and index health",
-                "mimeType": "application/json",
-                "annotations": {
-                    "audience": ["assistant"]
-                }
-            }]
-        }))
+        JsonRpcResponse::success(
+            id,
+            json!({
+                "resources": [{
+                    "uri": "code-graph://project-summary",
+                    "name": "Code Graph Project Summary",
+                    "description": "Overview of the indexed codebase: file count, node count, edge count, languages, and index health",
+                    "mimeType": "application/json",
+                    "annotations": {
+                        "audience": ["assistant"]
+                    }
+                }]
+            }),
+        )
     }
 
-    fn handle_resources_read(&self, id: Option<serde_json::Value>, params: Option<serde_json::Value>) -> JsonRpcResponse {
-        let uri = params.as_ref()
+    fn handle_resources_read(
+        &self,
+        id: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
+    ) -> JsonRpcResponse {
+        let uri = params
+            .as_ref()
             .and_then(|p| p["uri"].as_str())
             .unwrap_or("");
 
@@ -1966,11 +2145,13 @@ impl McpServer {
             "code-graph://project-summary" => {
                 let status = match queries::get_index_status(self.db.conn(), self.is_watching()) {
                     Ok(s) => s,
-                    Err(e) => return JsonRpcResponse::error(
-                        id,
-                        super::protocol::JSONRPC_INTERNAL_ERROR,
-                        format!("Failed to get index status: {}", e),
-                    ),
+                    Err(e) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            super::protocol::JSONRPC_INTERNAL_ERROR,
+                            format!("Failed to get index status: {}", e),
+                        )
+                    }
                 };
 
                 let summary = json!({
@@ -1983,13 +2164,16 @@ impl McpServer {
                     "last_indexed_at": status.last_indexed_at,
                 });
 
-                JsonRpcResponse::success(id, json!({
-                    "contents": [{
-                        "uri": "code-graph://project-summary",
-                        "mimeType": "application/json",
-                        "text": serde_json::to_string_pretty(&summary).unwrap_or_default()
-                    }]
-                }))
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "contents": [{
+                            "uri": "code-graph://project-summary",
+                            "mimeType": "application/json",
+                            "text": serde_json::to_string_pretty(&summary).unwrap_or_default()
+                        }]
+                    }),
+                )
             }
             _ => JsonRpcResponse::error(
                 id,
@@ -2000,39 +2184,46 @@ impl McpServer {
     }
 
     fn handle_prompts_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
-        JsonRpcResponse::success(id, json!({
-            "prompts": [
-                {
-                    "name": "impact-analysis",
-                    "description": "Analyze the blast radius of changing a symbol",
-                    "arguments": [
-                        { "name": "symbol_name", "description": "Symbol to analyze", "required": true }
-                    ]
-                },
-                {
-                    "name": "understand-module",
-                    "description": "Deep dive into a module's architecture and relationships",
-                    "arguments": [
-                        { "name": "path", "description": "File or directory path", "required": true }
-                    ]
-                },
-                {
-                    "name": "trace-request",
-                    "description": "Trace an HTTP request from route to data layer",
-                    "arguments": [
-                        { "name": "route", "description": "HTTP route path (e.g. /api/users)", "required": true }
-                    ]
-                }
-            ]
-        }))
+        JsonRpcResponse::success(
+            id,
+            json!({
+                "prompts": [
+                    {
+                        "name": "impact-analysis",
+                        "description": "Analyze the blast radius of changing a symbol",
+                        "arguments": [
+                            { "name": "symbol_name", "description": "Symbol to analyze", "required": true }
+                        ]
+                    },
+                    {
+                        "name": "understand-module",
+                        "description": "Deep dive into a module's architecture and relationships",
+                        "arguments": [
+                            { "name": "path", "description": "File or directory path", "required": true }
+                        ]
+                    },
+                    {
+                        "name": "trace-request",
+                        "description": "Trace an HTTP request from route to data layer",
+                        "arguments": [
+                            { "name": "route", "description": "HTTP route path (e.g. /api/users)", "required": true }
+                        ]
+                    }
+                ]
+            }),
+        )
     }
 
-    fn handle_prompts_get(&self, id: Option<serde_json::Value>, params: Option<serde_json::Value>) -> JsonRpcResponse {
-        let name = params.as_ref()
+    fn handle_prompts_get(
+        &self,
+        id: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
+    ) -> JsonRpcResponse {
+        let name = params
+            .as_ref()
             .and_then(|p| p["name"].as_str())
             .unwrap_or("");
-        let arguments = params.as_ref()
-            .and_then(|p| p["arguments"].as_object());
+        let arguments = params.as_ref().and_then(|p| p["arguments"].as_object());
 
         match name {
             "impact-analysis" => {
@@ -2040,65 +2231,74 @@ impl McpServer {
                     .and_then(|a| a.get("symbol_name"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("<symbol>");
-                JsonRpcResponse::success(id, json!({
-                    "messages": [{
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": format!(
-                                "Analyze the impact of changing the symbol '{}'. \
-                                 Use get_ast_node with include_impact=true and symbol_name='{}' to get the blast radius, \
-                                 then use get_call_graph to understand the full caller/callee chain. \
-                                 Present: affected files, affected routes, risk level, and recommendations.",
-                                symbol, symbol
-                            )
-                        }
-                    }]
-                }))
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!(
+                                    "Analyze the impact of changing the symbol '{}'. \
+                                     Use get_ast_node with include_impact=true and symbol_name='{}' to get the blast radius, \
+                                     then use get_call_graph to understand the full caller/callee chain. \
+                                     Present: affected files, affected routes, risk level, and recommendations.",
+                                    symbol, symbol
+                                )
+                            }
+                        }]
+                    }),
+                )
             }
             "understand-module" => {
                 let path = arguments
                     .and_then(|a| a.get("path"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("<path>");
-                JsonRpcResponse::success(id, json!({
-                    "messages": [{
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": format!(
-                                "Give me a deep understanding of the module at '{}'. \
-                                 Use module_overview to get exports and hot paths, \
-                                 then use dependency_graph to map what it depends on and what depends on it. \
-                                 For the top 3 most-called exports, use get_call_graph to show their caller chain. \
-                                 Present: purpose, public API, dependencies, dependents, and hot paths.",
-                                path
-                            )
-                        }
-                    }]
-                }))
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!(
+                                    "Give me a deep understanding of the module at '{}'. \
+                                     Use module_overview to get exports and hot paths, \
+                                     then use dependency_graph to map what it depends on and what depends on it. \
+                                     For the top 3 most-called exports, use get_call_graph to show their caller chain. \
+                                     Present: purpose, public API, dependencies, dependents, and hot paths.",
+                                    path
+                                )
+                            }
+                        }]
+                    }),
+                )
             }
             "trace-request" => {
                 let route = arguments
                     .and_then(|a| a.get("route"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("<route>");
-                JsonRpcResponse::success(id, json!({
-                    "messages": [{
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": format!(
-                                "Trace the complete HTTP request flow for route '{}'. \
-                                 Use trace_http_chain to get the full chain from route to data layer. \
-                                 For each key node, use get_ast_node(node_id=N, context_lines=5) to show the implementation. \
-                                 Map the flow: route → middleware → validation → business logic → data access → response. \
-                                 Highlight error handling, auth checks, and database operations.",
-                                route
-                            )
-                        }
-                    }]
-                }))
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": format!(
+                                    "Trace the complete HTTP request flow for route '{}'. \
+                                     Use trace_http_chain to get the full chain from route to data layer. \
+                                     For each key node, use get_ast_node(node_id=N, context_lines=5) to show the implementation. \
+                                     Map the flow: route → middleware → validation → business logic → data access → response. \
+                                     Highlight error handling, auth checks, and database operations.",
+                                    route
+                                )
+                            }
+                        }]
+                    }),
+                )
             }
             _ => JsonRpcResponse::error(
                 id,
@@ -2131,8 +2331,12 @@ impl McpServer {
         let elapsed = start.elapsed();
         let err_msg = result.as_ref().err().map(|e| e.to_string());
         let err_kind = err_msg.as_deref().map(ErrKind::classify);
-        lock_or_recover(&self.metrics, "metrics")
-            .record_tool_call(name, elapsed.as_millis() as u64, err_kind, err_msg.as_deref());
+        lock_or_recover(&self.metrics, "metrics").record_tool_call(
+            name,
+            elapsed.as_millis() as u64,
+            err_kind,
+            err_msg.as_deref(),
+        );
         if elapsed.as_millis() > 100 {
             tracing::info!("[tool] {} completed in {:.1}s", name, elapsed.as_secs_f64());
         } else {
@@ -2143,7 +2347,6 @@ impl McpServer {
         // already return results with a "mode" key when compressed — those are left unchanged.
         result.map(centralized_compress)
     }
-
 }
 
 impl Drop for McpServer {
@@ -2177,15 +2380,25 @@ mod tests {
 
         let lock_path = cg.join("index.lock");
         let holder = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(false).open(&lock_path).unwrap();
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
         // SAFETY: `holder` is an open File owned by this scope, so `as_raw_fd()` is a
         // valid live fd for the flock call; `holder` is dropped below to release it.
         let rc = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(rc, 0, "the test must first acquire the lock");
-        assert!(other_process_holds_index_lock(cg), "a held flock must be detected");
+        assert!(
+            other_process_holds_index_lock(cg),
+            "a held flock must be detected"
+        );
 
         drop(holder); // releases the flock
-        assert!(!other_process_holds_index_lock(cg), "a released lock must read as free");
+        assert!(
+            !other_process_holds_index_lock(cg),
+            "a released lock must read as free"
+        );
     }
 
     fn tool_call_json(tool_name: &str, args: serde_json::Value) -> String {
@@ -2197,7 +2410,8 @@ mod tests {
                 "name": tool_name,
                 "arguments": args
             }
-        }).to_string()
+        })
+        .to_string()
     }
 
     fn parse_tool_result(response: &Option<String>) -> serde_json::Value {
@@ -2214,8 +2428,14 @@ mod tests {
         // the floor, every node would strand at 0% vec until restart. NoModel must leave
         // BOTH floor and retries untouched so the next tick re-attempts once the model
         // lands. `remeasured` is irrelevant here and must be ignored.
-        assert_eq!(apply_backfill_outcome(0, 0, BackfillOutcome::NoModel, 500), (0, 0));
-        assert_eq!(apply_backfill_outcome(7, 2, BackfillOutcome::NoModel, 500), (7, 2));
+        assert_eq!(
+            apply_backfill_outcome(0, 0, BackfillOutcome::NoModel, 500),
+            (0, 0)
+        );
+        assert_eq!(
+            apply_backfill_outcome(7, 2, BackfillOutcome::NoModel, 500),
+            (7, 2)
+        );
     }
 
     #[test]
@@ -2223,8 +2443,14 @@ mod tests {
         // A full drain means the embeddable set emptied. Floor → 0 so any later count is
         // treated as fresh work, and the stall-retry budget resets. `remeasured` is
         // ignored (a race-added node should be picked up next tick, not skipped).
-        assert_eq!(apply_backfill_outcome(0, 0, BackfillOutcome::Drained, 0), (0, 0));
-        assert_eq!(apply_backfill_outcome(42, 2, BackfillOutcome::Drained, 3), (0, 0));
+        assert_eq!(
+            apply_backfill_outcome(0, 0, BackfillOutcome::Drained, 0),
+            (0, 0)
+        );
+        assert_eq!(
+            apply_backfill_outcome(42, 2, BackfillOutcome::Drained, 3),
+            (0, 0)
+        );
     }
 
     #[test]
@@ -2234,13 +2460,21 @@ mod tests {
         // self-heals) while the retry counter climbs.
         let stalled = BackfillOutcome::Stalled { progressed: false };
         let (f1, r1) = apply_backfill_outcome(0, 0, stalled, 9);
-        assert_eq!((f1, r1), (0, 1), "first stall: floor stays low, retry counted");
+        assert_eq!(
+            (f1, r1),
+            (0, 1),
+            "first stall: floor stays low, retry counted"
+        );
         let (f2, r2) = apply_backfill_outcome(f1, r1, stalled, 9);
         assert_eq!((f2, r2), (0, 2), "second stall: still retrying");
         // Budget spent (MAX = 3): pin the floor to the residue and reset retries so a
         // FUTURE rise above this floor still re-triggers a drain.
         let (f3, r3) = apply_backfill_outcome(f2, r2, stalled, 9);
-        assert_eq!((f3, r3), (9, 0), "budget spent: pin floor to residue, reset retries");
+        assert_eq!(
+            (f3, r3),
+            (9, 0),
+            "budget spent: pin floor to residue, reset retries"
+        );
     }
 
     #[test]
@@ -2263,10 +2497,16 @@ mod tests {
         // to_string() substring check would MISS it — this is exactly why the predicate
         // matches the full chain ({:#}). Locks the W3 fix against a future .context() regression.
         let wrapped = bare.context("while running incremental index");
-        assert!(!wrapped.to_string().contains("FOREIGN KEY constraint failed"),
-            "precondition: the outer message hides the cause from to_string()");
-        assert!(is_fk_constraint_error(&wrapped),
-            "full-chain match must still detect the wrapped FK cause");
+        assert!(
+            !wrapped
+                .to_string()
+                .contains("FOREIGN KEY constraint failed"),
+            "precondition: the outer message hides the cause from to_string()"
+        );
+        assert!(
+            is_fk_constraint_error(&wrapped),
+            "full-chain match must still detect the wrapped FK cause"
+        );
         // A non-FK error must not match (no spurious truncate+rebuild).
         assert!(!is_fk_constraint_error(&anyhow::anyhow!("disk full")));
     }
@@ -2305,17 +2545,26 @@ mod tests {
     fn test_get_index_status_tool() {
         let server = McpServer::new_test();
         {
-            upsert_file(server.db().conn(), &FileRecord {
-                path: "a.rs".into(), blake3_hash: "h".into(),
-                last_modified: 1, language: Some("rust".into()),
-            }).unwrap();
+            upsert_file(
+                server.db().conn(),
+                &FileRecord {
+                    path: "a.rs".into(),
+                    blake3_hash: "h".into(),
+                    last_modified: 1,
+                    language: Some("rust".into()),
+                },
+            )
+            .unwrap();
         }
 
         let req = tool_call_json("get_index_status", json!({}));
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         assert_eq!(result["files_count"], 1);
-        assert_eq!(result["schema_version"], crate::storage::schema::SCHEMA_VERSION);
+        assert_eq!(
+            result["schema_version"],
+            crate::storage::schema::SCHEMA_VERSION
+        );
     }
 
     /// Extract the results array from a `semantic_code_search` response: a bare
@@ -2345,21 +2594,28 @@ function handleLogin(req: Request) {
     }
 }
 "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
-        let req = tool_call_json("semantic_code_search", json!({"query": "validateToken", "top_k": 3}));
+        let req = tool_call_json(
+            "semantic_code_search",
+            json!({"query": "validateToken", "top_k": 3}),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         // No embedding model in unit tests → FTS5-only object path; assert the
         // degradation signal is surfaced, then read results shape-agnostically.
-        assert_eq!(result["vector_available"], serde_json::json!(false),
-            "no-model test env must report vector_available=false, got: {}", result);
+        assert_eq!(
+            result["vector_available"],
+            serde_json::json!(false),
+            "no-model test env must report vector_available=false, got: {}",
+            result
+        );
         let results = search_results(&result);
         assert!(!results.is_empty(), "search should return results");
         let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
-        assert!(names.contains(&"validateToken"),
-            "got names: {:?}", names);
+        assert!(names.contains(&"validateToken"), "got names: {:?}", names);
     }
 
     #[test]
@@ -2378,18 +2634,24 @@ function handleLogin(req: Request) {
     }
 }
 "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
         // Trigger indexing
-        let _ = server.handle_message(&tool_call_json("get_index_status", json!({}))).unwrap();
+        let _ = server
+            .handle_message(&tool_call_json("get_index_status", json!({})))
+            .unwrap();
         server.ensure_indexed().unwrap();
 
-        let req = tool_call_json("get_call_graph", json!({
-            "function_name": "handleLogin",
-            "direction": "callees",
-            "depth": 2
-        }));
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({
+                "function_name": "handleLogin",
+                "direction": "callees",
+                "depth": 2
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         assert_eq!(result["function"], "handleLogin");
@@ -2401,15 +2663,19 @@ function handleLogin(req: Request) {
         std::fs::write(
             project_dir.path().join("utils.ts"),
             "function helper() { return 42; }\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
 
-        let req = tool_call_json("get_ast_node", json!({
-            "file_path": "utils.ts",
-            "symbol_name": "helper"
-        }));
+        let req = tool_call_json(
+            "get_ast_node",
+            json!({
+                "file_path": "utils.ts",
+                "symbol_name": "helper"
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         assert_eq!(result["name"], "helper");
@@ -2422,7 +2688,8 @@ function handleLogin(req: Request) {
         std::fs::write(
             project_dir.path().join("main.ts"),
             "// header\nfunction foo() {\n  return 1;\n}\n// footer\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
@@ -2436,7 +2703,10 @@ function handleLogin(req: Request) {
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         assert_eq!(result["name"], "foo");
-        assert!(result["code_content"].as_str().unwrap().contains("return 1"));
+        assert!(result["code_content"]
+            .as_str()
+            .unwrap()
+            .contains("return 1"));
     }
 
     #[test]
@@ -2448,8 +2718,13 @@ function handleLogin(req: Request) {
         let req = tool_call_json("rebuild_index", json!({"confirm": false}));
         let resp = server.handle_message(&req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        assert!(parsed["result"]["isError"].as_bool().unwrap_or(false)
-            || parsed["result"]["content"][0]["text"].as_str().unwrap_or("").contains("Error"));
+        assert!(
+            parsed["result"]["isError"].as_bool().unwrap_or(false)
+                || parsed["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Error")
+        );
     }
 
     #[test]
@@ -2532,10 +2807,16 @@ function handleLogin(req: Request) {
         for _ in 0..40 {
             server.ensure_indexed().unwrap();
             nodes = queries::get_nodes_by_name(server.db().conn(), "changed").unwrap();
-            if !nodes.is_empty() { break; }
+            if !nodes.is_empty() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        assert_eq!(nodes.len(), 1, "changed function should be indexed after watcher-triggered reindex");
+        assert_eq!(
+            nodes.len(),
+            1,
+            "changed function should be indexed after watcher-triggered reindex"
+        );
 
         // Stop watching
         let req = tool_call_json("stop_watch", json!({}));
@@ -2566,17 +2847,27 @@ function handleLogin(req: Request) {
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(parsed["result"]["isError"], serde_json::json!(true));
-        assert!(text.contains("not found"), "should still report not found: {text}");
-        assert!(text.contains("secondary mode"),
-            "secondary not-found must carry the stale-index hint: {text}");
+        assert!(
+            text.contains("not found"),
+            "should still report not found: {text}"
+        );
+        assert!(
+            text.contains("secondary mode"),
+            "secondary not-found must carry the stale-index hint: {text}"
+        );
 
         // Primary: identical query must NOT carry the secondary hint.
         let resp2 = primary.handle_message(&req).unwrap().unwrap();
         let parsed2: serde_json::Value = serde_json::from_str(&resp2).unwrap();
         let text2 = parsed2["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text2.contains("not found"), "primary should report not found: {text2}");
-        assert!(!text2.contains("secondary mode"),
-            "primary must not add the secondary hint: {text2}");
+        assert!(
+            text2.contains("not found"),
+            "primary should report not found: {text2}"
+        );
+        assert!(
+            !text2.contains("secondary mode"),
+            "primary must not add the secondary hint: {text2}"
+        );
     }
 
     #[test]
@@ -2599,7 +2890,10 @@ function handleLogin(req: Request) {
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert!(parsed["error"].is_object());
         assert_eq!(parsed["error"]["code"], -32700);
-        assert!(parsed["error"]["message"].as_str().unwrap().contains("Parse error"));
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Parse error"));
     }
 
     #[test]
@@ -2638,7 +2932,10 @@ function handleLogin(req: Request) {
         let resp = server.handle_message(batch).unwrap().expect("must reply");
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(parsed["error"]["code"], -32600);
-        assert!(parsed["error"]["message"].as_str().unwrap().contains("batch"));
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("batch"));
     }
 
     #[test]
@@ -2648,7 +2945,10 @@ function handleLogin(req: Request) {
         // listening for a response to a notification.
         let server = McpServer::new_test();
         let resp = server.handle_message(r#"{"jsonrpc":"2.0"}"#).unwrap();
-        assert!(resp.is_none(), "malformed notifications must never receive a response");
+        assert!(
+            resp.is_none(),
+            "malformed notifications must never receive a response"
+        );
     }
 
     #[test]
@@ -2657,7 +2957,10 @@ function handleLogin(req: Request) {
         // Notification (no id) with wrong JSON-RPC version — must still return None per spec
         let req = r#"{"jsonrpc":"1.0","method":"notifications/initialized"}"#;
         let resp = server.handle_message(req).unwrap();
-        assert!(resp.is_none(), "malformed notifications must never receive a response");
+        assert!(
+            resp.is_none(),
+            "malformed notifications must never receive a response"
+        );
     }
 
     #[test]
@@ -2715,29 +3018,46 @@ function handleLogin(req: Request) {
         let resp = server.handle_message(&req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Error"), "unknown tool should return error in content");
+        assert!(
+            text.contains("Error"),
+            "unknown tool should return error in content"
+        );
         assert!(parsed["result"]["isError"].as_bool().unwrap_or(false));
     }
 
     #[test]
     fn test_semantic_search_language_filter() {
         let project_dir = TempDir::new().unwrap();
-        std::fs::write(project_dir.path().join("app.ts"), "function handler() { return 1; }").unwrap();
-        std::fs::write(project_dir.path().join("app.py"), "def handler():\n    return 1\n").unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function handler() { return 1; }",
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.path().join("app.py"),
+            "def handler():\n    return 1\n",
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
 
         // Search with language filter for typescript
-        let req = tool_call_json("semantic_code_search", json!({
-            "query": "handler",
-            "language": "typescript"
-        }));
+        let req = tool_call_json(
+            "semantic_code_search",
+            json!({
+                "query": "handler",
+                "language": "typescript"
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         let results = search_results(&result);
         for r in &results {
-            assert!(r["file_path"].as_str().unwrap().ends_with(".ts"),
-                "language filter should only return typescript files, got: {}", r["file_path"]);
+            assert!(
+                r["file_path"].as_str().unwrap().ends_with(".ts"),
+                "language filter should only return typescript files, got: {}",
+                r["file_path"]
+            );
         }
     }
 
@@ -2746,20 +3066,31 @@ function handleLogin(req: Request) {
         // Parity with CLI `search` and the node_type guard: an unknown language
         // must return an error the caller can act on, not silently empty results.
         let project_dir = TempDir::new().unwrap();
-        std::fs::write(project_dir.path().join("app.ts"), "function handler() { return 1; }").unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function handler() { return 1; }",
+        )
+        .unwrap();
         let server = McpServer::new_test_with_project(project_dir.path());
 
-        let req = tool_call_json("semantic_code_search", json!({
-            "query": "handler",
-            "language": "pyton"
-        }));
+        let req = tool_call_json(
+            "semantic_code_search",
+            json!({
+                "query": "handler",
+                "language": "pyton"
+            }),
+        );
         let resp = server.handle_message(&req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(parsed["result"]["isError"].as_bool().unwrap_or(false),
-            "unknown language must be an error result; got: {text}");
-        assert!(text.contains("Unknown language filter") && text.contains("pyton"),
-            "error text must name the bad language and valid set; got: {text}");
+        assert!(
+            parsed["result"]["isError"].as_bool().unwrap_or(false),
+            "unknown language must be an error result; got: {text}"
+        );
+        assert!(
+            text.contains("Unknown language filter") && text.contains("pyton"),
+            "error text must name the bad language and valid set; got: {text}"
+        );
     }
 
     #[test]
@@ -2770,40 +3101,68 @@ function handleLogin(req: Request) {
         // Without it (validate then pass raw), "TypeScript" would silently return
         // no results while "typescript" works — all other tests still green.
         let project_dir = TempDir::new().unwrap();
-        std::fs::write(project_dir.path().join("app.ts"), "function handler() { return 1; }").unwrap();
+        std::fs::write(
+            project_dir.path().join("app.ts"),
+            "function handler() { return 1; }",
+        )
+        .unwrap();
         let server = McpServer::new_test_with_project(project_dir.path());
         let ask = |lang: &str| {
-            let req = tool_call_json("semantic_code_search", json!({ "query": "handler", "language": lang }));
+            let req = tool_call_json(
+                "semantic_code_search",
+                json!({ "query": "handler", "language": lang }),
+            );
             let resp = server.handle_message(&req).unwrap();
             search_results(&parse_tool_result(&resp)).len()
         };
         let lower = ask("typescript");
-        assert!(lower > 0, "sanity: lowercase 'typescript' must return the .ts match");
-        assert_eq!(ask("TypeScript"), lower, "mixed-case must match lowercase (canonicalized)");
-        assert_eq!(ask("TYPESCRIPT"), lower, "upper-case must match lowercase (canonicalized)");
+        assert!(
+            lower > 0,
+            "sanity: lowercase 'typescript' must return the .ts match"
+        );
+        assert_eq!(
+            ask("TypeScript"),
+            lower,
+            "mixed-case must match lowercase (canonicalized)"
+        );
+        assert_eq!(
+            ask("TYPESCRIPT"),
+            lower,
+            "upper-case must match lowercase (canonicalized)"
+        );
     }
 
     #[test]
     fn test_semantic_search_node_type_filter() {
         let project_dir = TempDir::new().unwrap();
-        std::fs::write(project_dir.path().join("mix.ts"), r#"
+        std::fs::write(
+            project_dir.path().join("mix.ts"),
+            r#"
 class UserService {
     getUser() { return null; }
 }
 function standalone() { return 1; }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
-        let req = tool_call_json("semantic_code_search", json!({
-            "query": "user",
-            "node_type": "class"
-        }));
+        let req = tool_call_json(
+            "semantic_code_search",
+            json!({
+                "query": "user",
+                "node_type": "class"
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         let results = search_results(&result);
         for r in &results {
-            assert_eq!(r["type"].as_str().unwrap(), "class",
-                "node_type filter should only return classes");
+            assert_eq!(
+                r["type"].as_str().unwrap(),
+                "class",
+                "node_type filter should only return classes"
+            );
         }
     }
 
@@ -2822,10 +3181,13 @@ function standalone() { return 1; }
         std::fs::write(project_dir.path().join("big.ts"), &code).unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
-        let req = tool_call_json("semantic_code_search", json!({
-            "query": "func",
-            "top_k": 20
-        }));
+        let req = tool_call_json(
+            "semantic_code_search",
+            json!({
+                "query": "func",
+                "top_k": 20
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
 
@@ -2842,7 +3204,9 @@ function standalone() { return 1; }
     #[test]
     fn test_find_http_route_with_downstream() {
         let project_dir = TempDir::new().unwrap();
-        std::fs::write(project_dir.path().join("server.ts"), r#"
+        std::fs::write(
+            project_dir.path().join("server.ts"),
+            r#"
 function validateToken(token: string) { return true; }
 
 function handleLogin(req: Request) {
@@ -2851,15 +3215,20 @@ function handleLogin(req: Request) {
 }
 
 app.post('/api/login', handleLogin);
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
 
-        let req = tool_call_json("find_http_route", json!({
-            "route_path": "/api/login",
-            "include_middleware": true
-        }));
+        let req = tool_call_json(
+            "find_http_route",
+            json!({
+                "route_path": "/api/login",
+                "include_middleware": true
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         assert_eq!(result["route"], "/api/login");
@@ -2873,27 +3242,36 @@ app.post('/api/login', handleLogin);
         std::fs::write(
             project_dir.path().join("small.ts"),
             "function hello() { return 1; }\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
         // Request absurdly large top_k — should not error, just return clamped results
-        let req = tool_call_json("semantic_code_search", json!({
-            "query": "hello",
-            "top_k": 999999
-        }));
+        let req = tool_call_json(
+            "semantic_code_search",
+            json!({
+                "query": "hello",
+                "top_k": 999999
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
         // Should succeed (bare array, FTS5-only object, or compressed mode) — not crash/OOM
-        assert!(result.is_array()
+        assert!(
+            result.is_array()
                 || result.get("results").is_some()
                 || result["mode"].as_str() == Some("compressed"),
-            "search with huge top_k should return valid results, got: {}", result);
+            "search with huge top_k should return valid results, got: {}",
+            result
+        );
     }
 
     #[test]
     fn test_trace_http_chain() {
         let project_dir = TempDir::new().unwrap();
-        std::fs::write(project_dir.path().join("server.ts"), r#"
+        std::fs::write(
+            project_dir.path().join("server.ts"),
+            r#"
 function validateToken(token: string) { return true; }
 function queryDatabase(userId: string) { return null; }
 
@@ -2903,15 +3281,20 @@ function handleLogin(req: Request) {
 }
 
 app.post('/api/login', handleLogin);
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
 
-        let req = tool_call_json("trace_http_chain", json!({
-            "route_path": "/api/login",
-            "depth": 3
-        }));
+        let req = tool_call_json(
+            "trace_http_chain",
+            json!({
+                "route_path": "/api/login",
+                "depth": 3
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
 
@@ -2922,7 +3305,10 @@ app.post('/api/login', handleLogin);
         // First handler should have a call_chain with recursive callees
         let handler = &handlers[0];
         assert!(handler["handler_name"].as_str().is_some());
-        assert!(handler["call_chain"].is_array(), "handler should have call_chain array");
+        assert!(
+            handler["call_chain"].is_array(),
+            "handler should have call_chain array"
+        );
     }
 
     #[test]
@@ -2931,7 +3317,8 @@ app.post('/api/login', handleLogin);
         std::fs::write(
             project_dir.path().join("a.ts"),
             "function exists() { return 1; }\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
@@ -2941,8 +3328,11 @@ app.post('/api/login', handleLogin);
         let resp = server.handle_message(&req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Error") || text.contains("not found"),
-            "missing node should return error message, got: {}", text);
+        assert!(
+            text.contains("Error") || text.contains("not found"),
+            "missing node should return error message, got: {}",
+            text
+        );
     }
 
     #[test]
@@ -2964,7 +3354,8 @@ app.post('/api/login', handleLogin);
                 assert!(
                     !canonical.starts_with(&root),
                     "canonical traversal path {:?} must not start with root {:?}",
-                    canonical, root
+                    canonical,
+                    root
                 );
             }
             Err(_) => {
@@ -2976,7 +3367,10 @@ app.post('/api/login', handleLogin);
         // Also test that a legitimate path DOES pass
         std::fs::write(project_dir.path().join("safe.ts"), "function ok() {}").unwrap();
         let safe_path = root.join("safe.ts").canonicalize().unwrap();
-        assert!(safe_path.starts_with(&root), "legitimate path should be within root");
+        assert!(
+            safe_path.starts_with(&root),
+            "legitimate path should be within root"
+        );
     }
 
     #[test]
@@ -2998,11 +3392,14 @@ app.post('/api/login', handleLogin);
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
 
-        let req = tool_call_json("get_call_graph", json!({
-            "function_name": "chain0",
-            "direction": "callees",
-            "depth": 20
-        }));
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({
+                "function_name": "chain0",
+                "direction": "callees",
+                "depth": 20
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
 
@@ -3035,23 +3432,33 @@ app.post('/api/login', handleLogin);
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
 
-        let req = tool_call_json("get_call_graph", json!({
-            "function_name": "hub",
-            "direction": "callers",
-            "depth": 1
-        }));
+        let req = tool_call_json(
+            "get_call_graph",
+            json!({
+                "function_name": "hub",
+                "direction": "callers",
+                "depth": 1
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
 
         // Rollup branch fired (dense fanout collapsed to file-level summary).
-        assert_eq!(result["mode"], "rollup_call_graph",
-            "250 callers in one file must trip rollup, got mode={:?}", result["mode"]);
+        assert_eq!(
+            result["mode"], "rollup_call_graph",
+            "250 callers in one file must trip rollup, got mode={:?}",
+            result["mode"]
+        );
 
         // Truncation provenance survives the rollup: row limit hit, warning present.
-        assert_eq!(result["limit_hit"], json!(true),
-            "200-row cap hit on 250-caller fixture must surface limit_hit=true");
+        assert_eq!(
+            result["limit_hit"],
+            json!(true),
+            "200-row cap hit on 250-caller fixture must surface limit_hit=true"
+        );
         assert!(
-            result["truncation_warning"].as_str()
+            result["truncation_warning"]
+                .as_str()
                 .map(|s| s.contains("row limit"))
                 .unwrap_or(false),
             "truncation_warning must mention row limit; got {:?}",
@@ -3070,10 +3477,13 @@ app.post('/api/login', handleLogin);
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
 
-        let req = tool_call_json("get_ast_node", json!({
-            "file_path": "big.ts",
-            "symbol_name": "bigFunc"
-        }));
+        let req = tool_call_json(
+            "get_ast_node",
+            json!({
+                "file_path": "big.ts",
+                "symbol_name": "bigFunc"
+            }),
+        );
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
 
@@ -3124,12 +3534,21 @@ app.post('/api/login', handleLogin);
         let req = tool_call_json("get_index_status", json!({}));
         let resp = server.handle_message(&req).unwrap();
         let result = parse_tool_result(&resp);
-        assert!(result["embedding_status"].is_string(),
-            "should have embedding_status: {:?}", result);
-        assert!(result["embedding_progress"].is_string(),
-            "should have embedding_progress: {:?}", result);
-        assert!(result["model_available"].is_boolean(),
-            "should have model_available: {:?}", result);
+        assert!(
+            result["embedding_status"].is_string(),
+            "should have embedding_status: {:?}",
+            result
+        );
+        assert!(
+            result["embedding_progress"].is_string(),
+            "should have embedding_progress: {:?}",
+            result
+        );
+        assert!(
+            result["model_available"].is_boolean(),
+            "should have model_available: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -3137,8 +3556,11 @@ app.post('/api/login', handleLogin);
         // Verify that estimate_json_tokens works as expected for compression threshold checks
         let small = json!({"name": "hello", "type": "function"});
         let small_tokens = crate::sandbox::compressor::estimate_json_tokens(&small);
-        assert!(small_tokens < COMPRESSION_TOKEN_THRESHOLD,
-            "small JSON should be under threshold: {} tokens", small_tokens);
+        assert!(
+            small_tokens < COMPRESSION_TOKEN_THRESHOLD,
+            "small JSON should be under threshold: {} tokens",
+            small_tokens
+        );
 
         // Build a large JSON value that exceeds the compression threshold
         // COMPRESSION_TOKEN_THRESHOLD = 2000, and estimate is len/3
@@ -3146,18 +3568,29 @@ app.post('/api/login', handleLogin);
         let large_content: String = "x".repeat(8000);
         let large = json!({"code_content": large_content, "name": "big_function"});
         let large_tokens = crate::sandbox::compressor::estimate_json_tokens(&large);
-        assert!(large_tokens > COMPRESSION_TOKEN_THRESHOLD,
+        assert!(
+            large_tokens > COMPRESSION_TOKEN_THRESHOLD,
             "large JSON should exceed threshold: {} tokens vs {} threshold",
-            large_tokens, COMPRESSION_TOKEN_THRESHOLD);
+            large_tokens,
+            COMPRESSION_TOKEN_THRESHOLD
+        );
 
         // Verify the centralized compression produces a truncated result
         let compressed = centralized_compress(large.clone());
-        assert_ne!(compressed, large, "compressed result should differ from original");
-        assert!(compressed.get("_truncated").is_some(),
-            "centralized compression should add _truncated marker");
+        assert_ne!(
+            compressed, large,
+            "compressed result should differ from original"
+        );
+        assert!(
+            compressed.get("_truncated").is_some(),
+            "centralized compression should add _truncated marker"
+        );
         let compressed_tokens = crate::sandbox::compressor::estimate_json_tokens(&compressed);
-        assert!(compressed_tokens <= COMPRESSION_TOKEN_THRESHOLD * 2,
-            "compressed result should be much smaller: {} tokens", compressed_tokens);
+        assert!(
+            compressed_tokens <= COMPRESSION_TOKEN_THRESHOLD * 2,
+            "compressed result should be much smaller: {} tokens",
+            compressed_tokens
+        );
     }
 
     /// W2 end-to-end: a watcher-triggered incremental skipped because embedding holds the
@@ -3177,21 +3610,42 @@ app.post('/api/login', handleLogin);
 
         // Embedding holds the write path → the incremental SKIPS (after its 2s wait) and
         // must arm pending so the consumed change isn't lost.
-        server.indexing.embedding_in_progress.store(true, Ordering::SeqCst);
-        server.run_incremental_with_cache_restore(project.path(), None).unwrap();
-        assert!(server.indexing.pending_incremental.load(Ordering::SeqCst),
-            "a skipped incremental must arm pending_incremental");
-        assert!(crate::storage::queries::get_node_ids_by_name(server.db.conn(), "beta_fn")
-            .unwrap().is_empty(), "the skipped incremental must NOT have indexed beta yet");
+        server
+            .indexing
+            .embedding_in_progress
+            .store(true, Ordering::SeqCst);
+        server
+            .run_incremental_with_cache_restore(project.path(), None)
+            .unwrap();
+        assert!(
+            server.indexing.pending_incremental.load(Ordering::SeqCst),
+            "a skipped incremental must arm pending_incremental"
+        );
+        assert!(
+            crate::storage::queries::get_node_ids_by_name(server.db.conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "the skipped incremental must NOT have indexed beta yet"
+        );
 
         // Release embedding; the owed incremental runs, clears the flag, and indexes beta.
-        server.indexing.embedding_in_progress.store(false, Ordering::SeqCst);
-        server.run_incremental_with_cache_restore(project.path(), None).unwrap();
-        assert!(!server.indexing.pending_incremental.load(Ordering::SeqCst),
-            "a completed incremental must clear pending_incremental");
-        assert!(!crate::storage::queries::get_node_ids_by_name(server.db.conn(), "beta_fn")
-            .unwrap().is_empty(),
-            "the previously-stranded beta.rs must be indexed once the owed incremental runs");
+        server
+            .indexing
+            .embedding_in_progress
+            .store(false, Ordering::SeqCst);
+        server
+            .run_incremental_with_cache_restore(project.path(), None)
+            .unwrap();
+        assert!(
+            !server.indexing.pending_incremental.load(Ordering::SeqCst),
+            "a completed incremental must clear pending_incremental"
+        );
+        assert!(
+            !crate::storage::queries::get_node_ids_by_name(server.db.conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "the previously-stranded beta.rs must be indexed once the owed incremental runs"
+        );
     }
 
     /// W2: with a watcher ACTIVE but NO fresh events, `ensure_indexed` must still run an
@@ -3217,23 +3671,39 @@ app.post('/api/login', handleLogin);
         // startup event now reaches the channel and made this precondition flaky on macos-no-embed
         // CI. Draining an isolated channel removes that platform-specific fs-event race.
         let idle = TempDir::new().unwrap();
-        let (sink_tx, _sink_rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        let (sink_tx, _sink_rx) =
+            mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
         let fw = FileWatcher::start(idle.path(), sink_tx).expect("watcher must start");
-        let (_quiet_tx, quiet_rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
-        *lock_or_recover(&server.watcher, "watcher") = Some(WatcherState { _watcher: fw, receiver: quiet_rx });
+        let (_quiet_tx, quiet_rx) =
+            mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        *lock_or_recover(&server.watcher, "watcher") = Some(WatcherState {
+            _watcher: fw,
+            receiver: quiet_rx,
+        });
 
         // Stranded state: a real change on disk + pending armed (as a prior embedding-skip
         // would leave it), with a watcher active and no events for it.
         fs::write(project.path().join("gamma.rs"), "fn gamma_fn() {}\n").unwrap();
-        server.indexing.pending_incremental.store(true, Ordering::SeqCst);
-        assert!(!server.drain_watcher_events(), "precondition: no watcher events queued");
+        server
+            .indexing
+            .pending_incremental
+            .store(true, Ordering::SeqCst);
+        assert!(
+            !server.drain_watcher_events(),
+            "precondition: no watcher events queued"
+        );
 
         server.ensure_indexed().unwrap();
-        assert!(!server.indexing.pending_incremental.load(Ordering::SeqCst),
-            "ensure_indexed must run and clear the owed incremental");
-        assert!(!crate::storage::queries::get_node_ids_by_name(server.db.conn(), "gamma_fn")
-            .unwrap().is_empty(),
-            "owed incremental must index the stranded change (watcher active, no new events)");
+        assert!(
+            !server.indexing.pending_incremental.load(Ordering::SeqCst),
+            "ensure_indexed must run and clear the owed incremental"
+        );
+        assert!(
+            !crate::storage::queries::get_node_ids_by_name(server.db.conn(), "gamma_fn")
+                .unwrap()
+                .is_empty(),
+            "owed incremental must index the stranded change (watcher active, no new events)"
+        );
     }
 
     #[test]
@@ -3243,7 +3713,10 @@ app.post('/api/login', handleLogin);
         let server = McpServer::new_test_with_project(project_dir.path());
 
         // Simulate background indexing in progress
-        server.indexing.startup_indexing.store(true, Ordering::SeqCst);
+        server
+            .indexing
+            .startup_indexing
+            .store(true, Ordering::SeqCst);
         *server.indexing.startup_indexing_done.0.lock().unwrap() = false;
 
         // Call ensure_indexed and verify it returns within 5 seconds
@@ -3252,14 +3725,23 @@ app.post('/api/login', handleLogin);
         let elapsed = start.elapsed();
 
         // Must complete quickly (under 5 seconds), not block for 300 seconds
-        assert!(elapsed.as_secs() < 5,
-            "ensure_indexed should return within 5 seconds, took {}s", elapsed.as_secs());
+        assert!(
+            elapsed.as_secs() < 5,
+            "ensure_indexed should return within 5 seconds, took {}s",
+            elapsed.as_secs()
+        );
 
         // Should return an error indicating indexing is in progress
-        assert!(result.is_err(), "ensure_indexed should return Err when indexing is in progress");
+        assert!(
+            result.is_err(),
+            "ensure_indexed should return Err when indexing is in progress"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("ndexing in progress") || err_msg.contains("retry"),
-            "error message should mention indexing in progress or retry, got: {}", err_msg);
+        assert!(
+            err_msg.contains("ndexing in progress") || err_msg.contains("retry"),
+            "error message should mention indexing in progress or retry, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -3273,7 +3755,10 @@ app.post('/api/login', handleLogin);
         // until the real deadline and still return Err.
         let project_dir = TempDir::new().unwrap();
         let server = McpServer::new_test_with_project(project_dir.path());
-        server.indexing.startup_indexing.store(true, Ordering::SeqCst);
+        server
+            .indexing
+            .startup_indexing
+            .store(true, Ordering::SeqCst);
         *server.indexing.startup_indexing_done.0.lock().unwrap() = false;
 
         let dvar = std::sync::Arc::clone(&server.indexing.startup_indexing_done);
@@ -3292,10 +3777,15 @@ app.post('/api/login', handleLogin);
         stop.store(true, Ordering::Relaxed);
         notifier.join().unwrap();
 
-        assert!(elapsed.as_secs() < 5,
-            "must stay non-blocking even under spurious wakeups, took {}s", elapsed.as_secs());
-        assert!(result.is_err(),
-            "ensure_indexed must return Err under spurious wakeups while indexing is unfinished");
+        assert!(
+            elapsed.as_secs() < 5,
+            "must stay non-blocking even under spurious wakeups, took {}s",
+            elapsed.as_secs()
+        );
+        assert!(
+            result.is_err(),
+            "ensure_indexed must return Err under spurious wakeups while indexing is unfinished"
+        );
     }
 
     #[test]
@@ -3317,7 +3807,11 @@ app.post('/api/login', handleLogin);
         // survive rebuild.
         let project_dir = TempDir::new().unwrap();
         std::fs::write(project_dir.path().join("a.ts"), "function alpha() {}").unwrap();
-        std::fs::write(project_dir.path().join("b.ts"), "function beta() { alpha(); }").unwrap();
+        std::fs::write(
+            project_dir.path().join("b.ts"),
+            "function beta() { alpha(); }",
+        )
+        .unwrap();
         let server = McpServer::new_test_with_project(project_dir.path());
         server.ensure_indexed().unwrap();
 
@@ -3333,11 +3827,13 @@ app.post('/api/login', handleLogin);
              INSERT INTO edges (source_id, target_id, relation) VALUES (88888, 88888, 'calls');\n\
              PRAGMA foreign_keys = ON;"
         ).unwrap();
-        let count = |sql: &str| -> i64 {
-            server.db().conn().query_row(sql, [], |r| r.get(0)).unwrap()
-        };
-        assert_eq!(count("SELECT COUNT(*) FROM nodes WHERE name = 'phantom_fn'"), 1,
-            "phantom injected");
+        let count =
+            |sql: &str| -> i64 { server.db().conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM nodes WHERE name = 'phantom_fn'"),
+            1,
+            "phantom injected"
+        );
 
         // Step 1 of the fallback: truncate (same SQL as mod.rs:987's FK branch).
         {
@@ -3346,27 +3842,42 @@ app.post('/api/login', handleLogin);
             tx.commit().unwrap();
         }
         assert_eq!(count("SELECT COUNT(*) FROM files"), 0, "files truncated");
-        assert_eq!(count("SELECT COUNT(*) FROM nodes"), 0,
-            "nodes CASCADE-deleted (schema: nodes.file_id ON DELETE CASCADE)");
-        assert_eq!(count("SELECT COUNT(*) FROM edges"), 0,
-            "edges CASCADE-deleted (schema: edges.source_id/target_id ON DELETE CASCADE)");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM nodes"),
+            0,
+            "nodes CASCADE-deleted (schema: nodes.file_id ON DELETE CASCADE)"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM edges"),
+            0,
+            "edges CASCADE-deleted (schema: edges.source_id/target_id ON DELETE CASCADE)"
+        );
 
         // Step 2 of the fallback: run_full_index rebuilds from clean state.
-        let result = crate::indexer::pipeline::run_full_index(
-            server.db(), project_dir.path(), None, None,
-        ).unwrap();
-        assert!(result.files_indexed >= 2,
-            "both on-disk files re-indexed (got {})", result.files_indexed);
+        let result =
+            crate::indexer::pipeline::run_full_index(server.db(), project_dir.path(), None, None)
+                .unwrap();
+        assert!(
+            result.files_indexed >= 2,
+            "both on-disk files re-indexed (got {})",
+            result.files_indexed
+        );
 
         // Post-recovery invariants: on-disk symbols restored, phantom gone.
         let alpha = queries::get_nodes_by_name(server.db().conn(), "alpha").unwrap();
         assert_eq!(alpha.len(), 1, "alpha re-indexed after truncate+rebuild");
         let beta = queries::get_nodes_by_name(server.db().conn(), "beta").unwrap();
         assert_eq!(beta.len(), 1, "beta re-indexed after truncate+rebuild");
-        assert_eq!(count("SELECT COUNT(*) FROM nodes WHERE name = 'phantom_fn'"), 0,
-            "phantom purged by fallback");
-        assert_eq!(count("SELECT COUNT(*) FROM files WHERE path = 'phantom.ts'"), 0,
-            "phantom file row purged by fallback");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM nodes WHERE name = 'phantom_fn'"),
+            0,
+            "phantom purged by fallback"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM files WHERE path = 'phantom.ts'"),
+            0,
+            "phantom file row purged by fallback"
+        );
     }
 
     /// Inode-safety contract: when a snapshot is installed into .code-graph/index.db
@@ -3388,15 +3899,36 @@ app.post('/api/login', handleLogin);
 
         // Build a snapshot from a git fixture with one indexable Rust file.
         let source = TempDir::new().unwrap();
-        Command::new("git").args(["init", "-q"]).current_dir(source.path()).status().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(source.path()).status().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(source.path()).status().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(source.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(source.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(source.path())
+            .status()
+            .unwrap();
         std::fs::write(
             source.path().join("lib.rs"),
             "pub fn snapshot_sentinel() {}\npub fn snapshot_caller() { snapshot_sentinel(); }\n",
-        ).unwrap();
-        Command::new("git").args(["add", "."]).current_dir(source.path()).status().unwrap();
-        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(source.path()).status().unwrap();
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(source.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(source.path())
+            .status()
+            .unwrap();
 
         let raw_db = source.path().join("snap.db");
         crate::snapshot::create(source.path(), &raw_db, false).unwrap();
@@ -3412,13 +3944,17 @@ app.post('/api/login', handleLogin);
         std::fs::write(
             consumer.path().join("lib.rs"),
             "pub fn snapshot_sentinel() {}\npub fn snapshot_caller() { snapshot_sentinel(); }\n",
-        ).unwrap();
+        )
+        .unwrap();
         let url = format!("file://{}", zst_path.display());
         crate::snapshot::try_install(&url, consumer.path()).unwrap();
 
         // Verify snapshot was installed.
         let index_db = consumer.path().join(".code-graph").join("index.db");
-        assert!(index_db.exists(), "snapshot must be installed before from_project_root");
+        assert!(
+            index_db.exists(),
+            "snapshot must be installed before from_project_root"
+        );
 
         // Open the server — from_project_root skips maybe_install_snapshot because
         // index.db already exists (the guard condition is !db_path.exists()).
@@ -3428,18 +3964,27 @@ app.post('/api/login', handleLogin);
         // KEY ASSERTION: self.db sees the snapshot nodes without calling ensure_indexed.
         // If the inode-swap bug were present (install after open), this would return empty.
         let nodes = queries::get_nodes_by_name(server.db().conn(), "snapshot_sentinel").unwrap();
-        assert!(!nodes.is_empty(),
+        assert!(
+            !nodes.is_empty(),
             "self.db must see snapshot_sentinel from the pre-installed snapshot; \
-             got {} nodes — inode-swap regression if 0", nodes.len());
+             got {} nodes — inode-swap regression if 0",
+            nodes.len()
+        );
 
         // ensure_indexed should run incrementally (not full) since has_existing = true.
         // This verifies the ensure_indexed drift-correction path works correctly.
         server.ensure_indexed().unwrap();
-        let nodes_after = queries::get_nodes_by_name(server.db().conn(), "snapshot_sentinel").unwrap();
-        assert!(!nodes_after.is_empty(),
-            "snapshot_sentinel must still be present after incremental drift-check");
-        let caller_nodes = queries::get_nodes_by_name(server.db().conn(), "snapshot_caller").unwrap();
-        assert!(!caller_nodes.is_empty(),
-            "snapshot_caller must be present after drift-check");
+        let nodes_after =
+            queries::get_nodes_by_name(server.db().conn(), "snapshot_sentinel").unwrap();
+        assert!(
+            !nodes_after.is_empty(),
+            "snapshot_sentinel must still be present after incremental drift-check"
+        );
+        let caller_nodes =
+            queries::get_nodes_by_name(server.db().conn(), "snapshot_caller").unwrap();
+        assert!(
+            !caller_nodes.is_empty(),
+            "snapshot_caller must be present after drift-check"
+        );
     }
 }

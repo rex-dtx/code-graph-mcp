@@ -26,7 +26,8 @@ END;
 /// Build the full CREATE_TABLES SQL at runtime by concatenating the static parts.
 /// This avoids duplicating FTS5 trigger definitions.
 pub fn create_tables_sql() -> String {
-    format!(r#"
+    format!(
+        r#"
 CREATE TABLE IF NOT EXISTS files (
     id          INTEGER PRIMARY KEY,
     path        TEXT NOT NULL UNIQUE,
@@ -119,7 +120,8 @@ CREATE TABLE IF NOT EXISTS pending_unresolved_calls (
 CREATE INDEX IF NOT EXISTS idx_pending_target_lang ON pending_unresolved_calls(target_name, source_language);
 CREATE INDEX IF NOT EXISTS idx_pending_source ON pending_unresolved_calls(source_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_unique ON pending_unresolved_calls(source_id, target_name, source_language);
-"#)
+"#
+    )
 }
 
 /// Check if a column exists on a table using PRAGMA table_info (safe from SQL injection).
@@ -127,13 +129,17 @@ fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool
     // Validate table name against allowlist to prevent injection via PRAGMA
     const ALLOWED_TABLES: &[&str] = &["files", "nodes", "edges", "pending_unresolved_calls"];
     if !ALLOWED_TABLES.contains(&table) {
-        tracing::warn!("column_exists: table '{}' not in allowlist, add it to ALLOWED_TABLES", table);
+        tracing::warn!(
+            "column_exists: table '{}' not in allowlist, add it to ALLOWED_TABLES",
+            table
+        );
         return false;
     }
     let sql = format!("PRAGMA table_info({})", table);
     match conn.prepare(&sql) {
         Ok(mut stmt) => {
-            let found = stmt.query_map([], |row| row.get::<_, String>(1))
+            let found = stmt
+                .query_map([], |row| row.get::<_, String>(1))
                 .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == column))
                 .unwrap_or(false);
             found
@@ -143,19 +149,34 @@ fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool
 }
 
 /// Add a column only if it doesn't already exist (idempotent ALTER TABLE).
-fn add_column_if_not_exists(conn: &rusqlite::Connection, table: &str, column: &str, col_type: &str) -> anyhow::Result<()> {
+fn add_column_if_not_exists(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    col_type: &str,
+) -> anyhow::Result<()> {
     // Validate identifiers to prevent SQL injection
     fn is_valid_ident(s: &str) -> bool {
         !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
     fn is_valid_col_type(s: &str) -> bool {
-        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ')
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ')
     }
     if !is_valid_ident(table) || !is_valid_ident(column) || !is_valid_col_type(col_type) {
-        anyhow::bail!("Invalid identifier in ALTER TABLE: table={}, column={}, type={}", table, column, col_type);
+        anyhow::bail!(
+            "Invalid identifier in ALTER TABLE: table={}, column={}, type={}",
+            table,
+            column,
+            col_type
+        );
     }
     if !column_exists(conn, table, column) {
-        conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type))?;
+        conn.execute_batch(&format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            table, column, col_type
+        ))?;
     }
     Ok(())
 }
@@ -172,7 +193,7 @@ pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         "DROP TRIGGER IF EXISTS nodes_ai;
          DROP TRIGGER IF EXISTS nodes_ad;
          DROP TRIGGER IF EXISTS nodes_au;
-         DROP TABLE IF EXISTS nodes_fts;"
+         DROP TABLE IF EXISTS nodes_fts;",
     )?;
 
     conn.execute_batch(
@@ -180,7 +201,7 @@ pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             name, qualified_name, code_content, context_string, doc_comment,
             name_tokens, return_type, param_types,
             content='nodes', content_rowid='id'
-        );"
+        );",
     )?;
     conn.execute_batch(FTS5_TRIGGERS)?;
 
@@ -193,7 +214,9 @@ pub fn migrate_v1_to_v2(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 /// Migrate from schema v2 to v3. Must be called within a transaction.
 /// Changes edges UNIQUE constraint to include metadata (enables multiple route edges per file).
 pub fn migrate_v2_to_v3(conn: &rusqlite::Connection) -> anyhow::Result<()> {
-    tracing::info!("[schema] Migrating v2 → v3: updating edges unique constraint to include metadata");
+    tracing::info!(
+        "[schema] Migrating v2 → v3: updating edges unique constraint to include metadata"
+    );
 
     // SQLite requires recreating the table to change constraints
     conn.execute_batch(
@@ -235,7 +258,7 @@ pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         "DROP TRIGGER IF EXISTS nodes_ai;
          DROP TRIGGER IF EXISTS nodes_ad;
          DROP TRIGGER IF EXISTS nodes_au;
-         DROP TABLE IF EXISTS nodes_fts;"
+         DROP TABLE IF EXISTS nodes_fts;",
     )?;
 
     conn.execute_batch(
@@ -244,7 +267,7 @@ pub fn migrate_v3_to_v4(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             name_tokens, return_type, param_types,
             content='nodes', content_rowid='id',
             tokenize='porter unicode61'
-        );"
+        );",
     )?;
     conn.execute_batch(FTS5_TRIGGERS)?;
 
@@ -264,7 +287,7 @@ pub fn migrate_v4_to_v5(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 pub fn migrate_v5_to_v6(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     tracing::info!("[schema] Migrating v5 -> v6: adding index on qualified_name");
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);"
+        "CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);",
     )?;
     tracing::info!("[schema] Migration v5->v6 complete.");
     Ok(())
@@ -280,7 +303,7 @@ pub fn migrate_v6_to_v7(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY NOT NULL,
             value TEXT NOT NULL
-        );"
+        );",
     )?;
     tracing::info!("[schema] Migration v6->v7 complete.");
     Ok(())
@@ -313,7 +336,9 @@ pub fn migrate_v7_to_v8(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 /// helper's identifier validator. The DEFAULT backfills existing rows to
 /// 'extracted'; the next index pass reclassifies via classify_edge_confidence.
 pub fn migrate_v8_to_v9(conn: &rusqlite::Connection) -> anyhow::Result<()> {
-    tracing::info!("[schema] Migrating v8 -> v9: adding edges.confidence (resolution confidence tier)");
+    tracing::info!(
+        "[schema] Migrating v8 -> v9: adding edges.confidence (resolution confidence tier)"
+    );
     // The `edges` table may not exist yet when migrating a contentless older DB
     // (migrations run BEFORE create_tables_sql, which then creates `edges` WITH
     // the column). Only ALTER an existing `edges` table that lacks the column —
@@ -325,7 +350,7 @@ pub fn migrate_v8_to_v9(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     )? > 0;
     if edges_exists && !column_exists(conn, "edges", "confidence") {
         conn.execute_batch(
-            "ALTER TABLE edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'extracted'"
+            "ALTER TABLE edges ADD COLUMN confidence TEXT NOT NULL DEFAULT 'extracted'",
         )?;
     }
     tracing::info!("[schema] Migration v8->v9 complete.");
@@ -347,7 +372,12 @@ pub fn migrate_v9_to_v10(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         |r| r.get::<_, i64>(0),
     )? > 0;
     if table_exists {
-        add_column_if_not_exists(conn, "pending_unresolved_calls", "attempts", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_not_exists(
+            conn,
+            "pending_unresolved_calls",
+            "attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
     }
     tracing::info!("[schema] Migration v9->v10 complete.");
     Ok(())

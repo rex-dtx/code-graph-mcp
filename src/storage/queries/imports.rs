@@ -19,7 +19,10 @@ pub fn get_import_tree(
 ) -> Result<Vec<FileDependency>> {
     use crate::domain::{REL_CALLS, REL_IMPORTS};
     if !matches!(direction, "outgoing" | "incoming" | "both") {
-        anyhow::bail!("invalid direction '{}': expected outgoing, incoming, or both", direction);
+        anyhow::bail!(
+            "invalid direction '{}': expected outgoing, incoming, or both",
+            direction
+        );
     }
     let max_depth = max_depth.clamp(1, 10);
     let mut results = Vec::new();
@@ -106,7 +109,7 @@ pub fn get_import_tree(
             FROM dep_tree dt
             WHERE dt.depth > 0
             GROUP BY dt.file_path
-            ORDER BY min_depth, cnt DESC"
+            ORDER BY min_depth, cnt DESC",
         )?;
         let rows = stmt.query_map(
             rusqlite::params![REL_IMPORTS, file_path, REL_CALLS, max_depth],
@@ -153,11 +156,17 @@ pub fn get_reverse_dependents(
     use crate::domain::{REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS, REL_REFERENCES};
     let max_depth = max_depth.clamp(1, 10);
     // Relation IN-list built from trusted constants (no user input → no injection).
-    let in_list = [REL_IMPORTS, REL_CALLS, REL_REFERENCES, REL_IMPLEMENTS, REL_INHERITS]
-        .iter()
-        .map(|r| format!("'{r}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let in_list = [
+        REL_IMPORTS,
+        REL_CALLS,
+        REL_REFERENCES,
+        REL_IMPLEMENTS,
+        REL_INHERITS,
+    ]
+    .iter()
+    .map(|r| format!("'{r}'"))
+    .collect::<Vec<_>>()
+    .join(", ");
     let sql = format!(
         "WITH RECURSIVE dep_tree(file_id, file_path, depth, visited_ids) AS (
             SELECT f0.id, f0.path, 0, CAST(f0.id AS TEXT)
@@ -224,8 +233,8 @@ pub fn all_file_import_edges(conn: &Connection) -> Result<Vec<(String, String)>>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::helpers::test_db;
+    use super::*;
 
     #[test]
     fn test_get_import_tree() {
@@ -241,13 +250,24 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', 'funcB1', 'funcB1', 1, 10, 'fn funcB1()')", []).unwrap();
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'function', 'funcB2', 'funcB2', 11, 20, 'fn funcB2()')", []).unwrap();
         // funcA1 imports funcB1, funcA2 calls funcB2 — 2 cross-file edges
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (1, 3, 'imports')", []).unwrap();
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (2, 4, 'calls')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (1, 3, 'imports')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (2, 4, 'calls')",
+            [],
+        )
+        .unwrap();
 
         let tree = get_import_tree(conn, "src/a.ts", "outgoing", 2).unwrap();
         assert!(!tree.is_empty());
         let b_dep = tree.iter().find(|d| d.file_path == "src/b.ts").unwrap();
-        assert_eq!(b_dep.symbol_count, 2, "symbol_count should reflect actual cross-file edges");
+        assert_eq!(
+            b_dep.symbol_count, 2,
+            "symbol_count should reflect actual cross-file edges"
+        );
         assert_eq!(b_dep.depth, 1);
 
         // Incoming: from B's perspective, A depends on it with 2 symbols
@@ -277,16 +297,24 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (1,'function','a',1,2,'')", []).unwrap();
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (2,'function','b',1,2,'')", []).unwrap();
         // a (file 1) references b (file 2) via a 'references' edge — NOT imports/calls.
-        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'references')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'references')",
+            [],
+        )
+        .unwrap();
 
         // get_import_tree walks only imports∪calls → must MISS the references-only dep.
         let imp = get_import_tree(conn, "b.ts", "incoming", 5).unwrap();
-        assert!(imp.iter().all(|d| d.file_path != "a.ts"),
-            "import_tree (imports∪calls) should not see a references-only dependent");
+        assert!(
+            imp.iter().all(|d| d.file_path != "a.ts"),
+            "import_tree (imports∪calls) should not see a references-only dependent"
+        );
         // get_reverse_dependents walks all dependency relations → must INCLUDE a.ts.
         let rev = get_reverse_dependents(conn, "b.ts", 5).unwrap();
-        assert!(rev.iter().any(|(p, _)| p == "a.ts"),
-            "reverse_dependents must include the references dependent; got {rev:?}");
+        assert!(
+            rev.iter().any(|(p, _)| p == "a.ts"),
+            "reverse_dependents must include the references dependent; got {rev:?}"
+        );
     }
 
     #[test]
@@ -298,10 +326,22 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (1,'function','fa',1,2,'')", []).unwrap();
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (2,'function','fb',1,2,'')", []).unwrap();
         // a imports b AND b imports a → a file-level cycle.
-        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'imports')", []).unwrap();
-        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (2,1,'imports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'imports')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id,target_id,relation) VALUES (2,1,'imports')",
+            [],
+        )
+        .unwrap();
         // A 'calls' edge must NOT appear — cycles are imports-only (call cycles = recursion).
-        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'calls')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'calls')",
+            [],
+        )
+        .unwrap();
 
         let mut edges = all_file_import_edges(conn).unwrap();
         edges.sort();
@@ -326,10 +366,21 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (1,'function','f2',3,4,'')", []).unwrap();
         conn.execute("INSERT INTO nodes (file_id,type,name,start_line,end_line,code_content) VALUES (2,'function','ext',1,2,'')", []).unwrap();
         // Intra-file import (same file) and an import of the <external> bucket — both excluded.
-        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'imports')", []).unwrap();
-        conn.execute("INSERT INTO edges (source_id,target_id,relation) VALUES (1,3,'imports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id,target_id,relation) VALUES (1,2,'imports')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id,target_id,relation) VALUES (1,3,'imports')",
+            [],
+        )
+        .unwrap();
 
         let edges = all_file_import_edges(conn).unwrap();
-        assert!(edges.is_empty(), "self-file and <external> imports must be excluded; got {edges:?}");
+        assert!(
+            edges.is_empty(),
+            "self-file and <external> imports must be excluded; got {edges:?}"
+        );
     }
 }

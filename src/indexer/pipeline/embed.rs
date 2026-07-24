@@ -21,7 +21,11 @@ use crate::storage::queries::insert_node_vectors_batch;
 /// stays `WHERE node_vectors IS NULL` and, being ordered first by caller-count, would be
 /// re-fetched at the head of every batch and starve the embeddable nodes behind it.
 /// Indexing callers ignore the return.
-pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_updates: &[(i64, String)]) -> Result<Vec<i64>> {
+pub fn embed_and_store_batch(
+    db: &Database,
+    model: &EmbeddingModel,
+    context_updates: &[(i64, String)],
+) -> Result<Vec<i64>> {
     if context_updates.is_empty() {
         return Ok(Vec::new());
     }
@@ -65,8 +69,11 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
     }
     if to_embed.is_empty() {
         if reused > 0 {
-            tracing::info!("[embed] {} nodes reused from cache in {:.1}s",
-                reused, t0.elapsed().as_secs_f64());
+            tracing::info!(
+                "[embed] {} nodes reused from cache in {:.1}s",
+                reused,
+                t0.elapsed().as_secs_f64()
+            );
         }
         return Ok(embedded_ids);
     }
@@ -76,8 +83,10 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
     // Index context by node_id so both store paths can key content-hash cache entries. Every
     // freshly-computed embedding is also written to embedding_cache, so a later full rebuild
     // reuses it by content instead of re-running the model.
-    let ctx_by_id: std::collections::HashMap<i64, &str> =
-        to_embed.iter().map(|(id, ctx)| (*id, ctx.as_str())).collect();
+    let ctx_by_id: std::collections::HashMap<i64, &str> = to_embed
+        .iter()
+        .map(|(id, ctx)| (*id, ctx.as_str()))
+        .collect();
     let cache_entries_for = |vectors: &[(i64, Vec<f32>)]| -> Vec<([u8; 32], Vec<f32>)> {
         vectors
             .iter()
@@ -104,7 +113,9 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
                     }
                 }
             }
-            let vectors: Vec<(i64, Vec<f32>)> = ids.iter().zip(embs)
+            let vectors: Vec<(i64, Vec<f32>)> = ids
+                .iter()
+                .zip(embs)
                 .filter_map(|(&id, emb)| emb.map(|e| (id, e)))
                 .collect();
             if !vectors.is_empty() {
@@ -115,8 +126,12 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
                 tx.commit()?;
             }
             embedded_ids.extend(vectors.iter().map(|(id, _)| *id));
-            tracing::info!("[embed] {} embedded + {} reused (sequential fallback) in {:.1}s",
-                vectors.len(), reused, t0.elapsed().as_secs_f64());
+            tracing::info!(
+                "[embed] {} embedded + {} reused (sequential fallback) in {:.1}s",
+                vectors.len(),
+                reused,
+                t0.elapsed().as_secs_f64()
+            );
             return Ok(embedded_ids);
         }
     };
@@ -133,8 +148,10 @@ pub fn embed_and_store_batch(db: &Database, model: &EmbeddingModel, context_upda
     }
     embedded_ids.extend(vectors.iter().map(|(id, _)| *id));
 
-    tracing::info!("[embed] {} embedded + {} reused in {:.1}s (embed {:.1}s)",
-        vectors.len(), reused,
+    tracing::info!(
+        "[embed] {} embedded + {} reused in {:.1}s (embed {:.1}s)",
+        vectors.len(),
+        reused,
         t0.elapsed().as_secs_f64(),
         t_embed.as_secs_f64(),
     );

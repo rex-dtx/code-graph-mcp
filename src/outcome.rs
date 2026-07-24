@@ -9,7 +9,8 @@ pub const RANKED_TOOLS: &[&str] = &["semantic_code_search", "ast_search", "searc
 /// on the trailing `__<tool>` segment, not the full prefix.
 pub fn cg_pull_tool(name: &str) -> Option<String> {
     let base = name.rsplit("__").next().unwrap_or(name);
-    if name.starts_with("mcp__") && name.contains("code-graph")
+    if name.starts_with("mcp__")
+        && name.contains("code-graph")
         && crate::domain::LIVE_MCP_TOOLS.contains(&base)
     {
         Some(base.to_string())
@@ -27,7 +28,10 @@ pub fn is_ranked_tool(base: &str) -> bool {
 /// existing hyphens are preserved). Verified against the real `~/.claude/projects/`
 /// directory names (`/mnt/data_ssd/...` → `-mnt-data-ssd-...`).
 pub fn project_slug(abs_path: &str) -> String {
-    abs_path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+    abs_path
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 pub fn transcript_dir(target: &Path, home: &Path) -> PathBuf {
@@ -39,12 +43,23 @@ pub fn transcript_dir(target: &Path, home: &Path) -> PathBuf {
 /// repo-relative, from a cg result), compared by trailing path components. The
 /// returned path carries directory context so basename collisions are unlikely.
 pub fn paths_match(returned: &str, touched: &str) -> bool {
-    let split = |s: &str| s.trim_start_matches('/').split('/').filter(|p| !p.is_empty())
-        .map(|p| p.to_string()).collect::<Vec<_>>();
+    let split = |s: &str| {
+        s.trim_start_matches('/')
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+    };
     let r = split(returned);
     let t = split(touched);
-    if r.is_empty() || t.is_empty() { return false; }
-    let (long, short) = if t.len() >= r.len() { (&t, &r) } else { (&r, &t) };
+    if r.is_empty() || t.is_empty() {
+        return false;
+    }
+    let (long, short) = if t.len() >= r.len() {
+        (&t, &r)
+    } else {
+        (&r, &t)
+    };
     long[long.len() - short.len()..] == short[..]
 }
 
@@ -66,12 +81,20 @@ pub fn extract_returned(payload: &serde_json::Value, ranked: bool) -> Vec<Return
         // `results` array: ast_search always (`{results,count}`); semantic_code_search
         // when FTS-only (`{results,search_mode}`) or compressed (`{mode,results}`).
         // Unwrap `results` so the rank (array index) is not silently dropped to None.
-        let arr = payload.as_array()
+        let arr = payload
+            .as_array()
             .or_else(|| payload.get("results").and_then(|r| r.as_array()));
         if let Some(arr) = arr {
-            return arr.iter().enumerate().filter_map(|(i, el)| {
-                file_path_field(el).map(|fp| ReturnedItem { file_path: fp, rank: Some(i) })
-            }).collect();
+            return arr
+                .iter()
+                .enumerate()
+                .filter_map(|(i, el)| {
+                    file_path_field(el).map(|fp| ReturnedItem {
+                        file_path: fp,
+                        rank: Some(i),
+                    })
+                })
+                .collect();
         }
     }
     let mut out = Vec::new();
@@ -83,7 +106,9 @@ pub fn extract_returned(payload: &serde_json::Value, ranked: bool) -> Vec<Return
 fn file_path_field(v: &serde_json::Value) -> Option<String> {
     for key in ["file_path", "file", "path"] {
         if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-            if !s.is_empty() { return Some(s.to_string()); }
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
         }
     }
     None
@@ -93,12 +118,19 @@ fn collect_file_paths(v: &serde_json::Value, out: &mut Vec<ReturnedItem>) {
     match v {
         serde_json::Value::Object(map) => {
             if let Some(fp) = file_path_field(v) {
-                out.push(ReturnedItem { file_path: fp, rank: None });
+                out.push(ReturnedItem {
+                    file_path: fp,
+                    rank: None,
+                });
             }
-            for (_, val) in map { collect_file_paths(val, out); }
+            for (_, val) in map {
+                collect_file_paths(val, out);
+            }
         }
         serde_json::Value::Array(arr) => {
-            for el in arr { collect_file_paths(el, out); }
+            for el in arr {
+                collect_file_paths(el, out);
+            }
         }
         _ => {}
     }
@@ -118,7 +150,8 @@ fn scan_path_line_paths(text: &str) -> Vec<String> {
                 let mut start = i;
                 while start > 0 {
                     let c = b[start - 1];
-                    if c == b'/' || c == b'.' || c == b'-' || c == b'_' || c.is_ascii_alphanumeric() {
+                    if c == b'/' || c == b'.' || c == b'-' || c == b'_' || c.is_ascii_alphanumeric()
+                    {
                         start -= 1;
                     } else {
                         break;
@@ -145,11 +178,11 @@ fn scan_paren_paths(text: &str) -> Vec<String> {
         let mut rest = line;
         while let Some(open) = rest.find('(') {
             let after = &rest[open + 1..];
-            let Some(close) = after.find(')') else { break; };
+            let Some(close) = after.find(')') else {
+                break;
+            };
             let token = &after[..close];
-            if !token.is_empty()
-                && token.contains('/')
-                && !token.chars().any(|c| c.is_whitespace())
+            if !token.is_empty() && token.contains('/') && !token.chars().any(|c| c.is_whitespace())
             {
                 out.push(token.to_string());
             }
@@ -179,7 +212,10 @@ pub fn extract_returned_from_cli(stdout: &str, ranked: bool) -> Vec<ReturnedItem
     for path in paths {
         if seen.insert(path.clone()) {
             let rank = if ranked { Some(out.len()) } else { None };
-            out.push(ReturnedItem { file_path: path, rank });
+            out.push(ReturnedItem {
+                file_path: path,
+                rank,
+            });
         }
     }
     out
@@ -191,8 +227,15 @@ pub enum Event {
     /// tool_use blocks batched in one assistant message share it, so the scorer
     /// can tell batch-mates (shared forward window) from sequential calls
     /// (window ends at the next call).
-    CgCall { tool: String, query: String, returned: Vec<ReturnedItem>, turn: usize },
-    FileTouch { path: String },
+    CgCall {
+        tool: String,
+        query: String,
+        returned: Vec<ReturnedItem>,
+        turn: usize,
+    },
+    FileTouch {
+        path: String,
+    },
     RawGrep,
     Other,
 }
@@ -209,7 +252,9 @@ pub struct ParsedTranscript {
 /// Pull the inner text payload out of a tool_result's `content` (array of
 /// {type:text,text} blocks, or a bare string).
 fn tool_result_text(content: &serde_json::Value) -> Option<String> {
-    if let Some(s) = content.as_str() { return Some(s.to_string()); }
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
     if let Some(arr) = content.as_array() {
         for block in arr {
             if let Some(t) = block.get("text").and_then(|x| x.as_str()) {
@@ -262,12 +307,17 @@ fn cli_call_in_line(line: &str) -> Option<(&'static str, String)> {
         let prev_is_separator = i > 0 && {
             let p = toks[i - 1].as_str();
             matches!(p, "&&" | "||" | "|" | ";" | "&")
-                || p.ends_with(';') || p.ends_with('&') || p.ends_with('|')
+                || p.ends_with(';')
+                || p.ends_with('&')
+                || p.ends_with('|')
         };
         if i != 0 && !prev_is_separator {
             continue;
         }
-        if let Some(canon) = toks.get(i + 1).and_then(|s| crate::cli::canonical_query_cmd(s)) {
+        if let Some(canon) = toks
+            .get(i + 1)
+            .and_then(|s| crate::cli::canonical_query_cmd(s))
+        {
             let query = toks[i + 2..]
                 .iter()
                 .find(|a| !a.starts_with('-'))
@@ -293,17 +343,27 @@ fn shell_tokens(s: &str) -> Vec<String> {
             '"' | '\'' => {
                 has = true;
                 for n in chars.by_ref() {
-                    if n == c { break; }
+                    if n == c {
+                        break;
+                    }
                     cur.push(n);
                 }
             }
             c if c.is_whitespace() => {
-                if has { toks.push(std::mem::take(&mut cur)); has = false; }
+                if has {
+                    toks.push(std::mem::take(&mut cur));
+                    has = false;
+                }
             }
-            c => { has = true; cur.push(c); }
+            c => {
+                has = true;
+                cur.push(c);
+            }
         }
     }
-    if has { toks.push(cur); }
+    if has {
+        toks.push(cur);
+    }
     toks
 }
 
@@ -312,8 +372,12 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
     // Pass 1: tool_use_id -> result payload text.
     let mut results: HashMap<String, String> = HashMap::new();
     for line in content.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue; };
-        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else { continue; };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+            continue;
+        };
         for b in blocks {
             if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
                 if let (Some(id), Some(text)) = (
@@ -328,14 +392,22 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
     // Pass 2: build events in order from tool_use blocks.
     let mut out = ParsedTranscript::default();
     for (turn, line) in content.lines().enumerate() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue; };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
         if let Some(ts) = v.get("timestamp").and_then(|x| x.as_str()) {
-            if out.first_ts.is_none() { out.first_ts = Some(ts.to_string()); }
+            if out.first_ts.is_none() {
+                out.first_ts = Some(ts.to_string());
+            }
             out.last_ts = Some(ts.to_string());
         }
-        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else { continue; };
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+            continue;
+        };
         for b in blocks {
-            if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") { continue; }
+            if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
             let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("");
             let id = b.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let input = b.get("input").cloned().unwrap_or(serde_json::Value::Null);
@@ -344,18 +416,29 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
                     None => out.unresolved += 1,
                     Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
                         Ok(payload) => {
-                            let query = input.get("query").or_else(|| input.get("symbol"))
+                            let query = input
+                                .get("query")
+                                .or_else(|| input.get("symbol"))
                                 .or_else(|| input.get("name"))
-                                .and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let returned = extract_returned(&payload, is_ranked_tool(&tool));
-                            out.events.push(Event::CgCall { tool, query, returned, turn });
+                            out.events.push(Event::CgCall {
+                                tool,
+                                query,
+                                returned,
+                                turn,
+                            });
                         }
                         Err(_) => out.unparseable += 1,
                     },
                 }
             } else if name == "Read" || name == "Edit" || name == "Write" {
                 if let Some(fp) = input.get("file_path").and_then(|x| x.as_str()) {
-                    out.events.push(Event::FileTouch { path: fp.to_string() });
+                    out.events.push(Event::FileTouch {
+                        path: fp.to_string(),
+                    });
                 }
             } else if name == "Bash" {
                 let cmd = input.get("command").and_then(|x| x.as_str()).unwrap_or("");
@@ -366,7 +449,12 @@ pub fn parse_transcript(content: &str) -> ParsedTranscript {
                         None => out.unresolved += 1,
                         Some(stdout) => {
                             let returned = extract_returned_from_cli(stdout, ranked);
-                            out.events.push(Event::CgCall { tool, query, returned, turn });
+                            out.events.push(Event::CgCall {
+                                tool,
+                                query,
+                                returned,
+                                turn,
+                            });
                         }
                     }
                 } else if cmd.contains("grep ") || cmd.contains("rg ") {
@@ -405,10 +493,18 @@ pub fn score_session(events: &[Event]) -> Vec<CallOutcome> {
     let mut out = Vec::new();
     for (i, ev) in events.iter().enumerate() {
         match ev {
-            Event::FileTouch { path } => { touched_before.insert(path.clone()); }
-            Event::CgCall { tool, query, returned, turn } => {
+            Event::FileTouch { path } => {
+                touched_before.insert(path.clone());
+            }
+            Event::CgCall {
+                tool,
+                query,
+                returned,
+                turn,
+            } => {
                 // Candidate returned files not already opened before this call.
-                let candidates: Vec<&ReturnedItem> = returned.iter()
+                let candidates: Vec<&ReturnedItem> = returned
+                    .iter()
                     .filter(|it| !touched_before.iter().any(|t| paths_match(&it.file_path, t)))
                     .collect();
                 // Forward scan until the next CgCall. Track the lowest-rank matched
@@ -537,7 +633,9 @@ pub fn aggregate(
         if c.ranked {
             s.ranked_calls += 1;
             let rr = if c.adopted {
-                c.adopted_rank.map(|r| 1.0 / (r as f64 + 1.0)).unwrap_or(0.0)
+                c.adopted_rank
+                    .map(|r| 1.0 / (r as f64 + 1.0))
+                    .unwrap_or(0.0)
             } else {
                 0.0
             };
@@ -548,9 +646,21 @@ pub fn aggregate(
             }
         }
     }
-    s.adoption_rate = if s.cg_calls > 0 { s.adopted as f64 / s.cg_calls as f64 } else { 0.0 };
-    s.field_mrr_adopted = if s.ranked_adopted > 0 { rr_adopted_sum / s.ranked_adopted as f64 } else { 0.0 };
-    s.field_mrr_all = if s.ranked_calls > 0 { rr_all_sum / s.ranked_calls as f64 } else { 0.0 };
+    s.adoption_rate = if s.cg_calls > 0 {
+        s.adopted as f64 / s.cg_calls as f64
+    } else {
+        0.0
+    };
+    s.field_mrr_adopted = if s.ranked_adopted > 0 {
+        rr_adopted_sum / s.ranked_adopted as f64
+    } else {
+        0.0
+    };
+    s.field_mrr_all = if s.ranked_calls > 0 {
+        rr_all_sum / s.ranked_calls as f64
+    } else {
+        0.0
+    };
     s.low_confidence = s.cg_calls < MIN_N;
     s.field_mrr_low_confidence = s.ranked_calls < MIN_N;
     s
@@ -563,8 +673,10 @@ use clap::Parser;
 use std::time::{Duration, SystemTime};
 
 #[derive(Parser, Debug)]
-#[command(name = "code-graph-mcp outcome",
-          about = "Measure whether code-graph retrieval results get adopted by the model (read-only; reads session transcripts)")]
+#[command(
+    name = "code-graph-mcp outcome",
+    about = "Measure whether code-graph retrieval results get adopted by the model (read-only; reads session transcripts)"
+)]
 pub struct OutcomeArgs {
     /// Project whose transcripts to read (absolute path; default: resolved project root)
     #[arg(long)]
@@ -581,7 +693,10 @@ pub struct OutcomeArgs {
 }
 
 /// Read every transcript in `dir`, score each session, aggregate. Pure-ish (only fs reads).
-pub fn run_outcome(dir: &std::path::Path, since_days: Option<u64>) -> (OutcomeSummary, Vec<CallOutcome>) {
+pub fn run_outcome(
+    dir: &std::path::Path,
+    since_days: Option<u64>,
+) -> (OutcomeSummary, Vec<CallOutcome>) {
     let cutoff = since_days.map(|d| SystemTime::now() - Duration::from_secs(d * 86_400));
     let mut all_calls = Vec::new();
     let mut transcripts = 0usize;
@@ -592,26 +707,42 @@ pub fn run_outcome(dir: &std::path::Path, since_days: Option<u64>) -> (OutcomeSu
     let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
     for entry in entries {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
         if let Some(cut) = cutoff {
             if let Ok(meta) = entry.metadata() {
-                if meta.modified().map(|m| m < cut).unwrap_or(false) { continue; }
+                if meta.modified().map(|m| m < cut).unwrap_or(false) {
+                    continue;
+                }
             }
         }
-        let Ok(content) = std::fs::read_to_string(&path) else { continue; };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let parsed = parse_transcript(&content);
         unresolved += parsed.unresolved;
         unparseable += parsed.unparseable;
         if let Some(ft) = &parsed.first_ts {
-            if first_ts.as_ref().is_none_or(|c| ft < c) { first_ts = Some(ft.clone()); }
+            if first_ts.as_ref().is_none_or(|c| ft < c) {
+                first_ts = Some(ft.clone());
+            }
         }
         if let Some(lt) = &parsed.last_ts {
-            if last_ts.as_ref().is_none_or(|c| lt > c) { last_ts = Some(lt.clone()); }
+            if last_ts.as_ref().is_none_or(|c| lt > c) {
+                last_ts = Some(lt.clone());
+            }
         }
         all_calls.extend(score_session(&parsed.events));
         transcripts += 1;
     }
-    let mut summary = aggregate(&all_calls, transcripts, transcripts, unresolved, unparseable);
+    let mut summary = aggregate(
+        &all_calls,
+        transcripts,
+        transcripts,
+        unresolved,
+        unparseable,
+    );
     summary.first_ts = first_ts;
     summary.last_ts = last_ts;
     summary.since_days = since_days;
@@ -619,8 +750,9 @@ pub fn run_outcome(dir: &std::path::Path, since_days: Option<u64>) -> (OutcomeSu
 }
 
 pub fn cmd_outcome(project_root: &std::path::Path, args: OutcomeArgs) -> Result<()> {
-    let home = crate::cli::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory ($HOME / $USERPROFILE not set)"))?;
+    let home = crate::cli::home_dir().ok_or_else(|| {
+        anyhow::anyhow!("Cannot determine home directory ($HOME / $USERPROFILE not set)")
+    })?;
     let target = match &args.project {
         Some(p) => std::path::PathBuf::from(p),
         None => project_root.to_path_buf(),
@@ -628,9 +760,16 @@ pub fn cmd_outcome(project_root: &std::path::Path, args: OutcomeArgs) -> Result<
     let dir = transcript_dir(&target, &home);
     if !dir.is_dir() {
         if args.json {
-            println!("{}", serde_json::json!({"outcome": {"state": "absent", "dir": dir.display().to_string()}}));
+            println!(
+                "{}",
+                serde_json::json!({"outcome": {"state": "absent", "dir": dir.display().to_string()}})
+            );
         } else {
-            eprintln!("No transcripts for {} at {}", target.display(), dir.display());
+            eprintln!(
+                "No transcripts for {} at {}",
+                target.display(),
+                dir.display()
+            );
         }
         return Ok(());
     }
@@ -638,7 +777,11 @@ pub fn cmd_outcome(project_root: &std::path::Path, args: OutcomeArgs) -> Result<
     if let Some(path) = &args.emit_labels {
         emit_labels(&calls, path)?;
     }
-    if args.json { render_json(&s, &target); } else { render_human(&s, &target); }
+    if args.json {
+        render_json(&s, &target);
+    } else {
+        render_human(&s, &target);
+    }
     Ok(())
 }
 
@@ -647,7 +790,10 @@ pub fn cmd_outcome(project_root: &std::path::Path, args: OutcomeArgs) -> Result<
 /// but every call is emitted so non-adoption is visible too.
 pub fn emit_labels(calls: &[CallOutcome], path: &str) -> Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     for c in calls {
         let row = serde_json::json!({
             "tool": c.tool,
@@ -663,58 +809,103 @@ pub fn emit_labels(calls: &[CallOutcome], path: &str) -> Result<()> {
 }
 
 fn render_human(s: &OutcomeSummary, target: &std::path::Path) {
-    println!("Outcome (retrieval adoption)  \u{2014}  project: {}", target.display());
-    println!("Transcripts: {}   resolved cg calls: {}   (unresolved {}, unparseable {})",
-             s.transcripts, s.cg_calls, s.unresolved, s.unparseable);
+    println!(
+        "Outcome (retrieval adoption)  \u{2014}  project: {}",
+        target.display()
+    );
+    println!(
+        "Transcripts: {}   resolved cg calls: {}   (unresolved {}, unparseable {})",
+        s.transcripts, s.cg_calls, s.unresolved, s.unparseable
+    );
     if let (Some(f), Some(l)) = (&s.first_ts, &s.last_ts) {
-        let since = s.since_days.map(|d| format!("   (--since {d}d)")).unwrap_or_default();
+        let since = s
+            .since_days
+            .map(|d| format!("   (--since {d}d)"))
+            .unwrap_or_default();
         println!("Window: {f}  \u{2192}  {l}{since}");
     }
     if s.low_confidence {
-        println!("LOW CONFIDENCE: N={} (< {}) \u{2014} too small to conclude", s.cg_calls, MIN_N);
+        println!(
+            "LOW CONFIDENCE: N={} (< {}) \u{2014} too small to conclude",
+            s.cg_calls, MIN_N
+        );
     }
-    println!("Adoption: {}/{} = {:.0}%", s.adopted, s.cg_calls, s.adoption_rate * 100.0);
+    println!(
+        "Adoption: {}/{} = {:.0}%",
+        s.adopted,
+        s.cg_calls,
+        s.adoption_rate * 100.0
+    );
     let mrr_caveat = if s.field_mrr_low_confidence {
-        format!("   [LOW CONFIDENCE: ranked N={} < {}]", s.ranked_calls, MIN_N)
+        format!(
+            "   [LOW CONFIDENCE: ranked N={} < {}]",
+            s.ranked_calls, MIN_N
+        )
     } else {
         String::new()
     };
-    println!("field-MRR (ranked tools, {}/{} ranked adopted)  adopted: {:.2}   all: {:.2}{}",
-             s.ranked_adopted, s.ranked_calls, s.field_mrr_adopted, s.field_mrr_all, mrr_caveat);
-    let hist: Vec<String> = s.rank_histogram.iter().map(|(r, n)| format!("r{r}={n}")).collect();
-    println!("Adopted-rank histogram: {}", if hist.is_empty() { "-".into() } else { hist.join("  ") });
-    let dist: Vec<String> = s.adoption_distance_histogram.iter().map(|(d, n)| format!("d{d}={n}")).collect();
-    println!("Adoption-distance histogram (Nth file-touch after call): {}",
-             if dist.is_empty() { "-".into() } else { dist.join("  ") });
+    println!(
+        "field-MRR (ranked tools, {}/{} ranked adopted)  adopted: {:.2}   all: {:.2}{}",
+        s.ranked_adopted, s.ranked_calls, s.field_mrr_adopted, s.field_mrr_all, mrr_caveat
+    );
+    let hist: Vec<String> = s
+        .rank_histogram
+        .iter()
+        .map(|(r, n)| format!("r{r}={n}"))
+        .collect();
+    println!(
+        "Adopted-rank histogram: {}",
+        if hist.is_empty() {
+            "-".into()
+        } else {
+            hist.join("  ")
+        }
+    );
+    let dist: Vec<String> = s
+        .adoption_distance_histogram
+        .iter()
+        .map(|(d, n)| format!("d{d}={n}"))
+        .collect();
+    println!(
+        "Adoption-distance histogram (Nth file-touch after call): {}",
+        if dist.is_empty() {
+            "-".into()
+        } else {
+            dist.join("  ")
+        }
+    );
     for (tool, (calls, adopted)) in &s.by_tool {
         println!("  {:<24} {}/{}", tool, adopted, calls);
     }
 }
 
 fn render_json(s: &OutcomeSummary, target: &std::path::Path) {
-    println!("{}", serde_json::json!({"outcome": {
-        "state": "live",
-        "project": target.display().to_string(),
-        "transcripts": s.transcripts,
-        "n_sessions": s.sessions,
-        "since_days": s.since_days,
-        "first_ts": s.first_ts,
-        "last_ts": s.last_ts,
-        "cg_calls": s.cg_calls,
-        "unresolved": s.unresolved,
-        "unparseable": s.unparseable,
-        "adopted": s.adopted,
-        "adoption_rate": (s.adoption_rate * 100.0).round() / 100.0,
-        "ranked_calls": s.ranked_calls,
-        "ranked_adopted": s.ranked_adopted,
-        "field_mrr_adopted": (s.field_mrr_adopted * 1000.0).round() / 1000.0,
-        "field_mrr_all": (s.field_mrr_all * 1000.0).round() / 1000.0,
-        "field_mrr_low_confidence": s.field_mrr_low_confidence,
-        "rank_histogram": s.rank_histogram.iter().map(|(k,v)| (k.to_string(), *v)).collect::<std::collections::BTreeMap<_,_>>(),
-        "adoption_distance_histogram": s.adoption_distance_histogram.iter().map(|(k,v)| (k.to_string(), *v)).collect::<std::collections::BTreeMap<_,_>>(),
-        "by_tool": s.by_tool.iter().map(|(k,(c,a))| (k.clone(), serde_json::json!({"calls": c, "adopted": a}))).collect::<serde_json::Map<_,_>>(),
-        "low_confidence": s.low_confidence,
-    }}));
+    println!(
+        "{}",
+        serde_json::json!({"outcome": {
+            "state": "live",
+            "project": target.display().to_string(),
+            "transcripts": s.transcripts,
+            "n_sessions": s.sessions,
+            "since_days": s.since_days,
+            "first_ts": s.first_ts,
+            "last_ts": s.last_ts,
+            "cg_calls": s.cg_calls,
+            "unresolved": s.unresolved,
+            "unparseable": s.unparseable,
+            "adopted": s.adopted,
+            "adoption_rate": (s.adoption_rate * 100.0).round() / 100.0,
+            "ranked_calls": s.ranked_calls,
+            "ranked_adopted": s.ranked_adopted,
+            "field_mrr_adopted": (s.field_mrr_adopted * 1000.0).round() / 1000.0,
+            "field_mrr_all": (s.field_mrr_all * 1000.0).round() / 1000.0,
+            "field_mrr_low_confidence": s.field_mrr_low_confidence,
+            "rank_histogram": s.rank_histogram.iter().map(|(k,v)| (k.to_string(), *v)).collect::<std::collections::BTreeMap<_,_>>(),
+            "adoption_distance_histogram": s.adoption_distance_histogram.iter().map(|(k,v)| (k.to_string(), *v)).collect::<std::collections::BTreeMap<_,_>>(),
+            "by_tool": s.by_tool.iter().map(|(k,(c,a))| (k.clone(), serde_json::json!({"calls": c, "adopted": a}))).collect::<serde_json::Map<_,_>>(),
+            "low_confidence": s.low_confidence,
+        }})
+    );
 }
 
 #[cfg(test)]
@@ -723,8 +914,14 @@ mod tests {
 
     #[test]
     fn cg_pull_tool_matches_namespaced_cg_tools() {
-        assert_eq!(cg_pull_tool("mcp__code-graph-dev__semantic_code_search").as_deref(), Some("semantic_code_search"));
-        assert_eq!(cg_pull_tool("mcp__code-graph__get_call_graph").as_deref(), Some("get_call_graph"));
+        assert_eq!(
+            cg_pull_tool("mcp__code-graph-dev__semantic_code_search").as_deref(),
+            Some("semantic_code_search")
+        );
+        assert_eq!(
+            cg_pull_tool("mcp__code-graph__get_call_graph").as_deref(),
+            Some("get_call_graph")
+        );
         assert_eq!(cg_pull_tool("Read"), None);
         assert_eq!(cg_pull_tool("mcp__other__semantic_code_search"), None);
         assert_eq!(cg_pull_tool("mcp__code-graph-dev__no_such_tool"), None);
@@ -740,18 +937,24 @@ mod tests {
     #[test]
     fn slug_replaces_non_alphanumeric_with_dash() {
         // underscore must become a dash (matches the real ~/.claude/projects/ dir name)
-        assert_eq!(project_slug("/mnt/data_ssd/dev/projects/code-graph-mcp"),
-                   "-mnt-data-ssd-dev-projects-code-graph-mcp");
-        assert_eq!(project_slug("/mnt/data_ssd/dev/projects/daagu"),
-                   "-mnt-data-ssd-dev-projects-daagu");
+        assert_eq!(
+            project_slug("/mnt/data_ssd/dev/projects/code-graph-mcp"),
+            "-mnt-data-ssd-dev-projects-code-graph-mcp"
+        );
+        assert_eq!(
+            project_slug("/mnt/data_ssd/dev/projects/daagu"),
+            "-mnt-data-ssd-dev-projects-daagu"
+        );
         // dots also become dashes; existing hyphens are preserved
         assert_eq!(project_slug("/home/sds/.claude/x"), "-home-sds--claude-x");
     }
 
     #[test]
     fn paths_match_relative_vs_absolute() {
-        assert!(paths_match("claude-plugin/scripts/session-init.js",
-                            "/home/u/proj/claude-plugin/scripts/session-init.js"));
+        assert!(paths_match(
+            "claude-plugin/scripts/session-init.js",
+            "/home/u/proj/claude-plugin/scripts/session-init.js"
+        ));
         assert!(paths_match("src/outcome.rs", "/x/src/outcome.rs"));
         assert!(!paths_match("src/outcome.rs", "/x/src/cli.rs"));
         assert!(!paths_match("", "/x/y"));
@@ -760,7 +963,10 @@ mod tests {
     #[test]
     fn transcript_dir_joins_claude_projects() {
         assert_eq!(
-            transcript_dir(std::path::Path::new("/a/b"), std::path::Path::new("/home/u")),
+            transcript_dir(
+                std::path::Path::new("/a/b"),
+                std::path::Path::new("/home/u")
+            ),
             std::path::PathBuf::from("/home/u/.claude/projects/-a-b")
         );
     }
@@ -833,7 +1039,12 @@ mod tests {
         assert_eq!(p.unresolved, 0);
         assert_eq!(p.events.len(), 2);
         match &p.events[0] {
-            Event::CgCall { tool, query, returned, .. } => {
+            Event::CgCall {
+                tool,
+                query,
+                returned,
+                ..
+            } => {
                 assert_eq!(tool, "semantic_code_search");
                 assert_eq!(query, "login flow");
                 assert_eq!(returned[0].file_path, "src/auth.rs");
@@ -876,7 +1087,13 @@ mod tests {
         Event::CgCall {
             tool: tool.into(),
             query: "q".into(),
-            returned: files.iter().map(|(f, r)| ReturnedItem { file_path: f.to_string(), rank: *r }).collect(),
+            returned: files
+                .iter()
+                .map(|(f, r)| ReturnedItem {
+                    file_path: f.to_string(),
+                    rank: *r,
+                })
+                .collect(),
             turn,
         }
     }
@@ -886,19 +1103,28 @@ mod tests {
         static NEXT_TURN: AtomicUsize = AtomicUsize::new(1000);
         cg_at(NEXT_TURN.fetch_add(1, Ordering::Relaxed), tool, files)
     }
-    fn touch(p: &str) -> Event { Event::FileTouch { path: p.into() } }
+    fn touch(p: &str) -> Event {
+        Event::FileTouch { path: p.into() }
+    }
 
     #[test]
     fn adopted_when_forward_edit_hits_returned_untouched_file() {
         let events = vec![
-            cg("semantic_code_search", &[("src/a.rs", Some(0)), ("src/b.rs", Some(1))]),
+            cg(
+                "semantic_code_search",
+                &[("src/a.rs", Some(0)), ("src/b.rs", Some(1))],
+            ),
             touch("/proj/src/b.rs"),
         ];
         let outs = score_session(&events);
         assert_eq!(outs.len(), 1);
         assert!(outs[0].adopted);
         assert_eq!(outs[0].adopted_rank, Some(1));
-        assert_eq!(outs[0].adoption_distance, Some(1), "adopted on the very next touch");
+        assert_eq!(
+            outs[0].adoption_distance,
+            Some(1),
+            "adopted on the very next touch"
+        );
     }
 
     #[test]
@@ -950,7 +1176,10 @@ mod tests {
             touch("/proj/src/a.rs"),
         ];
         let outs = score_session(&events);
-        assert!(outs[0].adopted, "first batched call returned the touched file → credit");
+        assert!(
+            outs[0].adopted,
+            "first batched call returned the touched file → credit"
+        );
         assert!(!outs[1].adopted, "second batch member returned z.rs only");
     }
 
@@ -964,7 +1193,10 @@ mod tests {
             touch("/proj/src/a.rs"), // after the turn-9 call → outside the batch window
         ];
         let outs = score_session(&events);
-        assert!(!outs[0].adopted, "touch after a later-turn call is outside the window");
+        assert!(
+            !outs[0].adopted,
+            "touch after a later-turn call is outside the window"
+        );
         assert!(!outs[1].adopted);
     }
 
@@ -977,14 +1209,21 @@ mod tests {
         let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"{\"file_path\":\"src/a.rs\"}"}]},{"type":"tool_result","tool_use_id":"tu2","content":[{"type":"text","text":"{\"file_path\":\"src/z.rs\"}"}]}]}}"#;
         let edit = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu3","name":"Edit","input":{"file_path":"/proj/src/a.rs"}}]}}"#;
         let p = parse_transcript(&format!("{call}\n{result}\n{edit}\n"));
-        let turns: Vec<usize> = p.events.iter().filter_map(|e| match e {
-            Event::CgCall { turn, .. } => Some(*turn),
-            _ => None,
-        }).collect();
+        let turns: Vec<usize> = p
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::CgCall { turn, .. } => Some(*turn),
+                _ => None,
+            })
+            .collect();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0], turns[1], "same assistant message → same turn");
         let outs = score_session(&p.events);
-        assert!(outs[0].adopted, "first batched MCP call's returned file was edited");
+        assert!(
+            outs[0].adopted,
+            "first batched MCP call's returned file was edited"
+        );
         assert!(!outs[1].adopted);
     }
 
@@ -992,17 +1231,24 @@ mod tests {
     fn best_rank_is_lowest_when_multiple_returned_items_are_touched() {
         // rank 2 and rank 0 both touched → adopted_rank should be Some(0) (the lower)
         let events = vec![
-            cg("semantic_code_search", &[
-                ("src/a.rs", Some(2)),
-                ("src/b.rs", Some(0)),
-                ("src/c.rs", Some(5)),
-            ]),
+            cg(
+                "semantic_code_search",
+                &[
+                    ("src/a.rs", Some(2)),
+                    ("src/b.rs", Some(0)),
+                    ("src/c.rs", Some(5)),
+                ],
+            ),
             touch("/proj/src/a.rs"),
             touch("/proj/src/b.rs"),
         ];
         let outs = score_session(&events);
         assert!(outs[0].adopted);
-        assert_eq!(outs[0].adopted_rank, Some(0), "lowest rank among touched items wins");
+        assert_eq!(
+            outs[0].adopted_rank,
+            Some(0),
+            "lowest rank among touched items wins"
+        );
     }
 
     #[test]
@@ -1010,11 +1256,17 @@ mod tests {
         // get_call_graph is NOT ranked — returned items have rank: None
         // touching a returned file should still mark adopted=true; adopted_rank stays None
         let events = vec![
-            cg("get_call_graph", &[("src/graph.rs", None), ("src/storage.rs", None)]),
+            cg(
+                "get_call_graph",
+                &[("src/graph.rs", None), ("src/storage.rs", None)],
+            ),
             touch("/proj/src/graph.rs"),
         ];
         let outs = score_session(&events);
-        assert!(outs[0].adopted, "structural tool file should be adopted when touched");
+        assert!(
+            outs[0].adopted,
+            "structural tool file should be adopted when touched"
+        );
         assert_eq!(outs[0].adopted_rank, None, "structural items carry no rank");
         assert!(!outs[0].ranked, "get_call_graph is not a ranked tool");
     }
@@ -1038,7 +1290,10 @@ mod tests {
         let stdout = "run_full_index (src/indexer/pipeline/mod.rs)\n  \u{2190} called by: ensure_indexed (src/mcp/server/mod.rs) [function]\n  (75 test callers hidden, use --include-tests to show)";
         let items = extract_returned_from_cli(stdout, false);
         let paths: Vec<&str> = items.iter().map(|i| i.file_path.as_str()).collect();
-        assert_eq!(paths, vec!["src/indexer/pipeline/mod.rs", "src/mcp/server/mod.rs"]);
+        assert_eq!(
+            paths,
+            vec!["src/indexer/pipeline/mod.rs", "src/mcp/server/mod.rs"]
+        );
         assert!(items.iter().all(|i| i.rank.is_none()));
     }
 
@@ -1088,7 +1343,10 @@ mod tests {
 
     #[test]
     fn cli_extract_no_paths_is_empty() {
-        assert!(extract_returned_from_cli("[code-graph] No call graph results for: foo", false).is_empty());
+        assert!(
+            extract_returned_from_cli("[code-graph] No call graph results for: foo", false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1142,22 +1400,31 @@ mod tests {
         let raw = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"g1","name":"Bash","input":{"command":"grep -rn foo src/"}}]}}"#;
         let house = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"s1","name":"Bash","input":{"command":"code-graph-mcp stats"}}]}}"#;
         let p = parse_transcript(&format!("{raw}\n{house}\n"));
-        assert!(matches!(&p.events[0], Event::RawGrep));            // raw grep unchanged
+        assert!(matches!(&p.events[0], Event::RawGrep)); // raw grep unchanged
         assert!(p.events.iter().all(|e| !matches!(e, Event::CgCall { .. }))); // stats = housekeeping, not a cg call
     }
 
     // ── aggregate / OutcomeSummary helpers ───────────────────────────────────
 
     fn co(tool: &str, ranked: bool, adopted: bool, rank: Option<usize>) -> CallOutcome {
-        CallOutcome { tool: tool.into(), query: "q".into(), returned_files: vec![], adopted, adopted_rank: rank, adopted_file: None, ranked, adoption_distance: adopted.then_some(1) }
+        CallOutcome {
+            tool: tool.into(),
+            query: "q".into(),
+            returned_files: vec![],
+            adopted,
+            adopted_rank: rank,
+            adopted_file: None,
+            ranked,
+            adoption_distance: adopted.then_some(1),
+        }
     }
 
     #[test]
     fn mrr_reported_two_ways() {
         let calls = vec![
-            co("semantic_code_search", true, true, Some(0)),  // rr = 1.0
-            co("semantic_code_search", true, true, Some(2)),  // rr = 1/3
-            co("semantic_code_search", true, false, None),    // rr = 0 for _all only
+            co("semantic_code_search", true, true, Some(0)), // rr = 1.0
+            co("semantic_code_search", true, true, Some(2)), // rr = 1/3
+            co("semantic_code_search", true, false, None),   // rr = 0 for _all only
         ];
         let s = aggregate(&calls, 1, 1, 0, 0);
         assert_eq!(s.cg_calls, 3);
@@ -1211,11 +1478,23 @@ mod tests {
     fn detect_rejects_non_head_code_graph_mcp_mentions() {
         // mid-command mentions (echo / commit message / comment) are NOT cg calls
         assert_eq!(detect_cli_cg_call("echo code-graph-mcp grep foo"), None);
-        assert_eq!(detect_cli_cg_call("git commit -m \"fix code-graph-mcp grep parsing\""), None);
+        assert_eq!(
+            detect_cli_cg_call("git commit -m \"fix code-graph-mcp grep parsing\""),
+            None
+        );
         // real invocations still detected: at head, after `&&`, and head-then-pipe
-        assert_eq!(detect_cli_cg_call("code-graph-mcp callgraph Foo"), Some("callgraph"));
-        assert_eq!(detect_cli_cg_call("cd be && code-graph-mcp search x"), Some("search"));
-        assert_eq!(detect_cli_cg_call("code-graph-mcp grep p | head"), Some("grep"));
+        assert_eq!(
+            detect_cli_cg_call("code-graph-mcp callgraph Foo"),
+            Some("callgraph")
+        );
+        assert_eq!(
+            detect_cli_cg_call("cd be && code-graph-mcp search x"),
+            Some("search")
+        );
+        assert_eq!(
+            detect_cli_cg_call("code-graph-mcp grep p | head"),
+            Some("grep")
+        );
     }
 
     #[test]
@@ -1231,9 +1510,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("labels.jsonl");
         let calls = vec![CallOutcome {
-            tool: "semantic_code_search".into(), query: "login".into(),
+            tool: "semantic_code_search".into(),
+            query: "login".into(),
             returned_files: vec!["src/a.rs".into(), "src/b.rs".into()],
-            adopted: true, adopted_rank: Some(1), adopted_file: Some("src/b.rs".into()), ranked: true,
+            adopted: true,
+            adopted_rank: Some(1),
+            adopted_file: Some("src/b.rs".into()),
+            ranked: true,
             adoption_distance: Some(1),
         }];
         emit_labels(&calls, path.to_str().unwrap()).unwrap();
@@ -1250,14 +1533,18 @@ mod tests {
         // adoption N can clear MIN_N while ranked N does not: 25 structural + 1 ranked.
         // low_confidence (adoption) must be false; field_mrr_low_confidence must be true
         // so the headline MRR isn't presented as a confident value off a single sample.
-        let mut calls: Vec<CallOutcome> =
-            (0..25).map(|_| co("get_call_graph", false, true, None)).collect();
+        let mut calls: Vec<CallOutcome> = (0..25)
+            .map(|_| co("get_call_graph", false, true, None))
+            .collect();
         calls.push(co("semantic_code_search", true, true, Some(0)));
         let s = aggregate(&calls, 1, 1, 0, 0);
         assert_eq!(s.cg_calls, 26);
         assert!(!s.low_confidence, "adoption N=26 ≥ MIN_N");
         assert_eq!(s.ranked_calls, 1);
-        assert!(s.field_mrr_low_confidence, "ranked N=1 < MIN_N → MRR untrustworthy");
+        assert!(
+            s.field_mrr_low_confidence,
+            "ranked N=1 < MIN_N → MRR untrustworthy"
+        );
     }
 
     #[test]
@@ -1271,8 +1558,14 @@ mod tests {
                 tool: "semantic_code_search".into(),
                 query: "q".into(),
                 returned: vec![
-                    ReturnedItem { file_path: "src/a.rs".into(), rank: Some(0) },
-                    ReturnedItem { file_path: "src/c.rs".into(), rank: Some(2) },
+                    ReturnedItem {
+                        file_path: "src/a.rs".into(),
+                        rank: Some(0),
+                    },
+                    ReturnedItem {
+                        file_path: "src/c.rs".into(),
+                        rank: Some(2),
+                    },
                 ],
                 turn: 0,
             },
@@ -1292,7 +1585,10 @@ mod tests {
         // Structural (unranked) adoptions previously yielded adopted_file = null because
         // it was derived from adopted_rank (always None here). Now it is the matched path.
         let events = vec![
-            cg("get_call_graph", &[("src/graph.rs", None), ("src/storage.rs", None)]),
+            cg(
+                "get_call_graph",
+                &[("src/graph.rs", None), ("src/storage.rs", None)],
+            ),
             touch("/proj/src/storage.rs"),
         ];
         let outs = score_session(&events);
@@ -1305,21 +1601,42 @@ mod tests {
     fn detect_cli_cg_call_across_newline_separated_commands() {
         // A newline is a command separator — the binary at the head of a later line must
         // be detected even though the previous token isn't a shell separator (`backend`).
-        assert_eq!(detect_cli_cg_call("cd backend\ncode-graph-mcp callgraph Foo"), Some("callgraph"));
-        assert_eq!(detect_cli_cg_call("set -e\nexport X=1\ncode-graph-mcp search \"q\""), Some("search"));
+        assert_eq!(
+            detect_cli_cg_call("cd backend\ncode-graph-mcp callgraph Foo"),
+            Some("callgraph")
+        );
+        assert_eq!(
+            detect_cli_cg_call("set -e\nexport X=1\ncode-graph-mcp search \"q\""),
+            Some("search")
+        );
         // Mid-command mentions on their own line are still rejected.
-        assert_eq!(detect_cli_cg_call("echo hi\necho code-graph-mcp grep foo"), None);
+        assert_eq!(
+            detect_cli_cg_call("echo hi\necho code-graph-mcp grep foo"),
+            None
+        );
     }
 
     #[test]
     fn cli_call_captures_query_and_skips_flags() {
         // first positional after the subcommand is the query; quotes stripped, flags skipped
-        assert_eq!(cli_call("code-graph-mcp search \"login flow\""), Some(("search", "login flow".to_string())));
-        assert_eq!(cli_call("code-graph-mcp grep -i pat src/"), Some(("grep", "pat".to_string())));
-        assert_eq!(cli_call("code-graph-mcp callgraph Foo"), Some(("callgraph", "Foo".to_string())));
+        assert_eq!(
+            cli_call("code-graph-mcp search \"login flow\""),
+            Some(("search", "login flow".to_string()))
+        );
+        assert_eq!(
+            cli_call("code-graph-mcp grep -i pat src/"),
+            Some(("grep", "pat".to_string()))
+        );
+        assert_eq!(
+            cli_call("code-graph-mcp callgraph Foo"),
+            Some(("callgraph", "Foo".to_string()))
+        );
         assert_eq!(cli_call("code-graph-mcp stats"), None); // housekeeping → not a query call
-        // a quoted span containing the binary name is one token, never a bare invocation
-        assert_eq!(cli_call("git commit -m \"tweak code-graph-mcp grep parsing\""), None);
+                                                            // a quoted span containing the binary name is one token, never a bare invocation
+        assert_eq!(
+            cli_call("git commit -m \"tweak code-graph-mcp grep parsing\""),
+            None
+        );
     }
 
     #[test]
@@ -1329,7 +1646,12 @@ mod tests {
         let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b9","content":[{"type":"text","text":"h3 a  src/auth.rs:1-2"}]}]}}"#;
         let p = parse_transcript(&format!("{call}\n{result}\n"));
         match &p.events[0] {
-            Event::CgCall { tool, query, returned, .. } => {
+            Event::CgCall {
+                tool,
+                query,
+                returned,
+                ..
+            } => {
                 assert_eq!(tool, "search_cli");
                 assert_eq!(query, "login flow");
                 assert_eq!(returned[0].rank, Some(0));

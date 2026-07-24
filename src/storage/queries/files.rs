@@ -26,12 +26,16 @@ pub fn get_index_status(conn: &Connection, is_watching: bool) -> Result<IndexSta
     // and the MCP get_index_status tool + resource. The `has_data` gates that
     // read files_count stay correct: a real index always has ≥1 real file.
     let files_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM files WHERE path != '<external>'", [], |r| r.get(0))?;
+        "SELECT COUNT(*) FROM files WHERE path != '<external>'",
+        [],
+        |r| r.get(0),
+    )?;
     let nodes_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
     let edges_count: i64 = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
-    let last_indexed_at: Option<i64> = conn.query_row(
-        "SELECT MAX(indexed_at) FROM files", [], |r| r.get(0)
-    ).ok().flatten();
+    let last_indexed_at: Option<i64> = conn
+        .query_row("SELECT MAX(indexed_at) FROM files", [], |r| r.get(0))
+        .ok()
+        .flatten();
     let schema_version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
 
     // NOTE: page_count * page_size gives the main DB file size only.
@@ -70,7 +74,12 @@ pub fn upsert_file(conn: &Connection, file: &FileRecord) -> Result<i64> {
             language = excluded.language,
             indexed_at = unixepoch()
          RETURNING id",
-        (&file.path, &file.blake3_hash, file.last_modified, &file.language),
+        (
+            &file.path,
+            &file.blake3_hash,
+            file.last_modified,
+            &file.language,
+        ),
         |row| row.get(0),
     )?;
     Ok(id)
@@ -81,9 +90,14 @@ pub fn delete_files_by_paths(conn: &Connection, paths: &[String]) -> Result<()> 
         return Ok(());
     }
     for chunk in paths.chunks(MAX_IN_PARAMS) {
-        let sql = format!("DELETE FROM files WHERE path IN ({})", make_placeholders(1, chunk.len()));
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            chunk.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let sql = format!(
+            "DELETE FROM files WHERE path IN ({})",
+            make_placeholders(1, chunk.len())
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
         conn.execute(&sql, params.as_slice())?;
     }
     Ok(())
@@ -91,10 +105,11 @@ pub fn delete_files_by_paths(conn: &Connection, paths: &[String]) -> Result<()> 
 
 pub fn get_all_file_hashes(conn: &Connection) -> Result<HashMap<String, String>> {
     let mut stmt = conn.prepare("SELECT path, blake3_hash FROM files")?;
-    let map = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?
-    .collect::<Result<HashMap<_, _>, _>>()?;
+    let map = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
     Ok(map)
 }
 
@@ -115,8 +130,8 @@ pub fn get_file_language(conn: &Connection, file_id: i64) -> Result<Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::helpers::test_db;
+    use super::*;
 
     #[test]
     fn test_upsert_file() {
@@ -142,22 +157,39 @@ mod tests {
     #[test]
     fn test_delete_files_by_paths() {
         let (db, _tmp) = test_db();
-        let f1 = FileRecord { path: "a.rs".into(), blake3_hash: "h1".into(), last_modified: 1, language: None };
-        let f2 = FileRecord { path: "b.rs".into(), blake3_hash: "h2".into(), last_modified: 1, language: None };
+        let f1 = FileRecord {
+            path: "a.rs".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: None,
+        };
+        let f2 = FileRecord {
+            path: "b.rs".into(),
+            blake3_hash: "h2".into(),
+            last_modified: 1,
+            language: None,
+        };
         upsert_file(db.conn(), &f1).unwrap();
         upsert_file(db.conn(), &f2).unwrap();
 
         delete_files_by_paths(db.conn(), &["a.rs".into()]).unwrap();
 
-        let count: i64 = db.conn()
-            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 
     #[test]
     fn test_get_all_file_hashes() {
         let (db, _tmp) = test_db();
-        let f = FileRecord { path: "x.rs".into(), blake3_hash: "h1".into(), last_modified: 1, language: None };
+        let f = FileRecord {
+            path: "x.rs".into(),
+            blake3_hash: "h1".into(),
+            last_modified: 1,
+            language: None,
+        };
         upsert_file(db.conn(), &f).unwrap();
 
         let hashes = get_all_file_hashes(db.conn()).unwrap();

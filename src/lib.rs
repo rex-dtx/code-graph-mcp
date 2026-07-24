@@ -8,7 +8,7 @@ pub mod outcome;
 pub mod parser;
 pub mod resolve;
 pub mod sandbox;
-pub mod snapshot;
 pub mod search;
+pub mod snapshot;
 pub mod storage;
 pub mod utils;

@@ -13,7 +13,8 @@ use common::{parse_tool_result, tool_call_json};
 /// `{results, vector_available, ...}` object when the embedding model is not loaded
 /// (the case in CI / `--no-default-features`). Extract the results from either shape.
 fn search_hits(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    v.as_array().cloned()
+    v.as_array()
+        .cloned()
         .or_else(|| v.get("results").and_then(|r| r.as_array()).cloned())
         .unwrap_or_default()
 }
@@ -26,16 +27,22 @@ fn test_e2e_index_and_search() {
     fs::create_dir_all(project.path().join("src/auth")).unwrap();
     fs::create_dir_all(project.path().join("src/api")).unwrap();
 
-    fs::write(project.path().join("src/auth/token.ts"), r#"
+    fs::write(
+        project.path().join("src/auth/token.ts"),
+        r#"
 import jwt from 'jsonwebtoken';
 
 export function validateToken(token: string): boolean {
     const decoded = jwt.verify(token, process.env.SECRET);
     return decoded !== null;
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project.path().join("src/api/login.ts"), r#"
+    fs::write(
+        project.path().join("src/api/login.ts"),
+        r#"
 import { validateToken } from '../auth/token';
 
 export function handleLogin(req: Request, res: Response) {
@@ -43,7 +50,9 @@ export function handleLogin(req: Request, res: Response) {
     if (!user) { res.status(401); return; }
     res.json({ userId: user.id });
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
 
@@ -52,22 +61,29 @@ export function handleLogin(req: Request, res: Response) {
     server.handle_message(init).unwrap();
 
     // Search for auth-related code
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "validateToken", "top_k": 3}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "validateToken", "top_k": 3}),
+    );
     let resp = server.handle_message(&search).unwrap();
     let results = parse_tool_result(&resp);
     let results_arr = search_hits(&results);
     assert!(!results_arr.is_empty(), "search should find results");
-    let names: Vec<&str> = results_arr.iter()
+    let names: Vec<&str> = results_arr
+        .iter()
         .filter_map(|r| r["name"].as_str())
         .collect();
     assert!(names.contains(&"validateToken"), "got names: {:?}", names);
 
     // Get call graph for handleLogin
-    let graph = tool_call_json("get_call_graph", serde_json::json!({
-        "symbol_name": "handleLogin",
-        "direction": "callees",
-        "depth": 2
-    }));
+    let graph = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "symbol_name": "handleLogin",
+            "direction": "callees",
+            "depth": 2
+        }),
+    );
     let resp = server.handle_message(&graph).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["function"], "handleLogin");
@@ -76,15 +92,24 @@ export function handleLogin(req: Request, res: Response) {
     let status = tool_call_json("get_index_status", serde_json::json!({}));
     let resp = server.handle_message(&status).unwrap();
     let result = parse_tool_result(&resp);
-    assert!(result["files_count"].as_i64().unwrap() >= 2, "should have indexed at least 2 files");
-    assert!(result["nodes_count"].as_i64().unwrap() >= 2, "should have at least 2 nodes");
+    assert!(
+        result["files_count"].as_i64().unwrap() >= 2,
+        "should have indexed at least 2 files"
+    );
+    assert!(
+        result["nodes_count"].as_i64().unwrap() >= 2,
+        "should have at least 2 nodes"
+    );
 
     // Get AST node
-    let ast = tool_call_json("get_ast_node", serde_json::json!({
-        "file_path": "src/auth/token.ts",
-        "symbol_name": "validateToken",
-        "include_references": true
-    }));
+    let ast = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "file_path": "src/auth/token.ts",
+            "symbol_name": "validateToken",
+            "include_references": true
+        }),
+    );
     let resp = server.handle_message(&ast).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["name"], "validateToken");
@@ -92,10 +117,13 @@ export function handleLogin(req: Request, res: Response) {
 
     // Read snippet for a node
     let node_id = result["node_id"].as_i64().unwrap();
-    let snippet = tool_call_json("read_snippet", serde_json::json!({
-        "node_id": node_id,
-        "context_lines": 2
-    }));
+    let snippet = tool_call_json(
+        "read_snippet",
+        serde_json::json!({
+            "node_id": node_id,
+            "context_lines": 2
+        }),
+    );
     let resp = server.handle_message(&snippet).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["name"], "validateToken");
@@ -116,7 +144,9 @@ export function handleLogin(req: Request, res: Response) {
 fn test_e2e_express_route_discovery() {
     let project = TempDir::new().unwrap();
 
-    fs::write(project.path().join("server.ts"), r#"
+    fs::write(
+        project.path().join("server.ts"),
+        r#"
 function handleLogin(req: Request, res: Response) {
     res.json({ ok: true });
 }
@@ -127,7 +157,9 @@ function getUsers(req: Request, res: Response) {
 
 app.post('/api/login', handleLogin);
 app.get('/api/users', getUsers);
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
 
@@ -136,9 +168,12 @@ app.get('/api/users', getUsers);
     server.handle_message(init).unwrap();
 
     // Find route
-    let route = tool_call_json("find_http_route", serde_json::json!({
-        "route_path": "/api/login"
-    }));
+    let route = tool_call_json(
+        "find_http_route",
+        serde_json::json!({
+            "route_path": "/api/login"
+        }),
+    );
     let resp = server.handle_message(&route).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["route"], "/api/login");
@@ -159,7 +194,10 @@ fn test_e2e_incremental_reindex() {
     let _ = server.handle_message(&status).unwrap();
 
     // Search for original
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "original"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "original"}),
+    );
     let resp = server.handle_message(&search).unwrap();
     let result = parse_tool_result(&resp);
     assert!(!search_hits(&result).is_empty());
@@ -172,24 +210,33 @@ fn test_e2e_incremental_reindex() {
     let _ = server.handle_message(&rebuild).unwrap();
 
     // Search again
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "modified"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "modified"}),
+    );
     let resp = server.handle_message(&search).unwrap();
     let result = parse_tool_result(&resp);
     let hits = search_hits(&result);
-    let names: Vec<&str> = hits.iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
-    assert!(names.contains(&"modified"), "should find modified function, got: {:?}", names);
+    let names: Vec<&str> = hits.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(
+        names.contains(&"modified"),
+        "should find modified function, got: {:?}",
+        names
+    );
 }
 
 #[test]
 fn test_e2e_full_protocol_lifecycle() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("app.ts"), r#"
+    fs::write(
+        project.path().join("app.ts"),
+        r#"
 function greet(name: string): string {
     return "hello " + name;
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
 
@@ -240,12 +287,20 @@ function greet(name: string): string {
         let msg = serde_json::json!({
             "jsonrpc": "2.0", "id": 5, "method": "prompts/get",
             "params": { "name": name, "arguments": { arg_name: arg_val } }
-        }).to_string();
+        })
+        .to_string();
         let resp = server.handle_message(&msg).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        let text = parsed["result"]["messages"][0]["content"]["text"].as_str().unwrap();
-        assert!(text.contains(expected_text),
-            "prompt '{}' should mention '{}', got: {}", name, expected_text, text);
+        let text = parsed["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains(expected_text),
+            "prompt '{}' should mention '{}', got: {}",
+            name,
+            expected_text,
+            text
+        );
     }
 
     // 7. resources/read
@@ -257,12 +312,18 @@ function greet(name: string): string {
     assert!(summary["schema_version"].is_number());
 
     // 8. tool call — triggers indexing
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "greet"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "greet"}),
+    );
     let resp = server.handle_message(&search).unwrap();
     let result = parse_tool_result(&resp);
     // hybrid → bare array; FTS5-only (no model in CI) → {results, vector_available}
-    assert!(result.is_array() || result.get("results").is_some(),
-        "search should return results (array or FTS5-only object), got: {}", result);
+    assert!(
+        result.is_array() || result.get("results").is_some(),
+        "search should return results (array or FTS5-only object), got: {}",
+        result
+    );
 
     // 9. ping
     let msg = r#"{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}"#;
@@ -280,7 +341,10 @@ fn test_e2e_resources_read() {
     let server = McpServer::from_project_root(project.path()).unwrap();
 
     // Trigger indexing via search
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "function"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "function"}),
+    );
     let _ = server.handle_message(&search).unwrap();
 
     // Read project summary
@@ -290,8 +354,14 @@ fn test_e2e_resources_read() {
     let text = parsed["result"]["contents"][0]["text"].as_str().unwrap();
     let summary: serde_json::Value = serde_json::from_str(text).unwrap();
 
-    assert!(summary["files"].as_i64().unwrap() >= 2, "should have at least 2 files indexed");
-    assert!(summary["nodes"].as_i64().unwrap() >= 2, "should have at least 2 nodes");
+    assert!(
+        summary["files"].as_i64().unwrap() >= 2,
+        "should have at least 2 files indexed"
+    );
+    assert!(
+        summary["nodes"].as_i64().unwrap() >= 2,
+        "should have at least 2 nodes"
+    );
     assert!(summary["schema_version"].as_i64().unwrap() >= 1);
 }
 
@@ -301,7 +371,12 @@ fn test_e2e_prompts_get_all() {
     let server = McpServer::from_project_root(project.path()).unwrap();
 
     let cases = vec![
-        ("impact-analysis", "symbol_name", "handleLogin", "get_ast_node"),
+        (
+            "impact-analysis",
+            "symbol_name",
+            "handleLogin",
+            "get_ast_node",
+        ),
         ("understand-module", "path", "src/auth/", "module_overview"),
         ("trace-request", "route", "/api/users", "trace_http_chain"),
     ];
@@ -310,17 +385,28 @@ fn test_e2e_prompts_get_all() {
         let msg = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "prompts/get",
             "params": { "name": name, "arguments": { arg_name: arg_val } }
-        }).to_string();
+        })
+        .to_string();
         let resp = server.handle_message(&msg).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let messages = parsed["result"]["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
         let text = messages[0]["content"]["text"].as_str().unwrap();
-        assert!(text.contains(arg_val),
-            "prompt '{}' message should contain argument '{}', got: {}", name, arg_val, text);
-        assert!(text.contains(expected_substr),
-            "prompt '{}' message should reference tool '{}', got: {}", name, expected_substr, text);
+        assert!(
+            text.contains(arg_val),
+            "prompt '{}' message should contain argument '{}', got: {}",
+            name,
+            arg_val,
+            text
+        );
+        assert!(
+            text.contains(expected_substr),
+            "prompt '{}' message should reference tool '{}', got: {}",
+            name,
+            expected_substr,
+            text
+        );
     }
 }
 
@@ -333,7 +419,10 @@ fn test_e2e_resources_read_unknown_uri() {
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert!(parsed["error"].is_object());
     assert_eq!(parsed["error"]["code"], -32602);
-    assert!(parsed["error"]["message"].as_str().unwrap().contains("Unknown resource URI"));
+    assert!(parsed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown resource URI"));
 }
 
 #[test]
@@ -341,7 +430,9 @@ fn test_e2e_module_overview() {
     let project = TempDir::new().unwrap();
 
     fs::create_dir_all(project.path().join("src/auth")).unwrap();
-    fs::write(project.path().join("src/auth/validator.ts"), r#"
+    fs::write(
+        project.path().join("src/auth/validator.ts"),
+        r#"
 export function validateEmail(email: string): boolean {
     return email.includes('@');
 }
@@ -349,9 +440,13 @@ export function validateEmail(email: string): boolean {
 export function validatePassword(pw: string): boolean {
     return pw.length >= 8;
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project.path().join("src/auth/session.ts"), r#"
+    fs::write(
+        project.path().join("src/auth/session.ts"),
+        r#"
 import { validateEmail, validatePassword } from './validator';
 
 export function login(email: string, pw: string) {
@@ -360,32 +455,50 @@ export function login(email: string, pw: string) {
     }
     throw new Error('invalid');
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
 
     // Trigger indexing
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "validate"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "validate"}),
+    );
     let _ = server.handle_message(&search).unwrap();
 
     // module_overview for a directory prefix
-    let msg = tool_call_json("module_overview", serde_json::json!({
-        "path": "src/auth/"
-    }));
+    let msg = tool_call_json(
+        "module_overview",
+        serde_json::json!({
+            "path": "src/auth/"
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["path"], "src/auth/");
-    assert!(result["files_count"].as_i64().unwrap() >= 2, "should cover at least 2 files");
+    assert!(
+        result["files_count"].as_i64().unwrap() >= 2,
+        "should cover at least 2 files"
+    );
     assert!(result["summary"].as_str().unwrap().contains("src/auth/"));
 
     // Active exports: symbols with caller_count > 0
     let active = result["active_exports"].as_array().unwrap();
-    let active_names: Vec<&str> = active.iter()
-        .filter_map(|e| e["name"].as_str()).collect();
-    assert!(active_names.contains(&"validateEmail"), "active_exports should contain validateEmail, got {:?}", active_names);
-    assert!(active_names.contains(&"validatePassword"), "active_exports should contain validatePassword, got {:?}", active_names);
+    let active_names: Vec<&str> = active.iter().filter_map(|e| e["name"].as_str()).collect();
+    assert!(
+        active_names.contains(&"validateEmail"),
+        "active_exports should contain validateEmail, got {:?}",
+        active_names
+    );
+    assert!(
+        active_names.contains(&"validatePassword"),
+        "active_exports should contain validatePassword, got {:?}",
+        active_names
+    );
 
     // Each active export should have expected fields
     for exp in active {
@@ -393,31 +506,55 @@ export function login(email: string, pw: string) {
         assert!(exp["name"].is_string(), "export should have name");
         assert!(exp["type"].is_string(), "export should have type");
         assert!(exp["file"].is_string(), "export should have file");
-        assert!(exp["caller_count"].is_number(), "export should have caller_count");
-        assert!(exp["signature"].is_string() || exp["signature"].is_null(), "active export should have signature");
+        assert!(
+            exp["caller_count"].is_number(),
+            "export should have caller_count"
+        );
+        assert!(
+            exp["signature"].is_string() || exp["signature"].is_null(),
+            "active export should have signature"
+        );
     }
 
     // Inactive summary: symbols with caller_count == 0 grouped by type
     let inactive = result["inactive_summary"].as_array().unwrap();
     // login has no callers, should be in inactive summary
     let empty_arr = vec![];
-    let all_inactive_names: Vec<&str> = inactive.iter()
-        .flat_map(|g| g["names"].as_array().unwrap_or(&empty_arr).iter()
-            .filter_map(|n| n.as_str()))
+    let all_inactive_names: Vec<&str> = inactive
+        .iter()
+        .flat_map(|g| {
+            g["names"]
+                .as_array()
+                .unwrap_or(&empty_arr)
+                .iter()
+                .filter_map(|n| n.as_str())
+        })
         .collect();
-    assert!(all_inactive_names.contains(&"login"), "inactive_summary should contain login, got {:?}", all_inactive_names);
+    assert!(
+        all_inactive_names.contains(&"login"),
+        "inactive_summary should contain login, got {:?}",
+        all_inactive_names
+    );
 
     // hot_paths should include functions that have callers
     let hot_paths = result["hot_paths"].as_array().unwrap();
-    let hot_names: Vec<&str> = hot_paths.iter()
-        .filter_map(|h| h["name"].as_str()).collect();
-    assert!(hot_names.contains(&"validateEmail") || hot_names.contains(&"validatePassword"),
-        "hot_paths should include called functions, got {:?}", hot_names);
+    let hot_names: Vec<&str> = hot_paths
+        .iter()
+        .filter_map(|h| h["name"].as_str())
+        .collect();
+    assert!(
+        hot_names.contains(&"validateEmail") || hot_names.contains(&"validatePassword"),
+        "hot_paths should include called functions, got {:?}",
+        hot_names
+    );
 
     // module_overview for a single file
-    let msg = tool_call_json("module_overview", serde_json::json!({
-        "path": "src/auth/validator.ts"
-    }));
+    let msg = tool_call_json(
+        "module_overview",
+        serde_json::json!({
+            "path": "src/auth/validator.ts"
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["files_count"], 1);
@@ -431,46 +568,64 @@ fn test_e2e_dependency_graph() {
     let project = TempDir::new().unwrap();
 
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/db.ts"), r#"
+    fs::write(
+        project.path().join("src/db.ts"),
+        r#"
 export function query(sql: string): any[] {
     return [];
 }
 
 export function connect(): void {}
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project.path().join("src/repo.ts"), r#"
+    fs::write(
+        project.path().join("src/repo.ts"),
+        r#"
 import { query, connect } from './db';
 
 export function findUser(id: number) {
     connect();
     return query('SELECT * FROM users WHERE id = ' + id);
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project.path().join("src/api.ts"), r#"
+    fs::write(
+        project.path().join("src/api.ts"),
+        r#"
 import { findUser } from './repo';
 
 export function getUser(req: Request, res: Response) {
     const user = findUser(parseInt(req.params.id));
     res.json(user);
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
 
     // Trigger indexing
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "findUser"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "findUser"}),
+    );
     let _ = server.handle_message(&search).unwrap();
 
     // dependency_graph for the middle file (repo.ts) — should have both directions
-    let msg = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/repo.ts",
-        "direction": "both",
-        "depth": 2
-    }));
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/repo.ts",
+            "direction": "both",
+            "depth": 2
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["file"], "src/repo.ts");
@@ -478,54 +633,83 @@ export function getUser(req: Request, res: Response) {
 
     // repo.ts depends on db.ts (outgoing)
     let depends_on = result["depends_on"].as_array().unwrap();
-    let outgoing_files: Vec<&str> = depends_on.iter()
-        .filter_map(|d| d["file"].as_str()).collect();
-    assert!(outgoing_files.iter().any(|f| f.contains("db.ts")),
-        "repo.ts should depend on db.ts, got: {:?}", outgoing_files);
+    let outgoing_files: Vec<&str> = depends_on
+        .iter()
+        .filter_map(|d| d["file"].as_str())
+        .collect();
+    assert!(
+        outgoing_files.iter().any(|f| f.contains("db.ts")),
+        "repo.ts should depend on db.ts, got: {:?}",
+        outgoing_files
+    );
 
     // api.ts depends on repo.ts (incoming)
     let depended_by = result["depended_by"].as_array().unwrap();
-    let incoming_files: Vec<&str> = depended_by.iter()
-        .filter_map(|d| d["file"].as_str()).collect();
-    assert!(incoming_files.iter().any(|f| f.contains("api.ts")),
-        "api.ts should depend on repo.ts, got: {:?}", incoming_files);
+    let incoming_files: Vec<&str> = depended_by
+        .iter()
+        .filter_map(|d| d["file"].as_str())
+        .collect();
+    assert!(
+        incoming_files.iter().any(|f| f.contains("api.ts")),
+        "api.ts should depend on repo.ts, got: {:?}",
+        incoming_files
+    );
 
     // Each dependency entry should have expected fields
     for dep in depends_on.iter().chain(depended_by.iter()) {
         assert!(dep["file"].is_string(), "dependency should have file");
-        assert!(dep["symbols"].is_number(), "dependency should have symbols count");
+        assert!(
+            dep["symbols"].is_number(),
+            "dependency should have symbols count"
+        );
         assert!(dep["depth"].is_number(), "dependency should have depth");
     }
 
     // dependency_graph with outgoing-only direction
-    let msg = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/repo.ts",
-        "direction": "outgoing"
-    }));
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/repo.ts",
+            "direction": "outgoing"
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    assert!(!result["depends_on"].as_array().unwrap().is_empty(),
-        "outgoing direction should return depends_on");
+    assert!(
+        !result["depends_on"].as_array().unwrap().is_empty(),
+        "outgoing direction should return depends_on"
+    );
 
     // dependency_graph with incoming-only direction
-    let msg = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/repo.ts",
-        "direction": "incoming"
-    }));
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/repo.ts",
+            "direction": "incoming"
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    assert!(!result["depended_by"].as_array().unwrap().is_empty(),
-        "incoming direction should return depended_by");
+    assert!(
+        !result["depended_by"].as_array().unwrap().is_empty(),
+        "incoming direction should return depended_by"
+    );
 
     // dependency_graph for leaf file (db.ts) — no outgoing deps
-    let msg = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/db.ts"
-    }));
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/db.ts"
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["file"], "src/db.ts");
     let depends_on = result["depends_on"].as_array().unwrap();
-    assert!(depends_on.is_empty(), "db.ts should have no outgoing dependencies");
+    assert!(
+        depends_on.is_empty(),
+        "db.ts should have no outgoing dependencies"
+    );
 }
 
 #[test]
@@ -533,102 +717,166 @@ fn test_dependency_graph_multi_depth() {
     let project = TempDir::new().unwrap();
 
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/db.ts"), r#"
+    fs::write(
+        project.path().join("src/db.ts"),
+        r#"
 export function query(sql: string): any[] { return []; }
 export function connect(): void {}
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project.path().join("src/repo.ts"), r#"
+    fs::write(
+        project.path().join("src/repo.ts"),
+        r#"
 import { query, connect } from './db';
 export function findUser(id: number) {
     connect();
     return query('SELECT * FROM users WHERE id = ' + id);
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project.path().join("src/api.ts"), r#"
+    fs::write(
+        project.path().join("src/api.ts"),
+        r#"
 import { findUser } from './repo';
 export function getUser(req: Request, res: Response) {
     const user = findUser(parseInt(req.params.id));
     res.json(user);
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    fs::write(project.path().join("src/main.ts"), r#"
+    fs::write(
+        project.path().join("src/main.ts"),
+        r#"
 import { getUser } from './api';
 const app = { get: function(path: string, handler: any) {} };
 app.get('/users/:id', getUser);
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
 
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "getUser"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "getUser"}),
+    );
     let _ = server.handle_message(&search).unwrap();
 
     // depth=1: api.ts depends directly on repo.ts only
-    let msg = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/api.ts",
-        "direction": "outgoing",
-        "depth": 1
-    }));
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/api.ts",
+            "direction": "outgoing",
+            "depth": 1
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     let depends_on = result["depends_on"].as_array().unwrap();
-    let depth1_files: Vec<&str> = depends_on.iter()
-        .filter_map(|d| d["file"].as_str()).collect();
-    assert!(depth1_files.iter().any(|f| f.contains("repo.ts")),
-        "depth=1: api.ts should depend on repo.ts, got: {:?}", depth1_files);
-    assert!(!depth1_files.iter().any(|f| f.contains("db.ts")),
-        "depth=1: api.ts should NOT show db.ts, got: {:?}", depth1_files);
+    let depth1_files: Vec<&str> = depends_on
+        .iter()
+        .filter_map(|d| d["file"].as_str())
+        .collect();
+    assert!(
+        depth1_files.iter().any(|f| f.contains("repo.ts")),
+        "depth=1: api.ts should depend on repo.ts, got: {:?}",
+        depth1_files
+    );
+    assert!(
+        !depth1_files.iter().any(|f| f.contains("db.ts")),
+        "depth=1: api.ts should NOT show db.ts, got: {:?}",
+        depth1_files
+    );
 
     // depth=2: api.ts -> repo.ts -> db.ts (transitive)
-    let msg2 = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/api.ts",
-        "direction": "outgoing",
-        "depth": 2
-    }));
+    let msg2 = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/api.ts",
+            "direction": "outgoing",
+            "depth": 2
+        }),
+    );
     let resp2 = server.handle_message(&msg2).unwrap();
     let result2 = parse_tool_result(&resp2);
     let depends_on2 = result2["depends_on"].as_array().unwrap();
-    let depth2_files: Vec<&str> = depends_on2.iter()
-        .filter_map(|d| d["file"].as_str()).collect();
-    assert!(depth2_files.iter().any(|f| f.contains("db.ts")),
-        "depth=2: api.ts should transitively depend on db.ts, got: {:?}", depth2_files);
+    let depth2_files: Vec<&str> = depends_on2
+        .iter()
+        .filter_map(|d| d["file"].as_str())
+        .collect();
+    assert!(
+        depth2_files.iter().any(|f| f.contains("db.ts")),
+        "depth=2: api.ts should transitively depend on db.ts, got: {:?}",
+        depth2_files
+    );
 
     // Verify depth values
-    let db_dep = depends_on2.iter().find(|d| d["file"].as_str().unwrap().contains("db.ts")).unwrap();
-    assert_eq!(db_dep["depth"].as_i64().unwrap(), 2, "db.ts should be at depth 2");
+    let db_dep = depends_on2
+        .iter()
+        .find(|d| d["file"].as_str().unwrap().contains("db.ts"))
+        .unwrap();
+    assert_eq!(
+        db_dep["depth"].as_i64().unwrap(),
+        2,
+        "db.ts should be at depth 2"
+    );
 
-    let repo_dep = depends_on2.iter().find(|d| d["file"].as_str().unwrap().contains("repo.ts")).unwrap();
-    assert_eq!(repo_dep["depth"].as_i64().unwrap(), 1, "repo.ts should be at depth 1");
+    let repo_dep = depends_on2
+        .iter()
+        .find(|d| d["file"].as_str().unwrap().contains("repo.ts"))
+        .unwrap();
+    assert_eq!(
+        repo_dep["depth"].as_i64().unwrap(),
+        1,
+        "repo.ts should be at depth 1"
+    );
 
     // depth=3 incoming: db.ts <- repo.ts <- api.ts <- main.ts
-    let msg3 = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/db.ts",
-        "direction": "incoming",
-        "depth": 3
-    }));
+    let msg3 = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/db.ts",
+            "direction": "incoming",
+            "depth": 3
+        }),
+    );
     let resp3 = server.handle_message(&msg3).unwrap();
     let result3 = parse_tool_result(&resp3);
     let depended_by = result3["depended_by"].as_array().unwrap();
-    let incoming_files: Vec<&str> = depended_by.iter()
-        .filter_map(|d| d["file"].as_str()).collect();
-    assert!(incoming_files.iter().any(|f| f.contains("main.ts")),
-        "depth=3 incoming: db.ts should be transitively depended on by main.ts, got: {:?}", incoming_files);
+    let incoming_files: Vec<&str> = depended_by
+        .iter()
+        .filter_map(|d| d["file"].as_str())
+        .collect();
+    assert!(
+        incoming_files.iter().any(|f| f.contains("main.ts")),
+        "depth=3 incoming: db.ts should be transitively depended on by main.ts, got: {:?}",
+        incoming_files
+    );
 }
 
 #[test]
 fn test_e2e_prompts_get_unknown() {
     let project = TempDir::new().unwrap();
     let server = McpServer::from_project_root(project.path()).unwrap();
-    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"nonexistent-prompt"}}"#;
+    let msg =
+        r#"{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"nonexistent-prompt"}}"#;
     let resp = server.handle_message(msg).unwrap().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert!(parsed["error"].is_object());
     assert_eq!(parsed["error"]["code"], -32602);
-    assert!(parsed["error"]["message"].as_str().unwrap().contains("Unknown prompt"));
+    assert!(parsed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown prompt"));
 }
 
 #[test]
@@ -636,29 +884,37 @@ fn test_insert_node_cached_returns_same_as_insert_node() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Database::open(&tmp.path().join("test.db")).unwrap();
 
-    let file_id = upsert_file(db.conn(), &FileRecord {
-        path: "test.ts".into(),
-        blake3_hash: "abc123".into(),
-        last_modified: 0,
-        language: Some("typescript".into()),
-    }).unwrap();
+    let file_id = upsert_file(
+        db.conn(),
+        &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "abc123".into(),
+            last_modified: 0,
+            language: Some("typescript".into()),
+        },
+    )
+    .unwrap();
 
-    let id = insert_node_cached(db.conn(), &NodeRecord {
-        file_id,
-        node_type: "function".into(),
-        name: "foo".into(),
-        qualified_name: None,
-        start_line: 1,
-        end_line: 5,
-        code_content: "function foo() {}".into(),
-        signature: Some("foo()".into()),
-        doc_comment: None,
-        context_string: None,
-        name_tokens: None,
-        return_type: None,
-        param_types: None,
-        is_test: false,
-    }).unwrap();
+    let id = insert_node_cached(
+        db.conn(),
+        &NodeRecord {
+            file_id,
+            node_type: "function".into(),
+            name: "foo".into(),
+            qualified_name: None,
+            start_line: 1,
+            end_line: 5,
+            code_content: "function foo() {}".into(),
+            signature: Some("foo()".into()),
+            doc_comment: None,
+            context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
+            is_test: false,
+        },
+    )
+    .unwrap();
 
     assert!(id > 0);
     let nodes = get_nodes_by_name(db.conn(), "foo").unwrap();
@@ -671,25 +927,57 @@ fn test_insert_edge_cached_deduplicates() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Database::open(&tmp.path().join("test.db")).unwrap();
 
-    let file_id = upsert_file(db.conn(), &FileRecord {
-        path: "test.ts".into(),
-        blake3_hash: "abc".into(),
-        last_modified: 0,
-        language: Some("typescript".into()),
-    }).unwrap();
+    let file_id = upsert_file(
+        db.conn(),
+        &FileRecord {
+            path: "test.ts".into(),
+            blake3_hash: "abc".into(),
+            last_modified: 0,
+            language: Some("typescript".into()),
+        },
+    )
+    .unwrap();
 
-    let n1 = insert_node_cached(db.conn(), &NodeRecord {
-        file_id, node_type: "function".into(), name: "a".into(),
-        qualified_name: None, start_line: 1, end_line: 2,
-        code_content: "".into(), signature: None, doc_comment: None, context_string: None,
-        name_tokens: None, return_type: None, param_types: None, is_test: false,
-    }).unwrap();
-    let n2 = insert_node_cached(db.conn(), &NodeRecord {
-        file_id, node_type: "function".into(), name: "b".into(),
-        qualified_name: None, start_line: 3, end_line: 4,
-        code_content: "".into(), signature: None, doc_comment: None, context_string: None,
-        name_tokens: None, return_type: None, param_types: None, is_test: false,
-    }).unwrap();
+    let n1 = insert_node_cached(
+        db.conn(),
+        &NodeRecord {
+            file_id,
+            node_type: "function".into(),
+            name: "a".into(),
+            qualified_name: None,
+            start_line: 1,
+            end_line: 2,
+            code_content: "".into(),
+            signature: None,
+            doc_comment: None,
+            context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
+            is_test: false,
+        },
+    )
+    .unwrap();
+    let n2 = insert_node_cached(
+        db.conn(),
+        &NodeRecord {
+            file_id,
+            node_type: "function".into(),
+            name: "b".into(),
+            qualified_name: None,
+            start_line: 3,
+            end_line: 4,
+            code_content: "".into(),
+            signature: None,
+            doc_comment: None,
+            context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
+            is_test: false,
+        },
+    )
+    .unwrap();
 
     // First insert should succeed
     assert!(insert_edge_cached(db.conn(), n1, n2, "calls", None).unwrap());
@@ -709,13 +997,21 @@ fn test_index_skips_unparseable_files_without_crashing() {
     // Create a file with supported extension but binary content
     fs::write(project_dir.path().join("bad.ts"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
     // Another valid file
-    fs::write(project_dir.path().join("also_good.ts"), "function alsoWorks() {}").unwrap();
+    fs::write(
+        project_dir.path().join("also_good.ts"),
+        "function alsoWorks() {}",
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     let result = run_full_index(&db, project_dir.path(), None, None).unwrap();
 
     // Bad file skipped, but good files indexed
-    assert!(result.files_indexed >= 2, "Should index at least the 2 good files, got {}", result.files_indexed);
+    assert!(
+        result.files_indexed >= 2,
+        "Should index at least the 2 good files, got {}",
+        result.files_indexed
+    );
     let nodes = get_nodes_by_name(db.conn(), "works").unwrap();
     assert_eq!(nodes.len(), 1);
     let nodes2 = get_nodes_by_name(db.conn(), "alsoWorks").unwrap();
@@ -734,7 +1030,8 @@ fn test_batch_indexing_commits_partial_on_many_files() {
         fs::write(
             project_dir.path().join(format!("file{}.ts", i)),
             format!("function func{}() {{}}", i),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
@@ -768,7 +1065,8 @@ function handleUserLogin(req: Request) {
     }
 }
 "#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
@@ -776,12 +1074,20 @@ function handleUserLogin(req: Request) {
     // Searching for "validate" should find "validateAuthToken" via name_tokens splitting
     let results = fts5_search(db.conn(), "validate", 5).unwrap().nodes;
     let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-    assert!(names.contains(&"validateAuthToken"), "FTS5 should find validateAuthToken via token 'validate', got: {:?}", names);
+    assert!(
+        names.contains(&"validateAuthToken"),
+        "FTS5 should find validateAuthToken via token 'validate', got: {:?}",
+        names
+    );
 
     // Searching for "Login" should find "handleUserLogin"
     let results = fts5_search(db.conn(), "Login", 5).unwrap().nodes;
     let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-    assert!(names.contains(&"handleUserLogin"), "FTS5 should find handleUserLogin via token 'Login', got: {:?}", names);
+    assert!(
+        names.contains(&"handleUserLogin"),
+        "FTS5 should find handleUserLogin via token 'Login', got: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -802,7 +1108,8 @@ function processOrder(order: Order): OrderResult {
     return validate(order);
 }
 "#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
@@ -810,14 +1117,22 @@ function processOrder(order: Order): OrderResult {
     // Search by return type should find functions returning that type
     let results = fts5_search(db.conn(), "OrderResult", 5).unwrap().nodes;
     let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-    assert!(names.contains(&"processOrder"), "FTS5 should find processOrder via return type 'OrderResult', got: {:?}", names);
+    assert!(
+        names.contains(&"processOrder"),
+        "FTS5 should find processOrder via return type 'OrderResult', got: {:?}",
+        names
+    );
 }
 
 #[test]
 fn test_dependency_graph_directory_hint() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/app.ts"), "export function main() {}").unwrap();
+    fs::write(
+        project.path().join("src/app.ts"),
+        "export function main() {}",
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
@@ -830,14 +1145,22 @@ fn test_dependency_graph_directory_hint() {
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     let warning = result["warning"].as_str().unwrap();
-    assert!(warning.contains("module_overview"), "directory path should suggest module_overview, got: {}", warning);
+    assert!(
+        warning.contains("module_overview"),
+        "directory path should suggest module_overview, got: {}",
+        warning
+    );
 
     // Path without extension should also trigger directory hint
     let msg = tool_call_json("dependency_graph", serde_json::json!({"file_path": "src"}));
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     let warning = result["warning"].as_str().unwrap();
-    assert!(warning.contains("module_overview"), "extensionless path should suggest module_overview, got: {}", warning);
+    assert!(
+        warning.contains("module_overview"),
+        "extensionless path should suggest module_overview, got: {}",
+        warning
+    );
 }
 
 #[test]
@@ -852,22 +1175,42 @@ fn test_trace_http_chain_no_routes_message() {
     let _ = server.handle_message(&search).unwrap();
 
     // trace_http_chain with no routes should return a helpful message
-    let msg = tool_call_json("trace_http_chain", serde_json::json!({"route_path": "/api/nothing"}));
+    let msg = tool_call_json(
+        "trace_http_chain",
+        serde_json::json!({"route_path": "/api/nothing"}),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     assert!(result["handlers"].as_array().unwrap().is_empty());
-    assert!(result["message"].is_string(), "empty handlers should include a message");
-    assert!(result["message"].as_str().unwrap().contains("No matching routes"),
-        "message should explain no routes found, got: {}", result["message"]);
+    assert!(
+        result["message"].is_string(),
+        "empty handlers should include a message"
+    );
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("No matching routes"),
+        "message should explain no routes found, got: {}",
+        result["message"]
+    );
 }
 
 #[test]
 fn test_project_map_detects_main_entry_points() {
     let project = TempDir::new().unwrap();
     // Rust-style main function
-    fs::write(project.path().join("main.rs"), "fn main() { println!(\"hello\"); }").unwrap();
+    fs::write(
+        project.path().join("main.rs"),
+        "fn main() { println!(\"hello\"); }",
+    )
+    .unwrap();
     // JS-style main function
-    fs::write(project.path().join("index.js"), "async function main() { run(); }\nmain();").unwrap();
+    fs::write(
+        project.path().join("index.js"),
+        "async function main() { run(); }\nmain();",
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
@@ -878,21 +1221,32 @@ fn test_project_map_detects_main_entry_points() {
     let result = parse_tool_result(&resp);
 
     let entry_points = result["entry_points"].as_array().unwrap();
-    assert!(!entry_points.is_empty(), "project_map should detect main entry points");
-    let handlers: Vec<&str> = entry_points.iter()
+    assert!(
+        !entry_points.is_empty(),
+        "project_map should detect main entry points"
+    );
+    let handlers: Vec<&str> = entry_points
+        .iter()
         .map(|e| e["handler"].as_str().unwrap())
         .collect();
-    assert!(handlers.contains(&"main"), "should find main function as entry point");
+    assert!(
+        handlers.contains(&"main"),
+        "should find main function as entry point"
+    );
 }
 
 #[test]
 fn test_project_map_hot_functions_excludes_test_prefix() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.ts"), r#"
+    fs::write(
+        project.path().join("lib.ts"),
+        r#"
 function realWork() { return helper(); }
 function helper() { return 42; }
 function test_something() { realWork(); realWork(); realWork(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
@@ -904,21 +1258,32 @@ function test_something() { realWork(); realWork(); realWork(); }
 
     let hot = result["hot_functions"].as_array().unwrap();
     let hot_names: Vec<&str> = hot.iter().map(|h| h["name"].as_str().unwrap()).collect();
-    assert!(!hot_names.contains(&"test_something"),
-        "hot_functions should exclude test_ prefixed functions, got: {:?}", hot_names);
+    assert!(
+        !hot_names.contains(&"test_something"),
+        "hot_functions should exclude test_ prefixed functions, got: {:?}",
+        hot_names
+    );
 }
 
 #[test]
 fn test_project_map_module_dependencies() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/utils.ts"), r#"
+    fs::write(
+        project.path().join("src/utils.ts"),
+        r#"
 export function add(a: number, b: number): number { return a + b; }
-"#).unwrap();
-    fs::write(project.path().join("src/app.ts"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/app.ts"),
+        r#"
 import { add } from './utils';
 function main() { return add(1, 2); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
@@ -932,7 +1297,10 @@ function main() { return add(1, 2); }
     assert!(!modules.is_empty(), "project_map should detect modules");
     let _deps = result["module_dependencies"].as_array().unwrap();
     // At least verify the structure is correct, even if import resolution doesn't find cross-module deps
-    assert!(result["hot_functions"].is_array(), "hot_functions should be an array");
+    assert!(
+        result["hot_functions"].is_array(),
+        "hot_functions should be an array"
+    );
 }
 
 #[test]
@@ -941,8 +1309,11 @@ fn test_parse_timeout_does_not_hang() {
 
     // Verify the value exists and is reasonable
     let timeout = parse_timeout_ms();
-    assert!(timeout > 0 && timeout <= 30_000,
-        "parse_timeout_ms should be between 1 and 30000, got {}", timeout);
+    assert!(
+        timeout > 0 && timeout <= 30_000,
+        "parse_timeout_ms should be between 1 and 30000, got {}",
+        timeout
+    );
 
     // Generate deeply nested code that could stress the parser
     let mut code = String::new();
@@ -959,7 +1330,11 @@ fn test_parse_timeout_does_not_hang() {
     let elapsed = start.elapsed();
 
     // Whether it succeeds or fails, it should not take more than 10 seconds
-    assert!(elapsed.as_secs() < 10, "parse_tree should not hang, took {:?}", elapsed);
+    assert!(
+        elapsed.as_secs() < 10,
+        "parse_tree should not hang, took {:?}",
+        elapsed
+    );
     // Result can be Ok or Err (timeout) - both are acceptable
     drop(result);
 }
@@ -967,101 +1342,163 @@ fn test_parse_timeout_does_not_hang() {
 #[test]
 fn test_skip_indexing_flag() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("main.ts"), "export function hello() { return 42; }").unwrap();
+    fs::write(
+        project.path().join("main.ts"),
+        "export function hello() { return 42; }",
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
 
     // First call without skip — triggers indexing
-    let msg = tool_call_json("semantic_code_search", serde_json::json!({"query": "hello"}));
+    let msg = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "hello"}),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     // semantic_code_search returns a raw array on the hybrid path, or a
     // {results, vector_available} object when FTS5-only (no model in CI).
-    assert!(!search_hits(&result).is_empty(), "should find hello after indexing");
+    assert!(
+        !search_hits(&result).is_empty(),
+        "should find hello after indexing"
+    );
 
     // Second call with skip_indexing — should still work (index already built)
-    let msg2 = tool_call_json("semantic_code_search", serde_json::json!({
-        "query": "hello",
-        "skip_indexing": true
-    }));
+    let msg2 = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({
+            "query": "hello",
+            "skip_indexing": true
+        }),
+    );
     let resp2 = server.handle_message(&msg2).unwrap();
     let result2 = parse_tool_result(&resp2);
-    assert!(!search_hits(&result2).is_empty(), "should find hello with skip_indexing when already indexed");
+    assert!(
+        !search_hits(&result2).is_empty(),
+        "should find hello with skip_indexing when already indexed"
+    );
 
     // Third call: skip_indexing on a fresh server with no prior indexing should return empty results (not error)
     let project2 = TempDir::new().unwrap();
-    fs::write(project2.path().join("main.ts"), "export function world() { return 99; }").unwrap();
+    fs::write(
+        project2.path().join("main.ts"),
+        "export function world() { return 99; }",
+    )
+    .unwrap();
     let server2 = McpServer::from_project_root(project2.path()).unwrap();
     let init2 = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server2.handle_message(init2).unwrap();
 
-    let msg3 = tool_call_json("semantic_code_search", serde_json::json!({
-        "query": "world",
-        "skip_indexing": true
-    }));
+    let msg3 = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({
+            "query": "world",
+            "skip_indexing": true
+        }),
+    );
     let resp3 = server2.handle_message(&msg3).unwrap();
     let result3 = parse_tool_result(&resp3);
     // With skip_indexing and no prior indexing, there should be no results (empty DB)
     // Empty results return an object with results:[] and a message, not a bare array
-    let empty_results = result3.get("results").and_then(|r| r.as_array())
+    let empty_results = result3
+        .get("results")
+        .and_then(|r| r.as_array())
         .or_else(|| result3.as_array());
-    assert!(empty_results.is_none_or(|a| a.is_empty()),
-        "should return empty results when skip_indexing with no prior index, got: {}", result3);
+    assert!(
+        empty_results.is_none_or(|a| a.is_empty()),
+        "should return empty results when skip_indexing with no prior index, got: {}",
+        result3
+    );
 }
 
 #[test]
 fn test_get_ast_node_compact_mode() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/lib.ts"), r#"
+    fs::write(
+        project.path().join("src/lib.ts"),
+        r#"
 export function processData(input: string): number {
     const parsed = JSON.parse(input);
     return parsed.value * 2;
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "processData"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "processData"}),
+    );
     let _ = server.handle_message(&search).unwrap();
 
     // Non-compact: should have code_content
-    let msg = tool_call_json("get_ast_node", serde_json::json!({
-        "file_path": "src/lib.ts",
-        "symbol_name": "processData"
-    }));
+    let msg = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "file_path": "src/lib.ts",
+            "symbol_name": "processData"
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    assert!(result["code_content"].is_string(), "non-compact should have code_content");
+    assert!(
+        result["code_content"].is_string(),
+        "non-compact should have code_content"
+    );
 
     // Compact mode: should NOT have code_content
-    let msg = tool_call_json("get_ast_node", serde_json::json!({
-        "file_path": "src/lib.ts",
-        "symbol_name": "processData",
-        "compact": true
-    }));
+    let msg = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "file_path": "src/lib.ts",
+            "symbol_name": "processData",
+            "compact": true
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    assert!(result["code_content"].is_null(), "compact should strip code_content");
+    assert!(
+        result["code_content"].is_null(),
+        "compact should strip code_content"
+    );
     assert!(result["name"].is_string(), "compact should keep name");
     assert!(result["node_id"].is_number(), "compact should keep node_id");
     assert!(result["type"].is_string(), "compact should keep type");
-    assert!(result["file_path"].is_string(), "compact should keep file_path");
-    assert!(result["start_line"].is_number(), "compact should keep start_line");
-    assert!(result["signature"].is_string() || result["signature"].is_null(), "compact should keep signature");
+    assert!(
+        result["file_path"].is_string(),
+        "compact should keep file_path"
+    );
+    assert!(
+        result["start_line"].is_number(),
+        "compact should keep start_line"
+    );
+    assert!(
+        result["signature"].is_string() || result["signature"].is_null(),
+        "compact should keep signature"
+    );
 
     // Compact via node_id
     let node_id = result["node_id"].as_i64().unwrap();
-    let msg = tool_call_json("get_ast_node", serde_json::json!({
-        "node_id": node_id,
-        "compact": true
-    }));
+    let msg = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "node_id": node_id,
+            "compact": true
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    assert!(result["code_content"].is_null(), "compact via node_id should strip code_content");
+    assert!(
+        result["code_content"].is_null(),
+        "compact via node_id should strip code_content"
+    );
     assert_eq!(result["name"], "processData");
 }
 
@@ -1069,24 +1506,38 @@ export function processData(input: string): number {
 fn test_find_references_compact_mode() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/util.ts"), r#"
+    fs::write(
+        project.path().join("src/util.ts"),
+        r#"
 export function helper(): number { return 42; }
-"#).unwrap();
-    fs::write(project.path().join("src/main.ts"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/main.ts"),
+        r#"
 import { helper } from './util';
 function run() { return helper(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "helper"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "helper"}),
+    );
     let _ = server.handle_message(&search).unwrap();
 
     // Non-compact: references should have type field
-    let msg = tool_call_json("find_references", serde_json::json!({
-        "symbol_name": "helper"
-    }));
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "helper"
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     let refs = result["references"].as_array().unwrap();
@@ -1097,10 +1548,13 @@ function run() { return helper(); }
     }
 
     // Compact mode: references should NOT have type field
-    let msg = tool_call_json("find_references", serde_json::json!({
-        "symbol_name": "helper",
-        "compact": true
-    }));
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "helper",
+            "compact": true
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     let refs = result["references"].as_array().unwrap();
@@ -1111,7 +1565,10 @@ function run() { return helper(); }
         assert!(r["file_path"].is_string(), "compact should keep file_path");
         assert!(r["relation"].is_string(), "compact should keep relation");
         assert!(r["node_id"].is_number(), "compact should keep node_id");
-        assert!(r["start_line"].is_number(), "compact should keep start_line");
+        assert!(
+            r["start_line"].is_number(),
+            "compact should keep start_line"
+        );
     }
 }
 
@@ -1123,9 +1580,11 @@ fn test_fts5_keyword_query_does_not_leak_syntax_error() {
     // Each token is now wrapped in double quotes so it's treated as a phrase.
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/a.ts"),
-        "export function helper(): number { return 1; }\n"
-    ).unwrap();
+    fs::write(
+        project.path().join("src/a.ts"),
+        "export function helper(): number { return 1; }\n",
+    )
+    .unwrap();
     let server = common::init_server(&project);
 
     for query in ["NOT", "AND OR NOT", "NEAR", "OR"] {
@@ -1133,7 +1592,9 @@ fn test_fts5_keyword_query_does_not_leak_syntax_error() {
         let resp = server.handle_message(&msg).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
         let is_err = parsed["result"]["isError"] == serde_json::Value::Bool(true);
-        let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
+        let text = parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
         assert!(
             !is_err || !text.contains("fts5:"),
             "FTS5 keyword query '{query}' should not leak raw FTS5 syntax error; got: {text}"
@@ -1148,24 +1609,40 @@ fn test_module_overview_empty_path_errors() {
     // bug at the call site — must error instead of silently dumping everything.
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/a.ts"), "export function a() { return 1; }\n").unwrap();
+    fs::write(
+        project.path().join("src/a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
     let server = common::init_server(&project);
 
     let msg = tool_call_json("module_overview", serde_json::json!({"path": ""}));
     let resp = server.handle_message(&msg).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
-    assert_eq!(parsed["result"]["isError"], serde_json::Value::Bool(true),
-        "empty path must error: {:?}", parsed);
-    let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text.contains("must not be empty"),
-        "should explain the empty-path requirement; got: {text}");
+    assert_eq!(
+        parsed["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "empty path must error: {:?}",
+        parsed
+    );
+    let text = parsed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("must not be empty"),
+        "should explain the empty-path requirement; got: {text}"
+    );
 
     // "." should still work as the "match all" alias
     let msg = tool_call_json("module_overview", serde_json::json!({"path": "."}));
     let resp = server.handle_message(&msg).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
-    assert_ne!(parsed["result"]["isError"], serde_json::Value::Bool(true),
-        "'.' should still be the match-all alias: {:?}", parsed);
+    assert_ne!(
+        parsed["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "'.' should still be the match-all alias: {:?}",
+        parsed
+    );
 }
 
 #[test]
@@ -1174,23 +1651,40 @@ fn test_find_references_invalid_relation_errors() {
     // and silently return "all" results, masking caller typos like relation:"call".
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/a.ts"),
-        "export function helper(): number { return 1; }\nfunction run() { return helper(); }\n"
-    ).unwrap();
+    fs::write(
+        project.path().join("src/a.ts"),
+        "export function helper(): number { return 1; }\nfunction run() { return helper(); }\n",
+    )
+    .unwrap();
     let server = common::init_server(&project);
-    let init = tool_call_json("semantic_code_search", serde_json::json!({"query": "helper"}));
+    let init = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "helper"}),
+    );
     let _ = server.handle_message(&init);
 
-    let msg = tool_call_json("find_references", serde_json::json!({
-        "symbol_name": "helper",
-        "relation": "BOGUS_RELATION",
-    }));
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "helper",
+            "relation": "BOGUS_RELATION",
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
-    assert_eq!(parsed["result"]["isError"], serde_json::Value::Bool(true),
-        "invalid relation must error, not silently fall back: {:?}", parsed);
-    let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text.contains("Unknown relation"), "should explain the typo; got: {text}");
+    assert_eq!(
+        parsed["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "invalid relation must error, not silently fall back: {:?}",
+        parsed
+    );
+    let text = parsed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("Unknown relation"),
+        "should explain the typo; got: {text}"
+    );
 }
 
 /// Task 5: the new `references` relation filter must be ACCEPTED (not rejected
@@ -1202,34 +1696,53 @@ fn test_find_references_invalid_relation_errors() {
 #[test]
 fn test_find_references_references_relation_accepted() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub struct WidgetConfig { pub size: u32 }
 pub fn make_widget() -> WidgetConfig { WidgetConfig { size: 1 } }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let server = common::init_server(&project);
-    let warm = tool_call_json("semantic_code_search", serde_json::json!({"query": "WidgetConfig"}));
+    let warm = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "WidgetConfig"}),
+    );
     let _ = server.handle_message(&warm);
 
-    let msg = tool_call_json("find_references", serde_json::json!({
-        "symbol_name": "WidgetConfig",
-        "relation": "references",
-    }));
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "WidgetConfig",
+            "relation": "references",
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
 
     // Must NOT be rejected as an unknown filter.
-    assert_ne!(parsed["result"]["isError"], serde_json::Value::Bool(true),
-        "relation:\"references\" must be accepted, not rejected: {parsed:?}");
-    let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(!text.contains("Unknown relation"),
-        "relation:\"references\" must not hit the unknown-filter path; got: {text}");
+    assert_ne!(
+        parsed["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "relation:\"references\" must be accepted, not rejected: {parsed:?}"
+    );
+    let text = parsed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !text.contains("Unknown relation"),
+        "relation:\"references\" must not hit the unknown-filter path; got: {text}"
+    );
 
     // Must surface the real references edge (make_widget -> WidgetConfig).
     let result = parse_tool_result(&resp);
     let refs = result["references"].as_array().unwrap();
-    assert!(refs.iter().any(|r|
-        r["name"] == "make_widget" && r["relation"] == "references"),
-        "expected a references edge from make_widget to WidgetConfig; got: {refs:?}");
+    assert!(
+        refs.iter()
+            .any(|r| r["name"] == "make_widget" && r["relation"] == "references"),
+        "expected a references edge from make_widget to WidgetConfig; got: {refs:?}"
+    );
 }
 
 #[test]
@@ -1239,54 +1752,88 @@ fn test_get_call_graph_symbol_and_route_mutually_exclusive() {
     // mutually exclusive — enforce it so conflicting input surfaces as an error.
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/a.ts"),
-        "export function helper(): number { return 1; }\n"
-    ).unwrap();
+    fs::write(
+        project.path().join("src/a.ts"),
+        "export function helper(): number { return 1; }\n",
+    )
+    .unwrap();
     let server = common::init_server(&project);
-    let init = tool_call_json("semantic_code_search", serde_json::json!({"query": "helper"}));
+    let init = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "helper"}),
+    );
     let _ = server.handle_message(&init);
 
-    let msg = tool_call_json("get_call_graph", serde_json::json!({
-        "symbol_name": "helper",
-        "route_path": "GET /api/x",
-    }));
+    let msg = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "symbol_name": "helper",
+            "route_path": "GET /api/x",
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
-    assert_eq!(parsed["result"]["isError"], serde_json::Value::Bool(true),
-        "conflicting symbol_name+route_path must error: {:?}", parsed);
-    let text = parsed["result"]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text.contains("mutually exclusive"),
-        "should explain the conflict; got: {text}");
+    assert_eq!(
+        parsed["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "conflicting symbol_name+route_path must error: {:?}",
+        parsed
+    );
+    let text = parsed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("mutually exclusive"),
+        "should explain the conflict; got: {text}"
+    );
 }
 
 #[test]
 fn test_dependency_graph_compact_mode() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/db.ts"), r#"
+    fs::write(
+        project.path().join("src/db.ts"),
+        r#"
 export function query(sql: string): any[] { return []; }
-"#).unwrap();
-    fs::write(project.path().join("src/repo.ts"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/repo.ts"),
+        r#"
 import { query } from './db';
 export function findUser(id: number) { return query('SELECT * FROM users WHERE id=' + id); }
-"#).unwrap();
-    fs::write(project.path().join("src/api.ts"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/api.ts"),
+        r#"
 import { findUser } from './repo';
 export function getUser(req: any) { return findUser(req.params.id); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
-    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "findUser"}));
+    let search = tool_call_json(
+        "semantic_code_search",
+        serde_json::json!({"query": "findUser"}),
+    );
     let _ = server.handle_message(&search).unwrap();
 
     // Non-compact: should have symbols field for depth-1 deps
-    let msg = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/repo.ts",
-        "direction": "both",
-        "depth": 2
-    }));
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/repo.ts",
+            "direction": "both",
+            "depth": 2
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     let depends_on = result["depends_on"].as_array().unwrap();
@@ -1294,19 +1841,28 @@ export function getUser(req: any) { return findUser(req.params.id); }
     // Non-compact depth-1 deps have symbols
     let depth1 = depends_on.iter().find(|d| d["depth"].as_i64() == Some(1));
     assert!(depth1.is_some(), "should have depth-1 dep");
-    assert!(depth1.unwrap()["symbols"].is_number(), "non-compact depth-1 should have symbols count");
+    assert!(
+        depth1.unwrap()["symbols"].is_number(),
+        "non-compact depth-1 should have symbols count"
+    );
 
     // Compact mode: should NOT have symbols field
-    let msg = tool_call_json("dependency_graph", serde_json::json!({
-        "file_path": "src/repo.ts",
-        "direction": "both",
-        "depth": 2,
-        "compact": true
-    }));
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({
+            "file_path": "src/repo.ts",
+            "direction": "both",
+            "depth": 2,
+            "compact": true
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     let depends_on = result["depends_on"].as_array().unwrap();
-    assert!(!depends_on.is_empty(), "compact should still have outgoing deps");
+    assert!(
+        !depends_on.is_empty(),
+        "compact should still have outgoing deps"
+    );
     for dep in depends_on {
         assert!(dep["file"].is_string(), "compact should keep file");
         assert!(dep["depth"].is_number(), "compact should keep depth");
@@ -1314,7 +1870,10 @@ export function getUser(req: any) { return findUser(req.params.id); }
     }
     let depended_by = result["depended_by"].as_array().unwrap();
     for dep in depended_by {
-        assert!(dep["symbols"].is_null(), "compact should strip symbols from incoming deps too");
+        assert!(
+            dep["symbols"].is_null(),
+            "compact should strip symbols from incoming deps too"
+        );
     }
     assert!(result["file"].is_string(), "compact should keep file");
     assert!(result["summary"].is_string(), "compact should keep summary");
@@ -1340,14 +1899,12 @@ fn test_unicode_identifiers_index_and_search() {
     server.handle_message(init).unwrap();
 
     // Trigger indexing via a content-based search (FTS5 may not tokenize Unicode names)
-    let search = tool_call_json(
-        "semantic_code_search",
-        serde_json::json!({"query": "data"}),
-    );
+    let search = tool_call_json("semantic_code_search", serde_json::json!({"query": "data"}));
     let resp = server.handle_message(&search).unwrap();
     let results = parse_tool_result(&resp);
     let results_arr = search_hits(&results);
-    let names: Vec<&str> = results_arr.iter()
+    let names: Vec<&str> = results_arr
+        .iter()
         .filter_map(|r| r["name"].as_str())
         .collect();
     // The function that takes 'data' param should be found with its Unicode name preserved
@@ -1391,7 +1948,8 @@ fn test_cjk_identifiers_index_and_search() {
     let results = parse_tool_result(&resp);
     let results_arr = search_hits(&results);
     // Verify the CJK name is preserved in the result
-    let names: Vec<&str> = results_arr.iter()
+    let names: Vec<&str> = results_arr
+        .iter()
         .filter_map(|r| r["name"].as_str())
         .collect();
     assert!(
@@ -1444,8 +2002,11 @@ fn test_tools_call_missing_name_returns_error() {
     });
     let resp = server.handle_message(&msg.to_string()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
-    assert!(parsed["error"].is_object() || parsed["result"]["isError"] == true,
-        "Missing tool name should error: {:?}", parsed);
+    assert!(
+        parsed["error"].is_object() || parsed["result"]["isError"] == true,
+        "Missing tool name should error: {:?}",
+        parsed
+    );
 }
 
 #[test]
@@ -1472,25 +2033,37 @@ fn test_unknown_method_returns_error() {
 #[test]
 fn test_find_references_prefers_exact_over_substring() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.ts"), r#"
+    fs::write(
+        project.path().join("lib.ts"),
+        r#"
 function handle() { return 1; }
 function handle_one() { return handle(); }
 function handle_two() { return handle(); }
 function caller() { return handle(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = common::init_server(&project);
-    let msg = tool_call_json("find_references",
-        serde_json::json!({"symbol_name":"handle","compact":true}));
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({"symbol_name":"handle","compact":true}),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
 
     // Exact-name `handle` exists → must NOT report ambiguity with handle_one/handle_two
-    assert!(result.get("error").is_none(),
-        "find_references('handle') falsely reported ambiguity: {}", result);
+    assert!(
+        result.get("error").is_none(),
+        "find_references('handle') falsely reported ambiguity: {}",
+        result
+    );
     assert_eq!(result["symbol"], "handle");
     let refs = result["references"].as_array().unwrap();
-    assert!(!refs.is_empty(), "expected at least one caller of handle, got empty");
+    assert!(
+        !refs.is_empty(),
+        "expected at least one caller of handle, got empty"
+    );
 }
 
 // Fix #2 (truncate_large_strings homogeneous arrays) is covered by a unit
@@ -1501,12 +2074,16 @@ function caller() { return handle(); }
 #[test]
 fn test_project_map_hot_functions_excludes_structs() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub struct Foo;
 pub fn bar() -> Foo { baz(); baz(); baz(); Foo }
 pub fn baz() -> i32 { 1 }
 pub fn call_bar() { bar(); bar(); bar(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = common::init_server(&project);
     let msg = tool_call_json("project_map", serde_json::json!({}));
@@ -1516,8 +2093,11 @@ pub fn call_bar() { bar(); bar(); bar(); }
     let hot = result["hot_functions"].as_array().unwrap();
     for h in hot {
         let ty = h["type"].as_str().unwrap_or("");
-        assert!(ty == "function" || ty == "method",
-            "hot_functions must not include non-function types: {}", h);
+        assert!(
+            ty == "function" || ty == "method",
+            "hot_functions must not include non-function types: {}",
+            h
+        );
     }
 }
 
@@ -1525,7 +2105,11 @@ pub fn call_bar() { bar(); bar(); bar(); }
 #[test]
 fn test_project_map_entry_points_have_kind() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("main.rs"), "fn main() { println!(\"hi\"); }").unwrap();
+    fs::write(
+        project.path().join("main.rs"),
+        "fn main() { println!(\"hi\"); }",
+    )
+    .unwrap();
     let server = common::init_server(&project);
 
     let msg = tool_call_json("project_map", serde_json::json!({}));
@@ -1534,10 +2118,12 @@ fn test_project_map_entry_points_have_kind() {
 
     let eps = result["entry_points"].as_array().unwrap();
     assert!(!eps.is_empty(), "expected main entry point");
-    let kinds: Vec<&str> = eps.iter()
-        .filter_map(|e| e["kind"].as_str()).collect();
-    assert!(kinds.contains(&"main"),
-        "main fn should produce kind='main', got kinds={:?}", kinds);
+    let kinds: Vec<&str> = eps.iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(
+        kinds.contains(&"main"),
+        "main fn should produce kind='main', got kinds={:?}",
+        kinds
+    );
 }
 
 /// Fix #4: dependency_graph must drop the synthetic `<external>` bucket.
@@ -1545,25 +2131,39 @@ fn test_project_map_entry_points_have_kind() {
 fn test_dependency_graph_filters_external_sentinel() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/app.rs"), r#"
+    fs::write(
+        project.path().join("src/app.rs"),
+        r#"
 use std::collections::HashMap;
 pub fn load() -> HashMap<String, String> { HashMap::new() }
-"#).unwrap();
-    fs::write(project.path().join("src/main.rs"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/main.rs"),
+        r#"
 mod app;
 fn main() { let _ = app::load(); }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = common::init_server(&project);
-    let msg = tool_call_json("dependency_graph",
-        serde_json::json!({"file_path":"src/main.rs"}));
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({"file_path":"src/main.rs"}),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
 
     let depends_on = result["depends_on"].as_array().unwrap();
     for d in depends_on {
-        assert_ne!(d["file"].as_str().unwrap_or(""), "<external>",
-            "depends_on must not contain <external>: {:?}", depends_on);
+        assert_ne!(
+            d["file"].as_str().unwrap_or(""),
+            "<external>",
+            "depends_on must not contain <external>: {:?}",
+            depends_on
+        );
     }
 }
 
@@ -1574,25 +2174,32 @@ fn main() { let _ = app::load(); }
 #[test]
 fn test_find_similar_code_reports_cutoff() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub fn alpha() -> i32 { 1 }
 pub fn beta() -> i32 { 2 }
 pub fn gamma() -> i32 { 3 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let server = common::init_server(&project);
 
-    let msg = tool_call_json("find_similar_code",
-        serde_json::json!({"symbol_name":"alpha","top_k":5,"max_distance":0.0}));
+    let msg = tool_call_json(
+        "find_similar_code",
+        serde_json::json!({"symbol_name":"alpha","top_k":5,"max_distance":0.0}),
+    );
     let resp = server.handle_message(&msg).unwrap();
-    let Some(raw) = resp.as_ref() else { return; };
+    let Some(raw) = resp.as_ref() else {
+        return;
+    };
     let parsed: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => return, // malformed → environment-specific, not the target regression
     };
 
     // Embedding-disabled build path: server returns JSON-RPC error. Skip cleanly.
-    if parsed.get("error").is_some()
-        || parsed["result"]["isError"] == serde_json::Value::Bool(true)
+    if parsed.get("error").is_some() || parsed["result"]["isError"] == serde_json::Value::Bool(true)
     {
         return;
     }
@@ -1605,7 +2212,10 @@ pub fn gamma() -> i32 { 3 }
     let count = result["count"].as_i64().unwrap_or(0);
     if count < 5 {
         let has_marker = result.get("cutoff_applied").is_some()
-            || result["results"].as_array().map(|a| a.is_empty()).unwrap_or(true);
+            || result["results"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
         assert!(has_marker,
             "find_similar_code with tight max_distance must report cutoff_applied or return empty: {}",
             result);
@@ -1617,7 +2227,9 @@ pub fn gamma() -> i32 { 3 }
 #[test]
 fn test_module_overview_excludes_cfg_test_functions() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub fn compute_thing() -> i32 { 42 }
 
 #[cfg(test)]
@@ -1628,7 +2240,9 @@ mod tests {
     #[test]
     fn nothing_prefix_matches_test() { assert_eq!(2, 2); }
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = common::init_server(&project);
     let msg = tool_call_json("module_overview", serde_json::json!({"path":"."}));
@@ -1638,20 +2252,35 @@ mod tests {
     // All exported names across active + inactive — no leaked test fns.
     let mut all_names: Vec<String> = Vec::new();
     if let Some(active) = result["active_exports"].as_array() {
-        for e in active { if let Some(n) = e["name"].as_str() { all_names.push(n.into()); } }
+        for e in active {
+            if let Some(n) = e["name"].as_str() {
+                all_names.push(n.into());
+            }
+        }
     }
     if let Some(inactive) = result["inactive_summary"].as_array() {
         for bucket in inactive {
             if let Some(names) = bucket["names"].as_array() {
-                for n in names { if let Some(s) = n.as_str() { all_names.push(s.into()); } }
+                for n in names {
+                    if let Some(s) = n.as_str() {
+                        all_names.push(s.into());
+                    }
+                }
             }
         }
     }
-    assert!(all_names.iter().any(|n| n == "compute_thing"),
-        "expected real export 'compute_thing' in overview, got: {:?}", all_names);
+    assert!(
+        all_names.iter().any(|n| n == "compute_thing"),
+        "expected real export 'compute_thing' in overview, got: {:?}",
+        all_names
+    );
     for leak in ["arrays_are_homogeneous", "nothing_prefix_matches_test"] {
-        assert!(!all_names.iter().any(|n| n == leak),
-            "#[cfg(test)] fn '{}' leaked into module_overview: {:?}", leak, all_names);
+        assert!(
+            !all_names.iter().any(|n| n == leak),
+            "#[cfg(test)] fn '{}' leaked into module_overview: {:?}",
+            leak,
+            all_names
+        );
     }
 }
 
@@ -1662,7 +2291,9 @@ mod tests {
 #[test]
 fn test_module_overview_compact_preserves_dead_code() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub fn used_fn() -> i32 { 42 }
 pub fn caller() -> i32 { used_fn() }
 
@@ -1673,21 +2304,31 @@ pub fn orphan_long_function_name() -> i32 {
     let c = 3;
     a + b + c
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = common::init_server(&project);
-    let msg = tool_call_json("module_overview", serde_json::json!({
-        "path": ".", "include_dead": true, "compact": true
-    }));
+    let msg = tool_call_json(
+        "module_overview",
+        serde_json::json!({
+            "path": ".", "include_dead": true, "compact": true
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
 
-    assert!(result.get("dead_code").is_some(),
+    assert!(
+        result.get("dead_code").is_some(),
         "compact mode must forward dead_code; got keys: {:?}",
-        result.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+        result.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
     let dead = &result["dead_code"];
-    assert!(dead["orphan_count"].is_number(),
-        "dead_code must have numeric orphan_count, got: {}", dead);
+    assert!(
+        dead["orphan_count"].is_number(),
+        "dead_code must have numeric orphan_count, got: {}",
+        dead
+    );
 }
 
 /// project_map include_centrality (roadmap 2026-07-18 §2.4): the CLI-only
@@ -1698,41 +2339,67 @@ pub fn orphan_long_function_name() -> i32 {
 #[test]
 fn test_project_map_include_centrality_and_compact_forwarding() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub fn entry_a() -> i32 { bridge() }
 pub fn entry_b() -> i32 { bridge() }
 pub fn bridge() -> i32 { leaf_x() + leaf_y() }
 pub fn leaf_x() -> i32 { 1 }
 pub fn leaf_y() -> i32 { 2 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = common::init_server(&project);
-    let msg = tool_call_json("project_map", serde_json::json!({
-        "include_centrality": true
-    }));
+    let msg = tool_call_json(
+        "project_map",
+        serde_json::json!({
+            "include_centrality": true
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    let cent = result["centrality"].as_array()
-        .unwrap_or_else(|| panic!("include_centrality must attach a centrality array; got keys: {:?}",
-            result.as_object().map(|o| o.keys().collect::<Vec<_>>())));
-    assert!(cent.iter().any(|c| c["name"] == "bridge"),
-        "bridge sits on every entry→leaf path and must rank; got: {cent:?}");
+    let cent = result["centrality"].as_array().unwrap_or_else(|| {
+        panic!(
+            "include_centrality must attach a centrality array; got keys: {:?}",
+            result.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        )
+    });
+    assert!(
+        cent.iter().any(|c| c["name"] == "bridge"),
+        "bridge sits on every entry→leaf path and must rank; got: {cent:?}"
+    );
 
     // Default off: no field.
-    let resp_off = server.handle_message(&tool_call_json("project_map",
-        serde_json::json!({}))).unwrap();
-    assert!(parse_tool_result(&resp_off).get("centrality").is_none(),
-        "centrality must be opt-in");
+    let resp_off = server
+        .handle_message(&tool_call_json("project_map", serde_json::json!({})))
+        .unwrap();
+    assert!(
+        parse_tool_result(&resp_off).get("centrality").is_none(),
+        "centrality must be opt-in"
+    );
 
     // Compact whitelist must forward it (trimmed rows keep name+file+score).
-    let resp_c = server.handle_message(&tool_call_json("project_map",
-        serde_json::json!({"include_centrality": true, "compact": true}))).unwrap();
+    let resp_c = server
+        .handle_message(&tool_call_json(
+            "project_map",
+            serde_json::json!({"include_centrality": true, "compact": true}),
+        ))
+        .unwrap();
     let result_c = parse_tool_result(&resp_c);
-    let cent_c = result_c["centrality"].as_array()
-        .unwrap_or_else(|| panic!("compact must forward centrality (allowlist trap); got keys: {:?}",
-            result_c.as_object().map(|o| o.keys().collect::<Vec<_>>())));
-    assert!(cent_c.iter().any(|c| c["name"] == "bridge" && c["betweenness"].is_number()),
-        "compact rows keep name+betweenness; got: {cent_c:?}");
+    let cent_c = result_c["centrality"].as_array().unwrap_or_else(|| {
+        panic!(
+            "compact must forward centrality (allowlist trap); got keys: {:?}",
+            result_c.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        )
+    });
+    assert!(
+        cent_c
+            .iter()
+            .any(|c| c["name"] == "bridge" && c["betweenness"].is_number()),
+        "compact rows keep name+betweenness; got: {cent_c:?}"
+    );
 }
 
 /// v0.22.x fix: `ast_search query=<identifier> type=<X>` must fall back to
@@ -1757,24 +2424,43 @@ fn test_ast_search_query_plus_type_fallback_to_name_like() {
     fs::write(project.path().join("lib.rs"), &src).unwrap();
 
     let server = common::init_server(&project);
-    let msg = tool_call_json("ast_search", serde_json::json!({
-        "query": "Result", "type": "struct", "limit": 10
-    }));
+    let msg = tool_call_json(
+        "ast_search",
+        serde_json::json!({
+            "query": "Result", "type": "struct", "limit": 10
+        }),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
     let count = result["count"].as_u64().unwrap_or(0);
     assert!(count >= 2,
         "query='Result' type=struct must surface IndexResult + CallGraphResult via name-LIKE fallback, got count={}, results={}",
         count, result["results"]);
-    let names: Vec<String> = result["results"].as_array().unwrap().iter()
-        .filter_map(|r| r["name"].as_str().map(|s| s.to_string())).collect();
-    assert!(names.iter().any(|n| n == "IndexResult"),
-        "IndexResult missing from fallback results: {:?}", names);
-    assert!(names.iter().any(|n| n == "CallGraphResult"),
-        "CallGraphResult missing from fallback results: {:?}", names);
+    let names: Vec<String> = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "IndexResult"),
+        "IndexResult missing from fallback results: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n == "CallGraphResult"),
+        "CallGraphResult missing from fallback results: {:?}",
+        names
+    );
     // Hint must explain the fallback so caller knows what happened
-    assert!(result["hint"].as_str().map(|s| s.contains("name-substring")).unwrap_or(false),
-        "expected fallback hint, got: {:?}", result["hint"]);
+    assert!(
+        result["hint"]
+            .as_str()
+            .map(|s| s.contains("name-substring"))
+            .unwrap_or(false),
+        "expected fallback hint, got: {:?}",
+        result["hint"]
+    );
 }
 
 /// v0.11.2 fix: disambiguation suggestions carry `node_id` AND `start_line`
@@ -1784,7 +2470,9 @@ fn test_ast_search_query_plus_type_fallback_to_name_like() {
 #[test]
 fn test_disambiguation_suggestions_include_node_id_and_start_line() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub struct Foo;
 pub struct Bar;
 
@@ -1800,44 +2488,68 @@ pub fn make_them() {
     let _ = Foo::new();
     let _ = Bar::new();
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let server = common::init_server(&project);
 
     // find_references on an ambiguous same-file symbol should enumerate
     // per-definition suggestions with node_id + start_line.
-    let msg = tool_call_json("find_references",
-        serde_json::json!({"symbol_name":"new","file_path":"lib.rs"}));
+    let msg = tool_call_json(
+        "find_references",
+        serde_json::json!({"symbol_name":"new","file_path":"lib.rs"}),
+    );
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
 
-    assert!(result.get("error").is_some(),
-        "expected ambiguity error for same-file multi-def 'new': {}", result);
-    let suggestions = result["suggestions"].as_array()
+    assert!(
+        result.get("error").is_some(),
+        "expected ambiguity error for same-file multi-def 'new': {}",
+        result
+    );
+    let suggestions = result["suggestions"]
+        .as_array()
         .expect("suggestions array missing");
-    assert!(suggestions.len() >= 2,
-        "expected ≥2 suggestions for two fn new(), got {}: {}", suggestions.len(), result);
+    assert!(
+        suggestions.len() >= 2,
+        "expected ≥2 suggestions for two fn new(), got {}: {}",
+        suggestions.len(),
+        result
+    );
     for s in suggestions {
-        assert!(s["node_id"].as_i64().is_some(),
-            "suggestion missing node_id: {}", s);
-        assert!(s["start_line"].as_i64().is_some(),
-            "suggestion missing start_line: {}", s);
+        assert!(
+            s["node_id"].as_i64().is_some(),
+            "suggestion missing node_id: {}",
+            s
+        );
+        assert!(
+            s["start_line"].as_i64().is_some(),
+            "suggestion missing start_line: {}",
+            s
+        );
     }
-    let lines: Vec<i64> = suggestions.iter()
+    let lines: Vec<i64> = suggestions
+        .iter()
         .filter_map(|s| s["start_line"].as_i64())
         .collect();
-    assert!(lines.windows(2).any(|w| w[0] != w[1]),
-        "expected distinct start_line values across same-name defs, got: {:?}", lines);
+    assert!(
+        lines.windows(2).any(|w| w[0] != w[1]),
+        "expected distinct start_line values across same-name defs, got: {:?}",
+        lines
+    );
 
     // Caller should now be able to pass node_id from the suggestion
     // and get a clean single-definition result.
     let picked = suggestions[0].clone();
     let nid = picked["node_id"].as_i64().unwrap();
-    let msg2 = tool_call_json("find_references",
-        serde_json::json!({"node_id": nid}));
+    let msg2 = tool_call_json("find_references", serde_json::json!({"node_id": nid}));
     let resp2 = server.handle_message(&msg2).unwrap();
     let result2 = parse_tool_result(&resp2);
-    assert!(result2.get("error").is_none(),
-        "node_id selection should not be ambiguous: {}", result2);
+    assert!(
+        result2.get("error").is_none(),
+        "node_id selection should not be ambiguous: {}",
+        result2
+    );
 }
 
 /// Audit #6: get_call_graph must flag a same-file overload (≥2 non-test defs of
@@ -1847,7 +2559,9 @@ pub fn make_them() {
 #[test]
 fn test_mcp_callgraph_impact_same_file_overload_is_ambiguous() {
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub struct Foo;
 pub struct Bar;
 
@@ -1863,7 +2577,9 @@ pub fn make_them() {
     let _ = Foo::new();
     let _ = Bar::new();
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let server = common::init_server(&project);
 
     for tool in ["get_call_graph"] {
@@ -1873,17 +2589,27 @@ pub fn make_them() {
         let resp = server.handle_message(&msg).unwrap();
         let result = parse_tool_result(&resp);
         let err = result.get("error").and_then(|e| e.as_str()).unwrap_or("");
-        assert!(err.contains("Ambiguous symbol 'new'"),
-            "{tool} must report same-file ambiguity for 'new'; got: {result}");
+        assert!(
+            err.contains("Ambiguous symbol 'new'"),
+            "{tool} must report same-file ambiguity for 'new'; got: {result}"
+        );
         // Accurate same-file guidance (not the dead-end "Specify file_path").
-        assert!(err.contains("same file"),
-            "{tool} same-file message must name the same-file case; got: {err}");
-        let suggestions = result["suggestions"].as_array()
+        assert!(
+            err.contains("same file"),
+            "{tool} same-file message must name the same-file case; got: {err}"
+        );
+        let suggestions = result["suggestions"]
+            .as_array()
             .unwrap_or_else(|| panic!("{tool}: suggestions array missing: {result}"));
-        assert!(suggestions.len() >= 2,
-            "{tool}: expected ≥2 node_id suggestions; got: {result}");
+        assert!(
+            suggestions.len() >= 2,
+            "{tool}: expected ≥2 node_id suggestions; got: {result}"
+        );
         for s in suggestions {
-            assert!(s["node_id"].as_i64().is_some(), "{tool} suggestion needs node_id: {s}");
+            assert!(
+                s["node_id"].as_i64().is_some(),
+                "{tool} suggestion needs node_id: {s}"
+            );
         }
     }
 }
@@ -1895,14 +2621,18 @@ pub fn make_them() {
 fn test_find_dead_code_default_ignores_plugin_scripts() {
     let project = TempDir::new().unwrap();
     // A clearly-unused function in a regular src file.
-    fs::write(project.path().join("lib.rs"), r#"
+    fs::write(
+        project.path().join("lib.rs"),
+        r#"
 pub fn genuinely_dead_thing() {
     let x = 1;
     let y = 2;
     let z = x + y;
     println!("{}", z);
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     // Simulate a claude-plugin hook script — function invoked only via shell.
     fs::create_dir_all(project.path().join("claude-plugin/scripts")).unwrap();
     // `uninstall` has no in-file caller here. It was self-called at module
@@ -1910,13 +2640,17 @@ pub fn genuinely_dead_thing() {
     // extractor now attributes module-level calls to `<module>` and those
     // edges resolve same-file, adding a module-level `uninstall();` would
     // make this function non-dead and defeat the ignore-prefix assertion.
-    fs::write(project.path().join("claude-plugin/scripts/lifecycle.js"), r#"
+    fs::write(
+        project.path().join("claude-plugin/scripts/lifecycle.js"),
+        r#"
 function uninstall() {
     console.log("hook cleanup step 1");
     console.log("hook cleanup step 2");
     console.log("hook cleanup step 3");
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = common::init_server(&project);
 
@@ -1924,26 +2658,51 @@ function uninstall() {
     let msg = tool_call_json("find_dead_code", serde_json::json!({"min_lines": 3}));
     let resp = server.handle_message(&msg).unwrap();
     let result = parse_tool_result(&resp);
-    let names: Vec<&str> = result["results"].as_array().unwrap()
-        .iter().filter_map(|r| r["name"].as_str()).collect();
-    assert!(!names.contains(&"uninstall"),
-        "claude-plugin/ entry point leaked as dead code: {:?}", names);
-    assert!(result["ignored_count"].as_u64().unwrap_or(0) >= 1,
-        "expected at least 1 ignored result, got: {}", result);
-    assert_eq!(result["ignore_paths_defaulted"], true,
-        "defaulted ignore should be flagged: {}", result);
+    let names: Vec<&str> = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"uninstall"),
+        "claude-plugin/ entry point leaked as dead code: {:?}",
+        names
+    );
+    assert!(
+        result["ignored_count"].as_u64().unwrap_or(0) >= 1,
+        "expected at least 1 ignored result, got: {}",
+        result
+    );
+    assert_eq!(
+        result["ignore_paths_defaulted"], true,
+        "defaulted ignore should be flagged: {}",
+        result
+    );
 
     // Opt-out — pass `[]` and the plugin script now shows up.
-    let msg2 = tool_call_json("find_dead_code",
-        serde_json::json!({"min_lines": 3, "ignore_paths": []}));
+    let msg2 = tool_call_json(
+        "find_dead_code",
+        serde_json::json!({"min_lines": 3, "ignore_paths": []}),
+    );
     let resp2 = server.handle_message(&msg2).unwrap();
     let result2 = parse_tool_result(&resp2);
-    let names2: Vec<&str> = result2["results"].as_array().unwrap()
-        .iter().filter_map(|r| r["name"].as_str()).collect();
-    assert!(names2.contains(&"uninstall"),
-        "ignore_paths=[] should surface plugin entry points, got: {:?}", names2);
-    assert_eq!(result2["ignore_paths_defaulted"], false,
-        "explicit [] must not be flagged as defaulted: {}", result2);
+    let names2: Vec<&str> = result2["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names2.contains(&"uninstall"),
+        "ignore_paths=[] should surface plugin entry points, got: {:?}",
+        names2
+    );
+    assert_eq!(
+        result2["ignore_paths_defaulted"], false,
+        "explicit [] must not be flagged as defaulted: {}",
+        result2
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1959,26 +2718,46 @@ const INIT_MSG: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params"
 fn test_r12_callback_reference_resolves_cross_file() {
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/handlers.rs"), r#"
+    fs::write(
+        project.path().join("src/handlers.rs"),
+        r#"
 pub fn handler() {}
-"#).unwrap();
-    fs::write(project.path().join("src/app.rs"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/app.rs"),
+        r#"
 pub fn caller() {
     register(handler);
 }
 fn register<F>(_f: F) {}
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     server.handle_message(INIT_MSG).unwrap();
-    let _ = server.handle_message(&tool_call_json("semantic_code_search",
-        serde_json::json!({"query": "handler"}))).unwrap();
+    let _ = server
+        .handle_message(&tool_call_json(
+            "semantic_code_search",
+            serde_json::json!({"query": "handler"}),
+        ))
+        .unwrap();
 
-    let resp = server.handle_message(&tool_call_json("find_references",
-        serde_json::json!({"symbol_name": "handler", "relation": "references"}))).unwrap();
+    let resp = server
+        .handle_message(&tool_call_json(
+            "find_references",
+            serde_json::json!({"symbol_name": "handler", "relation": "references"}),
+        ))
+        .unwrap();
     let result = parse_tool_result(&resp);
-    let names: Vec<&str> = result["references"].as_array().unwrap()
-        .iter().filter_map(|r| r["name"].as_str()).collect();
+    let names: Vec<&str> = result["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
     assert!(names.contains(&"caller"),
         "find_references(handler, references) should include caller via a value-reference edge; got {:?}", names);
 }
@@ -1990,24 +2769,44 @@ fn test_r13_value_reference_does_not_cross_language() {
     // stay unreferenced (cross-language attribution is a fatal false positive).
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/app.rs"), r#"
+    fs::write(
+        project.path().join("src/app.rs"),
+        r#"
 pub fn caller() { schedule(process); }
 fn schedule<F>(_f: F) {}
-"#).unwrap();
-    fs::write(project.path().join("src/worker.js"), r#"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/worker.js"),
+        r#"
 function process() {}
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     server.handle_message(INIT_MSG).unwrap();
-    let _ = server.handle_message(&tool_call_json("semantic_code_search",
-        serde_json::json!({"query": "process"}))).unwrap();
+    let _ = server
+        .handle_message(&tool_call_json(
+            "semantic_code_search",
+            serde_json::json!({"query": "process"}),
+        ))
+        .unwrap();
 
-    let resp = server.handle_message(&tool_call_json("find_references",
-        serde_json::json!({"symbol_name": "process", "relation": "references"}))).unwrap();
+    let resp = server
+        .handle_message(&tool_call_json(
+            "find_references",
+            serde_json::json!({"symbol_name": "process", "relation": "references"}),
+        ))
+        .unwrap();
     let result = parse_tool_result(&resp);
-    let names: Vec<&str> = result["references"].as_array().unwrap()
-        .iter().filter_map(|r| r["name"].as_str()).collect();
+    let names: Vec<&str> = result["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
     assert!(!names.contains(&"caller"),
         "a Rust value-reference must NOT resolve to a same-named JS function (cross-language drop); got {:?}", names);
 }
@@ -2020,24 +2819,45 @@ fn test_r14_value_reference_excluded_from_call_graph() {
     // test_cli_impact_json_reports_value_references.
     let project = TempDir::new().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(project.path().join("src/app.rs"), r#"
+    fs::write(
+        project.path().join("src/app.rs"),
+        r#"
 pub fn caller() { register(handler); }
 fn register<F>(_f: F) {}
 fn handler() {}
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     server.handle_message(INIT_MSG).unwrap();
-    let _ = server.handle_message(&tool_call_json("semantic_code_search",
-        serde_json::json!({"query": "handler"}))).unwrap();
+    let _ = server
+        .handle_message(&tool_call_json(
+            "semantic_code_search",
+            serde_json::json!({"query": "handler"}),
+        ))
+        .unwrap();
 
     // find_references must surface the referencer.
-    let fr = parse_tool_result(&server.handle_message(&tool_call_json("find_references",
-        serde_json::json!({"symbol_name": "handler", "relation": "references"}))).unwrap());
-    let ref_names: Vec<&str> = fr["references"].as_array().unwrap()
-        .iter().filter_map(|r| r["name"].as_str()).collect();
-    assert!(ref_names.contains(&"caller"),
-        "find_references should surface the callback referencer; got {:?}", ref_names);
+    let fr = parse_tool_result(
+        &server
+            .handle_message(&tool_call_json(
+                "find_references",
+                serde_json::json!({"symbol_name": "handler", "relation": "references"}),
+            ))
+            .unwrap(),
+    );
+    let ref_names: Vec<&str> = fr["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        ref_names.contains(&"caller"),
+        "find_references should surface the callback referencer; got {:?}",
+        ref_names
+    );
 }
 
 #[test]
@@ -2056,7 +2876,11 @@ fn test_code_explorer_agent_references_only_live_tools() {
     };
 
     let registry = code_graph_mcp::mcp::tools::ToolRegistry::new();
-    let live: Vec<&str> = registry.list_tools().iter().map(|t| t.name.as_str()).collect();
+    let live: Vec<&str> = registry
+        .list_tools()
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
 
     const PREFIX: &str = "mcp__code-graph__";
     let mut referenced = 0;
@@ -2068,12 +2892,15 @@ fn test_code_explorer_agent_references_only_live_tools() {
         assert!(
             live.contains(&name.as_str()),
             "code-explorer.md references non-live MCP tool '{}' (live tools: {:?})",
-            name, live
+            name,
+            live
         );
         referenced += 1;
     }
-    assert!(referenced >= 1,
-        "expected code-explorer.md to reference at least one mcp__code-graph__ tool");
+    assert!(
+        referenced >= 1,
+        "expected code-explorer.md to reference at least one mcp__code-graph__ tool"
+    );
 }
 
 /// v0.79.1 audit sibling-hole (the deferred half of HIGH #1): an inline Rust
@@ -2091,7 +2918,9 @@ fn test_e2e_inline_unit_test_caller_excluded_across_surfaces() {
     // `descriptive_*_check` names contain no "test" substring and live in src/, so the
     // name/path heuristic classifies them as PROD; only the AST `is_test` flag catches
     // them. `real_caller` is a genuine production caller.
-    fs::write(project.path().join("src/lib.rs"), r#"
+    fs::write(
+        project.path().join("src/lib.rs"),
+        r#"
 pub fn target_fn() -> i32 { 42 }
 
 pub fn real_caller() -> i32 { target_fn() }
@@ -2111,50 +2940,83 @@ mod tests {
         assert_eq!(v, 42);
     }
 }
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let server = McpServer::from_project_root(project.path()).unwrap();
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
     server.handle_message(init).unwrap();
 
     // --- get_ast_node include_references: inline tests hidden by default ---
-    let refs = tool_call_json("get_ast_node", serde_json::json!({
-        "symbol_name": "target_fn", "file_path": "src/lib.rs", "include_references": true
-    }));
+    let refs = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "symbol_name": "target_fn", "file_path": "src/lib.rs", "include_references": true
+        }),
+    );
     let r = parse_tool_result(&server.handle_message(&refs).unwrap());
-    let called_by: Vec<&str> = r["called_by"].as_array().map(|a| a.iter()
-        .filter_map(|c| c["name"].as_str()).collect()).unwrap_or_default();
-    assert!(called_by.contains(&"real_caller"),
-        "prod caller must be present; got called_by={called_by:?}");
+    let called_by: Vec<&str> = r["called_by"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|c| c["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        called_by.contains(&"real_caller"),
+        "prod caller must be present; got called_by={called_by:?}"
+    );
     assert!(!called_by.contains(&"descriptive_behavior_check")
             && !called_by.contains(&"another_descriptive_check"),
         "inline unit tests (is_test=1, heuristic-invisible) leaked into prod callers: {called_by:?}");
-    assert_eq!(r["test_callers_hidden"].as_i64(), Some(2),
-        "both inline unit tests must be counted as hidden test callers; got {}", r);
+    assert_eq!(
+        r["test_callers_hidden"].as_i64(),
+        Some(2),
+        "both inline unit tests must be counted as hidden test callers; got {}",
+        r
+    );
 
     // --- get_ast_node include_impact: inline tests must not inflate risk count ---
-    let imp = tool_call_json("get_ast_node", serde_json::json!({
-        "symbol_name": "target_fn", "file_path": "src/lib.rs", "include_impact": true
-    }));
+    let imp = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "symbol_name": "target_fn", "file_path": "src/lib.rs", "include_impact": true
+        }),
+    );
     let r = parse_tool_result(&server.handle_message(&imp).unwrap());
-    assert_eq!(r["impact"]["direct_callers"].as_i64(), Some(1),
-        "only real_caller is a prod direct caller; got impact={}", r["impact"]);
-    assert_eq!(r["impact"]["test_callers_filtered"].as_i64(), Some(2),
-        "impact must exclude both inline unit tests; got impact={}", r["impact"]);
+    assert_eq!(
+        r["impact"]["direct_callers"].as_i64(),
+        Some(1),
+        "only real_caller is a prod direct caller; got impact={}",
+        r["impact"]
+    );
+    assert_eq!(
+        r["impact"]["test_callers_filtered"].as_i64(),
+        Some(2),
+        "impact must exclude both inline unit tests; got impact={}",
+        r["impact"]
+    );
 
     // --- get_call_graph callers: inline tests excluded from default view ---
-    let cg = tool_call_json("get_call_graph", serde_json::json!({
-        "symbol_name": "target_fn", "direction": "callers", "depth": 2
-    }));
+    let cg = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "symbol_name": "target_fn", "direction": "callers", "depth": 2
+        }),
+    );
     let r = parse_tool_result(&server.handle_message(&cg).unwrap());
     // Normal (non-rollup) get_call_graph keys the list under `callers`/`callees`.
-    let callers: Vec<&str> = r["callers"].as_array().map(|a| a.iter()
-        .filter_map(|n| n["name"].as_str()).collect()).unwrap_or_default();
-    assert!(callers.contains(&"real_caller"),
-        "prod caller must appear in the default call graph; got callers={callers:?}");
-    assert!(!callers.contains(&"descriptive_behavior_check")
+    let callers: Vec<&str> = r["callers"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|n| n["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        callers.contains(&"real_caller"),
+        "prod caller must appear in the default call graph; got callers={callers:?}"
+    );
+    assert!(
+        !callers.contains(&"descriptive_behavior_check")
             && !callers.contains(&"another_descriptive_check"),
-        "inline unit tests leaked into the default call graph: {callers:?}");
+        "inline unit tests leaked into the default call graph: {callers:?}"
+    );
 }
 
 /// Regression (real-user QA): C++ classes declared in a `.h` header (the most common
@@ -2169,7 +3031,9 @@ mod tests {
 fn test_cpp_header_classes_and_single_inherits_edge() {
     use code_graph_mcp::indexer::pipeline::run_full_index;
     let project = TempDir::new().unwrap();
-    fs::write(project.path().join("shape.h"), r#"#pragma once
+    fs::write(
+        project.path().join("shape.h"),
+        r#"#pragma once
 class Shape {
 public:
     virtual double area() const = 0;
@@ -2180,7 +3044,9 @@ public:
     Circle(double radius) : r(radius) {}
     double area() const override;
 };
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     fs::create_dir_all(&db_dir).unwrap();
     let db = Database::open(&db_dir.join("index.db")).unwrap();
@@ -2188,23 +3054,37 @@ public:
 
     // Classes from the .h header are extracted (were dropped when .h parsed as C).
     let types_of = |name: &str| -> Vec<String> {
-        get_nodes_by_name(db.conn(), name).unwrap().iter().map(|n| n.node_type.clone()).collect()
+        get_nodes_by_name(db.conn(), name)
+            .unwrap()
+            .iter()
+            .map(|n| n.node_type.clone())
+            .collect()
     };
     let shape_types = types_of("Shape");
-    assert!(shape_types.iter().any(|t| t == "class"),
-        "Shape class must be extracted from the .h header; got node types: {shape_types:?}");
+    assert!(
+        shape_types.iter().any(|t| t == "class"),
+        "Shape class must be extracted from the .h header; got node types: {shape_types:?}"
+    );
     let circle_types = types_of("Circle");
-    assert!(circle_types.iter().any(|t| t == "class"),
-        "Circle class must be extracted from the .h header; got node types: {circle_types:?}");
+    assert!(
+        circle_types.iter().any(|t| t == "class"),
+        "Circle class must be extracted from the .h header; got node types: {circle_types:?}"
+    );
 
     // Exactly ONE inherits edge — from the CLASS node, never the inline-constructor
     // `method Circle` that shares the name.
-    let inherits: Vec<(String, String)> = db.conn().prepare(
-        "SELECT s.type, t.name FROM edges e \
+    let inherits: Vec<(String, String)> = db
+        .conn()
+        .prepare(
+            "SELECT s.type, t.name FROM edges e \
          JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id \
-         WHERE e.relation = 'inherits'").unwrap()
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap()
-        .map(|r| r.unwrap()).collect();
+         WHERE e.relation = 'inherits'",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
     assert_eq!(inherits, vec![("class".to_string(), "Shape".to_string())],
         "exactly one inherits edge from the class node (not the constructor method); got: {inherits:?}");
 }

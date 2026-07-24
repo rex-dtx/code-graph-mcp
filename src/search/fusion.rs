@@ -141,7 +141,10 @@ mod tests {
         let exact = final_adjusted_score(0.01, 1.0, 0.1, 1.0, true);
         let best_non_exact =
             final_adjusted_score(1.0, crate::domain::NAME_BOOST_CAP, 1.0, 1.0, false);
-        assert!(exact > best_non_exact, "exact {exact} must beat non-exact {best_non_exact}");
+        assert!(
+            exact > best_non_exact,
+            "exact {exact} must beat non-exact {best_non_exact}"
+        );
     }
 
     #[test]
@@ -165,14 +168,32 @@ mod tests {
     #[test]
     fn test_rrf_fusion_basic() {
         let fts_results = vec![
-            SearchResult { node_id: 1, score: 0.0 },
-            SearchResult { node_id: 2, score: 0.0 },
-            SearchResult { node_id: 3, score: 0.0 },
+            SearchResult {
+                node_id: 1,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 2,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 3,
+                score: 0.0,
+            },
         ];
         let vec_results = vec![
-            SearchResult { node_id: 2, score: 0.0 },
-            SearchResult { node_id: 4, score: 0.0 },
-            SearchResult { node_id: 1, score: 0.0 },
+            SearchResult {
+                node_id: 2,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 4,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 1,
+                score: 0.0,
+            },
         ];
 
         let fused = rrf_fusion(&fts_results, &vec_results, 60, 3);
@@ -184,8 +205,14 @@ mod tests {
 
     #[test]
     fn test_rrf_with_no_overlap() {
-        let fts = vec![SearchResult { node_id: 1, score: 0.0 }];
-        let vec = vec![SearchResult { node_id: 2, score: 0.0 }];
+        let fts = vec![SearchResult {
+            node_id: 1,
+            score: 0.0,
+        }];
+        let vec = vec![SearchResult {
+            node_id: 2,
+            score: 0.0,
+        }];
 
         let fused = rrf_fusion(&fts, &vec, 60, 5);
         assert_eq!(fused.len(), 2);
@@ -193,28 +220,52 @@ mod tests {
 
     #[test]
     fn test_weighted_rrf_prefers_fts() {
-        let fts = vec![SearchResult { node_id: 1, score: 0.0 }];
-        let vec = vec![SearchResult { node_id: 2, score: 0.0 }];
+        let fts = vec![SearchResult {
+            node_id: 1,
+            score: 0.0,
+        }];
+        let vec = vec![SearchResult {
+            node_id: 2,
+            score: 0.0,
+        }];
 
         let fused = weighted_rrf_fusion(&fts, &vec, 60, 5, 2.0, 1.0);
         assert_eq!(fused.len(), 2);
-        assert_eq!(fused[0].node_id, 1, "FTS-only result should rank first when fts_weight > vec_weight");
+        assert_eq!(
+            fused[0].node_id, 1,
+            "FTS-only result should rank first when fts_weight > vec_weight"
+        );
         assert!(fused[0].score > fused[1].score);
     }
 
     #[test]
     fn test_weighted_rrf_both_sources() {
         let fts = vec![
-            SearchResult { node_id: 1, score: 0.0 },
-            SearchResult { node_id: 2, score: 0.0 },
+            SearchResult {
+                node_id: 1,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 2,
+                score: 0.0,
+            },
         ];
         let vec = vec![
-            SearchResult { node_id: 2, score: 0.0 },
-            SearchResult { node_id: 3, score: 0.0 },
+            SearchResult {
+                node_id: 2,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 3,
+                score: 0.0,
+            },
         ];
 
         let fused = weighted_rrf_fusion(&fts, &vec, 60, 5, 1.0, 1.0);
-        assert_eq!(fused[0].node_id, 2, "Node appearing in both sources should rank highest");
+        assert_eq!(
+            fused[0].node_id, 2,
+            "Node appearing in both sources should rank highest"
+        );
     }
 
     #[test]
@@ -222,8 +273,14 @@ mod tests {
         // Two FTS results at rank 0 and 1: node_1 has higher raw BM25 score
         // With blending, even if RRF ranks are close, the higher BM25 should win
         let fts = vec![
-            SearchResult { node_id: 1, score: 10.0 }, // high BM25
-            SearchResult { node_id: 2, score: 1.0 },  // low BM25
+            SearchResult {
+                node_id: 1,
+                score: 10.0,
+            }, // high BM25
+            SearchResult {
+                node_id: 2,
+                score: 1.0,
+            }, // low BM25
         ];
         let vec: Vec<SearchResult> = vec![];
 
@@ -231,7 +288,10 @@ mod tests {
         assert_eq!(fused[0].node_id, 1, "Higher raw score should rank first");
         // Verify that blending added score beyond pure RRF
         let pure_rrf_rank0 = 1.0 / (60.0 + 0.0 + 1.0);
-        assert!(fused[0].score > pure_rrf_rank0, "Blended score should exceed pure RRF");
+        assert!(
+            fused[0].score > pure_rrf_rank0,
+            "Blended score should exceed pure RRF"
+        );
     }
 
     /// Scientific invariant: blending must NEVER flip adjacent ranks.
@@ -244,8 +304,14 @@ mod tests {
         // rank-1 has the maximum. Old formula would let rank-1 win.
         for &k in &[10u32, 30, 60, 100] {
             let fts = vec![
-                SearchResult { node_id: 1, score: 0.0001 }, // rank 0, tiny score
-                SearchResult { node_id: 2, score: 1000.0 }, // rank 1, huge score
+                SearchResult {
+                    node_id: 1,
+                    score: 0.0001,
+                }, // rank 0, tiny score
+                SearchResult {
+                    node_id: 2,
+                    score: 1000.0,
+                }, // rank 1, huge score
             ];
             let vec_empty: Vec<SearchResult> = vec![];
             let fused = weighted_rrf_fusion(&fts, &vec_empty, k, 5, 1.0, 1.0);
@@ -267,15 +333,36 @@ mod tests {
         // Node 2: rank 5 in FTS + rank 0 in vec → RRF = 1/36 + 1/31 ≈ 0.0601
         // With (fts,vec) both weight=1, Node 2 has higher RRF and must win.
         let fts = vec![
-            SearchResult { node_id: 1, score: 100.0 }, // rank 0, max raw
-            SearchResult { node_id: 9, score: 1.0 },
-            SearchResult { node_id: 8, score: 1.0 },
-            SearchResult { node_id: 7, score: 1.0 },
-            SearchResult { node_id: 6, score: 1.0 },
-            SearchResult { node_id: 2, score: 0.001 }, // rank 5, tiny raw
+            SearchResult {
+                node_id: 1,
+                score: 100.0,
+            }, // rank 0, max raw
+            SearchResult {
+                node_id: 9,
+                score: 1.0,
+            },
+            SearchResult {
+                node_id: 8,
+                score: 1.0,
+            },
+            SearchResult {
+                node_id: 7,
+                score: 1.0,
+            },
+            SearchResult {
+                node_id: 6,
+                score: 1.0,
+            },
+            SearchResult {
+                node_id: 2,
+                score: 0.001,
+            }, // rank 5, tiny raw
         ];
         let vec = vec![
-            SearchResult { node_id: 2, score: 0.001 }, // rank 0 in vec, tiny raw
+            SearchResult {
+                node_id: 2,
+                score: 0.001,
+            }, // rank 0 in vec, tiny raw
         ];
         let fused = weighted_rrf_fusion(&fts, &vec, k, 5, 1.0, 1.0);
         assert_eq!(
@@ -297,8 +384,14 @@ mod tests {
         // (1/(31*32) ≈ 0.00101). Blend adds ~0.00025 max. Rank still dominates.
         let k = 30u32;
         let fts = vec![
-            SearchResult { node_id: 1, score: 100.0 }, // rank 0, max raw
-            SearchResult { node_id: 2, score: 10.0 },  // rank 1, lower raw
+            SearchResult {
+                node_id: 1,
+                score: 100.0,
+            }, // rank 0, max raw
+            SearchResult {
+                node_id: 2,
+                score: 10.0,
+            }, // rank 1, lower raw
         ];
         let vec_empty: Vec<SearchResult> = vec![];
         let fused = weighted_rrf_fusion(&fts, &vec_empty, k, 5, 1.0, 1.0);
@@ -325,8 +418,14 @@ mod tests {
     fn test_blend_negative_vector_score_cannot_flip_rank() {
         let fts: Vec<SearchResult> = vec![];
         let vec = vec![
-            SearchResult { node_id: 1, score: -1.0 }, // rank 0, most-negative similarity
-            SearchResult { node_id: 2, score: 0.02 }, // rank 1, small positive = vec_max
+            SearchResult {
+                node_id: 1,
+                score: -1.0,
+            }, // rank 0, most-negative similarity
+            SearchResult {
+                node_id: 2,
+                score: 0.02,
+            }, // rank 1, small positive = vec_max
         ];
         // Pre-fix: node 1's blend = blend_scale·(-1/0.02) = -50·blend_scale, which
         // dwarfs the ~1/992 adjacent gap → node 2 (rank 1) wins. Post-fix node 1 holds.
@@ -349,8 +448,14 @@ mod tests {
         // scores → identical fused RRF score 1/(k+1). The tie must resolve to
         // ascending node_id: [2, 9].
         for _ in 0..64 {
-            let fts = vec![SearchResult { node_id: 9, score: 0.0 }];
-            let vec = vec![SearchResult { node_id: 2, score: 0.0 }];
+            let fts = vec![SearchResult {
+                node_id: 9,
+                score: 0.0,
+            }];
+            let vec = vec![SearchResult {
+                node_id: 2,
+                score: 0.0,
+            }];
             let fused = weighted_rrf_fusion(&fts, &vec, 60, 5, 1.0, 1.0);
             assert_eq!(fused.len(), 2);
             assert!(
@@ -369,8 +474,14 @@ mod tests {
         // Three nodes all at their source's rank 0 with equal weight → identical
         // fused score. top_k=2 drops exactly one; it must always be the highest id.
         for _ in 0..64 {
-            let fts = vec![SearchResult { node_id: 7, score: 0.0 }];
-            let vec = vec![SearchResult { node_id: 3, score: 0.0 }];
+            let fts = vec![SearchResult {
+                node_id: 7,
+                score: 0.0,
+            }];
+            let vec = vec![SearchResult {
+                node_id: 3,
+                score: 0.0,
+            }];
             // node 5 in neither source's rank 0 uniquely — put it alone in a third
             // slot by giving it the same RRF as the others via fts rank 0 in a
             // separate weighted call is not possible; instead assert on the 2-way
@@ -396,7 +507,9 @@ mod tests {
             assert!(
                 blend_scale < adjacent_gap,
                 "k={}: blend_scale {} must be < adjacent RRF gap {}",
-                k, blend_scale, adjacent_gap
+                k,
+                blend_scale,
+                adjacent_gap
             );
             // Safety margin: blend should be ≤ half the gap
             assert!(

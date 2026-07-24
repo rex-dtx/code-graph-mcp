@@ -5,8 +5,8 @@
 //! plus `export { X } from './mod'` re-exports (barrel/index files) as
 //! REL_IMPORTS dependency edges.
 
-use super::ParsedRelation;
 use super::super::node_text;
+use super::ParsedRelation;
 use crate::domain::{REL_EXPORTS, REL_IMPORTS};
 
 pub(super) fn extract_export_names(
@@ -46,9 +46,9 @@ pub(super) fn extract_export_names(
                     collect_reexport_specifiers(&child, source, metadata.as_deref(), results);
                 }
             }
-            let is_star = (0..node.child_count()).filter_map(|i| node.child(i)).any(|c| {
-                c.kind() == "*" || c.kind() == "namespace_export"
-            });
+            let is_star = (0..node.child_count())
+                .filter_map(|i| node.child(i))
+                .any(|c| c.kind() == "*" || c.kind() == "namespace_export");
             if is_star {
                 results.push(ParsedRelation {
                     source_name: "<module>".into(),
@@ -73,8 +73,12 @@ pub(super) fn extract_export_names(
             None => continue,
         };
         match child.kind() {
-            "function_declaration" | "class_declaration" | "interface_declaration"
-            | "type_alias_declaration" | "enum_declaration" | "abstract_class_declaration" => {
+            "function_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "enum_declaration"
+            | "abstract_class_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = node_text(&name_node, source).to_string();
                     if !name.is_empty() {

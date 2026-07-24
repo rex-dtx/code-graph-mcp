@@ -14,7 +14,11 @@ pub struct RouteMatch {
     pub end_line: i64,
 }
 
-pub fn find_routes_by_path(conn: &Connection, route_path: &str, relation: &str) -> Result<Vec<RouteMatch>> {
+pub fn find_routes_by_path(
+    conn: &Connection,
+    route_path: &str,
+    relation: &str,
+) -> Result<Vec<RouteMatch>> {
     // Use json_extract for precise path matching instead of LIKE substring.
     // Match if the route_path is a prefix of the stored path (handles both exact and prefix matches).
     let mut stmt = conn.prepare(
@@ -25,24 +29,27 @@ pub fn find_routes_by_path(conn: &Connection, route_path: &str, relation: &str) 
          WHERE e.relation = ?2
          AND e.metadata IS NOT NULL
          AND (json_extract(e.metadata, '$.path') = ?1
-              OR json_extract(e.metadata, '$.path') LIKE ?3 ESCAPE '\\')"
+              OR json_extract(e.metadata, '$.path') LIKE ?3 ESCAPE '\\')",
     )?;
 
     // Support both exact match and prefix match with path boundary
     // (e.g., "/api/users" matches "/api/users/:id" but not "/api/userservices")
     let escaped = escape_like(route_path);
     let prefix_pattern = format!("{}/%", escaped);
-    let rows = stmt.query_map(rusqlite::params![route_path, relation, prefix_pattern], |row| {
-        Ok(RouteMatch {
-            node_id: row.get(0)?,
-            metadata: row.get(1)?,
-            handler_name: row.get(2)?,
-            handler_type: row.get(3)?,
-            file_path: row.get(4)?,
-            start_line: row.get(5)?,
-            end_line: row.get(6)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![route_path, relation, prefix_pattern],
+        |row| {
+            Ok(RouteMatch {
+                node_id: row.get(0)?,
+                metadata: row.get(1)?,
+                handler_name: row.get(2)?,
+                handler_type: row.get(3)?,
+                file_path: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+            })
+        },
+    )?;
     let results = rows.collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -83,8 +90,10 @@ pub fn fetch_route_metadata_map(
             placeholders,
             chunk.len() + 1
         );
-        let mut params: Vec<&dyn rusqlite::types::ToSql> =
-            chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let rel: &dyn rusqlite::types::ToSql = &REL_ROUTES_TO;
         params.push(rel);
         let mut stmt = conn.prepare(&sql)?;
@@ -137,7 +146,7 @@ impl ModuleExport {
 /// For JS/TS, uses explicit `exports` edges. For other languages (Rust, Go, Python, etc.),
 /// falls back to returning all named top-level symbols (functions, structs, classes, etc.).
 pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<ModuleExport>> {
-    use crate::domain::{REL_EXPORTS, REL_CALLS};
+    use crate::domain::{REL_CALLS, REL_EXPORTS};
     let escaped_prefix = escape_like(dir_prefix);
     let prefix_pattern = format!("{}%", escaped_prefix);
 
@@ -217,19 +226,22 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
          ORDER BY caller_count DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![&prefix_pattern, REL_CALLS, REL_EXPORTS], |row| {
-        Ok(ModuleExport {
-            node_id: row.get(0)?,
-            name: row.get(1)?,
-            node_type: row.get(2)?,
-            signature: row.get(3)?,
-            file_path: row.get(4)?,
-            caller_count: row.get(5)?,
-            start_line: row.get(6)?,
-            end_line: row.get(7)?,
-            qualified_name: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![&prefix_pattern, REL_CALLS, REL_EXPORTS],
+        |row| {
+            Ok(ModuleExport {
+                node_id: row.get(0)?,
+                name: row.get(1)?,
+                node_type: row.get(2)?,
+                signature: row.get(3)?,
+                file_path: row.get(4)?,
+                caller_count: row.get(5)?,
+                start_line: row.get(6)?,
+                end_line: row.get(7)?,
+                qualified_name: row.get(8)?,
+            })
+        },
+    )?;
     let all: Vec<ModuleExport> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
 
     // Deduplicate by (qualified_name, file_path) — keeps highest caller_count.
@@ -273,8 +285,8 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::helpers::test_db;
+    use super::*;
 
     #[test]
     fn test_get_module_exports() {
@@ -284,7 +296,11 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, signature) VALUES (1, 'function', 'validateUser', 'validateUser', 1, 10, 'function validateUser() {}', '(token: string) => User')", []).unwrap();
         // Add an export edge (module-level node exports this function)
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'module', 'validator', 'validator', 0, 0, '')", []).unwrap();
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (2, 1, 'exports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (2, 1, 'exports')",
+            [],
+        )
+        .unwrap();
 
         let exports = get_module_exports(conn, "src/auth/").unwrap();
         assert_eq!(exports.len(), 1);
@@ -306,17 +322,36 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'speak', 'Animal.speak', 2, 3, 'speak() {}')", []).unwrap();
         // Module node (id 3) exports the class (edge module -> Animal).
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'module', 'models', 'models', 0, 0, '')", []).unwrap();
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (3, 1, 'exports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (3, 1, 'exports')",
+            [],
+        )
+        .unwrap();
         // Non-exported internal class Helper (id 4) + its method secret (id 5).
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'class', 'Helper', 'Helper', 6, 8, 'class Helper {}')", []).unwrap();
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'secret', 'Helper.secret', 7, 7, 'secret() {}')", []).unwrap();
 
         let names: Vec<String> = get_module_exports(conn, "src/models")
-            .unwrap().iter().map(|e| e.name.clone()).collect();
-        assert!(names.contains(&"Animal".to_string()), "exported class shown: {names:?}");
-        assert!(names.contains(&"speak".to_string()), "method of exported class shown: {names:?}");
-        assert!(!names.contains(&"Helper".to_string()), "non-exported class hidden: {names:?}");
-        assert!(!names.contains(&"secret".to_string()), "method of non-exported class hidden: {names:?}");
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert!(
+            names.contains(&"Animal".to_string()),
+            "exported class shown: {names:?}"
+        );
+        assert!(
+            names.contains(&"speak".to_string()),
+            "method of exported class shown: {names:?}"
+        );
+        assert!(
+            !names.contains(&"Helper".to_string()),
+            "non-exported class hidden: {names:?}"
+        );
+        assert!(
+            !names.contains(&"secret".to_string()),
+            "method of non-exported class hidden: {names:?}"
+        );
     }
 
     /// Regression: two exported classes in one file that share a method name
@@ -335,8 +370,16 @@ mod tests {
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'method', 'render', 'Widget.render', 7, 8, 'render() {}')", []).unwrap();
         // Module node (id 5) exports BOTH classes.
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'module', 'widgets', 'widgets', 0, 0, '')", []).unwrap();
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (5, 1, 'exports')", []).unwrap();
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (5, 3, 'exports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (5, 1, 'exports')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (5, 3, 'exports')",
+            [],
+        )
+        .unwrap();
 
         let render_qns: Vec<String> = get_module_exports(conn, "src/widgets")
             .unwrap()
@@ -344,24 +387,46 @@ mod tests {
             .filter(|e| e.name == "render")
             .map(|e| e.qualified_name.clone())
             .collect();
-        assert!(render_qns.contains(&"Animal.render".to_string()), "Animal.render present: {render_qns:?}");
-        assert!(render_qns.contains(&"Widget.render".to_string()), "Widget.render present: {render_qns:?}");
-        assert_eq!(render_qns.len(), 2, "both same-named methods kept, not deduped: {render_qns:?}");
+        assert!(
+            render_qns.contains(&"Animal.render".to_string()),
+            "Animal.render present: {render_qns:?}"
+        );
+        assert!(
+            render_qns.contains(&"Widget.render".to_string()),
+            "Widget.render present: {render_qns:?}"
+        );
+        assert_eq!(
+            render_qns.len(),
+            2,
+            "both same-named methods kept, not deduped: {render_qns:?}"
+        );
     }
 
     #[test]
     fn test_module_export_display_name_qualifies_methods_only() {
         let method = ModuleExport {
-            node_id: 1, name: "render".into(), node_type: "method".into(),
-            signature: None, file_path: "a.ts".into(), caller_count: 0,
-            start_line: 1, end_line: 2, qualified_name: "Widget.render".into(),
+            node_id: 1,
+            name: "render".into(),
+            node_type: "method".into(),
+            signature: None,
+            file_path: "a.ts".into(),
+            caller_count: 0,
+            start_line: 1,
+            end_line: 2,
+            qualified_name: "Widget.render".into(),
         };
         // Members show `Class.method` so two same-named methods stay distinct.
         assert_eq!(method.display_name(), "Widget.render");
         let top_level = ModuleExport {
-            node_id: 2, name: "helper".into(), node_type: "function".into(),
-            signature: None, file_path: "a.ts".into(), caller_count: 0,
-            start_line: 3, end_line: 4, qualified_name: "helper".into(),
+            node_id: 2,
+            name: "helper".into(),
+            node_type: "function".into(),
+            signature: None,
+            file_path: "a.ts".into(),
+            caller_count: 0,
+            start_line: 3,
+            end_line: 4,
+            qualified_name: "helper".into(),
         };
         // Top-level symbols (qualified_name == name) render bare, no redundant prefix.
         assert_eq!(top_level.display_name(), "helper");
@@ -381,7 +446,13 @@ mod tests {
         // Target file has NO export edges → every top-level symbol is contributed.
         conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/target.py', 'h1', 0, 'python', 0)", []).unwrap();
         conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('src/callers.py', 'h2', 0, 'python', 0)", []).unwrap();
-        for (name, line) in [("alpha", 10), ("beta", 20), ("gamma", 30), ("delta", 40), ("epsilon", 50)] {
+        for (name, line) in [
+            ("alpha", 10),
+            ("beta", 20),
+            ("gamma", 30),
+            ("delta", 40),
+            ("epsilon", 50),
+        ] {
             conn.execute(
                 "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', ?1, ?1, ?2, ?2, '')",
                 rusqlite::params![name, line],
@@ -395,13 +466,37 @@ mod tests {
             ).unwrap();
         }
         // caller_count: alpha=3, beta=2, gamma=2, delta=1, epsilon=0 (targets 1..=5).
-        for (src, tgt) in [(6, 1), (7, 1), (8, 1), (9, 2), (10, 2), (11, 3), (12, 3), (13, 4)] {
-            conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'calls')", rusqlite::params![src, tgt]).unwrap();
+        for (src, tgt) in [
+            (6, 1),
+            (7, 1),
+            (8, 1),
+            (9, 2),
+            (10, 2),
+            (11, 3),
+            (12, 3),
+            (13, 4),
+        ] {
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation) VALUES (?1, ?2, 'calls')",
+                rusqlite::params![src, tgt],
+            )
+            .unwrap();
         }
 
-        let run1: Vec<String> = get_module_exports(conn, "src/target").unwrap().iter().map(|e| e.name.clone()).collect();
-        let run2: Vec<String> = get_module_exports(conn, "src/target").unwrap().iter().map(|e| e.name.clone()).collect();
-        assert_eq!(run1, run2, "two calls must return an identical order (was HashMap-shuffled)");
+        let run1: Vec<String> = get_module_exports(conn, "src/target")
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        let run2: Vec<String> = get_module_exports(conn, "src/target")
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(
+            run1, run2,
+            "two calls must return an identical order (was HashMap-shuffled)"
+        );
         assert_eq!(run1, vec!["alpha", "beta", "gamma", "delta", "epsilon"],
             "order must be caller_count DESC then (file, start_line): beta(2,L20) before gamma(2,L30)");
     }
@@ -432,9 +527,14 @@ mod tests {
         // Whole-project view (empty prefix → LIKE '%' matches every file).
         let exports = get_module_exports(conn, "").unwrap();
         let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"run"), "real project symbol must be present; got {names:?}");
-        assert!(exports.iter().all(|e| e.file_path != "<external>"),
-            "<external> pseudo-symbols must be excluded from overview; got {names:?}");
+        assert!(
+            names.contains(&"run"),
+            "real project symbol must be present; got {names:?}"
+        );
+        assert!(
+            exports.iter().all(|e| e.file_path != "<external>"),
+            "<external> pseudo-symbols must be excluded from overview; got {names:?}"
+        );
     }
 
     #[test]
@@ -448,7 +548,8 @@ mod tests {
             "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
              VALUES ('src/foo.rs', 'h1', 0, 'rust', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Real export — name doesn't match is_test_symbol heuristic
         conn.execute(
             "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
@@ -464,10 +565,15 @@ mod tests {
 
         let exports = get_module_exports(conn, "src/foo.rs").unwrap();
         let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"compute_thing"), "real export missing: {:?}", names);
+        assert!(
+            names.contains(&"compute_thing"),
+            "real export missing: {:?}",
+            names
+        );
         assert!(
             !names.contains(&"arrays_are_homogeneous"),
-            "is_test=1 node leaked into module exports: {:?}", names,
+            "is_test=1 node leaked into module exports: {:?}",
+            names,
         );
     }
 
@@ -487,7 +593,8 @@ mod tests {
             "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
              VALUES ('src/a.ts', 'h1', 0, 'typescript', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
              VALUES (1, 'function', 'tsExported', 'tsExported', 1, 5, 'export function tsExported(){}', 0)",
@@ -498,13 +605,18 @@ mod tests {
              VALUES (1, 'module', '<module>', '<module>', 0, 0, '', 0)",
             [],
         ).unwrap(); // node 2 (module source of the export edge)
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (2, 1, 'exports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (2, 1, 'exports')",
+            [],
+        )
+        .unwrap();
         // Python file with NO export edges (Python has no `export` concept)
         conn.execute(
             "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
              VALUES ('src/b.py', 'h2', 0, 'python', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
              VALUES (2, 'function', 'py_func', 'py_func', 1, 5, 'def py_func(): pass', 0)",
@@ -513,10 +625,15 @@ mod tests {
 
         let exports = get_module_exports(conn, "src/").unwrap();
         let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"tsExported"), "ESM export missing: {:?}", names);
+        assert!(
+            names.contains(&"tsExported"),
+            "ESM export missing: {:?}",
+            names
+        );
         assert!(
             names.contains(&"py_func"),
-            "non-export-language symbol dropped in mixed-language dir: {:?}", names,
+            "non-export-language symbol dropped in mixed-language dir: {:?}",
+            names,
         );
     }
 
@@ -532,7 +649,8 @@ mod tests {
             "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
              VALUES ('src/a.ts', 'h1', 0, 'typescript', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
              VALUES (1, 'function', 'publicApi', 'publicApi', 1, 5, 'export function publicApi(){}', 0)",
@@ -548,14 +666,23 @@ mod tests {
              VALUES (1, 'module', '<module>', '<module>', 0, 0, '', 0)",
             [],
         ).unwrap(); // node 3 (module)
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (3, 1, 'exports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (3, 1, 'exports')",
+            [],
+        )
+        .unwrap();
 
         let exports = get_module_exports(conn, "src/a.ts").unwrap();
         let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"publicApi"), "exported symbol missing: {:?}", names);
+        assert!(
+            names.contains(&"publicApi"),
+            "exported symbol missing: {:?}",
+            names
+        );
         assert!(
             !names.contains(&"internalHelper"),
-            "non-exported internal symbol leaked from an ESM file: {:?}", names,
+            "non-exported internal symbol leaked from an ESM file: {:?}",
+            names,
         );
     }
 
@@ -571,50 +698,55 @@ mod tests {
             "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
              VALUES ('src/foo.rs', 'h1', 0, 'rust', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Bench file
         conn.execute(
             "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
              VALUES ('benches/bench_foo.rs', 'h2', 0, 'rust', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Tests dir file
         conn.execute(
             "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at)
              VALUES ('tests/integration.rs', 'h3', 0, 'rust', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Target: production export
         conn.execute(
             "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
              VALUES (1, 'function', 'compute_thing', 'compute_thing', 1, 5, 'fn compute_thing(){}', 0)",
             [],
         ).unwrap(); // node 1 (target)
-        // Prod caller (real production code)
+                    // Prod caller (real production code)
         conn.execute(
             "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
              VALUES (1, 'function', 'prod_caller', 'prod_caller', 10, 20, 'fn prod_caller(){}', 0)",
             [],
         ).unwrap(); // node 2
-        // Bench caller (path = benches/, name doesn't start with test_)
+                    // Bench caller (path = benches/, name doesn't start with test_)
         conn.execute(
             "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
              VALUES (2, 'function', 'bench_compute', 'bench_compute', 1, 10, 'fn bench_compute(){}', 0)",
             [],
         ).unwrap(); // node 3
-        // Integration test caller (path = tests/, but is_test=0 since path-based)
+                    // Integration test caller (path = tests/, but is_test=0 since path-based)
         conn.execute(
             "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content, is_test)
              VALUES (3, 'function', 'test_compute_works', 'test_compute_works', 1, 10, 'fn test_compute_works(){}', 0)",
             [],
         ).unwrap(); // node 4
-        // Edges: all three call the target (node 1)
+                    // Edges: all three call the target (node 1)
         conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (2, 1, 'calls', NULL)", []).unwrap();
         conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (3, 1, 'calls', NULL)", []).unwrap();
         conn.execute("INSERT INTO edges (source_id, target_id, relation, metadata) VALUES (4, 1, 'calls', NULL)", []).unwrap();
 
         let exports = get_module_exports(conn, "src/foo.rs").unwrap();
-        let target = exports.iter().find(|e| e.name == "compute_thing")
+        let target = exports
+            .iter()
+            .find(|e| e.name == "compute_thing")
             .expect("compute_thing must be in exports");
         assert_eq!(
             target.caller_count, 1,

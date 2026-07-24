@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
-use crate::domain::{REL_CALLS, REL_IMPORTS, REL_ROUTES_TO, REL_EXPORTS};
+use crate::domain::{REL_CALLS, REL_EXPORTS, REL_IMPORTS, REL_ROUTES_TO};
 
 /// Per-module (directory) statistics for the project map.
 pub struct ModuleStats {
@@ -51,7 +51,14 @@ fn dir_of(path: &str) -> &str {
 
 /// Build a project architecture map from the knowledge graph.
 #[allow(clippy::type_complexity)]
-pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<ModuleDep>, Vec<EntryPoint>, Vec<HotFunction>)> {
+pub fn get_project_map(
+    conn: &Connection,
+) -> Result<(
+    Vec<ModuleStats>,
+    Vec<ModuleDep>,
+    Vec<EntryPoint>,
+    Vec<HotFunction>,
+)> {
     // 1. Module map: SQL-level aggregation (C3: use constants, I1: GROUP BY in SQL)
     // `method` counts toward the function bucket so the per-module symbol total
     // matches what `overview` and `key_symbols` actually list (methods are
@@ -95,7 +102,10 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
             *dir_ifaces.entry(dir.clone()).or_default() += ifaces;
             if let Some(l) = langs {
                 for lang in l.split(',').filter(|s| !s.is_empty()) {
-                    dir_langs.entry(dir.clone()).or_default().insert(lang.to_string());
+                    dir_langs
+                        .entry(dir.clone())
+                        .or_default()
+                        .insert(lang.to_string());
                 }
             }
         }
@@ -155,21 +165,29 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
     }
 
     // Assemble module stats (sorted by function count descending)
-    let mut modules: Vec<ModuleStats> = dir_files.keys().map(|dir| {
-        ModuleStats {
+    let mut modules: Vec<ModuleStats> = dir_files
+        .keys()
+        .map(|dir| ModuleStats {
             path: dir.clone(),
             files: dir_files.get(dir).map(|s| s.len()).unwrap_or(0),
             functions: *dir_funcs.get(dir).unwrap_or(&0),
             classes: *dir_classes.get(dir).unwrap_or(&0),
             interfaces_traits: *dir_ifaces.get(dir).unwrap_or(&0),
-            languages: dir_langs.get(dir).map(|s| s.iter().cloned().collect()).unwrap_or_default(),
+            languages: dir_langs
+                .get(dir)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default(),
             key_symbols: dir_symbols.remove(dir).unwrap_or_default(),
-        }
-    }).collect();
+        })
+        .collect();
     // `dir_files.keys()` iterates a HashMap (random per run) and `functions` ties
     // heavily (many modules share a count), so sorting by function count alone left
     // equal-count modules shuffled every run. Add `path` as a unique tiebreaker.
-    modules.sort_by(|a, b| b.functions.cmp(&a.functions).then_with(|| a.path.cmp(&b.path)));
+    modules.sort_by(|a, b| {
+        b.functions
+            .cmp(&a.functions)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     // 3. Cross-module dependencies (C3: use REL_IMPORTS constant)
     let mut dep_map: HashMap<(String, String), usize> = HashMap::new();
@@ -189,7 +207,11 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              GROUP BY sf.path, tf.path";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_IMPORTS], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? as usize))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as usize,
+            ))
         })?;
         for row in rows {
             let (from_file, to_file, count) = row?;
@@ -200,14 +222,20 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
             }
         }
     }
-    let mut deps: Vec<ModuleDep> = dep_map.into_iter()
-        .map(|((from, to), count)| ModuleDep { from, to, import_count: count })
+    let mut deps: Vec<ModuleDep> = dep_map
+        .into_iter()
+        .map(|((from, to), count)| ModuleDep {
+            from,
+            to,
+            import_count: count,
+        })
         .collect();
     // `dep_map.into_iter()` is HashMap-random and `import_count` ties, so sorting by
     // count alone shuffled equal-count edges every run. Add (from, to) — a unique
     // tiebreaker — so the Dependencies section is stable.
     deps.sort_by(|a, b| {
-        b.import_count.cmp(&a.import_count)
+        b.import_count
+            .cmp(&a.import_count)
             .then_with(|| a.from.cmp(&b.from))
             .then_with(|| a.to.cmp(&b.to))
     });
@@ -224,7 +252,11 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
              LIMIT 20";
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([REL_ROUTES_TO], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?;
         for row in rows {
             let (handler, file, metadata) = row?;
@@ -239,7 +271,12 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
             } else {
                 "?".into()
             };
-            entry_points.push(EntryPoint { route, handler, file, kind: "http_route".into() });
+            entry_points.push(EntryPoint {
+                route,
+                handler,
+                file,
+                kind: "http_route".into(),
+            });
         }
     }
 
@@ -257,7 +294,12 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
         })?;
         for row in rows {
             let (name, file) = row?;
-            entry_points.push(EntryPoint { route: "main".into(), handler: name, file, kind: "main".into() });
+            entry_points.push(EntryPoint {
+                route: "main".into(),
+                handler: name,
+                file,
+                kind: "main".into(),
+            });
         }
     }
 
@@ -293,12 +335,23 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([REL_CALLS], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)? as usize, row.get::<_, i64>(4)? as usize))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? as usize,
+                row.get::<_, i64>(4)? as usize,
+            ))
         })?;
         for row in rows {
             let (name, node_type, file, count, test_count) = row?;
-            hot_functions.push(HotFunction { name, node_type, file, caller_count: count, test_caller_count: test_count });
+            hot_functions.push(HotFunction {
+                name,
+                node_type,
+                file,
+                caller_count: count,
+                test_caller_count: test_count,
+            });
         }
     }
 
@@ -307,8 +360,8 @@ pub fn get_project_map(conn: &Connection) -> Result<(Vec<ModuleStats>, Vec<Modul
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::helpers::test_db;
+    use super::*;
 
     #[test]
     fn test_project_map_excludes_external_and_counts_methods() {
@@ -324,20 +377,34 @@ mod tests {
         conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('<external>', 'h2', 0, 'python', 0)", []).unwrap();
         conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (2, 'trait', 'Drop', 'Drop', 0, 0, '')", []).unwrap();
         // svc.py imports the external symbol (should NOT become a `→ <root>` dep).
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (1, 4, 'imports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (1, 4, 'imports')",
+            [],
+        )
+        .unwrap();
 
         let (modules, deps, _eps, _hot) = get_project_map(conn).unwrap();
 
-        let src = modules.iter().find(|m| m.path == "src").expect("src module present");
+        let src = modules
+            .iter()
+            .find(|m| m.path == "src")
+            .expect("src module present");
         // class(1) + method(1) + function(1) — method must count toward the total.
-        assert_eq!(src.functions + src.classes + src.interfaces_traits, 3,
-            "symbol total must include the method");
+        assert_eq!(
+            src.functions + src.classes + src.interfaces_traits,
+            3,
+            "symbol total must include the method"
+        );
         // No module derived from the synthetic <external> bucket (dir_of → "<root>").
-        assert!(modules.iter().all(|m| m.path != "<root>"),
-            "external pseudo-file must not appear as a <root> module");
+        assert!(
+            modules.iter().all(|m| m.path != "<root>"),
+            "external pseudo-file must not appear as a <root> module"
+        );
         // The external import must not surface as an internal dependency.
-        assert!(deps.iter().all(|d| d.to != "<root>" && d.from != "<root>"),
-            "external import must not surface as a <root> dependency");
+        assert!(
+            deps.iter().all(|d| d.to != "<root>" && d.from != "<root>"),
+            "external import must not surface as a <root> dependency"
+        );
     }
 
     /// Regression: `get_project_map` module + dependency ordering must be
@@ -352,7 +419,13 @@ mod tests {
         let conn = db.conn();
         // Five single-function modules → all tie on function count (1); ordering
         // must fall to the path tiebreaker.
-        for (fid, dir) in [(1, "src/mod_a"), (2, "src/mod_b"), (3, "src/mod_c"), (4, "src/mod_d"), (5, "src/mod_e")] {
+        for (fid, dir) in [
+            (1, "src/mod_a"),
+            (2, "src/mod_b"),
+            (3, "src/mod_c"),
+            (4, "src/mod_d"),
+            (5, "src/mod_e"),
+        ] {
             conn.execute(
                 "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES (?1, ?2, 0, 'python', 0)",
                 rusqlite::params![format!("{dir}/x.py"), format!("h{fid}")],
@@ -363,22 +436,56 @@ mod tests {
             ).unwrap();
         }
         // mod_a and mod_b both import mod_e → two deps tying on import_count (1).
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (1, 5, 'imports')", []).unwrap();
-        conn.execute("INSERT INTO edges (source_id, target_id, relation) VALUES (2, 5, 'imports')", []).unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (1, 5, 'imports')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation) VALUES (2, 5, 'imports')",
+            [],
+        )
+        .unwrap();
 
         let (m1, d1, _, _) = get_project_map(conn).unwrap();
         let (m2, d2, _, _) = get_project_map(conn).unwrap();
 
-        let mpaths = |ms: &[ModuleStats]| ms.iter().map(|m| m.path.clone()).collect::<Vec<String>>();
-        assert_eq!(mpaths(&m1), mpaths(&m2), "module order must be deterministic across calls");
-        assert_eq!(mpaths(&m1), vec!["src/mod_a", "src/mod_b", "src/mod_c", "src/mod_d", "src/mod_e"],
-            "equal-function-count modules must be tie-broken by path ASC");
+        let mpaths =
+            |ms: &[ModuleStats]| ms.iter().map(|m| m.path.clone()).collect::<Vec<String>>();
+        assert_eq!(
+            mpaths(&m1),
+            mpaths(&m2),
+            "module order must be deterministic across calls"
+        );
+        assert_eq!(
+            mpaths(&m1),
+            vec![
+                "src/mod_a",
+                "src/mod_b",
+                "src/mod_c",
+                "src/mod_d",
+                "src/mod_e"
+            ],
+            "equal-function-count modules must be tie-broken by path ASC"
+        );
 
-        let dpairs = |ds: &[ModuleDep]| ds.iter().map(|d| (d.from.clone(), d.to.clone())).collect::<Vec<(String, String)>>();
-        assert_eq!(dpairs(&d1), dpairs(&d2), "dep order must be deterministic across calls");
-        assert_eq!(dpairs(&d1), vec![
-            ("src/mod_a".to_string(), "src/mod_e".to_string()),
-            ("src/mod_b".to_string(), "src/mod_e".to_string()),
-        ], "equal-import-count deps must be tie-broken by (from, to)");
+        let dpairs = |ds: &[ModuleDep]| {
+            ds.iter()
+                .map(|d| (d.from.clone(), d.to.clone()))
+                .collect::<Vec<(String, String)>>()
+        };
+        assert_eq!(
+            dpairs(&d1),
+            dpairs(&d2),
+            "dep order must be deterministic across calls"
+        );
+        assert_eq!(
+            dpairs(&d1),
+            vec![
+                ("src/mod_a".to_string(), "src/mod_e".to_string()),
+                ("src/mod_b".to_string(), "src/mod_e".to_string()),
+            ],
+            "equal-import-count deps must be tie-broken by (from, to)"
+        );
     }
 }

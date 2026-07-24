@@ -63,7 +63,8 @@ fn main() -> Result<()> {
         Some("incremental-index") => {
             // clap-migrated (audit #4): flags via clap; the git/index guard below
             // stays in main() (must precede indexing side effects, may skip entirely).
-            let idx_args = code_graph_mcp::cli::IncrementalIndexArgs::parse_from(args.iter().skip(1));
+            let idx_args =
+                code_graph_mcp::cli::IncrementalIndexArgs::parse_from(args.iter().skip(1));
             let quiet = idx_args.quiet;
             let no_embed = idx_args.no_embed;
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
@@ -91,7 +92,8 @@ fn main() -> Result<()> {
         }
         Some("rebuild-index") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let rebuild_args = code_graph_mcp::cli::RebuildIndexArgs::parse_from(args.iter().skip(1));
+            let rebuild_args =
+                code_graph_mcp::cli::RebuildIndexArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_rebuild_index(&project_root, rebuild_args)
         }
         Some("reindex") => {
@@ -127,12 +129,14 @@ fn main() -> Result<()> {
         }
         Some("ast-search" | "ast_search") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let ast_search_args = code_graph_mcp::cli::AstSearchArgs::parse_from(args.iter().skip(1));
+            let ast_search_args =
+                code_graph_mcp::cli::AstSearchArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_ast_search(&project_root, ast_search_args)
         }
         Some("callgraph" | "get_call_graph") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let callgraph_args = code_graph_mcp::cli::CallgraphArgs::parse_from(args.iter().skip(1));
+            let callgraph_args =
+                code_graph_mcp::cli::CallgraphArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_callgraph(&project_root, callgraph_args)
         }
         Some("impact" | "impact_analysis") => {
@@ -192,7 +196,8 @@ fn main() -> Result<()> {
         }
         Some("centrality") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let centrality_args = code_graph_mcp::cli::CentralityArgs::parse_from(args.iter().skip(1));
+            let centrality_args =
+                code_graph_mcp::cli::CentralityArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_centrality(&project_root, centrality_args)
         }
         Some("cycles") => {
@@ -202,7 +207,8 @@ fn main() -> Result<()> {
         }
         Some("surprising") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let surprising_args = code_graph_mcp::cli::SurprisingArgs::parse_from(args.iter().skip(1));
+            let surprising_args =
+                code_graph_mcp::cli::SurprisingArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::cli::cmd_surprising(&project_root, surprising_args)
         }
         Some("report") => {
@@ -225,7 +231,8 @@ fn main() -> Result<()> {
         }
         Some("outcome") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            let outcome_args = code_graph_mcp::outcome::OutcomeArgs::parse_from(args.iter().skip(1));
+            let outcome_args =
+                code_graph_mcp::outcome::OutcomeArgs::parse_from(args.iter().skip(1));
             code_graph_mcp::outcome::cmd_outcome(&project_root, outcome_args)
         }
         Some("doctor") => {
@@ -244,7 +251,14 @@ fn main() -> Result<()> {
                 );
                 Ok(())
             } else {
-                run_node_script("doctor.js", &args.iter().filter(|a| a.as_str() == "--check-only").cloned().collect::<Vec<_>>())
+                run_node_script(
+                    "doctor.js",
+                    &args
+                        .iter()
+                        .filter(|a| a.as_str() == "--check-only")
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
             }
         }
         Some("adopt") => {
@@ -328,7 +342,9 @@ fn print_help() {
     println!("    ast-search [query]  Structured search with --type/--returns/--params filters");
     println!("    callgraph <symbol>  Show call graph (callers/callees)");
     println!("    impact <symbol>     Impact analysis (callers, routes, risk level)");
-    println!("    affected [files...] Changed files → test files to re-run (--stdin, --depth, --json)");
+    println!(
+        "    affected [files...] Changed files → test files to re-run (--stdin, --depth, --json)"
+    );
     println!("    show <symbol>       Show symbol details (code, type, signature)");
     println!("    map                 Project architecture map (modules, deps, entry points)");
     println!("    tour [path]         Dependency-ordered reading order (where to start reading a repo/subtree)");
@@ -338,16 +354,22 @@ fn print_help() {
     println!("    similar <symbol>    Find semantically similar code (requires embeddings)");
     println!("    refs <symbol>       Find all references to a symbol (callers, importers, etc.)");
     println!("    dead-code [path]    Find unused code (orphans and exported-unused symbols)");
-    println!("    centrality          Rank architectural chokepoints (betweenness over the call graph)");
+    println!(
+        "    centrality          Rank architectural chokepoints (betweenness over the call graph)"
+    );
     println!("    cycles              Detect circular import dependencies (file-level)");
     println!("    surprising          Surface unexpected cross-module couplings (uncertain edges)");
     println!("    report              Consolidated code-health report (summary + all analyses)");
     println!("    incremental-index   Run incremental index update");
-    println!("    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)");
+    println!(
+        "    rebuild-index       Drop and rebuild the index from scratch (requires --confirm)"
+    );
     println!("    reindex [--from-snapshot]");
     println!("                        Incremental index refresh. With --from-snapshot, drop the");
     println!("                        index and refetch the published snapshot (full rebuild if");
-    println!("                        unavailable). For an unconditional rebuild use rebuild-index.");
+    println!(
+        "                        unavailable). For an unconditional rebuild use rebuild-index."
+    );
     println!("    health-check        Query index status");
     println!("                        (Note: file watcher start/stop is MCP-only — see start_watch/stop_watch tools)");
     println!("    doctor              Diagnose and repair environment issues");
@@ -364,16 +386,22 @@ fn print_help() {
     println!("                        Print snapshot metadata as JSON (accepts .db or .db.zst)\n");
     println!("OPTIONS:");
     println!("    --json              JSON output (available on all commands)");
-    println!("    --compact           Compact output (search, callgraph, map, overview, deps, refs)");
+    println!(
+        "    --compact           Compact output (search, callgraph, map, overview, deps, refs)"
+    );
     println!("    --limit N           Limit results (search/ast-search default: 20; centrality default: 15; similar default: 5, alias of --top-k)");
     println!("    --language <lang>   Filter by language (search)");
     println!("    --node-type <type>  Filter by node type (search)");
     println!("    --type <type>       Filter by node type: fn, class, struct, enum, trait, ...");
     println!("    --returns <type>    Filter by return type (ast-search)");
     println!("    --params <text>     Filter by parameter text (ast-search)");
-    println!("    --direction <dir>   callers|callees|both (callgraph), outgoing|incoming|both (deps)");
+    println!(
+        "    --direction <dir>   callers|callees|both (callgraph), outgoing|incoming|both (deps)"
+    );
     println!("    --depth N           Max traversal depth (callgraph, impact, deps; default: 3)");
-    println!("    --file <path>       Disambiguate same-name symbols (callgraph, impact, show, refs)");
+    println!(
+        "    --file <path>       Disambiguate same-name symbols (callgraph, impact, show, refs)"
+    );
     println!("    --node-id N         Lookup by node ID (show, similar)");
     println!("    --change-type <t>   signature, behavior, or remove (impact; default: behavior)");
     println!("    --include-tests     Show test callers / include test symbols (callgraph, show, centrality; hidden by default)");
@@ -433,7 +461,11 @@ fn run_serve() -> Result<()> {
     let server = code_graph_mcp::mcp::server::McpServer::from_project_root(&project_root)?;
     let session_start = std::time::Instant::now();
 
-    tracing::info!("[session] Started v{}, project: {}", env!("CARGO_PKG_VERSION"), project_root.display());
+    tracing::info!(
+        "[session] Started v{}, project: {}",
+        env!("CARGO_PKG_VERSION"),
+        project_root.display()
+    );
 
     // Shared stdout handle: prevents interleaved JSON when background threads
     // send notifications concurrently with the main loop writing responses.
@@ -454,7 +486,10 @@ fn run_serve() -> Result<()> {
         // Err(InvalidData) and the `?` propagates OUTSIDE the per-request
         // catch_unwind below — a single oversized CJK request would kill the whole
         // long-lived session (H3). `read_until` + lossy decode tolerate it.
-        let n = reader.by_ref().take(MAX_MESSAGE_SIZE as u64).read_until(b'\n', &mut byte_buf)?;
+        let n = reader
+            .by_ref()
+            .take(MAX_MESSAGE_SIZE as u64)
+            .read_until(b'\n', &mut byte_buf)?;
         if n == 0 {
             break; // EOF
         }
@@ -475,7 +510,9 @@ fn run_serve() -> Result<()> {
             let mut sink: Vec<u8> = Vec::new();
             loop {
                 sink.clear();
-                let drained = reader.by_ref().take(MAX_MESSAGE_SIZE as u64)
+                let drained = reader
+                    .by_ref()
+                    .take(MAX_MESSAGE_SIZE as u64)
                     .read_until(b'\n', &mut sink)
                     .unwrap_or(0);
                 // EOF (nothing left) or we consumed through the newline → done.
@@ -516,18 +553,23 @@ fn run_serve() -> Result<()> {
         })) {
             Ok(r) => r,
             Err(panic) => {
-                let msg = panic.downcast_ref::<&str>().map(|s| (*s).to_string())
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "handler panicked".to_string());
                 tracing::error!("Panic handling message: {}", msg);
-                Ok(Some(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": code_graph_mcp::mcp::protocol::JSONRPC_INTERNAL_ERROR,
-                        "message": format!("Internal error (panic): {}", msg)
-                    }
-                }).to_string()))
+                Ok(Some(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": code_graph_mcp::mcp::protocol::JSONRPC_INTERNAL_ERROR,
+                            "message": format!("Internal error (panic): {}", msg)
+                        }
+                    })
+                    .to_string(),
+                ))
             }
         };
 
@@ -564,7 +606,9 @@ fn run_serve() -> Result<()> {
         if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             server.run_startup_tasks();
         })) {
-            let msg = panic.downcast_ref::<&str>().map(|s| (*s).to_string())
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "startup task panicked".to_string());
             eprintln!("[code-graph] Panic in startup tasks (continuing): {}", msg);
@@ -573,21 +617,58 @@ fn run_serve() -> Result<()> {
     }
 
     server.flush_metrics();
-    tracing::info!("[session] Ended after {:.0}s", session_start.elapsed().as_secs_f64());
+    tracing::info!(
+        "[session] Ended after {:.0}s",
+        session_start.elapsed().as_secs_f64()
+    );
 
     Ok(())
 }
 
 const SUBCOMMANDS: &[&str] = &[
-    "serve", "grep", "search", "ast-search", "callgraph", "impact",
-    "show", "map", "overview", "deps", "trace", "similar", "refs",
-    "dead-code", "incremental-index", "rebuild-index", "reindex", "health-check", "doctor",
-    "centrality", "cycles", "surprising", "report", "benchmark", "stats", "outcome", "adopt", "unadopt", "snapshot",
+    "serve",
+    "grep",
+    "search",
+    "ast-search",
+    "callgraph",
+    "impact",
+    "show",
+    "map",
+    "overview",
+    "deps",
+    "trace",
+    "similar",
+    "refs",
+    "dead-code",
+    "incremental-index",
+    "rebuild-index",
+    "reindex",
+    "health-check",
+    "doctor",
+    "centrality",
+    "cycles",
+    "surprising",
+    "report",
+    "benchmark",
+    "stats",
+    "outcome",
+    "adopt",
+    "unadopt",
+    "snapshot",
     // MCP tool names accepted as aliases (see dispatch above). Listed here so
     // typo-suggester picks the closer alias for inputs like "project_mapp".
-    "project_map", "module_overview", "get_ast_node", "find_references",
-    "get_call_graph", "impact_analysis", "find_similar_code", "dependency_graph",
-    "trace_http_chain", "find_dead_code", "ast_search", "semantic_code_search",
+    "project_map",
+    "module_overview",
+    "get_ast_node",
+    "find_references",
+    "get_call_graph",
+    "impact_analysis",
+    "find_similar_code",
+    "dependency_graph",
+    "trace_http_chain",
+    "find_dead_code",
+    "ast_search",
+    "semantic_code_search",
 ];
 
 /// Locate and exec a node script under claude-plugin/scripts/.
@@ -626,7 +707,9 @@ fn run_node_script(script: &str, extra_args: &[String]) -> Result<()> {
         if candidate.exists() {
             let mut cmd = std::process::Command::new("node");
             cmd.arg(candidate);
-            for a in extra_args { cmd.arg(a); }
+            for a in extra_args {
+                cmd.arg(a);
+            }
             let status = cmd.status().map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     anyhow::anyhow!("Node.js not found. Install Node.js to use this subcommand.")
@@ -695,7 +778,10 @@ mod tests {
             panic!("poison the stdout mutex");
         })
         .join();
-        assert!(m.lock().is_err(), "mutex must be poisoned for this test to mean anything");
+        assert!(
+            m.lock().is_err(),
+            "mutex must be poisoned for this test to mean anything"
+        );
         // The plain `.lock().unwrap()` the old code used would panic here; lock_stdout
         // recovers the guard and returns normally.
         let _guard = lock_stdout(&m);

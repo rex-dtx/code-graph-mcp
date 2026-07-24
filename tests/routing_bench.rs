@@ -102,47 +102,101 @@ Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
 const ORACLE: &[(&str, &str)] = &[
     // project_map
     ("Show me the project architecture", "project_map"),
-    ("Give me a high-level overview of this codebase", "project_map"),
-    ("Which modules depend on which at the top level?", "project_map"),
+    (
+        "Give me a high-level overview of this codebase",
+        "project_map",
+    ),
+    (
+        "Which modules depend on which at the top level?",
+        "project_map",
+    ),
     // module_overview
     ("What's in the src/indexer/ directory?", "module_overview"),
-    ("Show me what's exported from src/storage/", "module_overview"),
-    ("Give me an overview of the parser module", "module_overview"),
+    (
+        "Show me what's exported from src/storage/",
+        "module_overview",
+    ),
+    (
+        "Give me an overview of the parser module",
+        "module_overview",
+    ),
     // semantic_code_search
-    ("Find the code that does reciprocal rank fusion", "semantic_code_search"),
-    ("Where is the embedding model loaded from disk?", "semantic_code_search"),
-    ("Show me code related to change detection via Merkle hashing", "semantic_code_search"),
+    (
+        "Find the code that does reciprocal rank fusion",
+        "semantic_code_search",
+    ),
+    (
+        "Where is the embedding model loaded from disk?",
+        "semantic_code_search",
+    ),
+    (
+        "Show me code related to change detection via Merkle hashing",
+        "semantic_code_search",
+    ),
     // get_call_graph
     // Alternates accepted: at depth=1, find_references with relation=calls
     // returns the same callers list as get_call_graph. Pinning a single answer
     // over-fits the oracle — semantic equivalence both routes are correct.
-    ("Who calls the function ensure_indexed?", "get_call_graph|find_references"),
-    ("What does run_full_index call during execution?", "get_call_graph"),
-    ("Trace the call chain around extract_relations", "get_call_graph"),
+    (
+        "Who calls the function ensure_indexed?",
+        "get_call_graph|find_references",
+    ),
+    (
+        "What does run_full_index call during execution?",
+        "get_call_graph",
+    ),
+    (
+        "Trace the call chain around extract_relations",
+        "get_call_graph",
+    ),
     // find_references
-    ("Find all references to the constant REL_CALLS", "find_references"),
-    ("Is it safe to remove compute_diff? Show all usage sites.", "find_references"),
+    (
+        "Find all references to the constant REL_CALLS",
+        "find_references",
+    ),
+    (
+        "Is it safe to remove compute_diff? Show all usage sites.",
+        "find_references",
+    ),
     // ast_search
     ("Find all functions that return Vec<Relation>", "ast_search"),
     ("List all structs in the storage module", "ast_search"),
-    ("Which functions take a tree_sitter::Node as a parameter?", "ast_search"),
+    (
+        "Which functions take a tree_sitter::Node as a parameter?",
+        "ast_search",
+    ),
     // get_ast_node
-    ("Show me the EmbeddingModel struct definition", "get_ast_node"),
-    ("What's the signature of weighted_rrf_fusion?", "get_ast_node"),
-    ("Display the implementation of format_call_graph_response", "get_ast_node"),
+    (
+        "Show me the EmbeddingModel struct definition",
+        "get_ast_node",
+    ),
+    (
+        "What's the signature of weighted_rrf_fusion?",
+        "get_ast_node",
+    ),
+    (
+        "Display the implementation of format_call_graph_response",
+        "get_ast_node",
+    ),
     // v0.17.0 — description-tightening regression guards.
     // semantic_code_search now says "If module path is known, prefer
     // module_overview". This query bait-tests that hint: it has both a
     // concept word ("pipeline") AND an explicit module path. Pre-tightening
     // it would route to semantic_code_search; post-tightening it should
     // settle on module_overview.
-    ("How does the embedding pipeline work in src/embedding/?", "module_overview"),
+    (
+        "How does the embedding pipeline work in src/embedding/?",
+        "module_overview",
+    ),
     // find_references now says "For plain literals (string/regex), prefer
     // Grep". In tool-only mode the bench cannot register Grep as a decoy
     // (only context-rich mode adds Grep+Read decoys); regardless, this
     // query asserts the rename-audit phrasing still hits find_references
     // — the intent we want to preserve through the tightening.
-    ("I need to rename parse_tree to parse_ast — find every place I'd update.", "find_references"),
+    (
+        "I need to rename parse_tree to parse_ast — find every place I'd update.",
+        "find_references",
+    ),
 ];
 
 /// Frontend (JS/TS/Vue/React) phrasing of the same 7 tool intents. Activated
@@ -156,31 +210,67 @@ const ORACLE: &[(&str, &str)] = &[
 const FRONTEND_ORACLE: &[(&str, &str)] = &[
     // project_map
     ("Show me the architecture of this React app", "project_map"),
-    ("Give me a high-level map of this Vue project", "project_map"),
+    (
+        "Give me a high-level map of this Vue project",
+        "project_map",
+    ),
     ("Which top-level features depend on which?", "project_map"),
     // module_overview
-    ("What's in the src/components/ directory?", "module_overview"),
+    (
+        "What's in the src/components/ directory?",
+        "module_overview",
+    ),
     ("Show me what's exported from src/hooks/", "module_overview"),
-    ("Give me an overview of the auth feature module", "module_overview"),
+    (
+        "Give me an overview of the auth feature module",
+        "module_overview",
+    ),
     // semantic_code_search
-    ("Find the code that handles user login state", "semantic_code_search"),
+    (
+        "Find the code that handles user login state",
+        "semantic_code_search",
+    ),
     ("Where is the Redux store wired up?", "semantic_code_search"),
-    ("Show me code that debounces search input", "semantic_code_search"),
+    (
+        "Show me code that debounces search input",
+        "semantic_code_search",
+    ),
     // get_call_graph
-    ("Who calls the function fetchUserProfile?", "get_call_graph|find_references"),
-    ("What does handleSubmit invoke during execution?", "get_call_graph"),
-    ("Trace the call chain around dispatch in the reducer", "get_call_graph"),
+    (
+        "Who calls the function fetchUserProfile?",
+        "get_call_graph|find_references",
+    ),
+    (
+        "What does handleSubmit invoke during execution?",
+        "get_call_graph",
+    ),
+    (
+        "Trace the call chain around dispatch in the reducer",
+        "get_call_graph",
+    ),
     // find_references
-    ("Find every place that imports the Button component", "find_references"),
-    ("Is it safe to delete useDebounce? Show all usage sites.", "find_references"),
+    (
+        "Find every place that imports the Button component",
+        "find_references",
+    ),
+    (
+        "Is it safe to delete useDebounce? Show all usage sites.",
+        "find_references",
+    ),
     // ast_search
     ("Find all functions that return Promise<User>", "ast_search"),
     ("List all React components in src/components/", "ast_search"),
-    ("Which functions take a useEffect dependency array as a parameter?", "ast_search"),
+    (
+        "Which functions take a useEffect dependency array as a parameter?",
+        "ast_search",
+    ),
     // get_ast_node
     ("Show me the LoginForm component definition", "get_ast_node"),
     ("What's the signature of the useAuth hook?", "get_ast_node"),
-    ("Display the implementation of getAuthHeaders", "get_ast_node"),
+    (
+        "Display the implementation of getAuthHeaders",
+        "get_ast_node",
+    ),
 ];
 
 /// System prompt for trigger-rate mode. Unlike `SYSTEM_PROMPT` it does NOT
@@ -230,22 +320,17 @@ const TRIGGER_ORACLE: &[(&str, &str)] = &[
     ("今天的报告数据不准", "__CG__"),
     ("test 又挂了", "__CG__"),
     ("有 bug，帮我看看", "__CG__"),
-
     // ===== Misleading "use grep/find" framing =====
     ("用 grep 找一下为什么 user 数据没更新", "__CG__"),
     ("find 一下哪里写错了", "__CG__"),
-
     // ===== Answer-flavored guess (model should verify, not agree) =====
     ("应该是 cleanup 那段没等完吧", "__CG__"),
     ("是不是 cache 没刷", "__CG__"),
-
     // ===== Generic feature reference, no path/symbol =====
     ("看一下用户登录是怎么实现的", "__CG__"),
     ("准备重构 error handling，影响大不大", "__CG__"),
-
     // ===== English sloppy =====
     ("Why does this not work?", "__CG__"),
-
     // ===== Decoy preservation — must stay on Bash/Grep/Read =====
     ("Read the contents of CHANGELOG.md", "__DECOY__"),
     ("Search for literal 'FIXME' across the repo", "__DECOY__"),
@@ -257,13 +342,22 @@ const TRIGGER_ORACLE: &[(&str, &str)] = &[
 /// mode to compute FP-rate (boundary-leak rate into code-graph).
 const FP_ORACLE: &[(&str, &str)] = &[
     ("Find every TODO comment in source files.", "Grep"),
-    ("Search for the literal string `FIXME` across the codebase.", "Grep"),
+    (
+        "Search for the literal string `FIXME` across the codebase.",
+        "Grep",
+    ),
     ("Show me lines 50 through 80 of src/main.rs.", "Read"),
     ("What does the .gitignore file contain?", "Read"),
     ("Print the first 100 lines of CHANGELOG.md.", "Read"),
-    ("Search for all occurrences of the regex `error\\d+` in log files.", "Grep"),
+    (
+        "Search for all occurrences of the regex `error\\d+` in log files.",
+        "Grep",
+    ),
     ("Read the contents of Cargo.toml.", "Read"),
-    ("Find every line that mentions `deprecated` in comments.", "Grep"),
+    (
+        "Find every line that mentions `deprecated` in comments.",
+        "Grep",
+    ),
     ("Show me the contents of build.rs.", "Read"),
     ("Grep for the regex pattern `^test_` in test files.", "Grep"),
 ];
@@ -283,7 +377,9 @@ impl Backend {
 }
 
 fn detect_backend() -> Option<Backend> {
-    let model_override = std::env::var("ROUTING_BENCH_MODEL").ok().filter(|s| !s.is_empty());
+    let model_override = std::env::var("ROUTING_BENCH_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty());
     if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
         if !k.is_empty() {
             return Some(Backend::Anthropic {
@@ -324,13 +420,21 @@ fn build_backends(
         return Vec::new();
     }
     if let Some(k) = anthropic_key.filter(|s| !s.is_empty()) {
-        return models.into_iter()
-            .map(|m| Backend::Anthropic { key: k.to_string(), model: m })
+        return models
+            .into_iter()
+            .map(|m| Backend::Anthropic {
+                key: k.to_string(),
+                model: m,
+            })
             .collect();
     }
     if let Some(k) = openrouter_key.filter(|s| !s.is_empty()) {
-        return models.into_iter()
-            .map(|m| Backend::OpenRouter { key: k.to_string(), model: m })
+        return models
+            .into_iter()
+            .map(|m| Backend::OpenRouter {
+                key: k.to_string(),
+                model: m,
+            })
             .collect();
     }
     Vec::new()
@@ -351,7 +455,8 @@ fn build_backends(
 ///   - set with at least one non-empty model → returns that list of backends
 ///   - set but no API key → returns empty (caller should skip the test)
 pub(crate) fn detect_backends() -> Vec<Backend> {
-    let models_env = std::env::var("ROUTING_BENCH_MODELS").ok()
+    let models_env = std::env::var("ROUTING_BENCH_MODELS")
+        .ok()
         .filter(|s| !s.is_empty());
     let Some(models_str) = models_env else {
         return detect_backend().into_iter().collect();
@@ -394,7 +499,8 @@ fn call_backend(
                 "tool_choice": tool_choice,
                 "messages": [{ "role": "user", "content": query }],
             });
-            let resp = client.post("https://api.anthropic.com/v1/messages")
+            let resp = client
+                .post("https://api.anthropic.com/v1/messages")
                 .header("x-api-key", key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
@@ -402,7 +508,11 @@ fn call_backend(
                 .send()
                 .expect("POST to Anthropic API");
             if !resp.status().is_success() {
-                panic!("Anthropic API {}: {}", resp.status(), resp.text().unwrap_or_default());
+                panic!(
+                    "Anthropic API {}: {}",
+                    resp.status(),
+                    resp.text().unwrap_or_default()
+                );
             }
             let json_resp: Value = resp.json().expect("parse Anthropic JSON");
             json_resp["content"]
@@ -414,14 +524,19 @@ fn call_backend(
         Backend::OpenRouter { key, model } => {
             // Convert Anthropic-style {name, description, input_schema} tools to
             // OpenAI function-calling format {type, function: {name, description, parameters}}.
-            let openai_tools: Vec<Value> = tools.iter().map(|t| json!({
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["input_schema"],
-                }
-            })).collect();
+            let openai_tools: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t["name"],
+                            "description": t["description"],
+                            "parameters": t["input_schema"],
+                        }
+                    })
+                })
+                .collect();
             let tool_choice = if force_tool { "required" } else { "auto" };
             let body = json!({
                 "model": model,
@@ -434,7 +549,8 @@ fn call_backend(
                     { "role": "user",   "content": query },
                 ],
             });
-            let resp = client.post("https://openrouter.ai/api/v1/chat/completions")
+            let resp = client
+                .post("https://openrouter.ai/api/v1/chat/completions")
                 .header("authorization", format!("Bearer {}", key))
                 .header("content-type", "application/json")
                 .header("http-referer", "https://github.com/sdsrss/code-graph-mcp")
@@ -443,7 +559,11 @@ fn call_backend(
                 .send()
                 .expect("POST to OpenRouter");
             if !resp.status().is_success() {
-                panic!("OpenRouter API {}: {}", resp.status(), resp.text().unwrap_or_default());
+                panic!(
+                    "OpenRouter API {}: {}",
+                    resp.status(),
+                    resp.text().unwrap_or_default()
+                );
             }
             let json_resp: Value = resp.json().expect("parse OpenRouter JSON");
             // OpenAI shape: choices[0].message.tool_calls[0].function.name
@@ -463,26 +583,35 @@ fn call_backend(
 fn routing_recall_benchmark() {
     let backends = detect_backends();
     if backends.is_empty() {
-        eprintln!("[routing_bench] Neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY set — skipping.");
+        eprintln!(
+            "[routing_bench] Neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY set — skipping."
+        );
         return;
     }
     let mode = detect_mode();
     let domain = detect_domain();
     eprintln!(
         "[routing_bench] backends=[{}] mode={:?} domain={:?}",
-        backends.iter().map(|b| b.label()).collect::<Vec<_>>().join(", "),
-        mode, domain,
+        backends
+            .iter()
+            .map(|b| b.label())
+            .collect::<Vec<_>>()
+            .join(", "),
+        mode,
+        domain,
     );
 
     let registry = ToolRegistry::new();
     let registry_tools: Vec<Value> = registry
         .list_tools()
         .iter()
-        .map(|t| json!({
-            "name": t.name,
-            "description": t.description,
-            "input_schema": t.input_schema,
-        }))
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            })
+        })
         .collect();
     assert!(!registry_tools.is_empty(), "ToolRegistry returned no tools");
 
@@ -493,7 +622,10 @@ fn routing_recall_benchmark() {
     // Code-graph tool names from the live registry; used by TriggerRate mode
     // to classify each pick as code-graph / decoy / none.
     let cg_names: Vec<&str> = registry
-        .list_tools().iter().map(|t| t.name.as_str()).collect();
+        .list_tools()
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
     // TriggerRate uses `tool_choice: auto` so we can observe "model chose no
     // tool"; recall modes force `tool_choice: any/required`.
     let force_tool = !matches!(mode, BenchMode::TriggerRate);
@@ -521,9 +653,17 @@ fn routing_recall_benchmark() {
         for &(query, expected) in &oracle {
             let mut run_picks: Vec<Option<String>> = Vec::with_capacity(RUNS);
             for _ in 0..RUNS {
-                run_picks.push(call_backend(&client, backend, &tools, &system_prompt, query, force_tool));
+                run_picks.push(call_backend(
+                    &client,
+                    backend,
+                    &tools,
+                    &system_prompt,
+                    query,
+                    force_tool,
+                ));
             }
-            let pick_strs: Vec<&str> = run_picks.iter()
+            let pick_strs: Vec<&str> = run_picks
+                .iter()
                 .map(|p| p.as_deref().unwrap_or("(none)"))
                 .collect();
             let voted = majority_vote(&pick_strs).unwrap_or_else(|| "(none)".to_string());
@@ -609,17 +749,32 @@ fn routing_recall_benchmark() {
         if !matches!(mode, BenchMode::TriggerRate) && headline_recall < P_AT_1_THRESHOLD {
             any_below_threshold.push(format!(
                 "{}: {:.1}% ({} misses)",
-                backend.label(), headline_recall * 100.0, all_misses.len(),
+                backend.label(),
+                headline_recall * 100.0,
+                all_misses.len(),
             ));
         }
     }
 
     // Multi-model summary table when more than one backend ran.
     if backends.len() > 1 {
-        eprintln!("\n=== Multi-model P@1 summary (threshold {:.0}%) ===", P_AT_1_THRESHOLD * 100.0);
+        eprintln!(
+            "\n=== Multi-model P@1 summary (threshold {:.0}%) ===",
+            P_AT_1_THRESHOLD * 100.0
+        );
         for (label, recall, misses) in &all_results {
-            let marker = if *recall >= P_AT_1_THRESHOLD { "PASS" } else { "FAIL" };
-            eprintln!("  [{}] {:<40} {:.1}%  ({} miss)", marker, label, recall * 100.0, misses);
+            let marker = if *recall >= P_AT_1_THRESHOLD {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            eprintln!(
+                "  [{}] {:<40} {:.1}%  ({} miss)",
+                marker,
+                label,
+                recall * 100.0,
+                misses
+            );
         }
     }
 
@@ -647,9 +802,11 @@ fn print_per_domain_recall(domain: BenchDomain, picks: &HashMap<String, String>)
     eprintln!(
         "  Backend recall  = {:.1}% ({}/{})\n  Frontend recall = {:.1}% ({}/{})",
         be * 100.0,
-        (be * ORACLE.len() as f64).round() as usize, ORACLE.len(),
+        (be * ORACLE.len() as f64).round() as usize,
+        ORACLE.len(),
         fe * 100.0,
-        (fe * FRONTEND_ORACLE.len() as f64).round() as usize, FRONTEND_ORACLE.len(),
+        (fe * FRONTEND_ORACLE.len() as f64).round() as usize,
+        FRONTEND_ORACLE.len(),
     );
 }
 
@@ -854,8 +1011,14 @@ fn compute_recall(picks: &HashMap<String, String>, oracle: &[(&str, &str)]) -> f
     if oracle.is_empty() {
         return 0.0;
     }
-    let hits = oracle.iter()
-        .filter(|(q, exp)| picks.get(*q).map(|p| matches_expected(p, exp)).unwrap_or(false))
+    let hits = oracle
+        .iter()
+        .filter(|(q, exp)| {
+            picks
+                .get(*q)
+                .map(|p| matches_expected(p, exp))
+                .unwrap_or(false)
+        })
         .count();
     hits as f64 / oracle.len() as f64
 }
@@ -865,7 +1028,8 @@ fn compute_recall(picks: &HashMap<String, String>, oracle: &[(&str, &str)]) -> f
 /// Note: picking the *wrong* decoy (Read when Grep expected) is NOT a FP —
 /// the boundary held, only the specific decoy was off.
 fn compute_fp_rate(picks: &HashMap<String, String>) -> f64 {
-    let violations = FP_ORACLE.iter()
+    let violations = FP_ORACLE
+        .iter()
         .filter(|(q, _expected_decoy)| {
             let picked = picks.get(*q).map(|s| s.as_str()).unwrap_or("(none)");
             !["Grep", "Read"].contains(&picked)
@@ -923,10 +1087,16 @@ fn compute_trigger_metrics(
     cg_names: &[&str],
 ) -> TriggerMetrics {
     let mut m = TriggerMetrics {
-        cg_total: 0, trigger_hits: 0, cg_no_tool: 0,
-        decoy_total: 0, decoy_preserved: 0, decoy_leak: 0,
-        trigger_rate: 0.0, no_tool_rate: 0.0,
-        decoy_preserved_rate: 0.0, decoy_leak_rate: 0.0,
+        cg_total: 0,
+        trigger_hits: 0,
+        cg_no_tool: 0,
+        decoy_total: 0,
+        decoy_preserved: 0,
+        decoy_leak: 0,
+        trigger_rate: 0.0,
+        no_tool_rate: 0.0,
+        decoy_preserved_rate: 0.0,
+        decoy_leak_rate: 0.0,
     };
     for &(q, class) in oracle {
         let pick = picks.get(q).map(|s| s.as_str()).unwrap_or("(none)");
@@ -936,13 +1106,21 @@ fn compute_trigger_metrics(
         match class {
             "__CG__" => {
                 m.cg_total += 1;
-                if is_cg { m.trigger_hits += 1; }
-                if is_none { m.cg_no_tool += 1; }
+                if is_cg {
+                    m.trigger_hits += 1;
+                }
+                if is_none {
+                    m.cg_no_tool += 1;
+                }
             }
             "__DECOY__" => {
                 m.decoy_total += 1;
-                if is_decoy || is_none { m.decoy_preserved += 1; }
-                if is_cg { m.decoy_leak += 1; }
+                if is_decoy || is_none {
+                    m.decoy_preserved += 1;
+                }
+                if is_cg {
+                    m.decoy_leak += 1;
+                }
             }
             _ => {}
         }
@@ -963,10 +1141,17 @@ fn compute_trigger_metrics(
 /// picks as good (boundary held). Use recall and fp_rate separately for
 /// candidate comparison.
 fn compute_overall(picks: &HashMap<String, String>, oracle: &[(&str, &str)]) -> f64 {
-    let recall_hits = oracle.iter()
-        .filter(|(q, exp)| picks.get(*q).map(|p| matches_expected(p, exp)).unwrap_or(false))
+    let recall_hits = oracle
+        .iter()
+        .filter(|(q, exp)| {
+            picks
+                .get(*q)
+                .map(|p| matches_expected(p, exp))
+                .unwrap_or(false)
+        })
         .count();
-    let fp_violations = FP_ORACLE.iter()
+    let fp_violations = FP_ORACLE
+        .iter()
         .filter(|(q, _)| {
             let picked = picks.get(*q).map(|s| s.as_str()).unwrap_or("(none)");
             !["Grep", "Read"].contains(&picked)
@@ -1033,15 +1218,21 @@ fn steering_block_drift_check() {
 /// without an API key.
 fn assert_oracle_covers_registry(pool_name: &str, oracle: &[(&'static str, &'static str)]) {
     let registry = ToolRegistry::new();
-    let names: std::collections::HashSet<&str> = registry.list_tools().iter()
-        .map(|t| t.name.as_str()).collect();
+    let names: std::collections::HashSet<&str> = registry
+        .list_tools()
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
     let mut covered: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for &(query, expected) in oracle {
         for alt in expected.split('|') {
             assert!(
                 names.contains(alt),
                 "[{}] Oracle references unknown tool '{}' (query='{}'). Registry has: {:?}",
-                pool_name, alt, query, names,
+                pool_name,
+                alt,
+                query,
+                names,
             );
             covered.insert(alt);
         }
@@ -1050,7 +1241,8 @@ fn assert_oracle_covers_registry(pool_name: &str, oracle: &[(&'static str, &'sta
         assert!(
             covered.contains(name),
             "[{}] Tool '{}' has no oracle coverage — add at least one query.",
-            pool_name, name,
+            pool_name,
+            name,
         );
     }
 }
@@ -1087,7 +1279,10 @@ fn trigger_oracle_well_formed() {
             other => panic!("unknown TRIGGER_ORACLE class {:?} (query={:?})", other, q),
         }
     }
-    assert!(has_cg && has_decoy, "TRIGGER_ORACLE must include both __CG__ and __DECOY__ classes");
+    assert!(
+        has_cg && has_decoy,
+        "TRIGGER_ORACLE must include both __CG__ and __DECOY__ classes"
+    );
 }
 
 /// Drift check: every tool registered in `ToolRegistry` must be referenced
@@ -1123,7 +1318,8 @@ fn decision_table_covers_registry() {
         missing.is_empty(),
         "Decision-table drift: {} tool(s) registered in ToolRegistry but absent from \
          claude-plugin/templates/plugin_code_graph_mcp.md — add a row for: {:?}",
-        missing.len(), missing,
+        missing.len(),
+        missing,
     );
 }
 
@@ -1190,12 +1386,18 @@ mod domain_tests {
 
     #[test]
     fn detect_domain_explicit_backend() {
-        assert!(matches!(detect_domain_for(Some("backend")), BenchDomain::Backend));
+        assert!(matches!(
+            detect_domain_for(Some("backend")),
+            BenchDomain::Backend
+        ));
     }
 
     #[test]
     fn detect_domain_explicit_frontend() {
-        assert!(matches!(detect_domain_for(Some("frontend")), BenchDomain::Frontend));
+        assert!(matches!(
+            detect_domain_for(Some("frontend")),
+            BenchDomain::Frontend
+        ));
     }
 
     #[test]
@@ -1205,7 +1407,10 @@ mod domain_tests {
 
     #[test]
     fn detect_domain_unknown_value_falls_back_to_backend() {
-        assert!(matches!(detect_domain_for(Some("nonsense")), BenchDomain::Backend));
+        assert!(matches!(
+            detect_domain_for(Some("nonsense")),
+            BenchDomain::Backend
+        ));
     }
 
     #[test]
@@ -1235,9 +1440,7 @@ mod decoy_tests {
     fn decoy_tools_has_grep_and_read() {
         let tools = decoy_tools();
         assert_eq!(tools.len(), 2);
-        let names: Vec<&str> = tools.iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"Grep"));
         assert!(names.contains(&"Read"));
     }
@@ -1295,7 +1498,8 @@ mod fp_oracle_tests {
             assert!(
                 expected == "Grep" || expected == "Read",
                 "FP_ORACLE entry expects {} but must be Grep or Read: query={:?}",
-                expected, query
+                expected,
+                query
             );
         }
     }
@@ -1379,7 +1583,10 @@ mod builder_tests {
     #[test]
     fn build_oracle_all_context_rich_includes_fp() {
         let o = build_oracle(BenchMode::ContextRich, BenchDomain::All);
-        assert_eq!(o.len(), ORACLE.len() + FRONTEND_ORACLE.len() + FP_ORACLE.len());
+        assert_eq!(
+            o.len(),
+            ORACLE.len() + FRONTEND_ORACLE.len() + FP_ORACLE.len()
+        );
     }
 }
 
@@ -1389,14 +1596,18 @@ mod scoring_tests {
     use std::collections::HashMap;
 
     fn picks(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(q, t)| (q.to_string(), t.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(q, t)| (q.to_string(), t.to_string()))
+            .collect()
     }
 
     #[test]
     fn compute_recall_full_hit() {
         // Pick the first alternate from each pipe-separated expected — matches_expected
         // accepts any of them, so the first one is sufficient for a "full hit" simulation.
-        let p: HashMap<String, String> = ORACLE.iter()
+        let p: HashMap<String, String> = ORACLE
+            .iter()
             .map(|(q, t)| (q.to_string(), t.split('|').next().unwrap().to_string()))
             .collect();
         assert_eq!(compute_recall(&p, ORACLE), 1.0);
@@ -1404,7 +1615,8 @@ mod scoring_tests {
 
     #[test]
     fn compute_recall_full_hit_frontend() {
-        let p: HashMap<String, String> = FRONTEND_ORACLE.iter()
+        let p: HashMap<String, String> = FRONTEND_ORACLE
+            .iter()
             .map(|(q, t)| (q.to_string(), t.split('|').next().unwrap().to_string()))
             .collect();
         assert_eq!(compute_recall(&p, FRONTEND_ORACLE), 1.0);
@@ -1414,11 +1626,17 @@ mod scoring_tests {
     fn compute_recall_alternates_first_alt_hits() {
         // matches_expected splits on '|'; either alt should count as a hit.
         let oracle: &[(&str, &str)] = &[("q1", "get_call_graph|find_references")];
-        let p1: HashMap<String, String> = [("q1".to_string(), "get_call_graph".to_string())].into_iter().collect();
+        let p1: HashMap<String, String> = [("q1".to_string(), "get_call_graph".to_string())]
+            .into_iter()
+            .collect();
         assert_eq!(compute_recall(&p1, oracle), 1.0, "first alt should match");
-        let p2: HashMap<String, String> = [("q1".to_string(), "find_references".to_string())].into_iter().collect();
+        let p2: HashMap<String, String> = [("q1".to_string(), "find_references".to_string())]
+            .into_iter()
+            .collect();
         assert_eq!(compute_recall(&p2, oracle), 1.0, "second alt should match");
-        let p3: HashMap<String, String> = [("q1".to_string(), "module_overview".to_string())].into_iter().collect();
+        let p3: HashMap<String, String> = [("q1".to_string(), "module_overview".to_string())]
+            .into_iter()
+            .collect();
         assert_eq!(compute_recall(&p3, oracle), 0.0, "non-alt should miss");
     }
 
@@ -1441,10 +1659,19 @@ mod scoring_tests {
             ("Show me lines 50 through 80 of src/main.rs.", "Read"),
             ("What does the .gitignore file contain?", "Read"),
             ("Print the first 100 lines of CHANGELOG.md.", "Read"),
-            ("Search for the literal string `FIXME` across the codebase.", "Grep"),
-            ("Search for all occurrences of the regex `error\\d+` in log files.", "Grep"),
+            (
+                "Search for the literal string `FIXME` across the codebase.",
+                "Grep",
+            ),
+            (
+                "Search for all occurrences of the regex `error\\d+` in log files.",
+                "Grep",
+            ),
             ("Read the contents of Cargo.toml.", "Read"),
-            ("Find every line that mentions `deprecated` in comments.", "Grep"),
+            (
+                "Find every line that mentions `deprecated` in comments.",
+                "Grep",
+            ),
             ("Show me the contents of build.rs.", "Read"),
             ("Grep for the regex pattern `^test_` in test files.", "Grep"),
         ]);
@@ -1453,7 +1680,8 @@ mod scoring_tests {
 
     #[test]
     fn compute_fp_rate_full_violation() {
-        let p: HashMap<String, String> = FP_ORACLE.iter()
+        let p: HashMap<String, String> = FP_ORACLE
+            .iter()
             .map(|(q, _)| (q.to_string(), "get_call_graph".to_string()))
             .collect();
         assert_eq!(compute_fp_rate(&p), 1.0);
@@ -1462,7 +1690,8 @@ mod scoring_tests {
     #[test]
     fn compute_fp_rate_wrong_decoy_does_not_count_as_violation() {
         // Picking Read when Grep was expected is still NOT a FP — boundary held.
-        let p: HashMap<String, String> = FP_ORACLE.iter()
+        let p: HashMap<String, String> = FP_ORACLE
+            .iter()
             .map(|(q, _)| (q.to_string(), "Read".to_string()))
             .collect();
         assert_eq!(compute_fp_rate(&p), 0.0);
@@ -1496,7 +1725,10 @@ mod scoring_tests {
     // ===== Trigger-rate scoring tests =====
 
     fn picks_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(q, t)| (q.to_string(), t.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(q, t)| (q.to_string(), t.to_string()))
+            .collect()
     }
 
     #[test]
@@ -1512,11 +1744,15 @@ mod scoring_tests {
         let cg = &["get_call_graph"];
         assert!(matches_trigger_class("Grep", "__DECOY__", cg));
         assert!(matches_trigger_class("Read", "__DECOY__", cg));
-        assert!(matches_trigger_class("Bash", "__DECOY__", cg),
-            "Bash is a valid decoy in TriggerRate mode");
+        assert!(
+            matches_trigger_class("Bash", "__DECOY__", cg),
+            "Bash is a valid decoy in TriggerRate mode"
+        );
         assert!(matches_trigger_class("(none)", "__DECOY__", cg));
-        assert!(!matches_trigger_class("get_call_graph", "__DECOY__", cg),
-            "decoy preservation must reject a code-graph pick (boundary leak)");
+        assert!(
+            !matches_trigger_class("get_call_graph", "__DECOY__", cg),
+            "decoy preservation must reject a code-graph pick (boundary leak)"
+        );
     }
 
     #[test]
@@ -1528,8 +1764,8 @@ mod scoring_tests {
         let picks = picks_from(&[("q1", "Bash")]);
         let m = compute_trigger_metrics(&picks, oracle, &cg);
         assert_eq!(m.cg_total, 1);
-        assert_eq!(m.trigger_hits, 0);  // Bash is not a cg tool
-        assert_eq!(m.cg_no_tool, 0);    // it IS a tool, just the wrong one
+        assert_eq!(m.trigger_hits, 0); // Bash is not a cg tool
+        assert_eq!(m.cg_no_tool, 0); // it IS a tool, just the wrong one
     }
 
     #[test]
@@ -1552,11 +1788,7 @@ mod scoring_tests {
     #[test]
     fn compute_trigger_metrics_all_correct() {
         // 2 __CG__ → both pick cg; 1 __DECOY__ → picks Grep
-        let oracle: &[(&str, &str)] = &[
-            ("q1", "__CG__"),
-            ("q2", "__CG__"),
-            ("q3", "__DECOY__"),
-        ];
+        let oracle: &[(&str, &str)] = &[("q1", "__CG__"), ("q2", "__CG__"), ("q3", "__DECOY__")];
         let cg = vec!["get_call_graph"];
         let picks = picks_from(&[
             ("q1", "get_call_graph"),
@@ -1580,8 +1812,12 @@ mod scoring_tests {
         // 4 __CG__: 2 cg, 1 Grep (wrong route), 1 (none).
         // 2 __DECOY__: 1 Grep (good), 1 cg (leak).
         let oracle: &[(&str, &str)] = &[
-            ("c1", "__CG__"), ("c2", "__CG__"), ("c3", "__CG__"), ("c4", "__CG__"),
-            ("d1", "__DECOY__"), ("d2", "__DECOY__"),
+            ("c1", "__CG__"),
+            ("c2", "__CG__"),
+            ("c3", "__CG__"),
+            ("c4", "__CG__"),
+            ("d1", "__DECOY__"),
+            ("d2", "__DECOY__"),
         ];
         let cg = vec!["get_call_graph"];
         let picks = picks_from(&[
@@ -1632,7 +1868,9 @@ mod scoring_tests {
 mod backends_tests {
     use super::*;
 
-    fn label_of(b: &Backend) -> String { b.label() }
+    fn label_of(b: &Backend) -> String {
+        b.label()
+    }
 
     #[test]
     fn parse_models_env_basic() {
@@ -1643,7 +1881,10 @@ mod backends_tests {
     #[test]
     fn parse_models_env_trims_whitespace() {
         let v = parse_models_env(" claude-sonnet-4-6 , claude-opus-4-7 ,claude-haiku-4-5 ");
-        assert_eq!(v, vec!["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"]);
+        assert_eq!(
+            v,
+            vec!["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"]
+        );
     }
 
     #[test]
@@ -1669,7 +1910,11 @@ mod backends_tests {
         assert_eq!(backends.len(), 2);
         // Anthropic key wins — both backends should be Anthropic variant.
         for b in &backends {
-            assert!(matches!(b, Backend::Anthropic { .. }), "expected Anthropic, got {:?}", label_of(b));
+            assert!(
+                matches!(b, Backend::Anthropic { .. }),
+                "expected Anthropic, got {:?}",
+                label_of(b)
+            );
         }
         assert_eq!(label_of(&backends[0]), "anthropic/claude-opus-4-7");
         assert_eq!(label_of(&backends[1]), "anthropic/claude-haiku-4-5");
@@ -1684,27 +1929,26 @@ mod backends_tests {
         );
         assert_eq!(backends.len(), 1);
         assert!(matches!(backends[0], Backend::OpenRouter { .. }));
-        assert_eq!(label_of(&backends[0]), "openrouter/anthropic/claude-sonnet-4.5");
+        assert_eq!(
+            label_of(&backends[0]),
+            "openrouter/anthropic/claude-sonnet-4.5"
+        );
     }
 
     #[test]
     fn build_backends_no_keys_returns_empty() {
-        let backends = build_backends(
-            vec!["claude-sonnet-4-6".into()],
-            None,
-            None,
+        let backends = build_backends(vec!["claude-sonnet-4-6".into()], None, None);
+        assert!(
+            backends.is_empty(),
+            "no keys → empty backends, got {} entries",
+            backends.len()
         );
-        assert!(backends.is_empty(), "no keys → empty backends, got {} entries", backends.len());
     }
 
     #[test]
     fn build_backends_empty_keys_treated_as_missing() {
         // detect_backend treats empty-string keys as "not set"; build_backends mirrors that.
-        let backends = build_backends(
-            vec!["claude-sonnet-4-6".into()],
-            Some(""),
-            Some(""),
-        );
+        let backends = build_backends(vec!["claude-sonnet-4-6".into()], Some(""), Some(""));
         assert!(backends.is_empty());
     }
 
@@ -1716,15 +1960,10 @@ mod backends_tests {
 
     #[test]
     fn build_backends_preserves_model_order() {
-        let backends = build_backends(
-            vec!["m1".into(), "m2".into(), "m3".into()],
-            Some("k"),
-            None,
-        );
+        let backends = build_backends(vec!["m1".into(), "m2".into(), "m3".into()], Some("k"), None);
         assert_eq!(backends.len(), 3);
         assert_eq!(label_of(&backends[0]), "anthropic/m1");
         assert_eq!(label_of(&backends[1]), "anthropic/m2");
         assert_eq!(label_of(&backends[2]), "anthropic/m3");
     }
 }
-

@@ -24,11 +24,7 @@ fn setup_project(file_count: usize) -> (TempDir, McpServer) {
              export function helper_{}(): string {{ return 'hello'; }}\n",
             i, i, i
         );
-        fs::write(
-            project.path().join(format!("src/mod_{}.ts", i)),
-            content,
-        )
-        .unwrap();
+        fs::write(project.path().join(format!("src/mod_{}.ts", i)), content).unwrap();
     }
 
     let server = init_server(&project);
@@ -58,8 +54,7 @@ fn test_concurrent_tool_calls() {
                 );
                 let resp = srv.lock().unwrap().handle_message(&msg).unwrap();
                 assert!(resp.is_some(), "thread {} got no response", i);
-                let v: serde_json::Value =
-                    serde_json::from_str(resp.as_ref().unwrap()).unwrap();
+                let v: serde_json::Value = serde_json::from_str(resp.as_ref().unwrap()).unwrap();
                 assert!(
                     v.get("result").is_some(),
                     "thread {} got no result: {:?}",
@@ -344,10 +339,9 @@ fn project_root_resolution_rust_js_parity() {
 /// abort setting.
 #[test]
 fn release_profile_must_unwind_for_catch_unwind_defense() {
-    let manifest = fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
-    )
-    .expect("read Cargo.toml");
+    let manifest =
+        fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("read Cargo.toml");
 
     // Slice out the [profile.release] section: from its header to the next
     // top-level `[` table header (or EOF).

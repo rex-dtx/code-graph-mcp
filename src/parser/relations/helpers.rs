@@ -7,7 +7,8 @@ use super::super::node_text;
 pub(super) const MAX_SUBTREE_DEPTH: usize = 32;
 
 pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
-    let function = node.child_by_field_name("function")
+    let function = node
+        .child_by_field_name("function")
         .or_else(|| node.named_child(0))?;
 
     match function.kind() {
@@ -17,9 +18,11 @@ pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Opt
             // Python tree-sitter uses node kind `attribute` with field `attribute`
             // for the method name; JS/TS use `member_expression` with `property`;
             // Go uses `field_expression` with `field`.
-            if let Some(prop) = function.child_by_field_name("property")
+            if let Some(prop) = function
+                .child_by_field_name("property")
                 .or_else(|| function.child_by_field_name("field"))
-                .or_else(|| function.child_by_field_name("attribute")) {
+                .or_else(|| function.child_by_field_name("attribute"))
+            {
                 Some(node_text(&prop, source).to_string())
             } else {
                 Some(node_text(&function, source).to_string())
@@ -28,12 +31,14 @@ pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Opt
         "scoped_identifier" => {
             // Rust: Self::method(), Module::func(), std::collections::HashMap::new()
             // Extract the rightmost name component (the actual function being called)
-            function.child_by_field_name("name")
+            function
+                .child_by_field_name("name")
                 .map(|n| node_text(&n, source).to_string())
         }
         "selector_expression" => {
             // Go: receiver.Method(), http.HandleFunc(), etc.
-            function.child_by_field_name("field")
+            function
+                .child_by_field_name("field")
                 .map(|n| node_text(&n, source).to_string())
         }
         "qualified_identifier" => {
@@ -43,7 +48,9 @@ pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Opt
             // resolution then binds it like any bare call, mirroring Rust's
             // scoped_identifier handling above. Without this arm the call falls
             // to `_ => None` and the edge is silently dropped.
-            node_text(&function, source).rsplit("::").next()
+            node_text(&function, source)
+                .rsplit("::")
+                .next()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         }
@@ -129,7 +136,8 @@ pub(crate) fn extract_callee(
         return extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare));
     }
 
-    let function = node.child_by_field_name("function")
+    let function = node
+        .child_by_field_name("function")
         .or_else(|| node.named_child(0))?;
 
     match function.kind() {
@@ -137,9 +145,10 @@ pub(crate) fn extract_callee(
         // (e.g. Kotlin) use "simple_identifier"; if we ever share this match
         // arm with them, intentionally let "simple_identifier" fall through
         // to the `_` arm where extract_callee_name handles it generically.
-        "identifier" => {
-            Some((node_text(&function, source).to_string(), CalleeQualifier::Bare))
-        }
+        "identifier" => Some((
+            node_text(&function, source).to_string(),
+            CalleeQualifier::Bare,
+        )),
         "scoped_identifier" => extract_rust_scoped(&function, source),
         "field_expression" => extract_rust_field(&function, source),
         _ => extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare)),
@@ -148,11 +157,7 @@ pub(crate) fn extract_callee(
 
 /// Walk a scoped_identifier collecting all path segments + final name.
 /// `crate::a::b::foo` → segments=["crate","a","b"], name="foo"
-fn collect_scoped_path_segments(
-    node: &tree_sitter::Node,
-    source: &str,
-    out: &mut Vec<String>,
-) {
+fn collect_scoped_path_segments(node: &tree_sitter::Node, source: &str, out: &mut Vec<String>) {
     if node.kind() == "scoped_identifier" {
         if let Some(path) = node.child_by_field_name("path") {
             collect_scoped_path_segments(&path, source, out);
@@ -187,7 +192,8 @@ fn extract_rust_scoped(
         return Some((name, CalleeQualifier::SelfType(String::new())));
     }
 
-    let skip = path.iter()
+    let skip = path
+        .iter()
         .take_while(|s| matches!(s.as_str(), "crate" | "super" | "self"))
         .count();
     path.drain(..skip);
@@ -226,12 +232,21 @@ fn extract_rust_field(
     Some((name, qualifier))
 }
 
-pub(super) fn extract_string_from_subtree(node: &tree_sitter::Node, source: &str) -> Option<String> {
+pub(super) fn extract_string_from_subtree(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
     extract_string_from_subtree_inner(node, source, 0)
 }
 
-fn extract_string_from_subtree_inner(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
-    if depth > MAX_SUBTREE_DEPTH { return None; }
+fn extract_string_from_subtree_inner(
+    node: &tree_sitter::Node,
+    source: &str,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_SUBTREE_DEPTH {
+        return None;
+    }
     if node.kind() == "string" {
         let text = node_text(node, source);
         let text = text.trim_start_matches(['f', 'r', 'b', 'u', 'F', 'R', 'B', 'U']);

@@ -1,8 +1,8 @@
+use super::schema;
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use std::sync::Once;
-use super::schema;
 
 // FFI declaration for sqlite-vec init function (compiled via build.rs)
 extern "C" {
@@ -76,7 +76,8 @@ impl Database {
         )?;
         // PRAGMA query_only is belt-and-suspenders on top of the flag —
         // any accidental write attempt errors out at the SQL layer.
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA query_only = ON;
             PRAGMA busy_timeout = 5000;
             -- Keep mmap disabled here too (mirrors open_impl_inner). This is the
@@ -85,7 +86,8 @@ impl Database {
             -- SQLite's bundled compile default is already 0, so this enforces the
             -- invariant in code instead of relying on the build flag staying unset.
             PRAGMA mmap_size = 0;
-        ")?;
+        ",
+        )?;
         // Detect vec tables via sqlite_master so consumers know if vector
         // search is available without needing a separate probe.
         let vec_enabled: bool = conn
@@ -97,7 +99,11 @@ impl Database {
             .unwrap_or(false);
         // Secondary read-only instances never migrate or revalidate (the primary
         // owns bootstrap), so they don't compute a staleness verdict.
-        Ok(Self { conn, vec_enabled, index_version_stale: None })
+        Ok(Self {
+            conn,
+            vec_enabled,
+            index_version_stale: None,
+        })
     }
 
     fn open_impl(path: &Path, enable_vec: bool, revalidate: bool) -> Result<Self> {
@@ -117,14 +123,19 @@ impl Database {
             Err(e) if Self::is_corruption_error(&e) && path.exists() => {
                 tracing::warn!(
                     "[db] Database corrupt ({}), deleting for rebuild: {}",
-                    path.display(), e
+                    path.display(),
+                    e
                 );
                 // Remove DB + WAL + SHM files — the index is a pure cache
                 std::fs::remove_file(path).ok();
                 let wal_path = path.with_extension("db-wal");
                 let shm_path = path.with_extension("db-shm");
-                if wal_path.exists() { std::fs::remove_file(&wal_path).ok(); }
-                if shm_path.exists() { std::fs::remove_file(&shm_path).ok(); }
+                if wal_path.exists() {
+                    std::fs::remove_file(&wal_path).ok();
+                }
+                if shm_path.exists() {
+                    std::fs::remove_file(&shm_path).ok();
+                }
                 // Retry once with a fresh database
                 Self::open_impl_inner(path, enable_vec, revalidate)
             }
@@ -153,8 +164,12 @@ impl Database {
         std::fs::remove_file(path).ok();
         let wal_path = path.with_extension("db-wal");
         let shm_path = path.with_extension("db-shm");
-        if wal_path.exists() { std::fs::remove_file(&wal_path).ok(); }
-        if shm_path.exists() { std::fs::remove_file(&shm_path).ok(); }
+        if wal_path.exists() {
+            std::fs::remove_file(&wal_path).ok();
+        }
+        if shm_path.exists() {
+            std::fs::remove_file(&shm_path).ok();
+        }
     }
 
     fn open_impl_inner(path: &Path, enable_vec: bool, revalidate: bool) -> Result<Self> {
@@ -163,7 +178,8 @@ impl Database {
 
         let conn = Connection::open(path)?;
 
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;
@@ -186,10 +202,12 @@ impl Database {
             -- idle DB doesn't carry a multi-MB resident WAL (audit §8 saw ~4MB WAL
             -- on a 7.8MB main DB). run_optimize() additionally TRUNCATEs after bulk writes.
             PRAGMA journal_size_limit = 6291456;
-        ")?;
+        ",
+        )?;
 
         // Check existing schema version — migrate if needed, bail only on future versions
-        let existing_version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let existing_version: i32 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
         if existing_version > schema::SCHEMA_VERSION {
             // The trailing [marker] is a stable token the plugin statusline keys on
@@ -294,7 +312,8 @@ impl Database {
         //     indexer/server-startup open, warn on stderr. A genuine permanent
         //     downgrade still rebuilds by deleting .code-graph/index.db* first (fresh
         //     DB → application_id 0 → this binary stamps its own version cleanly).
-        let stored_index_version: i32 = conn.pragma_query_value(None, "application_id", |row| row.get(0))?;
+        let stored_index_version: i32 =
+            conn.pragma_query_value(None, "application_id", |row| row.get(0))?;
         let current_index_version = crate::domain::INDEX_VERSION;
         let is_downgrade = stored_index_version > current_index_version;
         let mut index_version_stale = None;
@@ -322,7 +341,8 @@ version, or update this binary. To force a rebuild at this older version, delete
             } else if revalidate {
                 tracing::info!(
                     "[index] Index version changed ({} → {}), clearing stale data for rebuild",
-                    stored_index_version, current_index_version
+                    stored_index_version,
+                    current_index_version
                 );
                 // Double-write to stderr: the CLI/MCP startup paths install no tracing
                 // subscriber (feedback_tracing_invisible_in_cli.md), so the tracing line
@@ -338,7 +358,7 @@ If you see this repeatedly, another code-graph server of a different version is 
                     stored_index_version, current_index_version
                 );
                 conn.execute_batch(
-                    "BEGIN; DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; COMMIT;"
+                    "BEGIN; DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; COMMIT;",
                 )?;
                 // Reclaim the pages freed by the sweep so a version bump that shrinks
                 // the index (fewer nodes under the new INDEX_VERSION, or a shrunk
@@ -368,7 +388,11 @@ If you see this repeatedly, another code-graph server of a different version is 
             conn.pragma_update(None, "application_id", current_index_version)?;
         }
 
-        Ok(Self { conn, vec_enabled: enable_vec, index_version_stale })
+        Ok(Self {
+            conn,
+            vec_enabled: enable_vec,
+            index_version_stale,
+        })
     }
 
     /// `Some(old_version)` when this handle opened (non-destructively) a DB built
@@ -391,10 +415,16 @@ If you see this repeatedly, another code-graph server of a different version is 
             return matches!(
                 sqlite_err,
                 rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error { code: rusqlite::ffi::ErrorCode::DatabaseCorrupt, .. },
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ffi::ErrorCode::DatabaseCorrupt,
+                        ..
+                    },
                     _
                 ) | rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error { code: rusqlite::ffi::ErrorCode::NotADatabase, .. },
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ffi::ErrorCode::NotADatabase,
+                        ..
+                    },
                     _
                 )
             );
@@ -419,7 +449,11 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// changing its behavior when run directly.
     pub fn savepoint(&self, name: &'static str) -> Result<UncheckedSavepoint<'_>> {
         self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
-        Ok(UncheckedSavepoint { conn: &self.conn, name, committed: false })
+        Ok(UncheckedSavepoint {
+            conn: &self.conn,
+            name,
+            committed: false,
+        })
     }
 
     pub fn vec_enabled(&self) -> bool {
@@ -475,7 +509,8 @@ If you see this repeatedly, another code-graph server of a different version is 
                     "[vec] Embedding dim changed: on-disk={} current={}. \
                      Dropping node_vectors and rebuilding at the new dim. \
                      Existing vectors were invalid for the new model.",
-                    dim, current
+                    dim,
+                    current
                 );
                 // Atomically drop + recreate so a mid-statement failure can't
                 // leave the DB with no vec0 table at all. embedding_cache is dropped
@@ -483,12 +518,17 @@ If you see this repeatedly, another code-graph server of a different version is 
                 // invalid for the new model, exactly like node_vectors. create_vec_tables_sql
                 // recreates both.
                 let tx = conn.unchecked_transaction()?;
-                tx.execute_batch("DROP TABLE IF EXISTS node_vectors; DROP TABLE IF EXISTS embedding_cache;")?;
+                tx.execute_batch(
+                    "DROP TABLE IF EXISTS node_vectors; DROP TABLE IF EXISTS embedding_cache;",
+                )?;
                 tx.execute_batch(&schema::create_vec_tables_sql())?;
                 tx.commit()?;
             }
             None => {
-                tracing::debug!("[vec] No prior vec0 table found; recording embedding_dim={}", current);
+                tracing::debug!(
+                    "[vec] No prior vec0 table found; recording embedding_dim={}",
+                    current
+                );
             }
         }
 
@@ -564,23 +604,33 @@ mod tests {
     fn test_savepoint_standalone_commit_and_rollback() {
         let tmp = TempDir::new().unwrap();
         let db = Database::open(&tmp.path().join("index.db")).unwrap();
-        db.conn().execute_batch("CREATE TABLE sp_t (x INTEGER);").unwrap();
+        db.conn()
+            .execute_batch("CREATE TABLE sp_t (x INTEGER);")
+            .unwrap();
 
         // Standalone: a top-level SAVEPOINT auto-starts a transaction; RELEASE
         // (commit) persists the row.
         let sp = db.savepoint("s1").unwrap();
-        db.conn().execute("INSERT INTO sp_t VALUES (1)", []).unwrap();
+        db.conn()
+            .execute("INSERT INTO sp_t VALUES (1)", [])
+            .unwrap();
         sp.commit().unwrap();
 
         // Drop without commit → ROLLBACK TO + RELEASE discards the row.
         let sp = db.savepoint("s2").unwrap();
-        db.conn().execute("INSERT INTO sp_t VALUES (2)", []).unwrap();
+        db.conn()
+            .execute("INSERT INTO sp_t VALUES (2)", [])
+            .unwrap();
         drop(sp);
 
-        let rows: Vec<i64> = db.conn()
-            .prepare("SELECT x FROM sp_t ORDER BY x").unwrap()
-            .query_map([], |r| r.get(0)).unwrap()
-            .map(|r| r.unwrap()).collect();
+        let rows: Vec<i64> = db
+            .conn()
+            .prepare("SELECT x FROM sp_t ORDER BY x")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
         assert_eq!(rows, vec![1], "committed row kept, rolled-back row dropped");
     }
 
@@ -591,24 +641,37 @@ mod tests {
         // behind — a rebuild that clears the index then fails restores the old index.
         let tmp = TempDir::new().unwrap();
         let db = Database::open(&tmp.path().join("index.db")).unwrap();
-        db.conn().execute_batch("CREATE TABLE sp_t (x INTEGER);").unwrap();
-        db.conn().execute("INSERT INTO sp_t VALUES (100)", []).unwrap(); // "old index"
+        db.conn()
+            .execute_batch("CREATE TABLE sp_t (x INTEGER);")
+            .unwrap();
+        db.conn()
+            .execute("INSERT INTO sp_t VALUES (100)", [])
+            .unwrap(); // "old index"
 
         {
             let outer = db.conn().unchecked_transaction().unwrap();
             db.conn().execute("DELETE FROM sp_t", []).unwrap(); // clear (part of outer)
             let sp = db.savepoint("inner").unwrap();
-            db.conn().execute("INSERT INTO sp_t VALUES (200)", []).unwrap();
+            db.conn()
+                .execute("INSERT INTO sp_t VALUES (200)", [])
+                .unwrap();
             sp.commit().unwrap(); // released into the outer transaction
             drop(outer); // no commit → ROLLBACK everything, incl. the released savepoint
         }
 
-        let rows: Vec<i64> = db.conn()
-            .prepare("SELECT x FROM sp_t").unwrap()
-            .query_map([], |r| r.get(0)).unwrap()
-            .map(|r| r.unwrap()).collect();
-        assert_eq!(rows, vec![100],
-            "old data restored; both the DELETE and the released savepoint rolled back");
+        let rows: Vec<i64> = db
+            .conn()
+            .prepare("SELECT x FROM sp_t")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![100],
+            "old data restored; both the DELETE and the released savepoint rolled back"
+        );
     }
 
     #[test]
@@ -617,7 +680,8 @@ mod tests {
         let db_path = tmp.path().join("index.db");
         let db = Database::open_with_vec(&db_path).unwrap();
 
-        let stored: String = db.conn()
+        let stored: String = db
+            .conn()
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
                 [schema::META_KEY_EMBEDDING_DIM],
@@ -680,30 +744,64 @@ mod tests {
         // optimization when a table carries triggers, so the no-WHERE `DELETE FROM nodes`
         // fires per-row — proving the wipe itself creates NO orphans (daagu's 157 came from
         // the async backfill race, now guarded in insert_node_vectors_batch, not from here).
-        use crate::storage::queries::{upsert_file, FileRecord, insert_node, NodeRecord, insert_node_vector};
+        use crate::storage::queries::{
+            insert_node, insert_node_vector, upsert_file, FileRecord, NodeRecord,
+        };
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("index.db");
         {
             let db = Database::open_with_vec(&db_path).unwrap();
             let conn = db.conn();
-            let fid = upsert_file(conn, &FileRecord {
-                path: "a.rs".into(), blake3_hash: "h".into(), last_modified: 0, language: None,
-            }).unwrap();
-            let nid = insert_node(conn, &NodeRecord {
-                file_id: fid, node_type: "function".into(), name: "f".into(),
-                qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
-                signature: None, doc_comment: None, context_string: Some("ctx".into()),
-                name_tokens: None, return_type: None, param_types: None, is_test: false,
-            }).unwrap();
+            let fid = upsert_file(
+                conn,
+                &FileRecord {
+                    path: "a.rs".into(),
+                    blake3_hash: "h".into(),
+                    last_modified: 0,
+                    language: None,
+                },
+            )
+            .unwrap();
+            let nid = insert_node(
+                conn,
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: "f".into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 2,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: Some("ctx".into()),
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap();
             insert_node_vector(conn, nid, &vec![0.0f32; crate::domain::EMBEDDING_DIM]).unwrap();
-            assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
             // Stamp an older generation so the next indexer open triggers the wipe.
-            conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1).unwrap();
+            conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1)
+                .unwrap();
         }
         // Reopen (indexer, revalidate=true) → version mismatch → wipe.
         let db = Database::open_with_vec(&db_path).unwrap();
-        assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0)).unwrap(),
-            0, "version-mismatch sweep must clear nodes");
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "version-mismatch sweep must clear nodes"
+        );
         assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(),
             0, "AFTER DELETE trigger must reap the wiped node's vector — no orphan survives a version bump");
     }
@@ -722,15 +820,36 @@ mod tests {
         let db_path = tmp.path().join("index.db");
         let emb: Vec<f32> = vec![0.25; crate::domain::EMBEDDING_DIM];
         let mk = |conn: &rusqlite::Connection, hash: &str| -> i64 {
-            let fid = upsert_file(conn, &FileRecord {
-                path: "a.rs".into(), blake3_hash: hash.into(), last_modified: 0, language: None,
-            }).unwrap();
-            insert_node(conn, &NodeRecord {
-                file_id: fid, node_type: "function".into(), name: "f".into(),
-                qualified_name: None, start_line: 1, end_line: 2, code_content: String::new(),
-                signature: None, doc_comment: None, context_string: Some("ctx-A".into()),
-                name_tokens: None, return_type: None, param_types: None, is_test: false,
-            }).unwrap()
+            let fid = upsert_file(
+                conn,
+                &FileRecord {
+                    path: "a.rs".into(),
+                    blake3_hash: hash.into(),
+                    last_modified: 0,
+                    language: None,
+                },
+            )
+            .unwrap();
+            insert_node(
+                conn,
+                &NodeRecord {
+                    file_id: fid,
+                    node_type: "function".into(),
+                    name: "f".into(),
+                    qualified_name: None,
+                    start_line: 1,
+                    end_line: 2,
+                    code_content: String::new(),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: Some("ctx-A".into()),
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap()
         };
         {
             let db = Database::open_with_vec(&db_path).unwrap();
@@ -738,21 +857,40 @@ mod tests {
             let nid = mk(conn, "h1");
             insert_node_vector(conn, nid, &emb).unwrap();
             cache_put_embeddings(conn, &[(cache_key("ctx-A"), emb.clone())]).unwrap();
-            conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1).unwrap();
+            conn.pragma_update(None, "application_id", crate::domain::INDEX_VERSION - 1)
+                .unwrap();
         }
         // Reopen (indexer) → version mismatch → wipe.
         let db = Database::open_with_vec(&db_path).unwrap();
         let conn = db.conn();
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0)).unwrap(),
-            0, "wipe clears nodes");
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r.get::<_, i64>(0)).unwrap(),
-            0, "trigger reaped the wiped node's vector");
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r.get::<_, i64>(0)).unwrap(),
-            1, "embedding_cache SURVIVES the version-bump wipe (that is what enables reuse)");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "wipe clears nodes"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM node_vectors", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "trigger reaped the wiped node's vector"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "embedding_cache SURVIVES the version-bump wipe (that is what enables reuse)"
+        );
         // Rebuild: a new node (new id) with the same content is a cache HIT — reused, no model.
         let new_nid = mk(conn, "h2");
         let (hits, misses) = partition_by_cache(conn, &[(new_nid, "ctx-A".into())]).unwrap();
-        assert_eq!(hits.len(), 1, "unchanged content reuses the cached embedding across the bump");
+        assert_eq!(
+            hits.len(),
+            1,
+            "unchanged content reuses the cached embedding across the bump"
+        );
         assert_eq!(hits[0].1, emb, "reused embedding is byte-identical");
         assert!(misses.is_empty(), "nothing left to re-embed");
     }
@@ -813,8 +951,15 @@ mod tests {
             .conn()
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(files_after, 0, "indexer open must perform the deferred wipe");
-        assert_eq!(indexer.index_version_stale(), None, "post-revalidate handle is current");
+        assert_eq!(
+            files_after, 0,
+            "indexer open must perform the deferred wipe"
+        );
+        assert_eq!(
+            indexer.index_version_stale(),
+            None,
+            "post-revalidate handle is current"
+        );
     }
 
     #[test]
@@ -921,7 +1066,8 @@ mod tests {
         // Reopen: guard should detect mismatch, drop + recreate node_vectors,
         // and upsert current dim.
         let db = Database::open_with_vec(&db_path).unwrap();
-        let stored: i64 = db.conn()
+        let stored: i64 = db
+            .conn()
             .query_row(
                 "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1",
                 [schema::META_KEY_EMBEDDING_DIM],
@@ -933,7 +1079,8 @@ mod tests {
             "stored dim must be upserted back to current EMBEDDING_DIM"
         );
         // node_vectors must exist and be empty (rebuilt)
-        let count: i64 = db.conn()
+        let count: i64 = db
+            .conn()
             .query_row("SELECT COUNT(*) FROM node_vectors", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
@@ -976,7 +1123,8 @@ mod tests {
             actual, current_dim,
             "node_vectors must be rebuilt at current EMBEDDING_DIM after v6→v7 upgrade"
         );
-        let stored: String = db.conn()
+        let stored: String = db
+            .conn()
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
                 [schema::META_KEY_EMBEDDING_DIM],
@@ -1002,7 +1150,8 @@ mod tests {
 
         let db = Database::open_with_vec(&db_path).unwrap();
         // Meta table exists and has our dim recorded
-        let stored: String = db.conn()
+        let stored: String = db
+            .conn()
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
                 [schema::META_KEY_EMBEDDING_DIM],
@@ -1011,7 +1160,8 @@ mod tests {
             .unwrap();
         assert_eq!(stored, crate::domain::EMBEDDING_DIM.to_string());
 
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
@@ -1040,33 +1190,45 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         // (a) Pending table exists and is empty (fresh migration → no rows).
-        let pending_count = crate::storage::queries::count_pending_unresolved_calls(db.conn()).unwrap();
-        assert_eq!(pending_count, 0,
-            "fresh migration must leave pending_unresolved_calls empty");
+        let pending_count =
+            crate::storage::queries::count_pending_unresolved_calls(db.conn()).unwrap();
+        assert_eq!(
+            pending_count, 0,
+            "fresh migration must leave pending_unresolved_calls empty"
+        );
 
         // (b) The unique index (source_id, target_name, source_language) exists —
         // without it, repeated Phase 2 invocations on the same file would
         // grow the table unbounded.
-        let unique_idx_exists: bool = db.conn().query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_pending_unique'",
-            [],
-            |_| Ok(true),
-        ).unwrap_or(false);
+        let unique_idx_exists: bool = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_pending_unique'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
         assert!(unique_idx_exists,
             "idx_pending_unique must exist after v7→v8 migration (insert idempotency depends on it)");
 
         // (c) The (target_name, source_language) lookup index exists — the sweep
         // depends on this for sub-O(N) name lookup.
-        let lookup_idx_exists: bool = db.conn().query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_pending_target_lang'",
-            [],
-            |_| Ok(true),
-        ).unwrap_or(false);
-        assert!(lookup_idx_exists,
-            "idx_pending_target_lang must exist after v7→v8 migration");
+        let lookup_idx_exists: bool = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_pending_target_lang'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(
+            lookup_idx_exists,
+            "idx_pending_target_lang must exist after v7→v8 migration"
+        );
 
         // (d) user_version pragma actually advanced.
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
@@ -1098,8 +1260,10 @@ mod tests {
 
         // Must open cleanly (re-run migrations from v2), not brick.
         let db = Database::open(&db_path).unwrap();
-        let version: i32 = db.conn()
-            .pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        let version: i32 = db
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION,
             "a v2-stamped DB whose edges already has extra columns must migrate to current, not brick");
     }
@@ -1126,8 +1290,9 @@ mod tests {
                     target_id   INTEGER NOT NULL,
                     relation    TEXT NOT NULL,
                     metadata    TEXT
-                );"
-            ).unwrap();
+                );",
+            )
+            .unwrap();
             c.pragma_update(None, "user_version", 8).unwrap();
         }
 
@@ -1135,20 +1300,29 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         // (a) The column now exists with the backfill default.
-        let has_col: bool = db.conn().query_row(
-            "SELECT 1 FROM pragma_table_info('edges') WHERE name = 'confidence'",
-            [], |_| Ok(true),
-        ).unwrap_or(false);
+        let has_col: bool = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('edges') WHERE name = 'confidence'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
         assert!(has_col, "edges.confidence must exist after v8→v9 migration");
 
         // (b) The exact query that crashed pre-fix now succeeds (no rows is fine).
-        let _: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM edges WHERE confidence = 'extracted'",
-            [], |r| r.get(0),
-        ).expect("SELECT on edges.confidence must not error after migration");
+        let _: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE confidence = 'extracted'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("SELECT on edges.confidence must not error after migration");
 
         // (c) user_version advanced.
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
@@ -1177,32 +1351,42 @@ mod tests {
                     target_name     TEXT NOT NULL,
                     source_language TEXT NOT NULL,
                     metadata        TEXT
-                );"
-            ).unwrap();
+                );",
+            )
+            .unwrap();
             c.execute(
                 "INSERT INTO pending_unresolved_calls (source_id, target_name, source_language)
                  VALUES (1, 'foo', 'typescript')",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             c.pragma_update(None, "user_version", 9).unwrap();
         }
 
         let db = Database::open(&db_path).unwrap();
 
         // (a) The column now exists, existing rows backfilled to 0.
-        let attempts: i64 = db.conn().query_row(
-            "SELECT attempts FROM pending_unresolved_calls WHERE target_name = 'foo'",
-            [], |r| r.get(0),
-        ).expect("attempts column must exist after v9→v10 migration");
+        let attempts: i64 = db
+            .conn()
+            .query_row(
+                "SELECT attempts FROM pending_unresolved_calls WHERE target_name = 'foo'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("attempts column must exist after v9→v10 migration");
         assert_eq!(attempts, 0, "pre-existing rows must backfill attempts = 0");
 
         // (b) The exact statements the sweep runs now succeed.
         let evicted = crate::storage::queries::age_and_evict_pending_unresolved_calls(db.conn())
             .expect("age/evict must not error after migration");
-        assert_eq!(evicted, 0, "a once-aged row is far below the eviction threshold");
+        assert_eq!(
+            evicted, 0,
+            "a once-aged row is far below the eviction threshold"
+        );
 
         // (c) user_version advanced.
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
@@ -1219,13 +1403,15 @@ mod tests {
         let ro = Database::open_readonly(&db_path).unwrap();
 
         // Reads work.
-        let count: i64 = ro.conn()
+        let count: i64 = ro
+            .conn()
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
 
         // Writes must fail at the SQLite layer — not bubble up as silent no-ops.
-        let err = ro.conn()
+        let err = ro
+            .conn()
             .execute(
                 "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) \
                  VALUES ('a', 'b', 0, 'rust', 0)",
@@ -1253,7 +1439,8 @@ mod tests {
         let db_path = tmp.path().join("index.db");
         let db = Database::open(&db_path).unwrap();
 
-        let tables: Vec<String> = db.conn()
+        let tables: Vec<String> = db
+            .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
             .query_map([], |row| row.get(0))
@@ -1273,7 +1460,8 @@ mod tests {
         let db_path = tmp.path().join("index.db");
         let db = Database::open(&db_path).unwrap();
 
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
@@ -1285,7 +1473,8 @@ mod tests {
         let db_path = tmp.path().join("index.db");
         let db = Database::open(&db_path).unwrap();
 
-        let mode: String = db.conn()
+        let mode: String = db
+            .conn()
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
@@ -1300,7 +1489,8 @@ mod tests {
         {
             register_sqlite_vec();
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .unwrap();
             conn.execute_batch(
                 "CREATE TABLE files (
                     id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
@@ -1340,7 +1530,8 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         // Verify schema version updated
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
@@ -1352,16 +1543,24 @@ mod tests {
         ).unwrap();
 
         // Verify FTS5 has 8 columns (insert trigger fires on UPDATE with new columns)
-        let fts_count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'hello'",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert!(fts_count >= 1, "FTS5 should find existing data after migration rebuild");
+        let fts_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            fts_count >= 1,
+            "FTS5 should find existing data after migration rebuild"
+        );
 
         // Verify existing data preserved
-        let name: String = db.conn().query_row(
-            "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
-        ).unwrap();
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(name, "hello");
     }
 
@@ -1387,7 +1586,10 @@ mod tests {
             .conn()
             .pragma_query_value(None, "mmap_size", |r| r.get(0))
             .unwrap();
-        assert_eq!(mmap, 0, "mmap must stay disabled to avoid the truncation SIGBUS");
+        assert_eq!(
+            mmap, 0,
+            "mmap must stay disabled to avoid the truncation SIGBUS"
+        );
     }
 
     #[test]
@@ -1416,13 +1618,26 @@ mod tests {
         // create_tables_sql and a migrate_vN ALTER — e.g. edges.confidence declared
         // `DEFAULT 'extracted'` in one site but a different literal in the other —
         // is invisible to a name/type/notnull/pk diff. feedback_schema_column_migration_seam.
-        fn columns(conn: &Connection, table: &str) -> BTreeMap<String, (String, bool, bool, Option<String>)> {
-            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
-            let rows = stmt.query_map([], |r| Ok((
-                r.get::<_, String>(1)?,
-                (r.get::<_, String>(2)?, r.get::<_, i64>(3)? != 0, r.get::<_, i64>(5)? != 0,
-                 r.get::<_, Option<String>>(4)?),
-            ))).unwrap();
+        fn columns(
+            conn: &Connection,
+            table: &str,
+        ) -> BTreeMap<String, (String, bool, bool, Option<String>)> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(1)?,
+                        (
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)? != 0,
+                            r.get::<_, i64>(5)? != 0,
+                            r.get::<_, Option<String>>(4)?,
+                        ),
+                    ))
+                })
+                .unwrap();
             rows.map(|r| r.unwrap()).collect()
         }
 
@@ -1436,7 +1651,8 @@ mod tests {
         {
             register_sqlite_vec();
             let conn = Connection::open(&mig_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .unwrap();
             // Frozen v1 schema (the shape the v1->v2 test builds).
             conn.execute_batch(
                 "CREATE TABLE files (
@@ -1468,9 +1684,16 @@ mod tests {
         // `meta` (migrate_v6_to_v7) and `pending_unresolved_calls` (migrate_v7_to_v8)
         // are created by both create_tables_sql and a migrate_vN — include them so a
         // future column drift on either is caught, not just files/nodes/edges.
-        for table in ["files", "nodes", "edges", "meta", "pending_unresolved_calls"] {
+        for table in [
+            "files",
+            "nodes",
+            "edges",
+            "meta",
+            "pending_unresolved_calls",
+        ] {
             assert_eq!(
-                columns(fresh.conn(), table), columns(migrated.conn(), table),
+                columns(fresh.conn(), table),
+                columns(migrated.conn(), table),
                 "table `{table}`: fresh create_tables_sql schema diverges from the \
                  v1->vN migration result — a migrate_vN / SCHEMA_VERSION bump is \
                  missing, or a column definition drifted between create_tables_sql \
@@ -1488,15 +1711,22 @@ mod tests {
         // Should auto-delete and recreate instead of crashing
         let db = Database::open(&db_path).unwrap();
         // Verify it works — tables were created
-        let tables: Vec<String> = db.conn()
+        let tables: Vec<String> = db
+            .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert!(tables.contains(&"files".to_string()), "Expected 'files' table after recovery");
-        assert!(tables.contains(&"nodes".to_string()), "Expected 'nodes' table after recovery");
+        assert!(
+            tables.contains(&"files".to_string()),
+            "Expected 'files' table after recovery"
+        );
+        assert!(
+            tables.contains(&"nodes".to_string()),
+            "Expected 'nodes' table after recovery"
+        );
     }
 
     #[test]
@@ -1515,12 +1745,18 @@ mod tests {
         // but the stale content must be gone — verify the WAL is not our sentinel value
         if wal_path.exists() {
             let content = std::fs::read(&wal_path).unwrap();
-            assert_ne!(content, b"stale wal", "Stale WAL content should be replaced");
+            assert_ne!(
+                content, b"stale wal",
+                "Stale WAL content should be replaced"
+            );
         }
         // SHM may or may not be recreated depending on WAL activity
         if shm_path.exists() {
             let content = std::fs::read(&shm_path).unwrap();
-            assert_ne!(content, b"stale shm", "Stale SHM content should be replaced");
+            assert_ne!(
+                content, b"stale shm",
+                "Stale SHM content should be replaced"
+            );
         }
     }
 
@@ -1529,7 +1765,10 @@ mod tests {
         // Opening a path where the parent dir doesn't exist is not corruption
         let bad_path = Path::new("/nonexistent_dir_xyz/impossible/index.db");
         let result = Database::open(bad_path);
-        assert!(result.is_err(), "Non-corruption errors should still propagate");
+        assert!(
+            result.is_err(),
+            "Non-corruption errors should still propagate"
+        );
     }
 
     // ============================================================
@@ -1567,15 +1806,22 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         // Fresh schema must be in place.
-        let tables: Vec<String> = db.conn()
+        let tables: Vec<String> = db
+            .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert!(tables.contains(&"files".to_string()), "expected 'files' after recovery");
-        assert!(tables.contains(&"nodes".to_string()), "expected 'nodes' after recovery");
+        assert!(
+            tables.contains(&"files".to_string()),
+            "expected 'files' after recovery"
+        );
+        assert!(
+            tables.contains(&"nodes".to_string()),
+            "expected 'nodes' after recovery"
+        );
 
         // Stale wal/shm bytes must NOT survive — otherwise the next open
         // could replay them against the freshly-recreated main.
@@ -1616,12 +1862,17 @@ mod tests {
         std::fs::write(&db_path, b"").unwrap();
 
         let db = Database::open(&db_path).unwrap();
-        let row_count: i64 = db.conn()
+        let row_count: i64 = db
+            .conn()
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(row_count, 0, "recovered DB must be empty (no carryover)");
         let main_size = std::fs::metadata(&db_path).unwrap().len();
-        assert!(main_size >= 100, "main DB must be >= header size, got {}", main_size);
+        assert!(
+            main_size >= 100,
+            "main DB must be >= header size, got {}",
+            main_size
+        );
     }
 
     #[test]
@@ -1638,7 +1889,8 @@ mod tests {
         std::fs::write(&db_path, partial).unwrap();
 
         let db = Database::open(&db_path).unwrap();
-        let row_count: i64 = db.conn()
+        let row_count: i64 = db
+            .conn()
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(row_count, 0, "recovered DB must be empty");
@@ -1653,18 +1905,24 @@ mod tests {
 
         {
             let db = Database::open(&db_path).unwrap();
-            db.conn().execute(
-                "INSERT INTO files (path, blake3_hash, last_modified, indexed_at) \
+            db.conn()
+                .execute(
+                    "INSERT INTO files (path, blake3_hash, last_modified, indexed_at) \
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params!["preserved.rs", "deadbeef", 0i64, 0i64],
-            ).unwrap();
+                    rusqlite::params!["preserved.rs", "deadbeef", 0i64, 0i64],
+                )
+                .unwrap();
         }
 
         let pre_size = std::fs::metadata(&db_path).unwrap().len();
-        assert!(pre_size > 100, "valid DB after one insert must exceed header size");
+        assert!(
+            pre_size > 100,
+            "valid DB after one insert must exceed header size"
+        );
 
         let db = Database::open(&db_path).unwrap();
-        let path: String = db.conn()
+        let path: String = db
+            .conn()
             .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(path, "preserved.rs", "valid DB must not be wiped on reopen");
@@ -1682,7 +1940,8 @@ mod tests {
         {
             register_sqlite_vec();
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .unwrap();
             conn.execute_batch(
                 "CREATE TABLE files (
                     id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
@@ -1731,7 +1990,8 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         // Verify schema version updated to current
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
@@ -1741,7 +2001,10 @@ mod tests {
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_edges_unique'",
             [], |row| row.get(0),
         ).unwrap();
-        assert!(idx_exists, "idx_edges_unique should exist after v2->v3 migration");
+        assert!(
+            idx_exists,
+            "idx_edges_unique should exist after v2->v3 migration"
+        );
 
         // Verify that edges with same (source, target, relation) but different metadata are allowed
         // (this was the whole point of v3: metadata is part of the unique constraint)
@@ -1751,16 +2014,21 @@ mod tests {
         ).unwrap();
 
         // Verify existing edge data preserved
-        let edge_meta: String = db.conn().query_row(
-            "SELECT metadata FROM edges WHERE source_id = 1 AND metadata = 'GET /api'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let edge_meta: String = db
+            .conn()
+            .query_row(
+                "SELECT metadata FROM edges WHERE source_id = 1 AND metadata = 'GET /api'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(edge_meta, "GET /api");
 
         // Verify existing node data preserved
-        let name: String = db.conn().query_row(
-            "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
-        ).unwrap();
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(name, "hello");
     }
 
@@ -1776,7 +2044,8 @@ mod tests {
         {
             register_sqlite_vec();
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .unwrap();
             conn.execute_batch(
                 "CREATE TABLE files (
                     id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
@@ -1820,22 +2089,31 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         // Verify schema version updated to current
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
 
         // Verify porter stemming works: searching "run" should match "running"
-        let fts_count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'run'",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert!(fts_count >= 1, "Porter stemmer should allow 'run' to match 'running'");
+        let fts_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            fts_count >= 1,
+            "Porter stemmer should allow 'run' to match 'running'"
+        );
 
         // Verify existing node data preserved
-        let name: String = db.conn().query_row(
-            "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
-        ).unwrap();
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(name, "running");
     }
 
@@ -1851,7 +2129,8 @@ mod tests {
         {
             register_sqlite_vec();
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .unwrap();
             conn.execute_batch(
                 "CREATE TABLE files (
                     id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
@@ -1910,28 +2189,38 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         // Verify schema version updated to current
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
 
         // Verify is_test column exists and defaults to 0 for existing rows
-        let is_test: i32 = db.conn().query_row(
-            "SELECT is_test FROM nodes WHERE id = 1", [], |row| row.get(0),
-        ).unwrap();
+        let is_test: i32 = db
+            .conn()
+            .query_row("SELECT is_test FROM nodes WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(is_test, 0, "is_test should default to 0 for existing rows");
 
         // Verify we can set is_test to 1
-        db.conn().execute("UPDATE nodes SET is_test = 1 WHERE id = 1", []).unwrap();
-        let is_test_updated: i32 = db.conn().query_row(
-            "SELECT is_test FROM nodes WHERE id = 1", [], |row| row.get(0),
-        ).unwrap();
+        db.conn()
+            .execute("UPDATE nodes SET is_test = 1 WHERE id = 1", [])
+            .unwrap();
+        let is_test_updated: i32 = db
+            .conn()
+            .query_row("SELECT is_test FROM nodes WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(is_test_updated, 1);
 
         // Verify existing node data preserved
-        let name: String = db.conn().query_row(
-            "SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0),
-        ).unwrap();
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM nodes WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(name, "myFunc");
     }
 
@@ -1946,7 +2235,8 @@ mod tests {
         {
             register_sqlite_vec();
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+                .unwrap();
             conn.execute_batch(
                 "CREATE TABLE files (
                     id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
@@ -2009,7 +2299,8 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         // Verify schema version updated to current
-        let version: i32 = db.conn()
+        let version: i32 = db
+            .conn()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, schema::SCHEMA_VERSION);
@@ -2019,12 +2310,18 @@ mod tests {
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_nodes_qualified_name'",
             [], |row| row.get(0),
         ).unwrap();
-        assert!(idx_exists, "idx_nodes_qualified_name should exist after v5->v6 migration");
+        assert!(
+            idx_exists,
+            "idx_nodes_qualified_name should exist after v5->v6 migration"
+        );
 
         // Verify existing node data preserved
-        let qname: String = db.conn().query_row(
-            "SELECT qualified_name FROM nodes WHERE id = 1", [], |row| row.get(0),
-        ).unwrap();
+        let qname: String = db
+            .conn()
+            .query_row("SELECT qualified_name FROM nodes WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(qname, "MyModule.myFunc");
     }
 
@@ -2033,25 +2330,27 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = Database::open_with_vec(&tmp.path().join("test.db")).unwrap();
         // Try creating a vec0 table
-        db.conn().execute_batch(
-            "CREATE VIRTUAL TABLE test_vec USING vec0(embedding float[4]);"
-        ).unwrap();
+        db.conn()
+            .execute_batch("CREATE VIRTUAL TABLE test_vec USING vec0(embedding float[4]);")
+            .unwrap();
         // Insert a vector
         let vec_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
         let bytes: &[u8] = bytemuck::cast_slice(&vec_data);
-        db.conn().execute(
-            "INSERT INTO test_vec(rowid, embedding) VALUES (1, ?)",
-            [bytes],
-        ).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO test_vec(rowid, embedding) VALUES (1, ?)",
+                [bytes],
+            )
+            .unwrap();
     }
 
     #[test]
     fn test_vec0_vector_search() {
         let tmp = TempDir::new().unwrap();
         let db = Database::open_with_vec(&tmp.path().join("test.db")).unwrap();
-        db.conn().execute_batch(
-            "CREATE VIRTUAL TABLE test_vec USING vec0(embedding float[4]);"
-        ).unwrap();
+        db.conn()
+            .execute_batch("CREATE VIRTUAL TABLE test_vec USING vec0(embedding float[4]);")
+            .unwrap();
 
         // Insert vectors
         let vecs: Vec<Vec<f32>> = vec![
@@ -2061,10 +2360,12 @@ mod tests {
         ];
         for (i, v) in vecs.iter().enumerate() {
             let bytes: &[u8] = bytemuck::cast_slice(v);
-            db.conn().execute(
-                "INSERT INTO test_vec(rowid, embedding) VALUES (?1, ?2)",
-                rusqlite::params![i as i64 + 1, bytes],
-            ).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO test_vec(rowid, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![i as i64 + 1, bytes],
+                )
+                .unwrap();
         }
 
         // Search for similar to [1,0,0,0]
@@ -2073,9 +2374,11 @@ mod tests {
         let mut stmt = db.conn().prepare(
             "SELECT rowid, distance FROM test_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT 2"
         ).unwrap();
-        let results: Vec<(i64, f64)> = stmt.query_map([query_bytes], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
+        let results: Vec<(i64, f64)> = stmt
+            .query_map([query_bytes], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 1); // exact match first

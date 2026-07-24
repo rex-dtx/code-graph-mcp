@@ -152,15 +152,24 @@ mod tests {
         );
         let cli = ambiguity_message("open", &cands, Surface::Cli);
         assert!(cli.contains("Specify --file"));
-        assert!(!cli.contains("--node-id"), "cross-file: callgraph/impact have no --node-id");
+        assert!(
+            !cli.contains("--node-id"),
+            "cross-file: callgraph/impact have no --node-id"
+        );
     }
 
     #[test]
     fn same_file_message_advises_node_id_path() {
         let cands = vec![cand("new", "lib.rs", 1, 5), cand("new", "lib.rs", 2, 9)];
         let cli = ambiguity_message("new", &cands, Surface::Cli);
-        assert!(cli.contains("same file"), "must name the same-file case: {cli}");
-        assert!(cli.contains("--node-id"), "must point at the node_id path: {cli}");
+        assert!(
+            cli.contains("same file"),
+            "must name the same-file case: {cli}"
+        );
+        assert!(
+            cli.contains("--node-id"),
+            "must point at the node_id path: {cli}"
+        );
         let mcp = ambiguity_message("new", &cands, Surface::Mcp);
         assert!(mcp.contains("same file"));
         assert!(mcp.contains("node_id"));

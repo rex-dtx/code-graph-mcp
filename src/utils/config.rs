@@ -7,9 +7,26 @@
 /// (feedback_lang_config_default_name) — fails the build instead of an indexed
 /// repo silently extracting nothing for that language.
 pub const SUPPORTED_LANGUAGES: &[&str] = &[
-    "rust", "typescript", "tsx", "javascript", "go", "python", "java",
-    "c", "cpp", "html", "css", "csharp", "kotlin", "ruby", "php", "swift",
-    "dart", "markdown", "bash", "json",
+    "rust",
+    "typescript",
+    "tsx",
+    "javascript",
+    "go",
+    "python",
+    "java",
+    "c",
+    "cpp",
+    "html",
+    "css",
+    "csharp",
+    "kotlin",
+    "ruby",
+    "php",
+    "swift",
+    "dart",
+    "markdown",
+    "bash",
+    "json",
 ];
 
 /// Resolve a user-supplied `--language` / `language` filter to its canonical
@@ -89,8 +106,13 @@ pub fn is_compatible_lang(root_path: &str, dep_path: &str) -> bool {
 /// equality would wrongly drop a `.tsx` class extending a `.ts` base.
 pub fn languages_compatible(a: &str, b: &str) -> bool {
     a == b
-        || matches!((a, b),
-            ("javascript" | "typescript" | "tsx", "javascript" | "typescript" | "tsx"))
+        || matches!(
+            (a, b),
+            (
+                "javascript" | "typescript" | "tsx",
+                "javascript" | "typescript" | "tsx"
+            )
+        )
         || matches!((a, b), ("c" | "cpp", "c" | "cpp"))
 }
 
@@ -155,11 +177,20 @@ mod tests {
     fn is_compatible_lang_filters_cross_language() {
         assert!(is_compatible_lang("a.rs", "b.rs"), "same language kept");
         assert!(is_compatible_lang("a.ts", "b.js"), "JS/TS family cross-ok");
-        assert!(is_compatible_lang("a.tsx", "b.ts"), "TSX/TS family cross-ok");
+        assert!(
+            is_compatible_lang("a.tsx", "b.ts"),
+            "TSX/TS family cross-ok"
+        );
         assert!(is_compatible_lang("a.c", "b.cpp"), "C/C++ family cross-ok");
         assert!(!is_compatible_lang("a.rs", "b.py"), "Rust↔Python dropped");
         assert!(!is_compatible_lang("a.ts", "b.rs"), "TS↔Rust dropped");
-        assert!(!is_compatible_lang("a.rs", "<external>"), "<external> dropped");
-        assert!(is_compatible_lang("a.rs", "data.unknownext"), "unknown ext kept");
+        assert!(
+            !is_compatible_lang("a.rs", "<external>"),
+            "<external> dropped"
+        );
+        assert!(
+            is_compatible_lang("a.rs", "data.unknownext"),
+            "unknown ext kept"
+        );
     }
 }

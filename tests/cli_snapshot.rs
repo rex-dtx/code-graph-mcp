@@ -10,13 +10,33 @@ fn cli_bin() -> String {
 fn init_git_repo() -> TempDir {
     let dir = TempDir::new().unwrap();
     let p = dir.path();
-    Command::new("git").args(["init", "-q"]).current_dir(p).status().unwrap();
-    Command::new("git").args(["config", "user.email", "t@t"]).current_dir(p).status().unwrap();
-    Command::new("git").args(["config", "user.name", "t"]).current_dir(p).status().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "t@t"])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "t"])
+        .current_dir(p)
+        .status()
+        .unwrap();
     std::fs::create_dir_all(p.join("src")).unwrap();
     std::fs::write(p.join("src/lib.rs"), "pub fn h() {}\n").unwrap();
-    Command::new("git").args(["add", "."]).current_dir(p).status().unwrap();
-    Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(p).status().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(p)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-q", "-m", "init"])
+        .current_dir(p)
+        .status()
+        .unwrap();
     dir
 }
 
@@ -46,7 +66,11 @@ fn cli_snapshot_create_then_inspect_round_trip() {
         .arg(&zst)
         .output()
         .unwrap();
-    assert!(output.status.success(), "inspect failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(!json["tool_version"].as_str().unwrap().is_empty());
     assert!(json["schema_version"].as_i64().unwrap() > 0);
@@ -72,26 +96,44 @@ const INTERNAL_TOKENS: &[&str] = &["audit #", "clap-migrat", "args[3]", "hand-ro
 
 #[test]
 fn cli_snapshot_help_lists_subcommands_no_leak() {
-    let out = Command::new(cli_bin()).args(["snapshot", "--help"]).output().unwrap();
+    let out = Command::new(cli_bin())
+        .args(["snapshot", "--help"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(0), "snapshot --help should exit 0");
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("create") && s.contains("inspect"),
-        "parent help must list both subcommands; got: {s}");
+    assert!(
+        s.contains("create") && s.contains("inspect"),
+        "parent help must list both subcommands; got: {s}"
+    );
     let low = s.to_lowercase();
     for tok in INTERNAL_TOKENS {
-        assert!(!low.contains(&tok.to_lowercase()), "snapshot --help leaked {tok:?}; got: {s}");
+        assert!(
+            !low.contains(&tok.to_lowercase()),
+            "snapshot --help leaked {tok:?}; got: {s}"
+        );
     }
 }
 
 #[test]
 fn cli_snapshot_create_help_shows_out_no_leak() {
-    let out = Command::new(cli_bin()).args(["snapshot", "create", "--help"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "snapshot create --help should exit 0");
+    let out = Command::new(cli_bin())
+        .args(["snapshot", "create", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "snapshot create --help should exit 0"
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("--out"), "create help must show --out; got: {s}");
     let low = s.to_lowercase();
     for tok in INTERNAL_TOKENS {
-        assert!(!low.contains(&tok.to_lowercase()), "snapshot create --help leaked {tok:?}; got: {s}");
+        assert!(
+            !low.contains(&tok.to_lowercase()),
+            "snapshot create --help leaked {tok:?}; got: {s}"
+        );
     }
 }
 
@@ -99,11 +141,22 @@ fn cli_snapshot_create_help_shows_out_no_leak() {
 fn cli_snapshot_no_subcommand_exits_2() {
     // clap requires a subcommand (was: hand-rolled Usage + exit 2).
     let out = Command::new(cli_bin()).args(["snapshot"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(2), "snapshot with no subcommand must exit 2");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "snapshot with no subcommand must exit 2"
+    );
 }
 
 #[test]
 fn cli_snapshot_unknown_subcommand_exits_2() {
-    let out = Command::new(cli_bin()).args(["snapshot", "bogus"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(2), "unknown snapshot subcommand must exit 2");
+    let out = Command::new(cli_bin())
+        .args(["snapshot", "bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unknown snapshot subcommand must exit 2"
+    );
 }
