@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.104.1 — staleness-heal gap from npm/dev authority + release gate hardening
+
+Upgrade notes: no action required. Follow-up to v0.104.0's hook-registration
+repair: closes a residual case where a hook pinned at an old plugin-cache
+version dir could not be healed, and hardens the release pipeline that let
+v0.104.0 ship with a red e2e test.
+
+### Fixed
+- **Old cache-pinned hooks unhealable from the global-npm/dev authority**
+  (`lifecycle.js`): v0.104.0's surface-tolerant staleness compared cache
+  versions only when BOTH the present and the desired hook paths carried a
+  cache version dir (`pv && dv`). The global-npm CLI and dev checkouts derive
+  version-less desired paths, so from those authorities a hook pinned at an
+  old plugin-cache version dir was never flagged stale and kept running old
+  code. Staleness now falls back to the plugin's own version for the compare;
+  a registration NEWER than the running authority still stays (downgrade-war
+  guard, §1.11).
+- **Release gate actually gates** (`release.yml`, `scripts/githooks/`,
+  `package.json`, `bump-version.sh`): `install-e2e.test.js` §1.9 shipped red
+  in v0.104.0 because its only gate — the local pre-commit hook — is installed
+  by npm `prepare`, which a pure-Rust checkout never runs. (a) release.yml now
+  runs the FULL JS suite (incl. install-e2e, fed the built linux-x64 artifact
+  via `target/release/`) before any publish step; (b) the pre-commit hook moved
+  to a committed `scripts/githooks/` dir activated via `core.hooksPath`, wired
+  from both npm `prepare` and `bump-version.sh` so any machine that cuts a
+  release has the gate active (covers all worktrees of a clone).
+
+### Added
+- **Field-shape regression smoke** (`hook-orphan-dedup.test.js`): one
+  settings.json mixing an old cache-version block, bare npm blocks from two
+  node versions, and a foreign plugin's hook must converge in a single
+  registration pass to exactly one current entry per (event, script), leave
+  the foreign hook untouched, and be a no-op on the second pass.
+
 ## v0.104.0 — hook-registration dedup + global-shell drift repair
 
 Upgrade notes: no action required. If you switch nvm/node versions, code-graph
