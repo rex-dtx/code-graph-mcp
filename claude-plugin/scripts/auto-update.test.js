@@ -35,6 +35,9 @@ const {
   cachedBinaryStaleVsState,
   downloadBinary,
   selfHealStaleBinary,
+  selfHealGlobalPkgs,
+  staleGlobalPkgs,
+  globalPkgVersion,
   isInstallMissingMode,
   isSilentMode,
   shouldCheck,
@@ -536,4 +539,87 @@ test('downloadAndInstall does NOT repoint install state when the plugin copy is 
     'installPath must not be repointed when the copy was skipped');
   assert.equal(rec.version, '0.0.1',
     'version must not be advanced when the copy was skipped');
+});
+
+// ── selfHealGlobalPkgs: keep global npm installs (CLI shim, platform relic) in step ──
+// The drift it pins: the `code-graph-mcp` CLI on PATH is the GLOBAL
+// @sdsrs/code-graph package, untouched by /plugin update or the binary
+// self-heal — observed at 0.46.0 while the plugin ran 0.101.0; and an
+// explicitly-installed top-level platform pkg relic (0.16.6) was the landmine
+// behind the MCP connect-timeout incident.
+
+test('selfHealGlobalPkgs refreshes stale globals and resets the attempt counter', async () => {
+  const latest = { version: '0.101.0' };
+  let installedSpecs = null;
+  const patch = await selfHealGlobalPkgs(latest, {}, {
+    readStale: () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }],
+    install: async (specs) => { installedSpecs = specs; return true; },
+  });
+  assert.deepEqual(installedSpecs, ['@sdsrs/code-graph@0.101.0']);
+  assert.deepEqual(patch, { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 0 });
+});
+
+test('selfHealGlobalPkgs never installs when nothing of ours is globally installed', async () => {
+  let touched = false;
+  const patch = await selfHealGlobalPkgs({ version: '0.101.0' }, {}, {
+    readStale: () => [],
+    install: async () => { touched = true; return true; },
+  });
+  assert.equal(touched, false, 'no global install → no npm run (never introduce one)');
+  assert.deepEqual(patch, {});
+});
+
+test('selfHealGlobalPkgs clears a leftover counter once globals are healthy', async () => {
+  const patch = await selfHealGlobalPkgs(
+    { version: '0.101.0' },
+    { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 2 },
+    { readStale: () => [], install: async () => true },
+  );
+  assert.deepEqual(patch, { globalPkgHealAttempts: 0, globalPkgHealVersion: null });
+});
+
+test('selfHealGlobalPkgs counts failures per target version and stops at the cap', async () => {
+  const latest = { version: '0.101.0' };
+  const failInstall = async () => false;
+  const stale = () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }];
+
+  // Failure increments the counter for THIS target version.
+  const p1 = await selfHealGlobalPkgs(latest, {}, { readStale: stale, install: failInstall });
+  assert.deepEqual(p1, { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 1 });
+
+  // At the cap, install is no longer attempted for the same target.
+  let touched = false;
+  const p2 = await selfHealGlobalPkgs(
+    latest,
+    { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 3 },
+    { readStale: stale, install: async () => { touched = true; return true; } },
+  );
+  assert.equal(touched, false, 'capped target must not retry');
+  assert.deepEqual(p2, {});
+
+  // A NEW release re-arms the counter.
+  let specs = null;
+  const p3 = await selfHealGlobalPkgs(
+    { version: '0.102.0' },
+    { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 3 },
+    { readStale: () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }],
+      install: async (s) => { specs = s; return true; } },
+  );
+  assert.deepEqual(specs, ['@sdsrs/code-graph@0.102.0']);
+  assert.deepEqual(p3, { globalPkgHealVersion: '0.102.0', globalPkgHealAttempts: 0 });
+});
+
+test('staleGlobalPkgs / globalPkgVersion read top-level global installs from disk', (t) => {
+  const root = mkDir(t, 'global-pkgs-');
+  const shellDir = path.join(root, '@sdsrs', 'code-graph');
+  fs.mkdirSync(shellDir, { recursive: true });
+  fs.writeFileSync(path.join(shellDir, 'package.json'), JSON.stringify({ version: '0.46.0' }));
+
+  assert.equal(globalPkgVersion('@sdsrs/code-graph', [root]), '0.46.0');
+  assert.equal(globalPkgVersion('@sdsrs/does-not-exist', [root]), null);
+
+  const stale = staleGlobalPkgs('0.101.0', [root]);
+  assert.deepEqual(stale, [{ name: '@sdsrs/code-graph', version: '0.46.0' }]);
+  assert.deepEqual(staleGlobalPkgs('0.46.0', [root]), [],
+    'a global install matching latest is not stale');
 });

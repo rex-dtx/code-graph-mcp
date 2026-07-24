@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
@@ -9,7 +9,7 @@ const path = require('path');
 const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
 const { claudeHome } = require('./claude-config');
-const { clearCache: clearBinaryCache } = require('./find-binary');
+const { clearCache: clearBinaryCache, globalNodeModulesCandidates, PLATFORM_PKG } = require('./find-binary');
 const { readBinaryVersion, isDevMode } = require('./version-utils');
 const { cgTmpDir } = require('./tmp-dir');
 
@@ -556,6 +556,96 @@ async function selfHealStaleBinary(latest, { needsUpdate = cachedBinaryNeedsUpda
   return await download(latest);
 }
 
+// ── Global npm package self-heal ───────────────────────────
+// The `code-graph-mcp` CLI on the user's PATH is the GLOBAL npm shell package
+// (@sdsrs/code-graph) — a delivery surface entirely outside the marketplace
+// plugin, so /plugin update and the binary self-heal above never touch it. In
+// the field it drifts for months (a 0.46.0 wrapper delegating to a 0.101.0
+// binary) and users were expected to run `npm update -g` by hand — which also
+// breaks on unrelated npm-config quirks (EALLOWGIT). Same story for a platform
+// package installed EXPLICITLY at the global top level (the old launcher's
+// manual-install hint suggested exactly that): that relic was the 0.16.6
+// landmine behind the MCP connect-timeout incident.
+//
+// Heal contract: refresh ONLY what the user already installed globally (never
+// introduce a global install they didn't ask for), one bounded npm run per
+// release target, silent failure (an unhealable npm env must not block or spam).
+
+const SHELL_PKG = '@sdsrs/code-graph';
+const GLOBAL_PKG_HEAL_MAX_ATTEMPTS = 3;
+const GLOBAL_PKG_HEAL_TIMEOUT_MS = 180000; // npm resolves + downloads the platform optionalDependency (~40MB)
+
+/** Installed version of a top-level GLOBAL npm package, or null when absent. */
+function globalPkgVersion(name, roots = null) {
+  for (const root of (roots || globalNodeModulesCandidates())) {
+    try {
+      const pkg = readJson(path.join(root, name, 'package.json'));
+      if (pkg && pkg.version) return pkg.version;
+    } catch { /* not installed under this root */ }
+  }
+  return null;
+}
+
+/** Globally-installed packages of ours whose version lags `latestVersion`. */
+function staleGlobalPkgs(latestVersion, roots = null) {
+  const out = [];
+  for (const name of [SHELL_PKG, PLATFORM_PKG]) {
+    const ver = globalPkgVersion(name, roots);
+    if (ver && compareVersions(ver, latestVersion) < 0) out.push({ name, version: ver });
+  }
+  return out;
+}
+
+/** One targeted `npm install -g` for the given specs. Resolves true on exit 0. */
+function npmInstallGlobal(specs) {
+  return new Promise((resolve) => {
+    if (!commandExists('npm')) { resolve(false); return; }
+    const child = spawn('npm', ['install', '-g', ...specs], {
+      timeout: GLOBAL_PKG_HEAL_TIMEOUT_MS,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', () => resolve(false));
+    child.on('exit', (code) => {
+      if (code === 0) {
+        console.error(`[code-graph] global npm package(s) refreshed: ${specs.join(' ')}`);
+        resolve(true);
+      } else {
+        const tail = stderr.trim().split('\n').slice(-2).join(' | ');
+        console.error(`[code-graph] global npm refresh failed (exit ${code}): ${tail}`);
+        resolve(false);
+      }
+    });
+  });
+}
+
+/**
+ * Self-heal globally-installed shell/platform packages to `latest.version`.
+ * Returns a state patch (spread into the update-state save): attempts are
+ * counted PER target version so a persistently-failing npm env stops being
+ * retried after GLOBAL_PKG_HEAL_MAX_ATTEMPTS, and the counter re-arms when the
+ * next release moves the target.
+ */
+async function selfHealGlobalPkgs(latest, state, {
+  readStale = staleGlobalPkgs,
+  install = npmInstallGlobal,
+} = {}) {
+  if (!latest || !latest.version) return {};
+  const stale = readStale(latest.version);
+  if (stale.length === 0) {
+    // Healthy (or nothing installed globally) — clear any leftover counter.
+    return state.globalPkgHealAttempts ? { globalPkgHealAttempts: 0, globalPkgHealVersion: null } : {};
+  }
+  const attempts = state.globalPkgHealVersion === latest.version ? (state.globalPkgHealAttempts || 0) : 0;
+  if (attempts >= GLOBAL_PKG_HEAL_MAX_ATTEMPTS) return {};
+  const ok = await install(stale.map((s) => `${s.name}@${latest.version}`));
+  return {
+    globalPkgHealVersion: latest.version,
+    globalPkgHealAttempts: ok ? 0 : attempts + 1,
+  };
+}
+
 async function checkForUpdate({ installMissing = false, force = false } = {}) {
   try {
     // Skip in dev mode — unless the launcher explicitly requested a missing-
@@ -615,7 +705,10 @@ async function checkForUpdate({ installMissing = false, force = false } = {}) {
         binaryUpdated: result.binaryUpdated,
         marketplaceRefreshed: result.marketplaceRefreshed,
       };
-      saveState(newState);
+      // Keep any globally-installed shell/platform npm packages in step with
+      // the release the plugin just moved to (see selfHealGlobalPkgs).
+      const globalHeal = await selfHealGlobalPkgs(latest, state);
+      saveState({ ...newState, ...globalHeal });
 
       return {
         updateAvailable: !success,
@@ -632,6 +725,12 @@ async function checkForUpdate({ installMissing = false, force = false } = {}) {
     // failure observed in the field (shell at v0.45, binary pinned at v0.16.6).
     const selfHealedBinary = await selfHealStaleBinary(latest);
 
+    // Same for the GLOBAL npm delivery surface (the `code-graph-mcp` CLI on
+    // PATH + any explicitly-installed platform package): nothing else ever
+    // updates it, and stale copies drift for months (0.46.0 wrapper) or years
+    // (the 0.16.6 platform relic).
+    const globalHeal = await selfHealGlobalPkgs(latest, state);
+
     saveState({
       ...state,
       installedVersion,
@@ -640,6 +739,7 @@ async function checkForUpdate({ installMissing = false, force = false } = {}) {
       updateAvailable: false,
       rateLimited: false,
       binaryUpdated: selfHealedBinary || state.binaryUpdated,
+      ...globalHeal,
     });
     return selfHealedBinary
       ? { updated: false, binaryUpdated: true, from: installedVersion, to: installedVersion }
@@ -657,6 +757,7 @@ module.exports = {
   requestJson, resolveProxy, parseLatestRelease, fetchLatestRelease,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
   selfHealStaleBinary,
+  selfHealGlobalPkgs, staleGlobalPkgs, globalPkgVersion, npmInstallGlobal,
   downloadAndInstall, refreshMarketplaceClone, marketplaceCloneDir,
 };
 
