@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.102.0 — install/update/uninstall hardening (full-chain audit)
+
+Upgrade notes: no action required. Uninstall behavior is additive — global npm
+packages are removed only when a marker proves the plugin installed them, or
+with the new `--purge-global` flag; a user's own `npm install -g` is never
+touched. Pin `@sdsrs/code-graph@0.101.0` to stay on the prior behavior.
+
+### Fixed
+- **Marketplace installs ran with the version gate disarmed**: `getPackageVersion()`
+  only read `../../package.json`, which does not exist in the plugin-cache
+  layout — every gate (disk-cache freshness, relic shadowing) silently accepted
+  the first candidate for marketplace users, re-opening the stale-binary
+  connect-timeout incident that d578d99 fixed for npm installs only. Now falls
+  back to `.claude-plugin/plugin.json` (regression-tested in the cache layout).
+- **Windows npm was ENOENT-dark**: every bare `spawn('npm', …)` (launcher
+  install, global self-heal, `npm root -g` discovery) failed on Windows —
+  `npm.cmd` is not spawnable without a shell. All npm calls now route through
+  `npm-exec.js` (`shell:true` on win32).
+- **musl/Alpine futile 40MB re-download every session**: the download path
+  ignored libc, fetched the glibc build, and the exec-based promote check
+  rejected it forever while `binaryMissing` bypassed the throttle.
+  `getPlatformAssetName()` now returns null under musl and the launcher
+  surfaces the cargo-install/glibc-image hint instead.
+- **`--version` parser loops**: the fully-anchored regex turned any benign
+  output variation (v-prefix, build-metadata suffix, extra line, >2s cold
+  exec) into "broken binary" → permanently stale → re-download every session.
+  Regex is now tolerant, timeout 2s → 5s; `cachedBinaryNeedsUpdate` /
+  `cachedBinaryStaleVsState` use ordered version compare so a newer-than-latest
+  (dev) binary is never downgraded to an older release.
+
+### Added
+- **Uninstall completeness**: the launcher's background `npm install -g` writes
+  `global-install-marker.json`; `lifecycle.js uninstall` (and
+  `code-graph-mcp uninstall`) removes the global shell + platform packages when
+  the marker proves plugin ownership or `--purge-global` is passed, reports
+  anything left, and lists every adopted project (new adopted-projects
+  registry maintained by adopt/unadopt). `doctor` gains a global-npm-residue
+  check naming who owns cleanup.
+- **Post-uninstall cache reclaim**: after `/plugin uninstall`, Claude Code
+  stops loading the plugin's hooks.json, so the SessionStart teardown never
+  ran and the ~40MB cached binary leaked. `cleanupDisabledStatusline()` — the
+  one code path that still fires (composite statusline) — now removes
+  `~/.cache/code-graph` on genuine uninstall (never on a temporary disable).
+- **Inter-process install lock** (`install-lock.js`, O_EXCL + dead-pid/age
+  reclaim): concurrent cold sessions and auto-update no longer run parallel
+  `npm install -g` against one global prefix (npm staging is not
+  concurrency-safe) or clobber each other's update-state counters.
+
+### Also first shipped in this release (committed post-0.101.0)
+- **Stub-first MCP handshake**: a missing binary no longer blocks `initialize`
+  behind a synchronous npm(60s)+GitHub(90s) chain (presented as the 30s MCP
+  connect timeout) — an upgradeable 0-tool stub answers instantly, the install
+  runs in the background, and the live connection hands over to the real
+  binary without a restart (f490a58).
+- **Version-gated binary discovery**: every discovery tier below the
+  auto-update cache now rejects candidates older than the plugin version
+  (newest-stale as last resort), and the `NPM_CONFIG_PREFIX` env prefix
+  outranks the execPath-derived global root (d578d99).
+- **Global npm self-heal**: stale globally-installed `@sdsrs/code-graph` CLI
+  shims and platform-package relics are refreshed with a targeted
+  `npm install -g pkg@version` (immune to unrelated `npm update -g` failures
+  like EALLOWGIT), bounded to 3 attempts per release (e2d9042).
+- **Statusline**: phantom "indexing" display unstuck (progress-file liveness by
+  mtime heartbeat, finalizing heartbeats, nested-timeout budget) (3803e28).
+
 ## v0.101.0 — instrumentation fixes + bounded pending retention (roadmap Phase 3)
 
 ### Added
