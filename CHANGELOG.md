@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.103.0 — statusline coexistence + uninstall sweep (audit remainder)
+
+Upgrade notes: no action required. New uninstall flag `--unadopt-all` cleans
+every adopted project in one pass. If another plugin (or you) takes over the
+statusLine slot repeatedly, code-graph now stops re-claiming it after 2
+attempts — re-claim explicitly with `node lifecycle.js install` or
+`CODE_GRAPH_FORCE_STATUSLINE=1`.
+
+### Added
+- **`uninstall --unadopt-all`** (CLI + lifecycle): removes the managed
+  CLAUDE.md block + generated detail file from every project in the
+  adopted-projects registry, with a per-project result line. `.code-graph/`
+  index dirs are project data — listed for manual removal, never auto-deleted.
+- **Statusline slot stand-down**: install() tracks how often a foreign command
+  displaces our composite from `settings.statusLine` (a peer plugin's
+  self-heal, or your own choice). After >2 displacements it stops re-claiming
+  — ending both the plugin-vs-plugin ping-pong and the fight against a user's
+  manual statusline change.
+- **Third-party provider survival**: providers registered through the
+  composite registry (e.g. gsd) are no longer orphaned — a genuine uninstall
+  hands them the statusLine slot (our runner dies with the plugin cache); a
+  temporary disable keeps the composite rendering them.
+- **doctor**: warns when the global-package self-heal has exhausted its 3
+  attempts (previously silent until the next release re-armed the counter),
+  with the exact manual `npm install -g` command.
+
+### Fixed
+- **Post-uninstall hook error spam**: settings.json hook commands are
+  existence-guarded on POSIX (`if [ -f … ]; then node …; fi`) — the window
+  where Claude Code deletes the plugin cache before our teardown strips the
+  entries no longer errors on every Edit/Bash/Read/prompt. Node's own exit
+  codes (PreToolUse deny = 2) still pass through.
+- **Truncated npm platform binaries**: candidates under 1MB are rejected
+  (a torn `npm install` could leave a partial file the npm tier accepted and
+  cached; the GitHub path already had size/sha/exec gates).
+- **Offline poll churn**: the missing-binary stub's 4s upgrade poll — each
+  probe a full discovery walk incl. `npm root -g` — now backs off
+  exponentially toward 60s; the background install's completion nudge still
+  upgrades instantly.
+- **compareVersions unified** into version-utils.js and made
+  pre-release-aware ("1.2.3-rc1" < "1.2.3"); the two prior divergent copies
+  disagreed silently on pre-release ordering.
+- **Template drift-refresh notice** now names the overwritten
+  `.claude/plugin_code_graph_mcp.md` too, not just the CLAUDE.md block.
+
 ## v0.102.0 — install/update/uninstall hardening (full-chain audit)
 
 Upgrade notes: no action required. Uninstall behavior is additive — global npm
