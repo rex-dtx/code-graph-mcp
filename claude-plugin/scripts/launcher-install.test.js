@@ -95,3 +95,105 @@ test('install steps run detached from the MCP handshake (no *Sync spawn)', () =>
   assert.doesNotMatch(src, /spawnSync|execSync|execFileSync/,
     'launcher-install must never use synchronous child_process APIs');
 });
+
+// ── Inter-process install lock + global-install marker ──────────────────────
+
+const fsLock = require('node:fs');
+const osLock = require('node:os');
+
+function mkLockDir() {
+  return fsLock.mkdtempSync(path.join(osLock.tmpdir(), 'cg-li-lock-'));
+}
+
+test('lockPath held by a live process → chain skipped entirely (no spawn, no callbacks)', (t) => {
+  const dir = mkLockDir();
+  t.after(() => fsLock.rmSync(dir, { recursive: true, force: true }));
+  const lockPath = path.join(dir, 'install.lock');
+  // Our own pid is alive → the lock reads as genuinely held.
+  fsLock.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: 'x' }));
+
+  const spawnFn = fakeSpawn([{ exit: 0 }]);
+  let called = false;
+  installBinaryInBackground({
+    version: '1.2.3',
+    findBinary: () => '/cache/bin/code-graph-mcp',
+    clearCache: () => {},
+    onInstalled: () => { called = true; },
+    onFailed: () => { called = true; },
+    spawnFn,
+    lockPath,
+  });
+  assert.equal(spawnFn.calls.length, 0, 'no install step may run while another session holds the lock');
+  assert.equal(called, false, 'neither callback fires — the other session owns the outcome');
+});
+
+test('lock is taken for the chain and released on completion', async (t) => {
+  const dir = mkLockDir();
+  t.after(() => fsLock.rmSync(dir, { recursive: true, force: true }));
+  const lockPath = path.join(dir, 'install.lock');
+
+  const spawnFn = fakeSpawn([{ exit: 0 }]);
+  await new Promise((resolve) => {
+    installBinaryInBackground({
+      version: '1.2.3',
+      findBinary: () => '/cache/bin/code-graph-mcp',
+      clearCache: () => {},
+      onInstalled: resolve,
+      onFailed: resolve,
+      spawnFn,
+      lockPath,
+    });
+  });
+  assert.equal(fsLock.existsSync(lockPath), false, 'lock released once the chain settles');
+});
+
+test('recordGlobalInstall fires only when the npm step itself succeeded', async () => {
+  // npm exit 0 + binary resolved → the plugin introduced the global packages.
+  let recorded = 0;
+  const spawnOk = fakeSpawn([{ exit: 0 }]);
+  await new Promise((resolve) => {
+    installBinaryInBackground({
+      version: '1.2.3',
+      findBinary: () => '/cache/bin/code-graph-mcp',
+      clearCache: () => {},
+      onInstalled: resolve,
+      onFailed: resolve,
+      spawnFn: spawnOk,
+      recordGlobalInstall: () => { recorded++; },
+    });
+  });
+  assert.equal(recorded, 1, 'marker written after a successful npm install');
+
+  // npm fails, GitHub fallback lands the binary → NOT a global npm install.
+  const spawnFallback = fakeSpawn([{ exit: 1 }, { exit: 0 }]);
+  await new Promise((resolve) => {
+    let step = 0;
+    installBinaryInBackground({
+      version: '1.2.3',
+      findBinary: () => (step++ === 0 ? null : '/cache/bin/code-graph-mcp'),
+      clearCache: () => {},
+      onInstalled: resolve,
+      onFailed: resolve,
+      spawnFn: spawnFallback,
+      recordGlobalInstall: () => { recorded++; },
+    });
+  });
+  assert.equal(recorded, 1, 'no marker when the binary came from the GitHub fallback');
+});
+
+test('auto-update fallback child carries CODE_GRAPH_INSTALL_LOCK_HELD (no self-deadlock)', async () => {
+  const spawnFn = fakeSpawn([{ exit: 1 }, { exit: 0 }]);
+  await new Promise((resolve) => {
+    installBinaryInBackground({
+      version: '1.2.3',
+      findBinary: () => null,
+      clearCache: () => {},
+      onInstalled: resolve,
+      onFailed: resolve,
+      spawnFn,
+    });
+  });
+  assert.equal(spawnFn.calls.length, 2);
+  assert.equal(spawnFn.calls[1].opts.env.CODE_GRAPH_INSTALL_LOCK_HELD, '1',
+    'the spawned auto-update must not try to take the lock its parent holds');
+});

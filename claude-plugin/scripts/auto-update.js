@@ -9,9 +9,11 @@ const path = require('path');
 const os = require('os');
 const { CACHE_DIR, PLUGIN_ID, MARKETPLACE_NAME, readManifest, readJson, writeJsonAtomic, installedPluginsPath, pluginsCacheDir } = require('./lifecycle');
 const { claudeHome } = require('./claude-config');
-const { clearCache: clearBinaryCache, globalNodeModulesCandidates, PLATFORM_PKG } = require('./find-binary');
+const { clearCache: clearBinaryCache, globalNodeModulesCandidates, PLATFORM_PKG, detectLibc } = require('./find-binary');
 const { readBinaryVersion, isDevMode } = require('./version-utils');
 const { cgTmpDir } = require('./tmp-dir');
+const { npmSpawnOpts } = require('./npm-exec');
+const { acquireLock } = require('./install-lock');
 
 // ── Environment Checks ────────────────────────────────────
 
@@ -56,9 +58,13 @@ function isForceMode(argv = process.argv.slice(2)) {
 }
 
 // ── Platform → GitHub release asset name mapping ──────────
-function getPlatformAssetName() {
-  const platform = os.platform();
-  const arch = os.arch();
+function getPlatformAssetName({ platform = os.platform(), arch = os.arch(), libc = null } = {}) {
+  // No musl asset is published: the glibc linux build downloads fine but cannot
+  // exec on Alpine, so promoteVerifiedBinary always rejected it and — with the
+  // binary still missing — every SessionStart bypassed the throttle and pulled
+  // the same futile ~40MB again. Null stops the download path entirely; the
+  // launcher surfaces unsupportedPlatformHint (cargo install / glibc image).
+  if (platform === 'linux' && (libc || detectLibc()) === 'musl') return null;
   const key = `${platform}-${arch}`;
   const map = {
     'linux-x64': 'code-graph-mcp-linux-x64',
@@ -284,7 +290,11 @@ function cachedBinaryPath() {
 function cachedBinaryNeedsUpdate(latest, { binaryPath = cachedBinaryPath(), readVersion = readBinaryVersion } = {}) {
   if (!latest || !latest.binaryUrl) return false;
   if (!fs.existsSync(binaryPath)) return true;
-  return readVersion(binaryPath) !== latest.version;
+  const current = readVersion(binaryPath);
+  if (!current) return true; // unreadable/broken binary — let the heal replace it
+  // Ordered compare, not string inequality: a binary NEWER than releases/latest
+  // (dev build, or the API momentarily lagging a publish) must not be downgraded.
+  return compareVersions(current, latest.version) < 0;
 }
 
 /**
@@ -298,7 +308,10 @@ function cachedBinaryNeedsUpdate(latest, { binaryPath = cachedBinaryPath(), read
 function cachedBinaryStaleVsState(state, { binaryPath = cachedBinaryPath(), readVersion = readBinaryVersion } = {}) {
   if (!state || !state.latestVersion) return false;
   if (!fs.existsSync(binaryPath)) return false;
-  return readVersion(binaryPath) !== state.latestVersion;
+  const current = readVersion(binaryPath);
+  if (!current) return true; // unreadable/broken — bypass throttle so the heal runs
+  // Ordered compare (see cachedBinaryNeedsUpdate): newer-than-state is not stale.
+  return compareVersions(current, state.latestVersion) < 0;
 }
 
 /**
@@ -600,10 +613,10 @@ function staleGlobalPkgs(latestVersion, roots = null) {
 function npmInstallGlobal(specs) {
   return new Promise((resolve) => {
     if (!commandExists('npm')) { resolve(false); return; }
-    const child = spawn('npm', ['install', '-g', ...specs], {
+    const child = spawn('npm', ['install', '-g', ...specs], npmSpawnOpts({
       timeout: GLOBAL_PKG_HEAL_TIMEOUT_MS,
       stdio: ['ignore', 'ignore', 'pipe'],
-    });
+    }));
     let stderr = '';
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     child.on('error', () => resolve(false));
@@ -647,6 +660,7 @@ async function selfHealGlobalPkgs(latest, state, {
 }
 
 async function checkForUpdate({ installMissing = false, force = false } = {}) {
+  let installLock = null;
   try {
     // Skip in dev mode — unless the launcher explicitly requested a missing-
     // binary install, in which case we MUST proceed regardless of mode (the
@@ -685,6 +699,19 @@ async function checkForUpdate({ installMissing = false, force = false } = {}) {
 
     // Compare versions
     const hasUpdate = compareVersions(latest.version, installedVersion) > 0;
+
+    // Inter-process gate for every mutating path below (plugin-cache copy,
+    // binary download, global npm heals): concurrent sessions racing here ran
+    // parallel `npm install -g` against one global prefix and clobbered each
+    // other's state-file counters (rateLimited, heal attempts). Skip-if-held:
+    // the holder does the work and its state outcome wins. The launcher's
+    // install chain already holds this lock across its spawn of this script —
+    // it marks that with CODE_GRAPH_INSTALL_LOCK_HELD so we don't deadlock
+    // against our own parent.
+    if (process.env.CODE_GRAPH_INSTALL_LOCK_HELD !== '1') {
+      installLock = acquireLock(path.join(CACHE_DIR, 'install.lock'));
+      if (!installLock) return null;
+    }
 
     if (hasUpdate) {
       const result = await downloadAndInstall(latest);
@@ -747,6 +774,8 @@ async function checkForUpdate({ installMissing = false, force = false } = {}) {
   } catch {
     // Silent failure — never block session
     return null;
+  } finally {
+    if (installLock) installLock.release();
   }
 }
 
@@ -756,6 +785,7 @@ module.exports = {
   isSilentMode, isInstallMissingMode, isForceMode,
   requestJson, resolveProxy, parseLatestRelease, fetchLatestRelease,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
+  getPlatformAssetName,
   selfHealStaleBinary,
   selfHealGlobalPkgs, staleGlobalPkgs, globalPkgVersion, npmInstallGlobal,
   downloadAndInstall, refreshMarketplaceClone, marketplaceCloneDir,

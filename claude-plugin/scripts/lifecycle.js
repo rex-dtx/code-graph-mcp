@@ -18,6 +18,13 @@ const CACHE_DIR = path.join(os.homedir(), '.cache', 'code-graph');
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
 const REGISTRY_FILE = path.join(CACHE_DIR, 'statusline-registry.json');
+// Written by the launcher's background install when ITS `npm install -g` step
+// introduced the global shell + platform packages. Uninstall only removes
+// global packages it can prove the plugin installed (marker present) or when
+// the user passes --purge-global — a deliberate user install is never yanked.
+const GLOBAL_INSTALL_MARKER = path.join(CACHE_DIR, 'global-install-marker.json');
+const INSTALL_LOCK_FILE = path.join(CACHE_DIR, 'install.lock');
+const SHELL_PKG = '@sdsrs/code-graph';
 
 // Lazy resolvers — Claude Code's config dir can be overridden by CLAUDE_CONFIG_DIR
 // (multi-account isolation). Re-read every call so test subprocesses with a
@@ -218,13 +225,25 @@ function cleanupDisabledStatusline() {
     return { cleaned: false, settingsChanged: false };
   }
 
+  // Decide BEFORE mutating: isPluginUninstalled reads the same composite/
+  // registry markers detachStatuslineIntegration is about to remove.
+  const uninstalled = isPluginUninstalled(settings);
+
   let settingsChanged = detachStatuslineIntegration(settings);
   if (removeHooksFromSettings(settings)) settingsChanged = true;
   if (settingsChanged) {
     writeJsonAtomic(settingsPath(), settings);
   }
 
-  return { cleaned: true, settingsChanged };
+  // Genuine uninstall (not a temporary disable): reclaim ~/.cache/code-graph
+  // too. This statusline-render path is the ONLY plugin code guaranteed to
+  // still run after `/plugin uninstall` — Claude Code stops loading the
+  // plugin's hooks.json, so the SessionStart teardown in session-init.js never
+  // fires post-uninstall. Without this, the ~40MB cached binary leaked forever.
+  let cacheRemoved = false;
+  if (uninstalled) cacheRemoved = removeCacheResidue();
+
+  return { cleaned: true, settingsChanged, cacheRemoved };
 }
 
 // --- Scope Conflict Detection ---
@@ -648,7 +667,30 @@ function install() {
 
 // --- Uninstall (clean all config) ---
 
-function uninstall() {
+/** Which of our npm packages exist at a global top level right now. */
+function installedGlobalPkgs() {
+  const { globalNodeModulesCandidates, PLATFORM_PKG } = require('./find-binary');
+  const found = [];
+  for (const name of [SHELL_PKG, PLATFORM_PKG]) {
+    for (const root of globalNodeModulesCandidates()) {
+      if (fs.existsSync(path.join(root, name, 'package.json'))) { found.push(name); break; }
+    }
+  }
+  return found;
+}
+
+function defaultRunNpm(args) {
+  const { spawnSync } = require('child_process');
+  const { npmSpawnOpts } = require('./npm-exec');
+  try {
+    const r = spawnSync('npm', args, npmSpawnOpts({
+      timeout: 120000, stdio: 'pipe', encoding: 'utf8',
+    }));
+    return !r.error && r.status === 0;
+  } catch { return false; }
+}
+
+function uninstall({ purgeGlobal = false, runNpm = defaultRunNpm, scanGlobalPkgs = installedGlobalPkgs } = {}) {
   const settings = readJson(settingsPath());
   let settingsChanged = false;
 
@@ -692,6 +734,23 @@ function uninstall() {
     if (ipChanged) writeJsonAtomic(installedPluginsPath(), installedPlugins);
   }
 
+  // 5.5. Global npm packages + adoption inventory — read BEFORE step 6 wipes
+  // CACHE_DIR (both the install marker and the adopted-projects registry live
+  // there). The launcher's background install runs `npm install -g` on the
+  // user's behalf; nothing on the Claude Code uninstall path ever removes those
+  // packages (~40MB platform binary + CLI shim left on PATH forever).
+  const pluginInstalledGlobals = !!readJson(GLOBAL_INSTALL_MARKER);
+  let adoptedProjects = [];
+  try { adoptedProjects = require('./adopt').readAdoptedProjects(); } catch { /* POSIX-only helper — ok */ }
+  let globalPkgsRemoved = [];
+  let globalPkgsRemaining = scanGlobalPkgs();
+  if (globalPkgsRemaining.length && (pluginInstalledGlobals || purgeGlobal)) {
+    if (runNpm(['uninstall', '-g', ...globalPkgsRemaining])) {
+      globalPkgsRemoved = globalPkgsRemaining;
+      globalPkgsRemaining = scanGlobalPkgs(); // re-scan: report only what actually survived
+    }
+  }
+
   // 6. Remove cache directory
   try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); } catch { /* ok */ }
 
@@ -706,7 +765,7 @@ function uninstall() {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ok */ }
   }
 
-  return { settingsChanged };
+  return { settingsChanged, pluginInstalledGlobals, globalPkgsRemoved, globalPkgsRemaining, adoptedProjects };
 }
 
 // --- Update (refresh config points) ---
@@ -952,6 +1011,7 @@ module.exports = {
   SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests
   PLUGIN_ROOT,                                                         // v0.32.1 — for tests / consumers
   registerStatuslineProvider, unregisterStatuslineProvider,
+  installedGlobalPkgs, GLOBAL_INSTALL_MARKER, INSTALL_LOCK_FILE, SHELL_PKG,   // uninstall residue
   PLUGIN_ID, OLD_PLUGIN_IDS, MARKETPLACE_NAME, CACHE_DIR, REGISTRY_FILE,
   settingsPath, installedPluginsPath, providersBackupFile, pluginsCacheDir,
 };
@@ -963,10 +1023,24 @@ if (require.main === module) {
     const r = install();
     console.log(`Installed v${r.version} | settings=${r.settingsChanged} | statusLine=${r.statusLineClaimed}`);
   } else if (cmd === 'uninstall') {
-    const r = uninstall();
+    const r = uninstall({ purgeGlobal: process.argv.includes('--purge-global') });
     console.log(`Uninstalled | settings cleaned=${r.settingsChanged}`);
-    console.log('  Note: also run `/plugin uninstall code-graph-mcp` inside Claude Code to sync its UI state,');
-    console.log('  and `code-graph-mcp unadopt` in each adopted project to remove its CLAUDE.md block.');
+    if (r.globalPkgsRemoved.length) {
+      console.log(`  Removed global npm package(s): ${r.globalPkgsRemoved.join(', ')}`);
+    }
+    if (r.globalPkgsRemaining.length) {
+      console.log(`  Global npm package(s) still installed: ${r.globalPkgsRemaining.join(', ')}`);
+      console.log(`    Remove with: npm uninstall -g ${r.globalPkgsRemaining.join(' ')}`);
+      if (!r.pluginInstalledGlobals) {
+        console.log('    (left in place: no plugin-install marker, so they may be your own install; --purge-global forces removal)');
+      }
+    }
+    if (r.adoptedProjects.length) {
+      console.log('  Adopted project(s) still carrying a managed CLAUDE.md block + .code-graph/ index:');
+      for (const p of r.adoptedProjects) console.log(`    ${p}`);
+      console.log('    In each: run `code-graph-mcp unadopt` and `rm -rf .code-graph` to clean up.');
+    }
+    console.log('  Note: also run `/plugin uninstall code-graph-mcp` inside Claude Code to sync its UI state.');
   } else if (cmd === 'update') {
     const r = update();
     console.log(`Updated ${r.oldVersion} → ${r.version} | settings=${r.settingsChanged}`);

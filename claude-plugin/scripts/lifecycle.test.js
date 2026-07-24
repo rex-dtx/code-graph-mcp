@@ -59,7 +59,9 @@ test('cleanupDisabledStatusline restores previous statusline and removes registr
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
   `], { env: { ...process.env, HOME: homeDir } }).toString();
 
-  assert.deepEqual(JSON.parse(out), { cleaned: true, settingsChanged: true });
+  // Disabled (not uninstalled) → settings are cleaned but the cache must
+  // survive: the user may re-enable, and re-download costs ~40MB.
+  assert.deepEqual(JSON.parse(out), { cleaned: true, settingsChanged: true, cacheRemoved: false });
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.equal(settings.statusLine.command, 'echo previous-status');
   assert.equal(fs.existsSync(registryPath), false);
@@ -93,10 +95,13 @@ test('cleanupDisabledStatusline also heals orphaned statusline after uninstall',
     process.stdout.write(JSON.stringify(cleanupDisabledStatusline()));
   `], { env: { ...process.env, HOME: homeDir } }).toString();
 
-  assert.deepEqual(JSON.parse(out), { cleaned: true, settingsChanged: true });
+  // Genuine uninstall → the composite render is the ONLY plugin code that still
+  // runs (CC stopped loading hooks.json), so it must also reclaim the cache.
+  assert.deepEqual(JSON.parse(out), { cleaned: true, settingsChanged: true, cacheRemoved: true });
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.equal(settings.statusLine.command, 'echo previous-status');
   assert.equal(fs.existsSync(registryPath), false);
+  assert.equal(fs.existsSync(path.join(homeDir, '.cache', 'code-graph')), false);
 });
 
 test('isPluginUninstalled distinguishes a genuine uninstall from a temporary disable', (t) => {
@@ -783,4 +788,74 @@ test('cleanupOldCacheVersions prunes beyond keep when nothing is in use', (t) =>
   assert.equal(
     fs.readdirSync(pluginDir).filter(n => fs.statSync(path.join(pluginDir, n)).isDirectory()).length,
     5, 'exactly keep=5 versions remain');
+});
+
+// ── uninstall: global npm packages + residue guidance ───────────────────────
+//
+// The launcher's background install runs `npm install -g` on the user's
+// behalf and writes global-install-marker.json. uninstall() must remove those
+// packages when the marker proves plugin ownership (or --purge-global), and
+// must NEVER touch a user's own global install without either.
+
+function seedUninstallHome(t) {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  fs.mkdirSync(cacheDir, { recursive: true });
+  writeJson(path.join(homeDir, '.claude', 'settings.json'), {});
+  return { homeDir, cacheDir };
+}
+
+function runUninstallInSubprocess(homeDir, { marker, purgeGlobal = false, pkgs }) {
+  // In-subprocess stub: scanGlobalPkgs returns `pkgs` until runNpm "removes"
+  // them; records the npm args it would have run.
+  const script = `
+    const { uninstall } = require(${JSON.stringify(lifecyclePath)});
+    let installed = ${JSON.stringify(pkgs)};
+    const npmCalls = [];
+    const r = uninstall({
+      purgeGlobal: ${JSON.stringify(purgeGlobal)},
+      scanGlobalPkgs: () => installed,
+      runNpm: (args) => { npmCalls.push(args); installed = []; return true; },
+    });
+    process.stdout.write(JSON.stringify({ r, npmCalls }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: homeDir },
+  }).toString());
+}
+
+test('uninstall removes plugin-installed global packages (marker present)', (t) => {
+  const { homeDir, cacheDir } = seedUninstallHome(t);
+  writeJson(path.join(cacheDir, 'global-install-marker.json'),
+    { installedBy: 'code-graph-mcp launcher', version: '1.2.3' });
+  writeJson(path.join(cacheDir, 'adopted-projects.json'), ['/proj/a', '/proj/b']);
+  const pkgs = ['@sdsrs/code-graph', '@sdsrs/code-graph-linux-x64'];
+
+  const { r, npmCalls } = runUninstallInSubprocess(homeDir, { marker: true, pkgs });
+
+  assert.equal(r.pluginInstalledGlobals, true);
+  assert.deepEqual(npmCalls, [['uninstall', '-g', ...pkgs]]);
+  assert.deepEqual(r.globalPkgsRemoved, pkgs);
+  assert.deepEqual(r.globalPkgsRemaining, []);
+  assert.deepEqual(r.adoptedProjects, ['/proj/a', '/proj/b'],
+    'adoption inventory read before the cache wipe');
+  assert.equal(fs.existsSync(cacheDir), false, 'cache dir removed');
+});
+
+test('uninstall leaves user-installed globals alone without marker; --purge-global overrides', (t) => {
+  const pkgs = ['@sdsrs/code-graph', '@sdsrs/code-graph-linux-x64'];
+
+  // No marker, no flag → report only, never run npm.
+  const a = seedUninstallHome(t);
+  const resA = runUninstallInSubprocess(a.homeDir, { pkgs });
+  assert.equal(resA.r.pluginInstalledGlobals, false);
+  assert.deepEqual(resA.npmCalls, [], 'must not uninstall a user-owned global install');
+  assert.deepEqual(resA.r.globalPkgsRemoved, []);
+  assert.deepEqual(resA.r.globalPkgsRemaining, pkgs, 'remaining packages surfaced for manual cleanup');
+
+  // No marker + explicit --purge-global → removal authorized by the user.
+  const b = seedUninstallHome(t);
+  const resB = runUninstallInSubprocess(b.homeDir, { purgeGlobal: true, pkgs });
+  assert.deepEqual(resB.npmCalls, [['uninstall', '-g', ...pkgs]]);
+  assert.deepEqual(resB.r.globalPkgsRemoved, pkgs);
 });

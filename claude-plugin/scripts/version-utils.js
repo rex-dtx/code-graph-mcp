@@ -3,12 +3,20 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION_OUTPUT_RE = /^code-graph-mcp\s+(\d+\.\d+\.\d+)$/;
+// Tolerant match: the version line anywhere in the output (m flag), optional
+// "v" prefix, and anything after the numeric triple (build-metadata suffixes
+// like "1.2.3 (abc123)" or "-dev"). The old fully-anchored /^...$/ turned ANY
+// deviation into null, which upstream reads as "broken binary" → judged
+// permanently stale → re-download every session, with the fresh download
+// rejected by the same parse: a self-sustaining loop.
+const VERSION_OUTPUT_RE = /^code-graph-mcp\s+v?(\d+\.\d+\.\d+)/m;
 
 function readBinaryVersion(binaryPath) {
   try {
     const out = execFileSync(binaryPath, ['--version'], {
-      timeout: 2000,
+      // 5s: a cold exec of a freshly-written ~40MB binary (page-in, Windows AV
+      // scan) regularly exceeded the old 2s, misclassifying a good binary.
+      timeout: 5000,
       stdio: ['pipe', 'pipe', 'pipe'],
     }).toString().trim();
     const match = out.match(VERSION_OUTPUT_RE);

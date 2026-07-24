@@ -602,9 +602,11 @@ test('§2.8 bin/cli.js shows install instructions when binary is missing', () =>
   fs.mkdirSync(fakePlugin, { recursive: true });
 
   // Copy find-binary.js + its module deps to fake root.
-  // (find-binary.js requires ./version-utils for B fix's cache version check.)
+  // (find-binary.js requires ./version-utils for B fix's cache version check,
+  // and ./npm-exec for the Windows npm shell shim.)
   fs.copyFileSync(FIND_BINARY, path.join(fakePlugin, 'find-binary.js'));
   fs.copyFileSync(VERSION_UTILS, path.join(fakePlugin, 'version-utils.js'));
+  fs.copyFileSync(path.join(PLUGIN_ROOT, 'scripts', 'npm-exec.js'), path.join(fakePlugin, 'npm-exec.js'));
 
   // Create a minimal cli.js that uses the fake find-binary
   const cliScript = `

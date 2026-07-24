@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { readBinaryVersion } = require('./version-utils');
+const { npmSpawnOpts } = require('./npm-exec');
 
 const PLATFORM = os.platform();
 const ARCH = os.arch();
@@ -51,9 +52,17 @@ function unsupportedPlatformHint(platform = PLATFORM, arch = ARCH, libc = null) 
   return null;
 }
 
-/** Read the npm pkg version from this script's package.json (claude-plugin/../package.json). */
+/**
+ * Version that arms the gates below. Two shipped layouts resolve differently:
+ * npm install has `<pkg>/package.json` two levels up; the marketplace/plugin-cache
+ * copy ships ONLY the claude-plugin subtree, so `../.claude-plugin/plugin.json`
+ * is the sole version source there. Without the fallback, every marketplace
+ * install ran with a null version and each gate degraded to
+ * first-candidate-wins (the pre-d578d99 relic-shadowing behavior).
+ */
 function getPackageVersion() {
-  try { return require('../../package.json').version; }
+  try { return require('../../package.json').version; } catch { /* not npm layout */ }
+  try { return require('../.claude-plugin/plugin.json').version; }
   catch { return null; }
 }
 
@@ -114,11 +123,11 @@ function globalNodeModulesCandidates() {
   // 4. Last resort: ask npm directly. Slow (~50-200ms) but most accurate when
   //    user has a non-standard prefix. Cached at the disk-cache layer above.
   try {
-    const root = execFileSync('npm', ['root', '-g'], {
+    const root = execFileSync('npm', ['root', '-g'], npmSpawnOpts({
       timeout: 2000,
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf8',
-    }).trim();
+    })).trim();
     if (root) out.push(root);
   } catch { /* npm not on PATH or timed out */ }
 

@@ -8,6 +8,7 @@ const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-util
 const {
   getPluginVersion, readJson, healthCheck, CACHE_DIR,
   settingsPath, surveyHookCoverage,
+  installedGlobalPkgs, GLOBAL_INSTALL_MARKER, SHELL_PKG,
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 
@@ -275,6 +276,29 @@ function runDiagnostics() {
     } else {
       const failed = fire.results.filter(r => !r.ok).map(r => r.label).join(', ') || fire.error || 'unknown';
       results.push({ name: 'Hook firing', status: 'warn', detail: `did not fire: ${failed}` });
+    }
+  } catch { /* probe failed — skip */ }
+
+  // 9. Global npm residue — the launcher's background install (or the user)
+  //    may have `npm install -g`'d the shell + platform packages. Surface what
+  //    exists and who owns cleanup: with the plugin-install marker,
+  //    `lifecycle.js uninstall` removes them; without it they are treated as
+  //    user-installed and a plugin uninstall leaves them on PATH.
+  try {
+    const { globalPkgVersion } = require('./auto-update');
+    const { PLATFORM_PKG } = require('./find-binary');
+    const found = [SHELL_PKG, PLATFORM_PKG]
+      .map((name) => ({ name, version: globalPkgVersion(name) }))
+      .filter((p) => p.version);
+    if (found.length) {
+      const marker = !!readJson(GLOBAL_INSTALL_MARKER);
+      results.push({
+        name: 'Global npm packages',
+        status: 'ok',
+        detail: found.map((p) => `${p.name}@${p.version}`).join(', ') + (marker
+          ? ' — plugin-installed; `node lifecycle.js uninstall` removes them'
+          : ` — no plugin-install marker; uninstall leaves them (remove: npm uninstall -g ${found.map((p) => p.name).join(' ')})`),
+      });
     }
   } catch { /* probe failed — skip */ }
 

@@ -172,6 +172,26 @@ test('getPackageVersion reads root package.json', () => {
   assert.match(v, /^\d+\.\d+\.\d+$/, `expected semver-ish, got: ${v}`);
 });
 
+test('getPackageVersion falls back to .claude-plugin/plugin.json (marketplace layout)', (t) => {
+  // The plugin cache ships only the claude-plugin subtree: no package.json two
+  // levels above scripts/. Before the fallback, getPackageVersion() returned
+  // null there and every version gate silently disarmed (first-candidate-wins),
+  // re-opening the relic-shadowing incident for all marketplace installs.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cgmcp-mkt-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.claude-plugin'), { recursive: true });
+  for (const f of ['find-binary.js', 'version-utils.js', 'npm-exec.js']) {
+    fs.copyFileSync(path.join(__dirname, f), path.join(root, 'scripts', f));
+  }
+  fs.writeFileSync(path.join(root, '.claude-plugin', 'plugin.json'),
+    JSON.stringify({ name: 'code-graph-mcp', version: '9.8.7' }));
+  const script = `process.stdout.write(String(require(${
+    JSON.stringify(path.join(root, 'scripts', 'find-binary.js'))}).getPackageVersion()))`;
+  const out = require('child_process').execFileSync(process.execPath, ['-e', script], { encoding: 'utf8' });
+  assert.equal(out, '9.8.7');
+});
+
 // ─── isCachedBinaryFresh: disk cache version-check (mem #8454) ────────────
 //
 // Builds a fake binary that responds to `--version` with a controllable

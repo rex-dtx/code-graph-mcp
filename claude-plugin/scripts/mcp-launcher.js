@@ -160,6 +160,7 @@ if (!binary) {
     },
   });
 
+  const { GLOBAL_INSTALL_MARKER, INSTALL_LOCK_FILE } = require('./lifecycle');
   installBinaryInBackground({
     version,
     findBinary,
@@ -167,6 +168,17 @@ if (!binary) {
     // Nudge the handover immediately instead of waiting for the stub's next poll.
     onInstalled: () => stub.attemptUpgrade(),
     onFailed: () => printManualInstallHints(),
+    // Marker: this npm install was OURS, so lifecycle.js uninstall knows it
+    // owns removing the global packages (never yanks a user's own install).
+    recordGlobalInstall: () => {
+      fs.mkdirSync(path.dirname(GLOBAL_INSTALL_MARKER), { recursive: true });
+      fs.writeFileSync(GLOBAL_INSTALL_MARKER, JSON.stringify({
+        installedBy: 'code-graph-mcp launcher', version, at: new Date().toISOString(),
+      }, null, 2) + '\n');
+    },
+    // Serialize against other cold sessions + auto-update (parallel global npm
+    // installs corrupt the shared prefix).
+    lockPath: INSTALL_LOCK_FILE,
   });
   return; // top-level function scope of mcp-launcher.js
 }

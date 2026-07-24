@@ -43,6 +43,25 @@ test('readBinaryVersion returns null for binary with unexpected output', (t) => 
   assert.equal(readBinaryVersion(bin), null);
 });
 
+// The old fully-anchored /^...$/ regex turned ANY deviation into null, which
+// upstream read as "broken binary" → permanently stale → re-download every
+// session, with the fresh download rejected by the same parse (a self-
+// sustaining loop). The parser must tolerate benign output variations.
+test('VERSION_OUTPUT_RE tolerates v prefix, suffixes, and extra lines', () => {
+  const { VERSION_OUTPUT_RE } = require('./version-utils');
+  const parse = (out) => {
+    const m = out.trim().match(VERSION_OUTPUT_RE);
+    return m ? m[1] : null;
+  };
+  assert.equal(parse('code-graph-mcp 0.101.0'), '0.101.0');
+  assert.equal(parse('code-graph-mcp v1.2.3'), '1.2.3');
+  assert.equal(parse('code-graph-mcp 1.2.3 (abc123)'), '1.2.3');
+  assert.equal(parse('code-graph-mcp 1.2.3-dev'), '1.2.3');
+  assert.equal(parse('warning: something\ncode-graph-mcp 1.2.3\n'), '1.2.3');
+  assert.equal(parse('some unrelated tool 1.2.3'), null);
+  assert.equal(parse(''), null);
+});
+
 // ── isDevMode ──
 
 function makeFakePluginRoot(t, { withCargo = false, withTarget = false, asSymlink = false } = {}) {

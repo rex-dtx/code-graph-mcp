@@ -339,7 +339,46 @@ function platformGuard() {
 // now lives in project-detect.js — the single activation gate shared with
 // mcp-launcher.js and session-init.js. Imported above and re-exported below.
 
-function adopt({ cwd, templatePath } = {}) {
+// ── Adopted-projects registry ───────────────────────────────
+// ~/.cache/code-graph/adopted-projects.json — every project adopt() has touched.
+// Sole consumer is lifecycle.js uninstall(): without this list it cannot tell
+// the user WHICH projects still carry a managed CLAUDE.md block + .code-graph/
+// index dir (adoption state is otherwise only discoverable per-project).
+// Best-effort: registry loss only degrades uninstall guidance, never adoption.
+
+function adoptedRegistryFile(home) {
+  return path.join(home || os.homedir(), '.cache', 'code-graph', 'adopted-projects.json');
+}
+
+function readAdoptedProjects(home) {
+  try {
+    const list = JSON.parse(fs.readFileSync(adoptedRegistryFile(home), 'utf8'));
+    return Array.isArray(list) ? list.filter((p) => typeof p === 'string') : [];
+  } catch { return []; }
+}
+
+function recordAdopted(projectDir, home) {
+  try {
+    const file = adoptedRegistryFile(home);
+    const list = readAdoptedProjects(home);
+    const abs = path.resolve(projectDir);
+    if (list.includes(abs)) return;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeFileAtomic(file, JSON.stringify([...list, abs], null, 2) + '\n');
+  } catch { /* best-effort */ }
+}
+
+function removeAdopted(projectDir, home) {
+  try {
+    const list = readAdoptedProjects(home);
+    const abs = path.resolve(projectDir);
+    const next = list.filter((p) => p !== abs);
+    if (next.length === list.length) return;
+    writeFileAtomic(adoptedRegistryFile(home), JSON.stringify(next, null, 2) + '\n');
+  } catch { /* best-effort */ }
+}
+
+function adopt({ cwd, templatePath, home } = {}) {
   const blocked = platformGuard();
   if (blocked) return blocked;
 
@@ -376,6 +415,7 @@ function adopt({ cwd, templatePath } = {}) {
   const exists = fs.existsSync(cPath);
   const current = exists ? fs.readFileSync(cPath, 'utf8') : '';
   if (current.includes(block)) {
+    recordAdopted(effectiveCwd, home);
     return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: false, created: false, healed: false };
   }
   const cleaned = exists ? stripSentinelBlock(current) : '';
@@ -383,6 +423,7 @@ function adopt({ cwd, templatePath } = {}) {
   const base = cleaned.replace(/\n+$/, '');
   const prefix = base ? base + '\n\n' : '';
   writeFileAtomic(cPath, prefix + block + '\n');
+  recordAdopted(effectiveCwd, home);
   return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: true, created: !exists, healed };
 }
 
@@ -495,12 +536,12 @@ function maybeAutoAdopt({ cwd, home, env, scriptPath } = {}) {
     // shipped template / 管理块 漂移时重跑 adopt 对齐。
     // opt-out: CODE_GRAPH_NO_TEMPLATE_REFRESH=1（锁定手动编辑）。
     if (env.CODE_GRAPH_NO_TEMPLATE_REFRESH !== '1' && needsRefresh({ cwd })) {
-      const result = adopt({ cwd });
+      const result = adopt({ cwd, home });
       return { attempted: true, reason: 'refreshed', result, migrated };
     }
     return { attempted: false, reason: 'already-adopted', migrated };
   }
-  const result = adopt({ cwd });
+  const result = adopt({ cwd, home });
   return { attempted: true, reason: 'adopted', result, migrated };
 }
 
@@ -544,6 +585,7 @@ function unadopt({ cwd, home } = {}) {
   // Also sweep any legacy memory-dir remnants (uninstall before auto-migration ran).
   const migrated = migrateLegacyMemoryDir({ cwd, home });
 
+  removeAdopted(effectiveCwd, home);
   return { ok: true, fileRemoved, blockPruned, claudeMdRemoved, target: dPath, claudeMdPath: cPath, migrated };
 }
 
@@ -603,6 +645,7 @@ if (require.main === module) {
 
 module.exports = {
   adopt, unadopt, memoryDir, formatResult, stripSentinelBlock,
+  readAdoptedProjects, recordAdopted, removeAdopted, adoptedRegistryFile,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
   detectProjectType, buildBlock, buildTriggerRows, migrateLegacyMemoryDir,
   claudeMdPath, detailDir, detailPath,

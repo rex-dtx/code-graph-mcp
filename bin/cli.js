@@ -54,15 +54,28 @@ if (sub === "uninstall") {
   }
   const lifecycle = require("../claude-plugin/scripts/lifecycle");
   const { unadopt } = require("../claude-plugin/scripts/adopt");
-  const r = lifecycle.uninstall();
+  const r = lifecycle.uninstall({ purgeGlobal: process.argv.slice(3).includes("--purge-global") });
   let ua = { ok: false };
   try { ua = unadopt(); } catch { /* best-effort — settings/cache already cleaned */ }
   const projectUnadopted = !!(ua && (ua.blockPruned || ua.fileRemoved || ua.claudeMdRemoved));
-  process.stdout.write(
+  let out =
     `Uninstalled code-graph-mcp | settings cleaned=${r.settingsChanged}` +
-    ` | this project unadopted=${projectUnadopted}\n` +
-    "  Also run `/plugin uninstall code-graph-mcp` in Claude Code, and\n" +
-    "  `code-graph-mcp unadopt` in any other adopted project.\n");
+    ` | this project unadopted=${projectUnadopted}\n`;
+  if (r.globalPkgsRemoved.length) {
+    out += `  Removed global npm package(s): ${r.globalPkgsRemoved.join(", ")}\n`;
+  }
+  if (r.globalPkgsRemaining.length) {
+    out += `  Global npm package(s) still installed: ${r.globalPkgsRemaining.join(", ")}\n` +
+      `    Remove with: npm uninstall -g ${r.globalPkgsRemaining.join(" ")}` +
+      (r.pluginInstalledGlobals ? "\n" : "   (or re-run with --purge-global)\n");
+  }
+  const otherAdopted = r.adoptedProjects.filter((p) => p !== process.cwd());
+  if (otherAdopted.length) {
+    out += "  Other adopted project(s) — run `code-graph-mcp unadopt` + `rm -rf .code-graph` in each:\n" +
+      otherAdopted.map((p) => `    ${p}\n`).join("");
+  }
+  out += "  Also run `/plugin uninstall code-graph-mcp` in Claude Code to sync its UI state.\n";
+  process.stdout.write(out);
   process.exit(0);
 }
 

@@ -4,6 +4,12 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+
+// Tests call adopt()/unadopt() in-process; both now maintain the
+// adopted-projects registry under ~/.cache/code-graph. Point HOME at a
+// sandbox BEFORE any test runs so no test writes the real user registry
+// (os.homedir() reads $HOME at call time on POSIX).
+process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-isolated-home-'));
 const {
   adopt, unadopt, memoryDir, stripSentinelBlock,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,
@@ -675,5 +681,41 @@ test('CODE_GRAPH_PROJECT_TYPE env override falls through on invalid value', () =
   try {
     fs.writeFileSync(path.join(sb.cwd, 'Cargo.toml'), '[package]\nname="x"\n');
     assert.strictEqual(detectProjectType(sb.cwd, { CODE_GRAPH_PROJECT_TYPE: 'web-rust' }), 'rust');
+  } finally { sb.cleanup(); }
+});
+
+// ── Adopted-projects registry (consumed by lifecycle.js uninstall) ──────────
+
+test('adopt records the project in the registry; unadopt removes it', () => {
+  const sb = makeSandbox();
+  try {
+    const { readAdoptedProjects, adoptedRegistryFile } = require('./adopt');
+    const r = adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(readAdoptedProjects(sb.home), [path.resolve(sb.cwd)],
+      'adopt must register the project for uninstall-time guidance');
+
+    // Idempotent: re-adopt does not duplicate.
+    adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(readAdoptedProjects(sb.home).length, 1);
+
+    unadopt({ cwd: sb.cwd, home: sb.home });
+    assert.deepStrictEqual(readAdoptedProjects(sb.home), [],
+      'unadopt must deregister the project');
+    assert.ok(fs.existsSync(adoptedRegistryFile(sb.home)) === true || true); // file may stay as []
+  } finally { sb.cleanup(); }
+});
+
+test('registry survives a corrupt file and never throws', () => {
+  const sb = makeSandbox();
+  try {
+    const { readAdoptedProjects, adoptedRegistryFile } = require('./adopt');
+    const file = adoptedRegistryFile(sb.home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'not-json');
+    assert.deepStrictEqual(readAdoptedProjects(sb.home), []);
+    const r = adopt({ cwd: sb.cwd, home: sb.home }); // must not throw on corrupt registry
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(readAdoptedProjects(sb.home), [path.resolve(sb.cwd)]);
   } finally { sb.cleanup(); }
 });

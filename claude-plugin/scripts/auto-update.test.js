@@ -33,6 +33,7 @@ const {
   cachedBinaryPath,
   cachedBinaryNeedsUpdate,
   cachedBinaryStaleVsState,
+  getPlatformAssetName,
   downloadBinary,
   selfHealStaleBinary,
   selfHealGlobalPkgs,
@@ -622,4 +623,43 @@ test('staleGlobalPkgs / globalPkgVersion read top-level global installs from dis
   assert.deepEqual(stale, [{ name: '@sdsrs/code-graph', version: '0.46.0' }]);
   assert.deepEqual(staleGlobalPkgs('0.46.0', [root]), [],
     'a global install matching latest is not stale');
+});
+
+// ── getPlatformAssetName: libc gating ───────────────────────────────────────
+
+test('getPlatformAssetName returns null on musl (no published asset → no futile download)', () => {
+  // Alpine: the glibc build downloads fine but cannot exec, so promote always
+  // rejected it and every SessionStart re-pulled ~40MB forever.
+  assert.equal(getPlatformAssetName({ platform: 'linux', arch: 'x64', libc: 'musl' }), null);
+  assert.equal(getPlatformAssetName({ platform: 'linux', arch: 'x64', libc: 'glibc' }),
+    'code-graph-mcp-linux-x64');
+  assert.equal(getPlatformAssetName({ platform: 'win32', arch: 'x64', libc: 'glibc' }),
+    'code-graph-mcp-win32-x64.exe');
+});
+
+// ── cachedBinaryNeedsUpdate / cachedBinaryStaleVsState: ordered compare ─────
+
+test('cached binary NEWER than latest is not downgraded; unreadable is healed', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-newer-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const binaryPath = path.join(dir, 'code-graph-mcp');
+  fs.writeFileSync(binaryPath, 'x');
+  const latest = { version: '1.0.0', binaryUrl: 'https://example.com/bin' };
+
+  // Newer than releases/latest (dev build / API lagging a publish) → keep it.
+  assert.equal(
+    cachedBinaryNeedsUpdate(latest, { binaryPath, readVersion: () => '9.9.9' }),
+    false, 'a newer binary must not be replaced by an older release');
+  // Unreadable --version → broken → let the heal replace it.
+  assert.equal(
+    cachedBinaryNeedsUpdate(latest, { binaryPath, readVersion: () => null }),
+    true);
+
+  const state = { latestVersion: '1.0.0' };
+  assert.equal(
+    cachedBinaryStaleVsState(state, { binaryPath, readVersion: () => '9.9.9' }),
+    false, 'newer-than-state must not bypass the throttle');
+  assert.equal(
+    cachedBinaryStaleVsState(state, { binaryPath, readVersion: () => null }),
+    true, 'unreadable binary bypasses the throttle so the heal can run');
 });

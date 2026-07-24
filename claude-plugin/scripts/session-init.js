@@ -480,10 +480,13 @@ function runSessionInit({ source } = {}) {
     cleanupDisabledStatusline();
     // Genuine uninstall (not a temporary disable) leaves residue the settings-only
     // self-heal can't reach: ~/.cache/code-graph (the ~40MB binary + state) and the
-    // current project's CLAUDE.md adoption block. CC fires no uninstall hook, so this
-    // SessionStart is the only automated teardown — symmetric to install's auto-adopt.
-    // Per-project: only the cwd we're in; other adopted projects self-clean when next
-    // opened, or via `code-graph-mcp unadopt`.
+    // current project's CLAUDE.md adoption block. CC fires no uninstall hook, AND it
+    // stops loading this plugin's hooks.json the moment the install record is gone —
+    // so after a real `/plugin uninstall` this SessionStart usually never runs again.
+    // The reachable teardown is cleanupDisabledStatusline() via the composite
+    // statusline (still wired in settings.json); it removes the cache residue too.
+    // This branch remains for the disable→uninstall-while-running edge and as the
+    // only place project unadoption can happen automatically.
     let teardown = null;
     if (uninstalled) {
       const cacheRemoved = removeCacheResidue();
