@@ -26,8 +26,77 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Quality gate (audit 2026-07-27 P1-3): before this job, a tag push reached
+  # npm without ever running fmt, clippy, or a single Rust test. release.yml's
+  # only trigger is `tags: ['v*']` and its job chain was build → publish →
+  # smoke, with no `needs: ci` and no `workflow_run` anywhere — and
+  # bump-version.sh instructs `git push && git push --tags` with no wait between
+  # them, so ci.yml's verdict on the commit does not exist yet when the tag
+  # fires. The 07-24 audit found clippy RED on already-committed code; under the
+  # old topology that state published to npm, which is irreversible.
+  #
+  # publish's existing gates (artifact `--version` == tag, full JS suite) are
+  # real but cover zero Rust.
+  #
+  gate:
+    name: Gate (fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          # Same redirect as `build` below: on workflow_dispatch, github.ref is
+          # main, and gating main's HEAD would certify code the tag doesn't
+          # contain. Sixth site of the inputs.tag fallback contract.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      # Restore-only, and only from the cache cache-warm.yml's `warm-gate` job
+      # writes on main. Two properties drive this:
+      #   - `shared-key` (not `key`): rust-cache's automatic key embeds the JOB
+      #     name, so a plain `key` from a differently-named job never matches.
+      #     Same lesson as `build` below, proven live on v0.101.0.
+      #   - `save-if: false`: Actions caches are ref-scoped, so anything this job
+      #     saved under refs/tags/vX would be invisible to the NEXT tag while
+      #     still consuming the repo's 10 GB LRU budget — pure eviction pressure
+      #     on entries that are readable. Only the main-branch warm job writes.
+      # If warm-gate has not run recently the restore simply misses and this job
+      # compiles cold (~5-9 min), which is what it did before caching existed.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-gate
+          save-if: false
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      # Both feature sets, in this order: the no-default pass is cheap (no
+      # candle) and fails fast, and its compiled deps are reused by the second.
+      # embed-model is what release binaries ship, so gating only the default
+      # set would leave the shipped configuration unchecked.
+      - name: Clippy (no default features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Clippy (embed-model)
+        run: cargo clippy --features embed-model --all-targets -- -D warnings
+
+      - name: Test (embed-model)
+        # Mirrors ci.yml's embed-check job: without this the spawned `serve`
+        # integration tests background-fetch the ~90 MB model on a runner whose
+        # cache does not carry it — slow, and flaky because cache population
+        # flips which tests self-skip. This job is now the last gate before an
+        # irreversible npm publish, so it must not be the flakiest one.
+        env:
+          CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
+        run: cargo test --features embed-model
+
   build:
     name: Build ${{ matrix.npm-pkg }}
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

@@ -6,7 +6,7 @@ const path = require('path');
 const os = require('os');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const {
-  getPluginVersion, readJson, healthCheck, CACHE_DIR,
+  getPluginVersion, readJson, readJsonResult, healthCheck, scanForBrokenPaths, CACHE_DIR,
   settingsPath, surveyHookCoverage,
   installedGlobalPkgs, GLOBAL_INSTALL_MARKER, SHELL_PKG,
 } = require('./lifecycle');
@@ -57,7 +57,15 @@ function classifyEmbeddings(hc) {
  * Run all diagnostic checks. Returns an array of:
  *   { name: string, status: 'ok'|'warn'|'error'|'skip', detail: string, fixId?: string }
  */
-function runDiagnostics() {
+// `checkOnly` must reach here, not just formatReport. `--check-only` is a
+// SHIPPED read-only contract (CHANGELOG v0.82.1: "it never reaches runRepairs"),
+// but the write was never in runRepairs — `healthCheck()` below calls
+// `install()`, which REBUILDS an unusable settings.json. Reproduced: under
+// `--check-only`, a settings.json holding `{"model":"opus",}` went 36 B -> 3318 B
+// with the model key gone, and the report then said "Run without --check-only to
+// fix." A read-only mode that rewrites the user's config is worse than one that
+// lies about it.
+function runDiagnostics({ checkOnly = false } = {}) {
   const results = [];
   const binary = findBinary();
 
@@ -214,9 +222,28 @@ function runDiagnostics() {
   // returning clean. If repaired:false despite install() running, the
   // re-scan still found broken paths — surfacing 'remaining' makes that
   // honest instead of telling the user we fixed nothing.
-  const hookResult = healthCheck();
+  // In check-only mode, SCAN without the auto-repair half of healthCheck().
+  const hookResult = checkOnly
+    ? (() => {
+        const issues = scanForBrokenPaths();
+        return { healthy: issues.length === 0, issues, repaired: false, rebuiltFrom: null };
+      })()
+    : healthCheck();
   if (hookResult.healthy) {
     results.push({ name: 'Hooks', status: 'ok', detail: 'all paths valid' });
+  } else if (hookResult.repaired && hookResult.rebuiltFrom) {
+    // The repair WORKED, but it worked by replacing an unusable settings.json
+    // with a freshly built one — the user's model / env / permissions / own
+    // hooks now exist only in the backup. Reporting that as `✅ auto-repaired`
+    // (which this did) describes a destructive event as a clean one and never
+    // names the file that holds their config.
+    results.push({
+      name: 'Hooks',
+      status: 'warn',
+      detail:
+        `settings.json was unusable and has been REBUILT — your original is at ` +
+        `${hookResult.rebuiltFrom}. Merge anything you need back by hand.`,
+    });
   } else if (hookResult.repaired) {
     results.push({
       name: 'Hooks',
@@ -224,13 +251,20 @@ function runDiagnostics() {
       detail: `${hookResult.issues.length} issue(s) auto-repaired`,
     });
   } else {
-    const remainingCount = Array.isArray(hookResult.remaining)
-      ? hookResult.remaining.length
-      : hookResult.issues.length;
+    const remaining = Array.isArray(hookResult.remaining)
+      ? hookResult.remaining
+      : hookResult.issues;
+    // An unusable settings.json is not a broken PATH — auto-repair correctly
+    // refuses to touch the file, so "invalid path(s)" would send the user
+    // hunting for a missing script instead of at the file that actually needs
+    // repairing.
+    const unusable = remaining.find((i) => i.type === 'settings-unusable');
     results.push({
       name: 'Hooks',
       status: 'warn',
-      detail: `${remainingCount} invalid path(s) — auto-repair did not resolve`,
+      detail: unusable
+        ? `settings.json unusable (${unusable.reason}) — hooks cannot be verified or repaired`
+        : `${remaining.length} invalid path(s) — auto-repair did not resolve`,
       fixId: 'hooks-invalid',
     });
   }
@@ -241,9 +275,24 @@ function runDiagnostics() {
   //    registering them in settings.json. "Missing" is the bug (previously
   //    "present" was treated as legacy debris — that was wrong).
   try {
-    const settings = readJson(settingsPath()) || {};
+    // Sibling of the `scanForBrokenPaths` read above, and it was left on the old
+    // collapsed-`null` idiom: an unusable settings.json became `{}`, which has no
+    // hooks, so this reported "missing 6/6 settings.json entries" — a confident,
+    // wrong diagnosis sitting in the SAME table as the correct "settings.json
+    // unusable" line two rows up.
+    const settingsRead = readJsonResult(settingsPath());
+    const settings = settingsRead.value || {};
     const cov = surveyHookCoverage(settings);
-    if (cov.missing.length === 0 && cov.stale.length === 0) {
+    if (settingsRead.corrupt) {
+      // No `fixId`: the repair is `install()`, which is already driven by the
+      // `Hooks` row above. Raising `missing-hooks-in-settings` here too would
+      // make doctor attempt the same repair twice and count the issue twice.
+      results.push({
+        name: 'Hook coverage',
+        status: 'warn',
+        detail: 'not determinable — settings.json could not be read or parsed',
+      });
+    } else if (cov.missing.length === 0 && cov.stale.length === 0) {
       results.push({
         name: 'Hook coverage',
         status: 'ok',
@@ -266,7 +315,17 @@ function runDiagnostics() {
         fixId: 'missing-hooks-in-settings',
       });
     }
-  } catch { /* probe failed — skip */ }
+  } catch (err) {
+    // Do NOT swallow silently: this catch hid a plain ReferenceError (a helper
+    // that was not imported) by simply dropping the whole Hook-coverage row, so
+    // the table looked complete while a check had not run at all. A probe that
+    // cannot run is itself a finding.
+    results.push({
+      name: 'Hook coverage',
+      status: 'warn',
+      detail: `probe failed: ${err && err.message ? err.message : err}`,
+    });
+  }
 
   // 8. Hook firing (v0.67.0) — coverage (#7) proves the hook is WIRED into
   //    settings.json; this proves the script actually RUNS. Spawns each
@@ -564,6 +623,14 @@ function runRepairs(results) {
         if (remaining.length === 0) {
           console.log('  \u2705 Hooks repaired \u2014 restart Claude Code to apply');
           fixed++;
+        } else if (remaining.some((i) => i.type === 'settings-unusable')) {
+          // Same branch runDiagnostics needs, for the same reason. This arm only
+          // became REACHABLE for unusable settings once scanForBrokenPaths began
+          // reporting them, so it inherited a diagnosis written for a different
+          // cause \u2014 telling the user to reinstall an npm package because their
+          // settings.json has a permissions problem or a trailing comma.
+          console.log('  \u274c settings.json could not be read or parsed \u2014 hooks cannot be verified or repaired');
+          console.log('     Repair it (or move it aside) and re-run; see the error above.');
         } else {
           console.log(`  \u274c ${remaining.length} hook path(s) still invalid \u2014 plugin scripts may be missing.`);
           console.log('     Reinstall: npm install -g @sdsrs/code-graph  (or re-run the plugin installer)');
@@ -579,6 +646,21 @@ function runRepairs(results) {
         if (r.hooksRegistered) {
           console.log('  \u2705 settings.json updated — restart Claude Code to apply');
           fixed++;
+        } else if (r.settingsUnwritable) {
+          // Symmetric with the unreadable arm below. Round-5 finding: the
+          // unwritable case was wired into lifecycle's CLI but not here, so
+          // doctor printed "install reported no change (settings already had
+          // entries)" for a settings.json it had just failed to write.
+          console.log('  \u274c settings.json is not writable \u2014 hooks NOT registered');
+          console.log('     Fix the permissions on it (or on ~/.claude) and re-run; see the error above.');
+        } else if (r.settingsUnreadable) {
+          // install() refused because settings.json exists but cannot be turned
+          // into an object (unparseable / unreadable / not an object). Reporting
+          // "already had entries" here states the exact opposite of the truth,
+          // at the one moment the user most needs the real cause \u2014 which
+          // otherwise appears only on stderr, contradicted by this very line.
+          console.log('  \u274c settings.json could not be read or parsed \u2014 hooks NOT registered');
+          console.log('     Repair it (or move it aside) and re-run; see the error above.');
         } else {
           console.log('  \u2796 install reported no change (settings already had entries)');
         }
@@ -615,7 +697,7 @@ function unresolvedCount({ checkOnly, issueCount, fixed }) {
 }
 
 function runDoctor(opts = {}) {
-  const results = runDiagnostics();
+  const results = runDiagnostics({ checkOnly: opts.checkOnly });
   console.log(formatReport(results, { checkOnly: opts.checkOnly }));
 
   const issues = results.filter(r => r.status === 'warn' || r.status === 'error');

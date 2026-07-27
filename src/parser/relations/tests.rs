@@ -952,33 +952,49 @@ fn main() {
         "should import Result, got: {:?}",
         imports.iter().map(|r| &r.target_name).collect::<Vec<_>>()
     );
-    // IDX v52 (audit 2026-07-24): std-root imports are skipped whole — the
-    // bare "HashMap" used to enter global bare-name resolution and could bind
-    // any same-named project symbol (the phantom `use std::fs` → `fn fs`
-    // test-helper edges). Non-std externals (anyhow above) still extract.
+    // IDX v53: std-root imports emit an EXTERNAL-marked relation — the bare
+    // "HashMap" must never enter global bare-name resolution (that produced the
+    // phantom `use std::fs` → `fn fs` test-helper edges), but the marked
+    // relation still binds to the `<external>` sentinel so the call-side prune
+    // has an import to contradict against. Non-std externals (anyhow above) keep
+    // the ordinary bare-name path with no marker.
+    let hashmap = imports
+        .iter()
+        .find(|r| r.target_name == "HashMap")
+        .expect("std::collections::HashMap must emit an external-marked import");
     assert!(
-        !imports.iter().any(|r| r.target_name == "HashMap"),
-        "std::collections::HashMap must NOT emit an import edge, got: {:?}",
-        imports.iter().map(|r| &r.target_name).collect::<Vec<_>>()
+        crate::domain::is_external_import_meta(hashmap.metadata.as_deref()),
+        "std-rooted import must carry the external marker, got {:?}",
+        hashmap.metadata
+    );
+    let anyhow_result = imports.iter().find(|r| r.target_name == "Result").unwrap();
+    assert!(
+        !crate::domain::is_external_import_meta(anyhow_result.metadata.as_deref()),
+        "a non-std crate is indistinguishable from a workspace sibling — it must \
+         NOT be marked external, got {:?}",
+        anyhow_result.metadata
     );
 }
 
 #[test]
-fn test_rust_std_root_use_skipped_entirely() {
+fn test_rust_std_root_use_binds_external_not_project() {
     // Audit 2026-07-24 (map phantom edges): every `use std::fs;` in the repo
     // emitted a bare `imports → fs` relation that global bare-name resolution
     // bound to the single project symbol named `fs` — a #[cfg(test)] helper in
     // an unrelated module — fabricating 13 cross-module import edges. Roots
-    // that are statically known external (`std`/`core`/`alloc`/`proc_macro`)
-    // can never resolve inside the project: skip the whole declaration, in
-    // every shape (simple / grouped / aliased). `crate::`-rooted and
-    // unknown-crate roots keep extracting.
+    // statically known external (`std`/`core`/`alloc`/`proc_macro`) can never
+    // resolve inside the project, in any shape (simple / grouped / aliased /
+    // leading `::` / root-level use-list). v52 dropped them; v53 marks them so
+    // they bind `<external>` instead — see `domain::IMPORT_EXTERNAL_META`.
+    // `crate::`-rooted and unknown-crate roots keep the bare-name path.
     let source = r#"
 use std::fs;
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use core::fmt::Debug;
 use alloc::vec::Vec;
+use ::std::mem::swap;
+use {std::io::Write, crate::a::cb};
 use crate::domain::normalize;
 use somecrate::helpers::assist;
 
@@ -986,21 +1002,47 @@ fn main() {}
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
     let relations = extract_relations_from_tree(&tree, source, "rust");
-    let imports: Vec<&str> = relations
+    let imports: Vec<&ParsedRelation> = relations
         .iter()
         .filter(|r| r.relation == REL_IMPORTS)
-        .map(|r| r.target_name.as_str())
         .collect();
-    for banned in ["fs", "HashMap", "HashSet", "Read", "Debug", "Vec"] {
+    let named = |n: &str| imports.iter().find(|r| r.target_name == n).copied();
+    let names = || {
+        imports
+            .iter()
+            .map(|r| r.target_name.as_str())
+            .collect::<Vec<_>>()
+    };
+
+    // `swap` covers the leading-`::` form (P2-1) and is the exact name whose
+    // call-side phantom the sentinel edge lets the prune pass remove.
+    // `Write` covers the root-level use-list form (P2-2), whose members used to
+    // be classified against the whole braced text and so never matched a root.
+    for external in [
+        "fs", "HashMap", "HashSet", "Read", "Debug", "Vec", "swap", "Write",
+    ] {
+        let rel = named(external)
+            .unwrap_or_else(|| panic!("`{external}` must emit an import, got: {:?}", names()));
         assert!(
-            !imports.contains(&banned),
-            "std/core/alloc-rooted `{banned}` must not emit an import edge, got: {imports:?}"
+            crate::domain::is_external_import_meta(rel.metadata.as_deref()),
+            "std/core/alloc-rooted `{external}` must be marked external so it \
+             binds the sentinel and not a same-named project symbol; got {:?}",
+            rel.metadata
         );
     }
-    for kept in ["normalize", "assist"] {
+    // A mixed root-level list must get a MIXED verdict, not one all-or-nothing
+    // decision for the declaration.
+    for internal in ["cb", "normalize", "assist"] {
+        let rel = named(internal).unwrap_or_else(|| {
+            panic!(
+                "project/unknown-crate import `{internal}` must still extract, got: {:?}",
+                names()
+            )
+        });
         assert!(
-            imports.contains(&kept),
-            "project/unknown-crate import `{kept}` must still extract, got: {imports:?}"
+            !crate::domain::is_external_import_meta(rel.metadata.as_deref()),
+            "`{internal}` is not statically external; got {:?}",
+            rel.metadata
         );
     }
 }
@@ -5724,4 +5766,204 @@ fn test_signature_fields_strip_nul_bytes() {
             "signature must be NUL-free; got {sig:?}"
         );
     }
+}
+
+#[test]
+fn test_rust_cfg_predicates_are_not_calls() {
+    // `#[cfg(not(windows))]` and `cfg!(any(unix))` put `not(…)` / `any(…)` in a
+    // token_tree that is byte-identical to a call. Every cfg predicate name is
+    // lowercase, so the CamelCase pattern guard (which catches `Some(y)`) waves
+    // them straight through: the production index carried `any` ×3 and `not` ×4
+    // in pending_unresolved_calls, each traced to a real `#[cfg(not(windows))]`
+    // inside a function body. A project defining `fn any` / `fn not` — ordinary
+    // in predicate and iterator utility modules — promotes those to real edges
+    // pointing at the wrong symbol.
+    let source = r#"
+fn run() {
+    #[cfg(not(windows))]
+    let a = 1;
+    #[cfg(any(unix, target_os = "macos"))]
+    let b = 2;
+    if cfg!(any(unix)) { compute(); }
+    if cfg!(not(test)) { compute(); }
+    assert_eq!(recovered(1), 2);
+    // Scoped spellings: the `macro` field is a scoped_identifier whose full text
+    // is `core::cfg`, which never equalled `cfg`.
+    if core::cfg!(any(unix)) { compute(); }
+    if std::cfg!(all(unix, target_pointer_width = "64")) { compute(); }
+}
+"#;
+    let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
+    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let calls: Vec<&str> = relations
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    for predicate in ["any", "all", "not", "cfg"] {
+        assert!(
+            !calls.contains(&predicate),
+            "cfg predicate `{predicate}` must not become a calls edge, got: {calls:?}"
+        );
+    }
+    // Negative control. `compute()` in the `if cfg!(..) { compute(); }` bodies
+    // above does NOT serve: it is a plain `call_expression` that never reaches
+    // `extract_rust_macro_token_call`, so it survives even if that pass is
+    // stubbed to `return None` — an earlier version of this test used it and was
+    // asserting nothing. `recovered()` sits inside macro ARGUMENTS, which is the
+    // only place this pass operates.
+    assert!(
+        calls.contains(&"recovered"),
+        "a genuine call inside macro arguments must still emit an edge, got: {calls:?}"
+    );
+}
+
+#[test]
+fn test_rust_attribute_arguments_are_not_calls() {
+    // The same shape outside `cfg!`: an attribute's argument list is metadata,
+    // never code. The attribute must be INSIDE a function — the token-tree pass
+    // requires an enclosing scope, so module-level attributes were never at risk
+    // and testing one there would assert nothing.
+    let source = r#"
+fn run() {
+    #[cfg_attr(test, serde(rename_all = "camelCase"))]
+    struct Inner;
+    helper();
+}
+"#;
+    let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
+    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let calls: Vec<&str> = relations
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    for attr_token in ["cfg_attr", "serde", "feature"] {
+        assert!(
+            !calls.contains(&attr_token),
+            "attribute argument `{attr_token}` must not become a calls edge, got: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_cfg_predicates_inside_another_macro_are_not_calls() {
+    // The ancestor walk in `in_cfg_predicate` cannot see this shape: a
+    // `#[cfg(...)]` written INSIDE another macro's token_tree is raw tokens —
+    // there is no `attribute` node in the tree at all, and the enclosing
+    // macro_invocation is `cfg_if!`/`quote!`, not `cfg!`. `cfg_if!` is the
+    // idiomatic home of conditional compilation in a macro (libc, rand, ring),
+    // so this is where the remaining volume lives; it additionally leaked `cfg`
+    // itself as a callee name, which the attribute path never produced.
+    let cases = [
+        "fn run() { cfg_if! { if #[cfg(not(windows))] { helper_a(); } else if #[cfg(any(unix))] { helper_b(); } } }",
+        "fn run() { quote! { #[cfg(all(feature = \"x\"))] fn z() {} }; helper_a(); }",
+    ];
+    for src in cases {
+        let rels = extract_relations(src, "rust").unwrap();
+        let calls: Vec<&str> = rels
+            .iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        for predicate in ["cfg", "any", "all", "not"] {
+            assert!(
+                !calls.contains(&predicate),
+                "cfg predicate `{predicate}` must not become a calls edge inside another macro, got: {calls:?}"
+            );
+        }
+        // Negative control: the genuine calls in the same token soup survive.
+        // Without this, returning None for everything would pass the above.
+        assert!(
+            calls.contains(&"helper_a"),
+            "real calls inside the same macro must still be recovered, got: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn test_raw_attribute_tokens_in_macro_are_not_calls() {
+    // A name blacklist (`cfg`/`any`/`all`/`not`) was the first attempt here and
+    // patched one instance of a wider class: ANY attribute written as raw tokens
+    // inside a macro's token_tree. `allow` / `deny` / `doc` / `serde` all took
+    // the same path and produced call edges, and a project defining `fn allow`
+    // promoted them to edges pointing at the wrong symbol.
+    let src = r#"
+pub fn host() {
+    wrap! {
+        #[cfg(any(unix, windows))]
+        #[allow(unused)]
+        #[deny(warnings)]
+        #[doc(hidden)]
+        #[serde(rename_all = "camelCase")]
+        fn inner() { real(true); }
+    }
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    for attr in ["cfg", "any", "allow", "deny", "doc", "serde"] {
+        assert!(
+            !calls.contains(&attr),
+            "attribute token `{attr}` inside a macro must not become a calls edge, got: {calls:?}"
+        );
+    }
+    assert!(
+        calls.contains(&"real"),
+        "the genuine call in the attributed item must survive, got: {calls:?}"
+    );
+}
+
+#[test]
+fn test_project_fns_named_like_cfg_predicates_keep_their_edges() {
+    // The structural rule must NOT cost what the name blacklist did. A project
+    // defining `fn any` / `fn all` / `fn not` and calling them bare from macro
+    // arguments keeps those edges — nothing here is inside a `#[...]` span.
+    let src = r#"
+pub fn any(x: bool) -> bool { x }
+pub fn all(x: bool) -> bool { x }
+pub fn not(x: bool) -> bool { !x }
+pub fn caller() {
+    assert!(any(true));
+    assert_eq!(all(true), not(false));
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS && r.source_name == "caller")
+        .map(|r| r.target_name.as_str())
+        .collect();
+    for name in ["any", "all", "not"] {
+        assert!(
+            calls.contains(&name),
+            "a project fn named `{name}` called from macro args must keep its edge, got: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn test_index_expression_in_macro_args_is_not_treated_as_an_attribute() {
+    // The bracket walk keys on `[` — an INDEX expression `a[f(x)]` opens one too.
+    // Only a `#`-preceded bracket is an attribute; without that check this would
+    // silently drop a real call.
+    let src = r#"
+pub fn caller(a: &[u8]) {
+    assert_eq!(a[idx(1)], 0);
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        calls.contains(&"idx"),
+        "a call inside an index expression is not an attribute argument, got: {calls:?}"
+    );
 }

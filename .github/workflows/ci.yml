@@ -21,6 +21,30 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # Audit 2026-07-27 P1-6: both commit-gate scripts were mode 100644 in the
+      # git index. Git silently ignores a non-executable hook ("hook was ignored
+      # because it's not set as executable") and the commit goes straight
+      # through, so on every fresh clone the gate was inert. It looked healthy on
+      # the author's box only because the WORKING TREE happened to carry rwx —
+      # a bit that was never committed. ea0166d's claim that "any machine that
+      # cuts a release has the gate active" was false for exactly this reason.
+      # Checked here rather than in a Rust test because the index mode is a
+      # property of the repository, not of the build.
+      - name: Commit-gate scripts must be executable in the git index
+        run: |
+          status=0
+          for f in scripts/githooks/pre-commit scripts/pre-commit.sh; do
+            mode=$(git ls-files -s -- "$f" | cut -d' ' -f1)
+            if [ -z "$mode" ]; then
+              echo "::error file=$f::not tracked by git — update this check if the hook moved"
+              status=1
+            elif [ "$mode" != "100755" ]; then
+              echo "::error file=$f::mode is $mode in the git index; git ignores non-executable hooks, so this gate does nothing on a fresh clone. Fix: git update-index --chmod=+x $f"
+              status=1
+            fi
+          done
+          exit $status
+
   # Full matrix: 3 OSes × 2 feature combos.
   # Catches platform-specific issues (Windows path separators, macOS linker
   # differences, sqlite-vec C compilation variance) that used to ship silently

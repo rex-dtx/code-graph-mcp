@@ -60,6 +60,18 @@ impl Database {
         Self::open_impl(path, false, false)
     }
 
+    /// READER open that additionally brings up the sqlite-vec tables.
+    ///
+    /// `similar` (CLI) is a passive consumer that happens to need vector search.
+    /// Before this existed it reached for [`Database::open_with_vec`], the
+    /// *indexer* constructor — so a single `code-graph-mcp similar foo` against a
+    /// version-lagging index wiped it to 0 nodes with no rebuild following, the
+    /// exact daagu failure [`Database::open_nondestructive`] documents. Vector
+    /// support and destructive revalidation are orthogonal; keep them so.
+    pub fn open_nondestructive_with_vec(path: &Path) -> Result<Self> {
+        Self::open_impl(path, true, false)
+    }
+
     /// Open an existing database in strict read-only mode. Used by secondary
     /// MCP instances (those that failed to acquire the index flock) so the
     /// SQLite driver hard-refuses any write, eliminating race conditions

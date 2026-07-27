@@ -39,8 +39,129 @@ function pluginsCacheDir() { return path.join(claudeHome(), 'plugins', 'cache');
 
 // --- Helpers ---
 
+// Read JSON while keeping *why* it failed. The distinction that matters to a
+// caller about to REBUILD the file is exactly one bit — "may I treat this as a
+// fresh install?" — and only a genuine ENOENT earns a yes.
+//
+//   missing: true   ENOENT only. Nothing is there; rebuilding destroys nothing.
+//   corrupt: true   Everything else: the file EXISTS and we could not turn it
+//                   into a settings object — unparseable (trailing comma),
+//                   unreadable (EACCES after a stray `sudo`, EPERM, EIO), a
+//                   directory (EISDIR), or valid JSON that isn't an object
+//                   (`null` / `[]` / `123` / `"str"`).
+//
+// Collapsing ANY of those into "absent" is the bug: `readJson(...) || {}` then
+// hands install() an empty object and the next atomic write replaces the user's
+// whole settings.json. The first version of this fix split out only the
+// unparseable case and left the unreadable one behind — a `chmod 000`
+// settings.json was still destroyed, silently, with no backup. `err.code` is the
+// whole gate; do not widen it back to a bare `catch`.
+function readJsonResult(filePath) {
+  // Read BYTES, decode separately. `readFileSync(p, 'utf8')` replaces every
+  // invalid byte with U+FFFD, and `raw` is what backupCorruptFile writes to the
+  // `.corrupt-*` copy before the original is overwritten — so a settings.json
+  // containing any non-UTF-8 byte (a latin-1 path, a stray BOM pair) was
+  // "preserved" as a lossy transcription and the true bytes were destroyed. The
+  // backup is the user's only copy; it has to be byte-exact.
+  let bytes;
+  let raw;
+  try {
+    bytes = fs.readFileSync(filePath);
+    raw = bytes.toString('utf8');
+  } catch (err) {
+    const missing = err && err.code === 'ENOENT';
+    return { value: null, missing, corrupt: !missing, error: err };
+  }
+  // A zero-byte file is what a crash mid-write leaves behind. It carries nothing
+  // to preserve, so back-up-then-rebuild would only litter `~/.claude` with an
+  // empty `.corrupt-*` copy; treat it as absent instead.
+  if (raw.trim() === '') {
+    return { value: null, missing: true, corrupt: false, raw: bytes };
+  }
+  try {
+    // Parse the TRIMMED text. A UTF-8 BOM is JS whitespace (so `.trim()` above
+    // strips it) but `JSON.parse` rejects it — and a BOM is exactly what
+    // PowerShell 5.1's `Out-File` / `Set-Content` write by default. Parsing the
+    // untrimmed string classified a perfectly valid settings.json as corrupt and
+    // rebuilt the live file from a backup-and-replace path it never needed.
+    const value = JSON.parse(raw.trim());
+    // `null` / `"str"` / `[]` parse fine but are not a settings object; treating
+    // them as "absent" would rebuild over them just the same.
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { value: null, missing: false, corrupt: true, raw: bytes };
+    }
+    return { value, missing: false, corrupt: false, raw: bytes };
+  } catch (err) {
+    return { value: null, missing: false, corrupt: true, raw: bytes, error: err };
+  }
+}
+
+// Lenient reader kept exactly as-is for its 20+ callers (manifests, registries,
+// plugin.json …) where "absent" and "unreadable" genuinely mean the same thing.
+// Only the settings write path needs readJsonResult's distinction.
 function readJson(filePath) {
   try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch { return null; }
+}
+
+// Preserve a file we are about to overwrite but could not turn into settings.
+// `raw` is its contents when we managed to read them; when we did not (EACCES,
+// EISDIR) it is undefined and we fall back to a filesystem-level copy — which
+// will usually fail for the same reason the read did, and that failure is the
+// point: it makes the caller refuse rather than overwrite. Returns the backup
+// path, or null when no copy could be made.
+function backupCorruptFile(filePath, raw) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const dest = `${filePath}.corrupt-${stamp}`;
+  try {
+    // Buffer, not string: see readJsonResult. A string here would re-encode.
+    if (Buffer.isBuffer(raw)) fs.writeFileSync(dest, raw);
+    else if (typeof raw === 'string') fs.writeFileSync(dest, Buffer.from(raw, 'utf8'));
+    else fs.copyFileSync(filePath, dest);
+    return dest;
+  } catch {
+    return null;
+  }
+}
+
+// Read ~/.claude/settings.json for a caller that will WRITE it back.
+//
+// A settings.json that exists but yields no object used to be indistinguishable
+// from an absent one, so `readJson(settingsPath()) || {}` handed
+// install()/update() an empty object and the next atomic write replaced the
+// user's model / env / permissions / enabledPlugins / own hooks with a two-key
+// file — silently, with no copy left. Such a file is now copied aside first; if
+// even the copy fails we refuse to touch the original and return null, and the
+// caller skips its settings work entirely.
+// Returns `{ settings, backedUpTo }`:
+//   settings   — the object to write back, or null when we refused to touch the file
+//   backedUpTo — path of the preserved original when we are about to REBUILD over
+//                a file that had content, else null
+//
+// `backedUpTo` is not decoration. Rebuilding from `{}` REPLACES the user's whole
+// settings.json, and callers report their outcome to a human: `doctor` was
+// printing "Hooks ✅ 1 issue(s) auto-repaired" for a run that moved the user's
+// model / env / permissions into a `.corrupt-*` file it never mentioned. A
+// destructive repair has to be reported as one, with the path to get it back.
+function readSettingsForWrite() {
+  const p = settingsPath();
+  const res = readJsonResult(p);
+  if (res.value) return { settings: res.value, backedUpTo: null };
+  if (res.missing) return { settings: {}, backedUpTo: null };
+  const why = res.error ? res.error.message : 'it does not contain a JSON object';
+  const backup = backupCorruptFile(p, res.raw);
+  if (!backup) {
+    console.error(
+      `[code-graph] cannot use ${p} (${why}), and no backup copy could be made. ` +
+      `Leaving it untouched and skipping settings changes — repair the file ` +
+      `(or move it aside) and re-run.`
+    );
+    return { settings: null, backedUpTo: null };
+  }
+  console.error(
+    `[code-graph] cannot use ${p} (${why}). ` +
+    `Saved the original to ${backup} before rebuilding it.`
+  );
+  return { settings: {}, backedUpTo: backup };
 }
 
 function writeJsonAtomic(filePath, data) {
@@ -49,6 +170,25 @@ function writeJsonAtomic(filePath, data) {
   const tmp = filePath + '.tmp.' + process.pid;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
   fs.renameSync(tmp, filePath);
+}
+
+// A settings.json we can READ but not WRITE (read-only ~/.claude, EROFS, a
+// container mount) used to escape as a raw fs stack trace with no `[code-graph]`
+// line — and because nothing of ours got registered, the follow-up `health` then
+// reported "OK — all paths valid", since it only checks that the paths it FINDS
+// are valid and it found none. Same class as the unreadable-file arm: report the
+// real cause, change nothing, and make the caller's exit code non-zero.
+function tryWriteSettings(settings) {
+  try {
+    writeJsonAtomic(settingsPath(), settings);
+    return null;
+  } catch (err) {
+    console.error(
+      `[code-graph] cannot write ${settingsPath()} (${err.code || err.name}: ${err.message}). ` +
+      `Nothing was changed. The plugin stays inactive until the file is writable.`
+    );
+    return err;
+  }
 }
 
 function readManifest() {
@@ -451,7 +591,19 @@ function buildSettingsHookEntries() {
 // in plugin-cache hooks.json (it's still loaded from there), so we don't
 // re-write it to settings.json.
 function registerHooksToSettings(settings) {
-  settings.hooks = settings.hooks || {};
+  // `hooks` must be a plain object. `settings.hooks || {}` accepted an ARRAY —
+  // and every named property assigned onto it below (`hooks.PreToolUse = [...]`)
+  // is silently dropped by JSON.stringify, which serializes an array by index.
+  // The result was total, reported-as-success inertness: `install` printed
+  // "Installed | settings=true", `health` printed "OK — all paths valid", and
+  // `"hooks": []` came back out with zero of our six hooks registered. A string
+  // or number was worse — an uncaught "Cannot create property on string".
+  // Anything non-object is replaced, same as a missing key: we cannot merge into
+  // a shape the schema does not allow, and leaving it means the plugin never
+  // works while claiming it does.
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
 
   // Idempotent across delivery surfaces: if every desired (event,matcher) is
   // already present exactly once, pointing at a current, existing script
@@ -693,7 +845,19 @@ function verifyHooksFire({ hooks, env, timeoutMs = 4000, tmpBase } = {}) {
 function install({ reclaimStatusline = false } = {}) {
   const version = getPluginVersion();
   const manifest = readManifest();
-  const settings = readJson(settingsPath()) || {};
+  const { settings, backedUpTo } = readSettingsForWrite();
+  if (!settings) {
+    // Unusable settings.json that we could not even copy aside. Bail without
+    // touching it — and without stamping the manifest, so the next run retries
+    // the whole install once the user has repaired the file.
+    return {
+      version,
+      settingsChanged: false,
+      statusLineClaimed: manifest.config.statusLine,
+      hooksRegistered: false,
+      settingsUnreadable: true,
+    };
+  }
   let settingsChanged = false;
 
   // 0. Migrate from old plugin IDs
@@ -768,7 +932,20 @@ function install({ reclaimStatusline = false } = {}) {
 
   // 3. Write settings atomically if changed
   if (settingsChanged) {
-    writeJsonAtomic(settingsPath(), settings);
+    const writeErr = tryWriteSettings(settings);
+    if (writeErr) {
+      // Do NOT fall through to the manifest stamp. A manifest carrying the
+      // current version tells the next run "already installed", so it would skip
+      // the retry and the plugin would stay inactive after the user makes the
+      // file writable again — the same trap as the unreadable arm.
+      return {
+        version,
+        settingsChanged: false,
+        hooksRegistered: false,
+        settingsUnwritable: true,
+        error: writeErr.code || writeErr.name,
+      };
+    }
   }
 
   // 4. Write manifest with version
@@ -777,7 +954,14 @@ function install({ reclaimStatusline = false } = {}) {
   manifest.updatedAt = new Date().toISOString();
   writeManifest(manifest);
 
-  return { version, settingsChanged, statusLineClaimed: manifest.config.statusLine, hooksRegistered };
+  return {
+    version,
+    settingsChanged,
+    statusLineClaimed: manifest.config.statusLine,
+    hooksRegistered,
+    // Non-null => the previous settings.json was REPLACED and lives here now.
+    settingsRebuiltFrom: backedUpTo,
+  };
 }
 
 // --- Uninstall (clean all config) ---
@@ -910,7 +1094,10 @@ function update() {
   const version = getPluginVersion();
   const manifest = readManifest();
   const oldVersion = manifest.version;
-  const settings = readJson(settingsPath()) || {};
+  const { settings, backedUpTo } = readSettingsForWrite();
+  if (!settings) {
+    return { oldVersion, version, settingsChanged: false, hooksRegistered: false, settingsUnreadable: true };
+  }
   let settingsChanged = false;
 
   // 0. Migrate from old plugin IDs
@@ -939,7 +1126,18 @@ function update() {
 
   // 4. Write settings if changed
   if (settingsChanged) {
-    writeJsonAtomic(settingsPath(), settings);
+    const writeErr = tryWriteSettings(settings);
+    if (writeErr) {
+      // Same reasoning as install(): stamping the manifest here would make the
+      // next run believe the update landed.
+      return {
+        oldVersion, version,
+        settingsChanged: false,
+        hooksRegistered: false,
+        settingsUnwritable: true,
+        error: writeErr.code || writeErr.name,
+      };
+    }
   }
 
   // 5. Clear update-check cache (force re-check after update)
@@ -959,7 +1157,7 @@ function update() {
   //    therefore skips any version still referenced by a live process cmdline.
   cleanupOldCacheVersions(5);
 
-  return { oldVersion, version, settingsChanged, hooksRegistered };
+  return { oldVersion, version, settingsChanged, hooksRegistered, settingsRebuiltFrom: backedUpTo };
 }
 
 /**
@@ -1050,7 +1248,29 @@ function readActiveProcessCmdlines() {
 //              empty array means repair succeeded
 
 function scanForBrokenPaths() {
-  const settings = readJson(settingsPath()) || {};
+  // The READ-side member of the same collapsed-`null` class the write side was
+  // fixed for: `readJson(...) || {}` on an unusable settings.json yields an
+  // empty object, every loop below finds nothing to check, and the caller
+  // reports "all paths valid" — the most confidently wrong answer available,
+  // delivered during the exact incident it should be flagging. Surface it as an
+  // issue instead.
+  //
+  // NOT auto-repairable in the sense that this issue carries no `fixId`. Be
+  // precise about what `install()` then does, because an earlier version of this
+  // comment claimed it "correctly refuses this file" and that is only half true:
+  // it refuses only the subset it cannot copy aside (unreadable file, read-only
+  // dir, path-is-a-directory). For the common case — unparseable but writable —
+  // it BACKS UP and REBUILDS, so `healthCheck` reports `repaired: true` and hands
+  // back `rebuiltFrom`. Callers must render that as the destructive repair it is.
+  const settingsRead = readJsonResult(settingsPath());
+  if (settingsRead.corrupt) {
+    return [{
+      type: 'settings-unusable',
+      path: settingsPath(),
+      reason: settingsRead.error ? settingsRead.error.message : 'not a JSON object',
+    }];
+  }
+  const settings = settingsRead.value || {};
   const issues = [];
 
   // Check statusLine path
@@ -1101,13 +1321,17 @@ function healthCheck() {
   // away. install() may legitimately fail to resolve a problem (binary path
   // permanently gone, registry corrupted, etc.) and the previous code lied
   // by always returning repaired:true.
-  install();
+  const r = install();
   const remaining = scanForBrokenPaths();
   return {
     healthy: false,
     issues,
     repaired: remaining.length === 0,
     remaining,
+    // A "repair" that rebuilt an unusable settings.json REPLACED the user's
+    // file — model / env / permissions / their own hooks now live only in the
+    // backup. Callers must not render that as a plain success.
+    rebuiltFrom: r.settingsRebuiltFrom || null,
   };
 }
 
@@ -1127,16 +1351,49 @@ function isPluginUninstalled(settings = readJson(settingsPath()) || {}) {
 // this so a CC `/plugin uninstall` (which fires no uninstall hook) still reclaims
 // the disk. Idempotent: rm is force, so repeat SessionStarts are no-ops. Does NOT
 // touch the plugin-cache script dirs — those are CC-managed and may be executing.
+// One thing in CACHE_DIR is NOT residue: adopted-projects.json, the only record
+// of which repos carry a managed CLAUDE.md block. Wiping it strands every block
+// — `uninstall({unadoptAll:true})` afterwards reads an empty registry, reports
+// `unadopted: []`, and the blocks stay in the user's repos with nothing left
+// that knows where they are. `uninstall()` captures the list before calling
+// here; `cleanupDisabledStatusline` does not, and by this function's own comment
+// that is the ONE path guaranteed to run after `/plugin uninstall`. So the
+// preservation belongs here, at the wipe, rather than at each caller — the same
+// "fix it at the shared layer, not per surface" the <external> query filter
+// needed.
 function removeCacheResidue() {
-  try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); return true; }
-  catch { return false; }
+  // Path comes from adopt.js rather than a second spelling of the basename —
+  // a literal here would silently stop matching the day adopt.js renames it,
+  // and the failure mode is exactly the data loss this guard exists to stop.
+  // Preserve ONLY when the registry still names projects. A registry that is
+  // absent, empty, or already fully unadopted (the normal SessionStart teardown
+  // order, which unadopts first) strands nothing, and re-creating CACHE_DIR to
+  // hold `[]` would just be new residue.
+  let registryPath = null;
+  let registry = null;
+  try {
+    registryPath = require('./adopt').adoptedRegistryFile();
+    const raw = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
+    const parsed = raw ? JSON.parse(raw.toString('utf8')) : null;
+    if (Array.isArray(parsed) && parsed.length) registry = raw;
+  } catch { /* POSIX-only helper, unreadable, or corrupt — nothing to preserve */ }
+  try {
+    fs.rmSync(CACHE_DIR, { recursive: true, force: true });
+  } catch { return false; }
+  if (registryPath && registry) {
+    try {
+      fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+      fs.writeFileSync(registryPath, registry);
+    } catch { /* best-effort: the binary is still reclaimed */ }
+  }
+  return true;
 }
 
 module.exports = {
   install, uninstall, update, healthCheck, scanForBrokenPaths, checkScopeConflict,
   isPluginExplicitlyDisabled, isPluginInactive, isPluginUninstalled, removeCacheResidue,
   cleanupDisabledStatusline,
-  readManifest, readJson, writeJsonAtomic,
+  readManifest, readJson, readJsonResult, readSettingsForWrite, writeJsonAtomic,
   readRegistry, writeRegistry,
   getPluginVersion, cleanupOldCacheVersions,
   removeHooksFromSettings, isOurHookEntry,
@@ -1158,6 +1415,15 @@ if (require.main === module) {
   if (cmd === 'install') {
     // Explicit CLI install = user intent: reset any statusline stand-down and re-claim.
     const r = install({ reclaimStatusline: true });
+    // Refusing to touch an unusable settings.json means NOTHING was installed —
+    // no hooks, no statusline, no manifest stamp. Printing "Installed" and
+    // exiting 0 there would make `lifecycle.js install && …` chains read the
+    // refusal as success; the true diagnosis is already on stderr.
+    if (r.settingsUnreadable || r.settingsUnwritable) {
+      const why = r.settingsUnreadable ? 'unusable' : 'not writable';
+      console.log(`Not installed: ${settingsPath()} is ${why} (see the error above). Nothing was changed.`);
+      process.exit(1);
+    }
     console.log(`Installed v${r.version} | settings=${r.settingsChanged} | statusLine=${r.statusLineClaimed}`);
   } else if (cmd === 'uninstall') {
     const r = uninstall({
@@ -1191,6 +1457,11 @@ if (require.main === module) {
     console.log('  Note: also run `/plugin uninstall code-graph-mcp` inside Claude Code to sync its UI state.');
   } else if (cmd === 'update') {
     const r = update();
+    if (r.settingsUnreadable || r.settingsUnwritable) {
+      const why = r.settingsUnreadable ? 'unusable' : 'not writable';
+      console.log(`Not updated: ${settingsPath()} is ${why} (see the error above). Nothing was changed.`);
+      process.exit(1);
+    }
     console.log(`Updated ${r.oldVersion} → ${r.version} | settings=${r.settingsChanged}`);
   } else if (cmd === 'health') {
     const r = healthCheck();

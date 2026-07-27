@@ -65,10 +65,20 @@ pub fn transcript_dir_on(target: &Path, home: &Path, windows: bool) -> PathBuf {
 /// True if `touched` (often absolute, from Read/Edit) ends with `returned` (often
 /// repo-relative, from a cg result), compared by trailing path components. The
 /// returned path carries directory context so basename collisions are unlikely.
+///
+/// Both separators split. These strings come out of a *recorded transcript* whose
+/// producing platform is unknown to this process, so a Windows client's
+/// `D:\repo\src\Foo.cs` must not collapse into one opaque component — that made
+/// every comparison fail and pinned the Windows adoption half of the conversion
+/// metric at a permanent zero. Same reasoning as the `.exe` token fix on the
+/// call-recognition half: parse what was recorded, not what this host spells.
+/// Unix filenames may legally contain `\`, but a path that reaches here already
+/// went through a tool that treats it as a path, so over-splitting one exotic
+/// name is strictly cheaper than a dark platform.
 pub fn paths_match(returned: &str, touched: &str) -> bool {
     let split = |s: &str| {
-        s.trim_start_matches('/')
-            .split('/')
+        s.trim_start_matches(['/', '\\'])
+            .split(['/', '\\'])
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
@@ -1069,6 +1079,26 @@ mod tests {
     fn paths_match_when_returned_is_the_longer_path() {
         // returned absolute, touched relative — exercises the (long, short) swap
         assert!(paths_match("/x/src/outcome.rs", "src/outcome.rs"));
+    }
+
+    #[test]
+    fn paths_match_windows_backslash_touched_path() {
+        // Read/Edit on a Windows client records `D:\repo\src\Foo.cs`. Splitting on
+        // '/' alone made that one component, so it could never match the
+        // repo-relative path a cg tool returned — the adoption half of the
+        // conversion metric was structurally zero on Windows while the
+        // call-recognition half worked. Runs on every platform: the input is a
+        // recorded string, not a path this host produced.
+        assert!(paths_match("src/Foo.cs", r"D:\repo\src\Foo.cs"));
+        assert!(paths_match(r"src\Foo.cs", "/home/u/repo/src/Foo.cs"));
+        // Mixed spelling (PowerShell tab-completion mixes them freely).
+        assert!(paths_match(
+            "src/parser/rust.rs",
+            r"D:\repo\src/parser\rust.rs"
+        ));
+        // Still discriminating — a different file must not match.
+        assert!(!paths_match("src/Foo.cs", r"D:\repo\src\Bar.cs"));
+        assert!(!paths_match("src/a/Foo.cs", r"D:\repo\src\b\Foo.cs"));
     }
 
     #[test]
