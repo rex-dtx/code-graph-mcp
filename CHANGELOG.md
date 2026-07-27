@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.107.0 — Windows MCP path lookup, test-classifier parity across its four mirrors
+
+Upgrade notes: **no index rebuild required** — `INDEX_VERSION` is unchanged at
+52. Two classification changes apply at query time and take effect immediately:
+files named `*Spec.cs` / `*Spec.java` / `*Spec.php` / `*Spec.swift` are now
+treated as **production** code again (they were misclassified as tests in
+v0.106.0), and `Test_Foo.py` / `Conftest.py` are production too, matching what
+pytest actually collects. If you relied on the v0.106.0 behavior, pin
+`0.106.0` — there is no flag for it, because both shapes were defects.
+
+Library consumers: `domain::PASCAL_TEST_STEMS` is **removed**, replaced by
+`domain::PASCAL_TEST_STEM_EXTS: [(&str, &[&str]); 3]` (per-stem extension sets).
+The flat `PASCAL_TEST_STEMS × PASCAL_TEST_EXTS` cross-product it existed for is
+what produced the `Spec` defect. Binary and MCP users are unaffected.
+
+Follow-up to the v0.106.0 field reports
+([#34](https://github.com/sdsrss/code-graph-mcp/issues/34),
+[#36](https://github.com/sdsrss/code-graph-mcp/issues/36)) — the fixes there were
+correct but incomplete, and this release closes the halves they left open.
+
+### Fixed
+- **MCP tools still missed the index on Windows (#34, second half)** — v0.106.0
+  taught `ensure_file_fresh_opt` to normalize separators, but that helper returns
+  `Result<()>`, so the normalized path never left it. All five tools taking a
+  path (`get_ast_node`, `find_references`, `dependency_graph`, `get_call_graph`,
+  `module_overview`) went on to hand the **raw** argument to the index. A client
+  echoing back `src\Foo.cs` therefore refreshed the right file and then answered
+  `File 'src\Foo.cs' not found in index` for a file that was indexed. Normalization
+  now happens once at tool entry, before both the freshness call and the lookup —
+  which also covers `skip_indexing:true`, where the freshness helper never runs.
+- **`affected` and the SQL surfaces disagreed about pytest files** — `is_test_path`
+  lower-cased before its `test_*.py` / `conftest.py` legs while the SQL mirror
+  used case-sensitive `GLOB`, so `api/Test_Signup.py` counted as a test file in
+  `affected` and as production in dead-code and search filtering. Both sides are
+  case-sensitive now, matching pytest itself (`fnmatch_ex` does not normcase, and
+  conftest is discovered by literal basename).
+- **`*Spec.cs` / `*Spec.java` / `*Spec.php` / `*Spec.swift` were classified as
+  tests** — `Spec` is a suite name in ScalaTest/Kotest but an ordinary production
+  noun elsewhere, so `src/Contracts/OpenApiSpec.cs` had its symbols dropped from
+  `search` entirely and appeared under "test file(s) to re-run" in `affected`.
+  The stem is now scoped to `scala`/`kt`.
+- **`affected` depth-group headers contradicted their own listing** — with 300
+  files at depth 1 and a display cap of 40, the header read `depth 1 (300 file(s)):`
+  above 40 paths. Truncated groups now print `depth 1 (40 of 300 file(s) shown):`.
+- **Model-download diagnostics test wrote to the real user cache on macOS and
+  Windows** — the test redirected `dirs::cache_dir()` via `XDG_CACHE_HOME`, which
+  `dirs` honors on Linux/BSD only (macOS is unconditionally `$HOME/Library/Caches`;
+  Windows resolves `SHGetKnownFolderPath`, not `%LOCALAPPDATA%`). The redirect was
+  a no-op there: the test clobbered the developer's own `model-download.json` and
+  then failed its "never attempted" assertion on the next run. The state-file path
+  is injected now, which also removes an `env::set_var` racing sibling tests.
+
 ## v0.106.0 — Windows grep correctness, xUnit/JVM/pytest test detection, model-download diagnosability
 
 Upgrade notes: **no index rebuild required** — `INDEX_VERSION` is unchanged at
