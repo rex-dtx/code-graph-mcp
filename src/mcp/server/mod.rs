@@ -1739,10 +1739,12 @@ impl McpServer {
         let Some(rel_path) = path else {
             return Ok(());
         };
-        // Caller-supplied strings reach the index as lookup keys, so normalize
-        // separators to the stored `/` form first — an MCP client on Windows may
-        // echo back a native-separator path. Normalizing BEFORE the trailing
-        // check also makes `src\` register as the directory it is.
+        // Belt-and-braces: every `tool_*` entry point now normalizes its path
+        // argument via `tools::normalize_path_arg` before calling here, so the
+        // freshness target and the subsequent index lookup key are the same
+        // string. This repeat is idempotent and keeps the leaf correct for any
+        // future caller that forgets. Normalizing BEFORE the trailing check also
+        // makes `src\` register as the directory it is.
         let rel_path = crate::indexer::merkle::normalize_rel_str(rel_path);
         if rel_path.is_empty() || rel_path.ends_with('/') {
             return Ok(());

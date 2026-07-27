@@ -30,9 +30,16 @@ impl McpServer {
             self.ensure_indexed()?;
         }
 
+        // Separator-normalize BEFORE the escape checks and the prefix match: the
+        // index stores `/`, so a Windows caller's `src\parser` must become
+        // `src/parser` to match `get_module_exports`'s prefix (and to be the same
+        // string `ensure_file_fresh_opt` refreshes). Doing it before validation
+        // also makes `..\foo` reach the `../` guard instead of slipping past it.
         let raw_path = args["path"]
             .as_str()
+            .map(super::normalize_path_arg)
             .ok_or_else(|| anyhow!("Missing path"))?;
+        let raw_path = raw_path.as_str();
         // Reject empty-string path explicitly: it normalizes to the "match all"
         // prefix the same way "." does, but is almost always a variable-substitution
         // bug at the call site (env var unset, optional chain returned ""). Surface

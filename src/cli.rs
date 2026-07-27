@@ -5041,7 +5041,24 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
             withheld_from_depth.get_or_insert(*d);
             continue;
         }
-        writeln!(stdout, "  depth {} ({} file(s)):", d, paths.len())?;
+        // Header counts must describe THIS listing, not the ungrouped total: with
+        // 300 files at depth 1 and a cap of 40, a bare `(300 file(s))` sat above
+        // 40 paths, and the `… N more` footer below attributes the remainder to
+        // the whole `depth X-Y` range rather than to this group. A reader — or a
+        // script scraping the header — could not reconcile the two. Show
+        // `shown/total` whenever the cap truncates this group.
+        let room = AFFECTED_DISPLAY_CAP - shown;
+        if room < paths.len() {
+            writeln!(
+                stdout,
+                "  depth {} ({} of {} file(s) shown):",
+                d,
+                room,
+                paths.len()
+            )?;
+        } else {
+            writeln!(stdout, "  depth {} ({} file(s)):", d, paths.len())?;
+        }
         for p in paths {
             if shown >= AFFECTED_DISPLAY_CAP {
                 withheld += 1;

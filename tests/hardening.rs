@@ -367,3 +367,81 @@ fn release_profile_must_unwind_for_catch_unwind_defense() {
         offender
     );
 }
+
+/// Every tool that takes a caller-supplied path must separator-normalize it at
+/// TOOL ENTRY, so the freshness refresh and the index lookup use the same key.
+///
+/// The regression: `ensure_file_fresh_opt` normalized internally but returned
+/// `Result<()>`, so its normalized value never escaped. Each caller then handed
+/// the RAW argument to `get_nodes_by_file_path` / `get_call_graph_filtered` /
+/// `get_module_exports`. A Windows client echoing back `src\mod_0.ts` refreshed
+/// the right file and then missed the index (which stores `src/mod_0.ts`),
+/// answering `File 'src\mod_0.ts' not found in index` for an indexed file.
+///
+/// Deliberately NOT `#[cfg(windows)]`. The forward-slash leg is the cross-
+/// platform contract and runs everywhere — it is what catches a normalization
+/// change that breaks the ordinary path. The backslash leg asserts only on
+/// Windows *by design*: on Unix `\` is a legal filename character (only `/` and
+/// NUL are illegal), so rewriting it there would be the #34 defect in the other
+/// direction — see `indexer::merkle::normalize_rel_str_on`.
+#[test]
+fn tool_path_args_are_separator_normalized_at_entry() {
+    let (_project, server) = setup_project(3);
+
+    // (tool, arg key holding the path, other args, JSON pointer that is present
+    // only when the path resolved to indexed rows)
+    let cases: Vec<(&str, &str, serde_json::Value, &str)> = vec![
+        (
+            "get_ast_node",
+            "file_path",
+            json!({"symbol_name": "func_0"}),
+            "/node_id",
+        ),
+        (
+            "find_references",
+            "file_path",
+            json!({"symbol_name": "func_0"}),
+            "/symbol",
+        ),
+        ("dependency_graph", "file_path", json!({}), "/file"),
+        ("module_overview", "path", json!({}), "/path"),
+    ];
+
+    for (tool, key, extra, present_ptr) in cases {
+        // `module_overview` takes a directory prefix; the others take a file.
+        let unix_path = if tool == "module_overview" {
+            "src/"
+        } else {
+            "src/mod_0.ts"
+        };
+        let win_path = unix_path.replace('/', "\\");
+
+        let call = |p: &str| {
+            let mut args = extra.clone();
+            args[key] = json!(p);
+            let resp = server.handle_message(&tool_call_json(tool, args)).unwrap();
+            parse_tool_result(&resp)
+        };
+
+        // Forward slashes: must resolve on every platform.
+        let unix_result = call(unix_path);
+        assert!(
+            unix_result.pointer(present_ptr).is_some(),
+            "{tool}: forward-slash path {unix_path:?} must resolve; got {unix_result}"
+        );
+        assert!(
+            unix_result.get("warning").is_none() && unix_result.get("error").is_none(),
+            "{tool}: forward-slash path {unix_path:?} must not warn/error; got {unix_result}"
+        );
+
+        // Backslashes: identical answer on Windows, where `\` is a separator.
+        if cfg!(windows) {
+            let win_result = call(&win_path);
+            assert_eq!(
+                win_result, unix_result,
+                "{tool}: native-separator path {win_path:?} must answer identically \
+                 to {unix_path:?} — the path arg is not normalized at tool entry"
+            );
+        }
+    }
+}

@@ -378,6 +378,75 @@ fn test_cli_affected_groups_blast_radius_by_depth() {
     );
 }
 
+/// A depth-group header must describe the listing printed under it. With
+/// `AFFECTED_DISPLAY_CAP = 40` and a wide fan-in, `depth 1 (60 file(s)):`
+/// stood above 40 paths — the count and the list disagreed, and the only
+/// correction (`… 20 more at depth 1-N`) is attributed to the whole depth range
+/// rather than to this group, so neither a reader nor a script scraping the
+/// header could reconcile them.
+#[test]
+fn test_cli_affected_truncated_depth_header_reports_shown_and_total() {
+    const FANIN: usize = 60; // > AFFECTED_DISPLAY_CAP (40)
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("core.ts"),
+        "export function coreFn(x: number): number { return x + 1; }\n",
+    )
+    .unwrap();
+    for i in 0..FANIN {
+        std::fs::write(
+            src.join(format!("dep_{i:02}.ts")),
+            format!(
+                "import {{ coreFn }} from './core';\n\
+                 export function use_{i}(v: number): number {{ return coreFn(v); }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/core.ts"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+
+    // Locate the depth-1 header and count the paths actually listed under it.
+    let header = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("depth 1 ("))
+        .unwrap_or_else(|| panic!("no depth 1 header in:\n{stdout}"));
+    let listed = stdout
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("depth 1 ("))
+        .skip(1)
+        .take_while(|l| l.starts_with("    ") && !l.trim_start().starts_with("depth "))
+        .count();
+
+    assert!(
+        listed < FANIN,
+        "test premise: the cap must truncate this group (listed {listed} of {FANIN})\n{stdout}"
+    );
+    assert!(
+        header.contains(&format!("{} of ", listed)),
+        "a truncated group header must state how many of the group are shown; \
+         got {header:?} above {listed} listed path(s)\n{stdout}"
+    );
+    assert!(
+        header.contains(&format!("of {} file(s) shown", FANIN)),
+        "a truncated group header must still state the group total; got {header:?}\n{stdout}"
+    );
+
+    // Un-truncated groups keep the plain form.
+    let (small_out, _, _) = run_cli(&setup_affected_project(), &["affected", "src/auth.ts"]);
+    assert!(
+        small_out.contains("depth 1 (") && !small_out.contains(" of "),
+        "an un-truncated group must keep the plain `depth N (M file(s)):` form, got:\n{small_out}"
+    );
+}
+
 #[test]
 fn test_cli_affected_json_core() {
     let project = setup_affected_project();

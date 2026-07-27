@@ -104,6 +104,28 @@ mod inner {
             let Ok(path) = Self::download_state_file() else {
                 return;
             };
+            Self::record_download_state_at(&path, status, attempts, error);
+        }
+
+        /// Testable core of [`record_download_state`], parameterized on the state
+        /// file path.
+        ///
+        /// The path is injected rather than redirected through the environment
+        /// because `dirs::cache_dir()` only honors `XDG_CACHE_HOME` on Linux/BSD:
+        /// on macOS it is unconditionally `$HOME/Library/Caches` and on Windows it
+        /// comes from `SHGetKnownFolderPath`, not the `LOCALAPPDATA` variable. An
+        /// env-redirecting test helper is therefore a silent no-op on two of the
+        /// three shipped platforms — it writes the developer's REAL
+        /// `model-download.json`, which both corrupts their diagnostics and makes
+        /// the test self-poisoning (the second run sees the first run's status
+        /// where it asserts "never attempted"). Injection also removes the
+        /// `env::set_var` that raced sibling tests on the same harness thread pool.
+        pub fn record_download_state_at(
+            path: &std::path::Path,
+            status: &str,
+            attempts: u32,
+            error: Option<&str>,
+        ) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -119,14 +141,19 @@ mod inner {
                 "url": Self::model_download_url(),
                 "binary_version": env!("CARGO_PKG_VERSION"),
             });
-            let _ = std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap_or_default());
+            let _ = std::fs::write(path, serde_json::to_vec_pretty(&state).unwrap_or_default());
         }
 
         /// Human-readable summary of the last download attempt for `doctor` and
         /// the FTS5-only search note. `None` when no attempt was ever recorded —
         /// itself a diagnosis ("never attempted"), distinct from "failed".
         pub fn download_state_summary() -> Option<String> {
-            let path = Self::download_state_file().ok()?;
+            Self::download_state_summary_at(&Self::download_state_file().ok()?)
+        }
+
+        /// Testable core of [`download_state_summary`]. See
+        /// [`record_download_state_at`] for why the path is injected.
+        pub fn download_state_summary_at(path: &std::path::Path) -> Option<String> {
             let raw = std::fs::read_to_string(path).ok()?;
             let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
             let status = v["status"].as_str().unwrap_or("unknown");
@@ -974,53 +1001,56 @@ mod tests {
     fn test_download_state_round_trips_each_status() {
         use inner::EmbeddingModel as M;
         let tmp = tempfile::TempDir::new().unwrap();
-        // `download_state_file` derives from the real cache dir; point the whole
-        // cache tree at a temp dir so the test never touches the user's cache.
-        temp_env_cache(tmp.path(), || {
-            assert!(
-                M::download_state_summary().is_none(),
-                "no recorded attempt must read as 'never attempted', not as a status"
-            );
+        // Inject the state-file path. The predecessor of this test redirected
+        // `dirs::cache_dir()` via XDG_CACHE_HOME/LOCALAPPDATA, which is a no-op on
+        // macOS and Windows (see `record_download_state_at`): there it wrote the
+        // developer's real model-download.json and then failed its own first
+        // assertion on the next run. The temp path also makes the test
+        // order-independent and drops the `env::set_var` race with the sibling
+        // tests that read `dirs::cache_dir()` on the same thread pool.
+        let state = tmp.path().join("model-download.json");
 
-            M::record_download_state("in_flight", 2, None);
-            assert_eq!(
-                M::download_state_summary().unwrap(),
-                "download in flight (attempt 2)"
-            );
+        assert!(
+            M::download_state_summary_at(&state).is_none(),
+            "no recorded attempt must read as 'never attempted', not as a status"
+        );
 
-            M::record_download_state("failed", 3, Some("tls handshake rejected"));
-            let summary = M::download_state_summary().unwrap();
-            assert!(
-                summary.contains("FAILED after 3 attempt(s)")
-                    && summary.contains("tls handshake rejected"),
-                "a failed download must surface attempt count AND cause, got: {summary}"
-            );
+        M::record_download_state_at(&state, "in_flight", 2, None);
+        assert_eq!(
+            M::download_state_summary_at(&state).unwrap(),
+            "download in flight (attempt 2)"
+        );
 
-            M::record_download_state("ok", 1, None);
-            assert_eq!(
-                M::download_state_summary().unwrap(),
-                "model downloaded successfully"
-            );
-        });
+        M::record_download_state_at(&state, "failed", 3, Some("tls handshake rejected"));
+        let summary = M::download_state_summary_at(&state).unwrap();
+        assert!(
+            summary.contains("FAILED after 3 attempt(s)")
+                && summary.contains("tls handshake rejected"),
+            "a failed download must surface attempt count AND cause, got: {summary}"
+        );
+
+        M::record_download_state_at(&state, "ok", 1, None);
+        assert_eq!(
+            M::download_state_summary_at(&state).unwrap(),
+            "model downloaded successfully"
+        );
     }
 
-    /// Run `f` with the platform cache dir redirected into `dir`. `dirs::cache_dir()`
-    /// reads XDG_CACHE_HOME on Linux and LOCALAPPDATA on Windows.
+    /// The production wrappers must still route through the real cache location —
+    /// otherwise the seam above could pass while `doctor` reads a different file.
     #[cfg(feature = "embed-model")]
-    fn temp_env_cache(dir: &std::path::Path, f: impl FnOnce()) {
-        let key = if cfg!(windows) {
-            "LOCALAPPDATA"
-        } else {
-            "XDG_CACHE_HOME"
-        };
-        let prev = std::env::var_os(key);
-        // SAFETY: single-threaded test body; restored before returning.
-        unsafe { std::env::set_var(key, dir) };
-        f();
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+    #[test]
+    fn test_download_state_file_sits_beside_models_dir() {
+        use inner::EmbeddingModel as M;
+        let models = M::cache_models_dir().unwrap();
+        let state = M::download_state_file().unwrap();
+        assert_eq!(
+            state.parent(),
+            models.parent(),
+            "state file must sit beside the models dir, not inside it \
+             (extract_and_promote renames the models dir)"
+        );
+        assert_eq!(state.file_name().unwrap(), "model-download.json");
     }
 
     #[cfg(feature = "embed-model")]

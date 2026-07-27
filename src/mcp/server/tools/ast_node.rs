@@ -28,12 +28,17 @@ impl McpServer {
             crate::domain::confidence_rank(tier)
         };
 
+        // Normalize the caller's separator spelling ONCE, at entry, so the
+        // freshness target and the index lookup key below are the same string
+        // (see `super::normalize_path_arg`). Must precede the freshness call.
+        let file_path_arg = args["file_path"].as_str().map(super::normalize_path_arg);
+
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
             // Edit-aware refresh fires only on the file_path branch — node_id
             // lookups have no path to refresh against, and node_id stability
             // across reindex isn't guaranteed.
-            self.ensure_file_fresh_opt(args["file_path"].as_str())?;
+            self.ensure_file_fresh_opt(file_path_arg.as_deref())?;
         }
 
         let include_refs = args["include_references"].as_bool().unwrap_or(false);
@@ -69,7 +74,7 @@ impl McpServer {
         let symbol_name = args["symbol_name"]
             .as_str()
             .filter(|s| !s.trim().is_empty());
-        let file_path = args["file_path"].as_str();
+        let file_path = file_path_arg.as_deref();
 
         // If only symbol_name provided (no file_path), resolve by name lookup
         if let (Some(sym), None) = (symbol_name, file_path) {

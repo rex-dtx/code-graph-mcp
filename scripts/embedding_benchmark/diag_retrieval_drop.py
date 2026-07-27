@@ -108,7 +108,14 @@ def fts_classify(conn, query: str, fetch: int):
 # Mirrors domain::PASCAL_TEST_* / INFIX_TEST_EXTS. One of five must-agree copies
 # of this predicate; see the "Five sites must agree" note in src/domain.rs.
 PASCAL_TEST_EXTS = ("cs", "vb", "fs", "java", "kt", "scala", "swift", "php")
-PASCAL_TEST_STEMS = ("Test", "Tests", "Spec")
+# `Spec` means TEST only in ScalaTest/Kotest. Elsewhere it is a production
+# noun (OpenApiSpec.cs, WireSpec.java), so it gets a narrower ext set.
+SPEC_TEST_EXTS = ("scala", "kt")
+PASCAL_TEST_STEM_EXTS = (
+    ("Test", PASCAL_TEST_EXTS),
+    ("Tests", PASCAL_TEST_EXTS),
+    ("Spec", SPEC_TEST_EXTS),
+)
 INFIX_TEST_EXTS = ("go", "rs", "py", "dart")
 
 
@@ -126,13 +133,17 @@ def is_test_path(p: str) -> bool:
         return True
     # PascalCase test-class convention: case-SENSITIVE, pinned to a known ext.
     if any(p.endswith(f"{stem}.{ext}")
-           for stem in PASCAL_TEST_STEMS for ext in PASCAL_TEST_EXTS):
+           for stem, exts in PASCAL_TEST_STEM_EXTS for ext in exts):
         return True
     if any(p.endswith(f"_test.{ext}") for ext in INFIX_TEST_EXTS):
         return True
-    if lower.endswith(".py") and (lower.startswith("test_")
-                                  or "/test_" in lower
-                                  or lower.endswith("conftest.py")):
+    # pytest conventions. Case-SENSITIVE like the PascalCase leg above: pytest
+    # matches python_files without normcase and finds conftest by the literal
+    # basename, so api/Test_Signup.py is a production module. Matches the
+    # case-sensitive GLOB in is_test_node_sql.
+    if p.endswith(".py") and (p.startswith("test_")
+                              or "/test_" in p
+                              or p.endswith("conftest.py")):
         return True
     return (p.startswith(("benches/", "bench/")) or "__tests__/" in p
             or p.endswith(("/tests.rs", ".test.ts", ".test.js",

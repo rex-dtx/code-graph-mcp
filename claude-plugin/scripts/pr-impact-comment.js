@@ -26,7 +26,14 @@ const TOP_AFFECTED = 15;
 /// ecosystem is one edit here and one in domain.rs — not a hunt through
 /// hand-written boolean chains.
 const PASCAL_TEST_EXTS = ['cs', 'vb', 'fs', 'java', 'kt', 'scala', 'swift', 'php'];
-const PASCAL_TEST_STEMS = ['Test', 'Tests', 'Spec'];
+// `Spec` means TEST only in ScalaTest/Kotest. Elsewhere it is a production noun
+// (OpenApiSpec.cs, WireSpec.java), so it gets its own narrower extension set.
+const SPEC_TEST_EXTS = ['scala', 'kt'];
+const PASCAL_TEST_STEM_EXTS = [
+  ['Test', PASCAL_TEST_EXTS],
+  ['Tests', PASCAL_TEST_EXTS],
+  ['Spec', SPEC_TEST_EXTS],
+];
 const INFIX_TEST_EXTS = ['go', 'rs', 'py', 'dart'];
 
 /// File-level test classifier — mirrors `domain::is_test_path` (Rust). This is
@@ -48,13 +55,16 @@ function isTestPath(p) {
   ) return true;
   // PascalCase test-class convention. Case-SENSITIVE and pinned to a known
   // extension so `src/latest.cs` and `src/mytests.rs` stay production.
-  if (PASCAL_TEST_STEMS.some((stem) => PASCAL_TEST_EXTS.some((ext) => p.endsWith(`${stem}.${ext}`)))) {
+  if (PASCAL_TEST_STEM_EXTS.some(([stem, exts]) => exts.some((ext) => p.endsWith(`${stem}.${ext}`)))) {
     return true;
   }
   if (INFIX_TEST_EXTS.some((ext) => p.endsWith(`_test.${ext}`))) return true;
-  // pytest naming conventions.
-  if (lower.endsWith('.py') &&
-      (lower.startsWith('test_') || lower.includes('/test_') || lower.endsWith('conftest.py'))) {
+  // pytest naming conventions. Case-SENSITIVE like the PascalCase leg above:
+  // pytest matches `python_files` without normcase and finds conftest by the
+  // literal basename, so `api/Test_Signup.py` is a production module. Keeps this
+  // mirror identical to `is_test_node_sql`'s case-sensitive GLOB.
+  if (p.endsWith('.py') &&
+      (p.startsWith('test_') || p.includes('/test_') || p.endsWith('conftest.py'))) {
     return true;
   }
   return (

@@ -429,9 +429,8 @@ pub fn is_test_path(file_path: &str) -> bool {
     // PascalCase test-class convention: `ResponsibleEntityServiceTests.cs`,
     // `AuthHandlerTest.java`, `RouteSpec.scala`. Case-SENSITIVE and pinned to a
     // known extension so `src/latest.rs` and `src/mytests.rs` stay production.
-    if PASCAL_TEST_STEMS.iter().any(|stem| {
-        PASCAL_TEST_EXTS
-            .iter()
+    if PASCAL_TEST_STEM_EXTS.iter().any(|(stem, exts)| {
+        exts.iter()
             .any(|ext| file_path.ends_with(&format!("{}.{}", stem, ext)))
     }) {
         return true;
@@ -444,10 +443,18 @@ pub fn is_test_path(file_path: &str) -> bool {
     {
         return true;
     }
-    if lower.ends_with(".py")
-        && (lower.starts_with("test_")
-            || lower.contains("/test_")
-            || lower.ends_with("conftest.py"))
+    // pytest filename conventions. Case-SENSITIVE, like the PascalCase leg above
+    // and unlike the directory leg: pytest matches `python_files` with
+    // `_pytest.pathlib.fnmatch_ex`, which does NOT normcase, and discovers
+    // conftest by the literal basename `conftest.py`. So `api/Test_Signup.py`
+    // and `api/Conftest.py` are ordinary production modules pytest never
+    // collects. This also keeps the leg identical to its SQL mirror
+    // (`is_test_node_sql`), where GLOB is case-sensitive — lower-casing here was
+    // a silent Rust-vs-SQL disagreement on exactly those two shapes.
+    if file_path.ends_with(".py")
+        && (file_path.starts_with("test_")
+            || file_path.contains("/test_")
+            || file_path.ends_with("conftest.py"))
     {
         return true;
     }
@@ -465,8 +472,7 @@ pub fn is_test_path(file_path: &str) -> bool {
         || file_path.ends_with(".spec.jsx")
 }
 
-/// Extensions whose ecosystems name a test class `FooTests.<ext>` (PascalCase),
-/// paired with [`PASCAL_TEST_STEMS`].
+/// Extensions whose ecosystems name a test class `FooTests.<ext>` (PascalCase).
 ///
 /// Enumerated rather than "any extension" so the SQL mirror ([`is_test_node_sql`])
 /// can express the same predicate EXACTLY: `GLOB '*Tests.cs'` is equivalent to
@@ -475,8 +481,25 @@ pub fn is_test_path(file_path: &str) -> bool {
 /// so a new entry lands in both at once.
 pub const PASCAL_TEST_EXTS: [&str; 8] = ["cs", "vb", "fs", "java", "kt", "scala", "swift", "php"];
 
-/// Stem suffixes paired with [`PASCAL_TEST_EXTS`].
-pub const PASCAL_TEST_STEMS: [&str; 3] = ["Test", "Tests", "Spec"];
+/// Extensions where the `Spec` stem means TEST and not "specification".
+///
+/// ScalaTest (`FlatSpec`/`WordSpec`) and Kotest name suites `FooSpec`, so there
+/// the stem is as reliable as `Test`. Nowhere else: `Spec` is an ordinary
+/// production noun in the C#/Java/PHP/Swift world — `src/Contracts/OpenApiSpec.cs`,
+/// `src/Protocol/WireSpec.java`, `src/Api/OpenApiSpec.php` are all shipped code.
+/// Classifying those as tests is not a cosmetic mislabel: `is_test_symbol` feeds
+/// `is_skippable_result`, so their symbols vanish from `search` entirely, and
+/// `affected` reports them as "test file(s) to re-run".
+pub const SPEC_TEST_EXTS: [&str; 2] = ["scala", "kt"];
+
+/// PascalCase stem suffixes, each paired with the extension set it is a TEST
+/// convention in. Per-stem rather than a flat cross-product because the stems do
+/// not share an ecosystem — see [`SPEC_TEST_EXTS`].
+pub const PASCAL_TEST_STEM_EXTS: [(&str, &[&str]); 3] = [
+    ("Test", &PASCAL_TEST_EXTS),
+    ("Tests", &PASCAL_TEST_EXTS),
+    ("Spec", &SPEC_TEST_EXTS),
+];
 
 /// Extensions using the `foo_test.<ext>` file-naming convention.
 pub const INFIX_TEST_EXTS: [&str; 4] = ["go", "rs", "py", "dart"];
@@ -507,18 +530,20 @@ pub fn is_test_node_sql(node_alias: &str, file_alias: &str) -> String {
     // Generated legs — same constants the Rust predicate reads, so the two
     // cannot drift as ecosystems are added.
     let mut generated = String::new();
-    for stem in PASCAL_TEST_STEMS {
-        for ext in PASCAL_TEST_EXTS {
+    for (stem, exts) in PASCAL_TEST_STEM_EXTS {
+        for ext in exts {
             generated.push_str(&format!(" OR {f}.path GLOB '*{stem}.{ext}'"));
         }
     }
     for ext in INFIX_TEST_EXTS {
         generated.push_str(&format!(" OR {f}.path GLOB '*_test.{ext}'"));
     }
-    // Case-insensitive legs use LIKE (ASCII-case-insensitive in SQLite, matching
-    // Rust's `to_ascii_lowercase` compare); none of these patterns contains `_`,
-    // so LIKE's `_`-as-wildcard cannot fire. The `test_*.py` legs stay on GLOB
-    // (`_` literal) and mirror Rust's `contains("/test_") && ends_with(".py")`.
+    // Directory legs use LIKE (ASCII-case-insensitive in SQLite, matching Rust's
+    // `to_ascii_lowercase` compare); none of these patterns contains `_`, so
+    // LIKE's `_`-as-wildcard cannot fire. The pytest legs stay on GLOB — both for
+    // `_`-as-literal AND because they are case-SENSITIVE on the Rust side too
+    // (pytest's `fnmatch_ex` does not normcase; `Conftest.py` is not a conftest).
+    // Mixing the two here is deliberate, not an oversight: see `is_test_path`.
     let case_insensitive = format!(
         " OR {f}.path LIKE 'tests/%' \
          OR {f}.path LIKE 'test/%' \
@@ -1032,6 +1057,7 @@ mod tests {
             ("run", "app/Domain/AuthServiceTests.cs"),   // *Tests.cs stem
             ("run", "app/Domain/AuthServiceTest.java"),  // *Test.java stem
             ("run", "app/routes/RouteSpec.scala"),       // *Spec.scala stem
+            ("run", "app/routes/RouteSpec.kt"),          // *Spec.kt (Kotest)
             ("run", "pkg/util_test.py"),                 // _test.py
             ("run", "lib/widget_test.dart"),             // _test.dart
             ("run", "api/test_signup.py"),               // pytest test_*.py
@@ -1053,6 +1079,22 @@ mod tests {
             ("run", "src/testing/api.cs"),  // 'testing' ≠ 'test'/'tests'
             ("run", "src/latest_test.txt"), // .txt not in INFIX_TEST_EXTS
             ("run", "src/attest.py"),       // no `test_` prefix / conftest
+            // …and the pytest legs' case sensitivity. SQLite GLOB is
+            // case-sensitive while LIKE is not, so a Rust side that lower-cased
+            // these disagreed with its own SQL mirror on exactly these shapes —
+            // `affected` called them tests, dead-code/search called them prod.
+            // pytest agrees with the strict reading: `fnmatch_ex` does not
+            // normcase and conftest is found by literal basename, so neither of
+            // these is ever collected.
+            ("run", "api/Test_Signup.py"), // capital T ≠ test_ prefix
+            ("run", "api/Conftest.py"),    // capital C ≠ conftest.py
+            ("run", "api/sub/Test_x.py"),  // same, via the `/test_` leg
+            // …and the `Spec` stem OUTSIDE the ScalaTest/Kotest world, where it
+            // is an ordinary production noun rather than a suite name.
+            ("run", "src/Contracts/OpenApiSpec.cs"),
+            ("run", "src/Protocol/WireSpec.java"),
+            ("run", "src/Api/OpenApiSpec.php"),
+            ("run", "src/Model/FieldSpec.swift"),
         ];
         for (name, path) in cases {
             let got: i64 = conn
@@ -1173,9 +1215,37 @@ mod tests {
         assert!(is_test_path("src/Button.spec.jsx"));
         assert!(is_test_path("pkg/handler_test.go"));
         assert!(is_test_path("a/__tests__/x.js"));
+        // pytest positives — the exact spellings pytest collects.
+        assert!(is_test_path("api/test_signup.py"));
+        assert!(is_test_path("api/sub/test_signup.py"));
+        assert!(is_test_path("api/conftest.py"));
         // Negatives.
         assert!(!is_test_path("src/auth.ts"));
         assert!(!is_test_path("src/main.rs"));
+        // The pytest legs are case-SENSITIVE. pytest matches `python_files` with
+        // `fnmatch_ex` (no normcase) and discovers conftest by literal basename,
+        // so these are production modules it never collects. Lower-casing them
+        // also silently disagreed with the case-sensitive GLOB in
+        // `is_test_node_sql` — see `test_is_test_node_sql_matches_rust`.
+        assert!(!is_test_path("api/Test_Signup.py"));
+        assert!(!is_test_path("api/sub/Test_Signup.py"));
+        assert!(!is_test_path("api/Conftest.py"));
+        // The DIRECTORY leg stays case-insensitive (xUnit `src/Tests/…`, issue #36).
+        assert!(is_test_path("src/Tests/Api/Thing.cs"));
+        assert!(is_test_path("src/Test/Api/Thing.cs"));
+        // `Spec` is a suite name in ScalaTest/Kotest…
+        assert!(is_test_path("app/routes/RouteSpec.scala"));
+        assert!(is_test_path("app/routes/RouteSpec.kt"));
+        // …and an ordinary production noun everywhere else. Classifying these as
+        // tests removed their symbols from `search` (is_skippable_result) and
+        // listed them as "test file(s) to re-run" in `affected`.
+        assert!(!is_test_path("src/Contracts/OpenApiSpec.cs"));
+        assert!(!is_test_path("src/Protocol/WireSpec.java"));
+        assert!(!is_test_path("src/Api/OpenApiSpec.php"));
+        assert!(!is_test_path("src/Model/FieldSpec.swift"));
+        // The `Test`/`Tests` stems keep the full ecosystem list.
+        assert!(is_test_path("app/Domain/AuthServiceTests.cs"));
+        assert!(is_test_path("app/Domain/AuthServiceTest.java"));
         // is_test_symbol still honors the name heuristic on a non-test path.
         assert!(is_test_symbol("test_login", "src/auth.rs"));
         assert!(!is_test_symbol("login", "src/auth.rs"));

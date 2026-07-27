@@ -178,10 +178,14 @@ impl McpServer {
         // Validate required + enum args at tool entry, before any index/freshness
         // work, so a missing file_path or bogus direction errors cleanly instead of
         // after ensure_indexed ran. feedback-enum-validate-at-entry.
-        let file_path = args["file_path"]
+        // Separator-normalized at entry (see `super::normalize_path_arg`) so the
+        // freshness target and the `get_nodes_by_file_path` key below match.
+        let file_path_owned = args["file_path"]
             .as_str()
             .filter(|s| !s.trim().is_empty())
+            .map(super::normalize_path_arg)
             .ok_or_else(|| anyhow!("file_path is required (relative to project root)"))?;
+        let file_path = file_path_owned.as_str();
         let direction_raw = args
             .get("direction")
             .and_then(|v| v.as_str())

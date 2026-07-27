@@ -18,7 +18,13 @@ impl McpServer {
             .filter(|s| !s.trim().is_empty());
         // Empty file_path => no filter (treat like missing). Otherwise we'd
         // get "Symbol 'x' not found in file ''" which is a useless error.
-        let file_path = args["file_path"].as_str().filter(|s| !s.is_empty());
+        // Separator-normalized at entry so the freshness target and the
+        // `get_nodes_by_file_path` key match (see `super::normalize_path_arg`).
+        let file_path_arg = args["file_path"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(super::normalize_path_arg);
+        let file_path = file_path_arg.as_deref();
         let relation_raw = args["relation"].as_str().unwrap_or("all");
         let compact = args["compact"].as_bool().unwrap_or(false);
         // Default true preserves the "every usage site" contract for rename audits

@@ -110,8 +110,15 @@ impl McpServer {
         let depth = args["depth"].as_i64().unwrap_or(3).clamp(1, 20) as i32;
         // Empty file_path is identical to absent — without this the
         // disambiguation/fuzzy path treats Some("") as "filter by this exact
-        // path" and silently returns no edges.
-        let file_path = args["file_path"].as_str().filter(|s| !s.is_empty());
+        // path" and silently returns no edges. Separator-normalized at entry
+        // (see `super::normalize_path_arg`): this value is both the freshness
+        // target and the `get_call_graph_filtered` path filter, and a raw
+        // `src\foo.rs` filter matches no indexed row.
+        let file_path_arg = args["file_path"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(super::normalize_path_arg);
+        let file_path = file_path_arg.as_deref();
         let compact = args["compact"].as_bool().unwrap_or(false);
         let include_tests = args["include_tests"].as_bool().unwrap_or(false);
         // Confidence floor (default 'inferred'): hide the ambiguous by-name
