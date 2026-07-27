@@ -126,6 +126,30 @@ test('classifyEmbeddings WARNS when embed-capable but nothing embedded (vector i
   assert.match(r.detail, /FTS5-only|vector INACTIVE/);
 });
 
+test('classifyEmbeddings reports the real download outcome, not "retry shortly" (issue #35)', () => {
+  const { classifyEmbeddings } = require('./doctor');
+  const base = { model_available: true, embedding_progress: '0/27201',
+    embedding_status: 'pending', search_mode: 'fts_only' };
+
+  // A download that failed must SAY so, with its cause. Advising the user to
+  // wait is what made a permanently-broken install look like a slow one.
+  const failed = classifyEmbeddings({ ...base,
+    model_download: 'download FAILED after 3 attempt(s): tls handshake rejected' });
+  assert.equal(failed.status, 'warn');
+  assert.match(failed.detail, /FAILED after 3 attempt\(s\): tls handshake rejected/);
+  assert.doesNotMatch(failed.detail, /retry shortly/);
+
+  // No record at all is a DIFFERENT diagnosis: the download never started.
+  const never = classifyEmbeddings(base);
+  assert.equal(never.status, 'warn');
+  assert.match(never.detail, /NO download has ever been attempted/);
+  assert.match(never.detail, /CODE_GRAPH_MODEL_DIR/);
+
+  // In-flight is the one state where waiting IS the right advice.
+  const inflight = classifyEmbeddings({ ...base, model_download: 'download in flight (attempt 1)' });
+  assert.match(inflight.detail, /in flight/);
+});
+
 test('classifyEmbeddings WARNS when binary lacks embed-model feature', () => {
   const { classifyEmbeddings } = require('./doctor');
   const r = classifyEmbeddings({ model_available: false, embedding_progress: '0/0' });

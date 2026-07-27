@@ -21,15 +21,46 @@ const MARKER = '<!-- code-graph-impact-review -->';
 const SPAWN_TIMEOUT_MS = 60_000;
 const TOP_AFFECTED = 15;
 
-/// File-level test classifier — mirrors `domain::is_test_path` (Rust). Kept in
-/// sync deliberately; see feedback_test_classifier_dual_sources.md.
+/// Constant lists mirroring `domain::PASCAL_TEST_*` / `INFIX_TEST_EXTS`. Both
+/// sides are generated from their lists rather than transcribed, so adding an
+/// ecosystem is one edit here and one in domain.rs — not a hunt through
+/// hand-written boolean chains.
+const PASCAL_TEST_EXTS = ['cs', 'vb', 'fs', 'java', 'kt', 'scala', 'swift', 'php'];
+const PASCAL_TEST_STEMS = ['Test', 'Tests', 'Spec'];
+const INFIX_TEST_EXTS = ['go', 'rs', 'py', 'dart'];
+
+/// File-level test classifier — mirrors `domain::is_test_path` (Rust). This is
+/// one of several deliberately-synchronized copies; `domain.rs` carries the
+/// "Five sites must agree" note, and two of those sites are intentionally
+/// divergent. Widening only the Rust side breaks the parity contract asserted
+/// by `isTestPath mirrors domain::is_test_path patterns` in the test file, and
+/// makes the "test gaps" section report every Java/C# test as uncovered
+/// production code.
 function isTestPath(p) {
+  // Case-insensitive `test`/`tests` DIRECTORY segment at any depth: xUnit/NUnit
+  // put suites under `src/Tests/<Project>/…` and Maven/Gradle under
+  // `src/test/java/…` (issue #36). Note `toLowerCase()` is Unicode-aware where
+  // Rust uses `to_ascii_lowercase()`; they agree on ASCII paths.
+  const lower = p.toLowerCase();
+  if (
+    lower.startsWith('tests/') || lower.startsWith('test/') ||
+    lower.includes('/tests/') || lower.includes('/test/')
+  ) return true;
+  // PascalCase test-class convention. Case-SENSITIVE and pinned to a known
+  // extension so `src/latest.cs` and `src/mytests.rs` stay production.
+  if (PASCAL_TEST_STEMS.some((stem) => PASCAL_TEST_EXTS.some((ext) => p.endsWith(`${stem}.${ext}`)))) {
+    return true;
+  }
+  if (INFIX_TEST_EXTS.some((ext) => p.endsWith(`_test.${ext}`))) return true;
+  // pytest naming conventions.
+  if (lower.endsWith('.py') &&
+      (lower.startsWith('test_') || lower.includes('/test_') || lower.endsWith('conftest.py'))) {
+    return true;
+  }
   return (
-    p.startsWith('tests/') || p.startsWith('test/') ||
     p.startsWith('benches/') || p.startsWith('bench/') ||
     p.includes('__tests__/') ||
     p.endsWith('/tests.rs') ||
-    p.endsWith('_test.go') || p.endsWith('_test.rs') ||
     p.endsWith('.test.ts') || p.endsWith('.test.js') ||
     p.endsWith('.test.tsx') || p.endsWith('.test.jsx') ||
     p.endsWith('.spec.ts') || p.endsWith('.spec.js') ||

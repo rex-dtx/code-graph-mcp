@@ -374,10 +374,18 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
     // so a barrel-scan `deps <root>/../../secret` did an out-of-root read (the
     // absolute-prefix sibling of the relative `..` traversal). Re-validate the
     // stripped remainder.
+    // Every `return Ok(...)` below yields an INDEX LOOKUP KEY, so it must be in
+    // the `/`-separated form `merkle::normalize_rel_path` stores. `to_string_lossy`
+    // on a stripped `Path` keeps the NATIVE separator, so on Windows these
+    // branches produced `src\Foo.cs` against an index holding `src/Foo.cs` — the
+    // key never matched and `affected` / `deps` / `trace` / `show` reported a
+    // present file as "not in index". Same defect class as issue #34.
+    // (`collapse_within_root`, used by the subdirectory branch below, already
+    // decomposes into `Component`s and re-joins with `/`, so it is unaffected.)
     let p = Path::new(raw);
     if p.is_absolute() {
         if let Ok(rel) = p.strip_prefix(project_root) {
-            let rel = rel.to_string_lossy().into_owned();
+            let rel = crate::indexer::merkle::normalize_rel_path(rel);
             if !is_safe_relative_path(&rel) {
                 return Err(escape());
             }
@@ -387,7 +395,7 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
         // strip_prefix here is genuinely under the root (no `..` can survive).
         if let (Ok(canon_p), Ok(canon_root)) = (p.canonicalize(), project_root.canonicalize()) {
             if let Ok(rel) = canon_p.strip_prefix(&canon_root) {
-                return Ok(rel.to_string_lossy().into_owned());
+                return Ok(crate::indexer::merkle::normalize_rel_path(rel));
             }
         }
         anyhow::bail!(
@@ -414,14 +422,19 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
             if !is_safe_relative_path(rest) {
                 return Err(escape());
             }
-            return Ok(rest.to_string());
+            return Ok(crate::indexer::merkle::normalize_rel_str(rest));
         }
         // Lexical escape check (no filesystem touch — target may be gitignored or
         // deleted): reject any prefix that climbs above the root.
         if !is_safe_relative_path(raw) {
             return Err(escape());
         }
-        return Ok(raw.to_string());
+        // Windows users type and paste `src\foo.rs` (Explorer, other tools' output,
+        // tab completion). Passing it through verbatim made it an index key that
+        // could never match. `is_safe_relative_path` already ran on the raw form
+        // and uses `Path::components`, which splits on `\` under Windows, so the
+        // escape check saw the same components either way.
+        return Ok(crate::indexer::merkle::normalize_rel_str(raw));
     }
 
     // cwd is a subdirectory of the root: resolve `raw` against it, collapsing
@@ -1153,6 +1166,14 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     } else {
         "partial"
     };
+    // Last model-download outcome. Without it, `pending` printed the same
+    // optimistic "retry shortly" forever — a permanently-degraded install was
+    // indistinguishable from one that just hadn't finished (issue #35).
+    #[cfg(feature = "embed-model")]
+    let model_download: Option<String> =
+        crate::embedding::model::EmbeddingModel::download_state_summary();
+    #[cfg(not(feature = "embed-model"))]
+    let model_download: Option<String> = None;
 
     // Snapshot metadata block — reads keys written by `snapshot install`.
     let snapshot_url =
@@ -1224,6 +1245,11 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "conversion_metric": recommendation_metric_state(project_root),
                 "index_version_stale": index_version_stale.is_some(),
             });
+            // Additive field: absent when no download was ever recorded, which
+            // is itself the "never attempted" diagnosis.
+            if let Some(ref s) = model_download {
+                json["model_download"] = serde_json::json!(s);
+            }
             if let Some(ref r) = resolution {
                 json["resolution"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
             }
@@ -1294,16 +1320,32 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 // Vector/embedding status — make a silent FTS5-only degradation visible
                 // (the prior gap: text health-check never surfaced search_mode, so a user
                 // whose model download failed had no way to see vector was inactive).
-                println!("Search: {} — {}% embedded ({})",
-                    if search_mode == "hybrid" { "hybrid (FTS5 + vector)" } else { "FTS5-only (vector inactive)" },
+                let pending_detail = match model_download.as_deref() {
+                    // "never attempted" is itself actionable — it means the
+                    // background download never even started, which is a
+                    // different bug from one that started and failed.
+                    None => "model not loaded yet; no download has been attempted on this machine \
+                             — start the MCP server, or set CODE_GRAPH_MODEL_DIR to a manually \
+                             populated model dir"
+                        .to_string(),
+                    Some(s) => format!("model not loaded yet; last download: {}", s),
+                };
+                println!(
+                    "Search: {} — {}% embedded ({})",
+                    if search_mode == "hybrid" {
+                        "hybrid (FTS5 + vector)"
+                    } else {
+                        "FTS5-only (vector inactive)"
+                    },
                     coverage_pct,
                     match embedding_status {
-                        "unavailable" => "binary built without embed-model feature",
-                        "pending" => "model not loaded yet; auto-downloads in background on first search — retry shortly, then re-check",
-                        "partial" => "embedding in progress",
-                        "complete" => "embeddings complete",
-                        other => other,
-                    });
+                        "unavailable" => "binary built without embed-model feature".to_string(),
+                        "pending" => pending_detail,
+                        "partial" => "embedding in progress".to_string(),
+                        "complete" => "embeddings complete".to_string(),
+                        other => other.to_string(),
+                    }
+                );
                 print_resolution();
             } else if !schema_ok {
                 eprintln!(
@@ -2677,11 +2719,19 @@ fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> V
     for rel in scope_rels {
         rg_files.arg(rel);
     }
+    // `rg --files` emits NATIVE separators (`src\foo.rs` on Windows) while
+    // `git ls-files` always emits `/`. Comparing the two spellings directly made
+    // `walked.contains(t)` miss EVERY file on Windows, so the "supplement" became
+    // the entire tracked set — 3,284 absolute paths appended to one argv, which
+    // is the `os error 206` (command line > 32 KB) in issue #34, and the source of
+    // the duplicated matches (each file scanned once by the walk and once as an
+    // explicit arg). Normalize both sides to the `/` form.
     let walked: std::collections::HashSet<String> = match rg_files.output() {
         // rg --files exits 1 with empty stdout when the walk finds nothing —
         // same parse either way; only spawn failure disables the supplement.
         Ok(out) => String::from_utf8_lossy(&out.stdout)
             .lines()
+            .map(normalize_path_display)
             .map(|l| l.trim_start_matches("./").to_string())
             .collect(),
         Err(_) => return Vec::new(),
@@ -2689,7 +2739,7 @@ fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> V
 
     tracked
         .into_iter()
-        .filter(|t| !walked.contains(t))
+        .filter(|t| !walked.contains(&normalize_path_display(t)))
         .collect()
 }
 
@@ -2775,12 +2825,23 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             grep_exit(2);
         }
         if let Ok(rel) = canonical.strip_prefix(&root_canonical) {
-            search_rels.push(rel.to_string_lossy().into_owned());
+            // `/`-separated: these go out as `git ls-files` / `rg --files`
+            // pathspecs (git pathspecs are always `/`) and are compared against
+            // relativized output rows in `-c` mode, which is also `/`.
+            search_rels.push(normalize_path_display(&rel.to_string_lossy()));
         }
         search_paths.push(canonical);
     }
 
-    let mut rg_cmd = Command::new("rg");
+    // Flags + pattern, WITHOUT the path operands: paths are appended per batch by
+    // `run_rg` below, because one argv cannot hold an unbounded supplement list
+    // (Windows caps a command line at ~32 KB — issue #34's `os error 206`).
+    let mut rg_args: Vec<std::ffi::OsString> = Vec::new();
+    macro_rules! rg_arg {
+        ($v:expr) => {
+            rg_args.push(std::ffi::OsString::from($v))
+        };
+    }
     // Determinism note: ripgrep parallelizes the walk and emits files in
     // worker-completion order, so the same grep shuffled every run (observed up to
     // 8/8 distinct) — the determinism class fixed for the graph commands in v0.85.x.
@@ -2793,56 +2854,63 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     if files_with_matches {
         // -l: plain one-path-per-line output (rg stops at the first match per
         // file); context flags are meaningless here, like grep, and ignored.
-        rg_cmd.arg("-l");
+        rg_arg!("-l");
     } else if count_mode {
         // -c: ripgrep --count prints `path:N` (matching LINES per file, listing
         // only files with ≥1 match). The per-file --max-count cap is intentionally
         // NOT applied so the count is exhaustive; context flags don't apply.
         // --with-filename forces the `path:` prefix even for a single file (rg
         // omits it otherwise, like `grep -c`), so the `path:N` parse is uniform.
-        rg_cmd.arg("--count").arg("--with-filename");
+        rg_arg!("--count");
+        rg_arg!("--with-filename");
     } else {
-        rg_cmd.arg("--json").arg("-n");
+        rg_arg!("--json");
+        rg_arg!("-n");
         if let Some(n) = context {
-            rg_cmd.arg(format!("--context={}", n));
+            rg_arg!(format!("--context={}", n));
         }
         if let Some(n) = after_context {
-            rg_cmd.arg(format!("--after-context={}", n));
+            rg_arg!(format!("--after-context={}", n));
         }
         if let Some(n) = before_context {
-            rg_cmd.arg(format!("--before-context={}", n));
+            rg_arg!(format!("--before-context={}", n));
         }
         if max_count > 0 {
-            rg_cmd.arg(format!("--max-count={}", max_count));
+            rg_arg!(format!("--max-count={}", max_count));
         }
     }
     if ignore_case {
-        rg_cmd.arg("-i");
+        rg_arg!("-i");
     }
     if word_regexp {
-        rg_cmd.arg("-w");
+        rg_arg!("-w");
     }
     if fixed_strings {
-        rg_cmd.arg("-F");
+        rg_arg!("-F");
     }
     // Scope filters (apply to every mode): --type by language, --glob by path.
     // rg validates a --type name and errors (exit 2) on an unknown one, surfaced
     // like any other rg error below.
     if let Some(ref t) = file_type {
-        rg_cmd.arg("--type").arg(t);
+        rg_arg!("--type");
+        rg_arg!(t);
     }
     for g in &glob {
-        rg_cmd.arg("--glob").arg(g);
+        rg_arg!("--glob");
+        rg_arg!(g);
     }
     // `--` so leading-dash patterns (e.g. searching for "--no-default-features")
     // reach rg as the pattern instead of being parsed as flags.
-    rg_cmd.arg("--").arg(&pattern);
+    rg_arg!("--");
+    rg_arg!(&pattern);
 
+    // Walk operands: the user's paths, or the whole root.
+    let mut walk_operands: Vec<std::ffi::OsString> = Vec::new();
     if search_paths.is_empty() {
-        rg_cmd.arg(project_root);
+        walk_operands.push(project_root.into());
     } else {
         for p in &search_paths {
-            rg_cmd.arg(p);
+            walk_operands.push(p.into());
         }
     }
 
@@ -2851,7 +2919,12 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // pathspecs + rg --files args are both scoped to the user's paths, so the
     // supplement honors path restrictions; files passed explicitly by the
     // user appear in the walk output and dedup naturally.
-    const SUPPLEMENT_CAP: usize = 500;
+    // Bounds the number of extra rg spawns (each batch is one), not the argv
+    // length — that is `ARGV_PATH_BUDGET` below. Raised from 500 in v0.105.x:
+    // 500 was a proxy for the command-line limit and silently dropped tracked
+    // files (a "no matches" that had matches), which the batching makes
+    // unnecessary. Reaching this cap is still reported on stderr.
+    const SUPPLEMENT_CAP: usize = 20_000;
     let mut supplement = tracked_files_missed_by_walk(project_root, &search_rels);
     // rg does NOT apply --type/--glob to files passed explicitly on the command
     // line, so the supplement (appended as explicit args below) would leak files
@@ -2898,26 +2971,92 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         );
         supplement.truncate(SUPPLEMENT_CAP);
     }
-    for rel in &supplement {
-        // Join on project_root (not the canonicalized root) so parse_rg_json's
-        // prefix-strip produces relative paths in the output.
-        let abs = project_root.join(rel);
-        if abs.is_file() {
-            rg_cmd.arg(abs);
+    // Supplement operands are RELATIVE (resolved by rg against `current_dir`,
+    // set to the project root below). Absolute ones cost the repeated root
+    // prefix on every entry — ~40 chars × 500 ≈ 20 KB of pure prefix on the
+    // reporter's layout — which is what pushed the argv past Windows' 32 KB
+    // limit. rg echoes the operand back verbatim, and `relativize_path`
+    // normalizes both spellings to the same root-relative form, so walk and
+    // supplement results still dedup against each other.
+    let supplement_operands: Vec<std::ffi::OsString> = supplement
+        .iter()
+        .filter(|rel| project_root.join(rel).is_file())
+        .map(std::ffi::OsString::from)
+        .collect();
+
+    // Windows caps a whole command line at 32,767 chars; POSIX ARG_MAX is
+    // ~2 MB. Budget the PATH operands conservatively under each, leaving room
+    // for the flags, the pattern, and the exe path.
+    const ARGV_PATH_BUDGET: usize = if cfg!(windows) { 24_000 } else { 512_000 };
+    // Override exists so the batching path is testable without materializing a
+    // 32 KB argv, and as an escape hatch for a shell with a tighter limit.
+    let argv_budget = std::env::var("CODE_GRAPH_RG_ARGV_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(ARGV_PATH_BUDGET);
+    let flags_len: usize = rg_args.iter().map(|a| a.len() + 1).sum();
+    let path_budget = argv_budget.saturating_sub(flags_len).max(1);
+
+    let run_rg = |paths: &[std::ffi::OsString]| -> std::io::Result<std::process::Output> {
+        let mut cmd = Command::new("rg");
+        cmd.current_dir(project_root);
+        cmd.args(&rg_args);
+        cmd.args(paths);
+        cmd.output()
+    };
+
+    // Batch 1 is always the walk; the supplement follows in argv-sized chunks.
+    // Each batch is an independent rg run whose stdout is concatenated — every
+    // consumer below (rg --json records, `-l` lines, `-c` rows) is line- or
+    // record-oriented and already sorts + dedups the merged set globally.
+    let mut batches: Vec<&[std::ffi::OsString]> = vec![&walk_operands];
+    {
+        let mut start = 0usize;
+        while start < supplement_operands.len() {
+            let mut end = start;
+            let mut used = 0usize;
+            while end < supplement_operands.len() {
+                let next = supplement_operands[end].len() + 1;
+                if end > start && used + next > path_budget {
+                    break;
+                }
+                used += next;
+                end += 1;
+            }
+            batches.push(&supplement_operands[start..end]);
+            start = end;
         }
     }
 
-    let rg_output = rg_cmd.output();
-    let rg_output = match rg_output {
-        Ok(output) => output,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if json_mode {
-                println!("[]");
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    // Merged exit code, worst-first: 2 (error) > 0 (matched) > 1 (no match).
+    let mut merged_code: i32 = 1;
+    for batch in batches {
+        let output = match run_rg(batch) {
+            Ok(output) => output,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if json_mode {
+                    println!("[]");
+                }
+                eprintln!("[code-graph] ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep");
+                grep_exit(2);
             }
-            eprintln!("[code-graph] ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep");
-            grep_exit(2);
-        }
-        Err(e) => return Err(e.into()),
+            Err(e) => return Err(e.into()),
+        };
+        stdout_buf.extend_from_slice(&output.stdout);
+        stderr_buf.extend_from_slice(&output.stderr);
+        merged_code = match output.status.code() {
+            Some(2) => 2,
+            Some(0) if merged_code != 2 => 0,
+            _ => merged_code,
+        };
+    }
+    let rg_output = RgRun {
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+        code: merged_code,
     };
 
     // ripgrep exit codes: 0 = matched, 1 = no match, 2 = error (invalid regex,
@@ -2928,7 +3067,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // 2; discarding them here turned a one-bad-path multi-path grep into a
     // silent exit 2. Deliver the partial results and keep the exit code.
     let mut partial_error = false;
-    if rg_output.status.code() == Some(2) {
+    if rg_output.code == 2 {
         let stderr = String::from_utf8_lossy(&rg_output.stderr);
         let stderr = stderr.trim();
         if rg_output.stdout.is_empty() {
@@ -2962,7 +3101,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         let mut files: Vec<String> = String::from_utf8_lossy(&rg_output.stdout)
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| relativize_path(l, &root_str).to_string())
+            .map(|l| relativize_path(l, &root_str))
             .collect();
         files.sort(); // global ascending-path order (walk + supplement + multi-path)
         files.dedup(); // overlapping/repeated path args can list one file twice
@@ -3004,10 +3143,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             .filter(|l| !l.is_empty())
             .filter_map(|l| {
                 let (path, n) = l.rsplit_once(':')?;
-                Some((
-                    relativize_path(path, &root_str).to_string(),
-                    n.trim().parse().ok()?,
-                ))
+                Some((relativize_path(path, &root_str), n.trim().parse().ok()?))
             })
             .collect();
         // GNU parity: every explicitly named FILE arg gets a count row, zero
@@ -3307,6 +3443,15 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     Ok(())
 }
 
+/// Merged result of the one-or-more ripgrep invocations a single `grep` runs
+/// (walk + argv-sized supplement batches — see `ARGV_PATH_BUDGET`).
+struct RgRun {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// Worst status across batches: 2 (error) > 0 (matched) > 1 (no match).
+    code: i32,
+}
+
 struct GrepMatch {
     file: String,
     line: u64,
@@ -3315,14 +3460,81 @@ struct GrepMatch {
     is_context: bool,
 }
 
-/// Make an rg-reported path relative to the project root.
-fn relativize_path<'a>(path_str: &'a str, root_str: &str) -> &'a str {
-    let root_prefix = root_str.trim_end_matches('/');
-    path_str
-        .strip_prefix(root_prefix)
-        .or_else(|| path_str.strip_prefix(root_str))
-        .unwrap_or(path_str)
+/// Canonical display form for any filesystem path that reaches stdout or is used
+/// as an index key: forward slashes, no Windows `\\?\` / `\\?\UNC\` extended
+/// prefix. The index stores `/`-separated relative paths
+/// (`indexer::merkle::normalize_rel_path`), so every path the CLI prints or looks
+/// up must land in that same spelling — on Windows `rg` emits `\`, `git ls-files`
+/// emits `/`, and `Path::canonicalize` emits `\\?\D:\…`, three spellings of one
+/// file that compare unequal (issue #34: duplicated matches, `\\?\` leaking into
+/// output, and AST annotation silently missing because the lookup key never
+/// matched the indexed path).
+pub(crate) fn normalize_path_display(path: &str) -> String {
+    normalize_path_display_on(path, cfg!(windows))
+}
+
+/// Testable core of [`normalize_path_display`]. `backslash_is_sep` says whether
+/// `\` is a path SEPARATOR on the target platform.
+///
+/// It must not be assumed: on Unix `\` is an ordinary filename character (only
+/// `/` and NUL are illegal), so rewriting it unconditionally would rename a
+/// legitimate `src/od\bc.rs` to `src/od/bc.rs` — printing a path that does not
+/// exist and, worse, producing a lookup key that misses the indexed one, since
+/// `indexer::merkle::normalize_rel_path` also rewrites separators only under
+/// `#[cfg(windows)]`. That is the very failure mode issue #34 was about, so the
+/// fix must not reintroduce it in the other direction.
+///
+/// The flag is a parameter rather than a `cfg!` so the Windows behaviour is
+/// exercised by the Linux and macOS CI legs too. That matters here: the three
+/// #34 defects were pure string handling that a `windows-latest` job already in
+/// the matrix never caught, because nothing asserted on path spellings at all.
+pub(crate) fn normalize_path_display_on(path: &str, backslash_is_sep: bool) -> String {
+    if !backslash_is_sep {
+        return path.to_string();
+    }
+    let stripped = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{}", rest))
+        .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path).to_string());
+    // Separator rewrite lives in ONE place crate-wide (the module that owns the
+    // index-key invariant); this function only adds the `\\?\` strip on top.
+    crate::indexer::merkle::normalize_rel_str_on(&stripped, backslash_is_sep)
+}
+
+/// Make an rg-reported path relative to the project root, in canonical
+/// (`/`-separated, prefix-free) display form.
+///
+/// Both sides are normalized before the strip so the mixed spellings above
+/// compare equal; on Windows the comparison is ASCII-case-insensitive because
+/// the same volume legitimately appears as `D:\` and `d:\` (and rg may echo back
+/// whichever spelling it was handed).
+fn relativize_path(path_str: &str, root_str: &str) -> String {
+    relativize_path_on(path_str, root_str, cfg!(windows))
+}
+
+/// Testable core of [`relativize_path`] — see [`normalize_path_display_on`] for
+/// why the platform is a parameter rather than a `cfg!`.
+fn relativize_path_on(path_str: &str, root_str: &str, windows: bool) -> String {
+    let path = normalize_path_display_on(path_str, windows);
+    let root = normalize_path_display_on(root_str, windows);
+    let root = root.trim_end_matches('/');
+    let rest = if root.is_empty() {
+        None
+    } else if windows {
+        // eq_ignore_ascii_case on the prefix only — the remainder keeps its case.
+        // Windows volumes are legitimately spelled `D:\` or `d:\`, and rg echoes
+        // back whichever spelling it was handed.
+        path.get(..root.len())
+            .filter(|head| head.eq_ignore_ascii_case(root))
+            .map(|_| &path[root.len()..])
+    } else {
+        path.strip_prefix(root)
+    };
+    // `./x` (rg walking `.`) and a leftover leading separator both reduce to `x`.
+    rest.unwrap_or(&path)
         .trim_start_matches('/')
+        .trim_start_matches("./")
+        .to_string()
 }
 
 /// Parse ripgrep JSON output into structured matches (and context lines when
@@ -3352,7 +3564,7 @@ fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
         let text = data["lines"]["text"].as_str().unwrap_or("").to_string();
 
         matches.push(GrepMatch {
-            file: relativize_path(path_str, &root_str).to_string(),
+            file: relativize_path(path_str, &root_str),
             line: line_number,
             text,
             is_context,
@@ -4797,14 +5009,57 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     for t in &tests {
         writeln!(stdout, "  {}", t)?;
     }
+    // Blast radius, grouped by proximity. A flat depth-ordered-by-path dump put
+    // the depth-1 dependents a developer would actually inspect in among
+    // hundreds of depth-8..10 transitive hits — on a monorepo with a shared core
+    // that is "12% of the repo, unranked" and nobody can act on it (issue #36).
+    // Grouping + a display cap keeps the actionable head; `--json` is uncapped
+    // and ungrouped, so scripted consumers are unaffected.
+    const AFFECTED_DISPLAY_CAP: usize = 40;
+    let mut by_depth: BTreeMap<i32, Vec<&String>> = BTreeMap::new();
+    for (p, d) in &affected {
+        by_depth.entry(*d).or_default().push(p);
+    }
+    let capped = affected.len() > AFFECTED_DISPLAY_CAP;
     writeln!(
         stdout,
-        "Full blast radius: {} file(s) (depth <= {})",
+        "Full blast radius: {} file(s) (depth <= {}){}",
         affected.len(),
-        depth
+        depth,
+        if capped {
+            format!(", nearest {} shown", AFFECTED_DISPLAY_CAP)
+        } else {
+            String::new()
+        }
     )?;
-    for (p, d) in &affected {
-        writeln!(stdout, "  {} (depth {})", p, d)?;
+    let mut shown = 0usize;
+    let mut withheld = 0usize;
+    let mut withheld_from_depth: Option<i32> = None;
+    for (d, paths) in &by_depth {
+        if shown >= AFFECTED_DISPLAY_CAP {
+            withheld += paths.len();
+            withheld_from_depth.get_or_insert(*d);
+            continue;
+        }
+        writeln!(stdout, "  depth {} ({} file(s)):", d, paths.len())?;
+        for p in paths {
+            if shown >= AFFECTED_DISPLAY_CAP {
+                withheld += 1;
+                withheld_from_depth.get_or_insert(*d);
+                continue;
+            }
+            writeln!(stdout, "    {}", p)?;
+            shown += 1;
+        }
+    }
+    if withheld > 0 {
+        writeln!(
+            stdout,
+            "  … {} more at depth {}-{} — narrow with --depth N, or use --json for the full list",
+            withheld,
+            withheld_from_depth.unwrap_or(depth),
+            by_depth.keys().next_back().copied().unwrap_or(depth)
+        )?;
     }
     if !not_indexed.is_empty() {
         writeln!(
@@ -8851,6 +9106,170 @@ mod tests {
         std::fs::create_dir_all(&sub_idx).unwrap();
         std::fs::write(sub_idx.join("index.db"), b"").unwrap();
         assert_eq!(resolve_project_root_from(&subdir), subdir);
+    }
+
+    // ── Windows path spellings (issue #34) ────────────────────────────────
+    // Platform-independent on purpose: the bug is pure string handling, so the
+    // Linux/macOS CI legs catch a regression too, not just windows-latest.
+
+    /// Everything `normalize_user_path_from` returns becomes an INDEX LOOKUP
+    /// KEY, so it must be spelled exactly the way `merkle::normalize_rel_path`
+    /// stores it. Asserted as a RELATION against the index normalizer rather
+    /// than a literal, so the same assertion is meaningful on every platform.
+    ///
+    /// Before the fix, the absolute and root-relative branches returned
+    /// `to_string_lossy()` verbatim, so on Windows `affected D:\repo\src\Foo.cs`
+    /// produced the key `src\Foo.cs` against an index holding `src/Foo.cs` and
+    /// the file was reported "not in index" — a present file, silently dropped.
+    #[test]
+    fn normalize_user_path_returns_index_key_spelling() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let native_rel: PathBuf = ["src", "parser", "mod.rs"].iter().collect();
+
+        // (1) relative, spelled with the platform's own separator
+        let typed = native_rel.to_string_lossy().into_owned();
+        let got = normalize_user_path_from(root, root, &typed).unwrap();
+        assert_eq!(
+            got,
+            crate::indexer::merkle::normalize_rel_path(&native_rel),
+            "relative input must normalize to the index's stored spelling"
+        );
+
+        // (2) the same file given as an absolute path
+        let abs = root.join(&native_rel);
+        let got_abs = normalize_user_path_from(root, root, &abs.to_string_lossy()).unwrap();
+        assert_eq!(
+            got_abs, got,
+            "absolute and relative spellings of one file must yield ONE key"
+        );
+
+        // (3) a backslash-typed relative path — what a Windows user pastes.
+        // On Windows that is a two-component path and must become `src/a.rs`;
+        // on Unix it is a single legal filename and must survive verbatim.
+        let got_bs = normalize_user_path_from(root, root, r"src\a.rs").unwrap();
+        assert_eq!(
+            got_bs,
+            crate::indexer::merkle::normalize_rel_str(r"src\a.rs")
+        );
+        if cfg!(windows) {
+            assert!(
+                !got_bs.contains('\\'),
+                "no index key may carry a native separator on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_path_display_strips_windows_prefixes_and_separators() {
+        assert_eq!(
+            normalize_path_display_on(r"\\?\D:\code\repo\src\main.rs", true),
+            "D:/code/repo/src/main.rs",
+            r"the \\?\ extended prefix must never reach stdout"
+        );
+        assert_eq!(
+            normalize_path_display_on(r"\\?\UNC\server\share\repo\a.rs", true),
+            "//server/share/repo/a.rs",
+            "UNC form keeps the double-slash host root"
+        );
+        assert_eq!(
+            normalize_path_display_on("src/main.rs", true),
+            "src/main.rs"
+        );
+        assert_eq!(
+            normalize_path_display_on(r"src\main.rs", true),
+            "src/main.rs"
+        );
+    }
+
+    /// On Unix `\` is a legal FILENAME character (only `/` and NUL are illegal),
+    /// so normalizing separators there would rename a real file and, worse, build
+    /// a lookup key that misses the indexed path — `merkle::normalize_rel_path`
+    /// also rewrites only under `#[cfg(windows)]`. Same failure mode as #34, just
+    /// in the other direction.
+    #[test]
+    fn normalize_path_display_leaves_unix_backslash_filenames_alone() {
+        assert_eq!(
+            normalize_path_display_on(r"src/od\bc.rs", false),
+            r"src/od\bc.rs",
+            r"a Unix file literally named `od\bc.rs` must survive verbatim"
+        );
+        assert_eq!(
+            relativize_path_on(r"/home/u/repo/src/od\bc.rs", "/home/u/repo", false),
+            r"src/od\bc.rs",
+            "…including through relativization, which feeds the AST lookup key"
+        );
+        // The same input on Windows IS a two-segment path — the flag is the whole
+        // difference, which is why it must not be inferred from the string.
+        assert_eq!(
+            normalize_path_display_on(r"src/od\bc.rs", true),
+            "src/od/bc.rs"
+        );
+    }
+
+    /// The three spellings one file arrives in on Windows — canonicalized walk
+    /// output, `project_root.join(rel)` mixed separators, and a bare relative
+    /// supplement operand — must all reduce to ONE key. When they did not, the
+    /// same match printed once per spelling and the AST lookup (indexed paths are
+    /// `/`-relative) missed every file.
+    #[test]
+    fn relativize_path_collapses_windows_spellings_to_one_key() {
+        let root = r"D:\code\repo";
+        let expected = "src/Web/Endpoints.cs";
+        for spelling in [
+            r"\\?\D:\code\repo\src\Web\Endpoints.cs",
+            r"D:\code\repo\src\Web\Endpoints.cs",
+            r"D:\code\repo\src/Web/Endpoints.cs",
+            "src/Web/Endpoints.cs",
+        ] {
+            assert_eq!(
+                relativize_path_on(spelling, root, true),
+                expected,
+                "spelling {:?} must relativize to the indexed form",
+                spelling
+            );
+        }
+    }
+
+    #[test]
+    fn relativize_path_handles_posix_and_dot_walk_output() {
+        assert_eq!(
+            relativize_path("/home/u/repo/src/main.rs", "/home/u/repo"),
+            "src/main.rs"
+        );
+        assert_eq!(
+            relativize_path("/home/u/repo/src/main.rs", "/home/u/repo/"),
+            "src/main.rs",
+            "a trailing slash on the root must not leave a leading slash"
+        );
+        assert_eq!(
+            relativize_path("./src/main.rs", "/home/u/repo"),
+            "src/main.rs"
+        );
+        // Out-of-root paths can't occur (the starts_with(root) guard rejects
+        // them upstream); pinning the pre-existing shape so the normalization
+        // rewrite is behaviour-preserving here.
+        assert_eq!(
+            relativize_path("/elsewhere/x.rs", "/home/u/repo"),
+            "elsewhere/x.rs"
+        );
+    }
+
+    #[test]
+    fn relativize_path_is_case_insensitive_on_windows_drive() {
+        assert_eq!(
+            relativize_path_on(r"d:\code\repo\src\a.rs", r"D:\code\repo", true),
+            "src/a.rs",
+            "the same volume may be spelled with either drive-letter case"
+        );
+        // Unix filesystems ARE case-sensitive: two differently-cased roots are
+        // two different directories and must not be collapsed.
+        assert_eq!(
+            relativize_path_on("/home/U/repo/src/a.rs", "/home/u/repo", false),
+            "/home/U/repo/src/a.rs".trim_start_matches('/'),
+            "case-insensitive matching must stay Windows-only"
+        );
     }
 
     #[test]

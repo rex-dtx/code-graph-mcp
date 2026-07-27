@@ -23,10 +23,40 @@ CODE_TYPES = {
 }
 
 
+# Mirrors domain::PASCAL_TEST_* / INFIX_TEST_EXTS. One of five must-agree copies
+# of this predicate; see the "Five sites must agree" note in src/domain.rs. Both
+# sides generate from these lists rather than transcribing boolean chains.
+PASCAL_TEST_EXTS = ("cs", "vb", "fs", "java", "kt", "scala", "swift", "php")
+PASCAL_TEST_STEMS = ("Test", "Tests", "Spec")
+INFIX_TEST_EXTS = ("go", "rs", "py", "dart")
+
+
 def is_test_path(p: str) -> bool:
-    """Port of src/domain.rs is_test_path."""
-    return (p.startswith(("tests/", "test/", "benches/", "bench/")) or "__tests__/" in p
-            or p.endswith(("/tests.rs", "_test.go", "_test.rs", ".test.ts", ".test.js",
+    """Port of src/domain.rs is_test_path.
+
+    Kept leg-for-leg in sync with the Rust original: this script selects gold
+    records for the retrieval benchmark, and a narrower predicate here silently
+    admits test symbols the binary excludes, inflating the measured miss rate.
+    """
+    # Case-insensitive test/tests DIRECTORY segment at any depth (issue #36:
+    # Maven's src/test/java/... and xUnit's src/Tests/<Project>/...).
+    lower = p.lower()
+    if (lower.startswith(("tests/", "test/"))
+            or "/tests/" in lower or "/test/" in lower):
+        return True
+    # PascalCase test-class convention: case-SENSITIVE and pinned to a known
+    # extension so src/latest.cs and src/mytests.rs stay production.
+    if any(p.endswith(f"{stem}.{ext}")
+           for stem in PASCAL_TEST_STEMS for ext in PASCAL_TEST_EXTS):
+        return True
+    if any(p.endswith(f"_test.{ext}") for ext in INFIX_TEST_EXTS):
+        return True
+    if lower.endswith(".py") and (lower.startswith("test_")
+                                  or "/test_" in lower
+                                  or lower.endswith("conftest.py")):
+        return True
+    return (p.startswith(("benches/", "bench/")) or "__tests__/" in p
+            or p.endswith(("/tests.rs", ".test.ts", ".test.js",
                            ".test.tsx", ".test.jsx", ".spec.ts", ".spec.js",
                            ".spec.tsx", ".spec.jsx")))
 

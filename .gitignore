@@ -20,8 +20,13 @@ models/
 !claude-plugin/.claude-plugin/
 !claude-plugin/.claude-plugin/**
 
-# Documentation (local only)
-docs/
+# Documentation (local only) — except contributor skills, which are version
+# controlled so they can be reviewed and evolve with the code they describe.
+# `docs/*` rather than `docs/`: git does not descend into an excluded DIRECTORY,
+# so a `!docs/skills/` negation under `docs/` would never be reached.
+docs/*
+!docs/skills/
+!docs/skills/**
 
 # AI assistant config
 CLAUDE.md

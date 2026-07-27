@@ -367,6 +367,39 @@ lazily on first use. To control that in a restricted environment:
 | `CODE_GRAPH_MODEL_DIR=<dir>` | Load `model.safetensors` from `<dir>` instead of downloading (highest-priority lookup). If the file isn't there, it warns and falls back to the normal search paths. |
 | `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1` | Disable the automatic background model download. An already-cached model is still loaded and used; the server otherwise stays in FTS5-only mode. |
 
+### Installing the model by hand
+
+`CODE_GRAPH_MODEL_DIR` is the supported manual route. Hand-populating the
+*default* cache dir (`<platform cache>/code-graph/models`) does **not** work:
+that dir is only trusted once `extract_and_promote` has written a `.model-id`
+marker, so a manually filled copy is treated as not-current and re-downloaded.
+
+```bash
+# Download + verify against the published checksum, then extract flat
+# (the archive has no wrapping folder: model.safetensors, tokenizer.json, config.json).
+curl -sL -o models.tar.gz \
+  https://github.com/sdsrss/code-graph-mcp/releases/download/v<version>/models.tar.gz
+curl -sL https://github.com/sdsrss/code-graph-mcp/releases/download/v<version>/models.tar.gz.sha256
+sha256sum -c models.tar.gz.sha256
+mkdir -p ~/.cache/code-graph/models-manual
+tar -xzf models.tar.gz -C ~/.cache/code-graph/models-manual
+export CODE_GRAPH_MODEL_DIR=~/.cache/code-graph/models-manual
+```
+
+On Windows use `%LOCALAPPDATA%\code-graph\models-manual`, and give `tar` a POSIX
+path for `-C` (`/c/Users/<you>/...`) — `tar -C C:\...` fails with
+"Cannot connect to C: resolve failed". The model is pinned by content hash, so
+a manual install must be redone on each version bump.
+
+### Diagnosing a model that never downloads
+
+`code-graph-mcp doctor` reports the last download outcome, distinguishing
+"no download has been attempted" from "download FAILED after N attempt(s): …"
+with the underlying error. The raw record is
+`<platform cache>/code-graph/model-download.json`. On a network that performs
+TLS inspection, the download retries automatically against the OS certificate
+store after the bundled roots are rejected.
+
 ## Storage
 
 Uses SQLite with:

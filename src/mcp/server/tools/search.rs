@@ -646,11 +646,31 @@ fn finalize_search_results(
     vector_available: bool,
 ) -> serde_json::Value {
     if !vector_available {
+        // "retry shortly" was printed unconditionally, so a machine whose
+        // download can never succeed got a wait-and-see message forever
+        // (issue #35). Name the actual last outcome when one was recorded.
+        #[cfg(feature = "embed-model")]
+        let last = crate::embedding::model::EmbeddingModel::download_state_summary();
+        #[cfg(not(feature = "embed-model"))]
+        let last: Option<String> = None;
+        let note = match last {
+            Some(s) => format!(
+                "Embedding model not loaded — results are FTS5-only (reduced semantic recall). \
+                 Last model download: {}. Run `code-graph-mcp doctor` for detail.",
+                s
+            ),
+            None => {
+                "Embedding model not loaded — results are FTS5-only (reduced semantic recall). \
+                     The model auto-downloads in the background on first use; retry shortly, or \
+                     run `code-graph-mcp doctor` to check status."
+                    .to_string()
+            }
+        };
         return json!({
             "results": results,
             "search_mode": "fts_only",
             "vector_available": false,
-            "note": "Embedding model not loaded — results are FTS5-only (reduced semantic recall). The model auto-downloads in the background on first use; retry shortly, or run `code-graph-mcp doctor` to check status."
+            "note": note
         });
     }
     if vector_only && !has_exact_name_match {

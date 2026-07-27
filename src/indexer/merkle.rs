@@ -19,13 +19,86 @@ use crate::utils::config::detect_language;
 /// a no-op on Unix.
 #[inline]
 pub(crate) fn normalize_rel_path(rel: &Path) -> String {
-    #[cfg(windows)]
-    {
-        rel.to_string_lossy().replace('\\', "/")
+    normalize_rel_str(&rel.to_string_lossy())
+}
+
+/// [`normalize_rel_path`] for a path that is already a string — e.g. one typed
+/// by a user on the CLI or supplied by an MCP caller, which never went through
+/// `Path` and so was never component-decomposed.
+#[inline]
+pub(crate) fn normalize_rel_str(rel: &str) -> String {
+    normalize_rel_str_on(rel, cfg!(windows))
+}
+
+/// Testable core. `backslash_is_sep` says whether `\` is a path SEPARATOR on the
+/// target platform; it must not be inferred from the string.
+///
+/// Two reasons this is a parameter rather than an inline `cfg!`:
+///
+/// 1. **Correctness.** On Unix `\` is an ordinary filename character (only `/`
+///    and NUL are illegal), so rewriting it there would rename a real
+///    `src/od\bc.rs` and produce a key that misses the indexed one.
+/// 2. **Testability.** This function defines the repo-wide path invariant, and
+///    every defect built on it (issue #34) was pure string logic that the
+///    `windows-latest` CI leg never caught because nothing asserted on path
+///    spellings. As a parameter, the Linux and macOS legs exercise the Windows
+///    branch too.
+///
+/// This is the single separator-normalizing implementation in the crate —
+/// `cli::normalize_path_display_on` strips the Windows `\\?\` prefix and then
+/// delegates here, so the two cannot drift.
+#[inline]
+pub(crate) fn normalize_rel_str_on(rel: &str, backslash_is_sep: bool) -> String {
+    if backslash_is_sep {
+        rel.replace('\\', "/")
+    } else {
+        rel.to_string()
     }
-    #[cfg(not(windows))]
-    {
-        rel.to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    /// The repo-wide index-key invariant, asserted for BOTH platforms from any
+    /// host — the property the `_on` seam exists for.
+    #[test]
+    fn normalize_rel_str_on_rewrites_only_where_backslash_is_a_separator() {
+        // Windows: `\` is a separator, so it becomes the stored `/` form.
+        assert_eq!(
+            normalize_rel_str_on(r"src\parser\mod.rs", true),
+            "src/parser/mod.rs"
+        );
+        assert_eq!(
+            normalize_rel_str_on("src/parser/mod.rs", true),
+            "src/parser/mod.rs"
+        );
+        // Unix: `\` is a legal filename character. Rewriting it would name a file
+        // that does not exist and build a key that misses the indexed one.
+        assert_eq!(
+            normalize_rel_str_on(r"src/od\bc.rs", false),
+            r"src/od\bc.rs"
+        );
+        assert_eq!(
+            normalize_rel_str_on("src/parser/mod.rs", false),
+            "src/parser/mod.rs"
+        );
+    }
+
+    /// `normalize_rel_path` (Path input) and `normalize_rel_str` (string input)
+    /// must agree — the string form exists precisely for input that never went
+    /// through `Path`, and a divergence would reintroduce the mismatch.
+    #[test]
+    fn normalize_rel_path_and_str_agree_on_native_input() {
+        let native = if cfg!(windows) {
+            r"src\a\b.rs"
+        } else {
+            "src/a/b.rs"
+        };
+        assert_eq!(
+            normalize_rel_path(Path::new(native)),
+            normalize_rel_str(native)
+        );
     }
 }
 

@@ -412,14 +412,49 @@ pub fn is_dead_code_exported(
 /// divergent patterns. See the "Five sites must agree" note below and
 /// feedback_test_classifier_dual_sources.md before changing any one of them.
 pub fn is_test_path(file_path: &str) -> bool {
-    file_path.starts_with("tests/")
-        || file_path.starts_with("test/")
-        || file_path.starts_with("benches/")
+    // Case-insensitive `test`/`tests` DIRECTORY segment. xUnit/NUnit/MSTest put
+    // suites under `src/Tests/<Project>/…` and Maven/Gradle under
+    // `src/test/java/…`; both were invisible to the old `starts_with("tests/")`
+    // leg, so `affected` reported "0 test files to re-run" for a C# change whose
+    // test called the changed symbol directly (issue #36) — a silent false
+    // negative in the one output a CI integration would act on.
+    let lower = file_path.to_ascii_lowercase();
+    if lower.starts_with("tests/")
+        || lower.starts_with("test/")
+        || lower.contains("/tests/")
+        || lower.contains("/test/")
+    {
+        return true;
+    }
+    // PascalCase test-class convention: `ResponsibleEntityServiceTests.cs`,
+    // `AuthHandlerTest.java`, `RouteSpec.scala`. Case-SENSITIVE and pinned to a
+    // known extension so `src/latest.rs` and `src/mytests.rs` stay production.
+    if PASCAL_TEST_STEMS.iter().any(|stem| {
+        PASCAL_TEST_EXTS
+            .iter()
+            .any(|ext| file_path.ends_with(&format!("{}.{}", stem, ext)))
+    }) {
+        return true;
+    }
+    // `foo_test.<ext>` beyond the original Go/Rust pair, and the pytest
+    // `test_*.py` / `conftest.py` filename conventions.
+    if INFIX_TEST_EXTS
+        .iter()
+        .any(|ext| file_path.ends_with(&format!("_test.{}", ext)))
+    {
+        return true;
+    }
+    if lower.ends_with(".py")
+        && (lower.starts_with("test_")
+            || lower.contains("/test_")
+            || lower.ends_with("conftest.py"))
+    {
+        return true;
+    }
+    file_path.starts_with("benches/")
         || file_path.starts_with("bench/")
         || file_path.contains("__tests__/")
         || file_path.ends_with("/tests.rs")
-        || file_path.ends_with("_test.go")
-        || file_path.ends_with("_test.rs")
         || file_path.ends_with(".test.ts")
         || file_path.ends_with(".test.js")
         || file_path.ends_with(".test.tsx")
@@ -429,6 +464,22 @@ pub fn is_test_path(file_path: &str) -> bool {
         || file_path.ends_with(".spec.tsx")
         || file_path.ends_with(".spec.jsx")
 }
+
+/// Extensions whose ecosystems name a test class `FooTests.<ext>` (PascalCase),
+/// paired with [`PASCAL_TEST_STEMS`].
+///
+/// Enumerated rather than "any extension" so the SQL mirror ([`is_test_node_sql`])
+/// can express the same predicate EXACTLY: `GLOB '*Tests.cs'` is equivalent to
+/// Rust's `ends_with("Tests.cs")`, whereas a last-path-segment rule has no GLOB
+/// equivalent (`*` crosses `/`). Both sides are generated from these constants,
+/// so a new entry lands in both at once.
+pub const PASCAL_TEST_EXTS: [&str; 8] = ["cs", "vb", "fs", "java", "kt", "scala", "swift", "php"];
+
+/// Stem suffixes paired with [`PASCAL_TEST_EXTS`].
+pub const PASCAL_TEST_STEMS: [&str; 3] = ["Test", "Tests", "Spec"];
+
+/// Extensions using the `foo_test.<ext>` file-naming convention.
+pub const INFIX_TEST_EXTS: [&str; 4] = ["go", "rs", "py", "dart"];
 
 /// SQL predicate mirroring [`is_test_node`] for a node aliased `node_alias` joined to
 /// its file aliased `file_alias`. Returns a parenthesized boolean (`(… OR …)`) meant
@@ -453,13 +504,35 @@ pub fn is_test_path(file_path: &str) -> bool {
 pub fn is_test_node_sql(node_alias: &str, file_alias: &str) -> String {
     let n = node_alias;
     let f = file_alias;
+    // Generated legs — same constants the Rust predicate reads, so the two
+    // cannot drift as ecosystems are added.
+    let mut generated = String::new();
+    for stem in PASCAL_TEST_STEMS {
+        for ext in PASCAL_TEST_EXTS {
+            generated.push_str(&format!(" OR {f}.path GLOB '*{stem}.{ext}'"));
+        }
+    }
+    for ext in INFIX_TEST_EXTS {
+        generated.push_str(&format!(" OR {f}.path GLOB '*_test.{ext}'"));
+    }
+    // Case-insensitive legs use LIKE (ASCII-case-insensitive in SQLite, matching
+    // Rust's `to_ascii_lowercase` compare); none of these patterns contains `_`,
+    // so LIKE's `_`-as-wildcard cannot fire. The `test_*.py` legs stay on GLOB
+    // (`_` literal) and mirror Rust's `contains("/test_") && ends_with(".py")`.
+    let case_insensitive = format!(
+        " OR {f}.path LIKE 'tests/%' \
+         OR {f}.path LIKE 'test/%' \
+         OR {f}.path LIKE '%/tests/%' \
+         OR {f}.path LIKE '%/test/%' \
+         OR {f}.path GLOB 'test_*.py' \
+         OR {f}.path GLOB '*/test_*.py' \
+         OR {f}.path GLOB '*conftest.py'"
+    );
     format!(
         "({n}.is_test = 1 \
          OR {n}.name GLOB 'test_*' \
          OR {n}.name GLOB '*Test' \
-         OR {n}.name GLOB '*Tests' \
-         OR {f}.path GLOB 'tests/*' \
-         OR {f}.path GLOB 'test/*' \
+         OR {n}.name GLOB '*Tests'{generated}{case_insensitive} \
          OR {f}.path GLOB 'benches/*' \
          OR {f}.path GLOB 'bench/*' \
          OR {f}.path GLOB '*__tests__/*' \
@@ -953,6 +1026,16 @@ mod tests {
             ("run", "src/a.test.ts"),      // .test.ts
             ("run", "src/a.test.tsx"),     // .test.tsx
             ("run", "src/a.spec.jsx"),     // .spec.jsx
+            // xUnit / JVM / pytest layouts (issue #36).
+            ("run", "src/Tests/Api.Tests/AuthTests.cs"), // Tests/ segment, any case
+            ("run", "src/test/java/com/x/AuthHandler.java"), // Maven src/test/
+            ("run", "app/Domain/AuthServiceTests.cs"),   // *Tests.cs stem
+            ("run", "app/Domain/AuthServiceTest.java"),  // *Test.java stem
+            ("run", "app/routes/RouteSpec.scala"),       // *Spec.scala stem
+            ("run", "pkg/util_test.py"),                 // _test.py
+            ("run", "lib/widget_test.dart"),             // _test.dart
+            ("run", "api/test_signup.py"),               // pytest test_*.py
+            ("run", "api/conftest.py"),                  // pytest conftest
             // Negatives — production symbols…
             ("handle_signup", "src/api.py"),
             ("format_greeting", "src/models.py"),
@@ -962,6 +1045,14 @@ mod tests {
             ("latest", "src/lib.rs"),      // ends 'test' not 'Test'
             ("run", "src/mytests.rs"),     // no '/' before tests.rs
             ("run", "src/attests.py"),     // 'test' substring, no path leg
+            // …and near-misses the widened legs must NOT swallow.
+            ("run", "src/latest.cs"),       // lowercase stem ≠ *Test
+            ("run", "src/Contest.cs"),      // 'test' inside, wrong case
+            ("run", "src/Testimonial.cs"),  // starts with Test, doesn't end with it
+            ("run", "src/protest/api.cs"),  // segment contains 'test', isn't 'test'
+            ("run", "src/testing/api.cs"),  // 'testing' ≠ 'test'/'tests'
+            ("run", "src/latest_test.txt"), // .txt not in INFIX_TEST_EXTS
+            ("run", "src/attest.py"),       // no `test_` prefix / conftest
         ];
         for (name, path) in cases {
             let got: i64 = conn

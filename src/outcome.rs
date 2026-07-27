@@ -35,8 +35,31 @@ pub fn project_slug(abs_path: &str) -> String {
 }
 
 pub fn transcript_dir(target: &Path, home: &Path) -> PathBuf {
-    let slug = project_slug(&target.to_string_lossy());
-    home.join(".claude").join("projects").join(slug)
+    transcript_dir_on(target, home, cfg!(windows))
+}
+
+/// Testable core of [`transcript_dir`]. `windows` says whether `\` is a path
+/// SEPARATOR on the target platform (it is an ordinary filename character on
+/// Unix, so this must not be assumed).
+///
+/// `project_slug` maps every non-alphanumeric byte to `-`, which makes it
+/// immune to the separator itself — `D:\dev\r`, `D:/dev/r` and the mixed
+/// `D:\dev/r` all slugify identically. The extended-length prefix is a
+/// different matter: `\\?\D:\dev\r` slugifies to `----D--dev-r` rather than
+/// `D--dev-r`, so a user who pastes back what `canonicalize()` printed gets a
+/// transcript directory Claude Code never created, and `outcome` reports
+/// "absent" with nothing actually wrong — the same silent-zero failure mode as
+/// D7. Stripping the prefix first is a no-op on Unix, where it cannot occur.
+///
+/// Deliberately NOT case-folded: Windows filesystems are case-insensitive but
+/// case-PRESERVING, and this slug has to match a directory name Claude Code
+/// chose from its own spelling of the path. Lower-casing here would trade a
+/// rare mismatch for a systematic one.
+pub fn transcript_dir_on(target: &Path, home: &Path, windows: bool) -> PathBuf {
+    let spelled = crate::cli::normalize_path_display_on(&target.to_string_lossy(), windows);
+    home.join(".claude")
+        .join("projects")
+        .join(project_slug(&spelled))
 }
 
 /// True if `touched` (often absolute, from Read/Edit) ends with `returned` (often
@@ -292,10 +315,30 @@ fn cli_call(cmd: &str) -> Option<(&'static str, String)> {
     cmd.lines().find_map(cli_call_in_line)
 }
 
+/// Does this shell token name the code-graph binary?
+///
+/// Matched against a command string as the agent typed it, so all four real
+/// spellings must be accepted. On Windows the plugin resolves an absolute path
+/// to `…\.cache\code-graph\bin\code-graph-mcp.exe`, which the previous
+/// `t.ends_with("/code-graph-mcp")` check missed on BOTH counts — the separator
+/// and the `.exe` suffix. Every such invocation then failed to register, so the
+/// conversion metric silently read zero on Windows and `doctor` reported the
+/// funnel DARK. Unlike the Rust side, the JS side (`find-binary.js`,
+/// `auto-update.js`) had `.exe` handling all along.
+///
+/// Accepting `\` on Unix too is deliberate: this parses a recorded command
+/// string whose originating platform is unknown, not a live filesystem path, so
+/// there is no Unix-filename ambiguity to preserve here.
+fn is_cg_binary_token(t: &str) -> bool {
+    const BIN: &str = "code-graph-mcp";
+    let stem = t.strip_suffix(".exe").unwrap_or(t);
+    stem == BIN || stem.ends_with(&format!("/{}", BIN)) || stem.ends_with(&format!("\\{}", BIN))
+}
+
 fn cli_call_in_line(line: &str) -> Option<(&'static str, String)> {
     let toks = shell_tokens(line);
     for (i, t) in toks.iter().enumerate() {
-        let is_bin = t == "code-graph-mcp" || t.ends_with("/code-graph-mcp");
+        let is_bin = is_cg_binary_token(t);
         if !is_bin {
             continue;
         }
@@ -971,6 +1014,57 @@ mod tests {
         );
     }
 
+    /// The three Windows spellings of one project directory must reach one
+    /// transcript directory. `canonicalize()` prints the `\\?\` form and users
+    /// paste it back, which is exactly how the extended prefix gets in.
+    #[test]
+    fn transcript_dir_collapses_windows_spellings_to_one_slug() {
+        let home = std::path::Path::new("/home/u");
+        let native = transcript_dir_on(std::path::Path::new(r"D:\dev\repo"), home, true);
+        for spelling in [
+            r"D:\dev\repo",     // as typed
+            "D:/dev/repo",      // forward slashes
+            r"D:\dev/repo",     // mixed, as PathBuf::join produces
+            r"\\?\D:\dev\repo", // as canonicalize() prints it
+        ] {
+            assert_eq!(
+                transcript_dir_on(std::path::Path::new(spelling), home, true),
+                native,
+                "{spelling} must reach the same transcript dir as the native spelling"
+            );
+        }
+        assert_eq!(
+            native,
+            std::path::PathBuf::from("/home/u/.claude/projects/D--dev-repo")
+        );
+    }
+
+    /// `\` is a legal filename character on Unix, so the Unix leg must treat a
+    /// path containing one as a name — not rewrite it into a separator. Without
+    /// the platform parameter this assertion could not run here at all.
+    #[test]
+    fn transcript_dir_leaves_unix_backslash_paths_alone() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            transcript_dir_on(std::path::Path::new(r"/srv/od\bc"), home, false),
+            std::path::PathBuf::from("/home/u/.claude/projects/-srv-od-bc")
+        );
+        // A leading `\\?\` is a PREFIX on Windows but ordinary data on Unix, so
+        // the two legs must disagree about it — this is the assertion that fails
+        // if the platform flag is ignored.
+        let looks_like_prefix = std::path::Path::new(r"\\?\D:\dev\repo");
+        assert_ne!(
+            transcript_dir_on(looks_like_prefix, home, false),
+            transcript_dir_on(looks_like_prefix, home, true),
+            "the extended prefix must be stripped only where `\\` is a separator"
+        );
+        // …and the production entry point agrees with the flag its platform implies.
+        assert_eq!(
+            transcript_dir(std::path::Path::new("/a/b"), home),
+            transcript_dir_on(std::path::Path::new("/a/b"), home, cfg!(windows))
+        );
+    }
+
     #[test]
     fn paths_match_when_returned_is_the_longer_path() {
         // returned absolute, touched relative — exercises the (long, short) swap
@@ -1494,6 +1588,46 @@ mod tests {
         assert_eq!(
             detect_cli_cg_call("code-graph-mcp grep p | head"),
             Some("grep")
+        );
+    }
+
+    /// The plugin resolves an absolute binary path, which on Windows ends in
+    /// `\code-graph-mcp.exe`. The old check (`ends_with("/code-graph-mcp")`)
+    /// missed both the separator and the suffix, so every such invocation went
+    /// unrecorded and the conversion metric read zero on Windows — `doctor`
+    /// then reported the funnel DARK with nothing actually broken.
+    ///
+    /// Pure string logic, so every CI leg exercises the Windows spellings.
+    #[test]
+    fn detect_accepts_windows_binary_spellings() {
+        for cmd in [
+            r"C:\Users\jo\.cache\code-graph\bin\code-graph-mcp.exe grep Foo",
+            r".\bin\code-graph-mcp.exe grep Foo",
+            "code-graph-mcp.exe grep Foo",
+            "/home/jo/.cache/code-graph/bin/code-graph-mcp grep Foo",
+            "code-graph-mcp grep Foo",
+        ] {
+            assert_eq!(
+                detect_cli_cg_call(cmd),
+                Some("grep"),
+                "binary spelling not recognized: {cmd}"
+            );
+        }
+        // The command-position and name guards must survive the widening.
+        assert_eq!(
+            detect_cli_cg_call(r"echo C:\bin\code-graph-mcp.exe grep Foo"),
+            None,
+            "a mid-command mention is still not an invocation"
+        );
+        assert_eq!(
+            detect_cli_cg_call("my-code-graph-mcp grep Foo"),
+            None,
+            "a different binary whose name merely ENDS with ours is not ours"
+        );
+        assert_eq!(
+            detect_cli_cg_call("code-graph-mcp.exe.bak grep Foo"),
+            None,
+            "only a real .exe suffix is stripped"
         );
     }
 

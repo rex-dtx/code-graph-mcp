@@ -21,6 +21,39 @@ test('isTestPath mirrors domain::is_test_path patterns', () => {
   }
 });
 
+// Issue #36 widened the Rust predicate to JVM/.NET layouts. This side is a
+// mirror, so it has to move with it — otherwise the "test gaps" section reports
+// every Java/C# test file as uncovered production code.
+test('isTestPath covers JVM and .NET layouts (issue #36 parity)', () => {
+  for (const p of [
+    // Maven/Gradle: nested, lowercase `test` segment.
+    'src/test/java/com/acme/OrderServiceTest.java',
+    'backend/src/test/java/com/acme/Foo.java',
+    // xUnit/NUnit/MSTest: capitalized `Tests` segment, PascalCase stem.
+    'src/Tests/Acme.Api/OrderControllerTests.cs',
+    'src/Acme.Api/OrderControllerTests.cs',
+    'src/AuthHandlerTest.java',
+    'src/RouteSpec.scala',
+    'src/HandlerTests.kt',
+    // Mixed case is legal on Windows and in .NET conventions.
+    'src/TESTS/Foo.cs',
+    // pytest + the widened _test.<ext> set.
+    'pkg/service/test_orders.py', 'pkg/conftest.py',
+    'lib/widget_test.dart', 'pkg/thing_test.py',
+  ]) {
+    assert.ok(isTestPath(p), `${p} should be a test path`);
+  }
+  // Near-miss negatives: these must stay production code. Each one is a
+  // substring trap that a naive `includes('test')` would misclassify.
+  for (const p of [
+    'src/latest.cs', 'src/Contest.java', 'src/Testimonial.cs',
+    'src/protest/api.cs', 'src/testing/api.cs', 'src/TestHelpers/api.cs',
+    'src/latest_test.txt', 'src/attest.py', 'src/mytests.rs',
+  ]) {
+    assert.ok(!isTestPath(p), `${p} should NOT be a test path`);
+  }
+});
+
 test('renderMarkdown: empty diff', () => {
   const md = renderMarkdown({ changed: [], not_indexed: [], tests: [], blast_radius: 0, top_affected: [], uncovered: [] });
   assert.ok(md.startsWith(MARKER), 'must start with marker');

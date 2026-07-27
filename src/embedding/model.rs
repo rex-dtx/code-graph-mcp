@@ -77,6 +77,75 @@ mod inner {
             Ok(cache.join("code-graph").join("models"))
         }
 
+        /// Where the last download outcome is recorded. Sits BESIDE the models
+        /// dir, not inside it, so `extract_and_promote`'s rename dance can't
+        /// take the diagnostics with it.
+        pub fn download_state_file() -> Result<std::path::PathBuf> {
+            Ok(Self::cache_models_dir()?
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("model cache dir has no parent"))?
+                .join("model-download.json"))
+        }
+
+        /// Persist the outcome of a download attempt.
+        ///
+        /// The background download previously logged to `tracing` only. A user
+        /// whose download never succeeded saw one `WARN … will be downloaded on
+        /// first use` and nothing else — not whether an attempt was made, what
+        /// it returned, or why it stopped (issue #35) — while `doctor` kept
+        /// printing "retry shortly" forever, which reads as *be patient* rather
+        /// than *this is broken*. Writing the outcome where `doctor` and the
+        /// search tools can read it is the fix that stands regardless of what
+        /// makes a given machine's download fail.
+        ///
+        /// Best-effort: a diagnostics write must never break the download path,
+        /// so every failure here is swallowed.
+        pub fn record_download_state(status: &str, attempts: u32, error: Option<&str>) {
+            let Ok(path) = Self::download_state_file() else {
+                return;
+            };
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let state = serde_json::json!({
+                "status": status,
+                "attempts": attempts,
+                "error": error,
+                "updated_epoch": epoch,
+                "url": Self::model_download_url(),
+                "binary_version": env!("CARGO_PKG_VERSION"),
+            });
+            let _ = std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap_or_default());
+        }
+
+        /// Human-readable summary of the last download attempt for `doctor` and
+        /// the FTS5-only search note. `None` when no attempt was ever recorded —
+        /// itself a diagnosis ("never attempted"), distinct from "failed".
+        pub fn download_state_summary() -> Option<String> {
+            let path = Self::download_state_file().ok()?;
+            let raw = std::fs::read_to_string(path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            let status = v["status"].as_str().unwrap_or("unknown");
+            let attempts = v["attempts"].as_u64().unwrap_or(0);
+            Some(match status {
+                "ok" => "model downloaded successfully".to_string(),
+                "in_flight" => format!("download in flight (attempt {})", attempts.max(1)),
+                "disabled" => {
+                    "download disabled by CODE_GRAPH_DISABLE_MODEL_DOWNLOAD=1".to_string()
+                }
+                "failed" => format!(
+                    "download FAILED after {} attempt(s): {}",
+                    attempts,
+                    v["error"].as_str().unwrap_or("unknown error")
+                ),
+                other => other.to_string(),
+            })
+        }
+
         /// blake3 of the pinned model.safetensors content
         /// (sentence-transformers/all-MiniLM-L6-v2 @ HF revision c9745ed1d9f2,
         /// sha256 53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db).
@@ -318,27 +387,62 @@ mod inner {
 
         /// Download model tarball from URL with timeout, extract to dest_dir.
         /// Integrity: HTTPS transport + valid tar.gz extraction + blake3 version marker.
+        /// Overall budget for the whole request. The released `models.tar.gz` is
+        /// ~83 MB (not the "~30 MB compressed" an earlier comment claimed), so
+        /// the previous 120s ceiling silently demanded ~700 KB/s sustained and
+        /// turned any slower link into a hard failure (issue #35).
+        const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+        fn agent_with_roots(platform_verifier: bool) -> ureq::Agent {
+            let builder =
+                ureq::config::Config::builder().timeout_global(Some(Self::DOWNLOAD_TIMEOUT));
+            let config = if platform_verifier {
+                builder
+                    .tls_config(
+                        ureq::tls::TlsConfig::builder()
+                            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                            .build(),
+                    )
+                    .build()
+            } else {
+                builder.build()
+            };
+            ureq::Agent::new_with_config(config)
+        }
+
         pub fn download_model_to(url: &str, dest_dir: &std::path::Path) -> Result<()> {
             use std::io::Read as IoRead;
 
             tracing::info!("[model] Downloading model from {}...", url);
 
-            let agent = ureq::Agent::new_with_config(
-                ureq::config::Config::builder()
-                    .timeout_global(Some(std::time::Duration::from_secs(120)))
-                    .build(),
-            );
-
-            let mut response = agent
-                .get(url)
-                .call()
-                .map_err(|e| anyhow::anyhow!("Model download failed: {}", e))?;
+            // ureq's bundled webpki roots do not include a corporate MITM proxy's
+            // private root, so on a TLS-inspecting network every fetch fails here
+            // while `curl` (schannel / OS store) succeeds — the asymmetry issue
+            // #35 reports. Try the bundled roots first (no behaviour change for
+            // anyone it already worked for), then fall back to the OS trust
+            // store rather than giving up.
+            let mut response = match Self::agent_with_roots(false).get(url).call() {
+                Ok(r) => r,
+                Err(first) => {
+                    tracing::warn!(
+                        "[model-dl] Bundled-roots fetch failed ({}) — retrying with the OS certificate store",
+                        first
+                    );
+                    Self::agent_with_roots(true).get(url).call().map_err(|e| {
+                        anyhow::anyhow!(
+                            "Model download failed (bundled roots: {}; OS trust store: {})",
+                            first,
+                            e
+                        )
+                    })?
+                }
+            };
 
             if response.status() != 200 {
                 anyhow::bail!("Model download returned HTTP {}", response.status());
             }
 
-            // Read body into memory (model is ~30MB compressed, cap at 200MB)
+            // Read body into memory (~83 MB for the published tarball; cap at 200MB)
             let mut body = Vec::new();
             response
                 .body_mut()
@@ -858,6 +962,65 @@ mod tests {
             "cache dir should contain 'code-graph': {:?}",
             dir
         );
+    }
+
+    /// Issue #35: a download that silently no-ops left the user permanently
+    /// FTS5-only with nothing to act on, and `doctor` printed the same
+    /// "retry shortly" forever. Each recorded status must round-trip into a
+    /// summary that names what actually happened — in particular "failed" must
+    /// carry the error and be distinguishable from "never attempted" (`None`).
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_download_state_round_trips_each_status() {
+        use inner::EmbeddingModel as M;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // `download_state_file` derives from the real cache dir; point the whole
+        // cache tree at a temp dir so the test never touches the user's cache.
+        temp_env_cache(tmp.path(), || {
+            assert!(
+                M::download_state_summary().is_none(),
+                "no recorded attempt must read as 'never attempted', not as a status"
+            );
+
+            M::record_download_state("in_flight", 2, None);
+            assert_eq!(
+                M::download_state_summary().unwrap(),
+                "download in flight (attempt 2)"
+            );
+
+            M::record_download_state("failed", 3, Some("tls handshake rejected"));
+            let summary = M::download_state_summary().unwrap();
+            assert!(
+                summary.contains("FAILED after 3 attempt(s)")
+                    && summary.contains("tls handshake rejected"),
+                "a failed download must surface attempt count AND cause, got: {summary}"
+            );
+
+            M::record_download_state("ok", 1, None);
+            assert_eq!(
+                M::download_state_summary().unwrap(),
+                "model downloaded successfully"
+            );
+        });
+    }
+
+    /// Run `f` with the platform cache dir redirected into `dir`. `dirs::cache_dir()`
+    /// reads XDG_CACHE_HOME on Linux and LOCALAPPDATA on Windows.
+    #[cfg(feature = "embed-model")]
+    fn temp_env_cache(dir: &std::path::Path, f: impl FnOnce()) {
+        let key = if cfg!(windows) {
+            "LOCALAPPDATA"
+        } else {
+            "XDG_CACHE_HOME"
+        };
+        let prev = std::env::var_os(key);
+        // SAFETY: single-threaded test body; restored before returning.
+        unsafe { std::env::set_var(key, dir) };
+        f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     #[cfg(feature = "embed-model")]

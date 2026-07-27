@@ -1,0 +1,53 @@
+{
+  "skill_name": "windows-compat",
+  "notes": "Task evals for the windows-compat skill. Each prompt is a job someone would actually bring to this repo. The interesting signal is not whether the model produces a fix, but whether the fix is testable from a Linux CI leg (platform as a parameter) and whether it keeps the merkle::normalize_rel_path index-key spelling. Run per skill-creator: spawn a with-skill and a without-skill subagent per eval in the same turn.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "triage-windows-only-duplicate-output",
+      "prompt": "Got a bug report from a user on Windows 11 with a big C#/TypeScript monorepo, ~3800 files indexed. They say `code-graph-mcp grep \"IServiceCollection\"` prints a bunch of matches twice, with the same file spelled two different ways (once with backslashes, once with forward slashes), and none of the results have the containing function/class annotation that they see on the Linux box. Works fine for me on Linux. Can you figure out what's going on and fix it?",
+      "expected_output": "Identifies that the two spellings come from two different producers (git ls-files always emits /, rg emits native separators) meeting in a HashSet comparison, so the set-difference matches nothing and every file gets scanned twice. Fix normalizes both sides through one function. Bonus: connects the missing AST annotation to the same key mismatch rather than treating it as a separate bug.",
+      "files": [],
+      "assertions": [
+        "Names the separator mismatch as the root cause: git ls-files emits '/' while rg emits native separators, so the set comparison matches nothing",
+        "Attributes all three symptoms (duplicate matches, two spellings, missing AST annotation) to that ONE root cause rather than fixing them as separate bugs",
+        "Normalizes BOTH sides of the set/map comparison through a single shared function",
+        "New path-normalization logic takes the platform as a parameter (an _on(..., bool) seam) instead of only an inline cfg!(windows)",
+        "Adds at least one test that asserts the Windows spelling and therefore runs on the Linux leg",
+        "Does NOT rewrite backslashes unconditionally (that would corrupt legal Unix filenames)",
+        "cargo build and cargo test --lib both pass"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "new-path-helper-is-testable-on-linux",
+      "prompt": "I need a helper in cli.rs that takes whatever path string the user typed on the command line and turns it into the form we use as the index lookup key. It needs to cope with people pasting absolute paths, `./foo/bar.rs`, and on Windows the `\\\\?\\D:\\...` thing that canonicalize spits out. Write it with tests.",
+      "expected_output": "Splits into a thin cfg!(windows) entry point plus a `_on(..., windows: bool)` function holding the logic, and asserts BOTH values of the flag so the Linux leg exercises the Windows branch. Delegates separator rewriting to merkle::normalize_rel_str_on rather than adding a second rewrite site. Does not rewrite backslashes unconditionally (they are legal Unix filename chars).",
+      "files": [],
+      "assertions": [
+        "Exposes a platform-parameterized seam (_on(..., windows: bool) or equivalent) rather than only an inline cfg!(windows)",
+        "Tests assert BOTH values of the platform flag, so the Windows branch is exercised from Linux",
+        "Strips the \\\\?\\ extended prefix, and handles the \\\\?\\UNC\\ form",
+        "Backslash-to-slash rewriting is gated on the platform rather than applied unconditionally",
+        "Reuses the crate's existing normalizer (merkle::normalize_rel_str/_on) instead of adding a second independent separator-rewrite site",
+        "cargo build and cargo test --lib both pass"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "extend-test-detection-keeps-sql-mirror",
+      "prompt": "Our `affected` command says \"0 test file(s) to re-run\" for a Java project even though there are obviously tests in src/test/java/com/acme/OrderServiceTest.java. Same for a C# repo with src/Tests/Acme.Api/OrderControllerTests.cs. Can you widen the test-file detection to cover these?",
+      "expected_output": "Widens domain::is_test_path AND notices it has a SQL mirror in is_test_node_sql that must stay in agreement, generating both from shared constants rather than transcribing. Uses case-insensitive segment containment instead of an anchored starts_with(\"tests/\"). Adds near-miss negatives (latest.cs, protest/api.cs, testing/api.cs) alongside the positives, and extends test_is_test_node_sql_matches_rust.",
+      "files": [],
+      "assertions": [
+        "is_test_path now classifies src/test/java/com/acme/OrderServiceTest.java AND src/Tests/Acme.Api/OrderControllerTests.cs as tests",
+        "Discovers that is_test_node_sql is a SQL mirror of the same predicate and updates it to stay in agreement",
+        "Generates the Rust and SQL legs from shared constants rather than transcribing the extension/stem list twice",
+        "Uses case-insensitive segment containment (e.g. '/tests/') instead of an anchored starts_with(\"tests/\")",
+        "Adds near-miss NEGATIVE cases (e.g. latest.cs, protest/, testing/, Contest.cs), not only positives",
+        "Extends the Rust-vs-SQL parity test (test_is_test_node_sql_matches_rust) to cover the new legs",
+        "cargo build and cargo test --lib both pass"
+      ]
+    }
+  ]
+}

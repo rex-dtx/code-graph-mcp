@@ -34,8 +34,15 @@ function classifyEmbeddings(hc) {
     return { name: 'Embeddings', status: 'ok', detail: 'no embeddable nodes' };
   }
   if (!done) {
+    // `model_download` carries the LAST recorded download outcome (issue #35).
+    // Without it this printed the same optimistic "retry shortly" on every run,
+    // so a machine whose download can never succeed read as "be patient"
+    // forever instead of "this is broken". Absent field = never attempted,
+    // which is itself a distinct diagnosis, not a reason to advise waiting.
     const why = (hc && hc.embedding_status === 'pending')
-      ? 'model not downloaded/loaded yet — auto-downloads in background on first search; retry shortly or restart the MCP server'
+      ? (hc.model_download
+          ? `last model download: ${hc.model_download}`
+          : 'model not loaded and NO download has ever been attempted on this machine — restart the MCP server, or set CODE_GRAPH_MODEL_DIR to a manually populated model dir (see README → Offline usage)')
       : `embedding_status=${(hc && hc.embedding_status) || 'unknown'}`;
     return { name: 'Embeddings', status: 'warn',
       detail: `vector INACTIVE — ${total} embeddable nodes, 0 embedded; semantic search is FTS5-only (${why})` };

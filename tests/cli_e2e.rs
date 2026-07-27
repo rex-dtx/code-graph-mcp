@@ -158,6 +158,226 @@ export function testValidate(): void {
     project
 }
 
+/// Issue #36's layout: a C# monorepo whose xUnit suites live in
+/// `src/Tests/<Project>/<Area>/<Name>Tests.cs`. `affected` reported
+/// "0 test file(s) to re-run" for a change to a symbol the test calls directly,
+/// because `is_test_path` only knew JS/Rust/Go conventions — a silent false
+/// negative in the one output a CI or pre-commit hook acts on.
+#[test]
+fn test_cli_affected_finds_csharp_xunit_tests() {
+    let project = TempDir::new().unwrap();
+    let lib = project.path().join("src/Libraries/Core");
+    let tests = project.path().join("src/Tests/WebApi.Tests/Authorization");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::create_dir_all(&tests).unwrap();
+
+    std::fs::write(
+        lib.join("Enumerations.cs"),
+        r#"
+namespace DEQ.Core {
+    public class Visibility {
+        public bool CanView(VisibilityTier minimumTier) { return true; }
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tests.join("ResponsibleEntityAuthorizationServiceTests.cs"),
+        r#"
+namespace DEQ.Tests {
+    public class ResponsibleEntityAuthorizationServiceTests {
+        public void CanView_returns_false_for_anonymous() {
+            var result = new Visibility();
+            result.CanView(VisibilityTier.Authorized);
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["affected", "src/Libraries/Core/Enumerations.cs", "--json"],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let tests_listed = v["tests"].as_array().unwrap();
+    assert!(
+        tests_listed.iter().any(|t| t
+            .as_str()
+            .unwrap()
+            .ends_with("ResponsibleEntityAuthorizationServiceTests.cs")),
+        "xUnit test file must be reported as a test to re-run, got: {stdout}"
+    );
+    // …and it must be flagged is_test in the blast radius, not just listed there.
+    let flagged = v["affected_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"].as_str().unwrap().contains("Tests.cs"));
+    if let Some(f) = flagged {
+        assert_eq!(f["is_test"], serde_json::json!(true), "got: {stdout}");
+    }
+}
+
+/// Maven/Gradle + xUnit side by side. `OrderCases.java` is deliberately named
+/// WITHOUT a `Test` stem: it is a test only because it sits under `src/test/`,
+/// so it is the only file here that exercises the directory-segment leg on its
+/// own. Without it, disabling that leg leaves this test green — the stem leg
+/// covers for it — and the test proves less than it appears to.
+fn setup_polyglot_affected_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let write = |rel: &str, body: &str| {
+        let p = project.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    };
+
+    write(
+        "src/main/java/com/acme/OrderService.java",
+        "package com.acme;\npublic class OrderService {\n    public int total(int qty, int price) { return qty * price; }\n}\n",
+    );
+    write(
+        "src/test/java/com/acme/OrderServiceTest.java",
+        "package com.acme;\npublic class OrderServiceTest {\n    public void totalMultiplies() {\n        OrderService svc = new OrderService();\n        svc.total(2, 3);\n    }\n}\n",
+    );
+    write(
+        "src/test/java/com/acme/OrderCases.java",
+        "package com.acme;\npublic class OrderCases {\n    public void twoTimesThree() {\n        OrderService svc = new OrderService();\n        svc.total(2, 3);\n    }\n}\n",
+    );
+    write(
+        "src/Acme.Api/OrderController.cs",
+        "namespace Acme.Api;\npublic class OrderController {\n    public int Create(int id) { return id; }\n}\n",
+    );
+    write(
+        "src/Tests/Acme.Api/OrderControllerTests.cs",
+        "namespace Acme.Api;\npublic class OrderControllerTests {\n    public void CreateReturnsId() {\n        var c = new OrderController();\n        c.Create(1);\n    }\n}\n",
+    );
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// Issue #36 end to end on the JVM layout: `affected` on a Maven production file
+/// must name its covering test instead of printing "0 test file(s) to re-run".
+#[test]
+fn test_cli_affected_finds_jvm_and_dotnet_tests() {
+    let project = setup_polyglot_affected_project();
+
+    for (changed, expected_test) in [
+        // Stem leg (`…Test.java`)…
+        (
+            "src/main/java/com/acme/OrderService.java",
+            "src/test/java/com/acme/OrderServiceTest.java",
+        ),
+        // …and the directory-segment leg on its own.
+        (
+            "src/main/java/com/acme/OrderService.java",
+            "src/test/java/com/acme/OrderCases.java",
+        ),
+        (
+            "src/Acme.Api/OrderController.cs",
+            "src/Tests/Acme.Api/OrderControllerTests.cs",
+        ),
+    ] {
+        let (stdout, _, code) = run_cli(&project, &["affected", changed, "--json"]);
+        assert_eq!(code, 0, "stdout: {stdout}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("invalid json: {e}; raw: {stdout}"));
+        let tests: Vec<String> = v["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            tests.contains(&expected_test.to_string()),
+            "changing {changed} must re-run {expected_test}; got tests={tests:?} raw={stdout}"
+        );
+    }
+}
+
+/// The same classification on the surface a CI integration actually reads: the
+/// human-readable count line, which is the literal sentence from the bug report.
+#[test]
+fn test_cli_affected_text_count_line_counts_jvm_and_dotnet_tests() {
+    let project = setup_polyglot_affected_project();
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "affected",
+            "src/main/java/com/acme/OrderService.java",
+            "src/Acme.Api/OrderController.cs",
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(
+        !stdout.contains("0 test file(s) to re-run"),
+        "regression: JVM/.NET tests went undetected; raw: {stdout}"
+    );
+    // Scope the assertion to the "to re-run" block. A bare `stdout.contains(path)`
+    // is NOT enough: each of these files also appears in the "Full blast radius"
+    // listing below it, so the loose form stays green even with the
+    // classification legs disabled.
+    let rerun_block: Vec<&str> = stdout
+        .lines()
+        .skip_while(|l| !l.contains("test file(s) to re-run:"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("Full blast radius:"))
+        .map(|l| l.trim())
+        .collect();
+    for expected in [
+        "src/test/java/com/acme/OrderServiceTest.java", // stem leg
+        "src/test/java/com/acme/OrderCases.java",       // segment leg alone
+        "src/Tests/Acme.Api/OrderControllerTests.cs",   // .NET, capitalized segment
+    ] {
+        assert!(
+            rerun_block.contains(&expected),
+            "{expected} must be listed as a test to re-run; re-run block was \
+             {rerun_block:?}; raw: {stdout}"
+        );
+    }
+}
+
+/// Issue #36, second half: the blast radius was a flat path-sorted dump, so the
+/// depth-1 dependents worth inspecting were buried among depth-8..10 transitive
+/// hits. Text output now groups by proximity and caps the list — and says how
+/// many it withheld, so a truncated list can never read as "that's everything".
+/// `--json` stays uncapped and ungrouped for scripted consumers.
+#[test]
+fn test_cli_affected_groups_blast_radius_by_depth() {
+    let project = setup_affected_project();
+    let (stdout, _, code) = run_cli(&project, &["affected", "src/auth.ts"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(
+        stdout.contains("depth 1 ("),
+        "blast radius must be grouped by depth, got:\n{stdout}"
+    );
+    // The grouped form indents members under their depth header rather than
+    // suffixing "(depth N)" onto every line.
+    assert!(
+        !stdout.contains("(depth 1)"),
+        "old flat per-line depth suffix must be gone, got:\n{stdout}"
+    );
+
+    let (json_out, _, _) = run_cli(&project, &["affected", "src/auth.ts", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+    assert!(
+        v["affected_files"][0]["depth"].is_number(),
+        "--json must keep the flat per-file depth field: {json_out}"
+    );
+}
+
 #[test]
 fn test_cli_affected_json_core() {
     let project = setup_affected_project();
@@ -2435,6 +2655,74 @@ fn test_cli_grep_tracked_but_gitignored() {
     // Untracked + ignored stays invisible (matches git grep semantics).
     let (_, _, code2) = run_cli(&project, &["grep", "scratch_needle"]);
     assert_eq!(code2, 1, "untracked ignored file must stay skipped");
+}
+
+/// Issue #34: the supplement (tracked files rg's walk skips) used to be appended
+/// to ONE argv, capped at 500 entries. On Windows that argv blew past the 32 KB
+/// command-line limit (`os error 206`) and the cap silently dropped the rest —
+/// `grep` reporting "no matches" for a file that had one. The supplement is now
+/// split into argv-sized batches; every tracked file is searched.
+///
+/// Driven through `CODE_GRAPH_RG_ARGV_BUDGET` so the batch boundary is crossed
+/// with a handful of files instead of a real 32 KB command line.
+#[test]
+fn test_cli_grep_supplement_batches_across_argv_budget() {
+    if !has_ripgrep() || !has_git() {
+        eprintln!("skipping: rg or git not installed");
+        return;
+    }
+    let project = setup_indexed_project();
+    let root = project.path();
+    std::fs::create_dir_all(root.join("vendored")).unwrap();
+    std::fs::write(root.join(".gitignore"), "vendored/\n.code-graph/\n").unwrap();
+
+    // 24 force-tracked files inside a gitignored dir → all 24 reach rg only via
+    // the supplement, and a 40-char budget fits ~1 path per batch.
+    const N: usize = 24;
+    let mut add_args: Vec<String> = vec!["add".into(), "-f".into()];
+    for i in 0..N {
+        let rel = format!("vendored/file_{i:02}.md");
+        std::fs::write(root.join(&rel), format!("batched_needle number {i}\n")).unwrap();
+        add_args.push(rel);
+    }
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    let add_refs: Vec<&str> = add_args.iter().map(|s| s.as_str()).collect();
+    git(&add_refs);
+
+    let (stdout, stderr, code) = run_cli_env(
+        &project,
+        &["grep", "batched_needle"],
+        &[("CODE_GRAPH_RG_ARGV_BUDGET", "40")],
+    );
+    assert_eq!(
+        code, 0,
+        "batched supplement grep must match; stderr={stderr}"
+    );
+    for i in 0..N {
+        assert!(
+            stdout.contains(&format!("vendored/file_{i:02}.md")),
+            "file_{i:02}.md missing from batched results — a batch was dropped.\n{stdout}"
+        );
+    }
+    // Each file appears exactly once: a file must not be scanned by both the
+    // walk and a supplement batch (the duplicate-output half of issue #34).
+    assert_eq!(
+        stdout.matches("batched_needle number 7").count(),
+        1,
+        "each match must be emitted once, got:\n{stdout}"
+    );
 }
 
 #[test]

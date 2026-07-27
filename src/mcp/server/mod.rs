@@ -1405,6 +1405,7 @@ impl McpServer {
             .as_deref()
             == Some("1")
         {
+            EmbeddingModel::record_download_state("disabled", 0, None);
             return;
         }
 
@@ -1413,6 +1414,7 @@ impl McpServer {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!("[model-dl] Cannot resolve cache dir: {}", e);
+                    EmbeddingModel::record_download_state("failed", 0, Some(&e.to_string()));
                     return;
                 }
             };
@@ -1422,6 +1424,7 @@ impl McpServer {
             // tampered cache) re-downloads instead of staying pinned forever —
             // same fault class as the native-binary pin fixed in v0.45.x.
             if EmbeddingModel::cached_model_is_current(&cache_dir) {
+                EmbeddingModel::record_download_state("ok", 0, None);
                 return; // Already downloaded and matching
             }
             if cache_dir.join("model.safetensors").exists() {
@@ -1435,7 +1438,13 @@ impl McpServer {
             // up; a later server start still re-attempts (cached_model_is_current).
             const MAX_ATTEMPTS: u32 = 3;
             let mut downloaded = false;
+            let mut last_error = String::new();
             for attempt in 1..=MAX_ATTEMPTS {
+                // Recorded BEFORE the call: an attempt that hangs or dies with
+                // the process still leaves "in_flight" behind, which `doctor`
+                // reports as in-flight rather than as the indistinguishable
+                // "never attempted" silence issue #35 describes.
+                EmbeddingModel::record_download_state("in_flight", attempt, None);
                 match EmbeddingModel::download_model_to(&url, &cache_dir) {
                     Ok(()) => {
                         tracing::info!(
@@ -1443,6 +1452,7 @@ impl McpServer {
                             attempt,
                             MAX_ATTEMPTS
                         );
+                        EmbeddingModel::record_download_state("ok", attempt, None);
                         downloaded = true;
                         break;
                     }
@@ -1453,6 +1463,7 @@ impl McpServer {
                             MAX_ATTEMPTS,
                             e
                         );
+                        last_error = e.to_string();
                         if attempt < MAX_ATTEMPTS {
                             // Exponential backoff: 4s, then 8s (background thread — sleeping is fine).
                             std::thread::sleep(std::time::Duration::from_secs(
@@ -1464,6 +1475,7 @@ impl McpServer {
             }
             if !downloaded {
                 tracing::warn!("[model-dl] All {} download attempts failed — staying in FTS5-only mode; will retry on next server start.", MAX_ATTEMPTS);
+                EmbeddingModel::record_download_state("failed", MAX_ATTEMPTS, Some(&last_error));
             }
         });
     }
@@ -1727,9 +1739,15 @@ impl McpServer {
         let Some(rel_path) = path else {
             return Ok(());
         };
+        // Caller-supplied strings reach the index as lookup keys, so normalize
+        // separators to the stored `/` form first — an MCP client on Windows may
+        // echo back a native-separator path. Normalizing BEFORE the trailing
+        // check also makes `src\` register as the directory it is.
+        let rel_path = crate::indexer::merkle::normalize_rel_str(rel_path);
         if rel_path.is_empty() || rel_path.ends_with('/') {
             return Ok(());
         }
+        let rel_path = rel_path.as_str();
         let Some(root) = self.project_root.as_deref() else {
             return Ok(());
         };

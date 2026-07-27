@@ -105,17 +105,39 @@ def fts_classify(conn, query: str, fetch: int):
     return ("or_fallback", [r[0] for r in rows])
 
 
+# Mirrors domain::PASCAL_TEST_* / INFIX_TEST_EXTS. One of five must-agree copies
+# of this predicate; see the "Five sites must agree" note in src/domain.rs.
+PASCAL_TEST_EXTS = ("cs", "vb", "fs", "java", "kt", "scala", "swift", "php")
+PASCAL_TEST_STEMS = ("Test", "Tests", "Spec")
+INFIX_TEST_EXTS = ("go", "rs", "py", "dart")
+
+
 def is_test_path(p: str) -> bool:
-    """Port of src/domain.rs is_test_path (path-based test-file detection)."""
-    return (p.startswith("tests/") or p.startswith("test/")
-            or p.startswith("benches/") or p.startswith("bench/")
-            or "__tests__/" in p
-            or p.endswith("/tests.rs")
-            or p.endswith("_test.go") or p.endswith("_test.rs")
-            or p.endswith(".test.ts") or p.endswith(".test.js")
-            or p.endswith(".test.tsx") or p.endswith(".test.jsx")
-            or p.endswith(".spec.ts") or p.endswith(".spec.js")
-            or p.endswith(".spec.tsx") or p.endswith(".spec.jsx"))
+    """Port of src/domain.rs is_test_path (path-based test-file detection).
+
+    Kept leg-for-leg in sync with the Rust original: this diagnostic reproduces
+    the binary's exclusion set, so a narrower predicate here misattributes an
+    excluded symbol to a retrieval drop.
+    """
+    # Case-insensitive test/tests DIRECTORY segment at any depth (issue #36).
+    lower = p.lower()
+    if (lower.startswith(("tests/", "test/"))
+            or "/tests/" in lower or "/test/" in lower):
+        return True
+    # PascalCase test-class convention: case-SENSITIVE, pinned to a known ext.
+    if any(p.endswith(f"{stem}.{ext}")
+           for stem in PASCAL_TEST_STEMS for ext in PASCAL_TEST_EXTS):
+        return True
+    if any(p.endswith(f"_test.{ext}") for ext in INFIX_TEST_EXTS):
+        return True
+    if lower.endswith(".py") and (lower.startswith("test_")
+                                  or "/test_" in lower
+                                  or lower.endswith("conftest.py")):
+        return True
+    return (p.startswith(("benches/", "bench/")) or "__tests__/" in p
+            or p.endswith(("/tests.rs", ".test.ts", ".test.js",
+                           ".test.tsx", ".test.jsx", ".spec.ts", ".spec.js",
+                           ".spec.tsx", ".spec.jsx")))
 
 
 def is_test_symbol(name: str, path: str) -> bool:
