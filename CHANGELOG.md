@@ -1,5 +1,159 @@
 # Changelog
 
+## v0.106.0 — Windows grep correctness, xUnit/JVM/pytest test detection, model-download diagnosability
+
+Upgrade notes: **no index rebuild required** — `INDEX_VERSION` is unchanged at
+52. The widened test-file classification is applied at query time
+(`domain::is_test_node` ORs the stored parser flag with the path heuristic), so
+existing indexes pick it up immediately. No config changes required.
+
+Field reports from a Windows 11 + C#/TypeScript monorepo (3,819 indexed files):
+issues [#34](https://github.com/sdsrss/code-graph-mcp/issues/34),
+[#35](https://github.com/sdsrss/code-graph-mcp/issues/35),
+[#36](https://github.com/sdsrss/code-graph-mcp/issues/36).
+
+### Fixed
+- **`grep` unusable on Windows at repo scale (#34)** — one root cause behind all
+  three reported defects: path spellings were compared without normalizing
+  separators. `rg --files` emits `src\foo.rs`, `git ls-files` emits `src/foo.rs`,
+  and `canonicalize()` emits `\\?\D:\…`, so `tracked_files_missed_by_walk`'s
+  `walked.contains(t)` matched **nothing** on Windows and the "supplement" became
+  the entire tracked set — 3,284 absolute paths on one argv, i.e. the reported
+  `os error 206` (Windows caps a command line at 32,767 chars). The same
+  mismatch made every file get scanned twice (walk + supplement → duplicated
+  matches in two different path spellings), leaked the `\\?\` extended prefix to
+  stdout, and broke AST annotation entirely, because the index stores
+  `/`-relative paths and the lookup key never matched — which is why Defect 3
+  ("no containing function/class in the output") appeared on Windows only.
+  `relativize_path` now normalizes both sides (`\\?\`/`\\?\UNC\` stripped, `\`→`/`,
+  drive-letter case-insensitive) and is the single key producer for output,
+  dedup, and index lookup.
+- **`grep` silently searched only the first 500 supplement files (#34)** — the
+  cap bounded the file *count* while the real constraint is argv *bytes*, so a
+  deep layout blew the limit well before 500 and a shallow one dropped files
+  without saying which. The supplement is now passed as relative paths (dropping
+  the repeated root prefix) and split into argv-budgeted batches — 24 KB on
+  Windows, 512 KB elsewhere, overridable via `CODE_GRAPH_RG_ARGV_BUDGET` — with
+  results merged and globally sorted/deduped as before. No tracked file is
+  dropped.
+- **`affected` reported "0 test file(s) to re-run" for C#/Java/Python suites
+  (#36)** — `is_test_path` only knew JS/Rust/Go conventions, so
+  `src/Tests/<Project>/<Name>Tests.cs` (xUnit/NUnit/MSTest) and
+  `src/test/java/…` (Maven/Gradle) matched no leg. A silent false negative in
+  the one output a CI or pre-commit integration acts on. Added: case-insensitive
+  `test`/`tests` path segments, the PascalCase `*Test`/`*Tests`/`*Spec` class
+  convention across 8 extensions, `_test.<ext>` beyond Go/Rust, and pytest
+  `test_*.py` / `conftest.py`. The Rust predicate and its SQL mirror
+  (`is_test_node_sql`) are now generated from shared constants so they cannot
+  drift; the parity test covers 16 new cases including near-misses
+  (`src/latest.cs`, `src/protest/api.cs`, `src/testing/api.cs`) that must stay
+  production.
+- **Embedding-model download failed invisibly (#35)** — the background download
+  logged to `tracing` only, so a permanently-degraded install was
+  indistinguishable from one that simply hadn't finished, and `doctor` printed
+  the same "auto-downloads in background … retry shortly" forever. Each attempt
+  now records its outcome to `<platform cache>/code-graph/model-download.json`;
+  `doctor` and the FTS5-only search note report "no download has been attempted"
+  vs "download in flight (attempt N)" vs "download FAILED after N attempt(s):
+  <error>". `doctor --json` gains an additive `model_download` field.
+- **Model download now falls back to the OS certificate store (#35)** — ureq's
+  bundled webpki roots do not include a corporate MITM proxy's private root, so
+  on a TLS-inspecting network every fetch failed while `curl` (schannel)
+  succeeded. Bundled roots are still tried first; on failure the request is
+  retried with `RootCerts::PlatformVerifier` (new `ureq` `platform-verifier`
+  feature) and both errors are reported together.
+- **Model download timeout was sized for the wrong archive (#35)** — the 120s
+  global timeout and its "~30MB compressed" comment predate an 83 MB tarball,
+  silently requiring ~700 KB/s sustained. Raised to 600s.
+- **Windows: a file given by absolute or backslash-typed path was reported "not
+  in index"** — found by auditing with the new skill, same class as #34.
+  `cli::normalize_user_path_from` returns the key that `affected` / `deps` /
+  `trace` / `show` look up, and two of its branches returned
+  `strip_prefix(root).to_string_lossy()` verbatim — which keeps the native
+  separator. On Windows `affected D:\repo\src\Foo.cs` therefore produced the key
+  `src\Foo.cs` against an index storing `src/Foo.cs`, and a present, indexed file
+  was silently dropped. (The subdirectory branch was already correct: it goes
+  through `collapse_within_root`, which decomposes into `Component`s and re-joins
+  with `/`.) The MCP freshness entry point (`ensure_file_fresh_opt`) now
+  normalizes the same way, which also makes a trailing `src\` register as the
+  directory it is.
+- **Windows: CLI invocations were not counted toward the conversion metric** —
+  `outcome::cli_call_in_line` matched the binary with
+  `t == "code-graph-mcp" || t.ends_with("/code-graph-mcp")`, missing the
+  `…\code-graph-mcp.exe` form the plugin actually resolves on Windows — both the
+  separator and the `.exe` suffix. The metric read zero and `doctor` reported the
+  funnel DARK with nothing broken. The JS delivery surface (`find-binary.js`,
+  `auto-update.js`) had handled `.exe` all along; the Rust side had no `.exe`
+  awareness anywhere.
+- **`grep` mangled Unix filenames containing a backslash** — caught before
+  release, introduced by the #34 fix itself. `\` is a legal filename character on
+  Unix (only `/` and NUL are illegal), so rewriting separators unconditionally
+  renamed a real `src/od\bc.rs` to `src/od/bc.rs` in output and produced a lookup
+  key that missed the indexed path — the same failure mode as #34, in the
+  opposite direction (`merkle::normalize_rel_path` also rewrites only under
+  `#[cfg(windows)]`). The rewrite is now gated on whether `\` is a separator on
+  the target platform.
+- **The test-file predicate had five copies and only two were widened (#36
+  follow-up)** — `domain.rs` carries a "Five sites must agree" note, but the
+  inventory document it points at no longer exists, so the first pass updated
+  only the Rust predicate and its SQL mirror. Three ports were left on the old
+  narrow rules: `claude-plugin/scripts/pr-impact-comment.js::isTestPath` (whose
+  own test is named `isTestPath mirrors domain::is_test_path patterns`), and the
+  Python ports in `scripts/embedding_benchmark/build_tier3_slice.py` and
+  `diag_retrieval_drop.py` (both docstringed "Port of src/domain.rs"). The JS
+  gap made the PR "test gaps" comment report every Java/C# test file as
+  uncovered production code; the Python gap inflated the retrieval benchmark's
+  measured miss rate. All five now generate from the same constant lists, and
+  agreement is checked by running one 31-path corpus through every executable
+  implementation rather than by maintaining parallel test tables. The two
+  deliberately divergent sites (`PROD_SOURCE_FILTER_AND`/`TEST_SOURCE_FILTER_OR`
+  and the closure in `pipeline::resolve::refine_ambiguous_targets`) are
+  unchanged, as their own comments require.
+- **Windows: `outcome` looked in the wrong transcript directory for a
+  canonicalized project path** — `project_slug` maps every non-alphanumeric byte
+  to `-`, which makes it immune to the separator itself (`D:\dev\r`, `D:/dev/r`
+  and `D:\dev/r` all slugify identically) but not to the extended-length prefix:
+  `\\?\D:\dev\r` became `----D--dev-r` instead of `D--dev-r`. Since
+  `canonicalize()` prints the `\\?\` form and `outcome --project` takes a
+  user-supplied path, pasting one back yielded a directory Claude Code never
+  created and the command reported "absent" with nothing actually wrong — the
+  same silent-zero failure mode as the `.exe` defect above. The prefix is now
+  stripped through the crate's existing normalizer before slugging (a no-op on
+  Unix, where it cannot occur). Deliberately not case-folded: Windows
+  filesystems are case-insensitive but case-*preserving*, and this slug must
+  match a directory name Claude Code chose from its own spelling.
+
+### Changed
+- **Separator normalization has one implementation crate-wide.**
+  `merkle::normalize_rel_str_on` is now the only place `\` becomes `/`;
+  `merkle::normalize_rel_path`, the new `merkle::normalize_rel_str` (for input
+  that never went through `Path`), and `cli::normalize_path_display_on` (which
+  adds the `\\?\` strip) all delegate to it. It takes the platform as a
+  parameter instead of an inline `#[cfg(windows)]`, so the Linux and macOS CI
+  legs exercise the Windows branch — the property that was missing when the #34
+  defects shipped past an existing `windows-latest` job.
+- **`affected` text output groups the blast radius by depth** and shows the
+  nearest 40, stating how many it withheld and at what depths. A flat
+  path-sorted dump buried the depth-1 dependents worth inspecting among hundreds
+  of depth-8..10 transitive hits (454 of 3,819 files on the reporting repo).
+  The `--depth` default (10) and the `--json` envelope are unchanged, so
+  scripted consumers see no difference.
+
+### Documentation
+- README: how to install the model by hand via `CODE_GRAPH_MODEL_DIR`, why a
+  hand-populated *default* cache dir is rejected (no `.model-id` marker), the
+  Windows `tar -C C:\…` trap, and how to diagnose a model that never downloads.
+- **New contributor skill `docs/skills/windows-compat/`** — an Agent Skill
+  encoding the root causes above so the next path-handling change starts from
+  them. Carries a `scripts/audit.sh` scan for the offending patterns, a
+  `references/failure-modes.md` catalogue of each shipped defect with its fix,
+  and the testability rule the whole batch turns on: take the platform as a
+  *parameter*, never an inline `cfg!(windows)`, so the Linux and macOS CI legs
+  exercise the Windows branch. `windows-latest` was already in the CI matrix and
+  caught none of these — they were pure string logic that nothing asserted on.
+  Install with:
+  `mkdir -p .claude/skills && cp -r docs/skills/windows-compat .claude/skills/`
+
 ## v0.105.0 — macro-call edges + std-import phantom fix (IDX v52), audit-batch hardening
 
 Upgrade notes: first query/index after upgrade triggers a one-time full index
