@@ -1272,7 +1272,13 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     // commit_drift: how many local commits landed after the snapshot was taken.
     let commit_drift = snapshot_commit.as_deref().and_then(|c| {
         std::process::Command::new("git")
-            .args(["rev-list", "--count", &format!("{c}..HEAD")])
+            // `--` closes the revision list, same as the `ls-files` sibling at
+            // :2832 which carries this comment already. Not exploitable here —
+            // argv form, and `{c}` is a 40-hex commit id read from the snapshot
+            // meta — but a commit-ish that git could read as a pathspec would
+            // otherwise change what this counts, and the two call sites in one
+            // file disagreeing is how the next one gets written without it.
+            .args(["rev-list", "--count", &format!("{c}..HEAD"), "--"])
             .current_dir(project_root)
             .output()
             .ok()

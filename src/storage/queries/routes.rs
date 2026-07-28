@@ -168,7 +168,7 @@ pub fn get_module_exports(conn: &Connection, dir_prefix: &str) -> Result<Vec<Mod
     // so prod-only counts align with project_map / find_references / get_ast_node
     // impact (see feedback_test_classifier_dual_sources for the full inventory).
     let prod_join = crate::domain::prod_source_join_sql("e2");
-    let prod_where = crate::domain::PROD_SOURCE_FILTER_AND;
+    let prod_where = crate::domain::prod_source_filter_and();
     let sql = format!(
         "SELECT DISTINCT n.id, n.name, n.type, n.signature, f.path,
                 COALESCE(cc.cnt, 0) as caller_count,

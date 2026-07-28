@@ -21,8 +21,16 @@ permissions:
 # Serialize releases for the same ref so a tag-push run and a workflow_dispatch
 # re-run on the same tag don't race (both build + publish the same version).
 # cancel-in-progress: false — never abort an in-flight publish half-way.
+#
+# The `inputs.tag ||` fallback is what makes that true, and this was the ONE
+# site in the file missing it (six others carry it — :51, :151, :199, :215,
+# :339, :414). A dispatch runs from the default branch, so bare `github.ref`
+# resolves to `refs/heads/main` while the tag-push run for the same version
+# resolves to `refs/tags/vX.Y.Z`: two different group keys, no serialization,
+# and both runs build and publish the same version concurrently — precisely the
+# race the comment above claims to prevent.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:

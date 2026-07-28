@@ -124,7 +124,7 @@ pub fn get_project_map(
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
                AND f.path NOT LIKE 'benches/%' \
-               AND f.path NOT LIKE '%_test.%' \
+               AND f.path NOT LIKE '%\\_test.%' ESCAPE '\\' \
              GROUP BY n.id \
              ORDER BY cnt DESC, n.name, f.path \
              LIMIT 200";
@@ -310,8 +310,8 @@ pub fn get_project_map(
     let mut hot_functions = Vec::new();
     {
         let prod_join = crate::domain::prod_source_join_sql("e");
-        let prod_where = crate::domain::PROD_SOURCE_FILTER_AND;
-        let test_where = crate::domain::TEST_SOURCE_FILTER_OR;
+        let prod_where = crate::domain::prod_source_filter_and();
+        let test_where = crate::domain::test_source_filter_or();
         let sql = format!(
             "SELECT n.name, n.type, f.path, \
                COUNT(CASE WHEN {prod_where} THEN e.id END) as prod_cnt, \
@@ -327,7 +327,7 @@ pub fn get_project_map(
                AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
                AND f.path NOT LIKE 'tests/%' \
                AND f.path NOT LIKE 'benches/%' \
-               AND f.path NOT LIKE '%_test.%' \
+               AND f.path NOT LIKE '%\\_test.%' ESCAPE '\\' \
              GROUP BY n.name, n.type, f.path \
              HAVING prod_cnt > 0 \
              ORDER BY prod_cnt DESC, n.name, n.type, f.path \

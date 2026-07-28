@@ -436,7 +436,7 @@ pub fn is_dead_code_exported(
 
 /// File-level test classifier (path heuristics only) shared by `is_test_symbol` and
 /// the `affected` command. NOT the only test-path matcher: the SQL counterparts
-/// (`PROD_SOURCE_FILTER_AND` / `TEST_SOURCE_FILTER_OR` below) and the local closure in
+/// (`prod_source_filter_and` / `test_source_filter_or` below) and the local closure in
 /// `indexer::pipeline::resolve::refine_ambiguous_targets` use their own, intentionally
 /// divergent patterns. See the "Five sites must agree" note below and
 /// feedback_test_classifier_dual_sources.md before changing any one of them.
@@ -609,7 +609,7 @@ pub const TEST_PATH_PARITY_CORPUS: &[&str] = &[
 /// surprising) classifies tests identically to the Rust query-time [`is_test_node`]
 /// path: the stored `is_test` flag OR the [`is_test_symbol`] name/path heuristic.
 ///
-/// Why this exists separately from [`TEST_SOURCE_FILTER_OR`]: that one is the
+/// Why this exists separately from [`test_source_filter_or`]: that one is the
 /// edge-oriented (`src`/`sf` alias) variant and is intentionally NARROWER — it omits
 /// the `*Test`/`*Tests` name legs and several path suffixes. Surfaces that classify a
 /// *node* (not an edge source) and want full `is_test_symbol` parity — e.g. so an
@@ -686,7 +686,7 @@ pub fn is_test_node_sql(node_alias: &str, file_alias: &str) -> String {
 
 /// JOINs that attach the source node and source file to an `edges` row.
 /// `edges_alias` is the alias used in the outer FROM/JOIN for the edges table.
-/// Pair with [`PROD_SOURCE_FILTER_AND`] in the WHERE clause.
+/// Pair with [`prod_source_filter_and`] in the WHERE clause.
 pub fn prod_source_join_sql(edges_alias: &str) -> String {
     format!(
         "JOIN nodes src ON src.id = {e}.source_id \
@@ -695,27 +695,73 @@ pub fn prod_source_join_sql(edges_alias: &str) -> String {
     )
 }
 
+/// The `foo_test.<ext>` leg, generated from [`INFIX_TEST_EXTS`] so it cannot
+/// drift from `is_test_path`'s own use of that list — the same technique
+/// [`is_test_node_sql`] already uses for this leg.
+///
+/// GLOB, not LIKE, for two independent reasons, both of which the LIKE spelling
+/// got wrong:
+///   * `_` is a LITERAL in GLOB and a single-character WILDCARD in LIKE, so
+///     `LIKE '%_test.%'` swallowed `latest.cs` (`%`=`l`, `_`=`a`, `test.`) and
+///     `attest.py` — ordinary production files, silently reclassified as tests.
+///   * GLOB is anchored, so `'*_test.go'` is an ends-with, matching the Rust
+///     side's `ends_with`. `LIKE '%_test.%'` was a contains over ANY extension,
+///     so `notes_test.txt` was excluded here while `is_test_path` called it
+///     production.
+fn infix_test_path_glob(file_alias: &str, joiner: &str) -> String {
+    INFIX_TEST_EXTS
+        .iter()
+        .map(|ext| format!("{file_alias}.path GLOB '*_test.{ext}'"))
+        .collect::<Vec<_>>()
+        .join(joiner)
+}
+
 /// AND-joined conditions that exclude test/bench source rows.
 /// Combines the AST-level `src.is_test=0` flag with name and path heuristics —
-/// kept in sync with `is_test_symbol`. Caller is expected to splice these
+/// kept in sync with `is_test_symbol`. Caller is expected to splice this
 /// inside a WHERE clause already started with another condition (no leading AND
 /// is added by callers — they prepend ` AND ` themselves) or inside a CASE WHEN.
-pub const PROD_SOURCE_FILTER_AND: &str = "src.is_test = 0 \
-     AND src.name NOT LIKE 'test\\_%' ESCAPE '\\' \
-     AND sf.path NOT LIKE 'tests/%' \
-     AND sf.path NOT LIKE 'benches/%' \
-     AND sf.path NOT LIKE '%_test.%' \
-     AND sf.path NOT LIKE '%/tests.rs'";
+///
+/// This is a fifth copy of the test-classification rule, and until the
+/// 2026-07-27 audit the only one with no mechanical guard. Two of its legs were
+/// BROADER than `is_test_symbol`, each excluding real production rows from every
+/// prod-caller count with no error raised anywhere:
+///   * the infix path leg — see [`infix_test_path_glob`];
+///   * the name leg, `LIKE 'test\_%'`, which is ASCII-case-INsensitive in SQLite
+///     while `is_test_symbol` is `starts_with("test_")`, so `Test_Signup` was
+///     excluded here and called production there. GLOB is case-sensitive.
+///
+/// It remains deliberately NARROWER on two legs — no `*Test`/`*Tests` name
+/// suffix, no PascalCase-stem or pytest path legs — an accepted recall gap
+/// (audit P2-3), asserted one-directionally by
+/// `prod_source_filter_never_excludes_a_production_path`.
+pub fn prod_source_filter_and() -> String {
+    format!(
+        "src.is_test = 0 \
+         AND src.name NOT GLOB 'test_*' \
+         AND sf.path NOT LIKE 'tests/%' \
+         AND sf.path NOT LIKE 'benches/%' \
+         AND NOT ({infix}) \
+         AND sf.path NOT LIKE '%/tests.rs'",
+        infix = infix_test_path_glob("sf", " OR "),
+    )
+}
 
-/// OR-joined inverse of [`PROD_SOURCE_FILTER_AND`] — matches test/bench sources.
+/// OR-joined inverse of [`prod_source_filter_and`] — matches test/bench sources.
 /// Used by SUM/CASE constructs that count test callers separately (e.g.
-/// project_map's hot_functions test_cnt CASE).
-pub const TEST_SOURCE_FILTER_OR: &str = "src.is_test = 1 \
-     OR src.name LIKE 'test\\_%' ESCAPE '\\' \
-     OR sf.path LIKE 'tests/%' \
-     OR sf.path LIKE 'benches/%' \
-     OR sf.path LIKE '%_test.%' \
-     OR sf.path LIKE '%/tests.rs'";
+/// project_map's hot_functions test_cnt CASE). Kept an exact inverse; the guard
+/// test asserts the two never agree on any corpus path.
+pub fn test_source_filter_or() -> String {
+    format!(
+        "src.is_test = 1 \
+         OR src.name GLOB 'test_*' \
+         OR sf.path LIKE 'tests/%' \
+         OR sf.path LIKE 'benches/%' \
+         OR {infix} \
+         OR sf.path LIKE '%/tests.rs'",
+        infix = infix_test_path_glob("sf", " OR "),
+    )
+}
 
 // -- Dead-code ignore defaults --
 /// Path-prefix defaults for `find_dead_code` ignore_paths.
@@ -1214,6 +1260,68 @@ mod tests {
         assert!(
             got != 0,
             "is_test flag=1 must classify as test even when name/path heuristic misses"
+        );
+    }
+
+    /// `prod_source_filter_and` / `test_source_filter_or` are a fifth copy of the
+    /// test-path rule and were the only one with no mechanical guard: the
+    /// Rust↔SQL differential above covers `is_test_node_sql`, and
+    /// `tests/predicate_parity.rs` covers the JS and both Python mirrors.
+    ///
+    /// The invariant asserted here is ONE-DIRECTIONAL, deliberately. These
+    /// constants are narrower than `is_test_path` — no PascalCase stem leg, no
+    /// `__tests__`, no pytest leg — and that recall gap is an accepted
+    /// divergence (audit 2026-07-27 P2-3), so requiring agreement would be
+    /// asserting something the code does not claim. What must never happen is
+    /// the other direction: a path Rust calls PRODUCTION being excluded as a
+    /// test, because that drops it from every prod-caller count with no error
+    /// raised anywhere. `'%_test.%'` did exactly that — LIKE's `_` is a
+    /// single-character wildcard, so it swallowed `latest.cs` (`l`,`a`,`test`,`.`)
+    /// and `attest.py`, two entries this corpus already carried as near-misses.
+    #[test]
+    fn prod_source_filter_never_excludes_a_production_path() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = format!(
+            "SELECT ({prod}), ({test}) \
+             FROM (SELECT ?1 AS name, 0 AS is_test) src, (SELECT ?2 AS path) sf",
+            prod = prod_source_filter_and(),
+            test = test_source_filter_or(),
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+
+        // Names cover the case boundary the LIKE spelling got wrong: SQLite's
+        // LIKE is ASCII-case-insensitive, `is_test_symbol` is `starts_with`.
+        let names = [
+            "run",         // plainly production
+            "test_signup", // genuine test_ prefix
+            "Test_Signup", // production per is_test_symbol; LIKE excluded it
+            "TEST_MODE",   // ditto
+            "testify",     // no underscore — production on both sides
+        ];
+
+        let mut wrongly_excluded = Vec::new();
+        for path in TEST_PATH_PARITY_CORPUS {
+            for name in names {
+                let (prod, is_test): (i64, i64) = stmt
+                    .query_row(rusqlite::params![name, path], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .unwrap();
+                assert_ne!(
+                    prod, is_test,
+                    "{name} @ {path}: the two filters must stay exact inverses; \
+                     got prod={prod} test={is_test}"
+                );
+                if !is_test_symbol(name, path) && prod == 0 {
+                    wrongly_excluded.push(format!("{name} @ {path}"));
+                }
+            }
+        }
+        assert!(
+            wrongly_excluded.is_empty(),
+            "these rows are PRODUCTION per `is_test_symbol` but the SQL source \
+             filter excluded them as tests — they vanish from every prod-caller \
+             count with nothing reported: {wrongly_excluded:?}"
         );
     }
 

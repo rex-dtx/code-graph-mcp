@@ -1,0 +1,52 @@
+# Line endings are normalized to LF in the repository AND in the working tree on
+# every platform.
+#
+# Without this file, a Windows checkout converts text files to CRLF (git's
+# core.autocrlf default there), and any code that matches on exact byte
+# sequences reads a different file than the one that was committed. That is not
+# hypothetical here: the workflow drift guard in tests/hardening.rs matches
+# "\n  <job>:\n" to locate a YAML job, and it went red on the windows-latest CI
+# leg for v0.108.0 — a failure with no defect behind it, costing a full
+# push/CI/fix round on an otherwise green release. The test now normalizes CRLF
+# itself; this file removes the class instead of the instance, for every future
+# fixture, snapshot, and exact-match assertion.
+#
+# `eol=lf` (not just `text=auto`) is what pins the WORKING TREE, not only the
+# blob. `text=auto` alone still hands Windows CRLF on checkout.
+* text=auto eol=lf
+
+# Binary formats: never touch the bytes. `text=auto` heuristically detects most
+# of these, but naming them makes the intent explicit and removes the guess for
+# the ones with text-like headers.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
+*.tgz    binary
+*.xz     binary
+*.zst    binary
+*.wasm   binary
+*.so     binary
+*.dylib  binary
+*.dll    binary
+*.exe    binary
+*.a      binary
+*.safetensors binary
+*.onnx   binary
+*.bin    binary
+*.db     binary
+*.sqlite binary
+
+# Windows-native scripts are the one text class that genuinely needs CRLF:
+# cmd.exe mis-parses an LF-only .bat/.cmd (a trailing `goto :eof` on the last
+# line without CR can be read as `goto :eof\n`), so pin them the other way.
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+
+# Vendored C sources ship as-is — sqlite-vec is built from vendor/ by build.rs
+# and its upstream checksums must keep matching.
+vendor/** -text

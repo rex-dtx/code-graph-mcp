@@ -704,11 +704,14 @@ fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
 #[test]
 fn release_and_cache_warm_workflows_do_not_drift() {
     let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
-    // Normalise CRLF. Without `.gitattributes` forcing LF, git checks these YAML
-    // files out with CRLF on Windows, and `workflow_job`'s exact `"\n  job:\n"`
-    // match then finds nothing — the guard failed on the windows-latest CI leg
-    // with "job `gate` not found", which reads as a rename rather than a line
-    // ending. Everything else here goes through `.lines()`, which strips `\r`.
+    // Normalise CRLF. Git used to check these YAML files out with CRLF on
+    // Windows, and `workflow_job`'s exact `"\n  job:\n"` match then found
+    // nothing — the guard failed on the windows-latest CI leg with "job `gate`
+    // not found", which reads as a rename rather than a line ending.
+    // `.gitattributes` (`* text=auto eol=lf`) now pins the working tree on every
+    // platform, but this stays: a clone made before that file landed keeps its
+    // CRLF working tree until the next checkout, and the cost here is one
+    // `replace`. Everything else goes through `.lines()`, which strips `\r`.
     let read_lf = |p: std::path::PathBuf| -> String {
         fs::read_to_string(&p)
             .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
@@ -862,4 +865,62 @@ fn release_and_cache_warm_workflows_do_not_drift() {
              so a command only the gate runs is a command the gate compiles cold."
         );
     }
+}
+
+/// Drift guard: every `github.ref` / `github.ref_name` EXPRESSION in release.yml
+/// must carry the `github.event.inputs.tag ||` fallback.
+///
+/// `workflow_dispatch` runs from the default branch, so on a re-release
+/// `github.ref` is `refs/heads/main` and `github.ref_name` is `main` — neither
+/// names the tag being released. Every site that forgets the fallback therefore
+/// acts on main's HEAD instead of the tag's source, and does so silently: the
+/// run is green, it just built and published the wrong commit.
+///
+/// This is a test rather than a comment because the site count has been wrong
+/// three separate times. It went in as five, a later audit found a sixth
+/// (checkout in `gate`), and the 2026-07-27 audit found a seventh — the
+/// top-level `concurrency.group`, where the miss meant a tag-push run and a
+/// dispatch re-run of the same version got DIFFERENT group keys and published
+/// concurrently, which is exactly what the comment above that block says it
+/// prevents. Each was found by reading, one at a time.
+#[test]
+fn release_workflow_ref_expressions_all_fall_back_to_the_dispatch_tag() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
+    let yaml = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n");
+
+    // `yaml_directives` drops whole-line comments, which is where every prose
+    // mention of `github.ref` in this file lives — including the ones explaining
+    // this very contract. Without that filter the guard would flag its own docs.
+    let offenders: Vec<&str> = yaml_directives(&yaml)
+        .into_iter()
+        .filter(|l| l.contains("${{") && l.contains("github.ref"))
+        .filter(|l| !l.contains("github.event.inputs.tag ||"))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "release.yml has {} `github.ref`/`github.ref_name` expression(s) with no \
+         `github.event.inputs.tag ||` fallback. On a workflow_dispatch re-release \
+         these resolve to the DEFAULT BRANCH, not the tag, and the run stays \
+         green while acting on the wrong commit:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
+
+    // Negative control: the fallback sites must actually exist. A future edit
+    // that deletes them all would otherwise leave this test green on an empty
+    // set — the vacuous pass this file exists to prevent.
+    let with_fallback = yaml_directives(&yaml)
+        .into_iter()
+        .filter(|l| l.contains("github.event.inputs.tag ||"))
+        .count();
+    assert!(
+        with_fallback >= 7,
+        "expected at least the 7 known `inputs.tag` fallback sites in release.yml, \
+         found {with_fallback} — if a site was legitimately removed, lower this \
+         number in the same commit and say which one"
+    );
 }

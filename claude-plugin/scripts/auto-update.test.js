@@ -729,3 +729,53 @@ test('cached binary NEWER than latest is not downgraded; unreadable is healed', 
     cachedBinaryStaleVsState(state, { binaryPath, readVersion: () => null }),
     true, 'unreadable binary bypasses the throttle so the heal can run');
 });
+
+// ── 403 rate-limit backoff survives the check that triggered it ─────────────
+//
+// `fetchLatestRelease` writes `rateLimited: true` on a GitHub 403, and
+// `shouldCheck` reads it to hold off for RATE_LIMIT_INTERVAL_MS (24h). Between
+// those two, `checkForUpdate` took its state snapshot BEFORE the fetch and then
+// wrote `{ ...state, lastCheck: now }` on the null return — spreading the stale
+// snapshot straight over the flag the fetch had just set. The backoff was dead
+// code from the day it was written: every 403 refreshed `lastCheck` and cleared
+// `rateLimited`, so the next tick hit GitHub on the ordinary interval while
+// already rate-limited.
+//
+// Driven through a child process because CACHE_DIR (and therefore the state
+// file) is `os.homedir()/.cache/code-graph`, resolved at module load: the parent
+// has already resolved it against the REAL home, and this test must not write
+// there. `requestJsonFn` is the injected 403 — no network.
+test('a GitHub 403 leaves the 24h backoff armed after checkForUpdate returns', (t) => {
+  const { spawnSync } = require('child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-403-home-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const autoUpdate = path.join(__dirname, 'auto-update.js');
+  const script = `
+    const au = require(${JSON.stringify(autoUpdate)});
+    (async () => {
+      await au.checkForUpdate({
+        installMissing: true,
+        force: true,
+        requestJsonFn: async () => ({ statusCode: 403, body: '' }),
+      });
+      process.stdout.write(JSON.stringify(au.readState()));
+    })().catch(e => { process.stderr.write(String(e)); process.exit(1); });
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+
+  const state = JSON.parse(r.stdout);
+  assert.equal(state.rateLimited, true,
+    'the 403 flag must survive the saveState on checkForUpdate\'s null-return path');
+  // The flag only matters through shouldCheck — assert the behaviour, not just
+  // the field, or a rename leaves this passing while the backoff stays dead.
+  assert.equal(shouldCheck(state), false,
+    'with rateLimited set and lastCheck just now, the next check must back off');
+  assert.equal(shouldCheck(state, { force: true }), false,
+    'the 24h backoff outranks force — a session start must not hammer a 403');
+});

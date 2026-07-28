@@ -687,7 +687,11 @@ function shouldHealGlobalsOnThrottle(state, { readStale = staleGlobalPkgs } = {}
   return readStale(state.latestVersion).length > 0;
 }
 
-async function checkForUpdate({ installMissing = false, force = false } = {}) {
+// `requestJsonFn` is a test seam, forwarded to fetchLatestRelease — the same
+// injection point that function already exposes. It exists so the 403 path can
+// be driven without a network: that path is where the rate-limit backoff either
+// engages or is silently erased, and no other observable distinguishes the two.
+async function checkForUpdate({ installMissing = false, force = false, requestJsonFn } = {}) {
   let installLock = null;
   try {
     // Skip in dev mode — unless the launcher explicitly requested a missing-
@@ -729,9 +733,17 @@ async function checkForUpdate({ installMissing = false, force = false } = {}) {
     }
 
     // Check GitHub for latest release
-    const latest = await fetchLatestRelease();
+    const latest = await fetchLatestRelease(requestJsonFn || requestJson);
     if (!latest) {
-      saveState({ ...state, installedVersion, lastCheck: new Date().toISOString() });
+      // Re-read, do NOT spread the pre-fetch `state`. On a 403 fetchLatestRelease
+      // writes `rateLimited: true` to the state file, and this is the branch it
+      // returns null through — spreading the stale snapshot wrote that flag
+      // straight back to whatever it was before (normally absent). The 24h
+      // RATE_LIMIT_INTERVAL_MS backoff in shouldCheck() therefore never engaged:
+      // it read a state where rateLimited had just been erased by the very call
+      // that set it, and kept polling GitHub on the ordinary interval while
+      // already rate-limited. Dead code since the backoff was written.
+      saveState({ ...readState(), installedVersion, lastCheck: new Date().toISOString() });
       return null;
     }
 
