@@ -28,6 +28,7 @@ const {
   fetchLatestRelease,
   getExtractedPluginVersion,
   parseLatestRelease,
+  PLUGIN_ASSET_NAME,
   readBinaryVersion,
   promoteVerifiedBinary,
   cachedBinaryPath,
@@ -61,6 +62,12 @@ test('getExtractedPluginVersion reads extracted plugin manifest version', (t) =>
   assert.equal(getExtractedPluginVersion(root), '1.2.3');
 });
 
+// Promotion is fail-closed, so the mechanics tests below have to hand it the
+// real digest of the fixture they just wrote.
+function sha256Of(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
 function writeFakeBinary(filePath, version, mode = 0o755) {
   const script = [
     '#!/usr/bin/env bash',
@@ -83,7 +90,9 @@ test('promoteVerifiedBinary accepts a runnable binary with the expected version'
   writeFakeBinary(tmp, '1.2.3');
 
   assert.equal(readBinaryVersion(tmp), '1.2.3');
-  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3'), true);
+  // Promotion is fail-closed, so hand it the real digest: this test pins the
+  // chmod/rename mechanics, not the integrity policy (which has its own tests).
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', sha256Of(tmp)), true);
   assert.equal(fs.existsSync(tmp), false);
   assert.equal(fs.existsSync(dst), true);
 });
@@ -112,7 +121,7 @@ test('promoteVerifiedBinary promotes a non-executable (0644) download — curl -
   writeFakeBinary(tmp, '1.2.3', 0o644);
 
   assert.equal(readBinaryVersion(tmp), null, 'precondition: 0644 binary is not executable');
-  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3'), true);
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', sha256Of(tmp)), true);
   assert.equal(fs.existsSync(dst), true);
   assert.equal(fs.statSync(dst).mode & 0o111, 0o111, 'promoted binary is executable');
   assert.equal(readBinaryVersion(dst), '1.2.3');
@@ -142,15 +151,21 @@ test('promoteVerifiedBinary rejects a binary whose sha256 mismatches the sidecar
   assert.equal(fs.existsSync(tmp), false, 'tmp cleaned up on rejection');
 });
 
-test('promoteVerifiedBinary proceeds without a sidecar (TOFU back-compat)', (t) => {
-  // Older releases ship no <asset>.sha256; a null expected hash must not block
-  // install (the size + version-exec gates still apply).
+test('promoteVerifiedBinary refuses a binary with no expected sha256 (fail-closed)', (t) => {
+  // Was the TOFU back-compat path: a null expected hash printed a warning and
+  // installed anyway, making this the only fail-OPEN link among the four
+  // download chains while src/snapshot/install.rs is fail-closed — and a warning
+  // on stderr during a background auto-update is seen by nobody. Every release
+  // back to v0.100.0 publishes a sidecar per binary and downloads always target
+  // `releases/latest`, so there is no no-sidecar case left to serve.
   const dir = mkDir(t, 'code-graph-bin-');
   const tmp = path.join(dir, 'code-graph-mcp.tmp');
   const dst = path.join(dir, 'code-graph-mcp');
   writeFakeBinary(tmp, '1.2.3');
-  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', null), true);
-  assert.equal(fs.existsSync(dst), true);
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', null), false);
+  assert.equal(fs.existsSync(dst), false, 'unverified binary must not be promoted');
+  assert.equal(fs.existsSync(tmp), false, 'tmp cleaned up on refusal');
+  // The gate runs BEFORE chmod, so nothing was ever made executable.
 });
 
 test('cachedBinaryNeedsUpdate is version-aware, not existence-only', (t) => {
@@ -282,12 +297,27 @@ test('parseLatestRelease selects the matching platform asset', () => {
       { name: 'other', browser_download_url: 'https://example.com/other' },
     ],
   }, 'code-graph-mcp-linux-x64');
+  // `pluginTarballUrl` is null here BY DESIGN: this fixture publishes no
+  // claude-plugin.tar.gz, and that null is what makes downloadAndInstall refuse
+  // to extract rather than fall back to the unchecksummed source tarball.
 
   assert.deepEqual(latest, {
     version: '1.2.3',
     tarballUrl: 'https://example.com/tarball.tgz',
+    pluginTarballUrl: null,
     binaryUrl: 'https://example.com/linux-x64',
   });
+
+  // And it IS picked up when the release publishes it.
+  const withPlugin = parseLatestRelease({
+    tag_name: 'v1.2.3',
+    tarball_url: 'https://example.com/tarball.tgz',
+    assets: [
+      { name: 'code-graph-mcp-linux-x64', browser_download_url: 'https://example.com/linux-x64' },
+      { name: PLUGIN_ASSET_NAME, browser_download_url: 'https://example.com/plugin.tgz' },
+    ],
+  }, 'code-graph-mcp-linux-x64');
+  assert.equal(withPlugin.pluginTarballUrl, 'https://example.com/plugin.tgz');
 });
 
 // ── commandExists ──────────────────────────────────────────
@@ -449,10 +479,29 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
     const fs = require('fs');
     const path = require('path');
     const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
-    const latest = { version: '9.9.9', tarballUrl: 'https://example/tar', binaryUrl: null };
+    const crypto = require('crypto');
+    const latest = {
+      version: '9.9.9',
+      tarballUrl: 'https://example/tar',
+      pluginTarballUrl: 'https://example/claude-plugin.tar.gz',
+      binaryUrl: null,
+    };
     const calls = [];
+    // The stub has to satisfy the integrity gate now: write the archive, then
+    // write ITS OWN digest as the sidecar. A stub that skipped the sidecar would
+    // be exercising the refusal path, not the install path.
     const exec = (cmd, args) => {
       calls.push(cmd);
+      if (cmd === 'curl') {
+        const out = args[args.indexOf('-o') + 1];
+        if (out.endsWith('.sha256')) {
+          const archive = out.slice(0, -'.sha256'.length);
+          const sha = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+          fs.writeFileSync(out, sha + '  ' + path.basename(archive));
+        } else {
+          fs.writeFileSync(out, 'not-a-real-gzip-but-hashable');
+        }
+      }
       if (cmd === 'tar') {
         // Simulate extraction: produce claude-plugin/ with a matching version.
         const tmpDir = args[args.indexOf('-C') + 1];
@@ -779,3 +828,83 @@ test('a GitHub 403 leaves the 24h backoff armed after checkForUpdate returns', (
   assert.equal(shouldCheck(state, { force: true }), false,
     'the 24h backoff outranks force — a session start must not hammer a 403');
 });
+
+// ── Plugin tarball integrity is fail-closed ────────────────────────────────
+//
+// This chain extracts an archive and copies its JAVASCRIPT into the plugin
+// cache, where Claude Code runs it as hooks on every tool call. It used to pull
+// GitHub's auto-generated source `tarball_url`, for which no checksum is
+// published anywhere — the only one of the four download chains with zero
+// integrity verification, and the only one whose payload becomes executed code
+// (audit 2026-07-27 P2-23). release.yml now publishes claude-plugin.tar.gz with
+// a .sha256 sidecar and this refuses to extract without a match.
+//
+// The assertion that matters is `tar` never running: a refusal that still
+// extracted would have written the untrusted JS to disk before deciding.
+for (const [label, mutate] of [
+  ['no sidecar published', (o) => { if (o.endsWith('.sha256')) throw new Error('404'); }],
+  ['sidecar does not match', (o, fsMod) => {
+    if (o.endsWith('.sha256')) fsMod.writeFileSync(o, 'de'.repeat(32));
+  }],
+  ['release publishes no plugin asset', null],
+]) {
+  test(`downloadAndInstall refuses to extract the plugin tarball when the ${label}`, (t) => {
+    const sandboxHome = mkDir(t, 'code-graph-int-');
+    const noAsset = mutate === null;
+    const script = `
+      const fs = require('fs');
+      const path = require('path');
+      const crypto = require('crypto');
+      const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+      const mutate = ${mutate ? mutate.toString() : 'null'};
+      const latest = {
+        version: '9.9.9',
+        tarballUrl: 'https://example/tar',
+        pluginTarballUrl: ${noAsset ? 'null' : "'https://example/claude-plugin.tar.gz'"},
+        binaryUrl: null,
+      };
+      const calls = [];
+      const exec = (cmd, args) => {
+        calls.push(cmd);
+        if (cmd === 'curl') {
+          const out = args[args.indexOf('-o') + 1];
+          if (mutate) { mutate(out, fs); }
+          if (!out.endsWith('.sha256')) fs.writeFileSync(out, 'payload');
+          else if (!fs.existsSync(out)) {
+            const archive = out.slice(0, -'.sha256'.length);
+            fs.writeFileSync(out, crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex'));
+          }
+        }
+        if (cmd === 'tar') {
+          const tmpDir = args[args.indexOf('-C') + 1];
+          const mDir = path.join(tmpDir, 'claude-plugin', '.claude-plugin');
+          fs.mkdirSync(mDir, { recursive: true });
+          fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '9.9.9' }));
+        }
+      };
+      (async () => {
+        const result = await downloadAndInstall(latest, {
+          exec,
+          cmdExists: () => true,
+          refreshMarketplace: () => true,
+          downloadBin: async () => true,
+        });
+        console.log(JSON.stringify({ result, calls }));
+      })();
+    `;
+    const out = execGit(process.execPath, ['-e', script], {
+      env: { ...process.env, HOME: sandboxHome },
+      encoding: 'utf8',
+    });
+    const { result, calls } = JSON.parse(out.trim().split('\n').pop());
+    assert.equal(result.pluginUpdated, false, `${label}: plugin must not be installed`);
+    assert.equal(calls.includes('tar'), false,
+      `${label}: refused BEFORE extraction — untrusted JS must never reach disk`);
+    // The binary chain has its own integrity gate and still runs, so a bad
+    // plugin asset does not strand the user on an old binary.
+    assert.equal(result.binaryUpdated, true, `${label}: binary update still proceeds`);
+    const dst = path.join(sandboxHome, '.claude', 'plugins', 'cache',
+      'code-graph-mcp', 'code-graph-mcp', '9.9.9');
+    assert.equal(fs.existsSync(dst), false, `${label}: nothing copied into the plugin cache`);
+  });
+}

@@ -924,3 +924,78 @@ fn release_workflow_ref_expressions_all_fall_back_to_the_dispatch_tag() {
          number in the same commit and say which one"
     );
 }
+
+/// Supply chain: every `uses:` in every workflow is pinned to a full commit SHA.
+///
+/// A mutable tag (`@v6`) is a standing write-authority grant to whoever can move
+/// that tag — and these workflows run with `contents: write` and, in the publish
+/// job, an `NPM_TOKEN`. The repo already SHA-pinned all 13 third-party uses and
+/// left all 21 first-party `actions/*` ones on major tags, which is the harder
+/// half to justify: `actions/checkout` runs first in every job, including the
+/// one holding the npm token.
+///
+/// Enforced here rather than by review because the audit flagged this twice
+/// (07-24 #17, 07-27 P2-25) and nothing changed either time. The 40-hex check
+/// also catches the likelier accident: pasting a SHORT sha, which GitHub accepts
+/// today and resolves ambiguously as the repo grows.
+#[test]
+fn every_workflow_action_is_pinned_to_a_full_commit_sha() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut checked = 0usize;
+    let mut unpinned: Vec<String> = Vec::new();
+
+    let mut files: Vec<_> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no workflow files found under {} — this guard would pass vacuously",
+        dir.display()
+    );
+
+    for path in &files {
+        let yaml = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        for line in yaml_directives(&yaml) {
+            let Some(rest) = line
+                .strip_prefix("- uses: ")
+                .or_else(|| line.strip_prefix("uses: "))
+            else {
+                continue;
+            };
+            checked += 1;
+            // `owner/repo@<ref>` — the ref runs to whitespace or the ` # vN` note.
+            let git_ref = rest
+                .split_whitespace()
+                .next()
+                .and_then(|spec| spec.split_once('@').map(|(_, r)| r))
+                .unwrap_or("");
+            let pinned = git_ref.len() == 40
+                && git_ref
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+            if !pinned {
+                unpinned.push(format!("{name}: {line}"));
+            }
+        }
+    }
+
+    assert!(
+        checked >= 21,
+        "expected at least the 21 known `uses:` sites across the workflows, found \
+         {checked} — a parse change would make this guard vacuous"
+    );
+    assert!(
+        unpinned.is_empty(),
+        "{} workflow action(s) are on a mutable ref instead of a 40-hex commit \
+         SHA. Whoever can move that tag can run code in a job that holds \
+         `contents: write` (and, in publish, NPM_TOKEN):\n  {}",
+        unpinned.len(),
+        unpinned.join("\n  ")
+    );
+}

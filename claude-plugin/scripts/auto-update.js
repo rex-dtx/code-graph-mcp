@@ -204,23 +204,29 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
   });
 }
 
+// Published by release.yml alongside the five platform binaries, each with a
+// `.sha256` sidecar. Distinct from `tarball_url`, which is GitHub's
+// auto-generated source archive and has no checksum published anywhere.
+const PLUGIN_ASSET_NAME = 'claude-plugin.tar.gz';
+
 function parseLatestRelease(data, assetName = getPlatformAssetName()) {
   if (!data || typeof data.tag_name !== 'string' || typeof data.tarball_url !== 'string') {
     return null;
   }
 
-  let binaryUrl = null;
-  if (assetName && Array.isArray(data.assets)) {
-    const asset = data.assets.find((entry) => entry && entry.name === assetName);
-    if (asset && typeof asset.browser_download_url === 'string') {
-      binaryUrl = asset.browser_download_url;
-    }
-  }
+  const assetUrl = (name) => {
+    if (!name || !Array.isArray(data.assets)) return null;
+    const asset = data.assets.find((entry) => entry && entry.name === name);
+    return asset && typeof asset.browser_download_url === 'string'
+      ? asset.browser_download_url
+      : null;
+  };
 
   return {
     version: data.tag_name.replace(/^v/, ''),
     tarballUrl: data.tarball_url,
-    binaryUrl,
+    pluginTarballUrl: assetUrl(PLUGIN_ASSET_NAME),
+    binaryUrl: assetUrl(assetName),
   };
 }
 
@@ -330,19 +336,35 @@ async function downloadBinary(latest) {
       latest.binaryUrl,
     ], { timeout: 60000, stdio: 'pipe' });
 
-    // Best-effort fetch of the integrity sidecar (<asset>.sha256). curl -f makes
-    // a 404 (an older release with no sidecar) fail → expectedSha stays null →
-    // promoteVerifiedBinary takes the TOFU path. Same-origin, so this guards
-    // corruption in transit, not a release-asset swap (version-exec is the
-    // backstop there).
+    // Integrity sidecar (<asset>.sha256), fail-CLOSED. `curl -f` turns a 404 into
+    // a throw. One retry, because the alternative to a transient network blip is
+    // no update this cycle — the installed binary keeps working and the next
+    // check tries again, which is a strictly safer failure than exec'ing bytes
+    // nothing vouched for.
+    //
+    // This used to fall through to a TOFU path on a missing sidecar, which made
+    // it the one download chain in the repo that was fail-OPEN while
+    // `src/snapshot/install.rs` (whose comment reads "this used to warn and fail
+    // OPEN") is fail-closed. release.yml publishes a sidecar for every binary of
+    // every release — verified back to v0.100.0 — and downloads always target
+    // `releases/latest`, so there is no reachable no-sidecar case left to serve.
+    // Same-origin, so this defends transit/CDN corruption and truncation, not a
+    // release-asset swap; the version-exec check is the backstop there.
     let expectedSha = null;
     const shaTmp = binaryTmp + '.sha256';
-    try {
-      execFileSync('curl', ['-sfL', '-o', shaTmp, latest.binaryUrl + '.sha256'],
-        { timeout: 30000, stdio: 'pipe' });
-      expectedSha = (fs.readFileSync(shaTmp, 'utf8').trim().split(/\s+/)[0]) || null;
-    } catch { /* no sidecar → TOFU */ } finally {
-      try { if (fs.existsSync(shaTmp)) fs.unlinkSync(shaTmp); } catch { /* ok */ }
+    for (let attempt = 0; attempt < 2 && !expectedSha; attempt++) {
+      try {
+        execFileSync('curl', ['-sfL', '-o', shaTmp, latest.binaryUrl + '.sha256'],
+          { timeout: 30000, stdio: 'pipe' });
+        expectedSha = (fs.readFileSync(shaTmp, 'utf8').trim().split(/\s+/)[0]) || null;
+      } catch { /* retry once, then refuse below */ } finally {
+        try { if (fs.existsSync(shaTmp)) fs.unlinkSync(shaTmp); } catch { /* ok */ }
+      }
+    }
+    if (!expectedSha) {
+      console.error(`[code-graph] Refusing to install: no sha256 sidecar for ${latest.binaryUrl} (fetched twice). The current binary is unchanged; the next update check will retry.`);
+      try { fs.unlinkSync(binaryTmp); } catch { /* ok */ }
+      return false;
     }
 
     return promoteVerifiedBinary(binaryTmp, binaryDst, latest.version, expectedSha);
@@ -370,17 +392,21 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSh
     // or tampered download is never exec'd. The published <asset>.sha256 sidecar
     // is same-origin, so this defends transit/CDN corruption + truncation, not a
     // full release compromise (an attacker swapping the binary swaps the sidecar
-    // too — the version-exec check below is the backstop there). No sidecar
-    // (older release) → warn + proceed (TOFU), preserving the size + version
-    // gates. Mirrors the snapshot checksum convention (src/snapshot/install.rs).
-    if (expectedSha256) {
-      const actualSha = sha256File(binaryTmp);
-      if (actualSha.toLowerCase() !== String(expectedSha256).toLowerCase()) {
-        console.error(`[code-graph] Binary checksum mismatch (sha256): expected ${expectedSha256}, got ${actualSha} — refusing to install.`);
-        return false;
-      }
-    } else {
-      console.error('[code-graph] No binary checksum sidecar found — content not verified (size + version checks still apply).');
+    // too — the version-exec check below is the backstop there).
+    //
+    // Fail-CLOSED: no expected sha, no install. The previous "warn and proceed"
+    // arm made this the only fail-open link in the four download chains, against
+    // a fail-closed `src/snapshot/install.rs` — and a warning printed to stderr
+    // during a background auto-update is seen by nobody.
+    if (!expectedSha256) {
+      console.error('[code-graph] No expected sha256 supplied — refusing to install an unverified binary.');
+      try { fs.unlinkSync(binaryTmp); } catch { /* ok */ }
+      return false;
+    }
+    const actualSha = sha256File(binaryTmp);
+    if (actualSha.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+      console.error(`[code-graph] Binary checksum mismatch (sha256): expected ${expectedSha256}, got ${actualSha} — refusing to install.`);
+      return false;
     }
 
     // chmod BEFORE reading the version. readBinaryVersion executes the binary
@@ -460,16 +486,48 @@ async function downloadAndInstall(latest, {
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    // ── Step 1: Download and install plugin files from tarball ──
-    const tarballPath = path.join(tmpDir, 'release.tar.gz');
+    // ── Step 1: Download and install plugin files from the release asset ──
+    //
+    // Fail-CLOSED on integrity, like the binary chain. This step extracts an
+    // archive and then COPIES ITS JAVASCRIPT into the plugin cache, where Claude
+    // Code runs it as hooks on every tool call — so of the four download chains
+    // it is the one where unverified bytes become executed code, and it was the
+    // only one with no checksum at all (`tarball_url` is GitHub's generated
+    // source archive; nothing publishes a digest for it).
+    // `claude-plugin.tar.gz` + `.sha256` are published by release.yml for every
+    // release from the one carrying this change onward, and updates always
+    // target `releases/latest` — so a missing asset means something is wrong
+    // with the release, not that we are talking to an older one. Refusing leaves
+    // the user on their current, working plugin version; the binary update below
+    // still runs.
+    if (!latest.pluginTarballUrl) {
+      console.error(`[code-graph] Plugin update skipped: release ${latest.version} publishes no ${PLUGIN_ASSET_NAME} — refusing to install plugin code from an unverifiable source archive.`);
+      return { pluginUpdated: false, binaryUpdated: await downloadBin(latest), marketplaceRefreshed: false };
+    }
+    const tarballPath = path.join(tmpDir, PLUGIN_ASSET_NAME);
     exec('curl', [
       '-sL', '-o', tarballPath,
-      '-H', 'Accept: application/vnd.github+json',
-      latest.tarballUrl,
+      '-H', 'Accept: application/octet-stream',
+      latest.pluginTarballUrl,
     ], { timeout: 30000, stdio: 'pipe' });
 
+    const shaPath = tarballPath + '.sha256';
+    let expectedSha = null;
+    try {
+      exec('curl', ['-sfL', '-o', shaPath, latest.pluginTarballUrl + '.sha256'],
+        { timeout: 30000, stdio: 'pipe' });
+      expectedSha = (fs.readFileSync(shaPath, 'utf8').trim().split(/\s+/)[0]) || null;
+    } catch { /* refused just below */ }
+    const actualSha = fs.existsSync(tarballPath) ? sha256File(tarballPath) : null;
+    if (!expectedSha || !actualSha || expectedSha.toLowerCase() !== actualSha.toLowerCase()) {
+      console.error(`[code-graph] Plugin tarball integrity check failed (expected ${expectedSha || '<no sidecar>'}, got ${actualSha || '<no download>'}) — refusing to extract.`);
+      return { pluginUpdated: false, binaryUpdated: await downloadBin(latest), marketplaceRefreshed: false };
+    }
+
+    // No --strip-components: the asset archives `claude-plugin/` itself, while
+    // GitHub's source tarball wraps everything in `<owner>-<repo>-<sha>/`.
     exec('tar', [
-      'xzf', tarballPath, '-C', tmpDir, '--strip-components=1',
+      'xzf', tarballPath, '-C', tmpDir,
     ], { timeout: 15000, stdio: 'pipe' });
 
     const pluginSrc = path.join(tmpDir, 'claude-plugin');
@@ -834,6 +892,7 @@ module.exports = {
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
   isSilentMode, isInstallMissingMode, isForceMode,
   requestJson, resolveProxy, parseLatestRelease, fetchLatestRelease,
+  PLUGIN_ASSET_NAME,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
   getPlatformAssetName,
   selfHealStaleBinary,
