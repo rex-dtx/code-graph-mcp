@@ -414,6 +414,48 @@ fn normalize_user_path_from_on(
     raw: &str,
     backslash_is_sep: bool,
 ) -> Result<String> {
+    let key = normalize_user_path_key(project_root, cwd, raw, backslash_is_sep)?;
+    // Collapse runs of `/` in the RESULT. No index key ever contains `//`, so a
+    // doubled separator anywhere in the input produced a key that matched
+    // nothing — and every command then reported that as a clean empty answer.
+    // `dead-code src// --json` returned `[]` exit 0 on a directory with real
+    // dead code, which is the exact false-clean the unindexed-path probe was
+    // added to prevent: the probe trimmed a TRAILING slash for its own
+    // comparison while the query kept the untrimmed filter, so the two disagreed
+    // and the disclosure never fired. `overview src//` meanwhile errored, so the
+    // two surfaces re-split on the shape they had just been aligned on.
+    //
+    // Applied to the output rather than the input because the input still has to
+    // reach the `\\`-prefixed UNC rejection intact — collapsing first turns
+    // `\\server\share` into `\server\share` and walks straight past that guard.
+    //
+    // A trailing separator is deliberately KEPT: `test_normalize_user_path_passes_relative_through`
+    // pins `src/parser/` round-tripping unchanged, and every consumer
+    // prefix-matches, so `src/` works wherever `src` does. Only the unindexed
+    // probe needed the two spellings unified, and it trims for itself.
+    let collapsed = if key.contains("//") {
+        let mut out = String::with_capacity(key.len());
+        let mut prev_sep = false;
+        for c in key.chars() {
+            if c == '/' && prev_sep {
+                continue;
+            }
+            prev_sep = c == '/';
+            out.push(c);
+        }
+        out
+    } else {
+        key
+    };
+    Ok(collapsed)
+}
+
+fn normalize_user_path_key(
+    project_root: &Path,
+    cwd: &Path,
+    raw: &str,
+    backslash_is_sep: bool,
+) -> Result<String> {
     use crate::indexer::pipeline::is_safe_relative_path;
     // Single source of truth for the escape check (shared with the MCP freshness
     // path) — eliminates the three-way divergence between this fn, the MCP
@@ -9540,6 +9582,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Repeated separators collapse, because no index key contains `//`.
+    ///
+    /// `dead-code src// --json` used to answer `[]` exit 0 on a directory with
+    /// real dead code — the key matched nothing and the empty result was
+    /// reported as clean. That is the same false-clean the unindexed-path probe
+    /// exists to prevent: the probe trimmed a TRAILING slash for its own
+    /// comparison while the query kept the untrimmed filter, so they disagreed
+    /// and the disclosure never fired. `overview src//` errored on the same
+    /// input, re-splitting two surfaces that had just been aligned.
+    ///
+    /// Known limitation, stated rather than hidden: the collapse runs on the
+    /// OUTPUT (so the `\\`-prefixed UNC rejection still sees its prefix), which
+    /// means an input whose DOUBLED separator changes how the input itself is
+    /// parsed is unaffected — `.//src/foo.rs` still errors "escapes the project
+    /// root", because stripping `./` leaves a leading `/`. Pre-existing, and not
+    /// reachable from tab completion; `./src//foo.rs` is covered below.
+    #[test]
+    fn normalize_user_path_collapses_repeated_separators() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (raw, want) in [
+            ("src//foo.rs", "src/foo.rs"),
+            ("src///foo.rs", "src/foo.rs"),
+            ("src//", "src/"),
+            ("./src//foo.rs", "src/foo.rs"),
+            ("a//b//c.rs", "a/b/c.rs"),
+            // Single separators are untouched.
+            ("src/foo.rs", "src/foo.rs"),
+            // A single trailing separator round-trips unchanged, pinned by
+            // `test_normalize_user_path_passes_relative_through`; consumers
+            // prefix-match, so `src/` works wherever `src` does.
+            ("src/parser/", "src/parser/"),
+        ] {
+            for backslash_is_sep in [true, false] {
+                let got = normalize_user_path_from_on(root, root, raw, backslash_is_sep).unwrap();
+                assert_eq!(
+                    got, want,
+                    "{raw:?} (backslash_is_sep={backslash_is_sep}) must normalize to a key \
+                     the index can actually contain"
+                );
+            }
+        }
+
+        // The collapse runs on the OUTPUT, so the UNC rejection still sees its
+        // `\\` prefix. Collapsing the input first would turn `\\server\share`
+        // into `\server\share` and walk past that guard entirely.
+        assert!(
+            normalize_user_path_from_on(root, root, r"\\server\share\x.rs", false).is_err(),
+            "a UNC root must still be rejected after the collapse was added"
+        );
     }
 
     /// The WINDOWS branch of that guard, executed on the Linux CI leg.

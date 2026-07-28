@@ -112,6 +112,31 @@ against the batch itself. No `INDEX_VERSION` change; no rebuild.
   the plugin asset excludes `*.test.js`, matching the npm `files` allowlist.
 - The `uses:` vacuity floor in the pin guard was 21 against a real count of 41,
   so a parse regression halving it would have passed.
+- **`dead-code src// --json` was a false clean** — the probe trimmed a *trailing*
+  slash for its own comparison while the report query kept the untrimmed filter,
+  so a doubled separator matched nothing and was reported as clean, while
+  `overview src//` errored on the same input. `normalize_user_path` now collapses
+  repeated separators in the key it returns, which fixes both surfaces at once
+  (no index key ever contains `//`). Applied to the output, not the input, so the
+  `\\`-prefixed UNC rejection still sees its prefix. Known limit, stated in the
+  test: `.//src/foo.rs` still errors, because stripping `./` leaves a leading
+  `/` — pre-existing, and not reachable from tab completion.
+- **The `CLAUDE_CONFIG_DIR` guard had two vacuity holes**, both found by planting
+  a leaking canary test file rather than by reading it. It matched
+  `...process.env` and `HOME:` on the *same line*, so the Prettier-formatted
+  spelling of the very lines it was written for went unseen; and it accepted a
+  `delete` anywhere in the file, including inside a function body that never
+  runs. It now scans a window and requires the statement at module scope, before
+  the first `test(`. Widening the window then broke the single-line case it
+  already caught — `take_while` on the closing brace dropped the first line — so
+  that is pinned too.
+
+### Changed
+- `project_map`'s `key_symbols` now excludes `*/tests.rs`, a side effect of
+  converging it onto the shared filter (that leg was in the shared rule and not
+  in the inline copy). `is_test_symbol` does classify that path as a test, so
+  this is convergence rather than regression, but it narrows `key_symbols` for
+  any Rust repo using the `mod tests` file layout.
 
 ## v0.108.1 — post-release review of v0.108.0
 

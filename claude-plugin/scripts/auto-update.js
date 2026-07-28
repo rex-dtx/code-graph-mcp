@@ -98,8 +98,10 @@ function saveState(state) {
 
 // Whether to hit GitHub now. Keyed to the previous check's outcome, with a force
 // override for high-intent triggers (session start / explicit reload). Ordering:
-//   1. rate-limit backoff (24h) wins over everything — never push more requests
-//      into a GitHub 403.
+//   1. rate-limit backoff (RATE_LIMIT_INTERVAL_MS, 1h = GitHub's own reset
+//      window) wins over everything, force included — never push more requests
+//      into a GitHub 403. Safe to outrank force only because it is an hour; the
+//      24h it said before made one 403 a silent day-long no-op for `--force`.
 //   2. force → only the short SESSION_START_MIN_GAP_MS floor applies, so opening
 //      a new session re-checks immediately while a crash/reopen loop still can't
 //      hammer the API.
@@ -808,7 +810,7 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
       // Re-read, do NOT spread the pre-fetch `state`. On a 403 fetchLatestRelease
       // writes `rateLimited: true` to the state file, and this is the branch it
       // returns null through — spreading the stale snapshot wrote that flag
-      // straight back to whatever it was before (normally absent). The 24h
+      // straight back to whatever it was before (normally absent). The
       // RATE_LIMIT_INTERVAL_MS backoff in shouldCheck() therefore never engaged:
       // it read a state where rateLimited had just been erased by the very call
       // that set it, and kept polling GitHub on the ordinary interval while

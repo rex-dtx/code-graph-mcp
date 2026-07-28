@@ -1053,20 +1053,29 @@ fn js_test_files_neutralize_claude_config_dir() {
     );
 
     let mut offenders = Vec::new();
-    let mut scanned = 0usize;
     for path in &files {
         let src = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
             .replace("\r\n", "\n");
-        // Line-anchored, NOT `src.contains`: commenting the statement out
-        // leaves the text in the file, so a `contains` check stayed green for a
-        // file that had just stopped neutralizing anything. Caught by mutating
-        // this very guard — the same "the words are present, so it must be true"
-        // failure the rest of this file exists to catch.
-        if src.lines().any(|l| {
-            l.trim_start()
-                .starts_with("delete process.env.CLAUDE_CONFIG_DIR")
-        }) {
+        // Three properties, each earned by a version of this guard that failed
+        // without it:
+        //   1. line-anchored, not `src.contains` — commenting the statement out
+        //      leaves the text in the file, and a `contains` check stayed green
+        //      for a file that had just stopped neutralizing anything;
+        //   2. at MODULE SCOPE (zero indentation) — a `delete` nested in a
+        //      function body may never run;
+        //   3. BEFORE the first `test(` — the modules under test resolve
+        //      `claudeHome()` when they are required, so a delete that lands
+        //      after that has already lost the race.
+        let first_test = src
+            .lines()
+            .position(|l| l.trim_start().starts_with("test("))
+            .unwrap_or(usize::MAX);
+        let neutralized = src
+            .lines()
+            .enumerate()
+            .any(|(i, l)| i < first_test && l.starts_with("delete process.env.CLAUDE_CONFIG_DIR"));
+        if neutralized {
             continue;
         }
         let lines: Vec<&str> = src.lines().collect();
@@ -1087,13 +1096,35 @@ fn js_test_files_neutralize_claude_config_dir() {
             //     version of this guard checked only spawns and therefore missed
             //     `adopt.test.js`, which wrote five `projects/<slug>/memory/`
             //     trees into a canary config dir while the guard stayed green.
-            let leaks_via_spawn = line.contains("...process.env") && line.contains("HOME:");
+            //
+            // The spawn check spans a WINDOW, not one line. `env: { ...process.env,
+            // HOME: home }` fits on one line today, but its Prettier-formatted
+            // spelling puts each key on its own — a per-line check goes quiet on
+            // a pure reformat while the leak returns. Six lines covers every env
+            // literal in this suite; the scan stops at the closing brace.
+            // The first line is ALWAYS in the window. Letting `take_while` see
+            // it dropped every single-line spawn — `{ env: { ...process.env,
+            // HOME: home } });` contains `});`, so the window came back empty
+            // and the guard went green on the one shape it was already
+            // catching. Only the CONTINUATION stops at the closing brace.
+            let window: Vec<&str> = std::iter::once(*line)
+                .chain(
+                    lines
+                        .iter()
+                        .skip(i + 1)
+                        .take(5)
+                        .take_while(|l| !l.contains("});"))
+                        .copied(),
+                )
+                .collect();
+            let leaks_via_spawn = line.contains("...process.env")
+                && window.iter().any(|l| l.contains("HOME:"))
+                && !window.iter().any(|l| l.contains("CLAUDE_CONFIG_DIR"));
             let leaks_in_process = t.starts_with("process.env.HOME =");
             if (leaks_via_spawn || leaks_in_process)
                 && !line.contains("CLAUDE_CONFIG_DIR")
                 && !paired_next
             {
-                scanned += 1;
                 offenders.push(format!(
                     "{}:{}: {}",
                     path.file_name().unwrap().to_string_lossy(),
@@ -1103,8 +1134,6 @@ fn js_test_files_neutralize_claude_config_dir() {
             }
         }
     }
-    let _ = scanned;
-
     assert!(
         offenders.is_empty(),
         "{} JS test spawn(s) redirect HOME but inherit CLAUDE_CONFIG_DIR, so they \

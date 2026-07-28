@@ -803,7 +803,7 @@ test('cached binary NEWER than latest is not downgraded; unreadable is healed', 
 // ── 403 rate-limit backoff survives the check that triggered it ─────────────
 //
 // `fetchLatestRelease` writes `rateLimited: true` on a GitHub 403, and
-// `shouldCheck` reads it to hold off for RATE_LIMIT_INTERVAL_MS (24h). Between
+// `shouldCheck` reads it to hold off for RATE_LIMIT_INTERVAL_MS (1h). Between
 // those two, `checkForUpdate` took its state snapshot BEFORE the fetch and then
 // wrote `{ ...state, lastCheck: now }` on the null return — spreading the stale
 // snapshot straight over the flag the fetch had just set. The backoff was dead
@@ -815,7 +815,7 @@ test('cached binary NEWER than latest is not downgraded; unreadable is healed', 
 // file) is `os.homedir()/.cache/code-graph`, resolved at module load: the parent
 // has already resolved it against the REAL home, and this test must not write
 // there. `requestJsonFn` is the injected 403 — no network.
-test('a GitHub 403 leaves the 24h backoff armed after checkForUpdate returns', (t) => {
+test('a GitHub 403 leaves the rate-limit backoff armed after checkForUpdate returns', (t) => {
   const { spawnSync } = require('child_process');
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-403-home-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));

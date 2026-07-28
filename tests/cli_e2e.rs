@@ -7199,7 +7199,7 @@ fn test_cli_json_dead_code_unindexed_path_discloses() {
     // runs, and the loop passes no matter what the probe does — measured: with
     // the normalization deleted, the scratch repro exits 1 for `.` and `src/`
     // while this loop stayed green.
-    for ok_path in [".", "src", "src/", "./src"] {
+    for ok_path in [".", "src", "src/", "./src", "src//", "./src//"] {
         let (clean_stdout, _, clean_code) = run_cli(
             &project,
             &["dead-code", ok_path, "--min-lines", "999", "--json"],
