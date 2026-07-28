@@ -47,11 +47,18 @@ the ones that mattered.
   which finds the first token spelling that string — an earlier flag's *value*.
   `grep -t rust -- rust` computed pattern-index 1 against separator-index 2 and
   concluded there was no separator.
-- **`tmp-dir.test.js` leaked a directory into `os.tmpdir()` on every run** — 52
-  had accumulated in `~/.claude/tmp/`, the same shape `install-e2e.test.js`
-  documents at 223. It also set only `TMPDIR`, which `os.tmpdir()` ignores on
-  Windows (`TEMP`/`TMP`), so the isolation the ~5% flake fix depends on was inert
-  there. All three names are set and the sandbox is removed in `after`.
+- **Three test files leaked a temp directory into `os.tmpdir()` on every run.**
+  `tmp-dir.test.js` (52 accumulated) and `adopt.test.js` (159) both took a
+  module-load `mkdtempSync` with no owner; `lifecycle.e2e.test.js` (154) cleaned
+  each home in `t.after` but one was re-created afterwards by a child outliving
+  the run that spawned it, so a run-end sweep was added as a second net. Under
+  Claude Code `os.tmpdir()` is `~/.claude/tmp/`, the same accumulation
+  `install-e2e.test.js` documents at 223. Measured after: 0 leaked across 2 full
+  JS-suite runs and 4 isolated runs, down from +2 per run. Only the first of the
+  three was in the review; the other two were found by counting what the
+  directory actually held. `tmp-dir.test.js` also set only `TMPDIR`, which
+  `os.tmpdir()` ignores on Windows (`TEMP`/`TMP`), leaving the isolation its ~5%
+  flake fix depends on inert there; all three names are now set.
 
 ## v0.108.0 — audit 2026-07-27 remediation (12 P1s, eight review rounds)
 

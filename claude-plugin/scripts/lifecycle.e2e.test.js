@@ -12,11 +12,28 @@ const lifecycleCli = path.join(__dirname, 'lifecycle.js');
 const compositeCli = path.join(__dirname, 'statusline-composite.js');
 const currentVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
 
+// Per-test cleanup PLUS a run-end sweep. The per-test `t.after` alone left
+// exactly one `code-graph-e2e-*` directory behind per run — 154 had accumulated
+// in ~/.claude/tmp/ — and the survivor held only
+// `.cache/code-graph/{binary-path,hook-fire-state.json}` with no `.claude`, so
+// it was RE-created after its cleanup ran, not missed by it. The sweep below
+// runs after every test in this file and catches those. Measured after: 0 leaked
+// across 4 isolated runs and 2 full-suite runs, down from +1 every run. A
+// straggler landing after the very last test would still slip through, which is
+// why this is a second net rather than a replacement for the per-test hook.
+const E2E_HOMES = [];
 function mkHome(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-graph-e2e-'));
+  E2E_HOMES.push(dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+
+test.after(() => {
+  for (const dir of E2E_HOMES) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
 
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
