@@ -268,7 +268,13 @@ const ENTRY_POINTS = [
 function runDoctorCli(homeDir, args, entry = ENTRY_POINTS[0]) {
   try {
     const stdout = execFileSync(process.execPath, entry.argv(args), {
-      env: { ...process.env, HOME: homeDir },
+      // CLAUDE_CONFIG_DIR as well as HOME: claude-config.js returns
+      // `process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')`,
+      // so the env var WINS and redirecting HOME alone leaves the sandbox open
+      // for any developer who exports it. The `no arguments still repairs` case
+      // below runs the full repair pass, which is what would land in their real
+      // config. Same fix as tests/cli_e2e.rs; this JS sibling was missed.
+      env: { ...process.env, HOME: homeDir, CLAUDE_CONFIG_DIR: path.join(homeDir, '.claude') },
       stdio: ['pipe', 'pipe', 'pipe'],
     }).toString();
     return { code: 0, stdout, stderr: '' };

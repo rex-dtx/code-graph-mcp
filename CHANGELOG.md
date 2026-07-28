@@ -15,7 +15,7 @@ next `code-graph-mcp incremental-index`.
   they had asked for the read-only one. The read-only contract this release
   otherwise hardens was one keystroke from being inverted. Unknown arguments now
   exit 2 before any diagnosis runs, and `--help` prints usage without acting.
-  All **four** entry points, found one at a time and each by a different means:
+  All **five** entry points, found one at a time and each by a different means:
   `doctor.js` (the original), `node lifecycle.js doctor …` (its own copy of the
   same `includes('--check-only')` line, found by checking which callers the new
   allowlist could reject), and `code-graph-mcp doctor …` — the surface users
@@ -28,15 +28,25 @@ next `code-graph-mcp incremental-index`.
   which intercepts adopt / unadopt / uninstall before the binary: it guarded
   `--help` but ignored every other token, so `code-graph-mcp adopt --helpp` ran
   adopt and wrote the user's CLAUDE.md — one keystroke from the side effect the
-  `--help` guard exists to prevent. Regression tests run against all four, and
-  the `doctor --help` text is now byte-identical between `src/main.rs` (which
-  intercepts `--help` so it stays side-effect-free) and `doctor.js`.
+  `--help` guard exists to prevent. The fifth, found by the pre-tag review after
+  the other four were closed, is `src/main.rs`'s own **adopt / unadopt** arms —
+  they discarded the argv tail exactly as its doctor arm used to, so
+  `code-graph-mcp adopt --helpp` wrote CLAUDE.md for anyone on `cargo install` or
+  the direct binary (npm/npx users were already covered by `bin/cli.js`). Passing
+  the tail through is not the fix there: `adopt.js` reads only `argv[2]` as the
+  action and parses no flags, so a typo would become the action name — those two
+  subcommands reject any argument beyond `--help` instead. Regression tests run
+  against all five, and the `doctor --help` text is byte-identical between
+  `src/main.rs` (which intercepts `--help` so it stays side-effect-free) and
+  `doctor.js`.
 - **The npm surface described a scheme it had not touched since v0.74.**
   `code-graph-mcp adopt --help` / `unadopt --help` via npm/npx still said
   "install the code-graph memory file + MEMORY.md sentinel" — the pre-v0.74
   memory-dir target — while the same command on the binary described the
   project's CLAUDE.md managed block. Two texts for one command; npm users got
-  the stale one.
+  the stale one. The same pre-v0.74 description survived in **`README.md`**,
+  which ships inside the npm tarball — so the entry claiming this was fixed would
+  itself have shipped alongside the text it says is gone. Both corrected.
 - **`grep` explains a flag-shaped pattern instead of just failing on it.** A long
   flag the subcommand does not implement (`grep --quiet foo`) is bound to the
   *pattern* positional — deliberately, so that a term like
@@ -299,7 +309,10 @@ next `code-graph-mcp incremental-index`.
   the original defect lived in, restored by an operation that looks unrelated.
   Nothing but the index check found it. Generalise: under `core.fileMode=false`,
   an explicitly-set mode is not durable across stash/checkout, so assert it in CI
-  rather than assuming a one-time `--chmod=+x` holds.
+  rather than assuming a one-time `--chmod=+x` holds. The assertion now also runs
+  in `release.yml`'s gate: `ci.yml` never fires on a tag, so before this a
+  reverted exec bit would have published silently with the local commit gate
+  inert.
 
 ### Internal
 - **A new e2e test wrote to the real `~/.claude`.** The doctor flag guard's
@@ -313,7 +326,11 @@ next `code-graph-mcp incremental-index`.
   pins `_FIND_BINARY_ROOT` so a redirected `CARGO_TARGET_DIR` — this repo's own
   documented mitigation for target-dir growth — no longer fails it with
   "must name the offending token" while the real cause ("doctor.js not found")
-  sits in stderr. Verified: with the fix in place, the RED run still reddens and
+  sits in stderr. Its JS sibling in `doctor.test.js` sandboxed only `HOME` — the
+  same half-applied shape one file over, and `claude-config.js` reads
+  `CLAUDE_CONFIG_DIR` ahead of `os.homedir()`, so a developer who exports it had
+  the full repair pass land in their real config. Verified closed with a canary
+  config dir: byte-identical after the suite runs. Verified: with the fix in place, the RED run still reddens and
   still takes ~89 s, and settings.json, the binary pin and the npm log count are
   all byte-identical afterwards.
 - **A fourth inert negative control, deleted rather than relabelled.** The

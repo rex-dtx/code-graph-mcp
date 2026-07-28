@@ -155,11 +155,11 @@ Then reconnect the MCP server in Claude Code with `/mcp`.
 
 By default, every user prompt the plugin deems code-related gets a small context injection from `code-graph` CLI output. If you'd rather rely on MEMORY.md + explicit tool calls, opt into invited-memory mode:
 
-1. Adopt the plugin contract into your project's memory index (idempotent, self-heals):
+1. Adopt the plugin contract into your project (idempotent, self-heals):
    ```bash
    code-graph-mcp adopt
    ```
-   This writes `plugin_code_graph_mcp.md` (decision rules) into `~/.claude/projects/<slug>/memory/` and links it from `MEMORY.md` inside a sentinel block. Run `code-graph-mcp unadopt` to remove.
+   This writes a sentinel-wrapped managed block into `<cwd>/CLAUDE.md` (auto-loaded each session) plus `<cwd>/.claude/plugin_code_graph_mcp.md` (the full decision table, opened on demand). Run `code-graph-mcp unadopt` to remove both; content outside the managed block is kept.
 2. Set the activation env var in `~/.claude/settings.json`:
    ```json
    {

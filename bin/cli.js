@@ -8,7 +8,7 @@ const path = require("path");
 process.env._FIND_BINARY_ROOT = path.resolve(__dirname, "..");
 
 // Intercept adopt / unadopt before forwarding — they're node-only concerns
-// (write to ~/.claude/projects/<slug>/memory/) and have no Rust counterpart.
+// (write <cwd>/CLAUDE.md + <cwd>/.claude/) and have no Rust counterpart.
 // Lets `code-graph-mcp adopt` / `unadopt` work uniformly across plugin / npm / npx.
 const sub = process.argv[2];
 
