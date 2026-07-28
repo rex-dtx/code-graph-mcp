@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.108.1 — post-release review of v0.108.0
 
-Post-release review of v0.108.0. Nothing here changes the shipped binary's
-behaviour for a project-relative path; the two developer-machine findings are
-the ones that mattered.
+No index rebuild: `INDEX_VERSION` is unchanged at 53, and nothing here changes
+the shipped binary's answer for a project-relative path. The two
+developer-machine findings are the ones that mattered.
 
 ### Fixed
 - **`scripts/install-e2e.test.js` acted on the developer's real Claude config.**
