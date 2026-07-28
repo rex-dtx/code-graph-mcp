@@ -1,5 +1,73 @@
 # Changelog
 
+## Unreleased
+
+Audit 2026-07-27 P2 batch: 11 of the ~29 observations, chosen for the ones whose
+failure mode is silence. No `INDEX_VERSION` change; no rebuild.
+
+### Added
+- **`.gitattributes` (`* text=auto eol=lf`)** — pins LF in the working tree on
+  every platform, removing the CRLF class that cost v0.108.0 a full
+  push/CI/fix round on an otherwise green release. `git add --renormalize .`
+  changed nothing else: the repo was already all-LF, so this is purely
+  preventive for Windows checkouts. It had to be negated in `.gitignore` first —
+  the `.*` blanket rule silently refuses every new repo-root dotfile, and
+  `git add` reports that as a hint rather than a failure.
+
+### Fixed
+- **SQL `LIKE` treated `_` as a wildcard in the test-source filter** (P2-10), so
+  `latest.cs` (`%`=`l`, `_`=`a`, then `test.`) and `attest.py` were classified as
+  tests and dropped from every production-caller count. The `'test\_%'` leg one
+  line above was already escaped, in the same string literal. Fixing it exposed
+  two more divergences in the same direction: the infix leg was a *contains* over
+  any extension while `is_test_path` is an *ends-with* over four, and the name leg
+  was ASCII-case-insensitive while `is_test_symbol` is `starts_with`, so
+  `Test_Signup` was excluded too. Both legs are now GLOB, and the infix leg is
+  generated from `INFIX_TEST_EXTS`. This was the fifth copy of the
+  test-classification rule and the only one with no mechanical guard; it has one
+  now, asserting the one-directional invariant that actually holds — the filter
+  may be narrower than `is_test_symbol` (an accepted recall gap), never broader.
+- **The release workflow's `concurrency.group` had no dispatch-tag fallback**
+  (P2-21) — the one site of seven missing it. A re-release dispatched from `main`
+  grouped under `refs/heads/main` while the tag-push run for the same version
+  grouped under `refs/tags/vX.Y.Z`, so the two did not serialize: exactly the
+  race the comment above that block says it prevents. A drift guard now covers
+  every `github.ref` expression in the file.
+- **The 24h GitHub rate-limit backoff was dead code** (P2-19). `checkForUpdate`
+  snapshotted state before the fetch and wrote it back on the null return,
+  erasing the `rateLimited: true` that the 403 handler had just set — so every
+  403 cleared the flag it raised, and polling continued on the ordinary interval.
+- **Both fail-open links in the download chains are closed.** The binary chain
+  (P2-24) treated a missing sha256 sidecar as permission to install: it now
+  retries once, then refuses. The plugin chain (P2-23) had no checksum available
+  at all — it pulled GitHub's auto-generated source tarball, for which nothing
+  publishes a digest, and it is the one chain whose payload becomes *executed
+  code* (the extracted JS is copied into the plugin cache and run as hooks).
+  `release.yml` now publishes `claude-plugin.tar.gz` with a `.sha256` sidecar,
+  and the client refuses to extract without a match. The binary update still
+  proceeds in every refusal case, so a bad plugin asset strands no one.
+- **All 21 first-party `actions/*` uses were on mutable major tags** (P2-25)
+  while all 13 third-party ones were SHA-pinned — the harder half to justify,
+  since `actions/checkout` runs first in every job including the one holding
+  `NPM_TOKEN`. Every `uses:` is now pinned to a verified 40-hex commit, with a
+  drift guard.
+- **`similar --json` answered an exit-1 miss with a bare `[]`** (P2-14), the last
+  CLI command doing so while `impact` / `callgraph` / `trace` / `deps` all answer
+  `{error, symbol}`. Once stderr is dropped that array is indistinguishable from
+  a successful empty result. The test meant to enforce the contract was pinning
+  its violation. The sqlite-vec-absent case now discloses too: "similarity could
+  not be computed" is not "nothing is similar".
+- **`dead-code <path-with-nothing-indexed> --json` returned `[]` and exit 0**
+  (P2-15) — a clean bill of health for a path the index has never heard of, while
+  `overview` answers the same input with an error object and exit 1.
+- **`get_ast_node` did not treat an empty `file_path` as absent** (incremental
+  audit Δ1) — the one of five tools missing the filter its siblings carry, and
+  that this same function applies to `symbol_name` forty lines below. An LLM
+  client that fills every declared field with a placeholder got "File '' not
+  found" for a request naming a real symbol.
+- **`git rev-list` gained its `--` separator** (P2-26), matching the `ls-files`
+  sibling 40 lines away that already carried the comment explaining why.
+
 ## v0.108.1 — post-release review of v0.108.0
 
 No index rebuild: `INDEX_VERSION` is unchanged at 53, and nothing here changes
