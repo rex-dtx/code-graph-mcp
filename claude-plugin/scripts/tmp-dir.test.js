@@ -15,7 +15,24 @@ const path = require('path');
 // re-creates it and the assertion fails. Measured at 2 failures in 40 full-suite
 // runs (~5%), while passing every time in isolation, which is the signature of
 // this race rather than a logic bug. Owning our own TMPDIR removes the sharing.
-process.env.TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-tmpdir-test-'));
+//
+// All three names are set: node's os.tmpdir() reads TMPDIR first on POSIX but
+// TEMP/TMP on Windows and ignores TMPDIR entirely there, so setting TMPDIR alone
+// left the isolation inert for Windows developers — the ~5% flake this fixes
+// would have survived on exactly the platform the comment above claims to cover.
+const TMP_SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-tmpdir-test-'));
+process.env.TMPDIR = TMP_SANDBOX;
+process.env.TEMP = TMP_SANDBOX;
+process.env.TMP = TMP_SANDBOX;
+
+// And it gets removed. Without this the sandbox (plus the `code-graph-mcp/`
+// subdir the tests create inside it) survived every run in the REAL os.tmpdir()
+// — which under Claude Code is ~/.claude/tmp/, the same accumulation
+// install-e2e.test.js documents at 223 observed directories. A test whose whole
+// subject is "do not leak into os.tmpdir()" must not leak into os.tmpdir().
+test.after(() => {
+  try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 const { cgTmpDir, CG_TMP_DIR } = require('./tmp-dir');
 

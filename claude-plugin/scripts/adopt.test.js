@@ -9,7 +9,17 @@ const os = require('os');
 // adopted-projects registry under ~/.cache/code-graph. Point HOME at a
 // sandbox BEFORE any test runs so no test writes the real user registry
 // (os.homedir() reads $HOME at call time on POSIX).
-process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-isolated-home-'));
+//
+// And it is REMOVED when the run ends. Without this the sandbox survived every
+// run in the real os.tmpdir() — which under Claude Code is ~/.claude/tmp/ —
+// measured at 159 accumulated `cg-adopt-isolated-home-*` directories, growing by
+// exactly one per run. Same shape as the leak fixed in tmp-dir.test.js: a
+// module-load mkdtemp with no owner, invisible to the exit code.
+const ISOLATED_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-isolated-home-'));
+process.env.HOME = ISOLATED_HOME;
+test.after(() => {
+  try { fs.rmSync(ISOLATED_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 const {
   adopt, unadopt, memoryDir, stripSentinelBlock,
   isAdopted, isPluginModeInstall, maybeAutoAdopt, needsRefresh, isProjectRoot,

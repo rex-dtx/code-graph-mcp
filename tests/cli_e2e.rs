@@ -914,10 +914,18 @@ fn test_cli_doctor_rejects_an_unknown_flag_instead_of_repairing() {
     // CLAUDE_CONFIG_DIR is set too, not just HOME: claude-config.js honours it
     // ahead of os.homedir(), so redirecting HOME alone leaves an escape hatch
     // for anyone who has it exported.
+    //
+    // It must point at `<home>/.claude`, NOT at `<home>`. `settingsPath()` is
+    // `claudeHome()/settings.json`, so pointing it at `<home>` made the closing
+    // assertion below watch `<home>/.claude/settings.json` — a path nothing in
+    // the program can ever create. The guard read as live and was inert: the
+    // mutation it claims to catch (a repair pass running here) would have
+    // written `<home>/settings.json` and the assertion would still have passed.
     let home = TempDir::new().unwrap();
+    let claude_home = home.path().join(".claude");
     let sandbox_env: Vec<(&str, &str)> = vec![
         ("HOME", home.path().to_str().unwrap()),
-        ("CLAUDE_CONFIG_DIR", home.path().to_str().unwrap()),
+        ("CLAUDE_CONFIG_DIR", claude_home.to_str().unwrap()),
     ];
 
     // `doctor` is JS-dispatched: main.rs spawns claude-plugin/scripts/doctor.js
@@ -965,11 +973,20 @@ stderr: {stderr}"
     );
 
     // And nothing landed in the sandboxed home — if a future edit lets a repair
-    // run here, this is what catches it before it reaches a real machine.
-    assert!(
-        !home.path().join(".claude/settings.json").exists(),
-        "a rejected flag (and --check-only) must not write settings.json"
-    );
+    // run here, this is what catches it before it reaches a real machine. The
+    // path is derived from `claude_home` (the same value handed to the child)
+    // rather than spelled out, so the two can no longer drift apart silently.
+    for artifact in [
+        "settings.json",
+        "statusline-providers.json",
+        "plugins/installed_plugins.json",
+    ] {
+        assert!(
+            !claude_home.join(artifact).exists(),
+            "a rejected flag (and --check-only) must not write {artifact}; found one at {}",
+            claude_home.join(artifact).display()
+        );
+    }
 }
 
 // ============================================================
