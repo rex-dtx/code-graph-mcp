@@ -9392,7 +9392,7 @@ mod tests {
     /// contains it, reddening four tests on the windows-latest CI leg while every
     /// Linux run stayed green.
     #[test]
-    fn windows_absolute_spellings_are_rejected_on_every_platform() {
+    fn windows_absolute_spellings_are_rejected_by_spelling_off_windows() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         for raw in [
@@ -9416,14 +9416,21 @@ mod tests {
         // the boundary; the earlier version of this control never did, so it
         // passed while the guard rejected the real, indexed root-level file
         // `a:b.rs` with "outside the project root".
-        for ok in [
-            "a:b.rs",   // colon at byte 1, no separator after → ordinary filename
-            "z:name",   // same shape, different letter
-            "a:b/c.rs", // and with a directory below it
-            "d/repo/src/Foo.cs",
-            "src/a:b.rs",
-            "a/b:c",
-        ] {
+        //
+        // The colon-bearing cases are Unix-only, and asserting them "on every
+        // platform" is what reddened this test on the windows-latest CI leg. `:`
+        // is legal in a POSIX filename, so `a:b.rs` there is an ordinary file
+        // sitting in the project root and refusing it is a false answer. On
+        // Windows it is neither: `a:` is a DRIVE-RELATIVE prefix, and NTFS
+        // forbids `:` in a name outright (it introduces an alternate data
+        // stream). Rejecting them there is correct, so the expectation, not the
+        // behaviour, is what has to be platform-scoped.
+        let colon_names: &[&str] = if cfg!(windows) {
+            &[]
+        } else {
+            &["a:b.rs", "z:name", "a:b/c.rs", "src/a:b.rs", "a/b:c"]
+        };
+        for ok in [&["d/repo/src/Foo.cs"][..], colon_names].concat() {
             for backslash_is_sep in [true, false] {
                 assert!(
                     normalize_user_path_from_on(root, root, ok, backslash_is_sep).is_ok(),
