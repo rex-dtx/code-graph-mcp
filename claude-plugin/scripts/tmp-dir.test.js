@@ -5,6 +5,18 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Redirect TMPDIR to a private sandbox BEFORE requiring tmp-dir, which resolves
+// CG_TMP_DIR from os.tmpdir() at module load.
+//
+// `node --test` runs test FILES in parallel processes, and CG_TMP_DIR is a
+// single shared path that every one of them may create. The
+// "returns the same path and creates the directory" test below wipes it and
+// then asserts it is absent — a sibling file calling cgTmpDir() in that window
+// re-creates it and the assertion fails. Measured at 2 failures in 40 full-suite
+// runs (~5%), while passing every time in isolation, which is the signature of
+// this race rather than a logic bug. Owning our own TMPDIR removes the sharing.
+process.env.TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-tmpdir-test-'));
+
 const { cgTmpDir, CG_TMP_DIR } = require('./tmp-dir');
 
 test('CG_TMP_DIR is a "code-graph-mcp" subdir of os.tmpdir()', () => {

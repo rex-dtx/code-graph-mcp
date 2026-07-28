@@ -83,3 +83,57 @@ jobs:
       # ones release.yml actually links against.
       - name: Build (warm dependency cache)
         run: cargo build --release --features embed-model --target ${{ matrix.target }}
+
+  # Primes release.yml's `gate` job (audit 2026-07-27 P1-3), which is the only
+  # thing standing between a tag push and an irreversible npm publish. Same
+  # ref-scoping problem as `warm` above: gate runs on refs/tags/vX and can only
+  # restore a cache written on the default branch, so gate is restore-only
+  # (`save-if: false`) and this job is the sole writer of `release-gate`.
+  #
+  # Distinct from `warm`: gate compiles the DEV profile with --all-targets (test
+  # binaries, clippy metadata), a different artifact set from `warm`'s
+  # `--release` host build, so it needs its own cache entry rather than sharing
+  # release-x86_64-unknown-linux-gnu.
+  #
+  # Commands mirror gate byte-for-byte, `-D warnings` included: the lint flags
+  # participate in cargo's fingerprint, so a "cheaper" variant here would warm a
+  # cache gate then misses. The consequence is that a lint-red or test-red main
+  # turns this job red — a true signal, since the next tag's gate would fail the
+  # same way. `cache-on-failure` is set because of that: it defaults to FALSE, so
+  # without it a single failing lint on main would also mean no cache was saved,
+  # and the warming would stay dark for as long as main stayed red — precisely
+  # when a release is most likely to need re-running.
+  warm-gate:
+    name: Warm release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      # shared-key must stay identical to release.yml's gate step.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-gate
+          cache-on-failure: true
+
+      - name: Clippy (no default features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Clippy (embed-model)
+        run: cargo clippy --features embed-model --all-targets -- -D warnings
+
+      - name: Test (embed-model)
+        # Mirrors ci.yml's embed-check job: without this the spawned `serve`
+        # integration tests background-fetch the ~90 MB model on a runner whose
+        # cache does not carry it — slow, and flaky because cache population
+        # flips which tests self-skip. This job is now the last gate before an
+        # irreversible npm publish, so it must not be the flakiest one.
+        env:
+          CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'
+        run: cargo test --features embed-model

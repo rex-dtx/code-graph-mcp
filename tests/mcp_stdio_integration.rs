@@ -1260,3 +1260,138 @@ fn mcp_trace_confidence_floor_over_wire() {
         "nothing is suppressed at the ambiguous floor; got: {body}"
     );
 }
+
+/// Contract audit 2026-07-27: the two `find_references` surfaces disagreed about
+/// an import-only name, and the MCP one lied about why.
+///
+/// `<external>` sentinels are excluded from *resolution* on purpose, so
+/// `resolve_fuzzy` returns NotFound for a name that exists only as an import.
+/// The NotFound arm then re-queried unfiltered, found the sentinel, and reported
+/// it as a "test/bench path" the caller could "bypass the test filter" on —
+/// `<external>` is neither a path on disk nor subject to any test filter, and
+/// the advice it gives an LLM client cannot work. Meanwhile the CLI `refs`
+/// answered normally, so CHANGELOG's "find_references / refs now answer for
+/// imported std names" was true of exactly half of what it named.
+#[test]
+fn mcp_find_references_answers_for_an_import_only_name() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    // HashMap exists ONLY as an import — no project symbol by that name.
+    std::fs::write(
+        src.join("a.rs"),
+        "use std::collections::HashMap;\npub fn build() -> HashMap<u8, u8> { HashMap::new() }\n",
+    )
+    .unwrap();
+    // A project symbol whose name is ALSO imported from std in the same file.
+    // This is the negative control for the split below.
+    //
+    // Two earlier versions of it were INERT, for two different reasons, and the
+    // second is the subtle one:
+    //   1. the fixture defined `take_local`, so there was no project `take` to
+    //      prefer and the assertion could not fail;
+    //   2. `use`-import sentinels are stored with node type `module`, and the
+    //      by-name queries already carry `AND n.type != 'module'` — so the
+    //      `<external>` predicate the control is supposed to exercise was a
+    //      no-op for them. Deleting it changed nothing and the test still passed.
+    //
+    // `impl Debug for S` is what makes it live: an IMPLEMENTS sentinel is typed
+    // `trait`, which the type filter does not catch, so `<external>` exclusion is
+    // the only thing keeping `Debug` from resolving to a phantom definition.
+    std::fs::write(
+        src.join("b.rs"),
+        "use std::mem::take;\npub fn take() -> u8 { 7 }\npub fn helper() -> u8 { take() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"ext_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let mut client = McpClient::spawn(project.path());
+    let resp = client.call_tool("find_references", json!({ "symbol_name": "HashMap" }));
+
+    let err_text = resp
+        .get("error")
+        .and_then(|e| e["message"].as_str())
+        .or_else(|| {
+            if resp["result"]["isError"].as_bool() == Some(true) {
+                resp["result"]["content"][0]["text"].as_str()
+            } else {
+                None
+            }
+        });
+
+    // Whatever it does, it must never describe `<external>` as a test/bench path.
+    if let Some(text) = err_text {
+        assert!(
+            !text.contains("test/bench paths"),
+            "`<external>` is not a test/bench path and there is no filter to \
+             bypass; this message sends an LLM client down an impossible \
+             recovery. Got: {text}"
+        );
+    }
+
+    // And per CHANGELOG it should answer with the import edges that bind it.
+    let body = extract_tool_payload(&resp);
+    let refs = body["references"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected references for an import-only name, got: {body}"));
+    assert!(
+        !refs.is_empty(),
+        "find_references on an import-only name must return its `imports` rows \
+         (the CLI `refs` surface already does): {body}"
+    );
+
+    // A name that exists BOTH as a project symbol and as a std import must still
+    // resolve to the project symbol.
+    //
+    // Honest scope, after three attempts to make this a negative control for the
+    // `<external>` exclusion and three mutation runs proving it was not one: it
+    // is NOT that control and cannot be. The by-name fuzzy path already carries
+    // `AND n.type != 'module'`, and a sentinel is typed non-`module` only when no
+    // project symbol shares its name — precisely the case with nothing to
+    // discriminate. Deleting `EXCLUDE_EXTERNAL_BY_NAME` or neutering
+    // `is_selectable_definition` leaves this test green.
+    //
+    // The live guard for that exclusion is
+    // `show_does_not_resolve_a_name_that_exists_only_as_an_import` in
+    // tests/reader_nondestructive.rs, which drives the binary at the surface
+    // where the defect was observed. Round-7 correction: it goes red under the
+    // SQL mutation only — `is_selectable_definition` sits BEHIND that guard, so
+    // no reachable input exercises it end-to-end, and it is unit-tested directly
+    // in src/resolve.rs instead. What the assertions below DO cover is
+    // project-symbol preference, which is worth pinning on its own.
+    let resp = client.call_tool("find_references", json!({ "symbol_name": "take" }));
+    let body = extract_tool_payload(&resp);
+    let refs = body["references"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected references for a project `take`, got: {body}"));
+    assert!(
+        refs.iter()
+            .any(|r| r["file_path"].as_str() == Some("src/b.rs")),
+        "`take` must resolve to the project fn in src/b.rs, not to the std import \
+         sentinel: {body}"
+    );
+    assert!(
+        !refs
+            .iter()
+            .any(|r| r["file_path"].as_str() == Some("<external>")),
+        "a name with a real project definition must not resolve to `<external>`: {body}"
+    );
+
+    // An earlier version added a `Debug` trait-sentinel block here labelled "the
+    // live half of the control". Round 7 instrumented it: the payload is
+    // byte-identical with and without the exclusion, because find_references
+    // answers from EDGE rows, which never enter the by-name lookups the
+    // exclusion filters — as `EXCLUDE_EXTERNAL_BY_NAME`'s own doc comment states.
+    // It was the FOURTH inert control in this effort, so it is deleted rather
+    // than relabelled: an inert block invites the next reader to trust it.
+}

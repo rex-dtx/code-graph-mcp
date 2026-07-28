@@ -142,20 +142,38 @@ impl McpServer {
                     // user is on a dead-code → find_references reverse-trace and
                     // needs to know they can bypass with node_id/file_path.
                     let unfiltered = queries::get_node_ids_by_name(self.db.conn(), symbol_name)?;
-                    if !unfiltered.is_empty() {
-                        let example_paths: Vec<String> = unfiltered
-                            .iter()
-                            .take(3)
-                            .map(|(_, fp)| fp.clone())
-                            .collect();
+                    // `<external>` sentinels are excluded by resolve_fuzzy (that
+                    // is deliberate — symbol *resolution* must keep preferring a
+                    // project symbol over an imported std name), so an
+                    // import-only name lands here. Answering with its `imports`
+                    // edges is what CHANGELOG promises for both refs surfaces,
+                    // and it is what the CLI already does by querying unfiltered
+                    // (src/cli.rs:7127). Without this split the MCP half instead
+                    // told an LLM client that `<external>` was a "test/bench
+                    // path" it could "bypass the test filter" on — a path that
+                    // does not exist on disk and a filter that is not applied.
+                    let (external, testish): (Vec<_>, Vec<_>) = unfiltered
+                        .into_iter()
+                        .partition(|(_, fp)| fp == crate::domain::EXTERNAL_FILE_PATH);
+                    if !external.is_empty() {
+                        (
+                            external.into_iter().map(|(id, _)| id).collect(),
+                            symbol_name.to_string(),
+                        )
+                    } else if !testish.is_empty() {
+                        let example_paths: Vec<String> =
+                            testish.iter().take(3).map(|(_, fp)| fp.clone()).collect();
                         return Err(anyhow!(
                             "Symbol '{}' exists but all {} match(es) are in test/bench paths ({}). \
                              Pass node_id (use ast_search or get_ast_node to obtain one) or \
                              file_path explicitly to bypass the test filter.",
-                            symbol_name, unfiltered.len(), example_paths.join(", ")
+                            symbol_name,
+                            testish.len(),
+                            example_paths.join(", ")
                         ));
+                    } else {
+                        return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name.", symbol_name));
                     }
-                    return Err(anyhow!("Symbol '{}' not found in index. Use semantic_code_search to find the correct symbol name.", symbol_name));
                 }
             }
         };

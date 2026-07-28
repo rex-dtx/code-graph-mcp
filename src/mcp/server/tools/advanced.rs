@@ -423,7 +423,13 @@ impl McpServer {
         &self,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let path = args["path"].as_str();
+        // Separator-normalized at entry (see `super::normalize_path_arg`): this
+        // value becomes a LIKE prefix against `files.path`, which stores `/`. A
+        // Windows client passing `src\parser` matched nothing and the tool
+        // answered "No dead code found" — a false clean, the quietest possible
+        // failure for a tool whose whole job is reporting absence.
+        let path = args["path"].as_str().map(super::normalize_path_arg);
+        let path = path.as_deref();
         let node_type = args["node_type"].as_str();
         // Validate node_type up-front: an unknown alias normalizes to an empty Vec
         // and find_dead_code falls through to a literal `n.type = :x` match that
@@ -436,10 +442,18 @@ impl McpServer {
         // ignore_paths: prefix-match exclusions. When omitted, apply defaults for
         // shell-invoked entry points (plugin hooks / lifecycle scripts) that the
         // static AST call graph can't track. Pass an empty array to disable.
+        // Separator-normalized for the same reason `path` above is, and it is the
+        // sibling that was missed when `path` was fixed FIVE LINES UP: these are
+        // matched with `starts_with` against `/`-stored file paths, so a Windows
+        // client's `ignore_paths: ["src\\generated"]` excludes nothing and the
+        // tool over-reports dead code. The entry-normalization drift guard reads
+        // the literal `args["…"]` bracket form and only the keys `path` /
+        // `file_path`, so it cannot see this site — `assert_ignore_paths_
+        // normalized_in_source` in tests/hardening.rs covers it instead.
         let (ignore_prefixes, ignore_was_defaulted) = match args.get("ignore_paths") {
             Some(serde_json::Value::Array(arr)) => (
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| v.as_str().map(super::normalize_path_arg))
                     .collect::<Vec<_>>(),
                 false,
             ),

@@ -204,6 +204,12 @@ pub fn find_functions_by_fuzzy_name(
          JOIN files f ON f.id = n.file_id
          WHERE (n.name LIKE ?1 ESCAPE '\\' OR n.name_tokens LIKE ?3 ESCAPE '\\')
            AND n.type != 'module'
+           -- `<external>` holds sentinel nodes for imports binding outside
+           -- the project. `n.type != 'module'` already drops the import
+           -- sentinels, but IMPLEMENTS sentinels are typed `trait` and slip
+           -- through — so a `use std::fmt::Debug; impl Debug for S {}` made
+           -- `Debug` a fuzzy candidate the caller cannot open or select.
+           AND f.path <> '<external>'
          ORDER BY
            CASE WHEN n.name = ?2 THEN 0
                 WHEN n.name LIKE ?4 || '%' ESCAPE '\\' THEN 1
@@ -241,10 +247,13 @@ pub fn find_functions_by_fuzzy_name(
         _ => 3,
     };
 
+    // Same two exclusions as phase 1 — a candidate the LIKE pass refuses to
+    // return must not reappear through the typo fallback.
     let sql2 = "SELECT DISTINCT n.name, f.path, n.type, n.id, n.start_line
          FROM nodes n
          JOIN files f ON f.id = n.file_id
          WHERE n.type != 'module'
+           AND f.path <> '<external>'
          LIMIT 5000";
     let mut stmt2 = conn.prepare(sql2)?;
     let rows2 = stmt2.query_map([], |row| {

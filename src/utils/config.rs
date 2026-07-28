@@ -87,7 +87,7 @@ pub fn detect_language(path: &str) -> Option<&'static str> {
 /// Shared by the dependency-graph tool, `deps`, and `affected` so the cross-language
 /// filter stays identical across all three reverse-dependency consumers.
 pub fn is_compatible_lang(root_path: &str, dep_path: &str) -> bool {
-    if dep_path == "<external>" {
+    if dep_path == crate::domain::EXTERNAL_FILE_PATH {
         return false;
     }
     match (detect_language(root_path), detect_language(dep_path)) {

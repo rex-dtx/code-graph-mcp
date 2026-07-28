@@ -80,148 +80,163 @@ impl McpServer {
             self.ensure_file_fresh_opt(Some(path))?;
         }
 
-        // Return cached result if fresh (< 60s), evict if expired
-        {
+        // Return cached result if fresh (< 60s), evict if expired.
+        //
+        // The cache holds the BASE overview only, and the `include_deps` /
+        // `include_dead` folding below runs on cached and freshly-built results
+        // alike. The flags are not part of the cache key, so an early return here
+        // silently dropped them: once any caller warmed `path` (SessionStart
+        // injection does), every `include_dead:true` call for the next 60s came
+        // back byte-identical to a plain one — no `dead_code`, and no
+        // `dead_code_unavailable` either, so the absence was indistinguishable
+        // from "nothing dead here". `project_map` keeps `centrality` outside its
+        // cache for exactly this reason; this one was missed.
+        let cached_base = {
             let mut cache = lock_or_recover(&self.cache.cached_module_overviews, "cached_movw");
-            if let Some((ts, _)) = cache.get(path) {
-                if ts.elapsed().as_secs() < 60 {
-                    let val = cache.get(path).unwrap().1.clone();
-                    if compact {
-                        return self.compact_module_overview(&val);
-                    }
-                    return Ok(val);
-                } else {
+            match cache.get(path) {
+                Some((ts, val)) if ts.elapsed().as_secs() < 60 => Some(val.clone()),
+                Some(_) => {
                     cache.remove(path);
+                    None
                 }
+                None => None,
             }
-        }
+        };
 
-        let exports = queries::get_module_exports(self.db.conn(), path)?;
+        let mut result = if let Some(cached) = cached_base {
+            cached
+        } else {
+            let exports = queries::get_module_exports(self.db.conn(), path)?;
 
-        // Filter out test functions — they add noise to module overviews
-        let exports: Vec<_> = exports
-            .into_iter()
-            .filter(|e| !is_test_symbol(&e.name, &e.file_path))
-            .collect();
+            // Filter out test functions — they add noise to module overviews
+            let exports: Vec<_> = exports
+                .into_iter()
+                .filter(|e| !is_test_symbol(&e.name, &e.file_path))
+                .collect();
 
-        // Get import/dependency info at file level
-        let files: std::collections::HashSet<&str> =
-            exports.iter().map(|e| e.file_path.as_str()).collect();
+            // Get import/dependency info at file level
+            let files: std::collections::HashSet<&str> =
+                exports.iter().map(|e| e.file_path.as_str()).collect();
 
-        // Split exports into active (called by others) and inactive to save tokens.
-        let (active, inactive): (Vec<_>, Vec<_>) = exports.iter().partition(|e| e.caller_count > 0);
+            // Split exports into active (called by others) and inactive to save tokens.
+            let (active, inactive): (Vec<_>, Vec<_>) =
+                exports.iter().partition(|e| e.caller_count > 0);
 
-        let mut hot_candidates: Vec<_> = exports.iter().filter(|e| e.caller_count > 0).collect();
-        hot_candidates.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
-        let hot_paths: Vec<serde_json::Value> = hot_candidates
-            .iter()
-            .take(5)
-            .map(|e| {
-                let mut obj = json!({
-                    "name": e.name,
-                    "type": e.node_type,
-                    "file": e.file_path,
-                    "caller_count": e.caller_count,
-                });
-                if e.qualified_name != e.name {
-                    obj["qualified_name"] = json!(e.qualified_name);
-                }
-                obj
-            })
-            .collect();
+            let mut hot_candidates: Vec<_> =
+                exports.iter().filter(|e| e.caller_count > 0).collect();
+            hot_candidates.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
+            let hot_paths: Vec<serde_json::Value> = hot_candidates
+                .iter()
+                .take(5)
+                .map(|e| {
+                    let mut obj = json!({
+                        "name": e.name,
+                        "type": e.node_type,
+                        "file": e.file_path,
+                        "caller_count": e.caller_count,
+                    });
+                    if e.qualified_name != e.name {
+                        obj["qualified_name"] = json!(e.qualified_name);
+                    }
+                    obj
+                })
+                .collect();
 
-        // Active exports get full detail; inactive ones are summarized by type.
-        const MAX_ACTIVE: usize = 30;
-        let active_capped = active.len() > MAX_ACTIVE;
-        let mut active_sorted = active.clone();
-        active_sorted.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
-        let active_exports: Vec<serde_json::Value> = active_sorted
-            .iter()
-            .take(MAX_ACTIVE)
-            .map(|e| {
-                let mut obj = json!({
-                    "node_id": e.node_id,
-                    "name": e.name,
-                    "type": e.node_type,
-                    "file": e.file_path,
-                    "caller_count": e.caller_count,
-                    "signature": e.signature,
-                    "start_line": e.start_line,
-                    "end_line": e.end_line,
-                });
-                // Disambiguate same-named methods of different classes (parity with
-                // CLI `overview --json`). Present only when it adds info.
-                if e.qualified_name != e.name {
-                    obj["qualified_name"] = json!(e.qualified_name);
-                }
-                obj
-            })
-            .collect();
+            // Active exports get full detail; inactive ones are summarized by type.
+            const MAX_ACTIVE: usize = 30;
+            let active_capped = active.len() > MAX_ACTIVE;
+            let mut active_sorted = active.clone();
+            active_sorted.sort_by_key(|e| std::cmp::Reverse(e.caller_count));
+            let active_exports: Vec<serde_json::Value> = active_sorted
+                .iter()
+                .take(MAX_ACTIVE)
+                .map(|e| {
+                    let mut obj = json!({
+                        "node_id": e.node_id,
+                        "name": e.name,
+                        "type": e.node_type,
+                        "file": e.file_path,
+                        "caller_count": e.caller_count,
+                        "signature": e.signature,
+                        "start_line": e.start_line,
+                        "end_line": e.end_line,
+                    });
+                    // Disambiguate same-named methods of different classes (parity with
+                    // CLI `overview --json`). Present only when it adds info.
+                    if e.qualified_name != e.name {
+                        obj["qualified_name"] = json!(e.qualified_name);
+                    }
+                    obj
+                })
+                .collect();
 
-        // Compact summary for inactive symbols — just counts by type
-        let mut inactive_by_type: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
-        for e in &inactive {
-            // Show `Class.method` for members so two same-named methods of different
-            // classes don't both surface as a bare, indistinguishable `render`.
-            inactive_by_type
-                .entry(e.node_type.as_str())
-                .or_default()
-                .push(e.display_name());
-        }
-        let inactive_summary: Vec<serde_json::Value> = inactive_by_type
-            .iter()
-            .map(|(typ, names)| {
-                let display: Vec<&&str> = names.iter().take(8).collect();
-                let mut obj = json!({
-                    "type": typ,
-                    "count": names.len(),
-                    "names": display,
-                });
-                if names.len() > 8 {
-                    obj["more"] = json!(names.len() - 8);
-                }
-                obj
-            })
-            .collect();
-
-        let mut result = json!({
-            "path": raw_path,
-            "files_count": files.len(),
-            "active_exports": active_exports,
-            "inactive_summary": inactive_summary,
-            "hot_paths": hot_paths,
-            "summary": format!("Module '{}': {} active + {} inactive exports across {} files",
-                raw_path, active.len(), inactive.len(), files.len())
-        });
-        if files.is_empty() {
-            result["warning"] = json!(format!("No files found for path '{}'. Check that the path is relative to the project root.", raw_path));
-        }
-        if active_capped {
-            result["active_capped"] = json!(true);
-            result["showing"] = json!(MAX_ACTIVE);
-            result["total_active"] = json!(active.len());
-            result["hint"] = json!("Active exports capped. Use a more specific path to see all.");
-        }
-
-        // Cache the full result (max 10 entries to bound memory)
-        {
-            let mut cache = lock_or_recover(&self.cache.cached_module_overviews, "cached_movw");
-            if cache.len() >= 10 {
-                // Evict oldest entry
-                if let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, (ts, _))| *ts)
-                    .map(|(k, _)| k.to_string())
-                {
-                    cache.remove(&oldest_key);
-                }
+            // Compact summary for inactive symbols — just counts by type
+            let mut inactive_by_type: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for e in &inactive {
+                // Show `Class.method` for members so two same-named methods of different
+                // classes don't both surface as a bare, indistinguishable `render`.
+                inactive_by_type
+                    .entry(e.node_type.as_str())
+                    .or_default()
+                    .push(e.display_name());
             }
-            cache.insert(
-                path.to_string(),
-                (std::time::Instant::now(), result.clone()),
-            );
-        }
+            let inactive_summary: Vec<serde_json::Value> = inactive_by_type
+                .iter()
+                .map(|(typ, names)| {
+                    let display: Vec<&&str> = names.iter().take(8).collect();
+                    let mut obj = json!({
+                        "type": typ,
+                        "count": names.len(),
+                        "names": display,
+                    });
+                    if names.len() > 8 {
+                        obj["more"] = json!(names.len() - 8);
+                    }
+                    obj
+                })
+                .collect();
+
+            let mut result = json!({
+                "path": raw_path,
+                "files_count": files.len(),
+                "active_exports": active_exports,
+                "inactive_summary": inactive_summary,
+                "hot_paths": hot_paths,
+                "summary": format!("Module '{}': {} active + {} inactive exports across {} files",
+                    raw_path, active.len(), inactive.len(), files.len())
+            });
+            if files.is_empty() {
+                result["warning"] = json!(format!("No files found for path '{}'. Check that the path is relative to the project root.", raw_path));
+            }
+            if active_capped {
+                result["active_capped"] = json!(true);
+                result["showing"] = json!(MAX_ACTIVE);
+                result["total_active"] = json!(active.len());
+                result["hint"] =
+                    json!("Active exports capped. Use a more specific path to see all.");
+            }
+
+            // Cache the full result (max 10 entries to bound memory)
+            {
+                let mut cache = lock_or_recover(&self.cache.cached_module_overviews, "cached_movw");
+                if cache.len() >= 10 {
+                    // Evict oldest entry
+                    if let Some(oldest_key) = cache
+                        .iter()
+                        .min_by_key(|(_, (ts, _))| *ts)
+                        .map(|(k, _)| k.to_string())
+                    {
+                        cache.remove(&oldest_key);
+                    }
+                }
+                cache.insert(
+                    path.to_string(),
+                    (std::time::Instant::now(), result.clone()),
+                );
+            }
+            result
+        };
 
         // include_deps: when path is a single file, fold in dependency_graph output.
         // Folds the former dependency_graph tool (v0.18.4).

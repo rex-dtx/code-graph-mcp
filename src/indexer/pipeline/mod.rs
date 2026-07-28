@@ -184,6 +184,18 @@ pub fn ensure_file_indexed(
     if !is_safe_relative_path(rel_path) {
         return Ok(false);
     }
+    // `<external>` is a PSEUDO-file: the row that anchors sentinel nodes for
+    // imports binding outside the project. It has no on-disk counterpart, so the
+    // missing-file branch below classified it as deleted and dropped the row —
+    // CASCADE taking every sentinel node and every edge into them with it. Any
+    // read command that displays or resolves an external name reaches here
+    // (`show HashMap` did it while printing "Symbol not found"), which makes a
+    // read-only query destructive — the same defect class as an indexer-mode
+    // open in a reader. A later incremental pass does not restore them, because
+    // only a file whose CONTENT changed re-emits its import relations.
+    if rel_path == crate::domain::EXTERNAL_FILE_PATH {
+        return Ok(false);
+    }
     let abs_path = project_root.join(rel_path);
 
     // Missing-file path: drop stale row so future queries don't return phantom nodes.
@@ -252,7 +264,7 @@ pub fn run_incremental_index(
     let deleted_files: Vec<String> = diff
         .deleted_files
         .into_iter()
-        .filter(|p| p != "<external>")
+        .filter(|p| p != crate::domain::EXTERNAL_FILE_PATH)
         .collect();
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
 
@@ -325,7 +337,7 @@ pub fn run_incremental_index_cached(
     let deleted_files: Vec<String> = diff
         .deleted_files
         .into_iter()
-        .filter(|p| p != "<external>")
+        .filter(|p| p != crate::domain::EXTERNAL_FILE_PATH)
         .collect();
     let to_index: Vec<String> = [diff.new_files, diff.changed_files].concat();
 

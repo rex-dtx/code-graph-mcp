@@ -37,17 +37,23 @@ fn use_path_root<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
 /// Handles simple (`use foo::Bar`), grouped (`use foo::{Bar, Baz}`),
 /// nested (`use foo::{bar::{A, B}}`), aliased (`use foo::Bar as B`), and glob imports.
 ///
-/// Statically-known EXTERNAL roots (`std`/`core`/`alloc`/`proc_macro`) are
-/// skipped whole (audit 2026-07-24, IDX v52): their bare trailing segment used
-/// to enter the global bare-name lookup with no qualifier metadata, where it
-/// bound to whatever single same-family project symbol shared the name —
-/// every `use std::fs;` in the repo produced a phantom `imports → fn fs`
-/// edge onto a `#[cfg(test)]` helper in `js_modules.rs`, polluting 4
-/// module_dependencies pairs in `map` (one of them 100% phantom). A std
-/// import can never resolve to a project symbol, so no edge (not even an
-/// `<external>` sentinel) beats a plausible-but-wrong one. Non-std external
-/// crates (`anyhow`, …) can't be told apart from workspace-sibling crates
-/// without Cargo.toml knowledge, so they still take the bare-name path.
+/// Statically-known EXTERNAL roots (`std`/`core`/`alloc`/`proc_macro`) bind to
+/// the `<external>` sentinel instead of the global bare-name pool (IDX v53;
+/// v52 dropped them entirely). Their bare trailing segment used to enter the
+/// global lookup with no qualifier metadata, where it bound to whatever single
+/// same-family project symbol shared the name — every `use std::fs;` in the repo
+/// produced a phantom `imports → fn fs` edge onto a `#[cfg(test)]` helper in
+/// `js_modules.rs`, polluting 4 module_dependencies pairs in `map`.
+///
+/// v52 fixed that by emitting nothing, which is correct but leaves value on the
+/// table: an explicit `<external>` binding *also* lets the existing
+/// `prune_import_contradicted_call_edges` kill the sibling CALLS phantom
+/// (`use std::mem::swap; swap(&mut a, &mut b)` → `calls → some_project::swap`).
+/// See [`crate::domain::IMPORT_EXTERNAL_META`].
+///
+/// Non-std external crates (`anyhow`, …) can't be told apart from
+/// workspace-sibling crates without Cargo.toml knowledge, so they still take the
+/// bare-name path.
 pub(super) fn extract_rust_use_imports(
     node: &tree_sitter::Node,
     source: &str,
@@ -55,13 +61,6 @@ pub(super) fn extract_rust_use_imports(
     results: &mut Vec<ParsedRelation>,
 ) {
     const EXTERNAL_ROOTS: &[&str] = &["std", "core", "alloc", "proc_macro"];
-    for i in 0..node.named_child_count() {
-        if let Some(child) = node.named_child(i) {
-            if EXTERNAL_ROOTS.contains(&use_path_root(&child, source)) {
-                return;
-            }
-        }
-    }
     fn collect_use_names(node: &tree_sitter::Node, source: &str, names: &mut Vec<String>) {
         collect_use_names_inner(node, source, names, 0);
     }
@@ -121,23 +120,47 @@ pub(super) fn extract_rust_use_imports(
         }
     }
 
-    let mut names = Vec::new();
-    // The use_declaration's first named child is the argument (scoped_identifier, use_list, etc.)
+    // The use_declaration's named children are the argument (scoped_identifier,
+    // use_list, …) plus an optional visibility_modifier.
+    //
+    // A ROOT-LEVEL use-list (`use {std::io::Read, crate::a::cb}`) is one child
+    // with no `path` field, so `use_path_root` returned the whole braced text and
+    // the external check never matched any member. Flatten one level so every
+    // member is classified on its OWN root — and so a mixed list gets a mixed
+    // verdict instead of one all-or-nothing decision for the declaration.
+    let mut members: Vec<tree_sitter::Node> = Vec::new();
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            collect_use_names(&child, source, &mut names);
+            if child.kind() == "use_list" {
+                for j in 0..child.named_child_count() {
+                    if let Some(m) = child.named_child(j) {
+                        members.push(m);
+                    }
+                }
+            } else {
+                members.push(child);
+            }
         }
     }
 
     let scope_name = scope.unwrap_or("<module>");
-    for name in names {
-        results.push(ParsedRelation {
-            source_name: scope_name.to_string(),
-            target_name: name,
-            relation: REL_IMPORTS.into(),
-            metadata: None,
-            source_language: String::new(),
-        });
+    for member in members {
+        // A leading `::` (`use ::std::mem::swap`) is part of the root token's
+        // text but not of the crate name, so the raw comparison missed it and the
+        // path fell straight back into the phantom-producing bare-name pool.
+        let root = use_path_root(&member, source).trim_start_matches("::");
+        let external = EXTERNAL_ROOTS.contains(&root);
+        let mut names = Vec::new();
+        collect_use_names(&member, source, &mut names);
+        for name in names {
+            results.push(ParsedRelation {
+                source_name: scope_name.to_string(),
+                target_name: name,
+                relation: REL_IMPORTS.into(),
+                metadata: external.then(|| crate::domain::IMPORT_EXTERNAL_META.to_string()),
+                source_language: String::new(),
+            });
+        }
     }
 }
 
@@ -418,7 +441,35 @@ pub(super) fn extract_rust_macro_token_call(
             return None;
         }
     }
+    // Configuration predicates are not code. `#[cfg(not(windows))]` and
+    // `cfg!(any(unix))` put `not(…)` / `any(…)` in a token_tree byte-identical to
+    // a call, and every predicate name is lowercase — so the CamelCase guard
+    // below waves them straight through. The production index carried `any` ×3
+    // and `not` ×4 in `pending_unresolved_calls`; in a project that defines
+    // `fn any` or `fn not` (predicate / iterator utility modules do) they promote
+    // to real edges pointing at the wrong symbol.
+    if in_cfg_predicate(node, source) {
+        return None;
+    }
     let name = node_text(node, source);
+    // ...and structurally for attributes spelled as RAW TOKENS, which the
+    // ancestor walk cannot see: `#[cfg(...)]` written inside another macro's
+    // token_tree produces no `attribute` node anywhere in the tree — just the
+    // token run `#` `[` `cfg` `(…)` `]` as siblings of the macro body.
+    //
+    //   cfg_if! { if #[cfg(not(windows))] { a(); } else { b(); } }
+    //   quote!   { #[cfg(all(feature = "x"))] fn z() {} }
+    //   wrap!    { #[allow(unused)] #[doc(hidden)] fn inner() { real(); } }
+    //
+    // `cfg_if!` is THE idiomatic home of conditional compilation inside a macro
+    // (libc, rand, ring). A name blacklist was tried first and was the wrong
+    // shape twice over: it missed every non-cfg attribute (`allow` / `deny` /
+    // `doc` all still produced call edges), and it cost real edges for any
+    // project that happens to define `fn any` / `fn all` / `fn not`. Matching
+    // the bracket span instead is exact — it loses nothing and needs no list.
+    if in_raw_attribute_tokens(node) {
+        return None;
+    }
     if name.is_empty() || name == "self" || name == "Self" || name == "_" {
         return None;
     }
@@ -440,6 +491,75 @@ pub(super) fn extract_rust_macro_token_call(
         metadata: None,
         source_language: String::new(),
     })
+}
+
+/// True when `node` lies inside an attribute written as RAW TOKENS — the
+/// `#` `[` … `]` run that appears when an attribute is nested in a macro's
+/// token_tree and therefore never becomes an `attribute` node.
+///
+/// tree-sitter groups each bracket run into its own `token_tree`, so this walks
+/// UP through enclosing `token_tree`s looking for one that opens with `[` and is
+/// immediately preceded by `#`. That reaches both the attribute path itself
+/// (`cfg` in `#[cfg(..)]`, a direct child of the `[…]` group) and anything
+/// nested in its arguments (`any` in `#[cfg(any(unix))]`, several groups down).
+/// Requiring the `#` is what keeps an INDEX expression — `a[f(x)]`, also a
+/// `[`-opened token_tree — from losing its call edge.
+fn in_raw_attribute_tokens(node: &tree_sitter::Node) -> bool {
+    let mut cur = *node;
+    for _ in 0..MAX_SUBTREE_DEPTH {
+        let Some(parent) = cur.parent() else {
+            return false;
+        };
+        if parent.kind() != "token_tree" {
+            return false;
+        }
+        // tree-sitter groups each bracket run into its own `token_tree`, so the
+        // attribute is the node `[ … ]` whose immediately-preceding sibling is
+        // `#`. Requiring the `#` is what keeps an INDEX expression — `a[f(x)]`,
+        // also a `[`-opened token_tree — from losing its call edge.
+        let opens_with_bracket = parent.child(0).is_some_and(|c| c.kind() == "[");
+        if opens_with_bracket && parent.prev_sibling().is_some_and(|h| h.kind() == "#") {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// True when `node` sits inside a PARSED attribute (`#[cfg(…)]`, `#[derive(…)]`,
+/// `#![feature(…)]`) or inside a `cfg!(…)` invocation — configuration
+/// predicates, where nothing is ever a function call.
+///
+/// The nearest enclosing `macro_invocation` decides: any other macro
+/// (`assert!(f())`, `println!("{}", g())`) may legitimately contain calls, and
+/// recovering those is precisely why the token-tree pass exists. Attributes
+/// written as raw tokens inside a macro body never become `attribute` nodes at
+/// all and are handled by [`in_raw_attribute_tokens`] instead.
+fn in_cfg_predicate(node: &tree_sitter::Node, source: &str) -> bool {
+    let mut cur = *node;
+    for _ in 0..MAX_SUBTREE_DEPTH {
+        let Some(parent) = cur.parent() else {
+            return false;
+        };
+        match parent.kind() {
+            "attribute" | "attribute_item" | "inner_attribute_item" => return true,
+            "macro_invocation" => {
+                // Compare the LAST path segment: the `macro` field is a
+                // `scoped_identifier` for `core::cfg!(…)` / `std::cfg!(…)`, whose
+                // full text is `core::cfg` and never equalled `cfg`, so those
+                // spellings leaked `any` / `all` / `not` as call edges. Both are
+                // ordinary in code that avoids relying on the prelude.
+                return parent.child_by_field_name("macro").is_some_and(|m| {
+                    node_text(&m, source)
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|seg| seg.trim() == "cfg")
+                });
+            }
+            _ => cur = parent,
+        }
+    }
+    false
 }
 
 pub(super) fn extract_rust_value_reference(

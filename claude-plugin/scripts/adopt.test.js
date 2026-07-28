@@ -39,6 +39,27 @@ function makeSandbox() {
   };
 }
 
+
+// A cwd that is genuinely NOT a project — for the two tests that assert the
+// activation gate refuses one.
+//
+// `mkdtemp(os.tmpdir())` is not enough: findProjectRoot walks UP, bounded by
+// $HOME, and under Claude Code $TMPDIR is `~/.claude/tmp`, whose ancestry
+// carries this machine's own package.json. Because the suite overrides HOME to a
+// tmpdir SIBLING, that bound stops applying and a bare temp dir resolves as a
+// project — so these two tests passed or failed depending on where $TMPDIR
+// pointed, which is also why the pre-commit hook saw failures that a bare
+// `node --test` in /tmp did not.
+//
+// Creating the cwd inside `process.env.HOME` restores the bound: the walk stops
+// at the home we control, which has no markers in it. It must be that HOME (set
+// at the top of this file) and NOT the `home` argument these tests pass to
+// adopt/maybeAutoAdopt — findProjectRoot bounds on the environment, not on the
+// caller-supplied home, and using the argument here left both tests still red.
+function mkBareCwd() {
+  return fs.mkdtempSync(path.join(process.env.HOME, 'bare-cwd-'));
+}
+
 // ── memoryDir (legacy slug — still used by migrateLegacyMemoryDir) ──────────
 
 test('memoryDir slugifies cwd path', () => {
@@ -165,13 +186,28 @@ test('adopt heals a malformed prior block (orphan BEGIN) and preserves neighbors
     const esc = SENTINEL_BEGIN.replace(/[\\/[\]^$.*+?()|{}]/g, '\\$&');
     assert.strictEqual((cmd.match(new RegExp(esc, 'g')) || []).length, 1, 'exactly one block');
     assert.ok(cmd.includes('Keep me.') && cmd.includes('Also keep me.'), 'neighbors preserved');
-    assert.ok(!cmd.includes('stale partial block'), 'stale block purged');
+
+    // DELIBERATE narrowing (2026-07-27 contract audit, round-5 F1): the heal
+    // removes the orphan MARKER LINE and leaves the content under it.
+    //
+    // This assertion used to read `!cmd.includes('stale partial block')`. That
+    // behavior is not implementable safely: this fixture and a user's own notes
+    // under a marker they quoted from our instructions are byte-for-byte the
+    // same shape, and the old "strip to the next blank line" rule took 221 B of
+    // a real CLAUDE.md down to 100 B in a repo that had never been adopted. Since
+    // the two cannot be distinguished, the tie goes to the recoverable outcome.
+    // The cost is this: a genuinely truncated block leaves a visible fragment.
+    assert.ok(cmd.includes('stale partial block'),
+      'the fragment is LEFT — see the comment above; deleting it would require ' +
+      'guessing whose text it is, and that guess destroyed user prose');
+    assert.ok(!cmd.split('\n').slice(0, 6).some(l => l.trim() === SENTINEL_BEGIN),
+      'but the orphan marker line itself is gone, so the fragment is inert');
   } finally { sb.cleanup(); }
 });
 
 test('adopt refuses a non-project cwd and writes nothing', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-home-'));
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-cwd-')); // no marker
+  const cwd = mkBareCwd(); // no marker, and no marker above it either
   try {
     const res = adopt({ cwd });
     assert.strictEqual(res.ok, false);
@@ -393,7 +429,7 @@ test('maybeAutoAdopt skips refresh when CODE_GRAPH_NO_TEMPLATE_REFRESH=1 (locks 
 
 test('maybeAutoAdopt surfaces not-a-project for a bare cwd', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-home-'));
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-cwd-'));
+  const cwd = mkBareCwd();
   try {
     const res = maybeAutoAdopt({ cwd, home, scriptPath: PLUGIN_SCRIPTS, env: {} });
     assert.strictEqual(res.result.ok, false);
@@ -717,5 +753,320 @@ test('registry survives a corrupt file and never throws', () => {
     const r = adopt({ cwd: sb.cwd, home: sb.home }); // must not throw on corrupt registry
     assert.strictEqual(r.ok, true);
     assert.deepStrictEqual(readAdoptedProjects(sb.home), [path.resolve(sb.cwd)]);
+  } finally { sb.cleanup(); }
+});
+
+// ── unadopt must never delete the user's own prose ──────────────────────────
+//
+// Contract audit 2026-07-27. CHANGELOG has promised since v0.74 that unadopt is
+// "guarded: never removes a user file lacking our marker" and that it strips
+// "only our block". It did neither once the marker string appeared anywhere
+// earlier in the file — and the block we write *invites* the user to mention it
+// ("do not edit inside this block"). `uninstall({unadoptAll:true})` runs this
+// over every registered project, so the blast radius was every adopted repo at
+// once, at exit 0, reporting success.
+//
+// Five of the six are measured repros — they were verified RED against the
+// pre-fix adopt.js, and the first one went 1078 B -> 43 B. The sixth is labelled
+// a negative control: it must stay GREEN on both sides, proving the guards did
+// not simply make unadopt inert.
+
+test('unadopt keeps prose that MENTIONS the begin marker mid-sentence', () => {
+  const sb = makeSandbox();
+  try {
+    const prose = [
+      '# Team rules',
+      '',
+      '## CRITICAL: prod runbook',
+      'Pager 555-0100. Key rotation quarterly.',
+      '',
+      'Note: the block starts with `' + SENTINEL_BEGIN + '` — do not edit inside it.',
+      '',
+    ].join('\n');
+    fs.writeFileSync(sb.claudeMd, prose);
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const res = unadopt({ cwd: sb.cwd, home: sb.home });
+
+    const after = fs.readFileSync(sb.claudeMd, 'utf8');
+    assert.ok(after.includes('Pager 555-0100'), 'runbook survives');
+    assert.ok(after.includes('Key rotation quarterly'), 'second prose line survives');
+    assert.ok(after.includes('do not edit inside it'), 'the sentence quoting the marker survives whole');
+    assert.strictEqual(res.claudeMdRemoved, false);
+    // The real block is still gone: only the quoted mention remains, and a
+    // mention is not a block opener.
+    assert.strictEqual(
+      after.split('\n').filter(l => l.trim() === SENTINEL_BEGIN).length, 0,
+      'no line-anchored begin marker left');
+  } finally { sb.cleanup(); }
+});
+
+test('unadopt keeps prose when the marker is quoted on its OWN line before the block', () => {
+  const sb = makeSandbox();
+  try {
+    // Order is load-bearing, and two weaker fixtures do NOT reproduce:
+    //   - quoting a BEGIN/END *pair*: the lazy match stops at the quoted END and
+    //     eats only the example;
+    //   - writing the quote BEFORE adopt: adopt's own orphan heal consumes the
+    //     quoted line, so nothing is left to mis-anchor at unadopt time.
+    // The real shape is a user annotating a block that already exists.
+    adopt({ cwd: sb.cwd, home: sb.home });
+    fs.writeFileSync(sb.claudeMd, [
+      '# Notes', '', 'Our generated block opens with:', '',
+      SENTINEL_BEGIN, '',
+      'KEEP: on-call rotation is in PagerDuty.',
+      'KEEP: escalate to #sre-oncall after 15 minutes.', '',
+    ].join('\n') + fs.readFileSync(sb.claudeMd, 'utf8'));
+    unadopt({ cwd: sb.cwd, home: sb.home });
+
+    const after = fs.existsSync(sb.claudeMd) ? fs.readFileSync(sb.claudeMd, 'utf8') : '';
+    assert.ok(after.includes('KEEP: on-call rotation'), 'prose after the quoted marker survives');
+    assert.ok(after.includes('KEEP: escalate to #sre-oncall'), 'second prose line survives');
+    assert.ok(after.includes('Our generated block opens with:'), 'prose before it survives');
+  } finally { sb.cleanup(); }
+});
+
+test('unadopt does not eat lines after a marker truncated mid-write', () => {
+  const sb = makeSandbox();
+  try {
+    // `[^>]*` (pre-fix) let an unterminated marker span newlines to the next
+    // `-->` anywhere below it.
+    fs.writeFileSync(sb.claudeMd, [
+      '<!-- code-graph-mcp:begin v2 --',
+      'DO NOT DELETE: escalation path',
+      'DO NOT DELETE: db failover steps',
+      '<!-- something else -->',
+      '', 'tail prose', '',
+    ].join('\n'));
+    const before = fs.readFileSync(sb.claudeMd, 'utf8');
+    unadopt({ cwd: sb.cwd, home: sb.home });
+    const after = fs.existsSync(sb.claudeMd) ? fs.readFileSync(sb.claudeMd, 'utf8') : '';
+    assert.ok(after.includes('escalation path'), 'first do-not-delete line survives');
+    assert.ok(after.includes('db failover steps'), 'second do-not-delete line survives');
+    assert.ok(after.includes('tail prose'), 'tail survives');
+    assert.strictEqual(after, before, 'nothing at all was stripped — no well-formed block present');
+  } finally { sb.cleanup(); }
+});
+
+test('unadopt will NOT unlink a detail file whose first line merely quotes the marker', () => {
+  const sb = makeSandbox();
+  try {
+    fs.mkdirSync(path.join(sb.cwd, '.claude'), { recursive: true });
+    const body = 'We write `' + MANAGED_BY + '` at the top of generated files.\nMy notes.\n';
+    fs.writeFileSync(sb.detail, body);
+    const res = unadopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.fileRemoved, false, 'not ours — must not be deleted');
+    assert.ok(fs.existsSync(sb.detail), 'user file still exists');
+    assert.strictEqual(fs.readFileSync(sb.detail, 'utf8'), body, 'byte-identical');
+  } finally { sb.cleanup(); }
+});
+
+test('unadopt still removes a real block, and a real managed detail file', () => {
+  // Negative control for the four guards above: they must not make unadopt inert.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd, '# Project\n\nMy own notes.\n');
+    adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(isAdopted({ cwd: sb.cwd }), true, 'precondition: adopted');
+    const res = unadopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.blockPruned, true, 'the real block WAS stripped');
+    assert.strictEqual(res.fileRemoved, true, 'the real detail file WAS removed');
+    const after = fs.readFileSync(sb.claudeMd, 'utf8');
+    assert.ok(!after.includes(SENTINEL_END), 'no end marker left');
+    assert.ok(after.includes('My own notes.'), 'user prose kept');
+  } finally { sb.cleanup(); }
+});
+
+test('isAdopted ignores markers that are only quoted in prose', () => {
+  const sb = makeSandbox();
+  try {
+    fs.mkdirSync(path.join(sb.cwd, '.claude'), { recursive: true });
+    fs.writeFileSync(sb.detail, MANAGED_BY + '\nbody\n');
+    fs.writeFileSync(sb.claudeMd,
+      'Docs: the block runs from `' + SENTINEL_BEGIN + '` to `' + SENTINEL_END + '`.\n');
+    assert.strictEqual(isAdopted({ cwd: sb.cwd }), false,
+      'a quoted pair is not an installed block — this gates auto-adopt, so a ' +
+      'false true means the block never gets written');
+  } finally { sb.cleanup(); }
+});
+
+test('unadopt writes THROUGH a symlinked CLAUDE.md instead of detaching it', () => {
+  const sb = makeSandbox();
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-shared-'));
+  try {
+    // A CLAUDE.md symlinked into a dotfiles/team repo — the atomic rename used
+    // to replace the LINK with a regular file, so the shared file kept the block
+    // while unadopt reported blockPruned:true.
+    const realFile = path.join(shared, 'team-CLAUDE.md');
+    fs.writeFileSync(realFile, '# Shared team rules\n\nKEEP: shared prose.\n');
+    fs.symlinkSync(realFile, sb.claudeMd);
+
+    adopt({ cwd: sb.cwd, home: sb.home });
+    assert.ok(fs.readFileSync(realFile, 'utf8').includes(SENTINEL_BEGIN),
+      'precondition: adopt wrote through the link');
+
+    const res = unadopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.blockPruned, true);
+    assert.ok(fs.lstatSync(sb.claudeMd).isSymbolicLink(), 'still a symlink, not detached');
+    const target = fs.readFileSync(realFile, 'utf8');
+    assert.ok(!target.includes(SENTINEL_BEGIN),
+      'the block is gone from the file the report claims it pruned');
+    assert.ok(target.includes('KEEP: shared prose.'), 'shared prose intact');
+  } finally {
+    fs.rmSync(shared, { recursive: true, force: true });
+    sb.cleanup();
+  }
+});
+
+test('unadopt does not unlink a symlinked CLAUDE.md that held only our block', () => {
+  const sb = makeSandbox();
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-shared2-'));
+  try {
+    const realFile = path.join(shared, 'team-CLAUDE.md');
+    fs.writeFileSync(realFile, '');
+    fs.symlinkSync(realFile, sb.claudeMd);
+    adopt({ cwd: sb.cwd, home: sb.home });
+
+    const res = unadopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.claudeMdRemoved, false,
+      'the user owns the link — "delete the file we created" does not apply');
+    assert.ok(fs.lstatSync(sb.claudeMd).isSymbolicLink(), 'link still there');
+    assert.strictEqual(fs.readFileSync(realFile, 'utf8').trim(), '', 'target emptied, not deleted');
+  } finally {
+    fs.rmSync(shared, { recursive: true, force: true });
+    sb.cleanup();
+  }
+});
+
+test('unadopt leaves a NEVER-ADOPTED file alone even when it quotes the begin marker', () => {
+  // Round-5 F1. The orphan self-heal used to strip from a stray begin marker to
+  // the next blank line, on the theory that what followed was our truncated
+  // block. In a repo that was never adopted there IS no block — the marker is
+  // the user quoting our own instructions — and the two shapes are byte-for-byte
+  // indistinguishable, so the heal ate their notes. Measured 221 B -> 100 B.
+  const sb = makeSandbox();
+  try {
+    const original = [
+      '# Team rules', '',
+      '## CRITICAL: prod runbook',
+      'Pager 555-0100.', '',
+      'Our generated block opens with',
+      SENTINEL_BEGIN,
+      'KEEP: on-call rotation is in PagerDuty.',
+      'KEEP: escalate to #sre-oncall after 15 minutes.', '',
+      'tail prose', '',
+    ].join('\n');
+    fs.writeFileSync(sb.claudeMd, original);
+
+    const res = unadopt({ cwd: sb.cwd, home: sb.home });
+
+    const after = fs.readFileSync(sb.claudeMd, 'utf8');
+    assert.ok(after.includes('KEEP: on-call rotation is in PagerDuty.'), 'first note survives');
+    assert.ok(after.includes('KEEP: escalate to #sre-oncall after 15 minutes.'), 'second note survives');
+    assert.ok(after.includes('Pager 555-0100.'), 'runbook survives');
+    assert.ok(after.includes('tail prose'), 'tail survives');
+    assert.strictEqual(res.claudeMdRemoved, false);
+    // The stray marker line itself is removed — that much is ours, is one line,
+    // and is visible. Nothing around it is.
+    assert.ok(!after.split('\n').some(l => l.trim() === SENTINEL_BEGIN), 'marker line removed');
+  } finally { sb.cleanup(); }
+});
+
+test('the same file is safe with NO blank line after the quoted marker', () => {
+  // The mutation that exposed the previous version of this guard as
+  // fixture-specific: the old code was bounded by the next blank line, so a
+  // fixture that happened to have one passed while the real shape did not.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd,
+      `# Notes\n\nOur block opens with\n${SENTINEL_BEGIN}\nKEEP: escalation path\nKEEP: db failover\n`);
+    unadopt({ cwd: sb.cwd, home: sb.home });
+    const after = fs.readFileSync(sb.claudeMd, 'utf8');
+    assert.ok(after.includes('KEEP: escalation path'), 'no blank line must not mean no protection');
+    assert.ok(after.includes('KEEP: db failover'), 'second line survives too');
+  } finally { sb.cleanup(); }
+});
+
+test('auto-adopt does not eat prose that quotes the marker (adopt path, not unadopt)', () => {
+  // adopt() calls the same strip, and maybeAutoAdopt runs it on every
+  // SessionStart in plugin mode — so this path has a far higher hit rate than
+  // the explicit unadopt one it was found on.
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd,
+      `# P\n\nThe block starts at\n${SENTINEL_BEGIN}\nKEEP: irreplaceable.\n`);
+    adopt({ cwd: sb.cwd, home: sb.home });
+    const after = fs.readFileSync(sb.claudeMd, 'utf8');
+    assert.ok(after.includes('KEEP: irreplaceable.'), 'adopt must not eat it either');
+  } finally { sb.cleanup(); }
+});
+
+test('a user line that is exactly the END marker costs only that line', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd,
+      `# Notes\n\nThe managed block is terminated by\n${SENTINEL_END}\nKEEP: everything below.\n`);
+    unadopt({ cwd: sb.cwd, home: sb.home });
+    const after = fs.readFileSync(sb.claudeMd, 'utf8');
+    assert.ok(after.includes('KEEP: everything below.'), 'content after the marker survives');
+    assert.ok(after.includes('The managed block is terminated by'), 'content before survives');
+  } finally { sb.cleanup(); }
+});
+
+test('unadopt does NOT overwrite a symlinked detail file target', () => {
+  // Round-5 F5: a regression introduced while fixing the CLAUDE.md symlink case.
+  // The detail file is a whole-file replacement, so following its link overwrites
+  // whatever the user pointed at instead of replacing our own link.
+  const sb = makeSandbox();
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-detail-'));
+  try {
+    const realFile = path.join(shared, 'my-important-doc.md');
+    fs.writeFileSync(realFile, '# Irreplaceable\n\nDo not overwrite me.\n');
+    fs.mkdirSync(path.join(sb.cwd, '.claude'), { recursive: true });
+    fs.symlinkSync(realFile, sb.detail);
+
+    adopt({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(
+      fs.readFileSync(realFile, 'utf8'), '# Irreplaceable\n\nDo not overwrite me.\n',
+      'adopt must replace our symlink, not write through it into the user\'s file');
+  } finally {
+    fs.rmSync(shared, { recursive: true, force: true });
+    sb.cleanup();
+  }
+});
+
+test('migrateLegacyMemoryDir will NOT delete a user file that merely starts with the legacy prefix', () => {
+  // Round-6 F3. `unadopt`'s detail-file guard was tightened to require a
+  // whole-line HTML comment, but the migration's copy kept a bare untrimmed
+  // `startsWith` — and migration is the HOT path: maybeAutoAdopt calls it on
+  // every SessionStart, while unadopt is explicit. Half-applied fix, on the more
+  // frequently executed half.
+  const sb = makeSandbox();
+  try {
+    const dir = memoryDir(sb.cwd, sb.home);
+    fs.mkdirSync(dir, { recursive: true });
+    const victim = path.join(dir, TARGET_NAME);
+    const body = '<!-- adopted-by: my own note-taking script, do not delete\nmy notes\n';
+    fs.writeFileSync(victim, body);
+
+    const res = migrateLegacyMemoryDir({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.legacyDetailRemoved, false, 'not ours — must survive');
+    assert.ok(fs.existsSync(victim), 'user file still exists');
+    assert.strictEqual(fs.readFileSync(victim, 'utf8'), body, 'byte-identical');
+  } finally { sb.cleanup(); }
+});
+
+test('migrateLegacyMemoryDir still deletes a real legacy detail file', () => {
+  // Negative control: the tightened guard must not make migration inert. The
+  // legacy scheme wrote `<!-- adopted-by: <cwd> -->` as the whole first line.
+  const sb = makeSandbox();
+  try {
+    const dir = memoryDir(sb.cwd, sb.home);
+    fs.mkdirSync(dir, { recursive: true });
+    const legacy = path.join(dir, TARGET_NAME);
+    fs.writeFileSync(legacy, `<!-- adopted-by: ${sb.cwd} -->\nold generated body\n`);
+
+    const res = migrateLegacyMemoryDir({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.legacyDetailRemoved, true, 'a real legacy file IS removed');
+    assert.ok(!fs.existsSync(legacy));
   } finally { sb.cleanup(); }
 });

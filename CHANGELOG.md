@@ -1,5 +1,426 @@
 # Changelog
 
+## Unreleased — audit 2026-07-27 remediation
+
+Upgrade notes: **index rebuild required** — `INDEX_VERSION` 52 → 53. The server
+wipes and rebuilds automatically on first start; a CLI-only setup rebuilds on the
+next `code-graph-mcp incremental-index`.
+
+### Fixed
+- **A typo in `doctor --check-only` ran the repairs it was meant to prevent.**
+  The CLI tested `args.includes('--check-only')` and discarded every other
+  argument, so `--check-onlyy` / `--checkonly` / `--check_only` — and any other
+  unrecognized flag — fell through to the default mode and performed the full
+  repair pass, rewriting `settings.json` and `MEMORY.md`, while the user believed
+  they had asked for the read-only one. The read-only contract this release
+  otherwise hardens was one keystroke from being inverted. Unknown arguments now
+  exit 2 before any diagnosis runs, and `--help` prints usage without acting.
+  All **five** entry points, found one at a time and each by a different means:
+  `doctor.js` (the original), `node lifecycle.js doctor …` (its own copy of the
+  same `includes('--check-only')` line, found by checking which callers the new
+  allowlist could reject), and `code-graph-mcp doctor …` — the surface users
+  actually install — whose Rust dispatch filtered argv down to the single literal
+  `--check-only` and dropped everything else, so the typo never reached the
+  validation at all. The two JS entry points now share one `runDoctorCli`, which
+  also keeps them from drifting on the exit-code rule (issues *unresolved after
+  repair*, not issues found); the binary passes its argv tail through verbatim
+  and propagates the exit code. The fourth is `bin/cli.js`, the npm/npx wrapper,
+  which intercepts adopt / unadopt / uninstall before the binary: it guarded
+  `--help` but ignored every other token, so `code-graph-mcp adopt --helpp` ran
+  adopt and wrote the user's CLAUDE.md — one keystroke from the side effect the
+  `--help` guard exists to prevent. The fifth, found by the pre-tag review after
+  the other four were closed, is `src/main.rs`'s own **adopt / unadopt** arms —
+  they discarded the argv tail exactly as its doctor arm used to, so
+  `code-graph-mcp adopt --helpp` wrote CLAUDE.md for anyone on `cargo install` or
+  the direct binary (npm/npx users were already covered by `bin/cli.js`). Passing
+  the tail through is not the fix there: `adopt.js` reads only `argv[2]` as the
+  action and parses no flags, so a typo would become the action name — those two
+  subcommands reject any argument beyond `--help` instead. Regression tests run
+  against all five, and the `doctor --help` text is byte-identical between
+  `src/main.rs` (which intercepts `--help` so it stays side-effect-free) and
+  `doctor.js`.
+- **The npm surface described a scheme it had not touched since v0.74.**
+  `code-graph-mcp adopt --help` / `unadopt --help` via npm/npx still said
+  "install the code-graph memory file + MEMORY.md sentinel" — the pre-v0.74
+  memory-dir target — while the same command on the binary described the
+  project's CLAUDE.md managed block. Two texts for one command; npm users got
+  the stale one. The same pre-v0.74 description survived in **`README.md`**,
+  which ships inside the npm tarball — so the entry claiming this was fixed would
+  itself have shipped alongside the text it says is gone. Both corrected.
+- **`grep` explains a flag-shaped pattern instead of just failing on it.** A long
+  flag the subcommand does not implement (`grep --quiet foo`) is bound to the
+  *pattern* positional — deliberately, so that a term like
+  `--no-default-features` stays searchable without an escape — which pushes the
+  real pattern into the path list, and ripgrep then reports the user's search
+  term as a missing file. Accurate and unreadable. The behavior is unchanged
+  (this is a published CLI surface and `grep -- --quiet` must keep working); what
+  is new is a note naming the token, why it was read as a pattern, and the `--`
+  escape. It fires only on the pairing that is actually ambiguous — a `--word`
+  pattern *and* a missing-path error — so a genuine literal search that fails for
+  another reason is not lectured.
+- **`unadopt` deleted the user's own prose from CLAUDE.md.** Stripping the
+  managed block matched from the *first* occurrence of the begin marker anywhere
+  in the file through the real block's end marker — and the block we write
+  invites the user to mention that marker ("do not edit inside this block"). One
+  sentence quoting it cost a 1078-byte CLAUDE.md all but 43 bytes, at exit 0,
+  printing `De-blocked →`. `uninstall({unadoptAll:true})` runs this over every
+  registered project, and the SessionStart teardown runs it on the current one.
+  Four separate amplifiers, all fixed: the match is now line-anchored (a
+  mid-sentence mention is prose, not a block opener) and refuses to span another
+  begin marker (so a marker quoted on its own line no longer anchors the match);
+  the marker pattern excludes newlines, so a marker truncated mid-write can no
+  longer run across lines to the next `-->`; the orphan-marker self-heal fires
+  only when no end marker survives anywhere; and the detail-file delete requires
+  the managed-by marker to *be* the first line rather than appear in it. A
+  CLAUDE.md that is a symlink is now written through rather than replaced by the
+  atomic rename — which had silently detached the link, left the real file's
+  block in place, and still reported `blockPruned: true` — and is never unlinked,
+  since "delete the file we created" does not apply to a link the user made.
+  `isAdopted` is line-anchored for the same reason: a quoted pair read as
+  installed, which gates auto-adopt, so the block was never written.
+
+  **Behavior change:** the orphan-marker self-heal no longer removes the content
+  under a stray begin marker — only the marker line. It used to strip to the next
+  blank line on the theory that what followed was our truncated block, and that
+  is not decidable: a leftover fragment and a user's notes under a marker they
+  quoted from our own instructions are byte-for-byte the same shape. In a repo
+  that had never been adopted, the heal took a 221-byte CLAUDE.md to 100 bytes,
+  and `adopt` runs the same strip, so it fired on auto-adopt every SessionStart.
+  The cost of the narrower rule is that a genuinely truncated block leaves a
+  visible fragment; `isAdopted` requires a well-formed begin *and* end, so the
+  next adopt still writes a clean block, and the fragment is inert.
+- **The `.corrupt-*` backup was not the original bytes.** It was written from a
+  UTF-8-decoded string, so every invalid byte became U+FFFD before the original
+  was overwritten — the backup is the user's only copy, and for a settings.json
+  containing any non-UTF-8 byte it was a lossy transcription (measured 50 B → 56 B).
+  The file is now read as a Buffer and copied verbatim; only the parse decodes.
+  The shipped test asserting "the backup must be the original bytes, verbatim"
+  passed throughout because its fixture was pure ASCII.
+- **`find_references` told an LLM client to bypass a filter that does not
+  exist.** The `<external>` binding below is deliberately excluded from symbol
+  *resolution*, so an import-only name reaches the not-found arm, which
+  re-queried unfiltered, found the sentinel, and reported "all match(es) are in
+  test/bench paths (`<external>`) … bypass the test filter" — a path that is not
+  on disk, a filter that is not applied, and recovery advice that cannot work.
+  The MCP surface now answers with the `imports` rows like the CLI already did,
+  so this release's "both refs surfaces answer for imported std names" is true of
+  both rather than half.
+- **`sync-versions.js --check` reported agreement it had not checked.** A version
+  site that did not exist was recorded as `SKIP (not found)` and did not set the
+  drift flag, so deleting a platform `package.json` produced "All version sites
+  agree" and exit 0 — eight sites checked, nine claimed. A corrupt, empty or
+  unreadable site was worse: `JSON.parse` threw out of the loop before a single
+  table row printed, every site after it went unexamined, and with real drift
+  elsewhere the crash hid it entirely while exiting 1 (node's uncaught-throw
+  code) indistinguishably from a clean drift report. Missing is now `MISSING` and
+  counts as drift; unreadable sites are caught per-site, printed as `UNREADABLE`
+  with the reason, and exit **2**, so a caller can tell "versions disagree"
+  (fixable by re-running this script) from "a site could not be read at all"
+  (not). Note that the write path already exits 2 on a cargo-build failure; the
+  two modes are disjoint and the caller picks one, but the code is not unique
+  across the script. `--check` still never writes. It is not currently wired
+  into pre-commit or CI — both roll their own comparison — so this hardens a
+  gate that its own docstring invites you to adopt rather than one in use.
+- **A non-object `hooks` value made `install` a silent no-op that reported
+  success.** `settings.hooks || {}` accepted an array, and the named properties
+  assigned onto it are dropped by `JSON.stringify` — so `{"hooks": []}` came back
+  out unchanged with zero of the six hooks registered, while `install` printed
+  `settings=true` and `health` printed `OK — all paths valid`. A string or number
+  threw an uncaught "cannot create property" instead. Any non-object value is now
+  replaced, exactly as a missing key is.
+- **An unwritable `~/.claude` escaped as a raw stack trace, then reported
+  healthy.** A settings.json we can read but not write (read-only home, EROFS, a
+  container mount) threw out of `fs.writeFileSync` with no `[code-graph]` line;
+  the follow-up `health` then said `OK — all paths valid`, because it validates
+  the paths it finds and it had registered none. It now reports the cause,
+  changes nothing, exits non-zero, and — critically — does **not** stamp the
+  install manifest, which would have told the next run "already installed" and
+  left the plugin inert after the user fixed the permissions. `doctor` reports it
+  too: the first version of this fix wired the new state into `lifecycle`'s CLI
+  only, so `doctor` still printed "install reported no change (settings already
+  had entries)" about a file it had just failed to write.
+- **A read-only `~/.claude` was diagnosed as a missing npm package.** `doctor`'s
+  `hooks-invalid` repair arm never learned the unwritable-settings state that its
+  sibling arm had just been taught, and `scanForBrokenPaths` cannot surface it
+  (the file reads fine), so a `chmod` on the config directory produced
+  "plugin scripts may be missing — reinstall: npm install -g …". Both arms now
+  report the same cause for the same failed `install()` call.
+- **The legacy-migration delete guard was the loose copy.** `unadopt`'s
+  detail-file guard was tightened to require a whole-line HTML comment, but
+  `migrateLegacyMemoryDir` kept a bare untrimmed `startsWith` — and migration is
+  the hot path, running on every SessionStart via auto-adopt, while `unadopt` is
+  explicit. A user file whose first line merely began `<!-- adopted-by:` was
+  still deleted there.
+- **Uninstall stranded every adopted project's CLAUDE.md block.** The
+  adopted-projects registry lives inside the cache directory, and the SessionStart
+  teardown wiped that directory *before* unadopting. Only the current project was
+  unadopted; every other repo's entry went with the wipe, so a later
+  `uninstall --unadopt-all` read an empty registry, reported `unadopted: []`, and
+  the blocks stayed behind with nothing left that knew where they were. The
+  teardown now unadopts first, and the wipe itself preserves a registry that
+  still names projects — a registry that is empty or absent strands nothing and
+  is removed as before, so the common single-project case still leaves no residue.
+  Same capture-before-cleanup ordering `uninstall()` already had to learn; this
+  was its sibling.
+- **`similar` destroyed a version-lagging index** — it was the one read command
+  still opening the database through the *indexer* constructor
+  (`open_with_vec`), which performs the destructive `INDEX_VERSION`
+  revalidation. After upgrading the binary, a single `code-graph-mcp similar foo`
+  in a project with no MCP server running wiped the index to 0 nodes and nothing
+  rebuilt it — the daagu failure that `open_nondestructive` exists to prevent,
+  reached through the one door still left open. The wipe happened before the
+  `vec_enabled()` check, so builds without `embed-model` — which bail out of
+  `similar` immediately — destroyed the index just the same. `similar` now goes
+  through `CliContext`, which also gives it the worktree read-side fallback the
+  other 19 commands already had.
+- **An unusable `~/.claude/settings.json` was silently overwritten** — the
+  plugin's `readJson` collapsed *every* failure into the same `null`, so
+  `readJson(settingsPath()) || {}` handed `install()`/`update()` an empty object
+  and the next atomic write replaced the whole file. One trailing comma cost the
+  user their `model`, `env`, `permissions`, `enabledPlugins` and their own hooks,
+  with no copy left anywhere. Only a genuine `ENOENT` now counts as "absent";
+  a file that exists but yields no settings object is never rebuilt over
+  in place. Where it can be read — unparseable text, or valid JSON that isn't an
+  object (`null` / `[]` / `123` / `"str"`) — it is preserved as
+  `settings.json.corrupt-<timestamp>` first. Where it cannot (**unreadable** after
+  a stray `sudo` leaves it root-owned `0600`, `EPERM`, `EIO`, or the path is a
+  directory), no copy is possible, so the original is left untouched and
+  `install()`/`update()` **do nothing at all** — no hooks, no statusline, no
+  manifest stamp — leaving the plugin inert until the file is repaired.
+
+  Every surface that used to paper over that now reports it: the CLI says
+  "Not installed … Nothing was changed." and exits non-zero instead of printing
+  "Installed", `doctor` reports `settings.json unusable` instead of
+  `all paths valid`, and **both** of its repair arms name the real cause instead
+  of claiming the hooks were already registered or that an npm reinstall is
+  needed. An empty or whitespace-only settings.json — what a crash mid-write
+  leaves — counts as absent and is rebuilt with no backup litter, while a
+  BOM-prefixed but otherwise valid file (PowerShell's default encoding) is now
+  parsed rather than misfiled as corrupt.
+- **A read-only query could delete part of the index** — `<external>` is a
+  pseudo-file with no on-disk counterpart, so the query-time freshness resync
+  classified it as a *deleted* file and dropped its row, CASCADE taking every
+  sentinel node and every import edge into them; a later incremental pass did not
+  restore them, because only a file whose content changed re-emits its import
+  relations. Any read command that displayed or resolved an external name reached
+  it — `show HashMap` destroyed them while printing `Symbol not found`, i.e. a
+  query that reported failure still damaged the index. Pre-existing, but the
+  `<external>` binding below puts far more nodes behind it, so it is fixed here.
+- **`module_overview`'s 60-second cache swallowed `include_deps` / `include_dead`**
+  — the flags are not part of the cache key and the folding happened *after* the
+  cache early-return, so once any call warmed a path (SessionStart injection
+  does), an `include_dead:true` call came back byte-identical to a plain one: no
+  `dead_code` section and no `dead_code_unavailable` marker either, which is
+  indistinguishable from "nothing dead here".
+- **`find_dead_code` reported a false clean on Windows** — it was the sixth
+  path-taking MCP tool and the only one still reading `args["path"]` raw. A
+  client passing `src\parser` produced a LIKE prefix that matched no row, and the
+  tool answered "No dead code found". A source-scanning drift guard now fails on
+  any tool that reads a path argument without normalizing it, replacing the
+  hand-maintained tool list that let this one through.
+- **Windows adoption metrics were structurally zero** — `paths_match` split only
+  on `/`, so a recorded `D:\repo\src\Foo.cs` became one opaque component and
+  never matched a repo-relative path. v0.107.0 fixed the call-recognition half of
+  the conversion metric (`.exe` tokens) and left this half dark.
+- **`.\src\foo.rs` produced a bad index key** — the `"."` / `"./"` prefix tests in
+  `normalize_user_path_from` were spelled Unix-only, so PowerShell's default
+  tab-completion spelling fell through to `./src/foo.rs`, a key the index never
+  contains. Separator normalization now happens before the prefix tests, and
+  `is_cwd_anchored` recognizes `.\` / `..\` — so its "cwd-anchored paths never
+  rebase" promise holds on Windows too. The branch is parameterized by platform,
+  so the Linux CI leg executes it.
+- **Windows-absolute paths given to a non-Windows binary answered "no results"
+  instead of erroring** — `Path::is_absolute` is irreducibly platform-native, so
+  `D:\repo\src\Foo.cs` and `C:/repo/src` were not absolute on a Unix host and
+  fell through to the relative branch, emerging as the index key
+  `D:/repo/src/Foo.cs`. A drive prefix or UNC root is now rejected by spelling on
+  every platform, matching what the MCP entry already did.
+- **cfg predicates were extracted as function calls (`INDEX_VERSION` 53)** —
+  `#[cfg(not(windows))]` and `cfg!(any(unix))` put `not(…)` / `any(…)` in a
+  token tree byte-identical to a call, and every predicate name is lowercase, so
+  the CamelCase pattern guard passed them through. A project defining `fn any` or
+  `fn not` had those calls bound to the wrong symbol.
+
+### Changed
+- **Rust `use std::…` now binds the `<external>` sentinel (`INDEX_VERSION` 53)**
+  — v0.107.0 dropped statically-external imports entirely to stop the phantom
+  `imports → fn fs` edges. Binding them explicitly stops the same phantoms *and*
+  lets the existing import-contradiction prune remove the sibling **call**
+  phantom that `use std::mem::swap; swap(&mut a, &mut b)` fabricates against a
+  project `swap` (risk names: swap / replace / take / min / max / read / write /
+  spawn / exit / sleep). Two shapes that bypassed the root check entirely are
+  covered in the same pass: a leading `::` (`use ::std::mem::swap`) and a
+  root-level use-list (`use {std::io::Read, crate::a::cb}`, now flattened so a
+  mixed list gets a mixed verdict).
+- **`resolve_fuzzy_name` is single-sourced** in `src/resolve.rs`. The CLI copy
+  was hand-written from the MCP one and had zero tests — the same shape as the
+  2026-06-03 incident that module exists to prevent.
+- **`find_references` / `refs` now answer for imported std names.** A consequence
+  of the `<external>` binding above: `refs HashMap` returns the `imports` edges
+  that bind it, where it previously answered `Symbol not found`. The rows are
+  import sites, not uses of the type.
+
+  Symbol *resolution* is unaffected. `<external>` sentinels are excluded at the
+  by-name query layer (`get_nodes_by_name`, `get_nodes_with_files_by_name`,
+  `get_first_node_id_by_name`, `find_functions_by_fuzzy_name`, and the call-graph
+  CTE seed), so `show` / `impact` / `callgraph` / `similar` / MCP `get_ast_node`
+  all behave as they did before v53 for a name that only exists as an import, and
+  a project `fn take` in a repo that also does `use std::mem::take` still
+  resolves to the project symbol. Filtering at the query rather than per surface
+  is deliberate: an earlier attempt patched two call sites and left `show
+  HashMap` printing `module <external>/HashMap` with exit 0.
+
+### CI
+- **A tag push could publish to npm without ever running fmt, clippy, or one
+  Rust test.** `release.yml`'s only trigger is `tags: ['v*']` and its chain was
+  build → publish → smoke — no `needs: ci`, no `workflow_run`. `bump-version.sh`
+  instructs `git push && git push --tags` back to back, so ci.yml's verdict on
+  the commit does not exist yet when the tag fires; publish's own gates (artifact
+  `--version` matches the tag, full JS suite) cover zero Rust. The 07-24 audit
+  found clippy RED on already-committed code — under that topology it would have
+  reached npm, which is irreversible. A `gate` job (fmt, clippy on both feature
+  sets, `cargo test --features embed-model`) now blocks `build`.
+- **`cache-warm.yml` primes that gate.** Actions caches are ref-scoped, so a
+  cache the gate saved under `refs/tags/vX` would be invisible to the next tag
+  while still consuming the repo's LRU budget. The gate is therefore
+  restore-only (`save-if: false`) and a new main-branch `warm-gate` job is the
+  sole writer of the `release-gate` key, mirroring the gate's commands
+  byte-for-byte — `-D warnings` included, since lint flags participate in
+  cargo's fingerprint and a cheaper variant would warm a cache the gate then
+  misses. It needs its own key rather than sharing `warm`'s: the gate compiles
+  the dev profile with `--all-targets`, a different artifact set from the
+  `--release` host build. On a cache miss the gate just compiles cold, as it did
+  before.
+- **Both commit-gate scripts were non-executable in the git index.**
+  `scripts/githooks/pre-commit` and `scripts/pre-commit.sh` were mode `100644`;
+  git silently ignores a hook without the exec bit and the commit goes straight
+  through, so the gate was inert on every fresh clone. It looked healthy on the
+  author's box only because the working tree carried `rwx` — a bit that was never
+  committed, which is why `ea0166d`'s "any machine that cuts a release has the
+  gate active" was false. Both are now `100755`, and the `fmt` job asserts the
+  index mode so it cannot silently revert.
+
+  That assertion earned itself before this release shipped. The repo sets
+  `core.fileMode = false`, so git ignores the working tree's exec bit entirely:
+  `git add -A` can never stage a mode change, and only an explicit
+  `git update-index --chmod=+x` sets it. A `git stash push -- scripts/` +
+  `git stash pop` round-trip during this batch silently reverted both files to
+  `100644` while the working tree kept showing `rwx` — the same invisible state
+  the original defect lived in, restored by an operation that looks unrelated.
+  Nothing but the index check found it. Generalise: under `core.fileMode=false`,
+  an explicitly-set mode is not durable across stash/checkout, so assert it in CI
+  rather than assuming a one-time `--chmod=+x` holds. The assertion now also runs
+  in `release.yml`'s gate: `ci.yml` never fires on a tag, so before this a
+  reverted exec bit would have published silently with the local commit gate
+  inert.
+
+### Internal
+- **A new e2e test wrote to the real `~/.claude`.** The doctor flag guard's
+  regression test inherited the ambient `HOME`, and its RED state — "doctor
+  performed the repairs", the exact regression it exists to catch — ran the full
+  repair pass over the developer's own settings.json, statusline registration,
+  binary pin and npm cache. The mutation run recorded in this batch's own commit
+  message did precisely that. `HOME` and `CLAUDE_CONFIG_DIR` are now sandboxed
+  per-invocation (the latter because `claude-config.js` honours it ahead of
+  `os.homedir()`), the test asserts nothing landed in the sandbox home, and it
+  pins `_FIND_BINARY_ROOT` so a redirected `CARGO_TARGET_DIR` — this repo's own
+  documented mitigation for target-dir growth — no longer fails it with
+  "must name the offending token" while the real cause ("doctor.js not found")
+  sits in stderr. Its JS sibling in `doctor.test.js` sandboxed only `HOME` — the
+  same half-applied shape one file over, and `claude-config.js` reads
+  `CLAUDE_CONFIG_DIR` ahead of `os.homedir()`, so a developer who exports it had
+  the full repair pass land in their real config. Verified closed with a canary
+  config dir: byte-identical after the suite runs. Verified: with the fix in place, the RED run still reddens and
+  still takes ~89 s, and settings.json, the binary pin and the npm log count are
+  all byte-identical afterwards.
+- **A fourth inert negative control, deleted rather than relabelled.** The
+  `Debug` trait-sentinel block added to the MCP find_references test was labelled
+  "the live half of the control"; instrumenting both branches showed the payload
+  byte-identical with and without the `<external>` exclusion, because
+  `find_references` answers from EDGE rows, which never enter the by-name lookups
+  the exclusion filters — as that constant's own doc comment says. An inert block
+  invites the next reader to trust it.
+- **`is_selectable_definition` had zero live coverage across 1346 tests**, while
+  a comment asserted the reader guard "does go red under both mutations". Only
+  the SQL mutation reddens it: the two guards sit in series with the SQL one
+  first, so no reachable input carries an `<external>` path into the Rust
+  predicate. The claim is corrected in place and the predicate now has a direct
+  unit test, labelled as covering the function and not its reachability — it
+  becomes load-bearing the moment the SQL exclusion is relaxed for the `deps`
+  disclosure its doc comment contemplates.
+- **Two independent test flakes, both root-caused.** `trackReadAndMaybeHint` failed
+  about one full-suite run in seven: it spawns a real `node` stub through
+  `cg-answer`, whose 2 s timeout is a product decision for a PreToolUse hook, so
+  under load cold node startup exceeded it. A test-only `_CG_ANSWER_TIMEOUT_MS`
+  seam (next to the `_CG_ANSWER_BINARY` one already there) insulates the tests
+  without lowering the hook's bar. What remained after that was a DIFFERENT
+  test — `cgTmpDir() returns the same path and creates the directory` — at 2
+  failures in 40 instrumented runs: it wipes the process-wide `CG_TMP_DIR` and
+  asserts it is absent, while `node --test` runs test files in parallel and any
+  sibling calling `cgTmpDir()` re-creates it inside that window. That file now
+  owns a private `TMPDIR`. Measured 0 failures in 40 runs afterwards, with the
+  failing test names recorded per run rather than only a pass count — the earlier
+  "30 clean runs" claim could not distinguish the two flakes because it did not
+  capture names.
+- **Three shipped promises verified against behavior, two already guarded.** A
+  sweep had listed the v0.85.4 `doctor` exit-code semantics, the read-only
+  secondary MCP explanation, and the `application_id` downgrade preservation as
+  unclassified. All three hold. Two turned out to have live tests — mutation runs
+  confirm `test_downgrade_open_never_wipes_newer_index` reddens when the version
+  check is made symmetric again, and `test_secondary_not_found_includes_stale_hint`
+  reddens when the hint text is removed. The third had a live PREDICATE test
+  (`unresolvedCount`) but no wiring test, which is the gap this repo already
+  named in v0.45.3; the exit code is now produced by three entry points, so a
+  report-vs-exit-code consistency test runs against each. Its limits are recorded
+  in the test itself rather than implied.
+- **The `<external>` query-layer exclusion had no live guard.** Round-6 mutation
+  runs showed that both tests believed to cover it — `external_sentinel_tests` in
+  `src/resolve.rs` and the "negative control" in the MCP integration test —
+  survive deleting `EXCLUDE_EXTERNAL_BY_NAME` *and* neutering
+  `is_selectable_definition`. The reason is structural, not a fixture slip: the
+  by-name fuzzy path already carries `AND n.type != 'module'`, and a sentinel is
+  typed non-`module` only when no project symbol shares its name — exactly the
+  case where there is nothing to discriminate. Three attempts to make that
+  control live failed; the claim has been removed from the test rather than
+  replaced with a fourth inert one. The real guard,
+  `show_does_not_resolve_a_name_that_exists_only_as_an_import`, drives the binary
+  at the surface where the defect was observed (`show HashMap` printing
+  `module <external>/HashMap` at exit 0) and does go red under the mutation.
+- **Workflow drift guard** (`release_and_cache_warm_workflows_do_not_drift`) pins
+  what had only ever been a comment: one toolchain pin and one rust-cache pin
+  across both files, every `shared-key` release.yml restores is written by a
+  cache-warm.yml job, the gate is restore-only while `warm-gate` is the writer,
+  the two jobs run the same cargo commands, the gate still runs fmt + both clippy
+  passes + the test suite, and `build` still declares `needs: gate`. The comment
+  version of this rule was already in `cache-warm.yml` when v0.101.0 shipped a
+  `key`/`shared-key` mismatch that made all five release builds cold. Each
+  assertion was checked at development time by mutating the workflow file and
+  confirming the guard goes red (nine such mutations); those checks are not
+  themselves committed, so treat the guard the way you would any other — the
+  first draft of it passed against the *prose* explaining `save-if: false`
+  rather than the setting itself, and only a mutation run caught that.
+- **Read commands can no longer reach the destructive constructor**
+  (`tests/reader_nondestructive.rs`). The `similar` fix above shipped with a
+  regression pin hardcoded to `similar`, which read command #26 would walk
+  straight past — the same shape that let `similar` itself survive four audits.
+  Two class-level guards replace it: a behavioural sweep that re-stamps a stale
+  `INDEX_VERSION` before each of 21 read subcommands and asserts the node count
+  survives, and a source scan that fails the moment any `cmd_*` outside the two
+  indexer entry points types `Database::open_with_vec`. A negative control
+  (pointing one read command at the destructive constructor) reddens all three.
+- Cross-language drift guard (`tests/predicate_parity.rs`) runs a shared corpus
+  through all four `is_test_path` mirrors (Rust, SQL, JS, two Python) and diffs
+  them. Only the Rust↔SQL pair had a mechanical differential before.
+
+### Errata (v0.106.0)
+- The `ureq` `platform-verifier` feature — a *functional* dependency change, not
+  a release chore — was committed inside `chore(release): v0.106.0`. Without it
+  the TLS fallback added in `5739dad` would have panicked on
+  `RootCerts::PlatformVerifier`, unwinding the download thread and leaving
+  `model-download.json` permanently `in_flight`. That combination was never
+  published, so no released version was affected; recorded here because
+  `git blame` points at a release commit for a runtime fix.
+
 ## v0.107.0 — Windows MCP path lookup, test-classifier parity across its four mirrors
 
 Upgrade notes: **no index rebuild required** — `INDEX_VERSION` is unchanged at

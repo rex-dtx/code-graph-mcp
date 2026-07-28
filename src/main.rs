@@ -251,14 +251,20 @@ fn main() -> Result<()> {
                 );
                 Ok(())
             } else {
-                run_node_script(
-                    "doctor.js",
-                    &args
-                        .iter()
-                        .filter(|a| a.as_str() == "--check-only")
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
+                // Pass the tail through VERBATIM. This used to filter argv down to
+                // the single literal `--check-only`, which silently DROPPED every
+                // other token — so `code-graph-mcp doctor --check-onlyy` reached
+                // doctor.js with an empty argv, parsed as "no flags", and ran the
+                // full repair pass while the user believed they had asked for the
+                // read-only mode. doctor.js validates its own flags and exits 2 on
+                // an unknown one; run_node_script propagates that exit code.
+                //
+                // Third site of the same parsing. doctor.js was fixed first,
+                // `lifecycle.js doctor` was found second — and this one, the
+                // surface users actually install via npx / cargo install / the
+                // plugin, was still on the old idiom. Whichever entry point you
+                // fix, enumerate the others before claiming the flag is handled.
+                run_node_script("doctor.js", &args[2..])
             }
         }
         Some("adopt") => {
@@ -273,6 +279,7 @@ fn main() -> Result<()> {
                 );
                 Ok(())
             } else {
+                reject_extra_args("adopt", &args)?;
                 run_node_script("adopt.js", &[])
             }
         }
@@ -287,6 +294,7 @@ fn main() -> Result<()> {
                 );
                 Ok(())
             } else {
+                reject_extra_args("unadopt", &args)?;
                 run_node_script("adopt.js", &["unadopt".to_string()])
             }
         }
@@ -326,6 +334,38 @@ fn print_version() {
 /// their side effects (settings.json / CLAUDE.md managed-block rewrites).
 fn wants_subcommand_help(args: &[String]) -> bool {
     args.iter().skip(2).any(|a| a == "--help" || a == "-h")
+}
+
+/// Refuse a flag-taking-no-flags subcommand any argument beyond `--help`.
+///
+/// `adopt` / `unadopt` are JS-dispatched and `adopt.js` reads only `argv[2]` as
+/// the action — it parses no flags at all, so anything else was silently
+/// discarded and the command ran. `code-graph-mcp adopt --helpp` therefore WROTE
+/// the user's CLAUDE.md, one keystroke from the side effect the `--help`
+/// interception exists to prevent.
+///
+/// Fifth site of this idiom, found by the pre-tag review after four others were
+/// closed: doctor.js, `lifecycle.js doctor`, main.rs's own doctor arm, and
+/// `bin/cli.js`. The npm/npx surface was already covered by bin/cli.js; this is
+/// the `cargo install` / direct-binary path.
+///
+/// Passing the tail through to adopt.js is NOT the fix here — it would make
+/// `--helpp` the action argument.
+fn reject_extra_args(sub: &str, args: &[String]) -> Result<()> {
+    let extra: Vec<&String> = args.iter().skip(2).collect();
+    if !extra.is_empty() {
+        eprintln!(
+            "code-graph-mcp {sub}: unknown argument(s): {}",
+            extra
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        eprintln!("Usage: code-graph-mcp {sub}");
+        std::process::exit(2);
+    }
+    Ok(())
 }
 
 fn print_help() {

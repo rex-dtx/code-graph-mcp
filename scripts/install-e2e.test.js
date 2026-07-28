@@ -967,3 +967,76 @@ test('§6.5 bin/cli.js syntax is valid', () => {
   const result = spawnSync(process.execPath, ['--check', BIN_CLI], { stdio: ['pipe', 'pipe', 'pipe'] });
   assert.equal(result.status, 0, `Syntax error in cli.js: ${result.stderr?.toString()}`);
 });
+
+// ── §6 the npm/npx wrapper must not act on an unrecognized flag ─────────────
+//
+// `bin/cli.js` intercepts adopt / unadopt / uninstall before the binary and
+// guarded `--help` — but ignored every other token, so `adopt --helpp` ran adopt
+// and wrote the user's CLAUDE.md, one keystroke from the side effect the --help
+// guard exists to prevent. This is the FOURTH entry point onto the same
+// "ignore what you don't recognise" idiom (doctor.js, lifecycle.js doctor and
+// src/main.rs were the first three), and it is the surface npm/npx users reach.
+
+function runCli(homeDir, cwd, args) {
+  const r = spawnSync(process.execPath, [BIN_CLI, ...args], {
+    cwd, env: { ...process.env, HOME: homeDir }, encoding: 'utf8',
+  });
+  return { code: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
+}
+
+function sandboxProject(t) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cli-home-'));
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cli-proj-'));
+  fs.mkdirSync(path.join(proj, '.git'));
+  fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p","version":"1.0.0"}');
+  t.after(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(proj, { recursive: true, force: true });
+  });
+  return { home, proj, claudeMd: path.join(proj, 'CLAUDE.md') };
+}
+
+test('§6.1 bin/cli.js rejects an unknown flag instead of running the command', (t) => {
+  for (const [sub, typo] of [
+    ['adopt', '--helpp'], ['adopt', '-H'], ['unadopt', '--all'],
+    ['uninstall', '--purge-globl'], ['uninstall', '--unadopt'],
+  ]) {
+    const sb = sandboxProject(t);
+    const r = runCli(sb.home, sb.proj, [sub, typo]);
+    assert.equal(r.code, 2, `${sub} ${typo} must exit 2; got ${r.code}\n${r.stderr}`);
+    assert.match(r.stderr, /unknown argument/, `${sub} ${typo} must say why`);
+    assert.equal(fs.existsSync(sb.claudeMd), false,
+      `${sub} ${typo} must not have written CLAUDE.md — a typo must not perform ` +
+      'the side effect the --help guard exists to prevent');
+  }
+});
+
+test('§6.2 the real flags and --help still work (the guard is not inert)', (t) => {
+  // Negative control for §6.1.
+  const sb = sandboxProject(t);
+  const help = runCli(sb.home, sb.proj, ['adopt', '--help']);
+  assert.equal(help.code, 0);
+  assert.match(help.stdout, /USAGE:/);
+  assert.equal(fs.existsSync(sb.claudeMd), false, '--help must not write');
+
+  const real = runCli(sb.home, sb.proj, ['adopt']);
+  assert.equal(real.code, 0, `bare adopt must still work:\n${real.stderr}`);
+  assert.equal(fs.existsSync(sb.claudeMd), true, 'bare adopt must still write the block');
+
+  const un = runCli(sb.home, sb.proj, ['uninstall', '--unadopt-all']);
+  assert.notEqual(un.code, 2, 'a documented uninstall flag must not be rejected');
+});
+
+test('§6.3 adopt/unadopt help describes the CLAUDE.md scheme, not the pre-v0.74 memory dir', (t) => {
+  // The npm surface kept printing "install the code-graph memory file +
+  // MEMORY.md sentinel" for three releases after the target moved to the
+  // project's own CLAUDE.md — two texts for one command, and npm users got the
+  // wrong one.
+  const sb = sandboxProject(t);
+  for (const sub of ['adopt', 'unadopt']) {
+    const { stdout } = runCli(sb.home, sb.proj, [sub, '--help']);
+    assert.match(stdout, /CLAUDE\.md/, `${sub} --help must name the real target`);
+    assert.doesNotMatch(stdout, /MEMORY\.md sentinel/,
+      `${sub} --help still describes the pre-v0.74 memory-dir scheme`);
+  }
+});

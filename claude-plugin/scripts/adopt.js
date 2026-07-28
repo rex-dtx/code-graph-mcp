@@ -20,7 +20,11 @@ const { PROJECT_MARKERS, isProjectRoot, isNonProjectCwd } = require('./project-d
 const SENTINEL_VERSION = 'v2';
 const SENTINEL_BEGIN = `<!-- code-graph-mcp:begin ${SENTINEL_VERSION} -->`;
 const SENTINEL_END = '<!-- code-graph-mcp:end -->';
-const SENTINEL_BEGIN_SRC = '<!-- code-graph-mcp:begin[^>]*-->';
+// `[^>\n]*`, not `[^>]*`: an HTML comment marker cannot span lines, but the
+// permissive class could — a marker truncated mid-write (`…:begin v2 --`) let
+// the match run across newlines to whatever `-->` came next, swallowing every
+// user line in between before any of the guards in stripSentinelBlock applied.
+const SENTINEL_BEGIN_SRC = '<!-- code-graph-mcp:begin[^>\\n]*-->';
 // Marker on the first line of the installed .claude/plugin_code_graph_mcp.md so
 // unadopt/needsRefresh can distinguish our generated copy from a user's own file
 // of the same name (and so needsRefresh strips it before the bytewise compare).
@@ -32,11 +36,28 @@ const LEGACY_ADOPTED_BY = '<!-- adopted-by:';
 // half-written MEMORY.md / detail file — the dir is shared with claude-mem-lite,
 // which reads MEMORY.md on every keyword match. Mirrors lifecycle.js
 // writeJsonAtomic / auto-update.js binary promote; accepts a string or Buffer.
-function writeFileAtomic(filePath, data) {
-  const tmp = filePath + '.tmp.' + process.pid;
+// `followLink` is opt-in, and ONLY the CLAUDE.md read-modify-write passes it.
+//
+// `rename` REPLACES a symlink with a regular file. For CLAUDE.md that is wrong:
+// we READ through the link, strip the block from what we read, and must write
+// the result back to the same file — otherwise the shared target keeps the block
+// while we report `blockPruned: true`, and the project silently gets a detached
+// private copy.
+//
+// For every other caller it is the opposite. The detail file and the registry
+// are whole-file REPLACEMENTS of content we own; following a link there turns
+// "replace our symlink" into "overwrite whatever the user pointed it at". A
+// first pass applied realpath to all four callers and created exactly that loss
+// path — the fix for one caller became a bug in the others.
+function writeFileAtomic(filePath, data, { followLink = false } = {}) {
+  let target = filePath;
+  if (followLink) {
+    try { target = fs.realpathSync(filePath); } catch { /* new file — no link to follow */ }
+  }
+  const tmp = target + '.tmp.' + process.pid;
   fs.writeFileSync(tmp, data);
   try {
-    fs.renameSync(tmp, filePath);
+    fs.renameSync(tmp, target);
   } catch (e) {
     // rename can fail (ENOSPC / EACCES / EROFS on the dir). Don't orphan the
     // temp in the shared memory dir — mirror auto-update.js's binary promote,
@@ -304,23 +325,54 @@ function escapeRegex(s) {
 
 // Strip our sentinel block — well-formed first, then self-heal orphan begin/end.
 // Shared by adopt (so re-adopt rewrites a stale/malformed block) and unadopt.
+//
+// Every rule below exists because its absence deleted a user's prose. The file
+// this runs against is the user's own CLAUDE.md, `unadopt` runs it over EVERY
+// registered project via `uninstall({unadoptAll:true})`, and the only thing that
+// distinguishes our block from their text is a string they are *invited* to
+// write down — the block itself tells them not to edit inside it. So: never
+// start a match at a marker we cannot prove we wrote, and when in doubt delete
+// less. A stale block left behind is visible and removable; deleted prose is not.
 function stripSentinelBlock(text) {
+  // Line-anchored. A marker mentioned mid-sentence ("the block starts with
+  // `<!-- code-graph-mcp:begin v2 -->` — don't edit inside it") is prose, not a
+  // block opener; matching it ate everything from that sentence to the end of
+  // the real block below it.
+  const BEGIN_LINE = `^[ \\t]*${SENTINEL_BEGIN_SRC}[ \\t]*$`;
+  const END_LINE = `^[ \\t]*${escapeRegex(SENTINEL_END)}[ \\t]*$`;
+
   // Match ANY begin version (v1 legacy MEMORY.md block, v2 CLAUDE.md block) so a
   // single strip handles both the new target and the legacy migration cleanup.
+  //
+  // `(?:(?!BEGIN)[\s\S])*?` — the body may not contain another BEGIN. Without it
+  // a lazy `[\s\S]*?` still ANCHORS at the earliest BEGIN in the file, so a
+  // marker quoted on its own line (a fenced example, a note to a teammate) made
+  // the match start there and run through everything up to our real END.
   const wellFormed = new RegExp(
-    `${SENTINEL_BEGIN_SRC}[\\s\\S]*?${escapeRegex(SENTINEL_END)}\\n?`, 'g'
+    `${BEGIN_LINE}(?:(?!${SENTINEL_BEGIN_SRC})[\\s\\S])*?${END_LINE}\\n?`,
+    'gm'
   );
   let out = text.replace(wellFormed, '');
-  // Orphan BEGIN with no matching END (truncation / partial edit).
-  // Strip from BEGIN to the next blank line or EOF — the file may be shared with
-  // claude-mem-lite (legacy MEMORY.md), so we must not eat past a blank-line boundary.
-  if (new RegExp(SENTINEL_BEGIN_SRC).test(out)) {
-    out = out.replace(
-      new RegExp(`${SENTINEL_BEGIN_SRC}[\\s\\S]*?(?=\\n\\n|$)`, 'g'),
-      ''
-    );
-  }
-  // Orphan END line by itself.
+  // Orphan BEGIN with no matching END (truncation / partial edit): remove the
+  // MARKER LINE ONLY, never the content after it.
+  //
+  // This used to strip from the marker to the next blank line, on the theory
+  // that the content below a stray begin marker was our truncated block. It is
+  // not decidable. These two files are byte-for-byte the same shape:
+  //
+  //   BEGIN / "- stale partial block" / "" / "Also keep me."      <- our leftovers
+  //   BEGIN / "KEEP: on-call rotation" / "" / "tail prose"        <- their notes
+  //
+  // and the second one is what a user writes after reading "the block opens
+  // with <marker>". The blank-line bound protects nothing when their next line
+  // is prose. Since the two cases cannot be told apart, the tie goes to the
+  // outcome that is recoverable: a stale fragment left in the file is visible
+  // and the user can delete it; prose we deleted is gone. `isAdopted` requires a
+  // line-anchored BEGIN *and* END, so a leftover fragment does not block
+  // re-adoption — the next adopt writes a fresh, well-formed block.
+  const orphanBegin = new RegExp(`${BEGIN_LINE}\\n?`, 'gm');
+  out = out.replace(orphanBegin, '');
+  // Orphan END line by itself — same rule, one line, nothing around it.
   if (out.includes(SENTINEL_END)) {
     out = out.split('\n').filter(l => l.trim() !== SENTINEL_END).join('\n');
   }
@@ -422,7 +474,8 @@ function adopt({ cwd, templatePath, home } = {}) {
   const healed = exists && cleaned !== current;
   const base = cleaned.replace(/\n+$/, '');
   const prefix = base ? base + '\n\n' : '';
-  writeFileAtomic(cPath, prefix + block + '\n');
+  // followLink: read-modify-write of a file the user may have symlinked.
+  writeFileAtomic(cPath, prefix + block + '\n', { followLink: true });
   recordAdopted(effectiveCwd, home);
   return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: true, created: !exists, healed };
 }
@@ -435,7 +488,11 @@ function isAdopted({ cwd } = {}) {
   const dPath = detailPath(effectiveCwd);
   if (!fs.existsSync(dPath) || !fs.existsSync(cPath)) return false;
   const c = fs.readFileSync(cPath, 'utf8');
-  return new RegExp(SENTINEL_BEGIN_SRC).test(c) && c.includes(SENTINEL_END);
+  // Line-anchored for the same reason stripSentinelBlock is: a user quoting the
+  // markers in prose would otherwise read as adopted, and this gates the
+  // idempotent auto-adopt — so the block would never actually be written.
+  return new RegExp(`^[ \\t]*${SENTINEL_BEGIN_SRC}[ \\t]*$`, 'm').test(c)
+    && new RegExp(`^[ \\t]*${escapeRegex(SENTINEL_END)}[ \\t]*$`, 'm').test(c);
 }
 
 // shipped template / 管理块 与已落地版本出现漂移时返回 true。让已 install 的项目
@@ -454,7 +511,11 @@ function needsRefresh({ cwd, templatePath } = {}) {
   const current = fs.readFileSync(dPath);
   let body = current;
   const nl = current.indexOf(0x0a);
-  if (nl > 0 && current.subarray(0, nl).toString().includes('managed-by: code-graph-mcp')) {
+  // Equality on the trimmed line, matching the unadopt guard. `includes` here
+  // was harmless in isolation (worst case: a spurious refresh) but it is the
+  // third spelling of the same predicate in this file, and the other two both
+  // turned out to be wrong — a loose one left behind is the next audit's finding.
+  if (nl > 0 && current.subarray(0, nl).toString().trim() === MANAGED_BY) {
     body = current.subarray(nl + 1);
   }
   if (!shipped.equals(body)) return true;
@@ -495,7 +556,15 @@ function migrateLegacyMemoryDir({ cwd, home } = {}) {
   if (fs.existsSync(legacyDetail)) {
     try {
       const head = fs.readFileSync(legacyDetail, 'utf8').split('\n', 1)[0];
-      if (head.startsWith(LEGACY_ADOPTED_BY)) {
+      // Same guard as unadopt's (:636), and it must be — this is the MORE
+      // frequently executed of the two: maybeAutoAdopt calls migrate on every
+      // SessionStart, while unadopt is explicit. Tightening only unadopt's copy
+      // left the hot path deleting any user file whose first line merely began
+      // with `<!-- adopted-by:` — e.g. a note from someone else's tooling.
+      // The legacy marker carries a payload after the prefix, so it is matched
+      // as a whole-line HTML comment rather than by equality.
+      const h = head.trim();
+      if (h.startsWith(LEGACY_ADOPTED_BY) && h.endsWith('-->')) {
         fs.unlinkSync(legacyDetail);
         result.legacyDetailRemoved = true;
       }
@@ -507,7 +576,7 @@ function migrateLegacyMemoryDir({ cwd, home } = {}) {
       const before = fs.readFileSync(legacyIndex, 'utf8');
       const after = stripSentinelBlock(before);
       if (after !== before) {
-        writeFileAtomic(legacyIndex, after);
+        writeFileAtomic(legacyIndex, after, { followLink: true });
         result.memoryIndexPruned = true;
       }
     } catch { /* unreadable → leave it */ }
@@ -561,7 +630,18 @@ function unadopt({ cwd, home } = {}) {
     let mine = false;
     try {
       const head = fs.readFileSync(dPath, 'utf8').split('\n', 1)[0];
-      mine = head.includes(MANAGED_BY) || head.startsWith(LEGACY_ADOPTED_BY);
+      // `===`, not `includes`. adopt writes the marker as the ENTIRE first line
+      // (`${MANAGED_BY}\n` + template, :403), so equality is exactly as capable
+      // here — while `includes` unlinked any user file whose first line merely
+      // quoted the marker, e.g. a note about what this plugin writes.
+      // BOTH arms anchored. Tightening only the current marker left the legacy
+      // one as a loose startsWith, so a user file opening `<!-- adopted-by: …`
+      // was still unlinked — the same half-applied shape this batch keeps
+      // producing. The legacy marker carries a payload after the prefix, so it
+      // is matched as a whole-line HTML comment rather than by equality.
+      const h = head.trim();
+      mine = h === MANAGED_BY
+        || (h.startsWith(LEGACY_ADOPTED_BY) && h.endsWith('-->'));
     } catch { mine = false; }
     if (mine) { fs.unlinkSync(dPath); fileRemoved = true; }
   }
@@ -573,11 +653,15 @@ function unadopt({ cwd, home } = {}) {
     const after = stripSentinelBlock(before);
     if (after !== before) {
       blockPruned = true;
-      if (after.trim() === '') {
+      // Only delete a file we could have created. A symlinked CLAUDE.md points
+      // at something the user owns (a shared team file, a dotfiles repo);
+      // unlinking it removes their link, and the "file we created" rationale
+      // does not apply. Write the stripped text through the link instead.
+      if (after.trim() === '' && !fs.lstatSync(cPath).isSymbolicLink()) {
         fs.unlinkSync(cPath);
         claudeMdRemoved = true;
       } else {
-        writeFileAtomic(cPath, after);
+        writeFileAtomic(cPath, after, { followLink: true });
       }
     }
   }

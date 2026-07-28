@@ -884,6 +884,94 @@ fn test_cli_js_subcommands_help_is_side_effect_free() {
     );
 }
 
+/// The published binary must not swallow an unrecognized `doctor` flag.
+///
+/// `doctor`'s default mode REPAIRS — it rewrites `~/.claude/settings.json`. The
+/// dispatch used to filter argv down to the single literal `--check-only`, so a
+/// typo like `--check-onlyy` was dropped and doctor.js was invoked with an empty
+/// argv, which parses as "no flags" and takes the repair path. The user asked for
+/// the read-only mode and got the writing one.
+///
+/// This is the THIRD entry point onto the same parsing: `doctor.js` and
+/// `lifecycle.js doctor` were fixed first, and this one — the surface installed
+/// via npx / `cargo install` / the plugin — kept the old behavior, invisible to
+/// the JS tests because they only drive the two JS entry points.
+#[test]
+fn test_cli_doctor_rejects_an_unknown_flag_instead_of_repairing() {
+    let project = TempDir::new().unwrap();
+
+    // HOME and CLAUDE_CONFIG_DIR MUST be sandboxed here, and this is the only
+    // cli_e2e test for which that is true.
+    //
+    // Its RED state is "doctor performed the repairs" — the very regression it
+    // guards. Repairs rewrite ~/.claude/settings.json, re-register the
+    // statusline, populate ~/.cache/code-graph (including the auto-update binary
+    // pin) and shell out to npm. Inheriting the ambient HOME meant that a
+    // mutation run to prove this guard live did all of that to the developer's
+    // real config — measured, and it is what the verification recorded in
+    // a1c94f8 actually did. On CI the same run would rewrite the runner's home.
+    //
+    // CLAUDE_CONFIG_DIR is set too, not just HOME: claude-config.js honours it
+    // ahead of os.homedir(), so redirecting HOME alone leaves an escape hatch
+    // for anyone who has it exported.
+    let home = TempDir::new().unwrap();
+    let sandbox_env: Vec<(&str, &str)> = vec![
+        ("HOME", home.path().to_str().unwrap()),
+        ("CLAUDE_CONFIG_DIR", home.path().to_str().unwrap()),
+    ];
+
+    // `doctor` is JS-dispatched: main.rs spawns claude-plugin/scripts/doctor.js
+    // relative to the executable. Under a redirected CARGO_TARGET_DIR that path
+    // does not resolve, and the failure surfaces as "must name the offending
+    // token" while the real cause sits in stderr. Point the resolver at the repo
+    // so the test measures the guard rather than the layout.
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut env = sandbox_env.clone();
+    env.push(("_FIND_BINARY_ROOT", repo_root.to_str().unwrap()));
+
+    for typo in ["--check-onlyy", "--checkonly", "--check_only", "--dry-run"] {
+        let (stdout, stderr, code) = run_cli_env(&project, &["doctor", typo], &env);
+        assert!(
+            !stderr.contains("doctor.js not found"),
+            "doctor.js was unreachable, so this run proved nothing about flag \
+             validation.\nstderr: {stderr}"
+        );
+        assert_ne!(
+            code, 0,
+            "`doctor {typo}` must not exit 0 — it was silently dropped and the              repair pass ran.
+stdout: {stdout}
+stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("unknown argument"),
+            "`doctor {typo}` must name the offending token.
+stdout: {stdout}
+stderr: {stderr}"
+        );
+        // The diagnostic run prints a magnifying-glass header; a rejected flag
+        // must not have reached it.
+        assert!(
+            !stdout.contains('\u{1f50d}'),
+            "`doctor {typo}` ran the diagnostic (and therefore the repairs) \
+             instead of refusing.\nstdout: {stdout}"
+        );
+    }
+
+    // Negative control: the real flag still works and is still read-only.
+    let (stdout, _, _) = run_cli_env(&project, &["doctor", "--check-only"], &env);
+    assert!(
+        stdout.contains('\u{1f50d}') || stdout.contains("issue"),
+        "`doctor --check-only` must still run the diagnostic; got:\n{stdout}"
+    );
+
+    // And nothing landed in the sandboxed home — if a future edit lets a repair
+    // run here, this is what catches it before it reaches a real machine.
+    assert!(
+        !home.path().join(".claude/settings.json").exists(),
+        "a rejected flag (and --check-only) must not write settings.json"
+    );
+}
+
 // ============================================================
 // health-check
 // ============================================================

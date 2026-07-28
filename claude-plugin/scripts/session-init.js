@@ -193,6 +193,29 @@ function isHighIntentSource(source) {
   return source !== 'compact';
 }
 
+// Every install()/update() in this file goes through these wrappers so the
+// "your settings.json was rebuilt" notice cannot be wired into some call sites
+// and not others — there are seven, and the previous fix wired the notice only
+// into `doctor`, the path a user runs deliberately, while THIS path runs on
+// every SessionStart and stayed silent.
+//
+// The notice goes to STDOUT on purpose. lifecycle.js already logs it to stderr,
+// which a SessionStart hook discards — so from the user's side their model /
+// env / permissions vanished with no message at all. stdout is the channel
+// Claude Code surfaces (same one injectProjectMap uses).
+function reportRebuild(r) {
+  if (r && r.settingsRebuiltFrom) {
+    process.stdout.write(
+      `[code-graph] ${settingsPath()} could not be parsed and has been REBUILT. ` +
+      `Your original is saved at ${r.settingsRebuiltFrom} — merge anything you ` +
+      `still need (model / env / permissions / your own hooks) back by hand.\n`
+    );
+  }
+  return r;
+}
+function installReporting(...args) { return reportRebuild(install(...args)); }
+function updateReporting(...args) { return reportRebuild(update(...args)); }
+
 function syncLifecycleConfig() {
   // v0.49.1: stale-relic guard. A still-running Claude Code process fires
   // SessionStart from the plugin-cache dir it loaded at startup; after
@@ -207,11 +230,11 @@ function syncLifecycleConfig() {
   const currentVersion = getPluginVersion();
 
   if (!manifest.version) {
-    install();
+    installReporting();
     return 'installed';
   }
   if (manifest.version !== currentVersion) {
-    update();
+    updateReporting();
     return 'updated';
   }
   // Self-heal: version matches but statusLine may have been lost or path corrupted
@@ -220,13 +243,13 @@ function syncLifecycleConfig() {
   const settings = readJson(settingsPath()) || {};
   if (!settings.statusLine || !settings.statusLine.command ||
       !settings.statusLine.command.includes('statusline-composite')) {
-    install();
+    installReporting();
     return 'self-healed';
   }
   // Also self-heal if composite path points to a non-existent script (path pollution)
   const scriptMatch = settings.statusLine.command.match(/node\s+"([^"]+)"/);
   if (scriptMatch && scriptMatch[1] && !fs.existsSync(scriptMatch[1])) {
-    install();
+    installReporting();
     return 'self-healed-bad-path';
   }
   // v0.49.1: also self-heal when the composite path exists but is not the one
@@ -234,7 +257,7 @@ function syncLifecycleConfig() {
   // invisible to the existence check above; same fault class as the binary pin).
   const { compositeCommand } = require('./lifecycle');
   if (settings.statusLine.command !== compositeCommand()) {
-    install();
+    installReporting();
     return 'self-healed-stale-statusline';
   }
   // Self-heal if any hook command points to a non-existent script (path pollution)
@@ -246,7 +269,7 @@ function syncLifecycleConfig() {
         for (const h of entry.hooks) {
           const m = h.command && h.command.match(/node\s+"([^"]+)"/);
           if (m && m[1] && m[1].includes('code-graph') && !fs.existsSync(m[1])) {
-            install();
+            installReporting();
             return 'self-healed-bad-hook';
           }
         }
@@ -265,11 +288,11 @@ function syncLifecycleConfig() {
   const { surveyHookCoverage } = require('./lifecycle');
   const cov = surveyHookCoverage(settings);
   if (cov.missing.length > 0) {
-    install();
+    installReporting();
     return 'self-healed-missing-settings-hook';
   }
   if (cov.stale.length > 0) {
-    install();
+    installReporting();
     return 'self-healed-stale-settings-hook';
   }
   return 'noop';
@@ -489,7 +512,21 @@ function runSessionInit({ source } = {}) {
     // only place project unadoption can happen automatically.
     let teardown = null;
     if (uninstalled) {
-      const cacheRemoved = removeCacheResidue();
+      // Unadopt BEFORE the wipe. The adopted-projects registry lives inside
+      // CACHE_DIR, so wiping first destroyed the record of every OTHER adopted
+      // repo — this branch only unadopts the current cwd, and a later
+      // `uninstall --unadopt-all` then read an empty registry and reported
+      // `unadopted: []` while the blocks stayed behind. Same capture-before-
+      // cleanup ordering `uninstall()` already had to learn; this was its
+      // sibling.
+      //
+      // Honest scope: this reorder alone does NOT save the registry. On the
+      // genuine post-uninstall path `cleanupDisabledStatusline()` runs earlier
+      // in this same function and already calls removeCacheResidue() itself, so
+      // the wipe still happens before we get here. What actually protects the
+      // other projects is the preservation inside removeCacheResidue(); this
+      // ordering is the belt to that pair of braces, and it is what keeps the
+      // single-project case from depending on the preservation at all.
       let unadopted = false;
       try {
         if (!isNonProjectCwd(process.cwd())) {
@@ -497,6 +534,7 @@ function runSessionInit({ source } = {}) {
           unadopted = !!(r && (r.blockPruned || r.fileRemoved || r.claudeMdRemoved));
         }
       } catch { /* best-effort — never let teardown break SessionStart */ }
+      const cacheRemoved = removeCacheResidue();
       teardown = { cacheRemoved, unadopted };
     }
     return { inactive: true, lifecycle: 'noop', autoUpdateLaunched: false, teardown };

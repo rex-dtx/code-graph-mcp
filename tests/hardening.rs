@@ -405,6 +405,18 @@ fn tool_path_args_are_separator_normalized_at_entry() {
         ),
         ("dependency_graph", "file_path", json!({}), "/file"),
         ("module_overview", "path", json!({}), "/path"),
+        // `get_call_graph`'s presence pointer is deliberately weak: this fixture
+        // has no call edges, and a wrong path filter yields the same empty
+        // callers/callees as a right one — so only the Windows equality leg
+        // below discriminates. It is listed because the audit found it missing
+        // from this enumeration entirely; its failure mode (a mis-spelled filter
+        // just silently drops edges) is the quietest of the six.
+        (
+            "get_call_graph",
+            "file_path",
+            json!({"symbol_name": "func_0", "direction": "callees"}),
+            "/function",
+        ),
     ];
 
     for (tool, key, extra, present_ptr) in cases {
@@ -443,5 +455,401 @@ fn tool_path_args_are_separator_normalized_at_entry() {
                  to {unix_path:?} — the path arg is not normalized at tool entry"
             );
         }
+    }
+}
+
+/// Mechanical companion to the behavioural test above: every place a tool reads
+/// a caller-supplied path out of `args` must have `normalize_path_arg` on the
+/// same expression.
+///
+/// The behavioural test can only cover tools whose answer *changes observably*
+/// on the current platform, and its case list is hand-maintained — which is how
+/// `find_dead_code` (the 6th path-taking tool) shipped unnormalized while a
+/// commit message claimed "five path-taking tools" were covered. Its failure
+/// mode was also the quietest possible: a `\`-spelled prefix matched no row and
+/// the tool reported "No dead code found".
+///
+/// This scan needs no fixture and no platform: it reads the source. A new tool
+/// that reads `args["path"]` without normalizing fails here on the Linux leg.
+#[test]
+fn every_tool_path_arg_read_is_normalized_in_source() {
+    const PATH_KEYS: [&str; 2] = ["path", "file_path"];
+    let tools_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/server/tools");
+
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&tools_dir)
+        .expect("tools dir must exist — did the module move?")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() >= 8,
+        "expected the tool modules to still live in {}; found {} .rs files",
+        tools_dir.display(),
+        files.len()
+    );
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for file in &files {
+        let src = std::fs::read_to_string(file).unwrap();
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(key) = PATH_KEYS
+                .iter()
+                .find(|k| line.contains(&format!("args[\"{k}\"]")))
+            else {
+                continue;
+            };
+            checked += 1;
+            // Gather the whole statement: `args["path"]` is usually the head of a
+            // method chain that spans several lines and ends at the first `;`.
+            let mut stmt = String::new();
+            for l in lines.iter().skip(i).take(12) {
+                stmt.push_str(l);
+                stmt.push('\n');
+                if l.contains(';') {
+                    break;
+                }
+            }
+            if !stmt.contains("normalize_path_arg") {
+                offenders.push(format!(
+                    "{}:{} (args[\"{key}\"]) — {}",
+                    file.file_name().unwrap().to_string_lossy(),
+                    i + 1,
+                    stmt.trim().replace('\n', " ⏎ ")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked >= 6,
+        "the scan found only {checked} path-arg reads — the `args[\"path\"]` access \
+         pattern probably changed and this guard is now scanning nothing"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these tool path arguments reach the index without separator normalization \
+         (add `.map(super::normalize_path_arg)` to the expression):\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// Optional-section flags must survive a warm cache.
+///
+/// `module_overview` cached the base result and returned it early, BEFORE folding
+/// in `include_deps` / `include_dead` — and the flags are not part of the cache
+/// key. Any earlier call warmed the entry (SessionStart injection and ordinary
+/// exploration both do), so for the next 60s an `include_dead:true` call came
+/// back byte-identical to a plain one: no `dead_code`, and no
+/// `dead_code_unavailable` either. A caller cannot tell that from "nothing dead
+/// here" — a false clean with a 60-second blast radius.
+///
+/// This is the cache-early-return axis of the same bug class the compact
+/// forwarder guard covers; `project_map` got it right (centrality stays outside
+/// its cache, with a comment) and this tool was the sibling hole.
+#[test]
+fn module_overview_optional_sections_survive_a_warm_cache() {
+    let (_project, server) = setup_project(3);
+
+    let call = |args: serde_json::Value| {
+        let resp = server
+            .handle_message(&tool_call_json("module_overview", args))
+            .unwrap();
+        parse_tool_result(&resp)
+    };
+
+    // 1. Warm the cache with a plain call — the precondition the bug needed.
+    let plain = call(json!({"path": "src/"}));
+    assert!(
+        plain.get("dead_code").is_none(),
+        "a plain call must not carry dead_code: {plain}"
+    );
+
+    // 2. Same path, flag on, well inside the 60s window.
+    let dead = call(json!({"path": "src/", "include_dead": true}));
+    assert!(
+        dead.get("dead_code").is_some() || dead.get("dead_code_unavailable").is_some(),
+        "include_dead:true on a cache-warm path must still answer the flag \
+         (either a dead_code section or an explicit dead_code_unavailable); got {dead}"
+    );
+
+    // 3. Same for include_deps. A directory path can't have dependencies, so the
+    //    honest answer is the explicit unavailable marker — silence is not.
+    let deps = call(json!({"path": "src/", "include_deps": true}));
+    assert!(
+        deps.get("dependencies").is_some() || deps.get("dependencies_unavailable").is_some(),
+        "include_deps:true on a cache-warm path must still answer the flag; got {deps}"
+    );
+
+    // 4. And a file path, where the fold produces a real dependencies section.
+    let file_plain = call(json!({"path": "src/mod_0.ts"}));
+    assert!(file_plain.get("dependencies").is_none());
+    let file_deps = call(json!({"path": "src/mod_0.ts", "include_deps": true}));
+    assert!(
+        file_deps.get("dependencies").is_some(),
+        "include_deps:true on a cache-warm FILE path must fold in dependencies; got {file_deps}"
+    );
+}
+
+/// The source scan above reads the literal `args["<key>"]` form and only the
+/// keys `path` / `file_path`. `find_dead_code` also takes a LIST of path
+/// prefixes via `args.get("ignore_paths")` — a different accessor and a
+/// different key, five lines below the `path` read that was just fixed, and
+/// invisible to that scan twice over.
+///
+/// Same failure shape as the `path` one and just as quiet: the prefixes are
+/// matched with `starts_with` against `/`-stored file paths, so a Windows
+/// client's `ignore_paths: ["src\\generated"]` excludes nothing and the tool
+/// over-reports dead code rather than under-reporting it.
+#[test]
+fn assert_ignore_paths_normalized_in_source() {
+    // BOTH surfaces. `dead_code_report` is reached from the MCP tool AND from
+    // `cmd_dead_code`, and the first version of this guard covered only the MCP
+    // one — leaving the CLI half of the same change with zero coverage, the very
+    // "fixed one, missed the sibling" shape it exists to catch.
+    //
+    // Source-scanned rather than behaviour-tested on purpose: the normalizer is
+    // the identity on a Unix host by construction (`cfg!(windows)`), so no Linux
+    // leg can observe the wiring. The behavioural contract — both spellings
+    // exclude the same set once normalized — is pinned separately by
+    // `test_dead_code_ignore_prefixes_are_separator_normalized`.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sites: [(&str, &str, &str); 2] = [
+        (
+            "src/mcp/server/tools/advanced.rs",
+            r#"args.get("ignore_paths")"#,
+            "normalize_path_arg",
+        ),
+        (
+            "src/cli.rs",
+            "let ignore_prefixes: Vec<String>",
+            "normalize_rel_str",
+        ),
+    ];
+
+    for (file, anchor_text, expected) in sites {
+        let src = std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|e| panic!("{file} moved or unreadable: {e}"));
+        let lines: Vec<&str> = src.lines().collect();
+        let anchor = lines
+            .iter()
+            .position(|l| l.contains(anchor_text))
+            .unwrap_or_else(|| {
+                panic!("anchor {anchor_text:?} moved out of {file} — update this guard")
+            });
+        let block: String = lines[anchor..(anchor + 14).min(lines.len())].join("\n");
+        assert!(
+            block.contains(expected),
+            "dead-code ignore prefixes reach the index without separator \
+             normalization ({file}:{}). They are matched with starts_with against \
+             `/`-stored paths, so a backslash-spelled prefix excludes nothing and \
+             the tool OVER-reports dead code.\n{block}",
+            anchor + 1
+        );
+    }
+}
+
+/// The trimmed, comment-stripped directive lines of a YAML block.
+///
+/// Every containment check below MUST go through this. The first version of this
+/// guard called `.contains("save-if: false")` on the raw text and passed against
+/// the *prose explaining why save-if is set* — deleting the actual setting left
+/// it green. That is the same "the words are present, so it must be true" failure
+/// the rest of this file exists to catch.
+fn yaml_directives(block: &str) -> Vec<&str> {
+    block
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+/// Slice one job out of a workflow file: from `  <name>:` to the next key at the
+/// same two-space indent (or EOF). Textual on purpose — the repo has no YAML
+/// dev-dependency and the properties below are all lexical.
+fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
+    let header = format!("\n  {job}:\n");
+    let start = yaml
+        .find(&header)
+        .unwrap_or_else(|| panic!("job `{job}` not found — it was renamed or removed"))
+        + header.len();
+    let rest = &yaml[start..];
+    // Next line beginning with exactly two spaces then a non-space.
+    let end = rest
+        .match_indices("\n  ")
+        .find(|(i, _)| rest.as_bytes().get(i + 3).is_some_and(|c| *c != b' '))
+        .map(|(i, _)| i + 1)
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Drift guard: `release.yml`'s cache-consuming jobs and the `cache-warm.yml`
+/// jobs that prime them must stay in lockstep.
+///
+/// This is enforced by test rather than by comment because the comment already
+/// failed in production. `cache-warm.yml` has carried "MUST mirror release.yml
+/// build byte-for-byte" since it was written, and v0.101.0 still shipped with
+/// `key:` on one side and the automatic job-scoped key on the other — a green
+/// priming run followed by "No cache found" on all five release targets. The
+/// invariants below are exactly the ones whose violation is silent: a cache that
+/// is written under a name nothing reads costs storage and reports success.
+///
+/// The `gate` pairing is newer (audit 2026-07-27 P1-3) and has the same shape,
+/// with one asymmetry that is deliberate and therefore also pinned: `gate` runs
+/// on `refs/tags/*`, where a saved cache is invisible to the next tag, so it is
+/// restore-only and `warm-gate` is the sole writer.
+#[test]
+fn release_and_cache_warm_workflows_do_not_drift() {
+    let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let release = fs::read_to_string(wf.join("release.yml")).expect("read release.yml");
+    let warm = fs::read_to_string(wf.join("cache-warm.yml")).expect("read cache-warm.yml");
+
+    // 1. One toolchain pin and one rust-cache pin across both files. A different
+    //    rustc hashes to a different cache namespace, so a drifted pin produces a
+    //    cache that can never be restored — silently, as a cold build.
+    for (action, label) in [
+        ("dtolnay/rust-toolchain@", "rust toolchain"),
+        ("Swatinem/rust-cache@", "rust-cache"),
+    ] {
+        let pins: std::collections::BTreeSet<&str> = release
+            .lines()
+            .chain(warm.lines())
+            .filter_map(|l| l.trim().strip_prefix("- uses: "))
+            .filter(|u| u.starts_with(action))
+            .map(|u| u.split_whitespace().next().unwrap_or(u))
+            .collect();
+        assert_eq!(
+            pins.len(),
+            1,
+            "{label} is pinned to {} different SHAs across release.yml and \
+             cache-warm.yml: {pins:?}. The warm cache is namespaced by toolchain \
+             and action version, so a split pin means release.yml silently builds \
+             cold.",
+            pins.len()
+        );
+    }
+
+    // 2. Every `shared-key` release.yml consumes must be written by cache-warm.yml.
+    let shared_keys = |src: &str| -> std::collections::BTreeSet<String> {
+        src.lines()
+            .filter_map(|l| l.trim().strip_prefix("shared-key:"))
+            .map(|v| v.trim().to_string())
+            .collect()
+    };
+    let consumed = shared_keys(&release);
+    let produced = shared_keys(&warm);
+    assert!(
+        !consumed.is_empty(),
+        "release.yml declares no shared-key at all — rust-cache's automatic key \
+         embeds the JOB name, so a cache written by cache-warm.yml can never be \
+         restored here. This is the exact v0.101.0 failure."
+    );
+    let orphans: Vec<&String> = consumed.difference(&produced).collect();
+    assert!(
+        orphans.is_empty(),
+        "release.yml restores shared-key(s) {orphans:?} that no cache-warm.yml job \
+         writes. Actions caches are ref-scoped, so nothing on refs/tags/* can warm \
+         them — every release would build cold while the workflow looks correct. \
+         cache-warm.yml writes: {produced:?}"
+    );
+
+    // 3. `gate` is restore-only; `warm-gate` is the writer. Reversing this puts a
+    //    tag-scoped cache nobody can read into the repo's LRU budget, evicting
+    //    entries that ARE readable.
+    let gate = yaml_directives(workflow_job(&release, "gate"));
+    let warm_gate = yaml_directives(workflow_job(&warm, "warm-gate"));
+    assert!(
+        gate.contains(&"save-if: false"),
+        "release.yml `gate` must set `save-if: false`. It runs on refs/tags/*, \
+         where a saved cache is invisible to the next tag but still consumes the \
+         repo's 10 GB LRU budget."
+    );
+    assert!(
+        !warm_gate.contains(&"save-if: false"),
+        "cache-warm.yml `warm-gate` is the ONLY writer of the release-gate cache; \
+         with save-if disabled on both sides the gate is permanently cold."
+    );
+    assert!(
+        warm_gate.contains(&"cache-on-failure: true"),
+        "cache-warm.yml `warm-gate` must set `cache-on-failure: true` — it defaults \
+         to FALSE, so a lint-red main would also mean no cache is saved, keeping \
+         the gate cold for exactly as long as main stays red."
+    );
+
+    // 4. The commands whose artifacts the cache holds must match. `cargo fmt` is
+    //    excluded: it compiles nothing, so it cannot affect the cache contents.
+    let gate_builds: Vec<&str> = gate
+        .iter()
+        .filter_map(|l| l.strip_prefix("run: cargo "))
+        .filter(|c| !c.starts_with("fmt"))
+        .collect();
+    assert!(
+        !gate_builds.is_empty(),
+        "no `run: cargo` steps found in release.yml `gate` — the job was \
+         restructured and this guard no longer reads it"
+    );
+
+    // 4a. The gate's own contract (audit 2026-07-27 P1-3). Warming a cache for a
+    //     job that no longer checks anything is worse than no gate at all: the
+    //     pipeline still reports a green "Gate" and publishes to npm, which is
+    //     irreversible. Each of these was a specific hole the audit found.
+    for (needle, why) in [
+        ("run: cargo fmt --check", "formatting"),
+        (
+            "run: cargo clippy --no-default-features --all-targets -- -D warnings",
+            "clippy on the default feature set",
+        ),
+        (
+            "run: cargo clippy --features embed-model --all-targets -- -D warnings",
+            "clippy on the feature set release binaries actually ship",
+        ),
+        (
+            "run: cargo test --features embed-model",
+            "the Rust test suite",
+        ),
+    ] {
+        assert!(
+            gate.contains(&needle),
+            "release.yml `gate` no longer runs {why} (`{needle}`). release.yml's \
+             only trigger is a tag push and publishing to npm is irreversible, so \
+             this job is the last check before release."
+        );
+    }
+
+    // 4b. …and it must still block. A `gate` job nothing depends on runs in
+    //     parallel with `build` and cannot stop a publish, while still showing a
+    //     green check named "Gate".
+    let build = yaml_directives(workflow_job(&release, "build"));
+    assert!(
+        build.contains(&"needs: gate"),
+        "release.yml `build` must declare `needs: gate`. Without it the gate runs \
+         alongside the build instead of before it, so a red gate does not stop the \
+         publish — it only annotates it."
+    );
+    // 4c. Environment parity for the test step. `CODE_GRAPH_DISABLE_MODEL_DOWNLOAD`
+    //     stops the spawned `serve` integration tests background-fetching a ~90 MB
+    //     model on a runner that has none. It affects runtime, not the cache, so a
+    //     split here is invisible to every other assertion — it just makes one of
+    //     the two jobs slow and flaky, and the gate is the last check before an
+    //     irreversible publish.
+    let env_key = "CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: '1'";
+    assert_eq!(
+        gate.contains(&env_key),
+        warm_gate.contains(&env_key),
+        "`{env_key}` must be set in BOTH release.yml `gate` and cache-warm.yml \
+         `warm-gate`, or in neither — they run the same test command and must run \
+         it under the same environment."
+    );
+
+    for cmd in gate_builds {
+        assert!(
+            warm_gate.iter().any(|l| *l == format!("run: cargo {cmd}")),
+            "release.yml `gate` runs `cargo {cmd}` but cache-warm.yml `warm-gate` \
+             does not. Lint and feature flags participate in cargo's fingerprint, \
+             so a command only the gate runs is a command the gate compiles cold."
+        );
     }
 }

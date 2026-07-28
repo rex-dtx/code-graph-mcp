@@ -273,6 +273,19 @@ pub struct CliContext {
 
 impl CliContext {
     pub fn open(project_root: &Path) -> Result<Self> {
+        Self::open_inner(project_root, false)
+    }
+
+    /// Same reader contract as [`CliContext::open`], but with the sqlite-vec
+    /// tables brought up for the one read command that needs vector search
+    /// (`similar`). Kept distinct from `Database::open_with_vec` on purpose:
+    /// that constructor also revalidates (wipes) on `INDEX_VERSION` mismatch,
+    /// which a read command must never do.
+    pub fn open_with_vec(project_root: &Path) -> Result<Self> {
+        Self::open_inner(project_root, true)
+    }
+
+    fn open_inner(project_root: &Path, with_vec: bool) -> Result<Self> {
         // Read-side worktree fallback (D#106, roadmap §2.2 — Rust mirror of the
         // v0.99.0 project-root.js fix): a linked worktree with no OWN index
         // reads the main checkout's index instead of erroring/cold-building.
@@ -293,7 +306,11 @@ impl CliContext {
         // health-check, …). Open non-destructively so a status poll or one-off
         // query never triggers the INDEX_VERSION wipe — only an explicit indexer
         // (reindex / incremental-index / server startup) clears + rebuilds.
-        let db = Database::open_nondestructive(&db_path)?;
+        let db = if with_vec {
+            Database::open_nondestructive_with_vec(&db_path)?
+        } else {
+            Database::open_nondestructive(&db_path)?
+        };
         Ok(Self {
             db,
             project_root: project_root.to_path_buf(),
@@ -353,6 +370,25 @@ fn normalize_user_path(project_root: &Path, raw: &str) -> Result<String> {
 /// directory a relative `raw` resolves against; in production it is always the
 /// project root or a descendant (`resolve_project_root` walks UP from cwd).
 fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Result<String> {
+    normalize_user_path_from_on(project_root, cwd, raw, cfg!(windows))
+}
+
+/// Platform-parameterized core of [`normalize_user_path_from`].
+///
+/// `backslash_is_sep` says whether `\` separates path components on the target
+/// platform. Taking it as a parameter (rather than reading `cfg!(windows)` deep
+/// inside) is what lets the Linux CI leg execute the Windows branches — the
+/// structural reason `.\src\foo.rs` slipped through in the first place: the
+/// `"."` / `"./"` prefix tests below are spelled Unix-only, and on Windows
+/// PowerShell's tab completion produces `.\` by default, so the whole
+/// cwd-anchored arm was dead there and the final `normalize_rel_str` emitted
+/// `./src/foo.rs` — a lookup key with a `./` prefix the index never contains.
+fn normalize_user_path_from_on(
+    project_root: &Path,
+    cwd: &Path,
+    raw: &str,
+    backslash_is_sep: bool,
+) -> Result<String> {
     use crate::indexer::pipeline::is_safe_relative_path;
     // Single source of truth for the escape check (shared with the MCP freshness
     // path) — eliminates the three-way divergence between this fn, the MCP
@@ -382,6 +418,35 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
     // present file as "not in index". Same defect class as issue #34.
     // (`collapse_within_root`, used by the subdirectory branch below, already
     // decomposes into `Component`s and re-joins with `/`, so it is unaffected.)
+    // Windows-absolute spellings are NOT absolute on a Unix host, so
+    // `Path::is_absolute` waves `D:\repo\src\Foo.cs` and `C:/repo/src` straight
+    // into the relative branch below, where they normalize to
+    // `D:/repo/src/Foo.cs` — a key no index contains, reported as an ordinary
+    // "no results". That is the silent-miss shape this whole function exists to
+    // prevent, reintroduced through the one predicate the `_on` seam does NOT
+    // parameterize. A drive prefix or a UNC root can never name a
+    // project-relative file on ANY platform, so reject them LEXICALLY rather
+    // than platform-natively — which also brings the CLI in line with the MCP
+    // entry (`tools/overview.rs` already rejects the drive-letter form).
+    // The drive form REQUIRES a separator after the colon (`C:\x`, `C:/x`) or the
+    // bare root (`C:`). A colon at byte 1 alone is not enough: `:` is a perfectly
+    // legal Unix filename character, so `a:b.rs` in the project root is a real,
+    // indexable file — and the first version of this guard rejected it with
+    // "outside the project root", a factually false answer about a file sitting
+    // right there. (Drive-RELATIVE `C:foo` is deliberately not matched: it is
+    // vanishingly rare next to ordinary colon-bearing filenames, and the cost of
+    // guessing wrong is refusing a file that exists.)
+    let b = raw.as_bytes();
+    let drive_root = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    let windows_absolute =
+        (drive_root && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\')) || raw.starts_with(r"\\");
+    if windows_absolute {
+        anyhow::bail!(
+            "path '{}' is outside the project root '{}' \u{2014} use a relative path or one under the project root",
+            raw, project_root.display()
+        );
+    }
+
     let p = Path::new(raw);
     if p.is_absolute() {
         if let Ok(rel) = p.strip_prefix(project_root) {
@@ -412,6 +477,16 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
         .strip_prefix(project_root)
         .map(|r| r.to_path_buf())
         .unwrap_or_default();
+
+    // Unify the separator BEFORE any prefix test. Windows users type and paste
+    // `src\foo.rs` and `.\src\foo.rs` (Explorer, tab completion, other tools'
+    // output); every `.`/`./`/`../` test below is spelled with `/`, so doing this
+    // last — as the code used to — left the whole cwd-anchored arm unreachable on
+    // Windows. `is_safe_relative_path` uses `Path::components`, which splits on
+    // `\` under Windows, so the escape check sees the same components either way.
+    let normalized = crate::indexer::merkle::normalize_rel_str_on(raw, backslash_is_sep);
+    let raw: &str = &normalized;
+
     if cwd_rel.as_os_str().is_empty() {
         // cwd == project root: historical root-relative behavior, unchanged.
         if raw == "." {
@@ -422,19 +497,14 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
             if !is_safe_relative_path(rest) {
                 return Err(escape());
             }
-            return Ok(crate::indexer::merkle::normalize_rel_str(rest));
+            return Ok(rest.to_string());
         }
         // Lexical escape check (no filesystem touch — target may be gitignored or
         // deleted): reject any prefix that climbs above the root.
         if !is_safe_relative_path(raw) {
             return Err(escape());
         }
-        // Windows users type and paste `src\foo.rs` (Explorer, other tools' output,
-        // tab completion). Passing it through verbatim made it an index key that
-        // could never match. `is_safe_relative_path` already ran on the raw form
-        // and uses `Path::components`, which splits on `\` under Windows, so the
-        // escape check saw the same components either way.
-        return Ok(crate::indexer::merkle::normalize_rel_str(raw));
+        return Ok(raw.to_string());
     }
 
     // cwd is a subdirectory of the root: resolve `raw` against it, collapsing
@@ -463,12 +533,23 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
 }
 
 /// A path the caller explicitly anchored to the current directory (`.`, `./x`,
-/// `../x`) — such paths never take the near-miss root rebase. Single source of
-/// the exclusion list shared by BOTH rebase arms (`normalize_user_path_from`
-/// and `cmd_grep`); extend it here so the two arms can't drift apart again
-/// (audit 2026-07-24: the arms were hand-duplicated copies).
+/// `../x`, and their `\` spellings) — such paths never take the near-miss root
+/// rebase. Single source of the exclusion list shared by BOTH rebase arms
+/// (`normalize_user_path_from` and `cmd_grep`); extend it here so the two arms
+/// can't drift apart again (audit 2026-07-24: the arms were hand-duplicated
+/// copies).
+///
+/// Both spellings are recognized unconditionally, and deliberately so: this is a
+/// *user-intent* predicate, not an index key. `normalize_user_path_from` hands it
+/// already-normalized input, but `cmd_grep` does not, and PowerShell tab
+/// completion emits `.\` by default — a Unix file literally named `.\x` merely
+/// forgoes a rebase it would rarely want anyway.
 fn is_cwd_anchored(raw: &str) -> bool {
-    raw == "." || raw.starts_with("./") || raw.starts_with("../")
+    raw == "."
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.starts_with(".\\")
+        || raw.starts_with("..\\")
 }
 
 /// The one stderr surface for a near-miss root rebase, shared by both arms so
@@ -507,40 +588,14 @@ fn strip_qualified_prefix(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
-/// CLI-side fuzzy name resolution. Mirrors MCP server's `resolve_fuzzy_name` so
-/// CLI `callgraph`/`refs` auto-promote a unique fuzzy match to the exact name
-/// instead of just printing "Did you mean" and bailing out.
-pub(crate) enum CliFuzzyResolution {
-    Unique(String),
-    Ambiguous(Vec<queries::NameCandidate>),
-    NotFound,
-}
+/// CLI-side fuzzy name resolution — the shared implementation in
+/// `crate::resolve`, so CLI `callgraph`/`refs` and the MCP tools cannot drift
+/// into opposite answers for one input (audit 2026-06-03 #6; the hand-written
+/// CLI copy this replaces was the same defect shape, and had zero tests).
+use crate::resolve::FuzzyResolution as CliFuzzyResolution;
 
 fn resolve_fuzzy_name_cli(conn: &rusqlite::Connection, name: &str) -> Result<CliFuzzyResolution> {
-    let candidates: Vec<_> = queries::find_functions_by_fuzzy_name(conn, name)?
-        .into_iter()
-        .filter(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path))
-        .collect();
-    let exact: Vec<_> = candidates
-        .iter()
-        .filter(|c| c.name == name)
-        .cloned()
-        .collect();
-    if exact.len() == 1 {
-        return Ok(CliFuzzyResolution::Unique(exact[0].name.clone()));
-    }
-    if exact.len() > 1 {
-        return Ok(CliFuzzyResolution::Ambiguous(exact));
-    }
-    if candidates.len() == 1 {
-        return Ok(CliFuzzyResolution::Unique(
-            candidates.into_iter().next().unwrap().name,
-        ));
-    }
-    if !candidates.is_empty() {
-        return Ok(CliFuzzyResolution::Ambiguous(candidates));
-    }
-    Ok(CliFuzzyResolution::NotFound)
+    crate::resolve::resolve_fuzzy(conn, name)
 }
 
 /// Emit the "ambiguous symbol" error in the same shape whether the command was
@@ -2431,6 +2486,14 @@ pub struct GrepArgs {
     /// Search pattern (ripgrep regex; use -F for literal strings)
     #[arg(allow_hyphen_values = true)]
     pub pattern: String,
+    /// Set by [`parse_grep_args`] when the caller wrote an explicit `--`.
+    ///
+    /// Not a flag — clap skips it. It exists so the flag-shaped-pattern hint can
+    /// stay silent for someone who has already said, in the only way the CLI
+    /// offers, that they meant the literal: telling them to add the `--` they
+    /// just typed is worse than saying nothing.
+    #[arg(skip)]
+    pub had_literal_separator: bool,
     /// Optional paths to restrict the search (must be within the project root)
     pub paths: Vec<String>,
     /// JSON output
@@ -2604,6 +2667,47 @@ fn first_unsupported_grep_flag(args: &[String]) -> Option<String> {
     None
 }
 
+/// Explain a `rg: <path>: No such file or directory` that was really caused by a
+/// long flag being consumed as the search pattern.
+///
+/// Returns `None` unless BOTH hold: the pattern looks like a long flag
+/// (`--word`), and ripgrep's complaint is a missing path. That pairing is what
+/// separates "the user typed `--quiet` expecting a flag" from "the user is
+/// genuinely searching for the literal `--quiet`" — the latter finds files (or
+/// reports no match) rather than erroring on a missing path.
+///
+/// Advisory only. Changing `grep --quiet` from "search for that literal" to "flag
+/// error" would be a behavior change on a published CLI surface, so this reports
+/// rather than decides.
+fn grep_flaglike_pattern_hint(
+    pattern: &str,
+    stderr: &str,
+    had_literal_separator: bool,
+) -> Option<String> {
+    // Someone who wrote `--` has already told us they meant the literal. Their
+    // missing path is their own typo'd path argument, not a displaced pattern,
+    // and the hint would advise adding the separator they just used.
+    if had_literal_separator {
+        return None;
+    }
+    let looks_like_long_flag = pattern.starts_with("--")
+        && pattern.len() > 2
+        && pattern[2..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !looks_like_long_flag || !stderr.contains("No such file or directory") {
+        return None;
+    }
+    Some(format!(
+        "[code-graph] note: `{pattern}` was taken as the SEARCH PATTERN, not as a \
+         flag — `grep` accepts a flag-shaped pattern so terms like \
+         `--no-default-features` are searchable. Your real pattern was then read \
+         as a path, which is the error above. If you meant a flag, `grep` does \
+         not implement `{pattern}`; if you meant the literal, write \
+         `grep -- {pattern}`."
+    ))
+}
+
 /// Parse `grep` arguments from the full process argv (including argv\[0]),
 /// applying [`normalize_grep_argv`] first. Mirrors the other subcommands'
 /// `skip(1)`; clap consumes the leading `grep` token as the binary-name slot.
@@ -2612,6 +2716,11 @@ fn first_unsupported_grep_flag(args: &[String]) -> Option<String> {
 /// they fail with a clear message instead of being swallowed as the pattern.
 pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
     let raw: Vec<String> = argv.iter().skip(1).cloned().collect();
+    // Position matters. `grep -- --quiet foo` means "search for the literal";
+    // `grep --quiet -- foo` is someone who typo'd a flag and then wrote a
+    // separator for their PATH, and they should still get the hint. Only a
+    // separator standing BEFORE the pattern is the "I meant the literal" signal.
+    let separator_at = raw.iter().position(|a| a == "--");
     if let Some(bad) = first_unsupported_grep_flag(&raw) {
         // --json early-bail must still emit an empty array (CLI JSON contract).
         let json = raw
@@ -2628,7 +2737,15 @@ pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
         );
         grep_exit(2);
     }
-    GrepArgs::parse_from(normalize_grep_argv(raw))
+    let mut parsed = GrepArgs::parse_from(normalize_grep_argv(raw.clone()));
+    parsed.had_literal_separator = match separator_at {
+        Some(sep) => raw
+            .iter()
+            .position(|a| *a == parsed.pattern)
+            .is_none_or(|pat| sep < pat),
+        None => false,
+    };
+    parsed
 }
 
 /// AST-context grep: ripgrep + AST context from index.
@@ -2746,6 +2863,7 @@ fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> V
 pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     let GrepArgs {
         pattern,
+        had_literal_separator,
         paths,
         json: json_mode,
         ignore_case,
@@ -3070,6 +3188,21 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     if rg_output.code == 2 {
         let stderr = String::from_utf8_lossy(&rg_output.stderr);
         let stderr = stderr.trim();
+        // A long flag this subcommand does not implement is bound to the PATTERN
+        // positional (`allow_hyphen_values`, so that `grep --no-default-features`
+        // can search for that literal), which pushes the real pattern into the
+        // path list. rg then reports the user's search term as a missing file —
+        // technically accurate and completely opaque. `first_unsupported_grep_flag`
+        // catches this for short clusters but deliberately leaves `--long` tokens
+        // alone, because treating them as flags would break the documented
+        // literal search. So: keep the behavior, explain it.
+        if let Some(hint) = grep_flaglike_pattern_hint(&pattern, stderr, had_literal_separator) {
+            eprintln!("{hint}");
+            // Short, distinct text for the log — matching the freshness-partial
+            // site below. Repeating the full hint verbatim printed it twice on
+            // any run that DOES have a subscriber installed.
+            tracing::warn!("grep: flag-shaped pattern taken as pattern: {}", pattern);
+        }
         if rg_output.stdout.is_empty() {
             if json_mode {
                 println!("[]");
@@ -6721,12 +6854,12 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     let json_mode = args.json;
     let node_id_arg: Option<i64> = args.node_id;
 
-    // Open with vec support for vector search
-    let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
-    if !db_path.exists() {
-        anyhow::bail!("No index found. Run the MCP server first to create the index.");
-    }
-    let db = Database::open_with_vec(&db_path)?;
+    // Open with vec support for vector search — but as a READER. `similar` is a
+    // passive consumer: reaching for the indexer constructor (`open_with_vec`)
+    // made it wipe a version-lagging index to 0 nodes with nothing rebuilding it,
+    // and it was the one read command bypassing CliContext's worktree fallback.
+    let ctx = CliContext::open_with_vec(project_root)?;
+    let db = &ctx.db;
     let conn = db.conn();
 
     if !db.vec_enabled() {
@@ -6872,7 +7005,7 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     // line numbers in place by matching name+file in the refreshed index, preserving
     // the similarity ranking and set.
     let files: Vec<String> = similar.iter().map(|(_, fp, _)| fp.clone()).collect();
-    let outcome = refresh_files_if_stale(&db, project_root, &files);
+    let outcome = refresh_files_if_stale(db, project_root, &files);
     if outcome.any_changed {
         for (node, fp, _) in similar.iter_mut() {
             if let Ok(fresh) = queries::get_nodes_by_file_path(conn, fp) {
@@ -7362,12 +7495,20 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
 
     // --ignore <pref>: repeatable, prefix-match exclusion. --no-ignore disables defaults.
     // Defaults are owned by `domain::default_dead_code_ignores()` (claude-plugin/, benches/).
+    // Separator-normalized like every other path argument: these are matched with
+    // `starts_with` against `/`-stored paths, so a Windows user's
+    // `--ignore src\generated` would exclude nothing and silently over-report.
+    // Not routed through `normalize_user_path` — a PREFIX is not required to name
+    // an existing file, and the escape check would reject legitimate ones.
     let ignore_prefixes: Vec<String> = if no_ignore {
         Vec::new()
     } else if ignore.is_empty() {
         crate::domain::default_dead_code_ignores()
     } else {
         ignore
+            .iter()
+            .map(|p| crate::indexer::merkle::normalize_rel_str(p))
+            .collect()
     };
 
     let ctx = CliContext::open(project_root)?;
@@ -9178,6 +9319,113 @@ mod tests {
         }
     }
 
+    /// The Windows legs of `normalize_user_path_from`, executed on every platform
+    /// via the `backslash_is_sep` seam. Without the parameter these branches were
+    /// reachable only on the windows-latest CI leg, which is exactly how the `.\`
+    /// spelling stayed broken: PowerShell tab completion emits `.\src\foo.rs` by
+    /// default, the `"./"` prefix test never matched it, and the function fell
+    /// through to produce the key `./src/foo.rs` — a `./`-prefixed key the index
+    /// never contains (same silent-miss shape as issue #34).
+    #[test]
+    fn normalize_user_path_handles_windows_dot_backslash_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // `.\src\foo.rs` must reduce to the bare key, not `./src/foo.rs`.
+        let got = normalize_user_path_from_on(root, root, r".\src\foo.rs", true).unwrap();
+        assert_eq!(got, "src/foo.rs", "`.\\` is the Windows spelling of `./`");
+
+        // `.` and `.\` both mean "whole project".
+        assert_eq!(
+            normalize_user_path_from_on(root, root, ".", true).unwrap(),
+            ""
+        );
+        assert_eq!(
+            normalize_user_path_from_on(root, root, r".\", true).unwrap(),
+            ""
+        );
+
+        // Plain backslash relative paths keep working.
+        assert_eq!(
+            normalize_user_path_from_on(root, root, r"src\foo.rs", true).unwrap(),
+            "src/foo.rs"
+        );
+
+        // The escape check must still fire through the `.\` prefix — it did not
+        // get looser by moving normalization ahead of it.
+        assert!(normalize_user_path_from_on(root, root, r".\..\secret", true).is_err());
+        assert!(normalize_user_path_from_on(root, root, r"..\secret", true).is_err());
+
+        // Unix leg (`backslash_is_sep = false`): `\` is an ordinary filename
+        // character and must survive verbatim — no over-normalization.
+        assert_eq!(
+            normalize_user_path_from_on(root, root, r"src\foo.rs", false).unwrap(),
+            r"src\foo.rs"
+        );
+    }
+
+    /// The `_on` seam parameterizes the SEPARATOR but not `Path::is_absolute`,
+    /// which is irreducibly platform-native. On a Unix host `D:\repo\src\Foo.cs`
+    /// and `C:/repo/src` are not absolute, so without a lexical guard they fall
+    /// into the relative branch and come back out as `D:/repo/src/Foo.cs` — a
+    /// key no index holds, answered as an ordinary empty result. Rejecting them
+    /// by spelling makes the verdict identical on every platform, and matches
+    /// what the MCP entry already did.
+    #[test]
+    fn windows_absolute_spellings_are_rejected_on_every_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for raw in [
+            r"D:\repo\src\Foo.cs",
+            "C:/repo/src/Foo.cs",
+            r"\\server\share\src\Foo.cs",
+            "c:/x",
+        ] {
+            for backslash_is_sep in [true, false] {
+                let got = normalize_user_path_from_on(root, root, raw, backslash_is_sep);
+                assert!(
+                    got.is_err(),
+                    "{raw:?} (backslash_is_sep={backslash_is_sep}) must be rejected, not \
+                     silently turned into an index key; got {got:?}"
+                );
+            }
+        }
+
+        // Near-misses that must NOT be swept up. The first three put a colon at
+        // BYTE 1 — the exact position the predicate keys on — because that is
+        // the boundary; the earlier version of this control never did, so it
+        // passed while the guard rejected the real, indexed root-level file
+        // `a:b.rs` with "outside the project root".
+        for ok in [
+            "a:b.rs",   // colon at byte 1, no separator after → ordinary filename
+            "z:name",   // same shape, different letter
+            "a:b/c.rs", // and with a directory below it
+            "d/repo/src/Foo.cs",
+            "src/a:b.rs",
+            "a/b:c",
+        ] {
+            for backslash_is_sep in [true, false] {
+                assert!(
+                    normalize_user_path_from_on(root, root, ok, backslash_is_sep).is_ok(),
+                    "{ok:?} (backslash_is_sep={backslash_is_sep}) is an ordinary \
+                     relative path — `:` is legal in a Unix filename — and must survive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_cwd_anchored_recognizes_both_separator_spellings() {
+        // The "cwd-anchored paths never rebase to the project root" promise was
+        // Unix-only; on Windows `.\x` fell through and could silently rebase.
+        for anchored in [".", "./x", "../x", r".\x", r"..\x"] {
+            assert!(is_cwd_anchored(anchored), "{anchored} is cwd-anchored");
+        }
+        for plain in ["src/x", r"src\x", ".hidden", "x"] {
+            assert!(!is_cwd_anchored(plain), "{plain} is not cwd-anchored");
+        }
+    }
+
     #[test]
     fn normalize_path_display_strips_windows_prefixes_and_separators() {
         assert_eq!(
@@ -9948,5 +10196,52 @@ mod tests {
             first_unsupported_grep_flag(&s(&["grep", "-A", "2", "-v", "pat"])).as_deref(),
             Some("-v")
         );
+    }
+
+    /// A LONG flag this subcommand does not implement is deliberately left to the
+    /// pattern positional (so `grep --no-default-features` stays searchable), and
+    /// the real pattern then becomes a path. That behavior is a published CLI
+    /// contract and is unchanged; what is new is that the resulting rg error gets
+    /// explained instead of standing alone as `rg: <your pattern>: No such file`.
+    #[test]
+    fn grep_flaglike_pattern_hint_fires_only_on_the_confusing_pairing() {
+        const MISSING: &str = "rg: /repo/alpha: No such file or directory (os error 2)";
+
+        // The confusing case: flag-shaped pattern AND a missing-path complaint.
+        for flag in ["--quiet", "--json", "--check-only", "--no_color", "--x1"] {
+            let hint = grep_flaglike_pattern_hint(flag, MISSING, false)
+                .unwrap_or_else(|| panic!("{flag} + missing-path must be explained"));
+            assert!(hint.contains(flag), "hint must name the token: {hint}");
+            assert!(
+                hint.contains("grep -- "),
+                "hint must give the escape that keeps the literal search working: {hint}"
+            );
+        }
+
+        // Same pattern, a DIFFERENT rg failure: not this diagnosis, stay quiet.
+        assert_eq!(
+            grep_flaglike_pattern_hint("--quiet", "rg: regex parse error", false),
+            None
+        );
+
+        // An explicit `--` means the caller already said they meant the literal.
+        // Their missing path is their own typo (`grep -- --no-default-features
+        // src/nope`), and the hint would tell them to add the separator they
+        // just typed.
+        assert_eq!(
+            grep_flaglike_pattern_hint("--no-default-features", MISSING, true),
+            None,
+            "an explicit `--` must silence the hint entirely"
+        );
+
+        // A genuine literal search that happens to fail on a missing path must not
+        // be told it typed a flag — these are ordinary patterns, not `--word`.
+        for pat in ["alpha", "-v", "->", "-1", "-.*", "--", "--=x", "--a b"] {
+            assert_eq!(
+                grep_flaglike_pattern_hint(pat, MISSING, false),
+                None,
+                "{pat} is not a long-flag spelling and must not be explained as one"
+            );
+        }
     }
 }

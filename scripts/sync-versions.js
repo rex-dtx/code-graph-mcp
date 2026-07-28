@@ -92,32 +92,57 @@ const updates = [
 if (CHECK_MODE) {
   const rows = [];
   let drift = false;
+  let unreadable = false;
   for (const { file, json, transform } of updates) {
     const filePath = path.join(root, file);
+    // A site that is expected but absent is NOT agreement. This used to
+    // `continue` without setting drift, so deleting a platform package.json made
+    // the gate print "All version sites agree" and exit 0 — eight sites checked,
+    // nine claimed.
     if (!fs.existsSync(filePath)) {
-      rows.push({ file, status: 'SKIP (not found)' });
+      rows.push({ file, status: 'MISSING' });
+      drift = true;
       continue;
     }
-    const original = fs.readFileSync(filePath, 'utf8');
-    let result;
-    if (json) {
-      result = JSON.stringify(transform(JSON.parse(original)), null, 2) + '\n';
-    } else {
-      result = transform(original);
+    // Per-site try/catch. Unguarded, one corrupt or unreadable file threw out of
+    // the loop before a single row printed, so the operator saw a stack trace
+    // instead of the table — and every site after it went unexamined. With real
+    // drift elsewhere the crash hid it completely, while the exit code (1, from
+    // node's default uncaught-throw) was indistinguishable from a clean drift
+    // report.
+    let status;
+    try {
+      const original = fs.readFileSync(filePath, 'utf8');
+      const result = json
+        ? JSON.stringify(transform(JSON.parse(original)), null, 2) + '\n'
+        : transform(original);
+      const ok = result === original;
+      if (!ok) drift = true;
+      status = ok ? 'OK' : 'DRIFT';
+    } catch (err) {
+      unreadable = true;
+      status = `UNREADABLE (${err.code || err.name}: ${err.message.split('\n')[0]})`;
     }
-    const ok = result === original;
-    if (!ok) drift = true;
-    rows.push({ file, status: ok ? 'OK' : 'DRIFT' });
+    rows.push({ file, status });
   }
   const width = Math.max(...rows.map((r) => r.file.length));
   console.log(`Canonical version (package.json): ${version}\n`);
   for (const { file, status } of rows) {
     console.log(`  ${file.padEnd(width)}  ${status}`);
   }
+  // Distinct exit codes so a CI consumer can tell "versions disagree" (fixable
+  // by re-running this script) from "a site could not be read at all" (not).
+  if (unreadable) {
+    console.error(`\nUNREADABLE: one or more version sites could not be parsed. Drift status for them is UNKNOWN${drift ? ' (and at least one readable site is out of sync)' : ''}.`);
+    process.exit(2);
+  }
   if (drift) {
     console.error(`\nDRIFT: one or more files disagree with package.json (${version}). Fix with: node scripts/sync-versions.js ${version}`);
     process.exit(1);
   }
+  // Wording is asserted verbatim by scripts/sync-versions.test.js (which ci.yml
+  // and pre-commit.sh both run) — the count I briefly added here turned that
+  // gate red. If it ever changes, change the test in the same commit.
   console.log(`\nAll version sites agree with package.json (${version}).`);
   process.exit(0);
 }

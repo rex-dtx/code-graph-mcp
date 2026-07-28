@@ -1208,6 +1208,25 @@ pub(super) fn index_files(
                     }
                 }
 
+                // Statically-external import (Rust `use std::…`): skip the whole
+                // name-based chain and bind to the `<external>` sentinel. The
+                // trailing segment of a std path is a bare name like `swap` or
+                // `fs`, and letting it into the global pool is how it bound to a
+                // same-named project symbol. See `domain::IMPORT_EXTERNAL_META`
+                // for why an explicit sentinel edge beats emitting nothing.
+                if rel.relation == REL_IMPORTS
+                    && crate::domain::is_external_import_meta(rel.metadata.as_deref())
+                {
+                    for &src_id in &source_ids {
+                        unresolved_externals.push((
+                            src_id,
+                            rel.target_name.clone(),
+                            rel.relation.clone(),
+                        ));
+                    }
+                    continue;
+                }
+
                 // Default resolution: global name-based lookup with language-aware layering.
                 // Tier order: same-file → same-language → (calls: drop) / (other: global).
                 // Dropping calls without a same-language match prevents Rust `hasher.update()`
@@ -1353,7 +1372,7 @@ pub(super) fn index_files(
             let ext_file_id = upsert_file(
                 db.conn(),
                 &FileRecord {
-                    path: "<external>".into(),
+                    path: crate::domain::EXTERNAL_FILE_PATH.into(),
                     blake3_hash: "external".into(),
                     last_modified: 0,
                     language: Some("external".into()),
@@ -1414,7 +1433,7 @@ pub(super) fn index_files(
             let ext_file_id = upsert_file(
                 db.conn(),
                 &FileRecord {
-                    path: "<external>".into(),
+                    path: crate::domain::EXTERNAL_FILE_PATH.into(),
                     blake3_hash: "external".into(),
                     last_modified: 0,
                     language: Some("external".into()),

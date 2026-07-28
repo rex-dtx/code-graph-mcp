@@ -131,10 +131,29 @@ pub fn insert_node_cached(conn: &Connection, node: &NodeRecord) -> Result<i64> {
     Ok(id)
 }
 
+/// SQL fragment excluding the `<external>` pseudo-file from a name lookup.
+///
+/// Every production caller of the by-name lookups below is USER-FACING symbol
+/// resolution — `show`, `impact`, `callgraph`, `refs`, `similar`, MCP
+/// `get_ast_node` — and none of them can do anything with a sentinel: it has no
+/// source, no line range, and its `file_path` cannot be passed back as `--file`
+/// / `file_path`. Filtering here rather than at each surface is deliberate:
+/// IDX v53 started binding Rust `use std::…` to sentinels, and the first attempt
+/// at this fix patched two call sites, leaving `show HashMap` answering
+/// `module <external>/HashMap` with exit 0 and `impact HashMap` answering
+/// `Risk: UNKNOWN, 0 callers` with exit 0 — both of which had correctly reported
+/// "Symbol not found" before v53. One filter at the source cannot be
+/// half-applied.
+///
+/// Edge-oriented surfaces (`deps` disclosure, `find_references`' import rows)
+/// do not go through these lookups and are unaffected.
+const EXCLUDE_EXTERNAL_BY_NAME: &str =
+    "AND file_id NOT IN (SELECT id FROM files WHERE path = '<external>')";
+
 pub fn get_nodes_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeResult>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM nodes WHERE name = ?1",
-        NODE_SELECT
+        "SELECT {} FROM nodes WHERE name = ?1 {}",
+        NODE_SELECT, EXCLUDE_EXTERNAL_BY_NAME
     ))?;
     let rows = stmt.query_map([name], map_node_row)?;
     let results = rows.collect::<Result<Vec<_>, _>>()?;
@@ -145,7 +164,8 @@ pub fn get_nodes_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeResult
 /// Avoids N+1 `get_file_path` calls when filtering/displaying by file.
 pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec<NodeWithFile>> {
     let sql = format!(
-        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id WHERE n.name = ?1",
+        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id \
+         WHERE n.name = ?1 AND f.path <> '<external>'",
         NODE_SELECT_ALIASED
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -354,7 +374,9 @@ pub fn get_node_ids_by_name(conn: &Connection, name: &str) -> Result<Vec<(i64, S
 }
 
 pub fn get_first_node_id_by_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM nodes WHERE name = ?1 LIMIT 1")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM nodes WHERE name = ?1 {EXCLUDE_EXTERNAL_BY_NAME} LIMIT 1"
+    ))?;
     let rows = stmt.query_map([name], |row| row.get::<_, i64>(0))?;
     Ok(first_row(rows)?)
 }

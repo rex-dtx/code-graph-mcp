@@ -2474,3 +2474,246 @@ fn test_ensure_file_indexed_rejects_out_of_root_path() {
         1
     );
 }
+
+#[test]
+fn test_std_import_prunes_same_named_project_call_phantom() {
+    // IDX v53 differential. `use std::mem::swap; swap(&mut a, &mut b)` used to
+    // fabricate `calls → project::swap` (an unrelated helper that merely shares
+    // the name), because the call is bare and the only same-language candidate
+    // is the project's own. v52 stopped the phantom IMPORT edge by dropping std
+    // uses entirely, but the CALL phantom survived — nothing recorded that this
+    // file's `swap` refers to something outside the project.
+    //
+    // Binding the std use to the `<external>` sentinel gives the existing
+    // `prune_import_contradicted_call_edges` the contradiction it needs: the
+    // caller's file imports `swap` bound to a DIFFERENT node than the edge's
+    // target, and does not import that target — so the phantom is removed.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+
+    // The bait: an unrelated project symbol that happens to be called `swap`.
+    fs::write(
+        project_dir.path().join("src/util.rs"),
+        "pub fn swap(v: &mut Vec<u8>) { v.reverse(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/caller.rs"),
+        "use std::mem::swap;\n\
+         pub fn reorder(a: &mut u8, b: &mut u8) {\n    swap(a, b);\n}\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let reorder = get_nodes_by_name(db.conn(), "reorder").unwrap();
+    let reorder_id = reorder.first().expect("reorder must be indexed").id;
+    let util_swap = get_nodes_by_name(db.conn(), "swap")
+        .unwrap()
+        .into_iter()
+        .find(|n| {
+            crate::storage::queries::get_file_path(db.conn(), n.file_id)
+                .unwrap()
+                .is_some_and(|p| p.ends_with("util.rs"))
+        })
+        .expect("the project's own `swap` must be indexed");
+
+    let phantom = get_edges_from(db.conn(), reorder_id)
+        .unwrap()
+        .into_iter()
+        .any(|e| e.relation == REL_CALLS && e.target_id == util_swap.id);
+    assert!(
+        !phantom,
+        "`use std::mem::swap` then `swap(a, b)` must not resolve to the project's \
+         unrelated `util.rs::swap` — the std import is what disambiguates it"
+    );
+    // The negative control lives in
+    // `test_std_import_prune_does_not_eat_real_cross_file_calls`: an absence
+    // assertion is satisfied just as well by a mechanism that deletes everything.
+}
+
+#[test]
+fn test_std_import_prune_does_not_eat_real_cross_file_calls() {
+    // Negative control for the test above: a genuine cross-file call to a
+    // project function must survive, including in a file that also imports std.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+
+    fs::write(
+        project_dir.path().join("src/util.rs"),
+        "pub fn tidy(v: &mut Vec<u8>) { v.sort(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/caller.rs"),
+        "use std::mem::swap;\n\
+         use crate::util::tidy;\n\
+         pub fn run(v: &mut Vec<u8>) {\n    tidy(v);\n}\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let run_id = get_nodes_by_name(db.conn(), "run").unwrap()[0].id;
+    let tidy_id = get_nodes_by_name(db.conn(), "tidy")
+        .unwrap()
+        .into_iter()
+        .find(|n| {
+            crate::storage::queries::get_file_path(db.conn(), n.file_id)
+                .unwrap()
+                .is_some_and(|p| p.ends_with("util.rs"))
+        })
+        .expect("tidy must be indexed")
+        .id;
+
+    let calls_tidy = get_edges_from(db.conn(), run_id)
+        .unwrap()
+        .into_iter()
+        .any(|e| e.relation == REL_CALLS && e.target_id == tidy_id);
+    assert!(
+        calls_tidy,
+        "a real cross-file call must survive the std-import external binding"
+    );
+}
+
+#[test]
+fn test_query_time_refresh_never_deletes_the_external_pseudo_file() {
+    // `<external>` anchors the sentinel nodes that unresolved imports bind to.
+    // It has no on-disk counterpart, so the query-time freshness resync
+    // classified it as a DELETED file and dropped the row — CASCADE taking every
+    // sentinel node and every edge into them. Any read command that displays or
+    // resolves an external name reached it: `show HashMap` did it while printing
+    // "Symbol not found", i.e. a read-only query that reported failure still
+    // destroyed part of the index, and a later incremental pass did not restore
+    // it (only a file whose CONTENT changed re-emits its import relations).
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+    fs::write(
+        project_dir.path().join("src/a.rs"),
+        "use std::collections::HashMap;\npub fn run() {}\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let external_nodes = |db: &Database| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id WHERE f.path = ?1",
+                [crate::domain::EXTERNAL_FILE_PATH],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    let before = external_nodes(&db);
+    assert!(
+        before > 0,
+        "fixture must produce sentinel nodes, or this test proves nothing"
+    );
+    let edges_before: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+        .unwrap();
+
+    // The exact call a read command makes for a node whose file is `<external>`.
+    let changed = ensure_file_indexed(
+        &db,
+        project_dir.path(),
+        crate::domain::EXTERNAL_FILE_PATH,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !changed,
+        "the pseudo-file has no content to refresh — reporting a change would \
+         also make callers re-run their query for nothing"
+    );
+
+    assert_eq!(
+        external_nodes(&db),
+        before,
+        "query-time refresh deleted the <external> pseudo-file and its sentinels"
+    );
+    let edges_after: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(edges_after, edges_before, "cascade took the import edges");
+
+    // Negative control: a genuinely deleted REAL file must still be dropped —
+    // that is the branch this guard sits in front of, and short-circuiting it
+    // for everything would satisfy the assertions above.
+    fs::remove_file(project_dir.path().join("src/a.rs")).unwrap();
+    assert!(
+        ensure_file_indexed(&db, project_dir.path(), "src/a.rs", None).unwrap(),
+        "a real file that disappeared must still be pruned"
+    );
+}
+
+#[test]
+fn test_dead_code_ignore_prefixes_are_separator_normalized() {
+    // The CLI half of the `ignore_paths` fix shipped with zero coverage: reverting
+    // `ignore.iter().map(normalize_rel_str)` left the whole suite green. The
+    // prefixes are matched with `starts_with` against `/`-stored paths, so a
+    // Windows user's `--ignore src\generated` excludes nothing and the tool
+    // OVER-reports dead code. Asserted at the query, because the CLI's own
+    // normalization is a no-op on a Unix host by construction.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src/generated")).unwrap();
+    fs::write(
+        project_dir.path().join("src/generated/gen.rs"),
+        "pub fn generated_orphan() { let _ = 1; let _ = 2; let _ = 3; }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/real.rs"),
+        "pub fn real_orphan() { let _ = 1; let _ = 2; let _ = 3; }\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let names = |ignore: &[String]| -> Vec<String> {
+        crate::storage::queries::dead_code_report(db.conn(), None, None, false, 1, ignore)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|r| r.name)
+            .collect()
+    };
+
+    assert!(
+        names(&[]).contains(&"generated_orphan".to_string()),
+        "precondition: the generated orphan is reported when nothing is ignored"
+    );
+
+    // The `/` spelling is the stored one and must exclude.
+    let unix = names(&["src/generated".to_string()]);
+    assert!(
+        !unix.contains(&"generated_orphan".to_string()),
+        "got {unix:?}"
+    );
+    assert!(
+        unix.contains(&"real_orphan".to_string()),
+        "the ignore prefix must not swallow unrelated files: {unix:?}"
+    );
+
+    // A `\`-spelled prefix, once normalized the way the CLI/MCP entry points do,
+    // must behave identically — that equality IS the contract.
+    let normalized = crate::indexer::merkle::normalize_rel_str_on(r"src\generated", true);
+    assert_eq!(normalized, "src/generated");
+    assert_eq!(
+        names(&[normalized]),
+        unix,
+        "a backslash-spelled ignore prefix must exclude exactly what the forward-slash one does"
+    );
+}
