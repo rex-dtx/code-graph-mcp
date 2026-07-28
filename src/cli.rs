@@ -414,40 +414,13 @@ fn normalize_user_path_from_on(
     raw: &str,
     backslash_is_sep: bool,
 ) -> Result<String> {
-    let key = normalize_user_path_key(project_root, cwd, raw, backslash_is_sep)?;
-    // Collapse runs of `/` in the RESULT. No index key ever contains `//`, so a
-    // doubled separator anywhere in the input produced a key that matched
-    // nothing — and every command then reported that as a clean empty answer.
-    // `dead-code src// --json` returned `[]` exit 0 on a directory with real
-    // dead code, which is the exact false-clean the unindexed-path probe was
-    // added to prevent: the probe trimmed a TRAILING slash for its own
-    // comparison while the query kept the untrimmed filter, so the two disagreed
-    // and the disclosure never fired. `overview src//` meanwhile errored, so the
-    // two surfaces re-split on the shape they had just been aligned on.
-    //
-    // Applied to the output rather than the input because the input still has to
-    // reach the `\\`-prefixed UNC rejection intact — collapsing first turns
-    // `\\server\share` into `\server\share` and walks straight past that guard.
-    //
-    // A trailing separator is deliberately KEPT: `test_normalize_user_path_passes_relative_through`
-    // pins `src/parser/` round-tripping unchanged, and every consumer
-    // prefix-matches, so `src/` works wherever `src` does. Only the unindexed
-    // probe needed the two spellings unified, and it trims for itself.
-    let collapsed = if key.contains("//") {
-        let mut out = String::with_capacity(key.len());
-        let mut prev_sep = false;
-        for c in key.chars() {
-            if c == '/' && prev_sep {
-                continue;
-            }
-            prev_sep = c == '/';
-            out.push(c);
-        }
-        out
-    } else {
-        key
-    };
-    Ok(collapsed)
+    // Separator normalization (including collapsing `//`) lives in
+    // `merkle::normalize_rel_str_on`, the crate's single implementation — the
+    // first fix for the doubled-separator false clean put the collapse here
+    // instead, which left the MCP entries (`tools::normalize_path_arg`) still
+    // broken, and MCP's failure was the worse one: it re-indexed the file under
+    // the non-canonical key rather than merely missing.
+    normalize_user_path_key(project_root, cwd, raw, backslash_is_sep)
 }
 
 fn normalize_user_path_key(

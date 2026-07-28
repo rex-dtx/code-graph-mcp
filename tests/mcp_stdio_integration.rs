@@ -1527,3 +1527,86 @@ fn mcp_get_ast_node_treats_an_empty_file_path_as_absent() {
         "a real but absent file_path must still be reported: {missing_text}"
     );
 }
+
+/// A doubled separator in an MCP `file_path` used to WRITE a duplicate into the
+/// index, not merely miss.
+///
+/// `tools::normalize_path_arg` unified `\` to `/` but left `//` alone, so
+/// `src//a.ts` reached the freshness path as a key the index had never heard of
+/// — and that path's answer to "unknown file" is to index it. Measured before
+/// the fix: `files` went from `package.json | src/a.ts` to
+/// `package.json | src//a.ts | src/a.ts`, and one `alpha` became two nodes, each
+/// reporting a different `file_path` for the same source line.
+///
+/// The CLI-side fix for the same input (`dead-code src//` reporting a false
+/// clean) was first written into `cli::normalize_user_path`, which left this
+/// surface untouched — and this was the failing direction that mutates. The
+/// collapse now lives in `merkle::normalize_rel_str_on`, the crate's single
+/// separator-normalizing implementation.
+#[test]
+fn mcp_doubled_separator_in_file_path_does_not_duplicate_the_index() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.ts"), "export function alpha(){ return 1; }\n").unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        "{\"name\":\"p\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let file_rows = |label: &str| -> Vec<String> {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            rows.iter().all(|p| !p.contains("//")),
+            "{label}: a `//` key reached the files table: {rows:?}"
+        );
+        rows
+    };
+    let before = file_rows("before");
+
+    let mut client = McpClient::spawn(project.path());
+    let resp = client.call_tool(
+        "get_ast_node",
+        json!({ "symbol_name": "alpha", "file_path": "src//a.ts" }),
+    );
+    let body = extract_tool_payload(&resp);
+
+    // It must answer, and answer with the CANONICAL path — echoing `src//a.ts`
+    // back is how the duplicate row was visible from outside.
+    let text = serde_json::to_string(&body).unwrap();
+    assert!(
+        text.contains("src/a.ts") && !text.contains("src//a.ts"),
+        "the response must carry the canonical key: {text}"
+    );
+
+    drop(client);
+    assert_eq!(
+        file_rows("after"),
+        before,
+        "a doubled separator must not add a files row"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let alphas: i64 = conn
+        .query_row("SELECT COUNT(*) FROM nodes WHERE name = 'alpha'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(alphas, 1, "one source symbol must stay one node");
+}

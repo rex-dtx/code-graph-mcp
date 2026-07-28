@@ -7225,6 +7225,30 @@ fn test_cli_json_dead_code_unindexed_path_discloses() {
         slash_code, 1,
         "trailing slash must not bypass the probe: {slash_stdout}"
     );
+
+    // The FALSE CLEAN itself, which the exit-code checks above cannot see: with
+    // candidates present, every spelling of the same directory must return the
+    // same ones. `src//` used to return `[]` at exit 0 while `src` returned real
+    // dead code — the probe trimmed a TRAILING slash for its own comparison
+    // while the query kept the untrimmed filter, so the disclosure never fired
+    // and the empty result read as clean. Asserting only on exit codes leaves
+    // that invisible: the probe's own trim makes the exit code right while the
+    // answer stays wrong. Measured — with the collapse in
+    // `merkle::normalize_rel_str_on` disabled, the exit-code loop above stays
+    // green and this block goes red.
+    let results_for = |p: &str| -> serde_json::Value {
+        let (out, _, _) = run_cli(&project, &["dead-code", p, "--min-lines", "1", "--json"]);
+        serde_json::from_str(out.trim())
+            .unwrap_or_else(|e| panic!("`dead-code {p} --min-lines 1 --json` invalid JSON: {e}"))
+    };
+    let canonical = results_for("src");
+    for spelling in ["src/", "src//", "./src//", "src///"] {
+        assert_eq!(
+            results_for(spelling),
+            canonical,
+            "`dead-code {spelling}` must return exactly what `dead-code src` returns"
+        );
+    }
 }
 
 /// Audit 2026-07-27 P2-3 / review follow-up: `project_map`'s two inline copies of

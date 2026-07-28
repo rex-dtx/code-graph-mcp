@@ -47,18 +47,109 @@ pub(crate) fn normalize_rel_str(rel: &str) -> String {
 /// This is the single separator-normalizing implementation in the crate —
 /// `cli::normalize_path_display_on` strips the Windows `\\?\` prefix and then
 /// delegates here, so the two cannot drift.
+///
+/// Runs of `/` collapse to one. An index key is built from walked `Path`
+/// components and can never contain `//`, so this is a no-op for stored paths —
+/// but a user-supplied `src//a.ts` used to survive all the way through. On the
+/// CLI that meant a filter matching zero files, reported as a clean empty
+/// answer; on MCP it was worse: the freshness path indexed the file a SECOND
+/// time under the non-canonical key, so `files` gained a `src//a.ts` row and
+/// `alpha` became two nodes. Collapsing here rather than at one entry point is
+/// what makes the CLI, the MCP tools, and the write path agree — the first fix
+/// for this put it in `cli::normalize_user_path` only, and MCP kept the bug.
 #[inline]
 pub(crate) fn normalize_rel_str_on(rel: &str, backslash_is_sep: bool) -> String {
-    if backslash_is_sep {
+    let unified = if backslash_is_sep {
         rel.replace('\\', "/")
     } else {
         rel.to_string()
+    };
+    if !unified.contains("//") {
+        return unified;
     }
+    // A LEADING `//` is preserved: that is a UNC host root (`\\server\share`
+    // arrives here as `//server/share` once backslashes are unified), and
+    // `cli::normalize_path_display_on` asserts it survives. Doubling is
+    // meaningless everywhere else in a path and meaningful only at position 0,
+    // so the collapse starts after it. Index keys are relative and never begin
+    // with a separator, so no stored key can take this branch.
+    let unc_root = unified.starts_with("//");
+    let body = if unc_root {
+        &unified[2..]
+    } else {
+        &unified[..]
+    };
+    let mut out = String::with_capacity(unified.len());
+    if unc_root {
+        out.push_str("//");
+    }
+    let mut prev_sep = false;
+    for c in body.chars() {
+        if c == '/' && prev_sep {
+            continue;
+        }
+        prev_sep = c == '/';
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
+
+    /// Doubled separators collapse, except a leading UNC host root.
+    ///
+    /// A user-supplied `src//a.ts` used to survive normalization intact. On the
+    /// CLI that produced a filter matching zero files, reported as a clean empty
+    /// answer; through MCP it was worse — the freshness path indexed the file a
+    /// SECOND time under the non-canonical key, so `files` gained a `src//a.ts`
+    /// row and one symbol became two nodes. Measured before the fix:
+    /// `files` = `package.json | src//a.ts | src/a.ts`, `alpha` nodes = 2.
+    ///
+    /// The first attempt put this in `cli::normalize_user_path`, which left the
+    /// MCP entries (`tools::normalize_path_arg`) broken — and MCP's was the
+    /// failing direction that WRITES. It belongs here, in the single
+    /// separator-normalizing implementation, so all three surfaces agree.
+    #[test]
+    fn normalize_rel_str_on_collapses_doubled_separators_but_keeps_the_unc_root() {
+        for backslash_is_sep in [true, false] {
+            for (raw, want) in [
+                ("src//a.ts", "src/a.ts"),
+                ("src///a.ts", "src/a.ts"),
+                ("a//b//c.rs", "a/b/c.rs"),
+                ("src//", "src/"),
+                ("src/a.ts", "src/a.ts"),
+            ] {
+                assert_eq!(
+                    normalize_rel_str_on(raw, backslash_is_sep),
+                    want,
+                    "{raw:?} (backslash_is_sep={backslash_is_sep})"
+                );
+            }
+        }
+        // UNC host root survives — `cli::normalize_path_display_on` asserts it,
+        // and doubling is meaningful only at position 0.
+        assert_eq!(
+            normalize_rel_str_on("//server/share/repo/a.rs", false),
+            "//server/share/repo/a.rs"
+        );
+        assert_eq!(
+            normalize_rel_str_on(r"\\server\share\repo\a.rs", true),
+            "//server/share/repo/a.rs"
+        );
+        // ...but a doubled separator INSIDE a UNC path still collapses.
+        assert_eq!(
+            normalize_rel_str_on("//server/share//repo/a.rs", false),
+            "//server/share/repo/a.rs"
+        );
+        // On Unix `\` is an ordinary filename character and must not be touched,
+        // collapse or no collapse.
+        assert_eq!(
+            normalize_rel_str_on(r"src/od\bc.rs", false),
+            r"src/od\bc.rs"
+        );
+    }
 
     /// The repo-wide index-key invariant, asserted for BOTH platforms from any
     /// host — the property the `_on` seam exists for.

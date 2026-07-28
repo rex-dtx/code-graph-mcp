@@ -112,15 +112,23 @@ against the batch itself. No `INDEX_VERSION` change; no rebuild.
   the plugin asset excludes `*.test.js`, matching the npm `files` allowlist.
 - The `uses:` vacuity floor in the pin guard was 21 against a real count of 41,
   so a parse regression halving it would have passed.
-- **`dead-code src// --json` was a false clean** — the probe trimmed a *trailing*
-  slash for its own comparison while the report query kept the untrimmed filter,
-  so a doubled separator matched nothing and was reported as clean, while
-  `overview src//` errored on the same input. `normalize_user_path` now collapses
-  repeated separators in the key it returns, which fixes both surfaces at once
-  (no index key ever contains `//`). Applied to the output, not the input, so the
-  `\\`-prefixed UNC rejection still sees its prefix. Known limit, stated in the
-  test: `.//src/foo.rs` still errors, because stripping `./` leaves a leading
-  `/` — pre-existing, and not reachable from tab completion.
+- **A doubled separator in a path argument corrupted the index through MCP, and
+  read as a clean answer on the CLI.** `src//a.ts` survived normalization intact:
+  `dead-code src//` returned `[]` at exit 0 on a directory with real dead code,
+  and `get_ast_node {file_path: "src//a.ts"}` did something worse than miss — the
+  freshness path indexed the file a SECOND time under the non-canonical key, so
+  `files` gained a `src//a.ts` row and one symbol became two nodes, each
+  reporting a different path for the same source line. Measured both ways.
+  Repeated separators now collapse in `merkle::normalize_rel_str_on`, the crate's
+  single separator-normalizing implementation, so the CLI, the MCP tools and the
+  write path agree. A leading `//` is preserved — that is a UNC host root, which
+  `normalize_path_display_on` asserts survives; index keys are relative and can
+  never take that branch. Known limit, stated in the test: `.//src/foo.rs` still
+  errors, because stripping `./` leaves a leading `/` — pre-existing, and not
+  reachable from tab completion.
+
+  Existing indexes may already carry a `//` row written by an earlier MCP call;
+  the next full reindex clears it, and nothing reads it in the meantime.
 - **The `CLAUDE_CONFIG_DIR` guard had two vacuity holes**, both found by planting
   a leaking canary test file rather than by reading it. It matched
   `...process.env` and `HOME:` on the *same line*, so the Prettier-formatted
