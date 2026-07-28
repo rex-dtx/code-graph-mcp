@@ -1,5 +1,58 @@
 # Changelog
 
+## Unreleased
+
+Post-release review of v0.108.0. Nothing here changes the shipped binary's
+behaviour for a project-relative path; the two developer-machine findings are
+the ones that mattered.
+
+### Fixed
+- **`scripts/install-e2e.test.js` acted on the developer's real Claude config.**
+  Every child it spawned redirected `HOME` but spread `process.env` — and
+  `claudeHome()` is `CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var wins.
+  For anyone who exports it (the documented multi-account setup), this file —
+  run by pre-commit whenever `claude-plugin/` or `scripts/` JS is staged, and
+  deliberately excluded from CI — operated on their live config. Measured against
+  a canary config dir: `uninstall --unadopt-all` deleted
+  `<canary>/plugins/cache/code-graph-mcp/` and wrote `statusline-providers.json`
+  into it, and nine §1 assertions failed because they were reading a stranger's
+  settings. All 19 spawn sites now go through one `sandboxEnv()` that pins both
+  names; under the same canary the run is 42/42 with the canary byte-identical.
+  Third sibling of an escape hatch v0.108.0 closed in `tests/cli_e2e.rs` and
+  `doctor.test.js` — and the review that found it named only one of the 19 sites.
+- **The v0.108.0 guard against exactly that was itself inert.**
+  `test_cli_doctor_rejects_an_unknown_flag_instead_of_repairing` set
+  `CLAUDE_CONFIG_DIR=<home>` while asserting on `<home>/.claude/settings.json` —
+  a path nothing in the program can create. A repair run in that sandbox writes
+  `<home>/settings.json`, so the assertion the comment calls "what catches it"
+  could never fire. Verified by running a real repair in a sandbox: it produces
+  `<CLAUDE_CONFIG_DIR>/settings.json` and `statusline-providers.json`, which is
+  what the test now watches, derived from the same variable it hands the child.
+- **`module_overview` refused legal filenames.** Its "outside the project root"
+  check keyed on a colon at byte 1 with no separator requirement — the over-broad
+  predicate `src/cli.rs` copied and then fixed on its own side in v0.108.0,
+  leaving the two surfaces disagreeing. `a:b.rs` is an ordinary POSIX filename;
+  `src/cli.rs` now asserts it must survive normalization while this entry
+  rejected it. The drive form now requires `C:`, `C:/…` or `C:\…`, and UNC roots
+  are named explicitly.
+- **Two Windows path spellings stopped being rejected on Windows.** The CI fix
+  that scoped the lexical drive/UNC check to `!cfg!(windows)` handed back the two
+  roots `Path::is_absolute` misses *there* too: bare `C:` is drive-relative and
+  `\\server` has no share. Both fell through to the relative branch and came back
+  as an ordinary empty result. The predicate now takes `is_absolute` as a
+  parameter instead of reading `cfg!(windows)`, so the Windows branch is
+  executable — and asserted — on the Linux leg.
+- **A `grep` hint told users to type what they had just typed.**
+  `had_literal_separator` located the pattern with `position(|a| *a == pattern)`,
+  which finds the first token spelling that string — an earlier flag's *value*.
+  `grep -t rust -- rust` computed pattern-index 1 against separator-index 2 and
+  concluded there was no separator.
+- **`tmp-dir.test.js` leaked a directory into `os.tmpdir()` on every run** — 52
+  had accumulated in `~/.claude/tmp/`, the same shape `install-e2e.test.js`
+  documents at 223. It also set only `TMPDIR`, which `os.tmpdir()` ignores on
+  Windows (`TEMP`/`TMP`), so the isolation the ~5% flake fix depends on was inert
+  there. All three names are set and the sandbox is removed in `after`.
+
 ## v0.108.0 — audit 2026-07-27 remediation (12 P1s, eight review rounds)
 
 Upgrade notes: **index rebuild required** — `INDEX_VERSION` 52 → 53. The server

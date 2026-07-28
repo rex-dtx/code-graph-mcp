@@ -1285,7 +1285,9 @@ fn mcp_find_references_answers_for_an_import_only_name() {
     )
     .unwrap();
     // A project symbol whose name is ALSO imported from std in the same file.
-    // This is the negative control for the split below.
+    // What it pins is project-symbol PREFERENCE, not the `<external>` exclusion
+    // — see the long note at the assertions below for why it cannot be the
+    // latter and which test is.
     //
     // Two earlier versions of it were INERT, for two different reasons, and the
     // second is the subtle one:
@@ -1296,9 +1298,14 @@ fn mcp_find_references_answers_for_an_import_only_name() {
     //      `<external>` predicate the control is supposed to exercise was a
     //      no-op for them. Deleting it changed nothing and the test still passed.
     //
-    // `impl Debug for S` is what makes it live: an IMPLEMENTS sentinel is typed
-    // `trait`, which the type filter does not catch, so `<external>` exclusion is
-    // the only thing keeping `Debug` from resolving to a phantom definition.
+    // A third version added an `impl Debug for S` fixture in `src/c.rs` on the
+    // theory that a `trait`-typed IMPLEMENTS sentinel escapes the type filter and
+    // would therefore exercise the exclusion. Round 7 measured it: the payload is
+    // byte-identical either way, because find_references answers from edge rows.
+    // Both the fixture and this comment's claim about it were deleted — the
+    // sentence that used to sit here ("`impl Debug for S` is what makes it live")
+    // described a file that no longer exists, which is the same invitation to
+    // trust an inert control, just relocated into prose.
     std::fs::write(
         src.join("b.rs"),
         "use std::mem::take;\npub fn take() -> u8 { 7 }\npub fn helper() -> u8 { take() }\n",
@@ -1394,4 +1401,75 @@ fn mcp_find_references_answers_for_an_import_only_name() {
     // exclusion filters — as `EXCLUDE_EXTERNAL_BY_NAME`'s own doc comment states.
     // It was the FOURTH inert control in this effort, so it is deleted rather
     // than relabelled: an inert block invites the next reader to trust it.
+}
+
+/// Review 2026-07-28: `module_overview`'s "obviously outside the root" guard
+/// keyed on a colon at BYTE 1 with no separator requirement — the over-broad
+/// predicate `src/cli.rs` copied and then fixed on its own side, leaving the two
+/// surfaces disagreeing about the same name. `a:b.rs` is a legal POSIX filename;
+/// `src/cli.rs`'s own unit test now asserts it must survive normalization, while
+/// this entry refused it with "must be relative to the project root" — a
+/// factually false answer about a file sitting in the root.
+#[test]
+fn mcp_module_overview_rejects_drive_roots_but_not_colon_filenames() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("lib.rs"), "pub fn anchor() -> u8 { 1 }\n").unwrap();
+
+    // `:` is legal in a POSIX filename but forbidden by NTFS (it introduces an
+    // alternate data stream), so the fixture — not just the expectation — is
+    // Unix-only. On Windows the drive-root half below still runs.
+    let colon_file = "a:b.rs";
+    if !cfg!(windows) {
+        std::fs::write(
+            project.path().join(colon_file),
+            "pub fn colon_named() -> u8 { 2 }\n",
+        )
+        .unwrap();
+    }
+
+    // Without a project marker the server comes up in non-project stub mode and
+    // answers every tool call with "method not found", which would have made the
+    // rejection assertions below pass for the wrong reason.
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"colon_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let mut client = McpClient::spawn(project.path());
+
+    let refused = |resp: &Value| -> bool {
+        resp["result"]["isError"].as_bool() == Some(true)
+            && resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("must be relative to the project root")
+    };
+
+    // Still refused: real drive roots and UNC roots, which no index key can name.
+    for bad in ["C:/repo", r"D:\repo\src", "c:", r"\\server\share\src"] {
+        let resp = client.call_tool("module_overview", json!({ "path": bad }));
+        assert!(
+            refused(&resp),
+            "{bad:?} must still be refused as an absolute path; got: {resp}"
+        );
+    }
+
+    // Not refused: ordinary relative paths whose second byte happens to be `:`.
+    if !cfg!(windows) {
+        let resp = client.call_tool("module_overview", json!({ "path": colon_file }));
+        assert!(
+            !refused(&resp),
+            "{colon_file:?} is a real file in the project root — refusing it as \
+             'outside the project root' is a false answer; got: {resp}"
+        );
+    }
 }

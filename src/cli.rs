@@ -383,6 +383,31 @@ fn normalize_user_path_from(project_root: &Path, cwd: &Path, raw: &str) -> Resul
 /// PowerShell's tab completion produces `.\` by default, so the whole
 /// cwd-anchored arm was dead there and the final `normalize_rel_str` emitted
 /// `./src/foo.rs` — a lookup key with a `./` prefix the index never contains.
+/// Does `raw` spell a Windows drive/UNC root that `Path::is_absolute` did NOT
+/// claim on this host?
+///
+/// `natively_absolute` is `Path::new(raw).is_absolute()`, taken as a parameter
+/// for the same reason `backslash_is_sep` is: it is the ONLY thing that differs
+/// between hosts here, so passing it in lets the Linux CI leg execute the
+/// Windows branch. Without that seam the Windows behaviour of this guard is
+/// unobservable off-Windows, and both previous versions shipped a defect that
+/// only the windows-latest leg could see.
+///
+/// The drive form requires a separator after the colon (`C:\x`, `C:/x`) or the
+/// bare root (`C:`). A colon at byte 1 alone is not enough: `:` is legal in a
+/// POSIX filename, so `a:b.rs` in the project root is a real, indexable file.
+fn needs_lexical_windows_rejection(raw: &str, natively_absolute: bool) -> bool {
+    if natively_absolute {
+        // Windows claims `C:\x` and `\\srv\share` itself; the under-root check
+        // is the right answer for them, and rejecting them lexically refused
+        // `C:\repo\src\mod.rs` for a root that literally contains it.
+        return false;
+    }
+    let b = raw.as_bytes();
+    let drive_root = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    (drive_root && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\')) || raw.starts_with(r"\\")
+}
+
 fn normalize_user_path_from_on(
     project_root: &Path,
     cwd: &Path,
@@ -428,38 +453,19 @@ fn normalize_user_path_from_on(
     // project-relative file on ANY platform, so reject them LEXICALLY rather
     // than platform-natively — which also brings the CLI in line with the MCP
     // entry (`tools/overview.rs` already rejects the drive-letter form).
-    // The drive form REQUIRES a separator after the colon (`C:\x`, `C:/x`) or the
-    // bare root (`C:`). A colon at byte 1 alone is not enough: `:` is a perfectly
-    // legal Unix filename character, so `a:b.rs` in the project root is a real,
-    // indexable file — and the first version of this guard rejected it with
-    // "outside the project root", a factually false answer about a file sitting
-    // right there. (Drive-RELATIVE `C:foo` is deliberately not matched: it is
-    // vanishingly rare next to ordinary colon-bearing filenames, and the cost of
-    // guessing wrong is refusing a file that exists.)
-    //
-    // ONLY on a non-Windows host. This guard exists to substitute for
-    // `Path::is_absolute`, which does not recognise the drive form off-Windows;
-    // ON Windows it recognises it natively, and the under-root check below is
-    // the correct answer. Applying the lexical rejection there too refuses
-    // `C:\repo\src\mod.rs` for a project root that literally contains it —
-    // which is what it did: four `normalize_user_path` tests failed on the
-    // windows-latest CI leg with "is outside the project root <that very root>"
-    // while passing on Linux, because the platform-parameterised test seam moves
-    // the SEPARATOR, not `is_absolute`. A fix for one platform, breaking the
-    // other.
-    let b = raw.as_bytes();
-    let drive_root = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
-    let windows_absolute = !cfg!(windows)
-        && ((drive_root && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\'))
-            || raw.starts_with(r"\\"));
-    if windows_absolute {
+    // Exact spellings, why `is_absolute` is the gate rather than `cfg!(windows)`,
+    // and the two defects each earlier version shipped: see
+    // `needs_lexical_windows_rejection`. (Drive-RELATIVE `C:foo` is deliberately
+    // not matched: it is vanishingly rare next to ordinary colon-bearing
+    // filenames, and the cost of guessing wrong is refusing a file that exists.)
+    let p = Path::new(raw);
+    if needs_lexical_windows_rejection(raw, p.is_absolute()) {
         anyhow::bail!(
             "path '{}' is outside the project root '{}' \u{2014} use a relative path or one under the project root",
             raw, project_root.display()
         );
     }
 
-    let p = Path::new(raw);
     if p.is_absolute() {
         if let Ok(rel) = p.strip_prefix(project_root) {
             let rel = crate::indexer::merkle::normalize_rel_path(rel);
@@ -2750,11 +2756,14 @@ pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
         grep_exit(2);
     }
     let mut parsed = GrepArgs::parse_from(normalize_grep_argv(raw.clone()));
+    // True exactly when the pattern's own slot sits after the `--`. Search only
+    // the tail: scanning from index 0 found the FIRST token equal to the pattern
+    // string, which may be an earlier flag's VALUE. `grep -g '--quiet' -- --quiet`
+    // computed pat=1 against sep=2, concluded "no separator", and the hint told
+    // the user to write `grep -- --quiet` — which is what they had just typed.
+    // (It also mishandled `grep -- --`, where sep == pat.)
     parsed.had_literal_separator = match separator_at {
-        Some(sep) => raw
-            .iter()
-            .position(|a| *a == parsed.pattern)
-            .is_none_or(|pat| sep < pat),
+        Some(sep) => raw.iter().skip(sep + 1).any(|a| *a == parsed.pattern),
         None => false,
     };
     parsed
@@ -9384,13 +9393,18 @@ mod tests {
     ///
     /// The VERDICT is identical on every platform; the MECHANISM is not, and the
     /// first version of this guard got that wrong. Off-Windows the lexical
-    /// spelling check rejects them. ON Windows `is_absolute` recognises the drive
-    /// form natively, `strip_prefix(root)` fails for a foreign drive, and the
-    /// same error is raised — so the lexical check is not merely redundant there,
-    /// it is harmful: applied unconditionally it also rejected
-    /// `C:\<temp>\src\parser\mod.rs` for a project root that literally
+    /// spelling check rejects them. ON Windows `is_absolute` recognises the
+    /// COMPLETE forms natively, `strip_prefix(root)` fails for a foreign drive,
+    /// and the same error is raised — so the lexical check is not merely
+    /// redundant for those, it is harmful: applied unconditionally it also
+    /// rejected `C:\<temp>\src\parser\mod.rs` for a project root that literally
     /// contains it, reddening four tests on the windows-latest CI leg while every
     /// Linux run stayed green.
+    ///
+    /// The INCOMPLETE roots are the ones `is_absolute` misses on Windows too —
+    /// bare `C:` is drive-relative and `\\server` has no share — so they are
+    /// asserted unconditionally below. The `!cfg!(windows)` version of the guard
+    /// handed exactly these two back to the relative branch.
     #[test]
     fn windows_absolute_spellings_are_rejected_by_spelling_off_windows() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9400,6 +9414,11 @@ mod tests {
             "C:/repo/src/Foo.cs",
             r"\\server\share\src\Foo.cs",
             "c:/x",
+            // Incomplete roots: rejected on EVERY platform, `is_absolute` claims
+            // neither anywhere.
+            "C:",
+            "z:",
+            r"\\server",
         ] {
             for backslash_is_sep in [true, false] {
                 let got = normalize_user_path_from_on(root, root, raw, backslash_is_sep);
@@ -9439,6 +9458,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The WINDOWS branch of that guard, executed on the Linux CI leg.
+    ///
+    /// `natively_absolute` is the only thing that differs between hosts here, so
+    /// taking it as a parameter is what makes these cases observable at all —
+    /// and both earlier versions of the predicate shipped a defect that ONLY
+    /// windows-latest could see. The test above cannot reach either: it drives
+    /// the real `Path::is_absolute`, which on Linux answers `false` for every
+    /// Windows spelling, so the whole "Windows already claimed it" arm is dead
+    /// there.
+    #[test]
+    fn lexical_windows_rejection_only_covers_what_is_absolute_did_not_claim() {
+        // Simulated Windows, COMPLETE roots: `is_absolute` claims them, the
+        // under-root check is the right answer, and firing here is what reddened
+        // four tests on windows-latest by refusing `C:\<root>\src\mod.rs` for a
+        // root that literally contains it.
+        for complete in [r"C:\repo\src\mod.rs", "C:/repo/src", r"\\srv\share\x"] {
+            assert!(
+                !needs_lexical_windows_rejection(complete, true),
+                "{complete:?} is natively absolute — the lexical check must stand down"
+            );
+        }
+        // Simulated Windows, INCOMPLETE roots: `is_absolute` does NOT claim these
+        // there either (bare `C:` is drive-relative, `\\server` has no share), so
+        // the `!cfg!(windows)` version let them fall into the relative branch and
+        // be answered as an ordinary empty result.
+        for incomplete in ["C:", "z:", r"\\server"] {
+            assert!(
+                needs_lexical_windows_rejection(incomplete, false),
+                "{incomplete:?} names no project-relative file on any host and must be rejected"
+            );
+        }
+        // Simulated Unix: nothing here is absolute, so every Windows-shaped form
+        // is rejected...
+        for shaped in [
+            r"D:\repo\src\Foo.cs",
+            "C:/repo/src/Foo.cs",
+            r"\\server\share\x",
+            "c:",
+        ] {
+            assert!(
+                needs_lexical_windows_rejection(shaped, false),
+                "{shaped:?} must be rejected lexically where `is_absolute` misses it"
+            );
+        }
+        // ...while ordinary names whose second byte is `:` are not.
+        for ok in ["a:b.rs", "z:name", "src/a:b.rs", "d/repo/src/Foo.cs", "1:x"] {
+            assert!(
+                !needs_lexical_windows_rejection(ok, false),
+                "{ok:?} is an ordinary relative path — `:` is legal in a POSIX filename"
+            );
+        }
+    }
+
+    /// `had_literal_separator` must describe the PATTERN's slot, not the first
+    /// token that happens to spell the same string.
+    ///
+    /// `position(|a| *a == pattern)` scanned from index 0, so an earlier flag's
+    /// VALUE claimed the slot: `grep -t rust -- rust` computed pat=1 against
+    /// sep=2 and concluded "no separator" for a command that plainly had one.
+    /// Downstream that makes `grep_flaglike_pattern_hint` advise a user who
+    /// already typed `--` to type it. The `sep == pat` case (`grep -- --`) was
+    /// wrong for the same reason, but is unreachable: clap consumes `--` itself,
+    /// so `grep -- --` never yields a `--` pattern (it exits 2 for a missing
+    /// PATTERN). Only the value-collision case above is a real command, and it
+    /// is the one asserted here.
+    #[test]
+    fn grep_literal_separator_tracks_the_pattern_slot_not_the_first_match() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // The pattern string also appears as `-t`'s value, before the separator.
+        let a = parse_grep_args(&argv(&[
+            "code-graph-mcp",
+            "grep",
+            "-t",
+            "rust",
+            "--",
+            "rust",
+        ]));
+        assert_eq!(a.pattern, "rust");
+        assert!(
+            a.had_literal_separator,
+            "the pattern's own slot is after `--`; an earlier flag VALUE spelling \
+             the same string must not claim it"
+        );
+
+        // Ordinary separated use, and unseparated use, both unchanged.
+        assert!(
+            parse_grep_args(&argv(&["code-graph-mcp", "grep", "--", "-foo"])).had_literal_separator
+        );
+        assert!(
+            !parse_grep_args(&argv(&["code-graph-mcp", "grep", "needle"])).had_literal_separator
+        );
+        assert!(
+            !parse_grep_args(&argv(&["code-graph-mcp", "grep", "-t", "rust", "rust"]))
+                .had_literal_separator
+        );
     }
 
     #[test]

@@ -54,10 +54,23 @@ impl McpServer {
         // 'C:\Windows' will never match anything — but currently they silently
         // return `0 files` with a generic warning. An upfront error is clearer
         // and matches the lesson from #259 (validate at parse time).
+        //
+        // The drive form REQUIRES a separator after the colon (`C:\x`, `C:/x`)
+        // or the bare root (`C:`). Keying on "a colon at byte 1" alone — which
+        // this did, and `src/cli.rs` copied before fixing it there — refuses
+        // `a:b.rs`, a perfectly legal POSIX filename sitting in the project
+        // root, with "must be relative to the project root". `src/cli.rs:9441`
+        // now asserts that exact name must survive; this surface disagreed.
+        let pb = raw_path.as_bytes();
+        let drive_shaped = pb.len() >= 2
+            && pb[0].is_ascii_alphabetic()
+            && pb[1] == b':'
+            && (pb.len() == 2 || pb[2] == b'/' || pb[2] == b'\\');
         if raw_path.starts_with('/')
             || raw_path.starts_with("../")
             || raw_path.contains("/../")
-            || (raw_path.len() >= 2 && raw_path.as_bytes()[1] == b':')
+            || drive_shaped
+            || raw_path.starts_with(r"\\")
         {
             return Err(anyhow!(
                 "path '{}' must be relative to the project root (no leading '/' or '../', no absolute paths)",

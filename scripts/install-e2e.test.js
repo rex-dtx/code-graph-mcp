@@ -41,6 +41,25 @@ function mkHome() {
   return dir;
 }
 
+// Every child process that touches lifecycle state must have BOTH names
+// redirected. `claudeHome()` is `process.env.CLAUDE_CONFIG_DIR ||
+// homedir/.claude`, so spreading `process.env` while pinning only HOME leaves
+// the config dir aimed at the developer's REAL ~/.claude for anyone who exports
+// it (the documented multi-account setup). Measured with a canary config dir:
+// `uninstall --unadopt-all` DELETED `<canary>/plugins/cache/code-graph-mcp/` and
+// wrote `statusline-providers.json` into it, while nine §1 assertions failed
+// because they were reading a stranger's settings. This file is gated by
+// pre-commit and excluded from CI (ci.yml), so it runs on developer machines
+// only — there is no CI leg that would have caught it.
+function sandboxEnv(homeDir, extra) {
+  return {
+    ...process.env,
+    HOME: homeDir,
+    CLAUDE_CONFIG_DIR: path.join(homeDir, '.claude'),
+    ...extra,
+  };
+}
+
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + '\n');
@@ -141,7 +160,7 @@ test('§1.4 hook split: cache hooks.json carries SessionStart only; install() re
     plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
   });
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: sandboxEnv(homeDir),
     stdio: 'pipe',
   });
   const settings = readJson(settingsPath);
@@ -160,7 +179,7 @@ test('§1.5 plugin install creates install manifest with version', () => {
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: sandboxEnv(homeDir),
     stdio: 'pipe',
   });
 
@@ -186,7 +205,7 @@ test('§1.6 plugin install sets up composite statusline', () => {
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: sandboxEnv(homeDir),
     stdio: 'pipe',
   });
 
@@ -230,7 +249,7 @@ test('§1.7 plugin update strips legacy settings.json hooks and clears update ca
   fs.writeFileSync(updateCache, '{}');
 
   execFileSync(process.execPath, [LIFECYCLE, 'update'], {
-    env: { ...process.env, HOME: homeDir },
+    env: sandboxEnv(homeDir),
     stdio: 'pipe',
   });
 
@@ -249,7 +268,7 @@ function runSyncLifecycleConfig(homeDir) {
   const sessionInit = path.join(PLUGIN_ROOT, 'scripts', 'session-init.js');
   return execFileSync(process.execPath, [
     '-e', `console.log(require(${JSON.stringify(sessionInit)}).syncLifecycleConfig())`,
-  ], { env: { ...process.env, HOME: homeDir }, stdio: 'pipe' }).toString().trim();
+  ], { env: sandboxEnv(homeDir), stdio: 'pipe' }).toString().trim();
 }
 
 function installIntoSandbox() {
@@ -260,7 +279,7 @@ function installIntoSandbox() {
     plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
   });
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir }, stdio: 'pipe',
+    env: sandboxEnv(homeDir), stdio: 'pipe',
   });
   return { homeDir, settingsPath };
 }
@@ -344,7 +363,7 @@ test('§1.11 a stale-relic session-init defers to the active install (downgrade-
   const relicSessionInit = path.join(relicDir, 'scripts', 'session-init.js');
   const out = execFileSync(process.execPath, [
     '-e', `console.log(require(${JSON.stringify(relicSessionInit)}).syncLifecycleConfig())`,
-  ], { env: { ...process.env, HOME: homeDir }, stdio: 'pipe' }).toString().trim();
+  ], { env: sandboxEnv(homeDir), stdio: 'pipe' }).toString().trim();
 
   assert.equal(out, 'deferred-to-active-install');
   assert.equal(readJson(manifestPath).version, '0.49.0',
@@ -370,7 +389,7 @@ test('§1.8 plugin uninstall removes all traces', () => {
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: sandboxEnv(homeDir),
     stdio: 'pipe',
   });
 
@@ -379,7 +398,7 @@ test('§1.8 plugin uninstall removes all traces', () => {
 
   // Then uninstall
   execFileSync(process.execPath, [LIFECYCLE, 'uninstall'], {
-    env: { ...process.env, HOME: homeDir },
+    env: sandboxEnv(homeDir),
     stdio: 'pipe',
   });
 
@@ -419,7 +438,7 @@ test('§1.9 plugin install migrates old plugin IDs', () => {
   });
 
   execFileSync(process.execPath, [LIFECYCLE, 'install'], {
-    env: { ...process.env, HOME: homeDir },
+    env: sandboxEnv(homeDir),
     stdio: 'pipe',
   });
 
@@ -445,7 +464,7 @@ test('§1.10 plugin install is idempotent', () => {
     plugins: { 'code-graph-mcp@code-graph-mcp': [{ installPath: PLUGIN_ROOT, version: CURRENT_VERSION, scope: 'user' }] },
   });
 
-  const env = { ...process.env, HOME: homeDir };
+  const env = sandboxEnv(homeDir);
 
   // Install twice
   execFileSync(process.execPath, [LIFECYCLE, 'install'], { env, stdio: 'pipe' });
@@ -482,7 +501,7 @@ test('§2.1b bin/cli.js: adopt/unadopt --help is side-effect-free', () => {
       fs.mkdirSync(cwd, { recursive: true });
       fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}'); // project marker
       const out = execFileSync(process.execPath, [BIN_CLI, sub, flag], {
-        cwd, env: { ...process.env, HOME: home }, stdio: ['pipe', 'pipe', 'pipe'],
+        cwd, env: sandboxEnv(home), stdio: ['pipe', 'pipe', 'pipe'],
       }).toString();
       assert.match(out, /USAGE/, `${sub} ${flag} must print usage`);
       // adopt/unadopt run-markers must be absent (proves the command didn't run).
@@ -511,7 +530,7 @@ test('§2.3 find-binary.js writes and reads disk cache', () => {
 
   // Run find-binary (should write cache)
   const result = execFileSync(process.execPath, [FIND_BINARY], {
-    env: { ...process.env, HOME: homeDir, _FIND_BINARY_ROOT: ROOT },
+    env: sandboxEnv(homeDir, { _FIND_BINARY_ROOT: ROOT }),
     stdio: ['pipe', 'pipe', 'pipe'],
   }).toString().trim();
 
@@ -523,7 +542,7 @@ test('§2.3 find-binary.js writes and reads disk cache', () => {
 
   // Second run should use cache (still returns same path)
   const result2 = execFileSync(process.execPath, [FIND_BINARY], {
-    env: { ...process.env, HOME: homeDir, _FIND_BINARY_ROOT: ROOT },
+    env: sandboxEnv(homeDir, { _FIND_BINARY_ROOT: ROOT }),
     stdio: ['pipe', 'pipe', 'pipe'],
   }).toString().trim();
   assert.equal(result2, result, 'Cached result should match');
@@ -539,7 +558,7 @@ test('§2.4 find-binary.js handles stale cache gracefully', () => {
 
   // find-binary should fall through to actual resolution
   const result = execFileSync(process.execPath, [FIND_BINARY], {
-    env: { ...process.env, HOME: homeDir, _FIND_BINARY_ROOT: ROOT },
+    env: sandboxEnv(homeDir, { _FIND_BINARY_ROOT: ROOT }),
     stdio: ['pipe', 'pipe', 'pipe'],
   }).toString().trim();
 
@@ -561,11 +580,12 @@ test('§2.5 find-binary.js clearCache removes the cache file', () => {
   // Clear via module
   const result = execFileSync(process.execPath, ['-e', `
     process.env.HOME = ${JSON.stringify(homeDir)};
+    process.env.CLAUDE_CONFIG_DIR = ${JSON.stringify(path.join(homeDir, '.claude'))};
     const { clearCache, CACHE_FILE } = require(${JSON.stringify(FIND_BINARY)});
     clearCache();
     process.stdout.write(String(require('fs').existsSync(CACHE_FILE)));
   `], {
-    env: { ...process.env, HOME: homeDir },
+    env: sandboxEnv(homeDir),
     stdio: ['pipe', 'pipe', 'pipe'],
   }).toString();
 
@@ -888,7 +908,7 @@ test('§6.1 full lifecycle: fresh install → use → update → uninstall', () 
   const cacheDir = path.join(homeDir, '.cache', 'code-graph');
   const manifestPath = path.join(cacheDir, 'install-manifest.json');
   const registryPath = path.join(cacheDir, 'statusline-registry.json');
-  const env = { ...process.env, HOME: homeDir };
+  const env = sandboxEnv(homeDir);
 
   // Phase 1: Fresh install (no prior settings)
   writeJson(settingsPath, { enabledPlugins: { 'code-graph-mcp@code-graph-mcp': true } });
@@ -977,9 +997,21 @@ test('§6.5 bin/cli.js syntax is valid', () => {
 // "ignore what you don't recognise" idiom (doctor.js, lifecycle.js doctor and
 // src/main.rs were the first three), and it is the surface npm/npx users reach.
 
+// CLAUDE_CONFIG_DIR is pinned alongside HOME, not left to inherit. §6.2 below
+// runs a REAL `uninstall --unadopt-all`, and every path it touches
+// (settings.json, installed_plugins.json, statusline-providers.json, the plugin
+// cache dir) resolves through lifecycle.js's `claudeHome()` — which is
+// `process.env.CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var WINS over a
+// redirected HOME. A developer who exports it (the documented multi-account
+// setup) would have had this file — run by pre-commit, and excluded from CI by
+// ci.yml — detach their real statusline and strip their real hooks. Third
+// sibling of the same escape hatch; cli_e2e.rs and doctor.test.js closed the
+// other two in the same batch that missed this one.
 function runCli(homeDir, cwd, args) {
   const r = spawnSync(process.execPath, [BIN_CLI, ...args], {
-    cwd, env: { ...process.env, HOME: homeDir }, encoding: 'utf8',
+    cwd,
+    env: sandboxEnv(homeDir),
+    encoding: 'utf8',
   });
   return { code: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
 }
