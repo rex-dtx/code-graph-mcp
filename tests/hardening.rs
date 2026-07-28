@@ -1064,9 +1064,13 @@ fn js_test_files_neutralize_claude_config_dir() {
         //      for a file that had just stopped neutralizing anything;
         //   2. at MODULE SCOPE (zero indentation) — a `delete` nested in a
         //      function body may never run;
-        //   3. BEFORE the first `test(` — the modules under test resolve
-        //      `claudeHome()` when they are required, so a delete that lands
-        //      after that has already lost the race.
+        //   3. BEFORE the first `test(`. NOT because of a load-time race — all
+        //      three resolvers (`claude-config.js` `claudeHome`, and adopt.js's
+        //      two registry paths) read the variable at CALL time, and nothing
+        //      binds a derived constant at require time, so a delete after the
+        //      first `require` is in fact safe. It is required anyway because
+        //      "somewhere in the file" is not a property: a delete inside a test
+        //      body runs only if that test runs, and only for the tests after it.
         let first_test = src
             .lines()
             .position(|l| l.trim_start().starts_with("test("))
@@ -1097,29 +1101,42 @@ fn js_test_files_neutralize_claude_config_dir() {
             //     `adopt.test.js`, which wrote five `projects/<slug>/memory/`
             //     trees into a canary config dir while the guard stayed green.
             //
-            // The spawn check spans a WINDOW, not one line. `env: { ...process.env,
-            // HOME: home }` fits on one line today, but its Prettier-formatted
-            // spelling puts each key on its own — a per-line check goes quiet on
-            // a pure reformat while the leak returns. Six lines covers every env
-            // literal in this suite; the scan stops at the closing brace.
-            // The first line is ALWAYS in the window. Letting `take_while` see
-            // it dropped every single-line spawn — `{ env: { ...process.env,
-            // HOME: home } });` contains `});`, so the window came back empty
-            // and the guard went green on the one shape it was already
-            // catching. Only the CONTINUATION stops at the closing brace.
+            // The spawn check spans the ENV OBJECT LITERAL, not one line and not a
+            // fixed line count. Three versions of this got it wrong:
+            //   * one line only — `env: { ...process.env,\n HOME: home }` is the
+            //     Prettier-formatted spelling of the very lines this guard was
+            //     written for, and it went unseen;
+            //   * `take_while` including the first line — a single-line spawn
+            //     contains its own `}`, so the window came back EMPTY and the
+            //     guard went quiet on the shape it was already catching;
+            //   * a fixed 5-line window — five intervening env keys put `HOME:`
+            //     at offset 6, outside it. A magic number is not a bound.
+            // The literal ends at the first `}`; 24 is a runaway cap, not a
+            // semantic limit.
             let window: Vec<&str> = std::iter::once(*line)
                 .chain(
                     lines
                         .iter()
                         .skip(i + 1)
-                        .take(5)
-                        .take_while(|l| !l.contains("});"))
+                        .take(24)
+                        .take_while(|l| !l.contains('}'))
                         .copied(),
                 )
                 .collect();
+            // The exemption must be an actual KEY in this literal. Matching bare
+            // `CLAUDE_CONFIG_DIR` anywhere in the window let two things launder a
+            // real leak: a correctly-sandboxed SECOND spawn a few lines down, and
+            // — worse, because this codebase writes exactly that — a COMMENT
+            // saying the variable is handled. Both measured green before this.
+            let mentions_key = |l: &&str| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with('*')
+                    && (l.contains("CLAUDE_CONFIG_DIR:") || l.contains("CLAUDE_CONFIG_DIR ="))
+            };
             let leaks_via_spawn = line.contains("...process.env")
                 && window.iter().any(|l| l.contains("HOME:"))
-                && !window.iter().any(|l| l.contains("CLAUDE_CONFIG_DIR"));
+                && !window.iter().any(mentions_key);
             let leaks_in_process = t.starts_with("process.env.HOME =");
             if (leaks_via_spawn || leaks_in_process)
                 && !line.contains("CLAUDE_CONFIG_DIR")
