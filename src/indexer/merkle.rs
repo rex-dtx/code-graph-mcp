@@ -48,15 +48,28 @@ pub(crate) fn normalize_rel_str(rel: &str) -> String {
 /// `cli::normalize_path_display_on` strips the Windows `\\?\` prefix and then
 /// delegates here, so the two cannot drift.
 ///
-/// Runs of `/` collapse to one. An index key is built from walked `Path`
-/// components and can never contain `//`, so this is a no-op for stored paths —
-/// but a user-supplied `src//a.ts` used to survive all the way through. On the
-/// CLI that meant a filter matching zero files, reported as a clean empty
-/// answer; on MCP it was worse: the freshness path indexed the file a SECOND
-/// time under the non-canonical key, so `files` gained a `src//a.ts` row and
-/// `alpha` became two nodes. Collapsing here rather than at one entry point is
-/// what makes the CLI, the MCP tools, and the write path agree — the first fix
-/// for this put it in `cli::normalize_user_path` only, and MCP kept the bug.
+/// Runs of `/` collapse to one.
+///
+/// "No stored key contains `//`" is an invariant THIS LINE ENFORCES, not one
+/// that holds on its own — do not delete the collapse as belt-and-braces. It is
+/// inherent only for keys the indexer walk produces (`scan_directory` →
+/// `normalize_rel_path` over walkdir `Path` components, which cannot emit a
+/// doubled separator). The MCP freshness path is the counterexample: it takes a
+/// user-supplied string and WRITES a row from it. Measured before this landed,
+/// `get_ast_node {file_path: "src//a.ts"}` did not miss — it indexed the file a
+/// second time under the non-canonical key:
+///
+/// ```text
+/// files before: package.json | src/a.ts
+/// files after : package.json | src//a.ts | src/a.ts
+/// ```
+///
+/// One symbol became two nodes, each reporting a different path for the same
+/// source line. On the CLI the same input merely lied — a filter matching zero
+/// files, reported as a clean empty answer. Collapsing HERE rather than at one
+/// entry point is what makes the CLI, the MCP tools and the write path agree:
+/// the first fix for this went into `cli::normalize_user_path` alone, and MCP —
+/// the failing direction that mutates — kept the bug.
 #[inline]
 pub(crate) fn normalize_rel_str_on(rel: &str, backslash_is_sep: bool) -> String {
     let unified = if backslash_is_sep {
