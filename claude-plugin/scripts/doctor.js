@@ -736,9 +736,19 @@ module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDocto
 // Returns `{ checkOnly }` to run, `{ help: true }` to print usage, or
 // `{ error }` naming the offending arguments.
 const DOCTOR_KNOWN_FLAGS = new Set(['--check-only', '--help', '-h']);
+// Kept in sync with the `doctor` help text in src/main.rs, which intercepts
+// `--help` before this script is spawned so that help stays side-effect-free.
+// Two texts for one command drift silently; a user who reaches this one (direct
+// `node doctor.js`) should read the same thing as one who reaches the other.
 const DOCTOR_USAGE = [
-  'Usage: doctor [--check-only]',
-  '  --check-only   report issues without changing anything',
+  'code-graph-mcp doctor — diagnose and repair environment issues',
+  '',
+  'USAGE:',
+  '    code-graph-mcp doctor [--check-only]',
+  '',
+  'By default doctor repairs detected issues (re-registers hooks in',
+  '~/.claude/settings.json, fixes stale binary/model paths). Pass',
+  '--check-only to report issues without changing anything.',
 ].join('\n');
 
 function parseDoctorArgs(args) {

@@ -2486,6 +2486,14 @@ pub struct GrepArgs {
     /// Search pattern (ripgrep regex; use -F for literal strings)
     #[arg(allow_hyphen_values = true)]
     pub pattern: String,
+    /// Set by [`parse_grep_args`] when the caller wrote an explicit `--`.
+    ///
+    /// Not a flag — clap skips it. It exists so the flag-shaped-pattern hint can
+    /// stay silent for someone who has already said, in the only way the CLI
+    /// offers, that they meant the literal: telling them to add the `--` they
+    /// just typed is worse than saying nothing.
+    #[arg(skip)]
+    pub had_literal_separator: bool,
     /// Optional paths to restrict the search (must be within the project root)
     pub paths: Vec<String>,
     /// JSON output
@@ -2671,7 +2679,17 @@ fn first_unsupported_grep_flag(args: &[String]) -> Option<String> {
 /// Advisory only. Changing `grep --quiet` from "search for that literal" to "flag
 /// error" would be a behavior change on a published CLI surface, so this reports
 /// rather than decides.
-fn grep_flaglike_pattern_hint(pattern: &str, stderr: &str) -> Option<String> {
+fn grep_flaglike_pattern_hint(
+    pattern: &str,
+    stderr: &str,
+    had_literal_separator: bool,
+) -> Option<String> {
+    // Someone who wrote `--` has already told us they meant the literal. Their
+    // missing path is their own typo'd path argument, not a displaced pattern,
+    // and the hint would advise adding the separator they just used.
+    if had_literal_separator {
+        return None;
+    }
     let looks_like_long_flag = pattern.starts_with("--")
         && pattern.len() > 2
         && pattern[2..]
@@ -2698,6 +2716,7 @@ fn grep_flaglike_pattern_hint(pattern: &str, stderr: &str) -> Option<String> {
 /// they fail with a clear message instead of being swallowed as the pattern.
 pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
     let raw: Vec<String> = argv.iter().skip(1).cloned().collect();
+    let had_literal_separator = raw.iter().any(|a| a == "--");
     if let Some(bad) = first_unsupported_grep_flag(&raw) {
         // --json early-bail must still emit an empty array (CLI JSON contract).
         let json = raw
@@ -2714,7 +2733,9 @@ pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
         );
         grep_exit(2);
     }
-    GrepArgs::parse_from(normalize_grep_argv(raw))
+    let mut parsed = GrepArgs::parse_from(normalize_grep_argv(raw));
+    parsed.had_literal_separator = had_literal_separator;
+    parsed
 }
 
 /// AST-context grep: ripgrep + AST context from index.
@@ -2832,6 +2853,7 @@ fn tracked_files_missed_by_walk(project_root: &Path, scope_rels: &[String]) -> V
 pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     let GrepArgs {
         pattern,
+        had_literal_separator,
         paths,
         json: json_mode,
         ignore_case,
@@ -3164,7 +3186,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         // catches this for short clusters but deliberately leaves `--long` tokens
         // alone, because treating them as flags would break the documented
         // literal search. So: keep the behavior, explain it.
-        if let Some(hint) = grep_flaglike_pattern_hint(&pattern, stderr) {
+        if let Some(hint) = grep_flaglike_pattern_hint(&pattern, stderr, had_literal_separator) {
             eprintln!("{hint}");
             // Short, distinct text for the log — matching the freshness-partial
             // site below. Repeating the full hint verbatim printed it twice on
@@ -10177,7 +10199,7 @@ mod tests {
 
         // The confusing case: flag-shaped pattern AND a missing-path complaint.
         for flag in ["--quiet", "--json", "--check-only", "--no_color", "--x1"] {
-            let hint = grep_flaglike_pattern_hint(flag, MISSING)
+            let hint = grep_flaglike_pattern_hint(flag, MISSING, false)
                 .unwrap_or_else(|| panic!("{flag} + missing-path must be explained"));
             assert!(hint.contains(flag), "hint must name the token: {hint}");
             assert!(
@@ -10188,15 +10210,25 @@ mod tests {
 
         // Same pattern, a DIFFERENT rg failure: not this diagnosis, stay quiet.
         assert_eq!(
-            grep_flaglike_pattern_hint("--quiet", "rg: regex parse error"),
+            grep_flaglike_pattern_hint("--quiet", "rg: regex parse error", false),
             None
+        );
+
+        // An explicit `--` means the caller already said they meant the literal.
+        // Their missing path is their own typo (`grep -- --no-default-features
+        // src/nope`), and the hint would tell them to add the separator they
+        // just typed.
+        assert_eq!(
+            grep_flaglike_pattern_hint("--no-default-features", MISSING, true),
+            None,
+            "an explicit `--` must silence the hint entirely"
         );
 
         // A genuine literal search that happens to fail on a missing path must not
         // be told it typed a flag — these are ordinary patterns, not `--word`.
         for pat in ["alpha", "-v", "->", "-1", "-.*", "--", "--=x", "--a b"] {
             assert_eq!(
-                grep_flaglike_pattern_hint(pat, MISSING),
+                grep_flaglike_pattern_hint(pat, MISSING, false),
                 None,
                 "{pat} is not a long-flag spelling and must not be explained as one"
             );

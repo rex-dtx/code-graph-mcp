@@ -325,7 +325,11 @@ for (const entry of ENTRY_POINTS) {
     const home = freshHome(t);
     const r = runDoctorCli(home, ['--help'], entry);
     assert.equal(r.code, 0);
-    assert.match(r.stdout, /Usage: doctor/);
+    // Matches src/main.rs's help too — the two texts are kept in sync, and the
+    // e2e test test_cli_js_subcommands_help_is_side_effect_free asserts the same
+    // USAGE marker on the binary side.
+    assert.match(r.stdout, /USAGE:\n\s+code-graph-mcp doctor/);
+    assert.match(r.stdout, /--check-only/);
     assert.equal(fs.existsSync(path.join(home, '.claude', 'settings.json')), false,
       '--help must not run the repair pass — a help flag that acts is its own bug class');
   });

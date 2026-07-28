@@ -15,11 +15,18 @@ next `code-graph-mcp incremental-index`.
   they had asked for the read-only one. The read-only contract this release
   otherwise hardens was one keystroke from being inverted. Unknown arguments now
   exit 2 before any diagnosis runs, and `--help` prints usage without acting.
-  Both entry points: `node lifecycle.js doctor …` carried its own copy of the
-  same `includes('--check-only')` line, so the first version of this fix left the
-  sibling running the repair pass on a typo. They now share one `runDoctorCli`,
-  which also keeps them from drifting on the exit-code rule (issues *unresolved
-  after repair*, not issues found), and every regression test runs against both.
+  All **three** entry points, found one at a time and each by a different means:
+  `doctor.js` (the original), `node lifecycle.js doctor …` (its own copy of the
+  same `includes('--check-only')` line, found by checking which callers the new
+  allowlist could reject), and `code-graph-mcp doctor …` — the surface users
+  actually install — whose Rust dispatch filtered argv down to the single literal
+  `--check-only` and dropped everything else, so the typo never reached the
+  validation at all. The two JS entry points now share one `runDoctorCli`, which
+  also keeps them from drifting on the exit-code rule (issues *unresolved after
+  repair*, not issues found); the binary passes its argv tail through verbatim
+  and propagates the exit code. Regression tests run against all three, and the
+  `doctor --help` text is now byte-identical between `src/main.rs` (which
+  intercepts `--help` so it stays side-effect-free) and `doctor.js`.
 - **`grep` explains a flag-shaped pattern instead of just failing on it.** A long
   flag the subcommand does not implement (`grep --quiet foo`) is bound to the
   *pattern* positional — deliberately, so that a term like

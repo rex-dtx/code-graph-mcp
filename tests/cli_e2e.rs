@@ -884,6 +884,52 @@ fn test_cli_js_subcommands_help_is_side_effect_free() {
     );
 }
 
+/// The published binary must not swallow an unrecognized `doctor` flag.
+///
+/// `doctor`'s default mode REPAIRS — it rewrites `~/.claude/settings.json`. The
+/// dispatch used to filter argv down to the single literal `--check-only`, so a
+/// typo like `--check-onlyy` was dropped and doctor.js was invoked with an empty
+/// argv, which parses as "no flags" and takes the repair path. The user asked for
+/// the read-only mode and got the writing one.
+///
+/// This is the THIRD entry point onto the same parsing: `doctor.js` and
+/// `lifecycle.js doctor` were fixed first, and this one — the surface installed
+/// via npx / `cargo install` / the plugin — kept the old behavior, invisible to
+/// the JS tests because they only drive the two JS entry points.
+#[test]
+fn test_cli_doctor_rejects_an_unknown_flag_instead_of_repairing() {
+    let project = TempDir::new().unwrap();
+    for typo in ["--check-onlyy", "--checkonly", "--check_only", "--dry-run"] {
+        let (stdout, stderr, code) = run_cli(&project, &["doctor", typo]);
+        assert_ne!(
+            code, 0,
+            "`doctor {typo}` must not exit 0 — it was silently dropped and the              repair pass ran.
+stdout: {stdout}
+stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("unknown argument"),
+            "`doctor {typo}` must name the offending token.
+stdout: {stdout}
+stderr: {stderr}"
+        );
+        // The diagnostic run prints a magnifying-glass header; a rejected flag
+        // must not have reached it.
+        assert!(
+            !stdout.contains('\u{1f50d}'),
+            "`doctor {typo}` ran the diagnostic (and therefore the repairs) \
+             instead of refusing.\nstdout: {stdout}"
+        );
+    }
+
+    // Negative control: the real flag still works and is still read-only.
+    let (stdout, _, _) = run_cli(&project, &["doctor", "--check-only"]);
+    assert!(
+        stdout.contains('\u{1f50d}') || stdout.contains("issue"),
+        "`doctor --check-only` must still run the diagnostic; got:\n{stdout}"
+    );
+}
+
 // ============================================================
 // health-check
 // ============================================================
