@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — audit 2026-07-27 remediation
+## v0.108.0 — audit 2026-07-27 remediation (12 P1s, eight review rounds)
 
 Upgrade notes: **index rebuild required** — `INDEX_VERSION` 52 → 53. The server
 wipes and rebuilds automatically on first start; a CLI-only setup rebuilds on the
