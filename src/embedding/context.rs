@@ -18,6 +18,37 @@ pub struct NodeContext {
     pub doc_comment: Option<String>,
 }
 
+/// Per-list cap on the graph-relation lines. Applies to EVERY relation list:
+/// `inherits`/`imports`/`implements`/`exports` used to join all of them while
+/// `routes`/`callees`/`callers` capped, and those four are emitted BEFORE the
+/// doc comment and the code body — so one wide list (a barrel file importing 200
+/// names is ordinary) evicted the symbol's own doc and body from the 512-token
+/// window, inverting the priority order this function exists to enforce.
+const MAX_RELATIONS: usize = 10;
+
+/// `label: a, b, c (+N)` — first [`MAX_RELATIONS`] entries plus the dropped
+/// count. The `(+N)` suffix is not decoration: a silently truncated list reads as
+/// a complete one, both to a model consuming the embedding text and to anyone
+/// debugging recall.
+fn relation_line(label: &str, items: &[String]) -> String {
+    let suffix = if items.len() > MAX_RELATIONS {
+        format!(" (+{})", items.len() - MAX_RELATIONS)
+    } else {
+        String::new()
+    };
+    format!(
+        "{}: {}{}",
+        label,
+        items
+            .iter()
+            .take(MAX_RELATIONS)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "),
+        suffix
+    )
+}
+
 pub fn build_context_string(info: &NodeContext) -> String {
     let mut parts = Vec::new();
 
@@ -51,63 +82,18 @@ pub fn build_context_string(info: &NodeContext) -> String {
     }
 
     // 4. Graph relations (structural signals that survive truncation)
-    const MAX_RELATIONS: usize = 10;
-    if !info.routes.is_empty() {
-        parts.push(format!(
-            "routes: {}",
-            info.routes
-                .iter()
-                .take(MAX_RELATIONS)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if !info.callees.is_empty() {
-        let suffix = if info.callees.len() > MAX_RELATIONS {
-            format!(" (+{})", info.callees.len() - MAX_RELATIONS)
-        } else {
-            String::new()
-        };
-        parts.push(format!(
-            "calls: {}{}",
-            info.callees
-                .iter()
-                .take(MAX_RELATIONS)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-            suffix
-        ));
-    }
-    if !info.callers.is_empty() {
-        let suffix = if info.callers.len() > MAX_RELATIONS {
-            format!(" (+{})", info.callers.len() - MAX_RELATIONS)
-        } else {
-            String::new()
-        };
-        parts.push(format!(
-            "called_by: {}{}",
-            info.callers
-                .iter()
-                .take(MAX_RELATIONS)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-            suffix
-        ));
-    }
-    if !info.inherits.is_empty() {
-        parts.push(format!("inherits: {}", info.inherits.join(", ")));
-    }
-    if !info.imports.is_empty() {
-        parts.push(format!("imports: {}", info.imports.join(", ")));
-    }
-    if !info.implements.is_empty() {
-        parts.push(format!("implements: {}", info.implements.join(", ")));
-    }
-    if !info.exports.is_empty() {
-        parts.push(format!("exports: {}", info.exports.join(", ")));
+    for (label, items) in [
+        ("routes", &info.routes),
+        ("calls", &info.callees),
+        ("called_by", &info.callers),
+        ("inherits", &info.inherits),
+        ("imports", &info.imports),
+        ("implements", &info.implements),
+        ("exports", &info.exports),
+    ] {
+        if !items.is_empty() {
+            parts.push(relation_line(label, items));
+        }
     }
 
     // 5. Doc comment (medium priority — often short enough to survive)
@@ -225,5 +211,67 @@ mod tests {
         assert!(ctx.contains("in utils.ts"));
         assert!(!ctx.contains("calls:"));
         assert!(!ctx.contains("routes:"));
+    }
+
+    #[test]
+    fn test_relation_lists_are_capped_symmetrically() {
+        // callees/callers/routes capped at MAX_RELATIONS; inherits/imports/
+        // implements/exports joined ALL of them. Those four are emitted BEFORE
+        // doc and code in the priority order, so an unbounded list (a barrel
+        // file importing 200 names is ordinary) pushes the symbol's own doc and
+        // body out of the 512-token embedding window entirely — the very
+        // truncation the ordering exists to control.
+        let many = |prefix: &str| (0..25).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>();
+        let info = NodeContext {
+            node_type: "class".into(),
+            name: "Wide".into(),
+            qualified_name: None,
+            file_path: "src/wide.ts".into(),
+            language: Some("typescript".into()),
+            signature: None,
+            return_type: None,
+            param_types: None,
+            code_content: Some("class Wide {}".into()),
+            routes: many("route"),
+            callees: many("callee"),
+            callers: many("caller"),
+            inherits: many("base"),
+            imports: many("imp"),
+            implements: many("iface"),
+            exports: many("exp"),
+            doc_comment: Some("Wide type.".into()),
+        };
+        let ctx = build_context_string(&info);
+        for (label, prefix) in [
+            ("routes", "route"),
+            ("calls", "callee"),
+            ("called_by", "caller"),
+            ("inherits", "base"),
+            ("imports", "imp"),
+            ("implements", "iface"),
+            ("exports", "exp"),
+        ] {
+            assert!(
+                ctx.contains(&format!("{label}: ")),
+                "{label} line missing from: {ctx}"
+            );
+            assert!(
+                !ctx.contains(&format!("{prefix}10")),
+                "{label} must stop at 10 entries, but {prefix}10 is present: {ctx}"
+            );
+            assert!(
+                ctx.contains(&format!("{prefix}9")),
+                "{label} must keep the first 10 entries, {prefix}9 missing: {ctx}"
+            );
+        }
+        // No silent caps: every truncated list discloses how many it dropped.
+        assert_eq!(
+            ctx.matches("(+15)").count(),
+            7,
+            "each of the 7 relation lists must disclose its dropped count: {ctx}"
+        );
+        // The whole point — doc and code still make it into the string.
+        assert!(ctx.contains("doc: Wide type."), "doc dropped: {ctx}");
+        assert!(ctx.contains("code: class Wide {}"), "code dropped: {ctx}");
     }
 }

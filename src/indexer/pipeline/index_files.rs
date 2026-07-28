@@ -1720,7 +1720,19 @@ pub(super) fn index_files(
     // ambiguity of cross-file edges in OTHER, unchanged files. (Phase 2c above stays
     // unconditional: it early-returns on an empty pending table, so it is already
     // cheap on a no-op pass.)
-    if !all_indexed.is_empty() || !delete_paths.is_empty() {
+    //
+    // `pending_resolved > 0` is part of the condition because Phase 2c INSERTS
+    // edges, and every edge it inserts is a cross-file by-name bind — precisely
+    // the shape Phase 2e downgrades off the `extracted` column default. Today the
+    // term is unreachable: a pending row only becomes resolvable once its target
+    // node exists, which takes a non-empty batch, which already satisfies the
+    // first term. That reachability is an accident of `resolve_pending_calls`
+    // sweeping the WHOLE table in one pass — give it a per-tick cap (the natural
+    // fix for a large backlog, and adjacent to the attempts-counter work) and a
+    // spilled remainder drains on a later no-diff tick, where the first two terms
+    // are false and the edges would keep a confidence they never earned. Gating on
+    // the observable instead of on that argument keeps the invariant local.
+    if !all_indexed.is_empty() || !delete_paths.is_empty() || pending_resolved > 0 {
         finalize_tick();
         // Phase 2d-bind: positively resolve bare-name calls to the node an explicit
         // import in the caller's file binds them to. `refine_ambiguous_targets`

@@ -226,6 +226,156 @@ fn compact_allowlist_guard_detects_missing_key() {
 }
 
 // ---------------------------------------------------------------------------
+// Task 2b drift-guard: the SAME rule for `tool_project_map`.
+//
+// The guard above covered only `tool_module_overview`, and the compact
+// silent-drop bug class has now recurred three times (v0.90, v0.97.1, and the
+// deps triple). `tool_project_map` is the other whitelist-rebuild surface and
+// had no guard at all. Its shape differs — producer and compact form live in ONE
+// function, and both are `json!({...})` literals rather than a `for key in [...]`
+// allowlist — so it needs its own extractors, not a parameterization of the
+// overview ones.
+// ---------------------------------------------------------------------------
+
+const PROJECT_MAP_SRC: &str = "src/mcp/server/tools/project_map.rs";
+
+/// Producer keys `tool_project_map` sets that compact deliberately does NOT
+/// carry. Empty today; add with a comment if a key is ever intentionally
+/// dropped, and never to silence the guard.
+const PROJECT_MAP_DELIBERATELY_DROPPED: &[&str] = &[];
+
+/// Top-level keys of the FIRST `json!({ ... })` literal following `anchor`.
+/// Brace-matches from the macro's `{` and takes `"key":` pairs at depth 1, so
+/// nested object keys (`"name"`, `"file"` inside a hot-function entry) are not
+/// mistaken for envelope keys.
+fn json_literal_keys(region: &str, anchor: &str) -> Vec<String> {
+    let start = region
+        .find(anchor)
+        .unwrap_or_else(|| panic!("anchor `{anchor}` not found — did the envelope shape change?"));
+    let bytes = region.as_bytes();
+    let mut i = start + anchor.len() - 1; // anchor ends with the opening `{`
+    while i < bytes.len() && bytes[i] != b'{' {
+        i += 1;
+    }
+    let mut depth = 0i32;
+    let mut keys = Vec::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            b'"' if depth == 1 => {
+                let after = &region[i + 1..];
+                if let Some(j) = after.find('"') {
+                    let key = &after[..j];
+                    if after[j + 1..].trim_start().starts_with(':') {
+                        keys.push(key.to_string());
+                    }
+                    i += 1 + j;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    keys
+}
+
+/// Every `<var>["<key>"] =` assignment key in `region`, for exactly `var`.
+/// The preceding-char check is what keeps `result[` from also matching
+/// `compact_result[` — in this file BOTH live inside the same function, unlike
+/// overview.rs where producer and forwarder are separate fns.
+fn assigned_keys_for(region: &str, var: &str) -> Vec<String> {
+    let marker = format!("{var}[\"");
+    let mut keys = Vec::new();
+    let mut offset = 0usize;
+    while let Some(i) = region[offset..].find(&marker) {
+        let abs = offset + i;
+        let preceded_by_ident = abs > 0 && {
+            let prev = region.as_bytes()[abs - 1];
+            prev.is_ascii_alphanumeric() || prev == b'_'
+        };
+        let after = &region[abs + marker.len()..];
+        if let Some(j) = after.find("\"]") {
+            if !preceded_by_ident {
+                let tail = after[j + 2..].trim_start();
+                if tail.starts_with('=') && !tail.starts_with("==") {
+                    keys.push(after[..j].to_string());
+                }
+            }
+            offset = abs + marker.len() + j + 2;
+        } else {
+            break;
+        }
+    }
+    keys
+}
+
+/// Producer keys that the compact rebuild neither includes nor deliberately drops.
+fn project_map_uncovered_keys(src: &str) -> Vec<String> {
+    let region = fn_region(src, "tool_project_map");
+    let mut produced = json_literal_keys(region, "let r = json!({");
+    produced.extend(assigned_keys_for(region, "result"));
+
+    let mut compacted = json_literal_keys(region, "let mut compact_result = json!({");
+    compacted.extend(assigned_keys_for(region, "compact_result"));
+
+    let mut uncovered: Vec<String> = produced
+        .into_iter()
+        .filter(|k| {
+            !compacted.contains(k) && !PROJECT_MAP_DELIBERATELY_DROPPED.contains(&k.as_str())
+        })
+        .collect();
+    uncovered.sort();
+    uncovered.dedup();
+    uncovered
+}
+
+#[test]
+fn project_map_compact_covers_all_result_keys() {
+    let src = fs::read_to_string(PROJECT_MAP_SRC).expect("read project_map.rs");
+    let uncovered = project_map_uncovered_keys(&src);
+    assert!(
+        uncovered.is_empty(),
+        "tool_project_map produces top-level key(s) {uncovered:?} that its compact rebuild \
+         drops. Add each to the `compact_result` literal (trimmed as appropriate) in \
+         {PROJECT_MAP_SRC}, or document it in PROJECT_MAP_DELIBERATELY_DROPPED \
+         (tests/freshness_parity.rs)."
+    );
+}
+
+/// Permanent negative control: the guard must actually fire. Both halves are
+/// mutated because the producer has two key SOURCES (the cached envelope literal
+/// and the later `result["centrality"] =` assignment) and a guard that read only
+/// one of them would still pass the positive test above.
+#[test]
+fn project_map_compact_guard_detects_missing_key() {
+    let src = fs::read_to_string(PROJECT_MAP_SRC).expect("read project_map.rs");
+
+    // (a) A key from the producer's envelope literal, dropped from compact.
+    let broken = src.replace("\"hot_functions\": compact_hot,", "");
+    let uncovered = project_map_uncovered_keys(&broken);
+    assert!(
+        uncovered.iter().any(|k| k == "hot_functions"),
+        "negative control (a) failed: dropping `hot_functions` from the compact literal must \
+         surface it as uncovered, got {uncovered:?}"
+    );
+
+    // (b) The key that arrives via a post-literal assignment instead.
+    let broken = src.replace("compact_result[\"centrality\"] = json!(compact_cent);", "");
+    let uncovered = project_map_uncovered_keys(&broken);
+    assert!(
+        uncovered.iter().any(|k| k == "centrality"),
+        "negative control (b) failed: dropping the compact `centrality` assignment must \
+         surface it as uncovered, got {uncovered:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Task 3 drift-guard: CLI + MCP query-time freshness resync coverage.
 // ---------------------------------------------------------------------------
 

@@ -124,6 +124,13 @@ pub fn extract_relations_from_tree(
 ) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
     let config = LanguageConfig::for_language(language);
+    // The Rust local-binding memo is keyed by tree-sitter node id, and ids are
+    // unique only WITHIN a tree. Clearing here — the one entry point every file's
+    // walk goes through — is what makes a cross-file hit impossible; a leaked
+    // entry would silently suppress real call edges in an unrelated file.
+    // Unconditional (not gated on `language == "rust"`) so a non-Rust file can
+    // never carry a previous Rust file's entries into the next Rust one.
+    rust::reset_fn_local_names_cache();
     walk_for_relations(
         tree.root_node(),
         source,
@@ -710,34 +717,56 @@ fn walk_for_relations(
                 if let Some((callee, mut qualifier)) =
                     extract_callee(&node, source, language, current_rust_impl)
                 {
-                    // Fill SelfRecv/SelfType payload from current impl context.
-                    // The helper emits these with empty payload because it
-                    // doesn't know the enclosing impl's type; we know it here.
-                    let needs_payload = matches!(&qualifier,
-                        helpers::CalleeQualifier::SelfRecv(t) | helpers::CalleeQualifier::SelfType(t) if t.is_empty()
-                    );
-                    if needs_payload {
-                        match &mut qualifier {
-                            helpers::CalleeQualifier::SelfRecv(t)
-                            | helpers::CalleeQualifier::SelfType(t) => {
-                                if let Some(impl_type) = current_rust_impl {
-                                    *t = impl_type.to_string();
-                                } else {
-                                    // self/Self called outside an impl block — drop qualifier (Bare).
-                                    qualifier = helpers::CalleeQualifier::Bare;
+                    // A BARE Rust callee whose name is a local binding of the
+                    // enclosing fn is a closure/fn-pointer call, not a call of the
+                    // same-named global fn — Rust's value namespace makes the
+                    // local win.
+                    //
+                    // "Bare" must be decided STRUCTURALLY (the `function` field is
+                    // an `identifier`), NOT from `CalleeQualifier::Bare`: that
+                    // variant is also `extract_rust_field`'s fallback arm for a
+                    // method call whose receiver is not self / a plain identifier /
+                    // a call. `ctx.db.conn()` has a `field_expression` receiver and
+                    // so reports Bare — gating on the enum dropped 14 real
+                    // `Database::conn` edges in this repo alone, every `cmd_*` that
+                    // writes `let conn = ctx.db.conn();`, because the method name
+                    // matched the local it is assigned to.
+                    let bare_call = node
+                        .child_by_field_name("function")
+                        .is_some_and(|f| f.kind() == "identifier");
+                    let shadowed = language == "rust"
+                        && bare_call
+                        && rust::shadowed_by_enclosing_local(&node, source, &callee);
+                    if !shadowed {
+                        // Fill SelfRecv/SelfType payload from current impl context.
+                        // The helper emits these with empty payload because it
+                        // doesn't know the enclosing impl's type; we know it here.
+                        let needs_payload = matches!(&qualifier,
+                            helpers::CalleeQualifier::SelfRecv(t) | helpers::CalleeQualifier::SelfType(t) if t.is_empty()
+                        );
+                        if needs_payload {
+                            match &mut qualifier {
+                                helpers::CalleeQualifier::SelfRecv(t)
+                                | helpers::CalleeQualifier::SelfType(t) => {
+                                    if let Some(impl_type) = current_rust_impl {
+                                        *t = impl_type.to_string();
+                                    } else {
+                                        // self/Self called outside an impl block — drop qualifier (Bare).
+                                        qualifier = helpers::CalleeQualifier::Bare;
+                                    }
                                 }
+                                _ => unreachable!(),
                             }
-                            _ => unreachable!(),
                         }
+                        let metadata = serialize_callee_qualifier(&qualifier);
+                        results.push(ParsedRelation {
+                            source_name: scope,
+                            target_name: callee,
+                            relation: REL_CALLS.into(),
+                            metadata,
+                            source_language: String::new(),
+                        });
                     }
-                    let metadata = serialize_callee_qualifier(&qualifier);
-                    results.push(ParsedRelation {
-                        source_name: scope,
-                        target_name: callee,
-                        relation: REL_CALLS.into(),
-                        metadata,
-                        source_language: String::new(),
-                    });
                 }
             }
         }

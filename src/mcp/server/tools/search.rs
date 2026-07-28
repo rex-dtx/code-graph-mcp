@@ -454,6 +454,10 @@ impl McpServer {
         // the output. Estimating from raw context_string massively overestimates and
         // fires compression even for small top_k (e.g. 3) responses that would fit
         // comfortably under the token budget.
+        //
+        // The formula lives in `compressor::estimate_result_tokens` so this gate
+        // and the compression LEVEL selector cannot drift apart — they did, and
+        // the selector was reading context_string until the 2026-07-27 audit.
         use crate::sandbox::compressor::CompressedOutput;
         let estimated_tokens: usize = if compact {
             0
@@ -461,12 +465,13 @@ impl McpServer {
             candidates
                 .iter()
                 .map(|c| {
-                    let node = c.node;
-                    let code_chars = node.code_content.len().min(MAX_SEARCH_CODE_LEN);
-                    let sig_chars = node.signature.as_ref().map_or(0, |s| s.len());
-                    let name_chars = node.name.len() + c.file_path.len();
-                    // ~80 chars of JSON framing per result (keys, braces, quotes, node_id/line)
-                    (code_chars + sig_chars + name_chars + 80) / crate::domain::CHARS_PER_TOKEN
+                    crate::sandbox::compressor::estimate_result_tokens(
+                        &c.node.code_content,
+                        MAX_SEARCH_CODE_LEN,
+                        c.node.signature.as_deref(),
+                        &c.node.name,
+                        c.file_path,
+                    )
                 })
                 .sum()
         };
@@ -501,6 +506,10 @@ impl McpServer {
                 &node_results,
                 &file_paths,
                 COMPRESSION_TOKEN_THRESHOLD,
+                // Same number that opened this branch: the level selector used
+                // to re-derive its own from context_string, which is not part of
+                // the payload (audit 2026-07-27).
+                estimated_tokens,
             )? {
                 let (mode, compact) = match compressed {
                     CompressedOutput::Nodes(nodes) => {
