@@ -290,6 +290,17 @@ next `code-graph-mcp incremental-index`.
   gate active" was false. Both are now `100755`, and the `fmt` job asserts the
   index mode so it cannot silently revert.
 
+  That assertion earned itself before this release shipped. The repo sets
+  `core.fileMode = false`, so git ignores the working tree's exec bit entirely:
+  `git add -A` can never stage a mode change, and only an explicit
+  `git update-index --chmod=+x` sets it. A `git stash push -- scripts/` +
+  `git stash pop` round-trip during this batch silently reverted both files to
+  `100644` while the working tree kept showing `rwx` — the same invisible state
+  the original defect lived in, restored by an operation that looks unrelated.
+  Nothing but the index check found it. Generalise: under `core.fileMode=false`,
+  an explicitly-set mode is not durable across stash/checkout, so assert it in CI
+  rather than assuming a one-time `--chmod=+x` holds.
+
 ### Internal
 - **A new e2e test wrote to the real `~/.claude`.** The doctor flag guard's
   regression test inherited the ambient `HOME`, and its RED state — "doctor
