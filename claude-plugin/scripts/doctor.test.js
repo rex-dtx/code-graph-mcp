@@ -387,9 +387,14 @@ test('a read-only ~/.claude is reported as a permissions problem, not a missing 
 
   assert.match(all, /not writable/,
     'the real cause must appear in the report');
-  assert.doesNotMatch(all, /npm install -g/,
-    'must NOT tell the user to reinstall a package over a chmod — that is the ' +
-    'misdiagnosis this arm exists to prevent');
+  // Scope the negative to THIS arm's own sentence. A bare /npm install -g/ scan
+  // also matches the binary-not-found row, which is legitimate advice on a
+  // machine without the binary — true on CI's plugin-tests job, which builds no
+  // Rust, and never true locally. That made this assertion pass everywhere I ran
+  // it and fail on the first CI run.
+  assert.doesNotMatch(all, /hook path\(s\) still invalid/,
+    'must NOT tell the user their plugin scripts are missing over a chmod — that ' +
+    'is the misdiagnosis this arm exists to prevent');
   // The file really was left alone.
   const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
   assert.ok(settings.hooks.PreToolUse, 'settings untouched');

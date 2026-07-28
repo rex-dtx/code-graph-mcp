@@ -436,10 +436,22 @@ fn normalize_user_path_from_on(
     // right there. (Drive-RELATIVE `C:foo` is deliberately not matched: it is
     // vanishingly rare next to ordinary colon-bearing filenames, and the cost of
     // guessing wrong is refusing a file that exists.)
+    //
+    // ONLY on a non-Windows host. This guard exists to substitute for
+    // `Path::is_absolute`, which does not recognise the drive form off-Windows;
+    // ON Windows it recognises it natively, and the under-root check below is
+    // the correct answer. Applying the lexical rejection there too refuses
+    // `C:\repo\src\mod.rs` for a project root that literally contains it —
+    // which is what it did: four `normalize_user_path` tests failed on the
+    // windows-latest CI leg with "is outside the project root <that very root>"
+    // while passing on Linux, because the platform-parameterised test seam moves
+    // the SEPARATOR, not `is_absolute`. A fix for one platform, breaking the
+    // other.
     let b = raw.as_bytes();
     let drive_root = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
-    let windows_absolute =
-        (drive_root && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\')) || raw.starts_with(r"\\");
+    let windows_absolute = !cfg!(windows)
+        && ((drive_root && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\'))
+            || raw.starts_with(r"\\"));
     if windows_absolute {
         anyhow::bail!(
             "path '{}' is outside the project root '{}' \u{2014} use a relative path or one under the project root",
@@ -9368,9 +9380,17 @@ mod tests {
     /// which is irreducibly platform-native. On a Unix host `D:\repo\src\Foo.cs`
     /// and `C:/repo/src` are not absolute, so without a lexical guard they fall
     /// into the relative branch and come back out as `D:/repo/src/Foo.cs` — a
-    /// key no index holds, answered as an ordinary empty result. Rejecting them
-    /// by spelling makes the verdict identical on every platform, and matches
-    /// what the MCP entry already did.
+    /// key no index holds, answered as an ordinary empty result.
+    ///
+    /// The VERDICT is identical on every platform; the MECHANISM is not, and the
+    /// first version of this guard got that wrong. Off-Windows the lexical
+    /// spelling check rejects them. ON Windows `is_absolute` recognises the drive
+    /// form natively, `strip_prefix(root)` fails for a foreign drive, and the
+    /// same error is raised — so the lexical check is not merely redundant there,
+    /// it is harmful: applied unconditionally it also rejected
+    /// `C:\<temp>\src\parser\mod.rs` for a project root that literally
+    /// contains it, reddening four tests on the windows-latest CI leg while every
+    /// Linux run stayed green.
     #[test]
     fn windows_absolute_spellings_are_rejected_on_every_platform() {
         let tmp = tempfile::tempdir().unwrap();
