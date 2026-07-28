@@ -704,8 +704,18 @@ fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
 #[test]
 fn release_and_cache_warm_workflows_do_not_drift() {
     let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
-    let release = fs::read_to_string(wf.join("release.yml")).expect("read release.yml");
-    let warm = fs::read_to_string(wf.join("cache-warm.yml")).expect("read cache-warm.yml");
+    // Normalise CRLF. Without `.gitattributes` forcing LF, git checks these YAML
+    // files out with CRLF on Windows, and `workflow_job`'s exact `"\n  job:\n"`
+    // match then finds nothing — the guard failed on the windows-latest CI leg
+    // with "job `gate` not found", which reads as a rename rather than a line
+    // ending. Everything else here goes through `.lines()`, which strips `\r`.
+    let read_lf = |p: std::path::PathBuf| -> String {
+        fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+            .replace("\r\n", "\n")
+    };
+    let release = read_lf(wf.join("release.yml"));
+    let warm = read_lf(wf.join("cache-warm.yml"));
 
     // 1. One toolchain pin and one rust-cache pin across both files. A different
     //    rustc hashes to a different cache namespace, so a drifted pin produces a
