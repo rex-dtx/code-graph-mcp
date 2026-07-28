@@ -1285,12 +1285,28 @@ fn mcp_find_references_answers_for_an_import_only_name() {
     )
     .unwrap();
     // A project symbol whose name is ALSO imported from std in the same file.
-    // This is the negative control for the split below, and it has to define a
-    // symbol literally named `take` — an earlier version defined `take_local`,
-    // so there was no project symbol to prefer and the control asserted nothing.
+    // This is the negative control for the split below.
+    //
+    // Two earlier versions of it were INERT, for two different reasons, and the
+    // second is the subtle one:
+    //   1. the fixture defined `take_local`, so there was no project `take` to
+    //      prefer and the assertion could not fail;
+    //   2. `use`-import sentinels are stored with node type `module`, and the
+    //      by-name queries already carry `AND n.type != 'module'` — so the
+    //      `<external>` predicate the control is supposed to exercise was a
+    //      no-op for them. Deleting it changed nothing and the test still passed.
+    //
+    // `impl Debug for S` is what makes it live: an IMPLEMENTS sentinel is typed
+    // `trait`, which the type filter does not catch, so `<external>` exclusion is
+    // the only thing keeping `Debug` from resolving to a phantom definition.
     std::fs::write(
         src.join("b.rs"),
         "use std::mem::take;\npub fn take() -> u8 { 7 }\npub fn helper() -> u8 { take() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("c.rs"),
+        "use std::fmt::Debug;\npub struct S;\nimpl Debug for S {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, \"S\") }\n}\npub fn use_s() -> S { S }\n",
     )
     .unwrap();
     std::fs::write(
@@ -1339,11 +1355,23 @@ fn mcp_find_references_answers_for_an_import_only_name() {
          (the CLI `refs` surface already does): {body}"
     );
 
-    // Negative control, actually executed: a name that exists BOTH as a project
-    // symbol and as a std import must still resolve to the project symbol. The
-    // `<external>` exclusion in resolve_fuzzy is what makes that true, so a fix
-    // that "answered for external names" by dropping the exclusion would pass
-    // the assertion above and fail here.
+    // A name that exists BOTH as a project symbol and as a std import must still
+    // resolve to the project symbol.
+    //
+    // Honest scope, after three attempts to make this a negative control for the
+    // `<external>` exclusion and three mutation runs proving it was not one: it
+    // is NOT that control and cannot be. The by-name fuzzy path already carries
+    // `AND n.type != 'module'`, and a sentinel is typed non-`module` only when no
+    // project symbol shares its name — precisely the case with nothing to
+    // discriminate. Deleting `EXCLUDE_EXTERNAL_BY_NAME` or neutering
+    // `is_selectable_definition` leaves this test green.
+    //
+    // The live guard for that exclusion is
+    // `show_does_not_resolve_a_name_that_exists_only_as_an_import` in
+    // tests/reader_nondestructive.rs, which drives the binary at the surface
+    // where the defect was observed and does go red under both mutations. What
+    // the assertions below DO cover is project-symbol preference, which is worth
+    // pinning on its own.
     let resp = client.call_tool("find_references", json!({ "symbol_name": "take" }));
     let body = extract_tool_payload(&resp);
     let refs = body["references"]
@@ -1361,4 +1389,38 @@ fn mcp_find_references_answers_for_an_import_only_name() {
             .any(|r| r["file_path"].as_str() == Some("<external>")),
         "a name with a real project definition must not resolve to `<external>`: {body}"
     );
+
+    // The live half of the control: `Debug` exists only as an IMPLEMENTS
+    // sentinel, which is typed `trait` and therefore sails past the
+    // `n.type != 'module'` filter that made the `take` case unable to fail.
+    // Whatever find_references answers for it, it must not be a phantom
+    // definition — and it must not be described as a test/bench path.
+    let resp = client.call_tool("find_references", json!({ "symbol_name": "Debug" }));
+    if let Some(text) = resp
+        .get("error")
+        .and_then(|e| e["message"].as_str())
+        .or_else(|| {
+            if resp["result"]["isError"].as_bool() == Some(true) {
+                resp["result"]["content"][0]["text"].as_str()
+            } else {
+                None
+            }
+        })
+    {
+        assert!(
+            !text.contains("test/bench paths"),
+            "`<external>` is not a test/bench path: {text}"
+        );
+    } else {
+        let body = extract_tool_payload(&resp);
+        let refs = body["references"].as_array().cloned().unwrap_or_default();
+        assert!(
+            refs.iter().all(|r| {
+                r["relation"].as_str() == Some("imports")
+                    || r["relation"].as_str() == Some("implements")
+            }),
+            "a trait known only through `use` must surface as its import/impl \
+             edges, never as a resolved definition of its own: {body}"
+        );
+    }
 }

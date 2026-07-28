@@ -1474,12 +1474,14 @@ if (require.main === module) {
       }
     }
   } else if (cmd === 'doctor') {
-    const { runDoctor } = require('./doctor');
-    const checkOnly = process.argv.includes('--check-only');
-    // Exit on issues that remain UNRESOLVED after repair, not issues found —
-    // a run that fixes everything exits 0. See unresolvedCount in doctor.js.
-    const { unresolved } = runDoctor({ checkOnly });
-    process.exit(unresolved > 0 ? 1 : 0);
+    // Delegate to doctor.js's shared CLI so the two entry points cannot drift on
+    // flag validation or exit codes. This arm used to do its own
+    // `process.argv.includes('--check-only')`, which silently ignored every other
+    // argument — `lifecycle.js doctor --check-onlyy` ran the full repair pass.
+    // Exit code still reflects issues that remain UNRESOLVED after repair, not
+    // issues found (see unresolvedCount in doctor.js).
+    const { runDoctorCli } = require('./doctor');
+    process.exit(runDoctorCli(process.argv.slice(3)));
   } else if (cmd === 'verify-hooks-fire') {
     // v0.67.0 — Layer-A firing self-test. Spawned detached by session-init
     // (off the SessionStart budget); writes a small state file the next

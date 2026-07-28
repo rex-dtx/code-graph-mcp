@@ -537,3 +537,34 @@ test('cache teardown leaves nothing behind when the registry is already empty', 
   assert.equal(fs.existsSync(cacheDir), false,
     'an empty registry strands nothing, so re-creating the dir would just be new residue');
 });
+
+test('the .corrupt-* backup is byte-identical, including non-UTF-8 bytes', (t) => {
+  // Round-6 F4: the Buffer fix was correct but unguarded — every corrupt fixture
+  // in this file was pure ASCII, so re-introducing the lossy `readFileSync(p,
+  // 'utf8')` broke nothing. That is the same blind spot the CHANGELOG records
+  // about the test this one replaces.
+  const homeDir = mkHome(t);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  // Invalid UTF-8 (0xff, 0xfe, a bare latin-1 0xe9) inside an unparseable file.
+  const original = Buffer.concat([
+    Buffer.from('{"model":"opus","note":"'),
+    Buffer.from([0xff, 0xfe, 0x20]),
+    Buffer.from('caf'),
+    Buffer.from([0xe9]),
+    Buffer.from('","env":{"A":"b"},}'),
+  ]);
+  fs.writeFileSync(settingsPath, original);
+
+  runScript(homeDir, lifecycleCli, ['install']);
+
+  const backups = fs.readdirSync(path.dirname(settingsPath))
+    .filter((f) => f.startsWith('settings.json.corrupt-'));
+  assert.equal(backups.length, 1, 'exactly one backup was taken');
+  const backup = fs.readFileSync(path.join(path.dirname(settingsPath), backups[0]));
+  assert.deepEqual(backup, original,
+    'the backup is the user\'s ONLY copy — a UTF-8 round-trip turns every invalid ' +
+    'byte into U+FFFD and the original is then overwritten, so it must be copied ' +
+    'as bytes, never as a decoded string');
+  assert.equal(backup.length, original.length, 'no re-encoding growth');
+});

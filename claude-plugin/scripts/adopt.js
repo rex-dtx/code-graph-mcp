@@ -556,7 +556,15 @@ function migrateLegacyMemoryDir({ cwd, home } = {}) {
   if (fs.existsSync(legacyDetail)) {
     try {
       const head = fs.readFileSync(legacyDetail, 'utf8').split('\n', 1)[0];
-      if (head.startsWith(LEGACY_ADOPTED_BY)) {
+      // Same guard as unadopt's (:636), and it must be — this is the MORE
+      // frequently executed of the two: maybeAutoAdopt calls migrate on every
+      // SessionStart, while unadopt is explicit. Tightening only unadopt's copy
+      // left the hot path deleting any user file whose first line merely began
+      // with `<!-- adopted-by:` — e.g. a note from someone else's tooling.
+      // The legacy marker carries a payload after the prefix, so it is matched
+      // as a whole-line HTML comment rather than by equality.
+      const h = head.trim();
+      if (h.startsWith(LEGACY_ADOPTED_BY) && h.endsWith('-->')) {
         fs.unlinkSync(legacyDetail);
         result.legacyDetailRemoved = true;
       }

@@ -236,3 +236,77 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
          CliContext::open / open_with_vec instead. Offending sites: {offenders:?}"
     );
 }
+
+/// The `<external>` query-layer exclusion has no other live guard.
+///
+/// Round-6 finding, on my own work: `external_sentinel_tests` in src/resolve.rs
+/// and the "negative control" in the MCP integration test both survive deleting
+/// `EXCLUDE_EXTERNAL_BY_NAME` *and* neutering `is_selectable_definition` — the
+/// by-name fuzzy path already carries `AND n.type != 'module'`, and a sentinel is
+/// typed non-`module` only when NO project symbol shares the name, which is
+/// exactly when there is nothing to discriminate. So those tests cannot fail.
+///
+/// This one drives the real binary at the surface where the defect was actually
+/// observed: before the fix, `show HashMap` in a project that merely imports it
+/// printed `module <external>/HashMap` and exited 0, inventing a definition that
+/// has no file on disk.
+#[test]
+fn show_does_not_resolve_a_name_that_exists_only_as_an_import() {
+    let project = TempDir::new().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("lib.rs"), "pub mod a;\n").unwrap();
+    // HashMap exists ONLY as an import — no project symbol by that name.
+    std::fs::write(
+        src.join("a.rs"),
+        "use std::collections::HashMap;\npub fn build() -> HashMap<u8, u8> { HashMap::new() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"f\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new(cli_bin())
+            .args(["incremental-index", "--quiet", "--no-embed"])
+            .current_dir(project.path())
+            .status()
+            .unwrap()
+            .success(),
+        "fixture index build failed"
+    );
+
+    let out = Command::new(cli_bin())
+        .args(["show", "HashMap"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stdout.contains(code_graph_mcp::domain::EXTERNAL_FILE_PATH),
+        "`show` resolved an import-only name to the `<external>` pseudo-file. That \
+         is not a location the user can open, and the sentinel exists to hold \
+         import edges, not to be a definition.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Sanity: a real project symbol still resolves, so the exclusion has not
+    // simply made `show` unable to find anything.
+    let ok = Command::new(cli_bin())
+        .args(["show", "build"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let ok_stdout = String::from_utf8_lossy(&ok.stdout);
+    assert!(
+        ok_stdout.contains("src/a.rs"),
+        "a real project symbol must still resolve: {ok_stdout}"
+    );
+}

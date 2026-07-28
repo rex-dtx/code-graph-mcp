@@ -20,7 +20,22 @@
 
 const { spawnSync } = require('child_process');
 
-const DEFAULT_TIMEOUT_MS = 2000;
+// 2000 ms is a product decision, not a tuning knob: a PreToolUse hook that
+// stalls longer than this costs the user more than the answer is worth, so the
+// answer degrades instead.
+//
+// `_CG_ANSWER_TIMEOUT_MS` exists ONLY as a test seam, mirroring the
+// `_CG_ANSWER_BINARY` override already used by the same tests. Without it the
+// hint tests spawn a real `node` process under whatever load the machine
+// happens to be under — a full cargo build saturating every core pushed cold
+// node startup past 2 s and reddened `trackReadAndMaybeHint: fires on 5th read`
+// roughly one run in seven, while 12/12 isolated runs passed. An intermittently
+// red suite teaches people to re-run instead of read, which is the one habit
+// this whole audit is about.
+const DEFAULT_TIMEOUT_MS = (() => {
+  const override = Number(process.env._CG_ANSWER_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : 2000;
+})();
 // ~1000 tokens. A deny reason carrying more than this stops being an answer
 // and starts being a context tax.
 const DEFAULT_MAX_BYTES = 4000;

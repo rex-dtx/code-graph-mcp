@@ -1,4 +1,11 @@
 'use strict';
+// These tests spawn a real `node` stub through cg-answer, whose production
+// timeout is 2 s. Under a loaded machine cold node startup can exceed it,
+// which made the fanout-hint assertions fail about one run in seven while
+// passing 12/12 in isolation. The timeout is a product decision for the hook,
+// not for the test harness, so the test raises it rather than the product
+// lowering its bar.
+process.env._CG_ANSWER_TIMEOUT_MS = process.env._CG_ANSWER_TIMEOUT_MS || '30000';
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');

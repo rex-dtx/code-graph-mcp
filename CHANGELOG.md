@@ -7,6 +7,30 @@ wipes and rebuilds automatically on first start; a CLI-only setup rebuilds on th
 next `code-graph-mcp incremental-index`.
 
 ### Fixed
+- **A typo in `doctor --check-only` ran the repairs it was meant to prevent.**
+  The CLI tested `args.includes('--check-only')` and discarded every other
+  argument, so `--check-onlyy` / `--checkonly` / `--check_only` — and any other
+  unrecognized flag — fell through to the default mode and performed the full
+  repair pass, rewriting `settings.json` and `MEMORY.md`, while the user believed
+  they had asked for the read-only one. The read-only contract this release
+  otherwise hardens was one keystroke from being inverted. Unknown arguments now
+  exit 2 before any diagnosis runs, and `--help` prints usage without acting.
+  Both entry points: `node lifecycle.js doctor …` carried its own copy of the
+  same `includes('--check-only')` line, so the first version of this fix left the
+  sibling running the repair pass on a typo. They now share one `runDoctorCli`,
+  which also keeps them from drifting on the exit-code rule (issues *unresolved
+  after repair*, not issues found), and every regression test runs against both.
+- **`grep` explains a flag-shaped pattern instead of just failing on it.** A long
+  flag the subcommand does not implement (`grep --quiet foo`) is bound to the
+  *pattern* positional — deliberately, so that a term like
+  `--no-default-features` stays searchable without an escape — which pushes the
+  real pattern into the path list, and ripgrep then reports the user's search
+  term as a missing file. Accurate and unreadable. The behavior is unchanged
+  (this is a published CLI surface and `grep -- --quiet` must keep working); what
+  is new is a note naming the token, why it was read as a pattern, and the `--`
+  escape. It fires only on the pairing that is actually ambiguous — a `--word`
+  pattern *and* a missing-path error — so a genuine literal search that fails for
+  another reason is not lectured.
 - **`unadopt` deleted the user's own prose from CLAUDE.md.** Stripping the
   managed block matched from the *first* occurrence of the begin marker anywhere
   in the file through the real block's end marker — and the block we write
@@ -88,6 +112,18 @@ next `code-graph-mcp incremental-index`.
   too: the first version of this fix wired the new state into `lifecycle`'s CLI
   only, so `doctor` still printed "install reported no change (settings already
   had entries)" about a file it had just failed to write.
+- **A read-only `~/.claude` was diagnosed as a missing npm package.** `doctor`'s
+  `hooks-invalid` repair arm never learned the unwritable-settings state that its
+  sibling arm had just been taught, and `scanForBrokenPaths` cannot surface it
+  (the file reads fine), so a `chmod` on the config directory produced
+  "plugin scripts may be missing — reinstall: npm install -g …". Both arms now
+  report the same cause for the same failed `install()` call.
+- **The legacy-migration delete guard was the loose copy.** `unadopt`'s
+  detail-file guard was tightened to require a whole-line HTML comment, but
+  `migrateLegacyMemoryDir` kept a bare untrimmed `startsWith` — and migration is
+  the hot path, running on every SessionStart via auto-adopt, while `unadopt` is
+  explicit. A user file whose first line merely began `<!-- adopted-by:` was
+  still deleted there.
 - **Uninstall stranded every adopted project's CLAUDE.md block.** The
   adopted-projects registry lives inside the cache directory, and the SessionStart
   teardown wiped that directory *before* unadopting. Only the current project was
@@ -238,6 +274,19 @@ next `code-graph-mcp incremental-index`.
   index mode so it cannot silently revert.
 
 ### Internal
+- **The `<external>` query-layer exclusion had no live guard.** Round-6 mutation
+  runs showed that both tests believed to cover it — `external_sentinel_tests` in
+  `src/resolve.rs` and the "negative control" in the MCP integration test —
+  survive deleting `EXCLUDE_EXTERNAL_BY_NAME` *and* neutering
+  `is_selectable_definition`. The reason is structural, not a fixture slip: the
+  by-name fuzzy path already carries `AND n.type != 'module'`, and a sentinel is
+  typed non-`module` only when no project symbol shares its name — exactly the
+  case where there is nothing to discriminate. Three attempts to make that
+  control live failed; the claim has been removed from the test rather than
+  replaced with a fourth inert one. The real guard,
+  `show_does_not_resolve_a_name_that_exists_only_as_an_import`, drives the binary
+  at the surface where the defect was observed (`show HashMap` printing
+  `module <external>/HashMap` at exit 0) and does go red under the mutation.
 - **Workflow drift guard** (`release_and_cache_warm_workflows_do_not_drift`) pins
   what had only ever been a comment: one toolchain pin and one rust-cache pin
   across both files, every `shared-key` release.yml restores is written by a

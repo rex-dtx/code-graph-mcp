@@ -613,7 +613,7 @@ function runRepairs(results) {
         console.log('\n  Repairing hooks...');
         if (relicRepairGuard()) break;
         const { install, scanForBrokenPaths } = require('./lifecycle');
-        install();
+        const installResult = install();
         // Diagnosis already ran install()+re-scan and the paths were STILL
         // broken (that `repaired:false` is what raised hooks-invalid). Verify
         // this second attempt actually cleared them before counting it fixed \u2014
@@ -623,6 +623,16 @@ function runRepairs(results) {
         if (remaining.length === 0) {
           console.log('  \u2705 Hooks repaired \u2014 restart Claude Code to apply');
           fixed++;
+        } else if (installResult && installResult.settingsUnwritable) {
+          // `scanForBrokenPaths` cannot surface this one: the file READS fine, so
+          // it reports no `settings-unusable` issue and the branch below is
+          // skipped. Without this arm a chmod on ~/.claude was diagnosed as
+          // "plugin scripts may be missing — reinstall the npm package". The
+          // sibling arm at `missing-hooks-in-settings` learned the unwritable
+          // case in the previous round and this one did not; the two arms print
+          // about the same install() call and have to agree about why it failed.
+          console.log('  ❌ settings.json is not writable — hooks NOT repaired');
+          console.log('     Fix the permissions on it (or on ~/.claude) and re-run; see the error above.');
         } else if (remaining.some((i) => i.type === 'settings-unusable')) {
           // Same branch runDiagnostics needs, for the same reason. This arm only
           // became REACHABLE for unusable settings once scanForBrokenPaths began
@@ -714,11 +724,47 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length, unresolved };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, detectEmbedModel, devBuildCommand };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, detectEmbedModel, devBuildCommand };
+
+// Shared by BOTH doctor entry points: `node doctor.js …` and `node lifecycle.js
+// doctor …`. It exists as one function because the first version of this guard
+// lived only in doctor.js's `require.main` block, leaving lifecycle's arm on the
+// original `process.argv.includes('--check-only')` — so the exact bug being
+// fixed (a typo'd flag running the repair pass) survived on the sibling entry
+// point. Same half-applied shape this whole batch keeps producing.
+//
+// Returns `{ checkOnly }` to run, `{ help: true }` to print usage, or
+// `{ error }` naming the offending arguments.
+const DOCTOR_KNOWN_FLAGS = new Set(['--check-only', '--help', '-h']);
+const DOCTOR_USAGE = [
+  'Usage: doctor [--check-only]',
+  '  --check-only   report issues without changing anything',
+].join('\n');
+
+function parseDoctorArgs(args) {
+  const unknown = args.filter((a) => !DOCTOR_KNOWN_FLAGS.has(a));
+  if (unknown.length) return { error: `doctor: unknown argument(s): ${unknown.join(' ')}` };
+  if (args.includes('--help') || args.includes('-h')) return { help: true };
+  return { checkOnly: args.includes('--check-only') };
+}
+
+// Run the CLI for a parsed argv tail and return the process exit code. Shared so
+// the two entry points cannot drift on exit-code semantics either.
+function runDoctorCli(args) {
+  const parsed = parseDoctorArgs(args);
+  if (parsed.error) {
+    console.error(parsed.error);
+    console.error(DOCTOR_USAGE);
+    return 2;
+  }
+  if (parsed.help) {
+    console.log(DOCTOR_USAGE);
+    return 0;
+  }
+  const { unresolved } = runDoctor({ checkOnly: parsed.checkOnly });
+  return unresolved > 0 ? 1 : 0;
+}
 
 if (require.main === module) {
-  const args = process.argv.slice(2);
-  const checkOnly = args.includes('--check-only');
-  const { unresolved } = runDoctor({ checkOnly });
-  process.exit(unresolved > 0 ? 1 : 0);
+  process.exit(runDoctorCli(process.argv.slice(2)));
 }

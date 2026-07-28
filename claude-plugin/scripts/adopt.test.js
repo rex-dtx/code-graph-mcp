@@ -1033,3 +1033,40 @@ test('unadopt does NOT overwrite a symlinked detail file target', () => {
     sb.cleanup();
   }
 });
+
+test('migrateLegacyMemoryDir will NOT delete a user file that merely starts with the legacy prefix', () => {
+  // Round-6 F3. `unadopt`'s detail-file guard was tightened to require a
+  // whole-line HTML comment, but the migration's copy kept a bare untrimmed
+  // `startsWith` — and migration is the HOT path: maybeAutoAdopt calls it on
+  // every SessionStart, while unadopt is explicit. Half-applied fix, on the more
+  // frequently executed half.
+  const sb = makeSandbox();
+  try {
+    const dir = memoryDir(sb.cwd, sb.home);
+    fs.mkdirSync(dir, { recursive: true });
+    const victim = path.join(dir, TARGET_NAME);
+    const body = '<!-- adopted-by: my own note-taking script, do not delete\nmy notes\n';
+    fs.writeFileSync(victim, body);
+
+    const res = migrateLegacyMemoryDir({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.legacyDetailRemoved, false, 'not ours — must survive');
+    assert.ok(fs.existsSync(victim), 'user file still exists');
+    assert.strictEqual(fs.readFileSync(victim, 'utf8'), body, 'byte-identical');
+  } finally { sb.cleanup(); }
+});
+
+test('migrateLegacyMemoryDir still deletes a real legacy detail file', () => {
+  // Negative control: the tightened guard must not make migration inert. The
+  // legacy scheme wrote `<!-- adopted-by: <cwd> -->` as the whole first line.
+  const sb = makeSandbox();
+  try {
+    const dir = memoryDir(sb.cwd, sb.home);
+    fs.mkdirSync(dir, { recursive: true });
+    const legacy = path.join(dir, TARGET_NAME);
+    fs.writeFileSync(legacy, `<!-- adopted-by: ${sb.cwd} -->\nold generated body\n`);
+
+    const res = migrateLegacyMemoryDir({ cwd: sb.cwd, home: sb.home });
+    assert.strictEqual(res.legacyDetailRemoved, true, 'a real legacy file IS removed');
+    assert.ok(!fs.existsSync(legacy));
+  } finally { sb.cleanup(); }
+});

@@ -2,6 +2,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
 const { runDiagnostics, formatReport, surveyHookCoverage } = require('./doctor');
 const { buildSettingsHookEntries } = require('./lifecycle');
 
@@ -240,4 +244,158 @@ test('runRepairs: hooks-invalid counts fixed only when the post-install re-scan 
     lc.scanForBrokenPaths = orig.scan;
     lc.isStaleRelicContext = orig.relic;
   }
+});
+
+// ── CLI argument handling ──────────────────────────────────────────────────
+//
+// Contract audit follow-up: `args.includes('--check-only')` ignored every other
+// argument, so a typo'd flag ran the FULL repair pass — writing settings.json and
+// MEMORY.md — while the user believed they had asked for the read-only mode. A
+// typo silently inverting a read-only contract is the worst shape this flag can
+// have, so an unrecognized argument now stops before any diagnosis runs.
+
+const { execFileSync } = require('child_process');
+
+// BOTH entry points. `node lifecycle.js doctor …` carried its own copy of the
+// flag parsing, so the first version of this guard fixed doctor.js and left the
+// sibling running the repair pass on a typo. They now share `runDoctorCli` from
+// doctor.js, and every case below is asserted against both so they cannot drift.
+const ENTRY_POINTS = [
+  { label: 'doctor.js', argv: (args) => [path.join(__dirname, 'doctor.js'), ...args] },
+  { label: 'lifecycle.js doctor', argv: (args) => [path.join(__dirname, 'lifecycle.js'), 'doctor', ...args] },
+];
+
+function runDoctorCli(homeDir, args, entry = ENTRY_POINTS[0]) {
+  try {
+    const stdout = execFileSync(process.execPath, entry.argv(args), {
+      env: { ...process.env, HOME: homeDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).toString();
+    return { code: 0, stdout, stderr: '' };
+  } catch (err) {
+    return {
+      code: err.status,
+      stdout: err.stdout ? err.stdout.toString() : '',
+      stderr: err.stderr ? err.stderr.toString() : '',
+    };
+  }
+}
+
+function freshHome(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-doctor-cli-'));
+  fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+for (const entry of ENTRY_POINTS) {
+  test(`${entry.label}: refuses an unknown argument instead of silently repairing`, (t) => {
+    // Every near-miss spelling of the read-only flag.
+    for (const typo of ['--check-onlyy', '--checkonly', '--check_only', '-check-only', '--dry-run']) {
+      const home = freshHome(t);
+      const r = runDoctorCli(home, [typo], entry);
+      assert.equal(r.code, 2, `${typo} must be rejected, not ignored`);
+      assert.match(r.stderr, /unknown argument/, `${typo} must say why`);
+      assert.equal(r.stdout, '', `${typo} must not emit a diagnostic report`);
+      assert.equal(
+        fs.existsSync(path.join(home, '.claude', 'settings.json')), false,
+        `${typo} must not have run the repair pass — that is the read-only contract ` +
+        'the user thought they were invoking');
+    }
+  });
+
+  test(`${entry.label}: --check-only still reports and still writes nothing`, (t) => {
+    const home = freshHome(t);
+    const r = runDoctorCli(home, ['--check-only'], entry);
+    assert.ok(r.stdout.length > 0, 'the real flag still produces a report');
+    assert.equal(fs.existsSync(path.join(home, '.claude', 'settings.json')), false,
+      'read-only');
+  });
+
+  test(`${entry.label}: no arguments still repairs (the guard must not make it inert)`, (t) => {
+    // Negative control for the two above.
+    const home = freshHome(t);
+    const r = runDoctorCli(home, [], entry);
+    assert.ok(r.stdout.length > 0);
+    assert.equal(fs.existsSync(path.join(home, '.claude', 'settings.json')), true,
+      'the default mode must still perform repairs');
+  });
+
+  test(`${entry.label}: --help exits 0 without running diagnostics`, (t) => {
+    const home = freshHome(t);
+    const r = runDoctorCli(home, ['--help'], entry);
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /Usage: doctor/);
+    assert.equal(fs.existsSync(path.join(home, '.claude', 'settings.json')), false,
+      '--help must not run the repair pass — a help flag that acts is its own bug class');
+  });
+}
+
+// ── an unwritable ~/.claude must be diagnosed as such by EVERY repair arm ────
+//
+// Round-6 F2/F4: the `settingsUnwritable` state was taught to
+// `missing-hooks-in-settings` but not to `hooks-invalid`, and neither arm had a
+// test. The consequence was a chmod being reported as "plugin scripts may be
+// missing — reinstall the npm package": a diagnosis that sends the user to fix
+// something that is not broken, from the tool whose job is to say what is.
+
+function unwritableHome(t, seed) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-doctor-ro-'));
+  const claudeDir = path.join(home, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  fs.writeFileSync(path.join(claudeDir, 'settings.json'), JSON.stringify(seed, null, 2) + '\n');
+  fs.chmodSync(claudeDir, 0o555);
+  t.after(() => {
+    try { fs.chmodSync(claudeDir, 0o755); } catch { /* already restored */ }
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  return home;
+}
+
+test('a read-only ~/.claude is reported as a permissions problem, not a missing package', (t) => {
+  // The entry has to be recognizable as OURS, or the coverage survey reports it
+  // as missing and the *other* arm answers — which is how the first version of
+  // this test passed while the arm it names stayed unguarded. Build the real
+  // entries, then repoint every path at a dead directory (same technique as the
+  // stale-path survey test above) so `hooks-invalid` is what gets raised.
+  const desired = buildSettingsHookEntries();
+  const hooks = {};
+  for (const [event, entries] of Object.entries(desired)) {
+    hooks[event] = entries.map((e) => {
+      const copy = JSON.parse(JSON.stringify(e));
+      copy.hooks = copy.hooks.map((h) => ({
+        ...h,
+        command: h.command.replaceAll('/scripts/', '/0.0.1-gone/scripts/'),
+      }));
+      return copy;
+    });
+  }
+  const home = unwritableHome(t, { hooks });
+
+  const r = runDoctorCli(home, []);
+  const all = r.stdout + r.stderr;
+
+  assert.match(all, /not writable/,
+    'the real cause must appear in the report');
+  assert.doesNotMatch(all, /npm install -g/,
+    'must NOT tell the user to reinstall a package over a chmod — that is the ' +
+    'misdiagnosis this arm exists to prevent');
+  // The file really was left alone.
+  const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
+  assert.ok(settings.hooks.PreToolUse, 'settings untouched');
+});
+
+test('a read-only ~/.claude is reported by the missing-hooks arm too', (t) => {
+  // No code-graph entries at all → `missing-hooks-in-settings` rather than
+  // `hooks-invalid`. Both arms print about the same failed install() call and
+  // have to agree about why it failed.
+  const home = unwritableHome(t, { model: 'opus' });
+
+  const r = runDoctorCli(home, []);
+  const all = r.stdout + r.stderr;
+
+  assert.match(all, /not writable/, 'the real cause must appear here as well');
+  assert.doesNotMatch(all, /already had entries/,
+    'must not claim the hooks were already registered');
+  assert.notEqual(r.code, 0, 'nothing was fixed, so this is not a clean run');
 });

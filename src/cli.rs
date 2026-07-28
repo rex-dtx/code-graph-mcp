@@ -2659,6 +2659,37 @@ fn first_unsupported_grep_flag(args: &[String]) -> Option<String> {
     None
 }
 
+/// Explain a `rg: <path>: No such file or directory` that was really caused by a
+/// long flag being consumed as the search pattern.
+///
+/// Returns `None` unless BOTH hold: the pattern looks like a long flag
+/// (`--word`), and ripgrep's complaint is a missing path. That pairing is what
+/// separates "the user typed `--quiet` expecting a flag" from "the user is
+/// genuinely searching for the literal `--quiet`" — the latter finds files (or
+/// reports no match) rather than erroring on a missing path.
+///
+/// Advisory only. Changing `grep --quiet` from "search for that literal" to "flag
+/// error" would be a behavior change on a published CLI surface, so this reports
+/// rather than decides.
+fn grep_flaglike_pattern_hint(pattern: &str, stderr: &str) -> Option<String> {
+    let looks_like_long_flag = pattern.starts_with("--")
+        && pattern.len() > 2
+        && pattern[2..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !looks_like_long_flag || !stderr.contains("No such file or directory") {
+        return None;
+    }
+    Some(format!(
+        "[code-graph] note: `{pattern}` was taken as the SEARCH PATTERN, not as a \
+         flag — `grep` accepts a flag-shaped pattern so terms like \
+         `--no-default-features` are searchable. Your real pattern was then read \
+         as a path, which is the error above. If you meant a flag, `grep` does \
+         not implement `{pattern}`; if you meant the literal, write \
+         `grep -- {pattern}`."
+    ))
+}
+
 /// Parse `grep` arguments from the full process argv (including argv\[0]),
 /// applying [`normalize_grep_argv`] first. Mirrors the other subcommands'
 /// `skip(1)`; clap consumes the leading `grep` token as the binary-name slot.
@@ -3125,6 +3156,21 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     if rg_output.code == 2 {
         let stderr = String::from_utf8_lossy(&rg_output.stderr);
         let stderr = stderr.trim();
+        // A long flag this subcommand does not implement is bound to the PATTERN
+        // positional (`allow_hyphen_values`, so that `grep --no-default-features`
+        // can search for that literal), which pushes the real pattern into the
+        // path list. rg then reports the user's search term as a missing file —
+        // technically accurate and completely opaque. `first_unsupported_grep_flag`
+        // catches this for short clusters but deliberately leaves `--long` tokens
+        // alone, because treating them as flags would break the documented
+        // literal search. So: keep the behavior, explain it.
+        if let Some(hint) = grep_flaglike_pattern_hint(&pattern, stderr) {
+            eprintln!("{hint}");
+            // Short, distinct text for the log — matching the freshness-partial
+            // site below. Repeating the full hint verbatim printed it twice on
+            // any run that DOES have a subscriber installed.
+            tracing::warn!("grep: flag-shaped pattern taken as pattern: {}", pattern);
+        }
         if rg_output.stdout.is_empty() {
             if json_mode {
                 println!("[]");
@@ -10118,5 +10164,42 @@ mod tests {
             first_unsupported_grep_flag(&s(&["grep", "-A", "2", "-v", "pat"])).as_deref(),
             Some("-v")
         );
+    }
+
+    /// A LONG flag this subcommand does not implement is deliberately left to the
+    /// pattern positional (so `grep --no-default-features` stays searchable), and
+    /// the real pattern then becomes a path. That behavior is a published CLI
+    /// contract and is unchanged; what is new is that the resulting rg error gets
+    /// explained instead of standing alone as `rg: <your pattern>: No such file`.
+    #[test]
+    fn grep_flaglike_pattern_hint_fires_only_on_the_confusing_pairing() {
+        const MISSING: &str = "rg: /repo/alpha: No such file or directory (os error 2)";
+
+        // The confusing case: flag-shaped pattern AND a missing-path complaint.
+        for flag in ["--quiet", "--json", "--check-only", "--no_color", "--x1"] {
+            let hint = grep_flaglike_pattern_hint(flag, MISSING)
+                .unwrap_or_else(|| panic!("{flag} + missing-path must be explained"));
+            assert!(hint.contains(flag), "hint must name the token: {hint}");
+            assert!(
+                hint.contains("grep -- "),
+                "hint must give the escape that keeps the literal search working: {hint}"
+            );
+        }
+
+        // Same pattern, a DIFFERENT rg failure: not this diagnosis, stay quiet.
+        assert_eq!(
+            grep_flaglike_pattern_hint("--quiet", "rg: regex parse error"),
+            None
+        );
+
+        // A genuine literal search that happens to fail on a missing path must not
+        // be told it typed a flag — these are ordinary patterns, not `--word`.
+        for pat in ["alpha", "-v", "->", "-1", "-.*", "--", "--=x", "--a b"] {
+            assert_eq!(
+                grep_flaglike_pattern_hint(pat, MISSING),
+                None,
+                "{pat} is not a long-flag spelling and must not be explained as one"
+            );
+        }
     }
 }
