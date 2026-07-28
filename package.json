@@ -29,8 +29,7 @@
   ],
   "scripts": {
     "build": "cargo build --release --no-default-features && node scripts/copy-binary.js",
-    "prepare": "git rev-parse --git-dir > /dev/null 2>&1 && git config core.hooksPath scripts/githooks || true",
-    "preuninstall": "node claude-plugin/scripts/lifecycle.js uninstall || true"
+    "prepare": "git rev-parse --git-dir > /dev/null 2>&1 && git config core.hooksPath scripts/githooks || true"
   },
   "engines": {
     "node": ">=16"

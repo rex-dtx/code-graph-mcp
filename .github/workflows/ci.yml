@@ -83,14 +83,29 @@ jobs:
         with:
           key: ${{ matrix.os }}-${{ matrix.feature-label }}
 
+      # --all-targets so BENCHES compile. `cargo check` (lib+bins) and
+      # `cargo test` (lib+bins+tests) both skip bench targets, so benches/
+      # indexing.rs was never built by any CI job and could rot against an API
+      # change without anything going red — the bench exists to catch indexing
+      # regressions and was itself unguarded.
       - name: Check
-        run: cargo check ${{ matrix.feature-flag }}
+        run: cargo check ${{ matrix.feature-flag }} --all-targets
 
       - name: Clippy
         run: cargo clippy ${{ matrix.feature-flag }} -- -D warnings
 
       - name: Test
         run: cargo test ${{ matrix.feature-flag }}
+
+      # Criterion `--test` runs each benchmark ONCE and fails on panic: a
+      # runtime smoke, not a timing gate (shared runners are far too noisy to
+      # assert wall-clock). Compiling is covered on every OS above; running it
+      # once on Linux is what catches a bench that builds but panics on its own
+      # fixture. Timing regressions remain uncaught by CI — see the perf note in
+      # the audit report; that needs a dedicated runner, not this step.
+      - name: Bench smoke (criterion --test)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo bench ${{ matrix.feature-flag }} --bench indexing -- --test
 
   # The shipped binary is built `--features embed-model` (release.yml), but the
   # matrix above only exercises the FTS5-only default — so a regression in the
@@ -209,16 +224,22 @@ jobs:
         # cg-answer's binary-resolution test flakes intermittently. Serial is
         # deterministic and the suite is fast (~15s).
         run: |
-          # Glob EVERY *.test.js under claude-plugin/scripts/ and scripts/, minus
-          # the two below that can't run on a bare CI checkout. Globbing (not a
-          # hand-maintained allowlist) means a NEW test file is picked up
+          # Discover EVERY *.test.js under claude-plugin/scripts/ and scripts/,
+          # minus the one below that can't run on a bare CI checkout. Discovery
+          # (not a hand-maintained allowlist) means a NEW test file is picked up
           # automatically — the old curated list had silently drifted to miss
           # hook-fire / mcp-stub / post-grep-inject / statusline-composite (M10).
           # A new file that genuinely needs a built binary / network fails LOUDLY
           # here; add it to the exclusion grep with a reason rather than dropping
           # back to an allowlist that misses files silently.
-          files=$(ls claude-plugin/scripts/*.test.js scripts/*.test.js \
-            | grep -vE '(^|/)install-e2e\.test\.js$')
+          #
+          # `find`, not a `*.test.js` shell glob: the glob is NON-RECURSIVE, so
+          # the first test file anyone puts in a subdirectory would be skipped in
+          # silence — the same M10 failure the allowlist had, re-entering through
+          # the mechanism that replaced it. Every test file sits at depth 1 today,
+          # which is exactly why this was worth fixing before it wasn't.
+          files=$(find claude-plugin/scripts scripts -type f -name '*.test.js' \
+            | grep -vE '(^|/)install-e2e\.test\.js$' | sort)
           node --test --test-concurrency=1 $files
 
   # Supply-chain CVE scan over Cargo.lock (376 transitive deps including the

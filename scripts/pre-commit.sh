@@ -85,14 +85,21 @@ fi
 js_staged=$(echo "$staged_files" | grep -c '^\(claude-plugin\|scripts\)/.*\.js$' || true)
 if [ "$js_staged" -gt 0 ]; then
   echo "Running plugin JS tests..."
-  for t in "$ROOT"/claude-plugin/scripts/*.test.js "$ROOT"/scripts/*.test.js; do
+  # `find`, not a `*.test.js` glob: the glob is NON-RECURSIVE and would skip the
+  # first test file anyone puts in a subdirectory, in silence. Note the staged-file
+  # detection above is already recursive (`.*\.js$`), so the asymmetry meant a
+  # nested test could TRIGGER this gate without ever being RUN by it.
+  # Fed by process substitution, NOT a pipe: a pipe would put the loop in a
+  # subshell where `exit 1` only leaves the subshell and the hook would pass a
+  # failing test.
+  while IFS= read -r t; do
     [ -f "$t" ] || continue
     if ! "${git_clean[@]}" node --test "$t" > /dev/null 2>&1; then
       echo "❌ Test failed: $(basename "$t")"
       echo "Run: node --test $t"
       exit 1
     fi
-  done
+  done < <(find "$ROOT/claude-plugin/scripts" "$ROOT/scripts" -type f -name '*.test.js' | sort)
   echo "✓ Plugin JS tests passed"
 fi
 
