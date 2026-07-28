@@ -894,10 +894,15 @@ fn release_workflow_ref_expressions_all_fall_back_to_the_dispatch_tag() {
     // `yaml_directives` drops whole-line comments, which is where every prose
     // mention of `github.ref` in this file lives — including the ones explaining
     // this very contract. Without that filter the guard would flag its own docs.
+    // Requires only that the expression CONSULTS `inputs.tag`, not that it uses
+    // the `tag ||` spelling: `concurrency.group` deliberately uses
+    // `tag && format('refs/tags/{0}', tag) || github.ref` instead, because a
+    // group key is compared as a literal string and the plain form yields a
+    // different key for the push and the dispatch (see that block's comment).
     let offenders: Vec<&str> = yaml_directives(&yaml)
         .into_iter()
         .filter(|l| l.contains("${{") && l.contains("github.ref"))
-        .filter(|l| !l.contains("github.event.inputs.tag ||"))
+        .filter(|l| !l.contains("github.event.inputs.tag"))
         .collect();
 
     assert!(
@@ -915,7 +920,7 @@ fn release_workflow_ref_expressions_all_fall_back_to_the_dispatch_tag() {
     // set — the vacuous pass this file exists to prevent.
     let with_fallback = yaml_directives(&yaml)
         .into_iter()
-        .filter(|l| l.contains("github.event.inputs.tag ||"))
+        .filter(|l| l.contains("github.event.inputs.tag"))
         .count();
     assert!(
         with_fallback >= 7,
@@ -985,10 +990,15 @@ fn every_workflow_action_is_pinned_to_a_full_commit_sha() {
         }
     }
 
+    // 41 is the measured count across the five workflow files, not a round
+    // number: the first version of this floor said 21 (the count of first-party
+    // uses I had just pinned), which a parse regression halving the real count
+    // would have sailed straight through.
     assert!(
-        checked >= 21,
-        "expected at least the 21 known `uses:` sites across the workflows, found \
-         {checked} — a parse change would make this guard vacuous"
+        checked >= 41,
+        "expected at least the 41 known `uses:` sites across the workflows, found \
+         {checked} — a parse change would make this guard vacuous. If a workflow \
+         or step was legitimately removed, lower this in the same commit."
     );
     assert!(
         unpinned.is_empty(),
@@ -997,5 +1007,111 @@ fn every_workflow_action_is_pinned_to_a_full_commit_sha() {
          `contents: write` (and, in publish, NPM_TOKEN):\n  {}",
         unpinned.len(),
         unpinned.join("\n  ")
+    );
+}
+
+/// Every JS test file that spawns with a redirected HOME must also neutralize
+/// `CLAUDE_CONFIG_DIR`.
+///
+/// `claudeHome()` is `process.env.CLAUDE_CONFIG_DIR || homedir/.claude`, so the
+/// env var OUTRANKS a redirected HOME. A spawn built as
+/// `{ ...process.env, HOME: sandbox }` passes it straight through, and for a
+/// developer who exports it (the documented multi-profile setup) the test then
+/// operates on their live config — measured on this branch: `npm test` wrote a
+/// fabricated `9.9.9` plugin version into the real plugins cache, and a real
+/// `uninstall --unadopt-all` deleted `<config>/plugins/cache/code-graph-mcp/`.
+///
+/// A file satisfies this by deleting the variable at module load (covers every
+/// spawn) or by setting it explicitly on each child env. This is a test because
+/// the class has now been half-fixed twice: v0.108.1 closed it in
+/// `tests/cli_e2e.rs` and `doctor.test.js` while missing `install-e2e.test.js`,
+/// and the fix for that missed six more files. CI never sees it — the variable
+/// is unset on the runners — so it can only fail on a developer's machine.
+#[test]
+fn js_test_files_neutralize_claude_config_dir() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in ["claude-plugin/scripts", "scripts"] {
+        let d = root.join(dir);
+        let mut found: Vec<_> = fs::read_dir(&d)
+            .unwrap_or_else(|e| panic!("read {}: {e}", d.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".test.js"))
+            })
+            .collect();
+        found.sort();
+        files.append(&mut found);
+    }
+    assert!(
+        files.len() >= 20,
+        "expected the JS test suite to be discovered, found {} files — a path \
+         change would make this guard vacuous",
+        files.len()
+    );
+
+    let mut offenders = Vec::new();
+    let mut scanned = 0usize;
+    for path in &files {
+        let src = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        // Line-anchored, NOT `src.contains`: commenting the statement out
+        // leaves the text in the file, so a `contains` check stayed green for a
+        // file that had just stopped neutralizing anything. Caught by mutating
+        // this very guard — the same "the words are present, so it must be true"
+        // failure the rest of this file exists to catch.
+        if src.lines().any(|l| {
+            l.trim_start()
+                .starts_with("delete process.env.CLAUDE_CONFIG_DIR")
+        }) {
+            continue;
+        }
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            // A `process.env.HOME = …` immediately followed by a
+            // `process.env.CLAUDE_CONFIG_DIR = …` is the explicit-pairing form
+            // (install-e2e's generated child script uses it), so look one line
+            // ahead before calling it an offender.
+            let paired_next = lines
+                .get(i + 1)
+                .is_some_and(|n| n.contains("process.env.CLAUDE_CONFIG_DIR"));
+            // Two shapes leak the variable:
+            //   * a spawn spreading `...process.env` (an env object built from
+            //     scratch, `{ HOME: dir, PATH: '' }`, never inherits it);
+            //   * an IN-PROCESS redirect, `process.env.HOME = <sandbox>`, where
+            //     the module under test calls `claudeHome()` directly. The first
+            //     version of this guard checked only spawns and therefore missed
+            //     `adopt.test.js`, which wrote five `projects/<slug>/memory/`
+            //     trees into a canary config dir while the guard stayed green.
+            let leaks_via_spawn = line.contains("...process.env") && line.contains("HOME:");
+            let leaks_in_process = t.starts_with("process.env.HOME =");
+            if (leaks_via_spawn || leaks_in_process)
+                && !line.contains("CLAUDE_CONFIG_DIR")
+                && !paired_next
+            {
+                scanned += 1;
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    i + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    let _ = scanned;
+
+    assert!(
+        offenders.is_empty(),
+        "{} JS test spawn(s) redirect HOME but inherit CLAUDE_CONFIG_DIR, so they \
+         act on the real Claude config for anyone who exports it. Fix by adding \
+         `delete process.env.CLAUDE_CONFIG_DIR;` at module load, or by setting it \
+         on the child env:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
     );
 }

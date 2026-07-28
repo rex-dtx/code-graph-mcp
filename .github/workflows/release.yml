@@ -22,15 +22,21 @@ permissions:
 # re-run on the same tag don't race (both build + publish the same version).
 # cancel-in-progress: false — never abort an in-flight publish half-way.
 #
-# The `inputs.tag ||` fallback is what makes that true, and this was the ONE
-# site in the file missing it (six others carry it — :51, :151, :199, :215,
-# :339, :414). A dispatch runs from the default branch, so bare `github.ref`
-# resolves to `refs/heads/main` while the tag-push run for the same version
-# resolves to `refs/tags/vX.Y.Z`: two different group keys, no serialization,
-# and both runs build and publish the same version concurrently — precisely the
-# race the comment above claims to prevent.
+# This was the ONE site in the file with no `inputs.tag` fallback: a dispatch
+# runs from the default branch, so bare `github.ref` was `refs/heads/main` while
+# the tag-push run for the same version was `refs/tags/vX.Y.Z` — two group keys,
+# no serialization, both runs publishing the same version.
+#
+# The fallback has to REBUILD the ref, not substitute the raw input. A
+# concurrency group is compared as a literal string, so the plain
+# `inputs.tag || github.ref` used everywhere else in this file yields
+# `release-v0.109.0` for the dispatch and `release-refs/tags/v0.109.0` for the
+# push — still two keys, still no serialization. The other six sites are correct
+# with the plain form because they feed `ref:` / `tag_name:`, where `v0.109.0`
+# and `refs/tags/v0.109.0` resolve to the same object; only here does the
+# spelling itself matter.
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref }}
+  group: release-${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -348,8 +354,14 @@ jobs:
         # `claude-plugin/` directory itself, so extraction reproduces that exact
         # layout. The source tarball needed a strip because GitHub wraps it in a
         # `<owner>-<repo>-<sha>/` directory.
+        #
+        # `--exclude='*.test.js'` matches package.json's `files` allowlist, which
+        # already keeps the 31 test files out of the npm tarball. The old source
+        # archive shipped them (so dropping them is no regression), but there is
+        # no reason to copy test code into a plugin cache Claude Code executes
+        # from.
         run: |
-          tar czf release-assets/claude-plugin.tar.gz claude-plugin
+          tar czf release-assets/claude-plugin.tar.gz --exclude='*.test.js' claude-plugin
           sha256sum release-assets/claude-plugin.tar.gz | cut -d' ' -f1 \
             > release-assets/claude-plugin.tar.gz.sha256
 

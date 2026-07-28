@@ -7602,7 +7602,22 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         // Compared in Rust rather than with SQL `LIKE`: the prefix is user
         // input, and `_`/`%` in a filename would silently widen the match — the
         // exact wildcard bug fixed in `prod_source_filter_and` this same batch.
-        let unindexed_prefix = path_filter.filter(|prefix| {
+        //
+        // Two spellings must NOT reach the probe, and the first version of it
+        // failed both — turning `dead-code .` and `dead-code src/` on a clean
+        // repo from `[]`/exit 0 into a hard error, which is the inverse of the
+        // bug this is meant to fix and would break anything gating CI on the
+        // exit code the day the repo gets clean:
+        //   * `.` normalizes to `""` (whole project), and no stored path equals
+        //     `""` or begins with `/`;
+        //   * a trailing slash from tab completion gives `src/`, and no stored
+        //     path begins with `src//`.
+        // The original negative control used bare `src`, which is exactly the
+        // one spelling of the three that worked.
+        let probe = path_filter
+            .map(|p| p.trim_end_matches('/'))
+            .filter(|p| !p.is_empty());
+        let unindexed_prefix = probe.filter(|prefix| {
             let scan = conn.prepare("SELECT path FROM files").and_then(|mut stmt| {
                 stmt.query_map([], |r| r.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<String>>>()

@@ -17,6 +17,18 @@ const GIT_ENV_VARS = [
   'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_PREFIX',
 ];
 for (const k of GIT_ENV_VARS) delete process.env[k];
+
+// `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
+//
+// The sandboxes below redirect HOME and spawn with `{...process.env}`, which
+// passes the variable straight through — and `claudeHome()` is
+// `CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var WINS over the
+// redirected HOME. For a developer who exports it (the documented multi-profile
+// setup) these tests wrote into their LIVE config: measured, a fabricated
+// `9.9.9` plugin version landed in the real plugins cache. Deleting it here
+// covers every spawn site at once; the few tests that need the variable set it
+// explicitly in their own child env, which still wins.
+delete process.env.CLAUDE_CONFIG_DIR;
 function cleanGitEnv() {
   const e = { ...process.env };
   for (const k of GIT_ENV_VARS) delete e[k];
@@ -238,8 +250,13 @@ test('shouldCheck re-verifies an up-to-date state on a short cadence (release-pu
   // a pending-but-unfinished update keeps the 6h steady-state interval
   assert.equal(shouldCheck({ lastCheck: minsAgo(45), updateAvailable: true }), false);
 
-  // rate-limit backoff (24h) wins even over the up-to-date short cadence
-  assert.equal(shouldCheck({ lastCheck: minsAgo(120), updateAvailable: false, rateLimited: true }), false);
+  // Rate-limit backoff wins even over the up-to-date short cadence. The window
+  // is GitHub's own unauthenticated reset period (1h), not the 24h this used to
+  // assert — that number was written while the flag was unreachable and became
+  // load-bearing only when the state clobber was fixed.
+  assert.equal(shouldCheck({ lastCheck: minsAgo(30), updateAvailable: false, rateLimited: true }), false);
+  assert.equal(shouldCheck({ lastCheck: minsAgo(61), updateAvailable: false, rateLimited: true }), true,
+    'past the reset window the backoff must clear, or a 403 stalls updates indefinitely');
 });
 
 test('shouldCheck lets a forced (session-start) check bypass the soft throttle', () => {
@@ -255,8 +272,12 @@ test('shouldCheck lets a forced (session-start) check bypass the soft throttle',
   // pound the GitHub API on every restart.
   assert.equal(shouldCheck({ lastCheck: minsAgo(0.5), updateAvailable: false }, { force: true }), false);
 
-  // Rate-limit backoff wins even over force — never push more requests into a 403.
-  assert.equal(shouldCheck({ lastCheck: minsAgo(60), updateAvailable: false, rateLimited: true }, { force: true }), false);
+  // Rate-limit backoff wins even over force — never push more requests into a
+  // 403. That ordering is only safe because the window is an hour: at 24h a
+  // single 403 made `--force` a silent no-op for a full day.
+  assert.equal(shouldCheck({ lastCheck: minsAgo(30), updateAvailable: false, rateLimited: true }, { force: true }), false);
+  assert.equal(shouldCheck({ lastCheck: minsAgo(61), updateAvailable: false, rateLimited: true }, { force: true }), true,
+    'force must work again once the reset window has passed');
 });
 
 test('selfHealStaleBinary wires the stale-binary check to a download (the v0.45.x glue)', async () => {
@@ -826,7 +847,19 @@ test('a GitHub 403 leaves the 24h backoff armed after checkForUpdate returns', (
   assert.equal(shouldCheck(state), false,
     'with rateLimited set and lastCheck just now, the next check must back off');
   assert.equal(shouldCheck(state, { force: true }), false,
-    'the 24h backoff outranks force — a session start must not hammer a 403');
+    'the backoff outranks force — a session start must not hammer a 403');
+
+  // And it RECOVERS. The backoff arm sits above the force arm, so if the window
+  // were wrong the stall would be silent and total: `--force` no-ops for its
+  // whole duration. It is one hour because that is GitHub's unauthenticated
+  // reset window; 24h was a constant that had never run (the flag was erased on
+  // the same call that set it) and became load-bearing only when that was fixed.
+  const hourAgo = new Date(Date.now() - 61 * 60 * 1000).toISOString();
+  assert.equal(shouldCheck({ ...state, lastCheck: hourAgo }), true,
+    'an hour after the 403 the backoff must clear on its own');
+  const halfHourAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  assert.equal(shouldCheck({ ...state, lastCheck: halfHourAgo }), false,
+    'half an hour is still inside the window');
 });
 
 // ── Plugin tarball integrity is fail-closed ────────────────────────────────

@@ -7185,18 +7185,114 @@ fn test_cli_json_dead_code_unindexed_path_discloses() {
     let ov: serde_json::Value = serde_json::from_str(ov_stdout.trim()).unwrap();
     assert!(ov.is_object() && ov.get("error").is_some());
 
-    // Negative control: a path that IS indexed and simply has no dead code must
-    // still take the true-empty path — `[]`, exit 0. Without this, "disclose
-    // harder" would pass by turning every clean run into an error.
-    let (clean_stdout, _, clean_code) = run_cli(&project, &["dead-code", "src", "--json"]);
+    // Negative controls: every spelling of a path that IS indexed must still take
+    // the true-empty path — `[]`, exit 0. Without these, "disclose harder" passes
+    // by turning clean runs into errors, which is what the first version did:
+    // it used only bare `src` here, and that is the one spelling of the four that
+    // worked. `.` normalizes to `""` and a tab-completed `src/` keeps its
+    // trailing slash; neither equals a stored path nor prefixes one with `/`, so
+    // both were reported as "no indexed files" on a repo that is simply clean —
+    // breaking anything gating CI on the exit code the day it goes green.
+    //
+    // `--min-lines 999` forces the report EMPTY so the probe is actually reached.
+    // Without it this fixture returns candidates for these paths, the probe never
+    // runs, and the loop passes no matter what the probe does — measured: with
+    // the normalization deleted, the scratch repro exits 1 for `.` and `src/`
+    // while this loop stayed green.
+    for ok_path in [".", "src", "src/", "./src"] {
+        let (clean_stdout, _, clean_code) = run_cli(
+            &project,
+            &["dead-code", ok_path, "--min-lines", "999", "--json"],
+        );
+        assert_eq!(
+            clean_code, 0,
+            "`dead-code {ok_path}` names indexed files and must keep the \
+             true-empty contract; got:\n{clean_stdout}"
+        );
+        let clean: serde_json::Value = serde_json::from_str(clean_stdout.trim())
+            .unwrap_or_else(|e| panic!("`dead-code {ok_path} --json` emitted invalid JSON: {e}"));
+        assert!(
+            clean.get("error").is_none(),
+            "`dead-code {ok_path}` must not be reported as an error: {clean}"
+        );
+    }
+
+    // ...and a trailing slash must not smuggle an unindexed path past the probe
+    // either — the trim is normalization, not a bypass.
+    let (slash_stdout, _, slash_code) =
+        run_cli(&project, &["dead-code", "src/no_such_dir_xyz/", "--json"]);
     assert_eq!(
-        clean_code, 0,
-        "an indexed path must keep the true-empty contract; got:\n{clean_stdout}"
+        slash_code, 1,
+        "trailing slash must not bypass the probe: {slash_stdout}"
     );
-    let clean: serde_json::Value = serde_json::from_str(clean_stdout.trim())
-        .expect("indexed-path dead-code must emit valid JSON");
+}
+
+/// Audit 2026-07-27 P2-3 / review follow-up: `project_map`'s two inline copies of
+/// the test-classification rule fell a fix behind the shared one.
+///
+/// `hot_functions` judges SOURCE rows with `domain::prod_source_filter_and()` and
+/// TARGET rows with what used to be a hand-written copy against its own `n`/`f`
+/// aliases. When the shared rule moved to anchored, extension-pinned,
+/// case-sensitive GLOB, the copy kept unanchored, any-extension,
+/// case-INsensitive LIKE — so inside one query the two sides disagreed about
+/// what a test is, and symbols that `callgraph` happily lists were silently
+/// missing from the map.
+///
+/// The two shapes below are the ones that fell through, both production per
+/// `is_test_symbol`:
+///   * `Test_Signup` — `LIKE 'test\_%'` is ASCII-case-insensitive; `starts_with`
+///     is not;
+///   * a symbol in `src/a_test.ts` — `.ts` is not in `INFIX_TEST_EXTS`, so
+///     `is_test_path` calls it production, but `LIKE '%_test.%'` matched any
+///     extension.
+#[test]
+fn test_cli_map_hot_functions_agree_with_is_test_symbol() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("main.ts"),
+        "export function plainHelper(): number { return 1; }\n\
+         export function Test_Signup(): number { return 2; }\n\
+         export function callAll(): number { return plainHelper() + Test_Signup() + helperFromUnderscoreTest(); }\n\
+         export function callAgain(): number { return plainHelper() + Test_Signup() + helperFromUnderscoreTest(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("a_test.ts"),
+        "export function helperFromUnderscoreTest(): number { return 3; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        "{\"name\":\"p\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+
+    let (_, _, _) = run_cli(&project, &["incremental-index"]);
+    let (stdout, _, code) = run_cli(&project, &["map", "--json"]);
+    assert_eq!(code, 0, "map --json failed:\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("map --json");
+    let names: Vec<&str> = v["hot_functions"]
+        .as_array()
+        .expect("hot_functions array")
+        .iter()
+        .filter_map(|h| h["name"].as_str())
+        .collect();
+
+    // Control: never in doubt on either rule. If this one is missing the fixture
+    // failed to index and the assertions below would pass for the wrong reason.
     assert!(
-        clean.is_array() || clean.get("error").is_none(),
-        "an indexed path must not be reported as an error: {clean}"
+        names.contains(&"plainHelper"),
+        "fixture did not index — no hot function at all: {names:?}"
     );
+    for expected in ["Test_Signup", "helperFromUnderscoreTest"] {
+        assert!(
+            names.contains(&expected),
+            "`{expected}` is production per `is_test_symbol` but project_map \
+             dropped it — the target-side filter has drifted from \
+             `domain::prod_filter_and`: {names:?}"
+        );
+    }
 }

@@ -114,21 +114,23 @@ pub fn get_project_map(
     // 2. Key symbols per module (C2: language-agnostic — use most-called functions per module)
     let mut dir_symbols: HashMap<String, Vec<String>> = HashMap::new();
     {
-        let sql = "SELECT n.name, f.path, COUNT(e.id) as cnt \
+        // Spliced, not hand-copied: these were two of the seven copies of the
+        // test-classification rule, and keeping them inline is how they kept
+        // one fix behind the shared version (see `domain::prod_filter_and`).
+        let sql = format!(
+            "SELECT n.name, f.path, COUNT(e.id) as cnt \
              FROM nodes n \
              JOIN files f ON f.id = n.file_id \
              JOIN edges e ON e.target_id = n.id \
              WHERE e.relation = ?1 AND n.type != 'module' AND n.name != '<module>' \
-               AND n.is_test = 0 \
                AND f.path != '<external>' \
-               AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
-               AND f.path NOT LIKE 'tests/%' \
-               AND f.path NOT LIKE 'benches/%' \
-               AND f.path NOT LIKE '%\\_test.%' ESCAPE '\\' \
+               AND {filter} \
              GROUP BY n.id \
              ORDER BY cnt DESC, n.name, f.path \
-             LIMIT 200";
-        let mut stmt = conn.prepare(sql)?;
+             LIMIT 200",
+            filter = crate::domain::prod_filter_and("n", "f"),
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([REL_CALLS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -305,13 +307,17 @@ pub fn get_project_map(
 
     // 5. Hot functions (C1: filter test code, split prod/test caller counts, C3: use REL_CALLS constant)
     // benches/ is classified as test/harness — see domain.rs::is_test_symbol.
-    // Source-side filter clauses come from domain helpers; target-side `n.*`/`f.*`
-    // filter is inline because aliases differ (n/f vs src/sf).
+    // BOTH sides come from the domain helper now. The target-side clauses used to
+    // be inline "because aliases differ (n/f vs src/sf)", and that inline copy
+    // then fell a fix behind: within this one query the source rows were judged
+    // by the anchored, case-sensitive GLOB rule and the target rows by the old
+    // unanchored, case-insensitive LIKE. `prod_filter_and` takes the aliases.
     let mut hot_functions = Vec::new();
     {
         let prod_join = crate::domain::prod_source_join_sql("e");
         let prod_where = crate::domain::prod_source_filter_and();
         let test_where = crate::domain::test_source_filter_or();
+        let target_filter = crate::domain::prod_filter_and("n", "f");
         let sql = format!(
             "SELECT n.name, n.type, f.path, \
                COUNT(CASE WHEN {prod_where} THEN e.id END) as prod_cnt, \
@@ -323,11 +329,7 @@ pub fn get_project_map(
              WHERE e.relation = ?1 \
                AND n.type IN ('function', 'method') \
                AND n.name != '<module>' \
-               AND n.is_test = 0 \
-               AND n.name NOT LIKE 'test\\_%' ESCAPE '\\' \
-               AND f.path NOT LIKE 'tests/%' \
-               AND f.path NOT LIKE 'benches/%' \
-               AND f.path NOT LIKE '%\\_test.%' ESCAPE '\\' \
+               AND {target_filter} \
              GROUP BY n.name, n.type, f.path \
              HAVING prod_cnt > 0 \
              ORDER BY prod_cnt DESC, n.name, n.type, f.path \

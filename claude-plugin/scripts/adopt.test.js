@@ -16,6 +16,15 @@ const os = require('os');
 // exactly one per run. Same shape as the leak fixed in tmp-dir.test.js: a
 // module-load mkdtemp with no owner, invisible to the exit code.
 const ISOLATED_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-isolated-home-'));
+// And CLAUDE_CONFIG_DIR is dropped, not just HOME. These tests call adopt()/
+// unadopt() IN-PROCESS, and `claudeHome()` is
+// `CLAUDE_CONFIG_DIR || homedir/.claude` — the env var outranks the redirected
+// HOME above, so for a developer who exports it the adoption registry and the
+// per-project memory dirs were written into their LIVE config (measured: five
+// `projects/<slug>/memory/` trees landed in a canary config dir). The two tests
+// that need the variable set it themselves and restore the previous value,
+// which is now correctly "absent".
+delete process.env.CLAUDE_CONFIG_DIR;
 process.env.HOME = ISOLATED_HOME;
 test.after(() => {
   try { fs.rmSync(ISOLATED_HOME, { recursive: true, force: true }); } catch { /* best effort */ }

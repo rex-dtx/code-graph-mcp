@@ -3,7 +3,8 @@
 ## Unreleased
 
 Audit 2026-07-27 P2 batch: 11 of the ~29 observations, chosen for the ones whose
-failure mode is silence. No `INDEX_VERSION` change; no rebuild.
+failure mode is silence, plus the seven findings an independent review raised
+against the batch itself. No `INDEX_VERSION` change; no rebuild.
 
 ### Added
 - **`.gitattributes` (`* text=auto eol=lf`)** — pins LF in the working tree on
@@ -67,6 +68,50 @@ failure mode is silence. No `INDEX_VERSION` change; no rebuild.
   found" for a request naming a real symbol.
 - **`git rev-list` gained its `--` separator** (P2-26), matching the `ls-files`
   sibling 40 lines away that already carried the comment explaining why.
+
+### Fixed in review (defects this batch introduced)
+- **`dead-code . --json` and `dead-code <dir>/ --json` hard-errored whenever the
+  answer was legitimately clean.** The new unindexed-path probe compared against
+  root-relative stored paths, and `.` normalizes to `""` while a tab-completed
+  `src/` keeps its slash — neither equals a stored path nor prefixes one with
+  `/`. So the fix inverted exactly the case it set out to make honest: a clean
+  repo answered "no indexed files" and exit 1, breaking anything gating CI on the
+  exit code the day it went green. The original negative control used bare `src`,
+  the one spelling of four that worked; it now covers all four, and forces the
+  report empty with `--min-lines 999` so the probe is actually reached — without
+  that the loop passed no matter what the probe did.
+- **The `concurrency.group` fix did not serialize the two runs it named.** A
+  group key is compared as a literal string, so the plain `inputs.tag ||`
+  spelling used everywhere else in the file yields `release-v0.109.0` for a
+  dispatch and `release-refs/tags/v0.109.0` for the tag push — still two keys.
+  It now rebuilds the ref with `format('refs/tags/{0}', …)`. The other six sites
+  are correct with the plain form because they feed `ref:` / `tag_name:`, where
+  both spellings resolve to the same object.
+- **`project_map`'s two inline copies of the test rule were left a fix behind.**
+  Inside one `hot_functions` query the source rows were judged by the new
+  anchored, case-sensitive GLOB and the target rows by the old unanchored,
+  case-insensitive LIKE, so `Test_Signup` and anything in `*_test.ts` /
+  `*_test.java` / `*_test.rb` vanished from `project_map` while `callgraph`
+  listed all their callers. Both now splice `domain::prod_filter_and`, which
+  takes the alias pair.
+- **Seven more JS test files wrote into the real Claude config.** v0.108.1 closed
+  this in two files and missed a third; the fix for that missed seven more,
+  including `adopt.test.js`, which redirects `HOME` in-process rather than
+  spawning. Measured against a canary config dir: five `projects/<slug>/memory/`
+  trees and a fabricated `9.9.9` plugin version landed in it. Now neutralized at
+  module load, with a guard covering both the spawn and in-process shapes — the
+  first version of that guard checked only spawns, and a second version stayed
+  green when the statement was commented out because it used `contains` on the
+  whole file rather than matching a line.
+- **The 24h rate-limit backoff became load-bearing without ever having run.**
+  Fixing the state clobber (P2-19) activated a constant written for a dead path.
+  GitHub's unauthenticated quota resets *hourly*, and the backoff arm outranks
+  `--force`, so one 403 froze every update check — force included — for a full
+  day. Now one hour, with the recovery direction asserted.
+- The plugin sidecar fetch gets the same single retry the binary sidecar has, and
+  the plugin asset excludes `*.test.js`, matching the npm `files` allowlist.
+- The `uses:` vacuity floor in the pin guard was 21 against a real count of 41,
+  so a parse regression halving it would have passed.
 
 ## v0.108.1 — post-release review of v0.108.0
 

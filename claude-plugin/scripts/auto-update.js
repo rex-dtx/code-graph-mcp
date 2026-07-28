@@ -39,7 +39,13 @@ const BINARY_CACHE_DIR = path.join(CACHE_DIR, 'bin');
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h — steady-state re-check
 const UP_TO_DATE_RECHECK_MS = 30 * 60 * 1000;        // 30min — re-verify an "up to date" result (release-race guard)
 const SESSION_START_MIN_GAP_MS = 2 * 60 * 1000;      // 2min — anti-hammer floor for forced (session-start) checks
-const RATE_LIMIT_INTERVAL_MS = 24 * 60 * 60 * 1000;  // 24h if rate-limited
+// GitHub's unauthenticated REST quota is 60 req/hr and resets HOURLY, so one
+// hour is the whole wait — 24h was written when this constant was unreachable
+// (checkForUpdate erased `rateLimited` on the same call that set it) and became
+// load-bearing the moment that was fixed, having never once been exercised. At
+// 24h a single 403 on a shared/NAT'd IP froze every update check for a day,
+// `--force` included, because the backoff arm sits above the force arm below.
+const RATE_LIMIT_INTERVAL_MS = 60 * 60 * 1000;       // 1h — GitHub's reset window
 const FETCH_TIMEOUT_MS = 3000;
 
 function isSilentMode(argv = process.argv.slice(2), env = process.env) {
@@ -511,13 +517,19 @@ async function downloadAndInstall(latest, {
       latest.pluginTarballUrl,
     ], { timeout: 30000, stdio: 'pipe' });
 
+    // One retry, matching the binary sidecar at :355 — same failure mode, same
+    // argument: a transient blip should cost an update cycle, not force a
+    // refusal. The first version of this gave the binary two attempts and the
+    // plugin one, for no reason anyone could state.
     const shaPath = tarballPath + '.sha256';
     let expectedSha = null;
-    try {
-      exec('curl', ['-sfL', '-o', shaPath, latest.pluginTarballUrl + '.sha256'],
-        { timeout: 30000, stdio: 'pipe' });
-      expectedSha = (fs.readFileSync(shaPath, 'utf8').trim().split(/\s+/)[0]) || null;
-    } catch { /* refused just below */ }
+    for (let attempt = 0; attempt < 2 && !expectedSha; attempt++) {
+      try {
+        exec('curl', ['-sfL', '-o', shaPath, latest.pluginTarballUrl + '.sha256'],
+          { timeout: 30000, stdio: 'pipe' });
+        expectedSha = (fs.readFileSync(shaPath, 'utf8').trim().split(/\s+/)[0]) || null;
+      } catch { /* retried once, then refused just below */ }
+    }
     const actualSha = fs.existsSync(tarballPath) ? sha256File(tarballPath) : null;
     if (!expectedSha || !actualSha || expectedSha.toLowerCase() !== actualSha.toLowerCase()) {
       console.error(`[code-graph] Plugin tarball integrity check failed (expected ${expectedSha || '<no sidecar>'}, got ${actualSha || '<no download>'}) — refusing to extract.`);

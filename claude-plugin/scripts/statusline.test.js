@@ -16,6 +16,18 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
+//
+// Every sandbox below redirects HOME and then spawns with `{...process.env}`,
+// which passes the variable straight through — and `claudeHome()` is
+// `CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var WINS over the
+// redirected HOME. For a developer who exports it (the documented multi-profile
+// setup) these tests wrote into their LIVE config: measured, a `9.9.9` plugin
+// version landed in the real plugins cache. Deleting it here fixes every spawn
+// site at once instead of 40 call sites, and `tests/hardening.rs`'s
+// `js_test_files_neutralize_claude_config_dir` keeps new files from skipping it.
+delete process.env.CLAUDE_CONFIG_DIR;
+
 const STATUSLINE = path.join(__dirname, 'statusline.js');
 
 function mkHome(t) {

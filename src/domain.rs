@@ -736,14 +736,30 @@ fn infix_test_path_glob(file_alias: &str, joiner: &str) -> String {
 /// (audit P2-3), asserted one-directionally by
 /// `prod_source_filter_never_excludes_a_production_path`.
 pub fn prod_source_filter_and() -> String {
+    prod_filter_and("src", "sf")
+}
+
+/// Same rule for an arbitrary node/file alias pair.
+///
+/// `project_map` carried two hand-written copies of these conditions against its
+/// own `n`/`f` aliases, and the 2026-07-27 batch fixed only the `ESCAPE` on
+/// their path leg — so within one `hot_functions` query the SOURCE rows were
+/// judged by the anchored, extension-pinned, case-sensitive rule here while the
+/// TARGET rows kept the unanchored, any-extension, case-insensitive LIKE. Any
+/// symbol in `*_test.java` / `*_test.ts` / `*_test.rb` (only go/rs/py/dart are
+/// in `INFIX_TEST_EXTS`), or named `Test_*`, vanished from `project_map` while
+/// `callgraph` listed all its callers.
+pub fn prod_filter_and(node_alias: &str, file_alias: &str) -> String {
+    let n = node_alias;
+    let f = file_alias;
     format!(
-        "src.is_test = 0 \
-         AND src.name NOT GLOB 'test_*' \
-         AND sf.path NOT LIKE 'tests/%' \
-         AND sf.path NOT LIKE 'benches/%' \
+        "{n}.is_test = 0 \
+         AND {n}.name NOT GLOB 'test_*' \
+         AND {f}.path NOT LIKE 'tests/%' \
+         AND {f}.path NOT LIKE 'benches/%' \
          AND NOT ({infix}) \
-         AND sf.path NOT LIKE '%/tests.rs'",
-        infix = infix_test_path_glob("sf", " OR "),
+         AND {f}.path NOT LIKE '%/tests.rs'",
+        infix = infix_test_path_glob(f, " OR "),
     )
 }
 

@@ -12,6 +12,18 @@ const lifecycleCli = path.join(__dirname, 'lifecycle.js');
 const compositeCli = path.join(__dirname, 'statusline-composite.js');
 const currentVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
 
+// `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
+//
+// The sandboxes below redirect HOME and spawn with `{...process.env}`, which
+// passes the variable straight through — and `claudeHome()` is
+// `CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var WINS over the
+// redirected HOME. For a developer who exports it (the documented multi-profile
+// setup) these tests wrote into their LIVE config: measured, a fabricated
+// `9.9.9` plugin version landed in the real plugins cache. Deleting it here
+// covers every spawn site at once; the few tests that need the variable set it
+// explicitly in their own child env, which still wins.
+delete process.env.CLAUDE_CONFIG_DIR;
+
 // Per-test cleanup PLUS a run-end sweep. The per-test `t.after` alone left
 // exactly one `code-graph-e2e-*` directory behind per run — 154 had accumulated
 // in ~/.claude/tmp/ — and the survivor held only
