@@ -403,3 +403,62 @@ test('a read-only ~/.claude is reported by the missing-hooks arm too', (t) => {
     'must not claim the hooks were already registered');
   assert.notEqual(r.code, 0, 'nothing was fixed, so this is not a clean run');
 });
+
+// ── the exit code must reflect what doctor could NOT fix — on every entry point ─
+//
+// `unresolvedCount` has a unit test above, but a predicate test does not cover
+// whether anything calls the predicate — this repo learned that in v0.45.3, on a
+// self-heal glue that regressed twice while its predicate stayed green. The exit
+// code is now produced by three entry points (doctor.js, `lifecycle.js doctor`,
+// and the Rust binary, which used to filter argv before dispatch), so the wiring
+// is exactly the part that can drift.
+//
+// The invariant asserted here is the CHANGELOG v0.85.4 promise in its own terms:
+// exit 0 when every found issue was resolved, 1 when something was left, and
+// --check-only nonzero whenever any issue exists at all.
+//
+// HONEST SCOPE — what this can and cannot catch. It compares the exit code
+// against doctor's OWN "N/M addressed" line, so it only distinguishes
+// "unresolved" from "found" in an environment where they differ, i.e. where
+// every found issue was fixable. On a checkout whose src/ is newer than the
+// built binary, the unfixable "Source fresh" issue makes remaining>0 always, and
+// then `found>0` and `remaining>0` agree — reverting `unresolvedCount` to the
+// pre-v0.85.4 `return issueCount` leaves these two tests GREEN (measured; only
+// the predicate test above reddens). Treat the 0-branch as pinned by the
+// predicate test plus the report-vs-code consistency here, NOT by these alone.
+for (const entry of ENTRY_POINTS) {
+  test(`${entry.label}: exit code equals "did anything remain unfixed"`, (t) => {
+    const home = freshHome(t);
+    const r = runDoctorCli(home, [], entry);
+    const addressed = /(\d+)\/(\d+) issue\(s\) addressed/.exec(r.stdout);
+    const found = /(\d+) issue\(s\) found/.exec(r.stdout);
+
+    if (!found) {
+      // A perfectly clean sandbox: nothing found, nothing to leave unfixed.
+      assert.equal(r.code, 0, `no issues found must exit 0; got ${r.code}\n${r.stdout}`);
+      return;
+    }
+    assert.ok(addressed, `a repair run that found issues must report N/M addressed:\n${r.stdout}`);
+    const fixed = Number(addressed[1]);
+    const total = Number(addressed[2]);
+    const remaining = total - fixed;
+    assert.equal(
+      r.code, remaining > 0 ? 1 : 0,
+      `exit code must key off issues left UNRESOLVED (${remaining} of ${total}), not issues found. ` +
+      `A run that fixed everything and still exited 1 is what broke \`doctor && …\` ` +
+      `and every self-heal caller.\n${r.stdout}`
+    );
+  });
+
+  test(`${entry.label}: --check-only exits nonzero while any issue exists`, (t) => {
+    const home = freshHome(t);
+    const r = runDoctorCli(home, ['--check-only'], entry);
+    if (/issue\(s\) found/.test(r.stdout)) {
+      assert.notEqual(r.code, 0,
+        `--check-only must stay nonzero while issues exist — it repairs nothing, ` +
+        `so "all resolved" can never be true for it.\n${r.stdout}`);
+    }
+    assert.doesNotMatch(r.stdout, /issue\(s\) addressed/,
+      '--check-only must not claim to have addressed anything');
+  });
+}

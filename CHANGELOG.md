@@ -281,6 +281,31 @@ next `code-graph-mcp incremental-index`.
   index mode so it cannot silently revert.
 
 ### Internal
+- **Two independent test flakes, both root-caused.** `trackReadAndMaybeHint` failed
+  about one full-suite run in seven: it spawns a real `node` stub through
+  `cg-answer`, whose 2 s timeout is a product decision for a PreToolUse hook, so
+  under load cold node startup exceeded it. A test-only `_CG_ANSWER_TIMEOUT_MS`
+  seam (next to the `_CG_ANSWER_BINARY` one already there) insulates the tests
+  without lowering the hook's bar. What remained after that was a DIFFERENT
+  test — `cgTmpDir() returns the same path and creates the directory` — at 2
+  failures in 40 instrumented runs: it wipes the process-wide `CG_TMP_DIR` and
+  asserts it is absent, while `node --test` runs test files in parallel and any
+  sibling calling `cgTmpDir()` re-creates it inside that window. That file now
+  owns a private `TMPDIR`. Measured 0 failures in 40 runs afterwards, with the
+  failing test names recorded per run rather than only a pass count — the earlier
+  "30 clean runs" claim could not distinguish the two flakes because it did not
+  capture names.
+- **Three shipped promises verified against behavior, two already guarded.** A
+  sweep had listed the v0.85.4 `doctor` exit-code semantics, the read-only
+  secondary MCP explanation, and the `application_id` downgrade preservation as
+  unclassified. All three hold. Two turned out to have live tests — mutation runs
+  confirm `test_downgrade_open_never_wipes_newer_index` reddens when the version
+  check is made symmetric again, and `test_secondary_not_found_includes_stale_hint`
+  reddens when the hint text is removed. The third had a live PREDICATE test
+  (`unresolvedCount`) but no wiring test, which is the gap this repo already
+  named in v0.45.3; the exit code is now produced by three entry points, so a
+  report-vs-exit-code consistency test runs against each. Its limits are recorded
+  in the test itself rather than implied.
 - **The `<external>` query-layer exclusion had no live guard.** Round-6 mutation
   runs showed that both tests believed to cover it — `external_sentinel_tests` in
   `src/resolve.rs` and the "negative control" in the MCP integration test —
