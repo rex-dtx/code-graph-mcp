@@ -31,7 +31,19 @@ impl McpServer {
         // Normalize the caller's separator spelling ONCE, at entry, so the
         // freshness target and the index lookup key below are the same string
         // (see `super::normalize_path_arg`). Must precede the freshness call.
-        let file_path_arg = args["file_path"].as_str().map(super::normalize_path_arg);
+        //
+        // Empty/whitespace-only `file_path` behaves like absent, matching the
+        // `symbol_name` treatment 40 lines below and the `.filter(|s|
+        // !s.trim().is_empty())` every sibling tool applies (trace, deps,
+        // similar, ast_search, callgraph). This was the one of the five without
+        // it, so `{symbol_name: "foo", file_path: ""}` took the file branch and
+        // answered "File '' not found" instead of resolving by name — an LLM
+        // client that fills every declared field with a placeholder gets a hard
+        // error for a request that names a real symbol.
+        let file_path_arg = args["file_path"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(super::normalize_path_arg);
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;

@@ -6203,14 +6203,56 @@ fn test_cli_json_empty_dead_code() {
 fn test_cli_json_empty_similar() {
     // Regression: `similar <existing-symbol>` where vector search yielded no matches
     // wrote only stderr and exited 0 with empty stdout, breaking JSON consumers.
-    // Symbol-not-found path already emits []; this guards the no-match path too.
+    //
+    // Audit 2026-07-27 P2-14: the fix emitted a bare `[]`, and THIS TEST froze
+    // that — `similar` was the last exit-1 miss in the CLI still answering with
+    // an array while `impact`, `callgraph`, `trace` and `deps` all answer with
+    // `{error, symbol}`. A bare `[]` on exit 1 is indistinguishable from a
+    // successful empty result once stderr is dropped, which is the failure the
+    // three-tier contract exists to prevent — so the assertion that was supposed
+    // to enforce the contract was pinning its violation.
     let project = setup_indexed_project();
     let (stdout, _, code) = run_cli(&project, &["similar", "xyznonexistent", "--json"]);
     assert_eq!(code, 1);
-    assert_eq!(
-        stdout.trim(),
-        "[]",
-        "JSON similar with unknown symbol should output []"
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("similar --json must output valid JSON on a miss");
+    assert!(
+        v.is_object(),
+        "an exit-1 miss must be an error OBJECT, not a bare array: {stdout}"
+    );
+    assert_eq!(v["symbol"], "xyznonexistent");
+    assert_eq!(v["error"], "Symbol not found");
+}
+
+/// The other two `similar` exit-1 misses take the same shape, and the
+/// capability-missing case discloses rather than claiming emptiness.
+#[test]
+fn test_cli_json_similar_misses_all_carry_a_reason() {
+    let project = setup_indexed_project();
+
+    // --node-id that does not exist.
+    let (stdout, _, code) = run_cli(&project, &["similar", "--node-id", "999999", "--json"]);
+    assert_eq!(code, 1, "unknown node_id must exit 1; got:\n{stdout}");
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("similar --node-id --json must emit valid JSON");
+    assert!(v.is_object(), "expected an error object, got: {stdout}");
+    assert_eq!(v["error"], "node_id not found");
+    assert_eq!(v["node_id"], 999999);
+
+    // Existing symbol, but the build/index cannot answer: either sqlite-vec is
+    // absent (exit 0, disclosure object) or no embeddings exist (exit 1, error
+    // object). Which one depends on the feature set, so assert what BOTH must
+    // carry — a machine-readable reason, never a bare `[]`.
+    let (stdout, _, _) = run_cli(&project, &["similar", "validateToken", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("similar --json must emit valid JSON for an existing symbol");
+    if v.is_array() {
+        // embed-model build with embeddings present: a real result array.
+        return;
+    }
+    assert!(
+        v.get("error").is_some() || v.get("unavailable").is_some(),
+        "an empty similar answer must say why it is empty: {stdout}"
     );
 }
 
@@ -7100,5 +7142,61 @@ export function fromB(): number { return fromA(); }
     assert!(
         !v["import_cycles"].as_array().unwrap().is_empty(),
         "should report the a.ts <-> b.ts import cycle; got {stdout}"
+    );
+}
+
+/// Audit 2026-07-27 P2-15: `dead-code <path-with-nothing-indexed> --json`
+/// answered `[]` with exit 0 — a clean bill of health for a path the index has
+/// never heard of. `overview` answers the same input with an error object and
+/// exit 1, and the two surfaces disagreed about the identical failure.
+///
+/// The path is in-root and well-formed, so `normalize_user_path` passes it
+/// through by design; nothing before the query can tell that it names no
+/// indexed file. Under `--json 2>/dev/null` the old answer is byte-identical to
+/// "this directory genuinely has no dead code", which is the shape an LLM client
+/// acts on.
+#[test]
+fn test_cli_json_dead_code_unindexed_path_discloses() {
+    let project = setup_indexed_project();
+
+    let (stdout, _, code) = run_cli(&project, &["dead-code", "src/no_such_dir_xyz", "--json"]);
+    assert_eq!(
+        code, 1,
+        "an unindexed path filter must not exit 0; got:\n{stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("stdout must stay valid JSON on the disclosure path");
+    assert!(v.is_object(), "expected an error object, got: {v}");
+    assert_eq!(v["path"], "src/no_such_dir_xyz");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("No indexed files"),
+        "the error must say WHY, not just that it is empty: {v}"
+    );
+
+    // Same shape as the surface it was diverging from.
+    let (ov_stdout, _, ov_code) = run_cli(&project, &["overview", "src/no_such_dir_xyz", "--json"]);
+    assert_eq!(
+        ov_code, code,
+        "dead-code and overview must agree on exit code"
+    );
+    let ov: serde_json::Value = serde_json::from_str(ov_stdout.trim()).unwrap();
+    assert!(ov.is_object() && ov.get("error").is_some());
+
+    // Negative control: a path that IS indexed and simply has no dead code must
+    // still take the true-empty path — `[]`, exit 0. Without this, "disclose
+    // harder" would pass by turning every clean run into an error.
+    let (clean_stdout, _, clean_code) = run_cli(&project, &["dead-code", "src", "--json"]);
+    assert_eq!(
+        clean_code, 0,
+        "an indexed path must keep the true-empty contract; got:\n{clean_stdout}"
+    );
+    let clean: serde_json::Value = serde_json::from_str(clean_stdout.trim())
+        .expect("indexed-path dead-code must emit valid JSON");
+    assert!(
+        clean.is_array() || clean.get("error").is_none(),
+        "an indexed path must not be reported as an error: {clean}"
     );
 }

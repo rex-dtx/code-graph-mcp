@@ -1473,3 +1473,57 @@ fn mcp_module_overview_rejects_drive_roots_but_not_colon_filenames() {
         );
     }
 }
+
+/// Audit 2026-07-27 (incremental) Δ1: `get_ast_node` was the one of five tools
+/// that did not treat an empty `file_path` as absent.
+///
+/// `trace`, `dependency_graph`, `find_similar_code`, `ast_search` and
+/// `get_call_graph` all carry `.filter(|s| !s.trim().is_empty())`, and this same
+/// function applies it to `symbol_name` forty lines below. Without it,
+/// `{symbol_name: "target_fn", file_path: ""}` took the by-file branch and came
+/// back "File '' not found" — a hard error for a request that names a real
+/// symbol. An LLM client that fills every declared field with a placeholder hits
+/// this on its first call.
+#[test]
+fn mcp_get_ast_node_treats_an_empty_file_path_as_absent() {
+    let project = setup_fixture_project();
+    let mut client = McpClient::spawn(project.path());
+
+    let by_name = client.call_tool("get_ast_node", json!({ "symbol_name": "target_fn" }));
+
+    for blank in ["", "   ", "\t"] {
+        let resp = client.call_tool(
+            "get_ast_node",
+            json!({ "symbol_name": "target_fn", "file_path": blank }),
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            resp["result"]["isError"].as_bool() != Some(true),
+            "file_path={blank:?} must behave like absent, not error: {text}"
+        );
+        assert!(
+            !text.contains("File '' not found") && !text.contains("not found"),
+            "file_path={blank:?} still took the by-file branch: {text}"
+        );
+        assert_eq!(
+            extract_tool_payload(&resp),
+            extract_tool_payload(&by_name),
+            "file_path={blank:?} must return exactly what omitting it returns"
+        );
+    }
+
+    // Negative control: a non-blank path that really is absent must STILL error.
+    // Otherwise "treat blank as absent" could have been implemented by dropping
+    // the by-file branch entirely and this test would not notice.
+    let missing = client.call_tool(
+        "get_ast_node",
+        json!({ "symbol_name": "target_fn", "file_path": "src/no_such_file_xyz.rs" }),
+    );
+    let missing_text = missing["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        missing["result"]["isError"].as_bool() == Some(true) || missing_text.contains("not found"),
+        "a real but absent file_path must still be reported: {missing_text}"
+    );
+}

@@ -6890,8 +6890,18 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     let conn = db.conn();
 
     if !db.vec_enabled() {
+        // Disclosure object, not `[]`. This is the CAPABILITY-missing case: a
+        // bare array under `2>/dev/null` says "no similar code exists", when the
+        // truth is that similarity could not be computed at all. Middle tier of
+        // the three-tier JSON contract (feedback_cli_json_empty_contract).
         if json_mode {
-            println!("[]");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "results": [],
+                    "unavailable": "vector search (sqlite-vec extension not loaded)",
+                })
+            );
         }
         eprintln!("[code-graph] Vector search not available (sqlite-vec extension not loaded).");
         eprintln!("  To enable: build with `cargo build --release --features embed-model`.");
@@ -6911,7 +6921,10 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         // in the default (no embed-model) build, and mirrors refs --node-id.
         if queries::get_node_by_id(conn, nid)?.is_none() {
             if json_mode {
-                println!("[]");
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": "node_id not found", "node_id": nid })
+                );
             }
             eprintln!("[code-graph] node_id {} not found in index", nid);
             std::process::exit(1);
@@ -6928,7 +6941,10 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
             Some(id) => (id, symbol.to_string()),
             None => {
                 if json_mode {
-                    println!("[]");
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": "Symbol not found", "symbol": symbol })
+                    );
                 }
                 // All-digit positional is almost certainly a node_id mistakenly passed
                 // without the flag — guide the user instead of "Symbol not found: 1010".
@@ -6953,7 +6969,15 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         // but no embeddings generated yet) is the only one in cmd_similar that was
         // missing it — a consumer piping stdout got an empty string → parse error.
         if json_mode {
-            println!("[]");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "No embeddings found",
+                    "symbol": target_label,
+                    "embedded_count": embedded_count,
+                    "total_nodes": total_nodes,
+                })
+            );
         }
         eprintln!(
             "[code-graph] No embeddings found ({}/{} nodes embedded).",
@@ -7566,6 +7590,43 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         // stderr: under `--json 2>/dev/null` a bare `[]` reads as "clean" even
         // when --ignore/--min-lines hid real candidates (disclosure-gap class,
         // roadmap 2026-07-18 §1.2). True clean keeps the plain `[]`.
+        // A path filter that matches NO indexed file is zero coverage, not a
+        // clean bill of health, and it is the one empty case `dead-code` still
+        // reported as `[]` + exit 0. `overview` answers the same input with an
+        // error object + exit 1 (:5641), and `normalize_user_path`'s own doc
+        // names this failure mode — a path can be in-root and well-formed while
+        // naming nothing indexed, so normalization cannot catch it. Under
+        // `--json 2>/dev/null` the old answer was indistinguishable from "this
+        // directory genuinely has no dead code".
+        //
+        // Compared in Rust rather than with SQL `LIKE`: the prefix is user
+        // input, and `_`/`%` in a filename would silently widen the match — the
+        // exact wildcard bug fixed in `prod_source_filter_and` this same batch.
+        let unindexed_prefix = path_filter.filter(|prefix| {
+            let scan = conn.prepare("SELECT path FROM files").and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            });
+            match scan {
+                // Only claim "nothing indexed here" when the scan succeeded.
+                Ok(paths) => !paths
+                    .iter()
+                    .any(|p| p == prefix || p.starts_with(&format!("{prefix}/"))),
+                Err(_) => false,
+            }
+        });
+        if let Some(prefix) = unindexed_prefix {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": "No indexed files under path", "path": prefix })
+                );
+                eprintln!("[code-graph] No indexed files under: {prefix}");
+                std::process::exit(1);
+            }
+            anyhow::bail!("[code-graph] No indexed files under: {prefix}");
+        }
+
         if report.ignored_count > 0 {
             if json_mode {
                 println!(
