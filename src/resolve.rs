@@ -344,6 +344,33 @@ mod fuzzy_tests {
 #[cfg(test)]
 mod external_sentinel_tests {
     use super::*;
+
+    /// Direct coverage for `is_selectable_definition`.
+    ///
+    /// Round 7 measured that NO test in the suite detects neutering this
+    /// predicate: the by-name SQL guard (`EXCLUDE_EXTERNAL_BY_NAME`) runs first
+    /// and no reachable input reaches here carrying an `<external>` path. That
+    /// makes it dead weight today and load-bearing the moment the SQL exclusion
+    /// is relaxed — the direction its own doc comment contemplates for `deps`
+    /// disclosure. This test covers the FUNCTION, not its reachability; the
+    /// end-to-end guard is
+    /// `show_does_not_resolve_a_name_that_exists_only_as_an_import`.
+    #[test]
+    fn is_selectable_definition_rejects_only_the_external_sentinel() {
+        assert!(!is_selectable_definition(crate::domain::EXTERNAL_FILE_PATH));
+        for real in [
+            "src/lib.rs",
+            "src/a.rs",
+            "external.rs",
+            "src/<external>.rs",
+            "",
+        ] {
+            assert!(
+                is_selectable_definition(real),
+                "{real:?} is a real path and must stay selectable"
+            );
+        }
+    }
     use crate::storage::db::Database;
     use tempfile::TempDir;
 

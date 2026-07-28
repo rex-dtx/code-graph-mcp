@@ -1305,11 +1305,6 @@ fn mcp_find_references_answers_for_an_import_only_name() {
     )
     .unwrap();
     std::fs::write(
-        src.join("c.rs"),
-        "use std::fmt::Debug;\npub struct S;\nimpl Debug for S {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, \"S\") }\n}\npub fn use_s() -> S { S }\n",
-    )
-    .unwrap();
-    std::fs::write(
         project.path().join("Cargo.toml"),
         "[package]\nname = \"ext_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
     )
@@ -1369,9 +1364,11 @@ fn mcp_find_references_answers_for_an_import_only_name() {
     // The live guard for that exclusion is
     // `show_does_not_resolve_a_name_that_exists_only_as_an_import` in
     // tests/reader_nondestructive.rs, which drives the binary at the surface
-    // where the defect was observed and does go red under both mutations. What
-    // the assertions below DO cover is project-symbol preference, which is worth
-    // pinning on its own.
+    // where the defect was observed. Round-7 correction: it goes red under the
+    // SQL mutation only — `is_selectable_definition` sits BEHIND that guard, so
+    // no reachable input exercises it end-to-end, and it is unit-tested directly
+    // in src/resolve.rs instead. What the assertions below DO cover is
+    // project-symbol preference, which is worth pinning on its own.
     let resp = client.call_tool("find_references", json!({ "symbol_name": "take" }));
     let body = extract_tool_payload(&resp);
     let refs = body["references"]
@@ -1390,37 +1387,11 @@ fn mcp_find_references_answers_for_an_import_only_name() {
         "a name with a real project definition must not resolve to `<external>`: {body}"
     );
 
-    // The live half of the control: `Debug` exists only as an IMPLEMENTS
-    // sentinel, which is typed `trait` and therefore sails past the
-    // `n.type != 'module'` filter that made the `take` case unable to fail.
-    // Whatever find_references answers for it, it must not be a phantom
-    // definition — and it must not be described as a test/bench path.
-    let resp = client.call_tool("find_references", json!({ "symbol_name": "Debug" }));
-    if let Some(text) = resp
-        .get("error")
-        .and_then(|e| e["message"].as_str())
-        .or_else(|| {
-            if resp["result"]["isError"].as_bool() == Some(true) {
-                resp["result"]["content"][0]["text"].as_str()
-            } else {
-                None
-            }
-        })
-    {
-        assert!(
-            !text.contains("test/bench paths"),
-            "`<external>` is not a test/bench path: {text}"
-        );
-    } else {
-        let body = extract_tool_payload(&resp);
-        let refs = body["references"].as_array().cloned().unwrap_or_default();
-        assert!(
-            refs.iter().all(|r| {
-                r["relation"].as_str() == Some("imports")
-                    || r["relation"].as_str() == Some("implements")
-            }),
-            "a trait known only through `use` must surface as its import/impl \
-             edges, never as a resolved definition of its own: {body}"
-        );
-    }
+    // An earlier version added a `Debug` trait-sentinel block here labelled "the
+    // live half of the control". Round 7 instrumented it: the payload is
+    // byte-identical with and without the exclusion, because find_references
+    // answers from EDGE rows, which never enter the by-name lookups the
+    // exclusion filters — as `EXCLUDE_EXTERNAL_BY_NAME`'s own doc comment states.
+    // It was the FOURTH inert control in this effort, so it is deleted rather
+    // than relabelled: an inert block invites the next reader to trust it.
 }

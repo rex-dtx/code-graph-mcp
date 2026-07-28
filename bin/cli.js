@@ -11,6 +11,23 @@ process.env._FIND_BINARY_ROOT = path.resolve(__dirname, "..");
 // (write to ~/.claude/projects/<slug>/memory/) and have no Rust counterpart.
 // Lets `code-graph-mcp adopt` / `unadopt` work uniformly across plugin / npm / npx.
 const sub = process.argv[2];
+
+// Reject unknown flags on the intercepted subcommands BEFORE doing their work.
+// `--help` was already guarded, but every OTHER token was ignored, so
+// `code-graph-mcp adopt --helpp` ran adopt and wrote the user's CLAUDE.md — a
+// typo away from the very side effect the --help guard exists to prevent. This
+// is the fourth entry point onto the same "ignore what you don't recognise"
+// idiom (doctor.js, lifecycle.js doctor, src/main.rs were the first three); it
+// is the npm/npx surface, so it is the one most users reach.
+function rejectUnknownFlags(name, known) {
+  const unknown = process.argv.slice(3).filter((a) => !known.has(a));
+  if (unknown.length) {
+    process.stderr.write(
+      `code-graph-mcp ${name}: unknown argument(s): ${unknown.join(" ")}\n` +
+      `Run \`code-graph-mcp ${name} --help\` for usage.\n`);
+    process.exit(2);
+  }
+}
 if (sub === "adopt" || sub === "unadopt") {
   // `--help`/`-h` must be side-effect-free: adopt() writes the memory file +
   // MEMORY.md sentinel, unadopt() removes them. The Rust binary guards this for
@@ -19,17 +36,23 @@ if (sub === "adopt" || sub === "unadopt") {
   // `code-graph-mcp adopt --help` rewrites MEMORY.md (the common new-user path).
   if (process.argv.slice(3).some((a) => a === "--help" || a === "-h")) {
     process.stdout.write(sub === "adopt"
-      ? "code-graph-mcp adopt — install the code-graph memory file + MEMORY.md sentinel\n\n" +
+      // Kept in sync with src/main.rs's adopt/unadopt help. This text described
+      // the pre-v0.74 scheme (a sentinel in the ~/.claude memory dir) for three
+      // releases after the target moved to the project's own CLAUDE.md, so npm
+      // users were told this command edits a file it has not touched since.
+      ? "code-graph-mcp adopt — install the code-graph steering block into the project CLAUDE.md\n\n" +
         "USAGE:\n    code-graph-mcp adopt\n\n" +
-        "Writes plugin_code_graph_mcp.md and a sentinel block into this project's\n" +
-        "~/.claude memory so Claude Code auto-loads the decision table. Run\n" +
-        "`code-graph-mcp unadopt` to remove it.\n"
-      : "code-graph-mcp unadopt — remove the code-graph memory file + sentinel\n\n" +
+        "Writes a sentinel-wrapped managed block into <cwd>/CLAUDE.md plus a\n" +
+        "<cwd>/.claude/plugin_code_graph_mcp.md detail doc, so Claude Code loads the\n" +
+        "decision table each session. Run `code-graph-mcp unadopt` to remove it.\n"
+      : "code-graph-mcp unadopt — remove the code-graph steering block\n\n" +
         "USAGE:\n    code-graph-mcp unadopt\n\n" +
-        "Reverses `code-graph-mcp adopt`: deletes the memory file and the MEMORY.md\n" +
-        "sentinel block. User content outside the sentinel is kept.\n");
+        "Reverses `code-graph-mcp adopt`: strips the managed block from\n" +
+        "<cwd>/CLAUDE.md and deletes <cwd>/.claude/plugin_code_graph_mcp.md.\n" +
+        "User content outside the sentinel is kept.\n");
     process.exit(0);
   }
+  rejectUnknownFlags(sub, new Set(["--help", "-h"]));
   const { adopt, unadopt, formatResult } = require("../claude-plugin/scripts/adopt");
   const result = sub === "unadopt" ? unadopt() : adopt();
   process.stdout.write(formatResult(sub, result) + "\n");
@@ -54,6 +77,7 @@ if (sub === "uninstall") {
       "`/plugin uninstall code-graph-mcp` in Claude Code to sync its UI.\n");
     process.exit(0);
   }
+  rejectUnknownFlags("uninstall", new Set(["--help", "-h", "--unadopt-all", "--purge-global"]));
   const lifecycle = require("../claude-plugin/scripts/lifecycle");
   const { unadopt } = require("../claude-plugin/scripts/adopt");
   const r = lifecycle.uninstall({

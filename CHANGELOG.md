@@ -15,7 +15,7 @@ next `code-graph-mcp incremental-index`.
   they had asked for the read-only one. The read-only contract this release
   otherwise hardens was one keystroke from being inverted. Unknown arguments now
   exit 2 before any diagnosis runs, and `--help` prints usage without acting.
-  All **three** entry points, found one at a time and each by a different means:
+  All **four** entry points, found one at a time and each by a different means:
   `doctor.js` (the original), `node lifecycle.js doctor …` (its own copy of the
   same `includes('--check-only')` line, found by checking which callers the new
   allowlist could reject), and `code-graph-mcp doctor …` — the surface users
@@ -24,9 +24,19 @@ next `code-graph-mcp incremental-index`.
   validation at all. The two JS entry points now share one `runDoctorCli`, which
   also keeps them from drifting on the exit-code rule (issues *unresolved after
   repair*, not issues found); the binary passes its argv tail through verbatim
-  and propagates the exit code. Regression tests run against all three, and the
-  `doctor --help` text is now byte-identical between `src/main.rs` (which
+  and propagates the exit code. The fourth is `bin/cli.js`, the npm/npx wrapper,
+  which intercepts adopt / unadopt / uninstall before the binary: it guarded
+  `--help` but ignored every other token, so `code-graph-mcp adopt --helpp` ran
+  adopt and wrote the user's CLAUDE.md — one keystroke from the side effect the
+  `--help` guard exists to prevent. Regression tests run against all four, and
+  the `doctor --help` text is now byte-identical between `src/main.rs` (which
   intercepts `--help` so it stays side-effect-free) and `doctor.js`.
+- **The npm surface described a scheme it had not touched since v0.74.**
+  `code-graph-mcp adopt --help` / `unadopt --help` via npm/npx still said
+  "install the code-graph memory file + MEMORY.md sentinel" — the pre-v0.74
+  memory-dir target — while the same command on the binary described the
+  project's CLAUDE.md managed block. Two texts for one command; npm users got
+  the stale one.
 - **`grep` explains a flag-shaped pattern instead of just failing on it.** A long
   flag the subcommand does not implement (`grep --quiet foo`) is bound to the
   *pattern* positional — deliberately, so that a term like
@@ -281,6 +291,35 @@ next `code-graph-mcp incremental-index`.
   index mode so it cannot silently revert.
 
 ### Internal
+- **A new e2e test wrote to the real `~/.claude`.** The doctor flag guard's
+  regression test inherited the ambient `HOME`, and its RED state — "doctor
+  performed the repairs", the exact regression it exists to catch — ran the full
+  repair pass over the developer's own settings.json, statusline registration,
+  binary pin and npm cache. The mutation run recorded in this batch's own commit
+  message did precisely that. `HOME` and `CLAUDE_CONFIG_DIR` are now sandboxed
+  per-invocation (the latter because `claude-config.js` honours it ahead of
+  `os.homedir()`), the test asserts nothing landed in the sandbox home, and it
+  pins `_FIND_BINARY_ROOT` so a redirected `CARGO_TARGET_DIR` — this repo's own
+  documented mitigation for target-dir growth — no longer fails it with
+  "must name the offending token" while the real cause ("doctor.js not found")
+  sits in stderr. Verified: with the fix in place, the RED run still reddens and
+  still takes ~89 s, and settings.json, the binary pin and the npm log count are
+  all byte-identical afterwards.
+- **A fourth inert negative control, deleted rather than relabelled.** The
+  `Debug` trait-sentinel block added to the MCP find_references test was labelled
+  "the live half of the control"; instrumenting both branches showed the payload
+  byte-identical with and without the `<external>` exclusion, because
+  `find_references` answers from EDGE rows, which never enter the by-name lookups
+  the exclusion filters — as that constant's own doc comment says. An inert block
+  invites the next reader to trust it.
+- **`is_selectable_definition` had zero live coverage across 1346 tests**, while
+  a comment asserted the reader guard "does go red under both mutations". Only
+  the SQL mutation reddens it: the two guards sit in series with the SQL one
+  first, so no reachable input carries an `<external>` path into the Rust
+  predicate. The claim is corrected in place and the predicate now has a direct
+  unit test, labelled as covering the function and not its reachability — it
+  becomes load-bearing the moment the SQL exclusion is relaxed for the `deps`
+  disclosure its doc comment contemplates.
 - **Two independent test flakes, both root-caused.** `trackReadAndMaybeHint` failed
   about one full-suite run in seven: it spawns a real `node` stub through
   `cg-answer`, whose 2 s timeout is a product decision for a PreToolUse hook, so

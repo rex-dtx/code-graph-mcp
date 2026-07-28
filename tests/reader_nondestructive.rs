@@ -250,6 +250,17 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
 /// observed: before the fix, `show HashMap` in a project that merely imports it
 /// printed `module <external>/HashMap` and exited 0, inventing a definition that
 /// has no file on disk.
+///
+/// SCOPE, corrected by round 7 after an earlier version of this comment claimed
+/// more: it goes red under the SQL mutation (`EXCLUDE_EXTERNAL_BY_NAME` emptied)
+/// and NOT under `is_selectable_definition` → `true`. Those two guards sit in
+/// series with the SQL one first, so no reachable input carries an `<external>`
+/// path into the Rust predicate. Nothing in the suite detects that second
+/// mutation end-to-end; `is_selectable_definition` is unit-tested directly in
+/// src/resolve.rs instead, which covers the function but not its reachability.
+/// If the SQL exclusion is ever relaxed — the direction its own doc comment
+/// contemplates for `deps` disclosure — that predicate becomes load-bearing and
+/// needs an end-to-end guard of its own.
 #[test]
 fn show_does_not_resolve_a_name_that_exists_only_as_an_import() {
     let project = TempDir::new().unwrap();

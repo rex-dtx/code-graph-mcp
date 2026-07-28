@@ -2716,7 +2716,11 @@ fn grep_flaglike_pattern_hint(
 /// they fail with a clear message instead of being swallowed as the pattern.
 pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
     let raw: Vec<String> = argv.iter().skip(1).cloned().collect();
-    let had_literal_separator = raw.iter().any(|a| a == "--");
+    // Position matters. `grep -- --quiet foo` means "search for the literal";
+    // `grep --quiet -- foo` is someone who typo'd a flag and then wrote a
+    // separator for their PATH, and they should still get the hint. Only a
+    // separator standing BEFORE the pattern is the "I meant the literal" signal.
+    let separator_at = raw.iter().position(|a| a == "--");
     if let Some(bad) = first_unsupported_grep_flag(&raw) {
         // --json early-bail must still emit an empty array (CLI JSON contract).
         let json = raw
@@ -2733,8 +2737,14 @@ pub fn parse_grep_args(argv: &[String]) -> GrepArgs {
         );
         grep_exit(2);
     }
-    let mut parsed = GrepArgs::parse_from(normalize_grep_argv(raw));
-    parsed.had_literal_separator = had_literal_separator;
+    let mut parsed = GrepArgs::parse_from(normalize_grep_argv(raw.clone()));
+    parsed.had_literal_separator = match separator_at {
+        Some(sep) => raw
+            .iter()
+            .position(|a| *a == parsed.pattern)
+            .is_none_or(|pat| sep < pat),
+        None => false,
+    };
     parsed
 }
 
