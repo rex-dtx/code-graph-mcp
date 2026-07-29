@@ -624,12 +624,44 @@ test('downloadAndInstall does NOT repoint install state when the plugin copy is 
 test('selfHealGlobalPkgs refreshes stale globals and resets the attempt counter', async () => {
   const latest = { version: '0.101.0' };
   let installedSpecs = null;
+  // `readStale` reflects the world: stale before the install, clean after. The
+  // counter resets on the SECOND reading, not on npm's exit code.
+  let healed = false;
   const patch = await selfHealGlobalPkgs(latest, {}, {
-    readStale: () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }],
-    install: async (specs) => { installedSpecs = specs; return true; },
+    readStale: () => (healed ? [] : [{ name: '@sdsrs/code-graph', version: '0.46.0' }]),
+    install: async (specs) => { installedSpecs = specs; healed = true; return true; },
   });
   assert.deepEqual(installedSpecs, ['@sdsrs/code-graph@0.101.0']);
   assert.deepEqual(patch, { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 0 });
+});
+
+test('selfHealGlobalPkgs counts an install that exits 0 but heals nothing as a failure (P2-22)', async () => {
+  // `npm i -g` installs into the prefix the CURRENT node resolves. Under nvm
+  // with several node versions — or an `npm --prefix` in the user's npmrc — that
+  // is not where the stale copy lives, so npm exits 0 and the stale package is
+  // exactly where it was. Trusting the exit code reset the counter every run,
+  // and the retry budget could never be spent: one npm install per throttle
+  // window, forever, with nothing to show for it.
+  const latest = { version: '0.101.0' };
+  const stillStale = () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }];
+  let runs = 0;
+  const patch = await selfHealGlobalPkgs(latest, {}, {
+    readStale: stillStale,
+    install: async () => { runs += 1; return true; },
+  });
+  assert.equal(runs, 1, 'the heal is still attempted once');
+  assert.deepEqual(patch, { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 1 },
+    'an unverified "success" must consume an attempt, or the cap never bites');
+
+  // And the cap does bite, so the loop terminates.
+  let touched = false;
+  const capped = await selfHealGlobalPkgs(
+    latest,
+    { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 3 },
+    { readStale: stillStale, install: async () => { touched = true; return true; } },
+  );
+  assert.equal(touched, false, 'a repeatedly-ineffective heal must stop being attempted');
+  assert.deepEqual(capped, {});
 });
 
 test('selfHealGlobalPkgs never installs when nothing of ours is globally installed', async () => {
@@ -672,11 +704,12 @@ test('selfHealGlobalPkgs counts failures per target version and stops at the cap
 
   // A NEW release re-arms the counter.
   let specs = null;
+  let healed = false;
   const p3 = await selfHealGlobalPkgs(
     { version: '0.102.0' },
     { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 3 },
-    { readStale: () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }],
-      install: async (s) => { specs = s; return true; } },
+    { readStale: () => (healed ? [] : [{ name: '@sdsrs/code-graph', version: '0.46.0' }]),
+      install: async (s) => { specs = s; healed = true; return true; } },
   );
   assert.deepEqual(specs, ['@sdsrs/code-graph@0.102.0']);
   assert.deepEqual(p3, { globalPkgHealVersion: '0.102.0', globalPkgHealAttempts: 0 });

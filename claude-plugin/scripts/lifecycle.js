@@ -642,6 +642,27 @@ function registerHooksToSettings(settings) {
 
 // Extract the .js script path a hook command invokes — bare (`node "…"`) or
 // existence-guarded (`if [ -f "…" ]; then node "…"; fi`).
+// Is the composite command currently in the statusLine slot one we should
+// replace? Mirrors the staleness rule `surveyHookCoverage` applies to hooks —
+// the two slots are claimed by the same install() and drift the same way.
+//
+// Stale means: unparseable, pointing at a script that no longer exists (a node
+// version was uninstalled, a checkout deleted), or pinned to an OLDER
+// plugin-cache version dir than ours. A live composite from a different
+// delivery surface at the same or a newer version is left alone — that is the
+// whole point. An in-place path (global npm, dev checkout) carries no version
+// dir and can never go version-stale: npm overwrites the same path on upgrade.
+function compositeSlotIsStale(currentCmd) {
+  const script = hookCmdScript(currentCmd);
+  if (!script) return true;
+  if (!fs.existsSync(script)) return true;
+  const pv = cacheDirVersion(script);
+  if (!pv) return false;
+  const { compareVersions } = require('./version-utils');
+  const dv = cacheDirVersion(hookCmdScript(compositeCommand())) || getPluginVersion();
+  return compareVersions(pv, dv) < 0;
+}
+
 function hookCmdScript(cmd) {
   const m = (cmd || '').match(/node "([^"]+\.js)"/) || (cmd || '').match(/"([^"]+\.js)"/);
   return m ? m[1] : null;
@@ -881,7 +902,15 @@ function install({ reclaimStatusline = false } = {}) {
     const currentCmd = settings.statusLine && settings.statusLine.command;
     if (reclaimStatusline || process.env.CODE_GRAPH_FORCE_STATUSLINE === '1') {
       manifest.config.statuslineDisplaced = 0;
-    } else if (manifest.config.statusLine === true && currentCmd) {
+    } else if (!currentCmd) {
+      // RE-ARM: the slot is EMPTY. Stand-down exists to stop a tug-of-war with
+      // another provider, and there is nobody to fight — whoever displaced us
+      // has been uninstalled, or the user cleared the slot. Without this the
+      // counter was write-only: once past the threshold the plugin stayed
+      // silently statusline-less for the life of the manifest, and the only way
+      // back was an env var nobody knows to set.
+      manifest.config.statuslineDisplaced = 0;
+    } else if (manifest.config.statusLine === true) {
       manifest.config.statuslineDisplaced = (manifest.config.statuslineDisplaced || 0) + 1;
     }
     if ((manifest.config.statuslineDisplaced || 0) > 2) {
@@ -905,9 +934,16 @@ function install({ reclaimStatusline = false } = {}) {
       manifest.config.statusLine = true;
     }
   } else {
-    // Composite exists — ensure path is correct (may have been polluted by env leak)
+    // Composite exists — heal it only when it is actually stale. An exact
+    // string mismatch is NOT staleness: two copies of this plugin (plugin cache
+    // + global npm, or a dev checkout) derive different absolute paths for the
+    // same current composite, and rewriting on mismatch made each install()
+    // take the slot back from the other — a 2-cycle that rewrote settings.json
+    // on every SessionStart. Identical shape to the hook ping-pong ea0166d
+    // fixed; that fix's regression test asserted only `settings.hooks`, so this
+    // half of the pair stayed open.
     const cmd = compositeCommand();
-    if (settings.statusLine.command !== cmd) {
+    if (settings.statusLine.command !== cmd && compositeSlotIsStale(settings.statusLine.command)) {
       settings.statusLine.command = cmd;
       settingsChanged = true;
     }
@@ -1398,7 +1434,7 @@ module.exports = {
   getPluginVersion, cleanupOldCacheVersions,
   removeHooksFromSettings, isOurHookEntry,
   registerHooksToSettings, buildSettingsHookEntries,                  // v0.32.0
-  surveyHookCoverage, compositeCommand,                                // v0.49.1 — version-aware self-heal
+  surveyHookCoverage, compositeCommand, compositeSlotIsStale,          // v0.49.1 — version-aware self-heal
   verifyHooksFire, defaultHookFireProbes,                              // v0.67.0 — firing self-test
   activeInstallPath, isStaleRelicContext,                              // v0.49.1 — stale-relic downgrade guard
   SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests

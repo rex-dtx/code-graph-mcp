@@ -82,6 +82,72 @@ fn edge_coverage_per_language_baseline() {
     assert!(calls("rust") >= 1, "Rust calls regressed: {by_lang:?}");
 }
 
+/// Every language whose extractor claims `calls` must produce one, in one table.
+///
+/// The baseline above covers three languages, and the import parity test covers
+/// six — so of the twenty languages the README lists, fourteen had NO numeric
+/// guard on the call axis at all (audit P2-27; the "~11/19" in the 07-24 report
+/// counted the two tests' union under a loose reading). A silently dropped arm
+/// in `walk_for_relations` is exactly the failure this repo keeps rediscovering,
+/// and it has been invisible for every language outside that overlap.
+///
+/// Excluded on purpose, with the reason stated so the gap stays legible:
+///   * `markdown` extracts headings, `html`/`css`/`json` are FTS-only — none has
+///     a call axis to regress.
+///   * `tsx` shares the TypeScript extractor path (same arm, different grammar).
+///
+/// Each fixture is the smallest two-function file where one calls the other, so
+/// a failure points at the language's arm rather than at resolution subtleties.
+#[test]
+fn call_extraction_parity_across_every_call_capable_language() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("javascript", "a.js", "function helper(x){return x+1;}\nfunction handle(x){return helper(x);}\n"),
+        ("go", "a.go", "package main\nfunc helper(x int) int { return x + 1 }\nfunc handle(x int) int { return helper(x) }\n"),
+        ("java", "A.java", "class A {\n  int helper(int x){ return x+1; }\n  int handle(int x){ return helper(x); }\n}\n"),
+        ("csharp", "A.cs", "class A {\n  int Helper(int x){ return x+1; }\n  int Handle(int x){ return Helper(x); }\n}\n"),
+        ("kotlin", "a.kt", "fun helper(x: Int): Int = x + 1\nfun handle(x: Int): Int = helper(x)\n"),
+        ("ruby", "a.rb", "def helper(x)\n  x + 1\nend\ndef handle(x)\n  helper(x)\nend\n"),
+        ("php", "a.php", "<?php\nfunction helper($x){ return $x+1; }\nfunction handle($x){ return helper($x); }\n"),
+        ("swift", "a.swift", "func helper(_ x: Int) -> Int { return x + 1 }\nfunc handle(_ x: Int) -> Int { return helper(x) }\n"),
+        ("dart", "a.dart", "int helper(int x) => x + 1;\nint handle(int x) => helper(x);\n"),
+        ("c", "a.c", "int helper(int x){ return x+1; }\nint handle(int x){ return helper(x); }\n"),
+        ("cpp", "a.cpp", "int helper(int x){ return x+1; }\nint handle(int x){ return helper(x); }\n"),
+        ("bash", "a.sh", "helper() { echo 1; }\nhandle() { helper; }\n"),
+    ];
+
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for (_, file, source) in cases {
+        std::fs::write(src.join(file), source).unwrap();
+    }
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let by_lang = edge_counts(&db);
+    let missing: Vec<&str> = cases
+        .iter()
+        .filter(|(lang, _, _)| {
+            by_lang
+                .get(*lang)
+                .and_then(|m| m.get("calls"))
+                .copied()
+                .unwrap_or(0)
+                < 1
+        })
+        .map(|(lang, _, _)| *lang)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these languages produced no `calls` edge for a plain handle→helper call \
+         — their extractor arm is missing or regressed: {missing:?}; \
+         edges_by_language={by_lang:?}"
+    );
+}
+
 #[test]
 fn c_include_resolves_to_indexed_header_module() {
     // A C/C++ `#include "widget.h"` must resolve to the indexed header's <module>

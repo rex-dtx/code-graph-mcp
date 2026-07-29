@@ -738,9 +738,18 @@ async function selfHealGlobalPkgs(latest, state, {
   const attempts = state.globalPkgHealVersion === latest.version ? (state.globalPkgHealAttempts || 0) : 0;
   if (attempts >= GLOBAL_PKG_HEAL_MAX_ATTEMPTS) return {};
   const ok = await install(stale.map((s) => `${s.name}@${latest.version}`));
+  // Success is "the stale copies are gone", not "npm exited 0". `npm i -g`
+  // installs into the prefix the CURRENT node resolves, which is not
+  // necessarily where the stale copy lives (nvm with several node versions,
+  // an `npm --prefix` in the user's npmrc, a sudo-owned /usr/local). In that
+  // shape npm reported success on every run while `staleGlobalPkgs` kept
+  // returning the same entry — the counter reset each time, so the retry
+  // budget never ran out and the install re-ran forever, once per throttle
+  // window. Re-read instead of trusting the exit code.
+  const remaining = ok ? readStale(latest.version) : stale;
   return {
     globalPkgHealVersion: latest.version,
-    globalPkgHealAttempts: ok ? 0 : attempts + 1,
+    globalPkgHealAttempts: remaining.length === 0 ? 0 : attempts + 1,
   };
 }
 

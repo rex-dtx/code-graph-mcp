@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Audit 2026-07-27 P2 batch: 16 of the ~29 observations, chosen for the ones whose
+Audit 2026-07-27 P2 batch: 20 of the ~29 observations, chosen for the ones whose
 failure mode is silence, plus the seven findings an independent review raised
 against the batch itself.
 
@@ -133,6 +133,50 @@ and pattern-position identifiers inside `matches!`.
   PATHEXT is upper-case by default on Windows and `cmd.exe` echoes what it
   resolved, so those invocations went unrecorded in the conversion metric. Only
   the extension is case-folded; the stem stays exact.
+- **Two copies of the plugin took the statusLine slot from each other every
+  session** (P2-17). `install()` rewrote the slot whenever the command string
+  differed from the one it would write — but a plugin-cache copy and a global-npm
+  copy (or a dev checkout) derive different absolute paths for the same current
+  composite, so each run undid the other and settings.json was rewritten on every
+  SessionStart. The slot now uses the version/surface-tolerant staleness rule the
+  hooks already had: only a dead path, an unparseable command, or an older
+  plugin-cache version dir is healed. `session-init.js` carried the same
+  exact-match test and was changed with it — otherwise it would have reported
+  `self-healed-stale-statusline` every session while `install()` quietly did
+  nothing. This is the sibling of the hook ping-pong fixed in v0.104.x, whose
+  regression test asserted `settings.hooks` and nothing else.
+- **Statusline stand-down never re-armed** (P2-22). After three displacements the
+  plugin releases the slot and stops competing — correct — but the counter was
+  write-only, so when the competing provider was uninstalled and the slot went
+  EMPTY, the plugin stayed statusline-less for the life of the manifest with only
+  an undocumented env var to recover. An empty slot now re-arms it; an occupied
+  one still doesn't (both directions mutation-tested).
+- **`selfHealGlobalPkgs` treated npm's exit code as proof** (P2-22). `npm i -g`
+  installs into whichever prefix the current node resolves, which under nvm — or
+  an `npm --prefix` in the user's npmrc — need not be where the stale copy lives.
+  npm exited 0, the stale package stayed exactly where it was, and the reset
+  counter meant the retry budget could never be spent: one npm install per
+  throttle window, forever. Success is now "the stale copies are gone", re-read
+  after the install.
+- **The model download's TLS fallback had three loose ends** (incremental audit
+  Δ4). (a) The OS-trust-store retry fired on ANY failure, so a dead mirror or a
+  404 cost a second full 600s attempt — with the caller's three tries, close to an
+  hour of `doctor` reporting "download in flight" for something that failed in the
+  first minute. It now fires only for failures a different root store could
+  explain. (b) Extraction runs before the blake3 pin can be checked and the only
+  size cap was on the COMPRESSED body, so a hostile gzip ratio could write
+  gigabytes of unverified data to the user's disk; the unpacked side is now bounded
+  from the tar header, before any member is written. (c) The trust path that
+  produced the bytes is recorded in `model-download.json`, so "did this model come
+  through the OS certificate chain?" is answerable after the fact. Content
+  integrity was never affected — the blake3 pin is checked either way.
+- **Fourteen of twenty languages had no numeric guard on the call axis**
+  (P2-27). The edge baseline asserted `calls` for three languages and imports for
+  six; everything else could lose its `walk_for_relations` arm silently, which is
+  this repo's most-repeated bug shape. One table now covers every call-capable
+  language (JS, Go, Java, C#, Kotlin, Ruby, PHP, Swift, Dart, C, C++, Bash) with a
+  plain handle→helper fixture; disabling the Ruby arm turns it red and names Ruby.
+  Markdown/HTML/CSS/JSON are excluded in writing — they have no call axis.
 
 ### Fixed in review (defects this batch introduced)
 - **`dead-code . --json` and `dead-code <dir>/ --json` hard-errored whenever the
