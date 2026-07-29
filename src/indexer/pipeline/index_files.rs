@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::domain::{
     is_cross_file_call_noise, max_file_size, REL_CALLS, REL_IMPLEMENTS, REL_IMPORTS, REL_INHERITS,
@@ -77,6 +78,211 @@ fn looks_like_cpp_header(source: &str) -> bool {
 /// then drops heavyweight data (ASTs, source strings) before the next batch.
 const BATCH_SIZE: usize = 500;
 
+// CPU-bound parse result — produced in parallel, consumed sequentially for DB insert
+struct FilePreParsed {
+    rel_path: String,
+    source: String,
+    language: String,
+    tree: tree_sitter::Tree,
+    hash: String,
+    last_modified: i64,
+    parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
+}
+
+// Heavyweight per-file data used during Phase 1+2, dropped after each batch
+#[allow(dead_code)]
+struct FileParsed {
+    rel_path: String,
+    source: String,
+    language: String,
+    tree: tree_sitter::Tree,
+    file_id: i64,
+    node_ids: Vec<i64>,
+    node_names: Vec<String>,
+    // Qualified names parallel to node_ids/node_names (None for <module>).
+    // Needed so Phase-2 source resolution can match a relation's
+    // qualified scope_name (`Class.method`) against class-based-language
+    // method nodes, whose bare `name` is just `method`.
+    node_qualified_names: Vec<Option<String>>,
+    // Node types parallel to node_ids/node_names. Needed so inherits/implements
+    // source resolution can reject a same-named function/method (a C++ inline
+    // constructor shares its class's name) — only a type node can be a supertype.
+    node_types: Vec<String>,
+}
+
+/// The counters Phase 1a bumps from rayon worker threads, so they are atomics
+/// rather than the plain `usize`s the sequential phases use. `parse_errors` is
+/// deliberately NOT a skip: tree-sitter's error recovery still returns a tree,
+/// so extraction proceeds best-effort — the count is what makes that
+/// partial-extraction risk observable without any schema change.
+#[derive(Default)]
+struct SkipCounters {
+    size: AtomicUsize,
+    parse: AtomicUsize,
+    read: AtomicUsize,
+    hash: AtomicUsize,
+    language: AtomicUsize,
+    parse_errors: AtomicUsize,
+}
+
+/// Phase 1a: the parallel, CPU-bound half of indexing one batch — read, parse,
+/// extract nodes. Touches no DB state (Phase 1b does the inserts sequentially),
+/// which is what makes it safe to fan out over rayon. Files it cannot handle
+/// are dropped from the result and counted in `counters`.
+fn pre_parse_batch(
+    batch: &[String],
+    root: &Path,
+    hashes: &HashMap<String, String>,
+    counters: &SkipCounters,
+) -> Vec<FilePreParsed> {
+    batch
+        .par_iter()
+        .filter_map(|rel_path| {
+            let mut language = match detect_language(rel_path) {
+                Some(l) => l,
+                None => {
+                    counters.language.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
+                }
+            };
+            let abs_path = root.join(rel_path);
+
+            let file_meta = std::fs::metadata(&abs_path).ok();
+            if let Some(ref meta) = file_meta {
+                if meta.len() > max_file_size() {
+                    tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
+                    counters.size.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
+                }
+            }
+
+            let source = match std::fs::read_to_string(&abs_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Skipping file {}: {}", rel_path, e);
+                    counters.read.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
+                }
+            };
+
+            // `.h` is C-vs-C++ ambiguous by extension, so detect_language maps it
+            // to C. But the C grammar can't parse `class`/`namespace`, so C++ classes
+            // declared in a `.h` header (the MOST common C++ layout) — and their
+            // base-class `inherits` edges — were silently dropped. When the header's
+            // content actually contains C++ constructs, parse it as C++ so those
+            // symbols are captured. Gated on markers so a pure-C header stays C;
+            // false positives are low-harm (the C++ grammar is a near-superset of C).
+            if language == "c" && rel_path.ends_with(".h") && looks_like_cpp_header(&source) {
+                language = "cpp";
+            }
+
+            let hash = match hashes.get(rel_path.as_str()) {
+                Some(h) => h.clone(),
+                None => match hash_file(&abs_path) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!("Skipping file (hash error): {}: {}", rel_path, e);
+                        counters.hash.fetch_add(1, AtomicOrdering::Relaxed);
+                        return None;
+                    }
+                },
+            };
+
+            let tree = match parse_tree(&source, language) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Parse failed for {}: {}", rel_path, e);
+                    counters.parse.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
+                }
+            };
+
+            // Tree-sitter recovers from syntax errors by inserting ERROR/MISSING
+            // nodes and still returning a tree, so parse "succeeds" but symbol
+            // extraction below runs over a damaged parse and can silently drop
+            // symbols. Surface it: warn once per file and count the pass total.
+            if tree.root_node().has_error() {
+                tracing::warn!(
+                    "Syntax errors in {} — symbols may be incomplete (parsed with tree-sitter error recovery)",
+                    rel_path
+                );
+                counters.parse_errors.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+
+            let last_modified = file_meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
+
+            Some(FilePreParsed {
+                rel_path: rel_path.clone(),
+                source,
+                language: language.to_string(),
+                tree,
+                hash,
+                last_modified,
+                parsed_nodes,
+            })
+        })
+        .collect()
+}
+
+/// Phase 0: cascade-delete `delete_paths` in a transaction of its own, after
+/// buffering the inbound calls that cascade is about to strip.
+///
+/// Without the buffering, deleting file A wipes B's edge to A.foo while B is
+/// not in `delete_paths` (so Phase 2 never re-extracts it), leaving B with
+/// neither an edge nor a pending row — the same staleness window the
+/// "callee added later" buffering closes, just from the deletion side. Both
+/// directions need to round-trip through pending or the v0.18.2 fix is only
+/// half-complete.
+fn buffer_then_delete_files(db: &Database, delete_paths: &[String]) -> Result<()> {
+    let tx = db.savepoint("idx_delete")?;
+
+    // Resolve file IDs once (delete_files_by_paths drops them) so we can
+    // query inbound calls before cascade fires.
+    let mut deleted_file_ids: Vec<i64> = Vec::with_capacity(delete_paths.len());
+    for path in delete_paths {
+        if let Ok(Some(fid)) =
+            db.conn()
+                .query_row("SELECT id FROM files WHERE path = ?1", [path], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+        {
+            deleted_file_ids.push(fid);
+        }
+    }
+
+    let mut buffered = 0usize;
+    for fid in &deleted_file_ids {
+        let inbound = crate::storage::queries::get_inbound_calls_for_pending(db.conn(), *fid)?;
+        for (source_id, target_name, source_language, metadata) in inbound {
+            crate::storage::queries::insert_pending_unresolved_call(
+                db.conn(),
+                source_id,
+                &target_name,
+                &source_language,
+                metadata.as_deref(),
+            )?;
+            buffered += 1;
+        }
+    }
+    if buffered > 0 {
+        tracing::info!(
+            "[index] Phase 0: buffered {} inbound calls before cascade-deleting {} file(s)",
+            buffered,
+            deleted_file_ids.len()
+        );
+    }
+
+    delete_files_by_paths(db.conn(), delete_paths)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Lightweight post-batch record — no Tree or source string.
 pub(super) struct FileIndexed {
     pub rel_path: String,
@@ -108,18 +314,7 @@ pub(super) fn index_files(
     // separate DB connections — safety relies on SQLite WAL mode + busy_timeout(5000),
     // not single-threadedness.
 
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    let skipped_size = AtomicUsize::new(0);
-    let skipped_parse = AtomicUsize::new(0);
-    let skipped_read = AtomicUsize::new(0);
-    let skipped_hash = AtomicUsize::new(0);
-    let skipped_language = AtomicUsize::new(0);
-    // Files that parsed into a tree carrying tree-sitter ERROR node(s). Distinct
-    // from skipped_parse (a hard parse failure that drops the file entirely):
-    // tree-sitter's error recovery still returns a tree, so extraction proceeds
-    // best-effort but a grammar error cascade can silently drop symbols. Counting
-    // this makes that partial-extraction risk observable without any schema change.
-    let parse_error_files = AtomicUsize::new(0);
+    let counters = SkipCounters::default();
 
     // Every caller derives `files` from HashMap iteration — `run_full_index`
     // from `scan_directory`'s hash map keys, both incremental entries from
@@ -143,66 +338,8 @@ pub(super) fn index_files(
     let mut all_indexed: Vec<FileIndexed> = Vec::new();
 
     // Phase 0: Delete removed files in own transaction.
-    //
-    // Before cascade strips inbound REL_CALLS edges, capture them as pending
-    // rows. Without this, deleting file A wipes B's edge to A.foo and B is
-    // not in `delete_paths` (so Phase 2 won't re-extract it), leaving B with
-    // neither an edge nor a pending row — the same staleness window the
-    // "callee added later" buffering closes, just from the deletion side.
-    // Both directions need to round-trip through pending or the v0.18.2 fix
-    // is only half-complete.
     if !delete_paths.is_empty() {
-        let tx = db.savepoint("idx_delete")?;
-
-        // Resolve file IDs once (delete_files_by_paths drops them) so we can
-        // query inbound calls before cascade fires.
-        let mut deleted_file_ids: Vec<i64> = Vec::with_capacity(delete_paths.len());
-        for path in delete_paths {
-            if let Ok(Some(fid)) =
-                db.conn()
-                    .query_row("SELECT id FROM files WHERE path = ?1", [path], |row| {
-                        row.get::<_, Option<i64>>(0)
-                    })
-            {
-                deleted_file_ids.push(fid);
-            }
-        }
-
-        let mut buffered = 0usize;
-        for fid in &deleted_file_ids {
-            let inbound = crate::storage::queries::get_inbound_calls_for_pending(db.conn(), *fid)?;
-            for (source_id, target_name, source_language, metadata) in inbound {
-                crate::storage::queries::insert_pending_unresolved_call(
-                    db.conn(),
-                    source_id,
-                    &target_name,
-                    &source_language,
-                    metadata.as_deref(),
-                )?;
-                buffered += 1;
-            }
-        }
-        if buffered > 0 {
-            tracing::info!(
-                "[index] Phase 0: buffered {} inbound calls before cascade-deleting {} file(s)",
-                buffered,
-                deleted_file_ids.len()
-            );
-        }
-
-        delete_files_by_paths(db.conn(), delete_paths)?;
-        tx.commit()?;
-    }
-
-    // CPU-bound parse result — produced in parallel, consumed sequentially for DB insert
-    struct FilePreParsed {
-        rel_path: String,
-        source: String,
-        language: String,
-        tree: tree_sitter::Tree,
-        hash: String,
-        last_modified: i64,
-        parsed_nodes: Vec<crate::parser::treesitter::ParsedNode>,
+        buffer_then_delete_files(db, delete_paths)?;
     }
 
     // Pre-build Python module map once (used in all batches for import resolution)
@@ -243,125 +380,12 @@ pub(super) fn index_files(
     let mut global_name_map: HashMap<String, Vec<crate::storage::queries::NameEntry>> =
         get_all_node_names_with_ids(db.conn())?;
 
-    // Heavyweight per-file data used during Phase 1+2, dropped after each batch
-    #[allow(dead_code)]
-    struct FileParsed {
-        rel_path: String,
-        source: String,
-        language: String,
-        tree: tree_sitter::Tree,
-        file_id: i64,
-        node_ids: Vec<i64>,
-        node_names: Vec<String>,
-        // Qualified names parallel to node_ids/node_names (None for <module>).
-        // Needed so Phase-2 source resolution can match a relation's
-        // qualified scope_name (`Class.method`) against class-based-language
-        // method nodes, whose bare `name` is just `method`.
-        node_qualified_names: Vec<Option<String>>,
-        // Node types parallel to node_ids/node_names. Needed so inherits/implements
-        // source resolution can reject a same-named function/method (a C++ inline
-        // constructor shares its class's name) — only a type node can be a supertype.
-        node_types: Vec<String>,
-    }
-
     // Process files in batches — each batch does Phase 1 + Phase 2
     for batch in files.chunks(BATCH_SIZE) {
         let tx = db.savepoint("idx_batch")?;
 
         // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
-        let pre_parsed: Vec<FilePreParsed> = batch
-            .par_iter()
-            .filter_map(|rel_path| {
-                let mut language = match detect_language(rel_path) {
-                    Some(l) => l,
-                    None => {
-                        skipped_language.fetch_add(1, AtomicOrdering::Relaxed);
-                        return None;
-                    }
-                };
-                let abs_path = root.join(rel_path);
-
-                let file_meta = std::fs::metadata(&abs_path).ok();
-                if let Some(ref meta) = file_meta {
-                    if meta.len() > max_file_size() {
-                        tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
-                        skipped_size.fetch_add(1, AtomicOrdering::Relaxed);
-                        return None;
-                    }
-                }
-
-                let source = match std::fs::read_to_string(&abs_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("Skipping file {}: {}", rel_path, e);
-                        skipped_read.fetch_add(1, AtomicOrdering::Relaxed);
-                        return None;
-                    }
-                };
-
-                // `.h` is C-vs-C++ ambiguous by extension, so detect_language maps it
-                // to C. But the C grammar can't parse `class`/`namespace`, so C++ classes
-                // declared in a `.h` header (the MOST common C++ layout) — and their
-                // base-class `inherits` edges — were silently dropped. When the header's
-                // content actually contains C++ constructs, parse it as C++ so those
-                // symbols are captured. Gated on markers so a pure-C header stays C;
-                // false positives are low-harm (the C++ grammar is a near-superset of C).
-                if language == "c" && rel_path.ends_with(".h") && looks_like_cpp_header(&source) {
-                    language = "cpp";
-                }
-
-                let hash = match hashes.get(rel_path.as_str()) {
-                    Some(h) => h.clone(),
-                    None => match hash_file(&abs_path) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            tracing::warn!("Skipping file (hash error): {}: {}", rel_path, e);
-                            skipped_hash.fetch_add(1, AtomicOrdering::Relaxed);
-                            return None;
-                        }
-                    },
-                };
-
-                let tree = match parse_tree(&source, language) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!("Parse failed for {}: {}", rel_path, e);
-                        skipped_parse.fetch_add(1, AtomicOrdering::Relaxed);
-                        return None;
-                    }
-                };
-
-                // Tree-sitter recovers from syntax errors by inserting ERROR/MISSING
-                // nodes and still returning a tree, so parse "succeeds" but symbol
-                // extraction below runs over a damaged parse and can silently drop
-                // symbols. Surface it: warn once per file and count the pass total.
-                if tree.root_node().has_error() {
-                    tracing::warn!(
-                        "Syntax errors in {} — symbols may be incomplete (parsed with tree-sitter error recovery)",
-                        rel_path
-                    );
-                    parse_error_files.fetch_add(1, AtomicOrdering::Relaxed);
-                }
-
-                let last_modified = file_meta
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-
-                let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
-
-                Some(FilePreParsed {
-                    rel_path: rel_path.clone(),
-                    source,
-                    language: language.to_string(),
-                    tree,
-                    hash,
-                    last_modified,
-                    parsed_nodes,
-                })
-            })
-            .collect();
+        let pre_parsed = pre_parse_batch(batch, root, hashes, &counters);
 
         let mut batch_parsed: Vec<FileParsed> = Vec::new();
         // Saved inbound edges from other files → batch files (to restore after cascade delete)
@@ -1384,217 +1408,16 @@ pub(super) fn index_files(
             }
         }
 
-        // Phase 2b: Create virtual nodes for external Python imports
-        if !external_python_imports.is_empty() {
-            let ext_file_id = upsert_file(
-                db.conn(),
-                &FileRecord {
-                    path: crate::domain::EXTERNAL_FILE_PATH.into(),
-                    blake3_hash: "external".into(),
-                    last_modified: 0,
-                    language: Some("external".into()),
-                },
-            )?;
+        // Phases 2b / 2b-ext: mint the `<external>` sentinel nodes for this
+        // batch's unresolved imports and trait targets, plus their edges.
+        let (ext_nodes, ext_edges) =
+            mint_external_sentinels(db, &external_python_imports, &unresolved_externals)?;
+        total_nodes_created += ext_nodes;
+        total_edges_created += ext_edges;
 
-            // Load existing external module nodes to avoid duplicates
-            let existing_ext_nodes: HashMap<String, i64> =
-                get_nodes_by_file_path(db.conn(), "<external>")?
-                    .into_iter()
-                    .map(|n| (n.name.clone(), n.id))
-                    .collect();
-
-            // Sorted, not raw set order: these nodes are minted here, so set
-            // iteration order would hand the same module a different node id
-            // on every run.
-            let unique_modules: Vec<String> = {
-                let mut v: Vec<String> = external_python_imports
-                    .iter()
-                    .map(|(_, m)| m.clone())
-                    .collect::<HashSet<String>>()
-                    .into_iter()
-                    .collect();
-                v.sort_unstable();
-                v
-            };
-
-            let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
-            for module_name in &unique_modules {
-                if !ext_node_ids.contains_key(module_name) {
-                    let node_id = insert_node_cached(
-                        db.conn(),
-                        &NodeRecord {
-                            file_id: ext_file_id,
-                            node_type: "external_module".into(),
-                            name: module_name.clone(),
-                            qualified_name: Some(format!("<external>/{}", module_name)),
-                            start_line: 0,
-                            end_line: 0,
-                            code_content: String::new(),
-                            signature: None,
-                            doc_comment: None,
-                            context_string: None,
-                            name_tokens: None,
-                            return_type: None,
-                            param_types: None,
-                            is_test: false,
-                        },
-                    )?;
-                    ext_node_ids.insert(module_name.clone(), node_id);
-                    total_nodes_created += 1;
-                }
-            }
-
-            for (source_id, module_name) in &external_python_imports {
-                if let Some(&ext_id) = ext_node_ids.get(module_name) {
-                    if insert_edge_cached(db.conn(), *source_id, ext_id, REL_IMPORTS, None)? {
-                        total_edges_created += 1;
-                    }
-                }
-            }
-        }
-
-        // Phase 2b-ext: Create sentinel nodes for unresolved external symbols
-        // (e.g., Rust `impl Write for SharedStdout` where Write is from std::io)
-        if !unresolved_externals.is_empty() {
-            let ext_file_id = upsert_file(
-                db.conn(),
-                &FileRecord {
-                    path: crate::domain::EXTERNAL_FILE_PATH.into(),
-                    blake3_hash: "external".into(),
-                    last_modified: 0,
-                    language: Some("external".into()),
-                },
-            )?;
-
-            let existing_ext_nodes: HashMap<String, i64> =
-                get_nodes_by_file_path(db.conn(), "<external>")?
-                    .into_iter()
-                    .map(|n| (n.name.clone(), n.id))
-                    .collect();
-
-            let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
-
-            // Collect unique targets with inferred type.
-            //
-            // One name can reach both channels in the same batch — `impl Write
-            // for X` alongside an unresolved `use std::io::Write`. Collecting
-            // straight into a map let the LAST push decide, so the sentinel was
-            // minted `trait` or `module` depending on relation order. Give the
-            // channels a fixed precedence instead: `implements` is the specific
-            // claim (this name IS a trait), an import only says "some external
-            // module-ish name", so implements wins regardless of arrival order.
-            // Sorted before insert so the ids are stable too.
-            let unique_targets: Vec<(&str, &str)> = {
-                let mut by_name: HashMap<&str, &str> = HashMap::new();
-                for (_, name, rel) in &unresolved_externals {
-                    let node_type = if rel == REL_IMPLEMENTS {
-                        "trait"
-                    } else {
-                        "module"
-                    };
-                    let slot = by_name.entry(name.as_str()).or_insert(node_type);
-                    if node_type == "trait" {
-                        *slot = "trait";
-                    }
-                }
-                let mut v: Vec<(&str, &str)> = by_name.into_iter().collect();
-                v.sort_unstable();
-                v
-            };
-
-            for &(name, node_type) in &unique_targets {
-                if !ext_node_ids.contains_key(name) {
-                    let node_id = insert_node_cached(
-                        db.conn(),
-                        &NodeRecord {
-                            file_id: ext_file_id,
-                            node_type: node_type.into(),
-                            name: name.into(),
-                            qualified_name: Some(format!("<external>/{}", name)),
-                            start_line: 0,
-                            end_line: 0,
-                            code_content: String::new(),
-                            signature: None,
-                            doc_comment: None,
-                            context_string: None,
-                            name_tokens: None,
-                            return_type: None,
-                            param_types: None,
-                            is_test: false,
-                        },
-                    )?;
-                    ext_node_ids.insert(name.into(), node_id);
-                    total_nodes_created += 1;
-                }
-            }
-
-            for (source_id, target_name, relation) in &unresolved_externals {
-                if let Some(&ext_id) = ext_node_ids.get(target_name.as_str()) {
-                    if insert_edge_cached(db.conn(), *source_id, ext_id, relation, None)? {
-                        total_edges_created += 1;
-                    }
-                }
-            }
-        }
-
-        // Phase 2c: Restore cross-file inbound edges lost to cascade delete.
-        // When a file is re-indexed, its old nodes are deleted (cascade-deleting edges).
-        // Edges from OTHER files into the re-indexed file must be rebuilt using new node IDs.
-        if !saved_inbound_edges.is_empty() {
-            // Build (target_file_id, name) → new_node_id map for batch files. Keying
-            // on the file the edge pointed INTO — not just the bare name — pins the
-            // restore to the same-name node in THAT file, so a re-indexed sibling
-            // file sharing the symbol name (or a cross-language same-name node in the
-            // batch) can no longer steal the edge. A genuinely-removed symbol yields
-            // no match → the edge drops, exactly as a full rebuild would.
-            let mut batch_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
-            for pf in &batch_parsed {
-                for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
-                    batch_name_to_ids
-                        .entry((pf.file_id, name.as_str()))
-                        .or_default()
-                        .push(*id);
-                }
-            }
-
-            let mut restored = 0usize;
-            let mut skipped_intra_batch = 0usize;
-            for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in
-                &saved_inbound_edges
-            {
-                // Source file is also in this batch — source_id is stale (deleted + re-created).
-                // Phase 2 already resolves cross-file edges for intra-batch files.
-                if batch_file_ids.contains(source_file_id) {
-                    skipped_intra_batch += 1;
-                    continue;
-                }
-                if let Some(new_target_ids) =
-                    batch_name_to_ids.get(&(*target_file_id, target_name.as_str()))
-                {
-                    for &new_tgt_id in new_target_ids {
-                        if *source_id != new_tgt_id
-                            && insert_edge_cached(
-                                db.conn(),
-                                *source_id,
-                                new_tgt_id,
-                                relation,
-                                metadata.as_deref(),
-                            )?
-                        {
-                            total_edges_created += 1;
-                            restored += 1;
-                        }
-                    }
-                }
-            }
-            if restored > 0 || skipped_intra_batch > 0 {
-                tracing::debug!(
-                    "[index] Restored {} cross-file inbound edges, skipped {} intra-batch",
-                    restored,
-                    skipped_intra_batch
-                );
-            }
-        }
+        // Phase 2c: restore cross-file inbound edges that cascade-delete stripped.
+        total_edges_created +=
+            restore_inbound_edges(db, &batch_parsed, &batch_file_ids, &saved_inbound_edges)?;
 
         tx.commit()?;
 
@@ -1729,12 +1552,12 @@ pub(super) fn index_files(
     }
 
     let stats = IndexStats {
-        files_skipped_size: skipped_size.load(AtomicOrdering::Relaxed),
-        files_skipped_parse: skipped_parse.load(AtomicOrdering::Relaxed),
-        files_skipped_read: skipped_read.load(AtomicOrdering::Relaxed),
-        files_skipped_hash: skipped_hash.load(AtomicOrdering::Relaxed),
-        files_skipped_language: skipped_language.load(AtomicOrdering::Relaxed),
-        files_with_parse_errors: parse_error_files.load(AtomicOrdering::Relaxed),
+        files_skipped_size: counters.size.load(AtomicOrdering::Relaxed),
+        files_skipped_parse: counters.parse.load(AtomicOrdering::Relaxed),
+        files_skipped_read: counters.read.load(AtomicOrdering::Relaxed),
+        files_skipped_hash: counters.hash.load(AtomicOrdering::Relaxed),
+        files_skipped_language: counters.language.load(AtomicOrdering::Relaxed),
+        files_with_parse_errors: counters.parse_errors.load(AtomicOrdering::Relaxed),
     };
 
     Ok(IndexResult {
@@ -1744,6 +1567,259 @@ pub(super) fn index_files(
         edges_created: total_edges_created,
         stats,
     })
+}
+
+/// Phases 2b / 2b-ext: mint the `<external>` pseudo-file's sentinel nodes.
+///
+/// Two channels feed it. Python `import flask` with no project file behind it
+/// arrives as `external_python_imports` (module → `external_module`); every
+/// other unresolved import or `implements` target — Rust `use std::io::Write`,
+/// JS `require('fs')`, `impl Write for X` — arrives as `unresolved_externals`.
+/// Both mint into the same namespace, so a name may already exist from the
+/// other channel or from an earlier batch; whoever gets there first owns the
+/// node and later arrivals only add edges to it.
+///
+/// Returns `(nodes_created, edges_created)`.
+fn mint_external_sentinels(
+    db: &Database,
+    external_python_imports: &[(i64, String)],
+    unresolved_externals: &[(i64, String, String)],
+) -> Result<(usize, usize)> {
+    let mut nodes_created = 0usize;
+    let mut edges_created = 0usize;
+
+    // Phase 2b: Create virtual nodes for external Python imports
+    if !external_python_imports.is_empty() {
+        let ext_file_id = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: crate::domain::EXTERNAL_FILE_PATH.into(),
+                blake3_hash: "external".into(),
+                last_modified: 0,
+                language: Some("external".into()),
+            },
+        )?;
+
+        // Load existing external module nodes to avoid duplicates
+        let existing_ext_nodes: HashMap<String, i64> =
+            get_nodes_by_file_path(db.conn(), "<external>")?
+                .into_iter()
+                .map(|n| (n.name.clone(), n.id))
+                .collect();
+
+        // Sorted, not raw set order: these nodes are minted here, so set
+        // iteration order would hand the same module a different node id
+        // on every run.
+        let unique_modules: Vec<String> = {
+            let mut v: Vec<String> = external_python_imports
+                .iter()
+                .map(|(_, m)| m.clone())
+                .collect::<HashSet<String>>()
+                .into_iter()
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
+        for module_name in &unique_modules {
+            if !ext_node_ids.contains_key(module_name) {
+                let node_id = insert_node_cached(
+                    db.conn(),
+                    &NodeRecord {
+                        file_id: ext_file_id,
+                        node_type: "external_module".into(),
+                        name: module_name.clone(),
+                        qualified_name: Some(format!("<external>/{}", module_name)),
+                        start_line: 0,
+                        end_line: 0,
+                        code_content: String::new(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: None,
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    },
+                )?;
+                ext_node_ids.insert(module_name.clone(), node_id);
+                nodes_created += 1;
+            }
+        }
+
+        for (source_id, module_name) in external_python_imports {
+            if let Some(&ext_id) = ext_node_ids.get(module_name) {
+                if insert_edge_cached(db.conn(), *source_id, ext_id, REL_IMPORTS, None)? {
+                    edges_created += 1;
+                }
+            }
+        }
+    }
+
+    // Phase 2b-ext: Create sentinel nodes for unresolved external symbols
+    // (e.g., Rust `impl Write for SharedStdout` where Write is from std::io)
+    if !unresolved_externals.is_empty() {
+        let ext_file_id = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: crate::domain::EXTERNAL_FILE_PATH.into(),
+                blake3_hash: "external".into(),
+                last_modified: 0,
+                language: Some("external".into()),
+            },
+        )?;
+
+        let existing_ext_nodes: HashMap<String, i64> =
+            get_nodes_by_file_path(db.conn(), "<external>")?
+                .into_iter()
+                .map(|n| (n.name.clone(), n.id))
+                .collect();
+
+        let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
+
+        // Collect unique targets with inferred type.
+        //
+        // One name can reach both channels in the same batch — `impl Write
+        // for X` alongside an unresolved `use std::io::Write`. Collecting
+        // straight into a map let the LAST push decide, so the sentinel was
+        // minted `trait` or `module` depending on relation order. Give the
+        // channels a fixed precedence instead: `implements` is the specific
+        // claim (this name IS a trait), an import only says "some external
+        // module-ish name", so implements wins regardless of arrival order.
+        // Sorted before insert so the ids are stable too.
+        let unique_targets: Vec<(&str, &str)> = {
+            let mut by_name: HashMap<&str, &str> = HashMap::new();
+            for (_, name, rel) in unresolved_externals {
+                let node_type = if rel == REL_IMPLEMENTS {
+                    "trait"
+                } else {
+                    "module"
+                };
+                let slot = by_name.entry(name.as_str()).or_insert(node_type);
+                if node_type == "trait" {
+                    *slot = "trait";
+                }
+            }
+            let mut v: Vec<(&str, &str)> = by_name.into_iter().collect();
+            v.sort_unstable();
+            v
+        };
+
+        for &(name, node_type) in &unique_targets {
+            if !ext_node_ids.contains_key(name) {
+                let node_id = insert_node_cached(
+                    db.conn(),
+                    &NodeRecord {
+                        file_id: ext_file_id,
+                        node_type: node_type.into(),
+                        name: name.into(),
+                        qualified_name: Some(format!("<external>/{}", name)),
+                        start_line: 0,
+                        end_line: 0,
+                        code_content: String::new(),
+                        signature: None,
+                        doc_comment: None,
+                        context_string: None,
+                        name_tokens: None,
+                        return_type: None,
+                        param_types: None,
+                        is_test: false,
+                    },
+                )?;
+                ext_node_ids.insert(name.into(), node_id);
+                nodes_created += 1;
+            }
+        }
+
+        for (source_id, target_name, relation) in unresolved_externals {
+            if let Some(&ext_id) = ext_node_ids.get(target_name.as_str()) {
+                if insert_edge_cached(db.conn(), *source_id, ext_id, relation, None)? {
+                    edges_created += 1;
+                }
+            }
+        }
+    }
+
+    Ok((nodes_created, edges_created))
+}
+
+/// Phase 2c: restore the cross-file inbound edges that cascade-delete stripped.
+///
+/// Re-indexing a file deletes its old nodes, and the cascade takes every edge
+/// pointing INTO them with it — including edges whose source file is not in
+/// this batch and so never gets re-extracted. Those were saved before the
+/// delete; here they are re-bound to the new node ids.
+///
+/// Returns the number of edges actually inserted.
+#[allow(clippy::type_complexity)]
+fn restore_inbound_edges(
+    db: &Database,
+    batch_parsed: &[FileParsed],
+    batch_file_ids: &HashSet<i64>,
+    saved_inbound_edges: &[(i64, i64, i64, String, String, Option<String>)],
+) -> Result<usize> {
+    let mut edges_created = 0usize;
+    // Phase 2c: Restore cross-file inbound edges lost to cascade delete.
+    // When a file is re-indexed, its old nodes are deleted (cascade-deleting edges).
+    // Edges from OTHER files into the re-indexed file must be rebuilt using new node IDs.
+    if !saved_inbound_edges.is_empty() {
+        // Build (target_file_id, name) → new_node_id map for batch files. Keying
+        // on the file the edge pointed INTO — not just the bare name — pins the
+        // restore to the same-name node in THAT file, so a re-indexed sibling
+        // file sharing the symbol name (or a cross-language same-name node in the
+        // batch) can no longer steal the edge. A genuinely-removed symbol yields
+        // no match → the edge drops, exactly as a full rebuild would.
+        let mut batch_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
+        for pf in batch_parsed {
+            for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+                batch_name_to_ids
+                    .entry((pf.file_id, name.as_str()))
+                    .or_default()
+                    .push(*id);
+            }
+        }
+
+        let mut restored = 0usize;
+        let mut skipped_intra_batch = 0usize;
+        for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in
+            saved_inbound_edges
+        {
+            // Source file is also in this batch — source_id is stale (deleted + re-created).
+            // Phase 2 already resolves cross-file edges for intra-batch files.
+            if batch_file_ids.contains(source_file_id) {
+                skipped_intra_batch += 1;
+                continue;
+            }
+            if let Some(new_target_ids) =
+                batch_name_to_ids.get(&(*target_file_id, target_name.as_str()))
+            {
+                for &new_tgt_id in new_target_ids {
+                    if *source_id != new_tgt_id
+                        && insert_edge_cached(
+                            db.conn(),
+                            *source_id,
+                            new_tgt_id,
+                            relation,
+                            metadata.as_deref(),
+                        )?
+                    {
+                        edges_created += 1;
+                        restored += 1;
+                    }
+                }
+            }
+        }
+        if restored > 0 || skipped_intra_batch > 0 {
+            tracing::debug!(
+                "[index] Restored {} cross-file inbound edges, skipped {} intra-batch",
+                restored,
+                skipped_intra_batch
+            );
+        }
+    }
+
+    Ok(edges_created)
 }
 
 /// Phase 3: build every indexed node's context string, store it, then embed.
