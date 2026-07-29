@@ -655,7 +655,8 @@ pub(super) fn index_files(
                         // calls exactly like the CJS require-namespace form.
                         if matches!(
                             meta.get("q").and_then(|v| v.as_str()),
-                            Some("ns_require") | Some("ns_import")
+                            Some(crate::domain::IMPORT_Q_NS_REQUIRE)
+                                | Some(crate::domain::IMPORT_Q_NS_IMPORT)
                         ) {
                             if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
                                 if let Some(file) =
@@ -770,7 +771,10 @@ pub(super) fn index_files(
                 if let Some(meta) = import_meta.as_ref() {
                     if matches!(
                         meta.get("q").and_then(|v| v.as_str()),
-                        Some("ns_require") | Some("ns_import") | Some("star_reexport")
+                        Some(crate::domain::IMPORT_Q_NS_REQUIRE)
+                            | Some(crate::domain::IMPORT_Q_NS_IMPORT)
+                            | Some(crate::domain::IMPORT_Q_STAR_REEXPORT)
+                            | Some(crate::domain::IMPORT_Q_DEFAULT)
                     ) {
                         if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
                             if let Some(file) =

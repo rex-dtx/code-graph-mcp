@@ -734,7 +734,7 @@ fn walk_for_relations(
                                                 source_name: "<module>".into(),
                                                 target_name: var,
                                                 relation: REL_IMPORTS.into(),
-                                                metadata: Some(serde_json::json!({ "q": "ns_require", "js_module": &path }).to_string()),
+                                                metadata: Some(serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_REQUIRE, "js_module": &path }).to_string()),
                                                 source_language: String::new(),
                                             });
                                         }

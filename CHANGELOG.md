@@ -21,6 +21,66 @@ and pattern-position identifiers inside `matches!`.
   the `.*` blanket rule silently refuses every new repo-root dotfile, and
   `git add` reports that as a hint rather than a failure.
 
+**`INDEX_VERSION` 55 → 56**: two import forms that emitted no edge at all now
+emit one (see the PHP and ESM entries below), so the index changes for any repo
+containing either.
+
+### Fixed
+- **PHP `require_once "lib.php"` emitted no import edge at all** — the
+  double-quoted spelling of all four include keywords (`require`,
+  `require_once`, `include`, `include_once`), while the single-quoted spelling
+  worked. tree-sitter-php gives a double-quoted string its own node kind,
+  `encapsed_string`, because that form can interpolate; the extractor only knew
+  `string`. Double quotes are the more common spelling
+  (`require_once "vendor/autoload.php"`), so PHP file-level dependencies were
+  largely invisible to deps / cycles / affected / project_map. An interpolated
+  path (`require_once "$dir/lib.php"`) is still skipped deliberately: its value
+  is not known statically, and guessing the stem would bind a real edge to
+  whatever file shares the literal tail.
+- **`import mod from './m'` emitted no import edge either** — the ESM default
+  binding, the most common ESM form there is. It is a bare `identifier` under
+  `import_clause`, so it was neither an `import_specifier` (all the specifier
+  walk looks for) nor a direct child of the statement (what the identifier arm
+  handles), and fell between the two. `import mod, { y } from './m'` emitted
+  only the named half. It now binds module-level, like the namespace form,
+  rather than as a symbol edge under the local name — the local name is
+  arbitrary (`import anything from './m'`) and the default export's own node is
+  usually called something else, so a name-based edge would either miss or bind
+  a same-named symbol elsewhere. It carries its own `q` marker rather than
+  reusing `ns_import`, because `mod.foo()` after a default import is a member of
+  the default-exported value, not a top-level symbol of that module, and must
+  not feed the namespace member-call map.
+
+  Both were found by the new import parity table below, on its first run. The
+  four `q` markers themselves were string literals written out twice — once at
+  the parser that stamps them, once at the Phase-2 branch that reads them — and
+  are now `domain::IMPORT_Q_*` constants.
+
+### Added
+- **Per-language, per-spelling import parity table** and a **per-language
+  inheritance parity table** (`tests/edge_coverage.rs`). The `calls` axis got
+  its 12-language table last batch; imports had six languages with one spelling
+  each, and the inheritance axis had no table at all — only scattered
+  single-language tests, leaving C#, Kotlin, Swift, Python, TypeScript and
+  JavaScript able to lose their arm with nothing going red. Mutation-verified:
+  disabling the C# `base_list` arm names `csharp inherits` and
+  `csharp implements`; disabling the Kotlin import arm names `kotlin import`.
+
+  The inheritance table records the modeling per (language, relation) because it
+  is not uniform — Kotlin and Swift fold interface/protocol conformance into
+  `inherits`, Go emits it for struct embedding only (interface satisfaction is
+  structural, so there is nothing to extract), Rust has `implements` and no
+  inheritance — and it asserts the zeroes too, so a future change that starts
+  emitting `implements` for every Kotlin supertype fails instead of
+  double-counting.
+
+  Both tables assert `files_with_parse_errors == 0`. tree-sitter recovers from a
+  syntax error by returning a damaged tree, so a bad fixture still yields
+  symbols and a missing edge would be ambiguous between "the arm is gone" and
+  "this fixture never parsed" — not hypothetical: a single-line Kotlin class
+  body (`class C { fun f(): Int = 1 }`) errors under the pinned grammar while
+  the identical code across three lines does not.
+
 ### Changed
 - **The additive `references` passes are a table, not eleven hand-written
   `if`s** (P1-9's other half). `walk_for_relations` carried one

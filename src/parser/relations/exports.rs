@@ -55,7 +55,7 @@ pub(super) fn extract_export_names(
                     target_name: "<module>".into(),
                     relation: REL_IMPORTS.into(),
                     metadata: Some(
-                        serde_json::json!({ "q": "star_reexport", "js_module": js_module })
+                        serde_json::json!({ "q": crate::domain::IMPORT_Q_STAR_REEXPORT, "js_module": js_module })
                             .to_string(),
                     ),
                     source_language: String::new(),

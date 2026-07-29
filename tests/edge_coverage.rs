@@ -270,3 +270,369 @@ fn edge_coverage_intra_class_method_call_resolves() {
         );
     }
 }
+
+/// Index one file per fixture and return the `imports` edge count per source file.
+///
+/// Asserts the fixtures PARSED. tree-sitter recovers from a syntax error by
+/// returning a damaged tree, so extraction still yields *some* symbols and a
+/// missing edge would be ambiguous between "the extractor arm is gone" and
+/// "this fixture never parsed". That is not hypothetical: a single-line Kotlin
+/// class body (`class C { fun f(): Int = 1 }`) errors under the pinned grammar
+/// while the identical code across three lines does not, so a parity fixture
+/// written the first way reports Kotlin as having lost its arm.
+fn index_parity_fixture(files: &[(&str, &str)]) -> (TempDir, Database) {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for (name, body) in files {
+        std::fs::write(src.join(name), body).unwrap();
+    }
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    let result =
+        code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(
+        result.stats.files_with_parse_errors, 0,
+        "a parity fixture failed to parse — fix the fixture before reading anything into a \
+         missing edge, because error recovery makes 'arm removed' and 'fixture invalid' \
+         look identical"
+    );
+    (project, db)
+}
+
+/// `imports` edge count per source file, for the spelling table below.
+fn imports_per_file(files: &[(&str, &str)]) -> (TempDir, BTreeMap<String, i64>) {
+    let (project, db) = index_parity_fixture(files);
+    let mut counts = BTreeMap::new();
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT f.path, count(*) FROM edges e \
+             JOIN nodes s ON e.source_id = s.id JOIN files f ON s.file_id = f.id \
+             WHERE e.relation = 'imports' GROUP BY 1",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .unwrap();
+    for row in rows {
+        let (path, n) = row.unwrap();
+        counts.insert(path, n);
+    }
+    (project, counts)
+}
+
+/// Per-language, per-FORM import parity.
+///
+/// `import_extraction_parity_across_full_languages` above covers six languages
+/// with one canonical form each. That left two gaps this table closes, both of
+/// which were live defects when it was written:
+///
+///   * nine import-capable languages had no import guard at all (C#, Kotlin,
+///     Ruby, PHP, Swift, Dart, C, C++, Bash);
+///   * within a covered language, only ONE spelling was ever exercised — and
+///     the spelling decides. PHP `require_once "b.php"` emitted nothing while
+///     `require_once 'b.php'` worked, because tree-sitter-php gives a
+///     double-quoted string the kind `encapsed_string` (it can interpolate) and
+///     the extractor only knew `string`. All four PHP include keywords were
+///     affected. Likewise `import f from './b'` — the single most common ESM
+///     form — emitted nothing, because the default binding is a bare
+///     `identifier` under `import_clause`, which is neither an
+///     `import_specifier` nor a direct child of the statement.
+///
+/// So each row is (label, file, source, min_edges): a language may legitimately
+/// need more than one row.
+#[test]
+fn import_parity_across_languages_and_spellings() {
+    let cases: &[(&str, &str, &str, i64)] = &[
+        // --- the spelling axis, where the two defects lived ---
+        (
+            "php require_once double-quoted",
+            "a.php",
+            "<?php\nrequire_once \"b.php\";\n",
+            1,
+        ),
+        (
+            "php require_once single-quoted",
+            "c.php",
+            "<?php\nrequire_once 'b.php';\n",
+            1,
+        ),
+        (
+            "php include double-quoted",
+            "d.php",
+            "<?php\ninclude \"b.php\";\n",
+            1,
+        ),
+        (
+            "php include_once double-quoted",
+            "e.php",
+            "<?php\ninclude_once \"b.php\";\n",
+            1,
+        ),
+        (
+            "php require double-quoted",
+            "f.php",
+            "<?php\nrequire \"b.php\";\n",
+            1,
+        ),
+        (
+            "esm default import",
+            "def.ts",
+            "import mod from './tgt';\n",
+            1,
+        ),
+        (
+            "esm default + named",
+            "both.ts",
+            "import mod, { y } from './tgt';\n",
+            2,
+        ),
+        (
+            "esm named import",
+            "named.ts",
+            "import { y } from './tgt';\n",
+            1,
+        ),
+        (
+            "esm namespace import",
+            "ns.ts",
+            "import * as everything from './tgt';\n",
+            1,
+        ),
+        (
+            "cjs require double-quoted",
+            "r1.js",
+            "const x = require(\"./tgtjs\");\n",
+            1,
+        ),
+        (
+            "cjs require single-quoted",
+            "r2.js",
+            "const x = require('./tgtjs');\n",
+            1,
+        ),
+        // --- the nine languages that had no import guard at all ---
+        ("csharp using", "A.cs", "using System;\n", 1),
+        ("kotlin import", "a.kt", "import kotlin.math.abs\n", 1),
+        ("ruby require", "a.rb", "require 'json'\n", 1),
+        ("swift import", "a.swift", "import Foundation\n", 1),
+        ("dart import", "a.dart", "import 'dart:math';\n", 1),
+        (
+            "c include angle-bracketed",
+            "a.c",
+            "#include <stdio.h>\n",
+            1,
+        ),
+        ("cpp include quoted", "a.cpp", "#include \"hdr.h\"\n", 1),
+        ("bash source", "a.sh", "source ./b.sh\n", 1),
+    ];
+
+    let mut files: Vec<(&str, &str)> = cases.iter().map(|(_, f, s, _)| (*f, *s)).collect();
+    // Import TARGETS. Not required for an edge to exist — an unresolved
+    // specifier still reaches an `<external>` sentinel — but a resolvable one
+    // proves the edge points somewhere real for the forms that bind file-level.
+    files.push(("b.php", "<?php\nfunction phpHelper() { return 1; }\n"));
+    files.push((
+        "tgt.ts",
+        "export const y = 1;\nexport default function f() {}\n",
+    ));
+    files.push(("tgtjs.js", "module.exports = { y: 1 };\n"));
+    files.push(("hdr.h", "int hdr_fn(int a);\n"));
+    files.push(("b.sh", "other() { echo 2; }\n"));
+
+    let (_p, counts) = imports_per_file(&files);
+
+    let shortfalls: Vec<String> = cases
+        .iter()
+        .filter_map(|(label, file, source, min)| {
+            let got = counts.get(&format!("src/{file}")).copied().unwrap_or(0);
+            (got < *min).then(|| format!("{label} ({file}, {source:?}): {got} < {min}"))
+        })
+        .collect();
+
+    assert!(
+        shortfalls.is_empty(),
+        "these import spellings produced too few `imports` edges — the extractor arm or \
+         branch for each is missing or regressed:\n  {}\nall counts: {counts:?}",
+        shortfalls.join("\n  ")
+    );
+}
+
+/// Per-language inheritance-axis parity.
+///
+/// The `calls` axis has `call_extraction_parity_across_every_call_capable_language`
+/// and imports has the table above; the inheritance axis had NO parity table at
+/// all — only scattered single-language tests for Java, Ruby, PHP, C++ and Dart.
+/// Six languages that emit these edges today (C#, Kotlin, Swift, Python,
+/// TypeScript, JavaScript) could lose their arm without a single test going red.
+///
+/// The expectations are per (language, relation) because the MODELING is not
+/// uniform, and that non-uniformity is the point of writing it down:
+///
+///   * separate `inherits` + `implements`: TS, Java, C#, PHP, Dart
+///   * `inherits` only, no interface syntax in the language: JS, Python, Ruby, C++
+///   * conformance folded INTO `inherits`: Kotlin (`: Base(), Iface`) and Swift
+///     (`: Base, Protocol`) — both emit TWO `inherits` edges and no `implements`
+///   * `implements` only: Rust `impl Trait for Type` (no inheritance to model).
+///     Rust also emits one `implements` per method in the impl block, on purpose,
+///     so dead-code sees incoming edges on trait methods.
+///   * Go: `inherits` for struct EMBEDDING only. Interface satisfaction is
+///     structural — there is no declaration to extract, so no edge, ever.
+///   * C: no inheritance at all.
+///
+/// Type names are language-distinct so a cross-language name collision cannot
+/// manufacture an edge and mask a missing arm.
+#[test]
+fn inheritance_parity_across_every_inheritance_capable_language() {
+    let files: &[(&str, &str)] = &[
+        (
+            "svc.ts",
+            "export interface TsGreeter {\n    greet(): string;\n}\nexport class TsBase {\n    helper(): number {\n        return 1;\n    }\n}\nexport class TsSvc extends TsBase implements TsGreeter {\n    greet(): string {\n        return \"hi\";\n    }\n}\n",
+        ),
+        (
+            "svc.js",
+            "class JsBase {\n    helper() {\n        return 1;\n    }\n}\nclass JsSvc extends JsBase {\n    handle() {\n        return this.helper();\n    }\n}\nmodule.exports = { JsSvc };\n",
+        ),
+        (
+            "svc.py",
+            "class PyBase:\n    def helper(self):\n        return 1\n\nclass PySvc(PyBase):\n    def handle(self):\n        return self.helper()\n",
+        ),
+        (
+            "a.rb",
+            "class RbBase\n  def helper\n    1\n  end\nend\n\nclass RbSvc < RbBase\n  def greet\n    helper\n  end\nend\n",
+        ),
+        (
+            "JvSvc.java",
+            "interface JvGreeter {\n    int greet();\n}\n\nclass JvBase {\n    int helper() {\n        return 1;\n    }\n}\n\npublic class JvSvc extends JvBase implements JvGreeter {\n    public int greet() {\n        return helper();\n    }\n}\n",
+        ),
+        (
+            "CsSvc.cs",
+            "interface ICsGreeter {\n    int Greet();\n}\n\nclass CsBase {\n    public int Helper() {\n        return 1;\n    }\n}\n\nclass CsSvc : CsBase, ICsGreeter {\n    public int Greet() {\n        return Helper();\n    }\n}\n",
+        ),
+        (
+            "a.php",
+            "<?php\ninterface PhpGreet {\n    public function greet();\n}\n\nclass PhpBase {\n    public function helper() {\n        return 1;\n    }\n}\n\nclass PhpSvc extends PhpBase implements PhpGreet {\n    public function greet() {\n        return $this->helper();\n    }\n}\n",
+        ),
+        (
+            "a.dart",
+            "abstract class DtGreet {\n  int greet();\n}\n\nclass DtBase {\n  int helper() => 1;\n}\n\nclass DtSvc extends DtBase implements DtGreet {\n  int greet() => helper();\n}\n",
+        ),
+        (
+            "a.kt",
+            "interface KtGreet {\n    fun greet(): Int\n}\n\nopen class KtBase {\n    open fun helper(): Int {\n        return 1\n    }\n}\n\nclass KtSvc : KtBase(), KtGreet {\n    override fun greet(): Int {\n        return helper()\n    }\n}\n",
+        ),
+        (
+            "a.swift",
+            "protocol SwGreet {\n    func greet() -> Int\n}\n\nclass SwBase {\n    func helper() -> Int {\n        return 1\n    }\n}\n\nclass SwSvc: SwBase, SwGreet {\n    func greet() -> Int {\n        return helper()\n    }\n}\n",
+        ),
+        (
+            "cppbase.hpp",
+            "class CppBase {\npublic:\n    int helper();\n};\n",
+        ),
+        (
+            "a.cpp",
+            "#include \"cppbase.hpp\"\n\nclass CppSvc : public CppBase {\npublic:\n    int greet();\n};\n",
+        ),
+        (
+            "lib.rs",
+            "pub trait RsGreet {\n    fn greet(&self) -> i32;\n}\n\npub struct RsSvc;\n\nimpl RsGreet for RsSvc {\n    fn greet(&self) -> i32 {\n        1\n    }\n}\n",
+        ),
+        (
+            "a.go",
+            "package main\n\ntype GoBase struct {\n\tId int\n}\n\ntype GoSvc struct {\n\tGoBase\n}\n",
+        ),
+        (
+            "a.c",
+            "struct CBase {\n    int id;\n};\n\nstruct CSvc {\n    struct CBase b;\n};\n",
+        ),
+    ];
+
+    // (language, relation, minimum). A language absent from a relation here is
+    // asserted to emit ZERO of it below, so both directions are pinned.
+    let expected: &[(&str, &str, i64)] = &[
+        ("typescript", "inherits", 1),
+        ("typescript", "implements", 1),
+        ("javascript", "inherits", 1),
+        ("python", "inherits", 1),
+        ("ruby", "inherits", 1),
+        ("java", "inherits", 1),
+        ("java", "implements", 1),
+        ("csharp", "inherits", 1),
+        ("csharp", "implements", 1),
+        ("php", "inherits", 1),
+        ("php", "implements", 1),
+        ("dart", "inherits", 1),
+        ("dart", "implements", 1),
+        // Conformance folded into `inherits`: base class AND interface/protocol.
+        ("kotlin", "inherits", 2),
+        ("swift", "inherits", 2),
+        ("cpp", "inherits", 1),
+        ("rust", "implements", 1),
+        // Struct embedding, the only inheritance-shaped Go syntax.
+        ("go", "inherits", 1),
+    ];
+
+    let (_p, db) = index_parity_fixture(files);
+    let by_lang = edge_counts(&db);
+    let count = |lang: &str, rel: &str| -> i64 {
+        by_lang
+            .get(lang)
+            .and_then(|m| m.get(rel))
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let shortfalls: Vec<String> = expected
+        .iter()
+        .filter_map(|(lang, rel, min)| {
+            let got = count(lang, rel);
+            (got < *min).then(|| format!("{lang} {rel}: {got} < {min}"))
+        })
+        .collect();
+    assert!(
+        shortfalls.is_empty(),
+        "these languages stopped emitting an inheritance edge — the arm is missing or \
+         regressed:\n  {}\nall counts: {by_lang:?}",
+        shortfalls.join("\n  ")
+    );
+
+    // Negative half. Without it, a change that starts emitting `implements` for
+    // every Kotlin supertype (or an `inherits` edge for Go's structural
+    // interfaces) would silently double-count and no test would notice.
+    let unexpected: Vec<String> = [
+        "typescript",
+        "javascript",
+        "python",
+        "ruby",
+        "java",
+        "csharp",
+        "php",
+        "dart",
+        "kotlin",
+        "swift",
+        "cpp",
+        "rust",
+        "go",
+        "c",
+    ]
+    .iter()
+    .flat_map(|lang| {
+        ["inherits", "implements"]
+            .iter()
+            .map(move |rel| (*lang, *rel))
+    })
+    .filter(|(lang, rel)| {
+        !expected.iter().any(|(l, r, _)| l == lang && r == rel) && count(lang, rel) > 0
+    })
+    .map(|(lang, rel)| format!("{lang} {rel}: {} (expected none)", count(lang, rel)))
+    .collect();
+    assert!(
+        unexpected.is_empty(),
+        "these languages emitted an inheritance edge the table does not model — either the \
+         extractor widened (update the table) or it is manufacturing edges:\n  {}\nall counts: \
+         {by_lang:?}",
+        unexpected.join("\n  ")
+    );
+}
