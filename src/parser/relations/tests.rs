@@ -1564,6 +1564,52 @@ fn guard(e: &MyEnum) -> bool {
 }
 
 #[test]
+fn test_rust_lowercase_pattern_in_matches_is_not_a_call() {
+    // The CamelCase skip is a CONVENTION check, not a structural one: a crate
+    // that carries `#[allow(non_camel_case_types)]` (bindgen output, C-ABI enum
+    // mirrors) has lowercase tuple variants, and `matches!(x, ok(v))` walks
+    // straight past the uppercase guard into a fabricated `calls → ok` edge —
+    // pointing at whichever same-language `fn ok` the resolver likes.
+    //
+    // Pattern position IS structural here: everything after the first top-level
+    // `,` of a matches!-family macro is a pattern. The guard is the counterweight
+    // — `if is_ready(v)` after the pattern is an EXPRESSION, and swallowing it
+    // would repeat the over-collection that cost real edges in the
+    // value-reference pass (audit 2026-07-28).
+    let src = r#"
+fn check(x: Thing) -> bool {
+    matches!(x, ok(v) if is_ready(v))
+}
+fn wrapped(x: Thing) -> bool {
+    assert!(matches!(x, err(code) if reportable(code)));
+    true
+}
+fn scrutinee(x: Thing) -> bool {
+    matches!(compute(x), ok(_))
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<(&str, &str)> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    for banned in ["ok", "err"] {
+        assert!(
+            !calls.iter().any(|(_, t)| *t == banned),
+            "lowercase pattern {banned} must not get a calls edge, got: {calls:?}"
+        );
+    }
+    // Guard expressions and the scrutinee are code and keep their edges.
+    for kept in ["is_ready", "reportable", "compute"] {
+        assert!(
+            calls.iter().any(|(_, t)| *t == kept),
+            "{kept} is an expression, not a pattern — its edge must survive, got: {calls:?}"
+        );
+    }
+}
+
+#[test]
 fn test_rust_top_level_macro_call_not_indexed() {
     // Parity with the call_expression arm: Rust calls with no enclosing named
     // scope are deliberately not indexed (no bare top-level statements in Rust;
@@ -5965,5 +6011,274 @@ pub fn caller(a: &[u8]) {
     assert!(
         calls.contains(&"idx"),
         "a call inside an index expression is not an attribute argument, got: {calls:?}"
+    );
+}
+
+#[test]
+fn test_rust_local_closure_call_is_not_a_global_edge() {
+    // Rust's VALUE namespace lets a `let` shadow an item, so `let cb = …; cb()`
+    // unambiguously invokes the local closure — never a same-named global fn.
+    // Both call channels reached this shape with no local-binding exclusion:
+    // the ordinary `call_expression` arm and the macro token_tree pass. The
+    // repo's own `refine_ambiguous_targets` (indexer/pipeline/resolve.rs) has a
+    // deliberately-divergent local `is_test_path` closure, and the production
+    // index recorded it as a caller of `domain::is_test_path` — a fn it never
+    // calls.
+    let cases = [
+        // Ordinary call_expression channel.
+        (
+            "fn run(p: &str) { let is_test_path = |s: &str| s.contains(\"t\"); if is_test_path(p) { work(); } }",
+            "is_test_path",
+        ),
+        // Macro token_tree channel (parent is `token_tree`, so the
+        // value-reference pass never fires and its M2.5 exclusion never applied).
+        (
+            "fn run() { let cb = |v: i32| v + 1; assert_eq!(cb(1), 2); }",
+            "cb",
+        ),
+        // Closure parameter, not a `let`.
+        (
+            "fn run() { helper(|fmt: fn(i32) -> i32| { let _ = fmt(1); }); }",
+            "fmt",
+        ),
+        // `if let` / `match` / `for` bindings feed the same collector.
+        (
+            "fn run(o: Option<fn()>) { if let Some(handler) = o { handler(); } }",
+            "handler",
+        ),
+    ];
+    for (src, local) in cases {
+        let rels = extract_relations(src, "rust").unwrap();
+        let calls: Vec<&str> = rels
+            .iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(
+            !calls.contains(&local),
+            "calling local binding `{local}` must not emit a global calls edge, got: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_local_exclusion_respects_scope_and_position() {
+    // The exclusion's name set is a whole-body over-approximation: every binder
+    // anywhere in the function, with no scope and no ordering. That is
+    // precision-safe on the `references` axis and NOT on the calls axis, where
+    // it silently drops real edges — and a missing calls edge is the dangerous
+    // direction, because dead-code reads exactly that edge and a live function
+    // becomes a deletion candidate.
+    //
+    // Each case binds `helper` somewhere that CANNOT shadow the call, so the
+    // call is a genuine call of the global `helper` and must still emit.
+    let cases: &[(&str, &str)] = &[
+        (
+            "binder comes after the call",
+            "fn helper() -> i32 { 1 }\nfn run() -> i32 { let a = helper(); let helper = 9; a + helper }",
+        ),
+        (
+            "binder in a sibling block",
+            "fn helper() -> i32 { 1 }\nfn run() -> i32 { { let helper = 2; let _ = helper; } helper() }",
+        ),
+        (
+            "for-loop binder, call after the loop",
+            "fn helper() -> i32 { 1 }\nfn run(v: Vec<i32>) -> i32 { for helper in v { let _ = helper; } helper() }",
+        ),
+        (
+            "match-arm binder, call after the match",
+            "fn helper() -> i32 { 1 }\nfn run(x: Result<i32, i32>) -> i32 { match x { Ok(helper) => { let _ = helper; } Err(_) => {} } helper() }",
+        ),
+        (
+            "if-let binder, call after",
+            "fn helper() -> i32 { 1 }\nfn run(o: Option<i32>) -> i32 { if let Some(helper) = o { let _ = helper; } helper() }",
+        ),
+        (
+            "closure param, call outside the closure",
+            "fn helper() -> i32 { 1 }\nfn run() -> i32 { let f = |helper: i32| helper + 1; let _ = f(1); helper() }",
+        ),
+    ];
+
+    let mut lost = Vec::new();
+    for (label, src) in cases {
+        let rels = extract_relations(src, "rust").unwrap();
+        let calls: Vec<&str> = rels
+            .iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        if !calls.contains(&"helper") {
+            lost.push(*label);
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "these shapes bind `helper` where it cannot shadow the call, so the call is genuine \
+         and must emit — the exclusion is over-firing on them: {lost:?}"
+    );
+
+    // The other direction, unchanged: a binder that GENUINELY shadows still
+    // suppresses. Without this the fix above could be "never exclude anything".
+    let shadowed = [
+        "fn helper() -> i32 { 1 }\nfn run() -> i32 { let helper = || 2; helper() }",
+        "fn helper() -> i32 { 1 }\nfn run(v: Vec<fn() -> i32>) -> i32 { for helper in v { let _ = helper(); } 0 }",
+        "fn helper() -> i32 { 1 }\nfn run(o: Option<fn() -> i32>) -> i32 { if let Some(helper) = o { helper() } else { 0 } }",
+        "fn helper() -> i32 { 1 }\nfn run(f: fn() -> i32) -> i32 { let g = |helper: fn() -> i32| helper(); g(f) }",
+    ];
+    for src in shadowed {
+        let rels = extract_relations(src, "rust").unwrap();
+        let calls: Vec<&str> = rels
+            .iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(
+            !calls.contains(&"helper"),
+            "a binder that really does shadow the call must still suppress it, got: {calls:?}\nsrc: {src}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_local_exclusion_keeps_genuine_calls() {
+    // Negative control for the exclusion above: suppressing everything would
+    // pass the previous test. A bare call whose name is NOT a local binding
+    // still emits, including when a same-named local exists for a DIFFERENT
+    // name in the same body.
+    let src = r#"
+fn run(p: &str) {
+    let is_test_path = |s: &str| s.contains("t");
+    if is_test_path(p) { work(); }
+    helper(1);
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    for kept in ["work", "helper"] {
+        assert!(
+            calls.contains(&kept),
+            "genuine call `{kept}` must survive local-binding exclusion, got: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_local_exclusion_spares_camelcase_constructors() {
+    // The local collector deliberately OVER-collects from pattern fields: a
+    // `match` arm `Ok(v)` contributes both `Ok` and `v`. That is precision-safe
+    // for value references but would cost real instantiation edges on the calls
+    // axis, where a tuple-variant constructor call IS the edge dead-code
+    // detection relies on. Variant/type names are CamelCase by convention (the
+    // same rule the macro pass already uses), so the exclusion skips them.
+    let src = r#"
+fn run(r: Result<i32, i32>) -> MyVariant {
+    match r {
+        Ok(v) => { let _ = v; }
+        Err(e) => { let _ = e; }
+    }
+    MyVariant(3)
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        calls.contains(&"MyVariant"),
+        "CamelCase constructor call must survive over-collected pattern names, got: {calls:?}"
+    );
+}
+
+#[test]
+fn test_method_call_survives_same_named_local() {
+    // `CalleeQualifier::Bare` is not the same predicate as "the callee is a bare
+    // identifier": it is also `extract_rust_field`'s FALLBACK arm for a method
+    // call whose receiver is neither `self`, a plain identifier, nor a call. A
+    // nested-field receiver (`ctx.db.conn()`) lands there. Gating the
+    // local-binding exclusion on the enum instead of on the node shape dropped
+    // 14 real `Database::conn` edges in this repo — every `cmd_*` that opens
+    // with `let conn = ctx.db.conn();`, because the METHOD name equals the local
+    // it is bound to. The method call must survive; only the bare call goes.
+    let src = r#"
+fn cmd_show(ctx: &Ctx) {
+    let conn = ctx.db.conn();
+    let helper = |x: i32| x + 1;
+    let _ = helper(1);
+    render(conn);
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        calls.contains(&"conn"),
+        "a method call must not be suppressed by a same-named local, got: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&"helper"),
+        "the bare local-closure call must still be suppressed, got: {calls:?}"
+    );
+    assert!(
+        calls.contains(&"render"),
+        "unrelated bare call must survive, got: {calls:?}"
+    );
+}
+
+#[test]
+fn test_match_guard_callee_is_not_a_local_binding() {
+    // tree-sitter wraps a match arm's pattern AND its optional `if` guard in one
+    // `match_pattern` node under the `pattern` field. The local-name collector
+    // over-collects from pattern fields deliberately (a variant name costs
+    // nothing), but a GUARD is an ordinary expression — sweeping it in makes
+    // every function it calls look like a local. Real instance: `cmd_grep`'s
+    // `Ok(c) if …!is_cwd_anchored(path) =>` suppressed the genuine call edge to
+    // `fn is_cwd_anchored` (cli.rs:580).
+    let src = r#"
+fn cmd_grep(path: &str, r: Result<i32, i32>) {
+    let resolved = match r {
+        Ok(c) if is_cwd_anchored(path) => c,
+        _ => 0,
+    };
+    let _ = resolved;
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        calls.contains(&"is_cwd_anchored"),
+        "a fn called in a match guard is not a local binding, got: {calls:?}"
+    );
+    // Negative control: the arm's actual BINDER is still collected, so a bare
+    // call to a name bound by the pattern is still suppressed.
+    let shadowed = r#"
+fn run(r: Result<fn(), i32>) {
+    match r {
+        Ok(handler) => { handler(); }
+        Err(_) => {}
+    }
+}
+"#;
+    let rels2 = extract_relations(shadowed, "rust").unwrap();
+    let calls2: Vec<&str> = rels2
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    assert!(
+        !calls2.contains(&"handler"),
+        "a name bound by the arm pattern must still be excluded, got: {calls2:?}"
     );
 }

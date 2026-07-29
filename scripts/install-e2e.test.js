@@ -314,7 +314,14 @@ test('§1.9 session-init self-heals a stale-but-existing settings.json hook path
 test('§1.10 session-init self-heals a stale-but-existing composite statusline path', () => {
   const { homeDir, settingsPath } = installIntoSandbox();
 
-  const staleComposite = path.join(homeDir, 'old-cache', '0.45.1', 'scripts', 'statusline-composite.js');
+  // Must use the REAL plugin-cache layout (<marketplace>/<plugin>/<ver>/scripts),
+  // for the same reason §1.9 above must: since the statusline slot joined the
+  // surface-tolerant staleness rule (audit P2-17), only a dead path or an OLDER
+  // cache-version dir is stale — an existing path of unknown shape is a valid
+  // in-place surface (global npm, a dev checkout) and is left alone, which is
+  // what stops two copies from taking the slot from each other every session.
+  const staleComposite = path.join(homeDir, '.claude', 'plugins', 'cache',
+    'code-graph-mcp', 'code-graph-mcp', '0.45.1', 'scripts', 'statusline-composite.js');
   fs.mkdirSync(path.dirname(staleComposite), { recursive: true });
   fs.writeFileSync(staleComposite, '// stale copy\n');
   const settings = readJson(settingsPath);
@@ -326,6 +333,31 @@ test('§1.10 session-init self-heals a stale-but-existing composite statusline p
   assert.equal(healed.statusLine.command,
     `node "${path.join(PLUGIN_ROOT, 'scripts', 'statusline-composite.js')}"`);
   assert.equal(runSyncLifecycleConfig(homeDir), 'noop');
+});
+
+test('§1.10b session-init leaves another delivery surface\'s live composite alone (P2-17)', () => {
+  // The tolerant half of §1.10, and the reason both gates had to change
+  // together: session-init decides whether to heal, install() decides whether to
+  // write. When only install() learned surface tolerance, session-init kept
+  // reporting 'self-healed-stale-statusline' on every session while install()
+  // quietly changed nothing — a self-heal that heals nothing, once per session,
+  // forever.
+  const { homeDir, settingsPath } = installIntoSandbox();
+
+  // A global-npm-shaped (in-place, no version dir) composite that exists.
+  const npmComposite = path.join(homeDir, '.nvm', 'versions', 'node', 'v24.18.0',
+    'lib', 'node_modules', '@sdsrs', 'code-graph', 'claude-plugin', 'scripts',
+    'statusline-composite.js');
+  fs.mkdirSync(path.dirname(npmComposite), { recursive: true });
+  fs.writeFileSync(npmComposite, '// live copy on another surface\n');
+  const settings = readJson(settingsPath);
+  settings.statusLine.command = `node "${npmComposite}"`;
+  writeJson(settingsPath, settings);
+
+  assert.equal(runSyncLifecycleConfig(homeDir), 'noop',
+    'a live composite on another surface is not stale');
+  assert.equal(readJson(settingsPath).statusLine.command, `node "${npmComposite}"`,
+    'and the slot must be left exactly as it was');
 });
 
 test('§1.11 a stale-relic session-init defers to the active install (downgrade-war guard)', () => {

@@ -101,10 +101,30 @@ mod inner {
         /// Best-effort: a diagnostics write must never break the download path,
         /// so every failure here is swallowed.
         pub fn record_download_state(status: &str, attempts: u32, error: Option<&str>) {
+            Self::record_download_state_trusted(status, attempts, error, None);
+        }
+
+        /// [`record_download_state`] plus the TLS trust path that produced the
+        /// bytes (`"bundled"` / `"platform"`).
+        ///
+        /// Recorded because the OS-trust-store fallback is otherwise invisible
+        /// after the fact: nothing on disk distinguished a model fetched through
+        /// ureq's pinned webpki roots from one fetched through whatever the
+        /// machine's certificate store happened to contain (a corporate MITM
+        /// root, an enterprise MDM profile), so `doctor` could not answer the
+        /// question and neither could the user. Content integrity does not
+        /// depend on this — the blake3 pin in `extract_and_promote` is checked
+        /// either way — but provenance is worth being able to state.
+        pub fn record_download_state_trusted(
+            status: &str,
+            attempts: u32,
+            error: Option<&str>,
+            trust_path: Option<&str>,
+        ) {
             let Ok(path) = Self::download_state_file() else {
                 return;
             };
-            Self::record_download_state_at(&path, status, attempts, error);
+            Self::record_download_state_at_trusted(&path, status, attempts, error, trust_path);
         }
 
         /// Testable core of [`record_download_state`], parameterized on the state
@@ -126,6 +146,18 @@ mod inner {
             attempts: u32,
             error: Option<&str>,
         ) {
+            Self::record_download_state_at_trusted(path, status, attempts, error, None);
+        }
+
+        /// [`record_download_state_at`] with the TLS trust path — see
+        /// [`record_download_state_trusted`].
+        pub fn record_download_state_at_trusted(
+            path: &std::path::Path,
+            status: &str,
+            attempts: u32,
+            error: Option<&str>,
+            trust_path: Option<&str>,
+        ) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -140,6 +172,7 @@ mod inner {
                 "updated_epoch": epoch,
                 "url": Self::model_download_url(),
                 "binary_version": env!("CARGO_PKG_VERSION"),
+                "trust_path": trust_path,
             });
             let _ = std::fs::write(path, serde_json::to_vec_pretty(&state).unwrap_or_default());
         }
@@ -310,6 +343,20 @@ mod inner {
             dest_dir: &std::path::Path,
             expected: &str,
         ) -> Result<()> {
+            // The published bundle unpacks to ~90 MB; 400 MiB leaves a 4x margin
+            // for the model growing while still bounding a decompression bomb.
+            Self::extract_and_promote_capped(body, dest_dir, expected, 400 * 1024 * 1024)
+        }
+
+        /// Testable core of [`extract_and_promote`] — `max_unpacked` is a
+        /// parameter so the refusal can be exercised on a kilobyte fixture
+        /// instead of a gigabyte one.
+        pub(crate) fn extract_and_promote_capped(
+            body: &[u8],
+            dest_dir: &std::path::Path,
+            expected: &str,
+            max_unpacked: u64,
+        ) -> Result<()> {
             let parent = dest_dir
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("model cache dir has no parent: {:?}", dest_dir))?;
@@ -362,6 +409,13 @@ mod inner {
             let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(body));
             let mut archive = tar::Archive::new(gz);
             archive.set_overwrite(true);
+            // Extraction happens BEFORE the blake3 pin can be checked (the pin is
+            // over the unpacked weights), so the bytes written here are not yet
+            // trusted. The 200 MB cap in `download_model_to` bounds the
+            // COMPRESSED body; gzip's ratio means that still permits a
+            // multi-gigabyte unpack, and the disk it fills is the user's. Bound
+            // the decompressed side too.
+            let mut unpacked: u64 = 0;
             for entry in archive.entries()? {
                 let mut entry = entry?;
                 let path = entry.path()?;
@@ -371,6 +425,16 @@ mod inner {
                     .any(|c| matches!(c, std::path::Component::ParentDir))
                 {
                     anyhow::bail!("Tar entry contains path traversal: {:?}", path);
+                }
+                // Checked against the header BEFORE unpacking, so an oversized
+                // member is refused rather than written and then noticed.
+                unpacked = unpacked.saturating_add(entry.header().size()?);
+                if unpacked > max_unpacked {
+                    anyhow::bail!(
+                        "Model archive unpacks to more than {} bytes — refusing to fill the disk \
+                         with unverified data",
+                        max_unpacked
+                    );
                 }
                 entry.unpack_in(&staging)?;
             }
@@ -437,7 +501,47 @@ mod inner {
             ureq::Agent::new_with_config(config)
         }
 
-        pub fn download_model_to(url: &str, dest_dir: &std::path::Path) -> Result<()> {
+        /// Can a DIFFERENT root store plausibly turn this failure into a success?
+        ///
+        /// The OS-trust-store retry exists for one shape: a TLS-inspecting proxy
+        /// whose private root is not in ureq's bundled webpki set. Retrying
+        /// anything else buys nothing and costs a second full
+        /// [`DOWNLOAD_TIMEOUT`] — with the caller's 3 attempts that turned a dead
+        /// mirror into 3 × 2 × 600s ≈ one hour of `model-download.json` reading
+        /// "in flight", which `doctor` reports verbatim to a user who could
+        /// otherwise have been told the download failed 55 minutes earlier.
+        pub(crate) fn os_trust_store_might_help(e: &ureq::Error) -> bool {
+            // Nothing about the root store changes these.
+            if matches!(
+                e,
+                ureq::Error::Timeout(_)
+                    | ureq::Error::StatusCode(_)
+                    | ureq::Error::HostNotFound
+                    | ureq::Error::BadUri(_)
+                    | ureq::Error::RedirectFailed
+                    | ureq::Error::TooManyRedirects
+                    | ureq::Error::InvalidProxyUrl
+            ) {
+                return false;
+            }
+            if matches!(e, ureq::Error::Tls(_)) {
+                return true;
+            }
+            // rustls surfaces a rejected chain through several variants depending
+            // on the transport (`Rustls`, or an `Io` wrapping it), and those are
+            // documented as outside ureq's stable API — so classify on the
+            // rendered message rather than on a variant that may be renamed.
+            let msg = e.to_string().to_ascii_lowercase();
+            ["certificate", "issuer", "handshake", "tls", "self-signed"]
+                .iter()
+                .any(|m| msg.contains(m))
+        }
+
+        /// Returns which trust path succeeded — `"bundled"` or `"platform"` —
+        /// so the download state file can record it (see
+        /// [`record_download_state_at`]); without that, "was this model fetched
+        /// through the OS certificate chain?" is unanswerable after the fact.
+        pub fn download_model_to(url: &str, dest_dir: &std::path::Path) -> Result<&'static str> {
             use std::io::Read as IoRead;
 
             tracing::info!("[model] Downloading model from {}...", url);
@@ -447,14 +551,19 @@ mod inner {
             // while `curl` (schannel / OS store) succeeds — the asymmetry issue
             // #35 reports. Try the bundled roots first (no behaviour change for
             // anyone it already worked for), then fall back to the OS trust
-            // store rather than giving up.
+            // store — but only for failures a trust store can actually explain.
+            let mut trust_path = "bundled";
             let mut response = match Self::agent_with_roots(false).get(url).call() {
                 Ok(r) => r,
                 Err(first) => {
+                    if !Self::os_trust_store_might_help(&first) {
+                        return Err(anyhow::anyhow!("Model download failed: {}", first));
+                    }
                     tracing::warn!(
                         "[model-dl] Bundled-roots fetch failed ({}) — retrying with the OS certificate store",
                         first
                     );
+                    trust_path = "platform";
                     Self::agent_with_roots(true).get(url).call().map_err(|e| {
                         anyhow::anyhow!(
                             "Model download failed (bundled roots: {}; OS trust store: {})",
@@ -481,11 +590,12 @@ mod inner {
             Self::extract_and_promote(&body, dest_dir, Self::MODEL_CONTENT_BLAKE3)?;
 
             tracing::info!(
-                "[model] Model extracted and verified at {:?} ({} bytes)",
+                "[model] Model extracted and verified at {:?} ({} bytes, {} trust path)",
                 dest_dir,
-                body.len()
+                body.len(),
+                trust_path
             );
-            Ok(())
+            Ok(trust_path)
         }
 
         fn find_models_dir() -> Result<std::path::PathBuf> {
@@ -869,6 +979,109 @@ mod tests {
         );
     }
 
+    /// The unpack budget is enforced from the tar HEADER, before any member is
+    /// written.
+    ///
+    /// Extraction runs before the blake3 pin can be checked (the pin is over the
+    /// unpacked weights), and the only size cap was on the COMPRESSED body — so
+    /// a bundle whose gzip ratio is hostile could write gigabytes of unverified
+    /// data to the user's disk before anything rejected it.
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_extract_refuses_an_archive_that_unpacks_past_the_budget() {
+        use inner::EmbeddingModel as M;
+
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut b = tar::Builder::new(gz);
+        let payload = vec![b'0'; 4096]; // compresses to nearly nothing
+        let mut h = tar::Header::new_gnu();
+        h.set_size(payload.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "model.safetensors", &payload[..])
+            .unwrap();
+        let body = b.into_inner().unwrap().finish().unwrap();
+        assert!(
+            body.len() < payload.len(),
+            "fixture must actually compress, else it proves nothing about ratios"
+        );
+
+        let root = tempfile::TempDir::new().unwrap();
+        let dest = root.path().join("models");
+        let id = blake3::hash(&payload).to_hex().to_string();
+
+        let err = M::extract_and_promote_capped(&body, &dest, &id, 1024)
+            .expect_err("an archive declaring more than the budget must be refused");
+        assert!(
+            err.to_string().contains("refusing to fill the disk"),
+            "the refusal must name its reason, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "nothing may be promoted from a refused archive"
+        );
+
+        // Same archive under a budget that fits gets past the guard — it is a
+        // bound, not a blanket refusal. (It still fails, on the missing
+        // companion files, which is a different rejection.)
+        let err = M::extract_and_promote_capped(&body, &dest, &id, 64 * 1024)
+            .expect_err("fixture has no tokenizer.json/config.json");
+        assert!(
+            !err.to_string().contains("refusing to fill the disk"),
+            "under a sufficient budget the size guard must not be what rejects: {err}"
+        );
+    }
+
+    /// The OS-trust-store retry must fire only for failures a different root
+    /// store could explain. Retrying a timeout or a 404 costs a second full
+    /// 600s budget for nothing, and with the caller's three attempts that is
+    /// close to an hour of `doctor` reporting "download in flight".
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_os_trust_store_retry_is_limited_to_trust_failures() {
+        use inner::EmbeddingModel as M;
+        assert!(
+            M::os_trust_store_might_help(&ureq::Error::Tls("invalid peer certificate")),
+            "a TLS error is exactly what the OS store can fix"
+        );
+        assert!(
+            !M::os_trust_store_might_help(&ureq::Error::StatusCode(404)),
+            "a 404 is the same 404 under any root store"
+        );
+        assert!(
+            !M::os_trust_store_might_help(&ureq::Error::HostNotFound),
+            "DNS is not a trust decision"
+        );
+        assert!(
+            !M::os_trust_store_might_help(&ureq::Error::TooManyRedirects),
+            "redirect loops do not depend on the root store"
+        );
+    }
+
+    /// The trust path that produced the bytes is recorded, so `doctor` can
+    /// answer "did this model come through the OS certificate chain?".
+    #[cfg(feature = "embed-model")]
+    #[test]
+    fn test_download_state_records_the_trust_path() {
+        use inner::EmbeddingModel as M;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("model-download.json");
+
+        M::record_download_state_at_trusted(&state, "ok", 1, None, Some("platform"));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(v["trust_path"], "platform");
+
+        // Absent rather than fabricated when the caller does not know.
+        M::record_download_state_at(&state, "in_flight", 1, None);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert!(
+            v["trust_path"].is_null(),
+            "an unknown trust path must read as unknown, not as bundled"
+        );
+    }
+
     #[cfg(feature = "embed-model")]
     #[test]
     fn test_embed_produces_correct_dims() {
@@ -1061,7 +1274,15 @@ mod tests {
             "https://invalid.example.com/nonexistent.tar.gz",
             tmp.path(),
         );
-        assert!(result.is_err(), "should fail on invalid URL");
+        let err = result.expect_err("should fail on invalid URL").to_string();
+        // …and fail ONCE. A name that does not resolve (or a connection that is
+        // refused) is not something the OS certificate store can fix, so the
+        // second full 600s attempt must not be spent — the two-attempt message
+        // shape is what betrays it if the narrowing regresses.
+        assert!(
+            !err.contains("OS trust store"),
+            "a non-trust failure must not trigger the trust-store retry: {err}"
+        );
     }
 
     #[cfg(feature = "embed-model")]

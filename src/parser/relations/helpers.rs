@@ -252,6 +252,25 @@ fn extract_string_from_subtree_inner(
         let text = text.trim_start_matches(['f', 'r', 'b', 'u', 'F', 'R', 'B', 'U']);
         return Some(text.trim_matches(|c| c == '\'' || c == '"').to_string());
     }
+    // tree-sitter-php gives a DOUBLE-quoted string its own kind, `encapsed_string`,
+    // because that form can interpolate; only the single-quoted form is `string`.
+    // So `require_once "lib.php"` extracted nothing while `require_once 'lib.php'`
+    // worked — all four include keywords, and double quotes are the more common
+    // spelling (`require_once "vendor/autoload.php"`). PHP is the only grammar
+    // using this kind, so no other language's walk is affected.
+    //
+    // An interpolated path (`require_once "$dir/lib.php"`) is deliberately NOT
+    // extracted: its value is not known statically, and guessing the stem would
+    // bind a real edge to whatever file happens to share the literal tail.
+    // Precision over recall, the same call the resolver makes elsewhere.
+    if node.kind() == "encapsed_string" {
+        let text = node_text(node, source);
+        let unquoted = text.trim_matches(|c| c == '"');
+        if !unquoted.contains('$') && !unquoted.contains('{') {
+            return Some(unquoted.to_string());
+        }
+        return None;
+    }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             if let Some(s) = extract_string_from_subtree_inner(&child, source, depth + 1) {

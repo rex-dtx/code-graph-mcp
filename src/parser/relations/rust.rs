@@ -476,12 +476,37 @@ pub(super) fn extract_rust_macro_token_call(
     // Tuple-variant/tuple-struct PATTERNS (`matches!(x, Some(y))`) parse
     // identically to calls in a token soup — token_tree carries no
     // pattern-vs-expression split (audit 2026-07-24, empirically reproduced:
-    // `matches!(x, Some(y))` fabricated a calls→Some edge). Variant and type
-    // names are CamelCase by convention (non_camel_case_types lint), while the
-    // fn calls this pass exists to recover are snake_case — so skip
-    // uppercase-initial names. Cost: constructor uses like `vec![Some(1)]`
-    // stay invisible, exactly as they were before this pass existed.
+    // `matches!(x, Some(y))` fabricated a calls→Some edge).
+    //
+    // First line of defence is convention, because it is one comparison: variant
+    // and type names are CamelCase (non_camel_case_types lint), the fn calls this
+    // pass exists to recover are snake_case — so skip uppercase-initial names.
+    //
+    // The cost is two-sided, and only the first half is obvious:
+    //   1. Constructor USES like `vec![Some(1)]` stay invisible, exactly as they
+    //      were before this pass existed.
+    //   2. Because they are invisible, a type CONSTRUCTED ONLY inside macros has
+    //      no inbound edge at all — `find_dead_code` then reports it as dead.
+    //      That is a recall loss on the type, not just on the call: the same
+    //      exclusion that protects `Some` from a fake edge denies a
+    //      macro-only-constructed struct its real one. Widening the skip (e.g.
+    //      to every uppercase name anywhere) makes that worse, not better.
     if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None;
+    }
+    // The reverse gap the convention cannot see: a LOWERCASE tuple variant, which
+    // `#[allow(non_camel_case_types)]` code (bindgen output, C-ABI enum mirrors)
+    // is full of. For the matches!-family shape — which is where pattern-shaped
+    // token soup overwhelmingly comes from — argument position settles it with no
+    // convention at all. Runs second because it walks ancestors and the check
+    // above is one comparison.
+    if in_matches_pattern_position(node, source) {
+        return None;
+    }
+    // `let cb = |v| v + 1; assert_eq!(cb(1), 2)` calls the LOCAL closure. The
+    // value-reference pass cannot suppress it here — inside a token_tree that
+    // pass never fires at all — so this channel applies the exclusion itself.
+    if shadowed_by_enclosing_local(node, source, name) {
         return None;
     }
     Some(ParsedRelation {
@@ -491,6 +516,92 @@ pub(super) fn extract_rust_macro_token_call(
         metadata: None,
         source_language: String::new(),
     })
+}
+
+/// Macros whose second and later top-level arguments are PATTERNS, not
+/// expressions. `matches!` is std; the `assert_matches` pair is the
+/// `assert_matches` crate / unstable std spelling of the same shape.
+const PATTERN_ARG_MACROS: &[&str] = &["matches", "assert_matches", "debug_assert_matches"];
+
+/// True when `node` sits in PATTERN position of a `matches!`-family macro.
+///
+/// Case conventions cannot decide this: `#[allow(non_camel_case_types)]` code
+/// (bindgen output, C-ABI enum mirrors) has lowercase tuple variants, so
+/// `matches!(x, ok(v))` walks past the CamelCase guard in
+/// [`extract_rust_macro_token_call`] and fabricates a `calls → ok` edge aimed at
+/// whichever same-language `fn ok` the resolver picks. Argument position is
+/// structural and needs no convention.
+///
+/// Two shapes reach here. `matches!(…)` written directly is a `macro_invocation`
+/// with a `token_tree` argument list; written INSIDE another macro
+/// (`assert!(matches!(…))`) it is raw tokens — `matches` `!` `(…)` as siblings —
+/// with no `macro_invocation` node anywhere, so the argument list is recognized
+/// by its two preceding tokens instead.
+///
+/// The `if` guard is the counterweight: `matches!(x, ok(v) if is_ready(v))` puts
+/// a real expression after the pattern, and `is_ready` must keep its edge.
+/// Collecting the guard along with the pattern is precisely the over-collection
+/// that silently deleted true edges from the value-reference axis (memory
+/// `feedback_edge_exclusion_verify_by_index_diff`), so the scan returns to
+/// expression state at a top-level `if`.
+fn in_matches_pattern_position(node: &tree_sitter::Node, source: &str) -> bool {
+    let mut child = *node;
+    while let Some(parent) = child.parent() {
+        if parent.kind() == "token_tree" && is_pattern_arg_list(&parent, source) {
+            // Innermost enclosing pattern-macro argument list decides: a nested
+            // `matches!` inside a guard is judged on its OWN argument positions.
+            return child_is_after_pattern_comma(&parent, &child);
+        }
+        child = parent;
+    }
+    false
+}
+
+/// Is this `token_tree` the argument list of a [`PATTERN_ARG_MACROS`] macro?
+fn is_pattern_arg_list(tt: &tree_sitter::Node, source: &str) -> bool {
+    if source.as_bytes().get(tt.start_byte()) != Some(&b'(') {
+        return false;
+    }
+    // Shape 1: a real `macro_invocation` node (macro written at expression level).
+    if let Some(parent) = tt.parent() {
+        if parent.kind() == "macro_invocation" {
+            return parent
+                .child_by_field_name("macro")
+                .map(|m| node_text(&m, source))
+                .is_some_and(|name| PATTERN_ARG_MACROS.contains(&name));
+        }
+    }
+    // Shape 2: raw tokens inside an outer macro's token_tree — `matches` `!` `(…)`.
+    let Some(bang) = tt.prev_sibling() else {
+        return false;
+    };
+    if bang.kind() != "!" {
+        return false;
+    }
+    bang.prev_sibling()
+        .filter(|n| n.kind() == "identifier")
+        .map(|n| node_text(&n, source))
+        .is_some_and(|name| PATTERN_ARG_MACROS.contains(&name))
+}
+
+/// Walk the argument list left to right and report whether `child` (a direct
+/// child of `arg_list` — the ancestor of the identifier under test) lands in
+/// pattern state. State starts as expression (the scrutinee), flips at the first
+/// top-level `,`, and flips back at a top-level `if` (the guard).
+fn child_is_after_pattern_comma(arg_list: &tree_sitter::Node, child: &tree_sitter::Node) -> bool {
+    let mut in_pattern = false;
+    let mut cursor = arg_list.walk();
+    for c in arg_list.children(&mut cursor) {
+        if c.id() == child.id() {
+            return in_pattern;
+        }
+        match c.kind() {
+            "," => in_pattern = true,
+            "if" => in_pattern = false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// True when `node` lies inside an attribute written as RAW TOKENS — the
@@ -601,7 +712,7 @@ pub(super) fn extract_rust_value_reference(
     if name.is_empty() || name == "self" || name == "Self" || name == "_" {
         return None;
     }
-    if enclosing_fn_local_names(node, source).contains(name) {
+    if with_enclosing_fn_local_names(node, source, |names| names.contains(name)) {
         return None;
     }
     Some(ParsedRelation {
@@ -613,47 +724,293 @@ pub(super) fn extract_rust_value_reference(
     })
 }
 
-/// Collect LOCAL binding names visible to a value-reference candidate so M2/M2.5
-/// can suppress them — a bare id equal to a local is a pass-through of that local,
-/// not a reference to a same-named global fn. Collects:
-///   - parameters of the nearest enclosing `function_item` + any enclosing closures
-///     (M2 — `type_identifier` types are excluded since only `identifier` nodes are
-///     gathered; generic `<F>` params live in `type_parameters`, not collected);
-///   - `let` binding names in the nearest function body (M2.5) — gathered from the
-///     `let_declaration` `pattern` field ONLY (never the RHS `value`), so
-///     `let db = open()` contributes `db` but not `open`. This kills the dominant
-///     Phase-1 false positive: `let db = open(); run(&db)` where an accessor fn/
-///     method `db` also exists (`conn`, `db`, `picks` … measured in dogfooding).
+/// True when a BARE callee name (`cb()`) is a local binding of the enclosing
+/// function — a closure or fn-pointer call, not a call of the same-named global
+/// fn. Rust's VALUE namespace lets a `let` shadow an item, so `let cb = …; cb()`
+/// unambiguously invokes the local; emitting a `calls` edge for it points at
+/// whichever project fn happens to share the name.
+///
+/// Both call channels needed this and neither had it: the ordinary
+/// `call_expression` arm, and the macro token_tree pass (inside a token_tree the
+/// value-reference pass never fires, so its M2.5 exclusion never applied). This
+/// repo's own `refine_ambiguous_targets` keeps a deliberately-divergent local
+/// `is_test_path` closure and the production index recorded it as a caller of
+/// `domain::is_test_path`.
+///
+/// CamelCase names are exempt. [`collect_rust_binding_names`] over-collects from
+/// pattern fields on purpose — a `match` arm `Ok(v)` contributes `Ok` as well as
+/// `v` — which is precision-safe for value references but would cost real edges
+/// here, where a tuple-variant/tuple-struct constructor call is exactly the edge
+/// dead-code detection reads. Variant and type names are CamelCase by convention
+/// (`non_camel_case_types`), the same rule [`extract_rust_macro_token_call`] uses
+/// to tell patterns from calls in a token soup.
+pub(super) fn shadowed_by_enclosing_local(
+    node: &tree_sitter::Node,
+    source: &str,
+    name: &str,
+) -> bool {
+    if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return false;
+    }
+    // Two stages, and the split is what makes this both correct and cheap.
+    //
+    // The memoized set is a whole-function OVER-approximation: every binder
+    // anywhere in the body, no scope, no ordering. On the `references` axis
+    // that is precision-safe. On the CALLS axis it is not — it suppresses real
+    // edges whenever the binder cannot actually shadow the call:
+    //
+    //   let a = helper(); let helper = 9;        // binder comes AFTER
+    //   { let helper = 2; }  helper()            // binder in a sibling block
+    //   for helper in v {}   helper()            // loop binder, call after
+    //   match x { Ok(helper) => {} }  helper()   // arm binder, call after
+    //   |helper| ...;        helper()            // closure param, call outside
+    //
+    // and a dropped `calls` edge is the dangerous direction: a live function
+    // reported dead. So a hit on the over-approximation is not the answer, only
+    // permission to ask the precise question — which walks the call's own
+    // ancestor chain and costs nothing for the overwhelming majority of names,
+    // because they never appear in the set at all.
+    if !with_enclosing_fn_local_names(node, source, |names| names.contains(name)) {
+        return false;
+    }
+    binder_shadows_call(node, source, name)
+}
+
+/// Is `name` bound by a binder that is BOTH in scope at `node` AND positioned
+/// before it? Rust's real shadowing rule, as opposed to the whole-body
+/// approximation [`with_enclosing_fn_local_names`] provides.
+///
+/// Walks outward from the call. At each enclosing block only the statements
+/// that PRECEDE the call can shadow it; a construct that owns the call through
+/// its body (a `for` loop, an `if let`, a `match` arm, a closure) shadows with
+/// its own pattern regardless of byte order, since the binding is live for the
+/// whole body. Stops at the enclosing `function_item` — Rust `let` scope does
+/// not cross a nested-fn boundary.
+fn binder_shadows_call(node: &tree_sitter::Node, source: &str, name: &str) -> bool {
+    let mut child = *node;
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            // Only preceding statements are in scope. `child` is the subtree the
+            // call sits in, so anything starting at or after it cannot shadow.
+            "block" => {
+                for i in 0..n.named_child_count() {
+                    let Some(stmt) = n.named_child(i) else {
+                        continue;
+                    };
+                    if stmt.start_byte() >= child.start_byte() {
+                        break;
+                    }
+                    if stmt.kind() == "let_declaration" {
+                        if let Some(pat) = stmt.child_by_field_name("pattern") {
+                            if pattern_binds(&pat, source, name) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Binding constructs: their pattern is live throughout the body, so
+            // position does not apply — but only when the call is INSIDE that
+            // body, which is exactly what walking up from the call establishes.
+            "for_expression" | "let_condition" | "match_arm" => {
+                if let Some(pat) = n.child_by_field_name("pattern") {
+                    // A `match_arm`'s pattern wraps an optional `if` guard; only
+                    // the binder half counts (the guard is an expression, and
+                    // sweeping it in is how a real call became a "local").
+                    let pat = if pat.kind() == "match_pattern" {
+                        pat.named_child(0).unwrap_or(pat)
+                    } else {
+                        pat
+                    };
+                    if pattern_binds(&pat, source, name) {
+                        return true;
+                    }
+                }
+            }
+            // `if let Some(x) = o { x() }` / `while let`: the binder lives in
+            // the CONDITION, which is a SIBLING of the body we walked up from,
+            // not an ancestor of the call. Reached only when the call is inside
+            // the guarded branch, which is what makes the binding live for it.
+            "if_expression" | "while_expression" => {
+                let guarded = n
+                    .child_by_field_name("consequence")
+                    .or_else(|| n.child_by_field_name("body"))
+                    .is_some_and(|b| b.id() == child.id());
+                if guarded {
+                    if let Some(cond) = n.child_by_field_name("condition") {
+                        if cond.kind() == "let_condition" {
+                            if let Some(pat) = cond.child_by_field_name("pattern") {
+                                if pattern_binds(&pat, source, name) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "closure_expression" => {
+                if let Some(p) = n.child_by_field_name("parameters") {
+                    let mut names = std::collections::HashSet::new();
+                    collect_param_idents(&p, source, &mut names, 0);
+                    if names.contains(name) {
+                        return true;
+                    }
+                }
+            }
+            "function_item" => {
+                if let Some(p) = n.child_by_field_name("parameters") {
+                    let mut names = std::collections::HashSet::new();
+                    collect_param_idents(&p, source, &mut names, 0);
+                    return names.contains(name);
+                }
+                return false;
+            }
+            _ => {}
+        }
+        child = n;
+        cur = n.parent();
+    }
+    false
+}
+
+/// Does this pattern introduce `name` as a binding? Identifier-only: a
+/// CamelCase variant or const in the pattern is not a binder, and the caller
+/// has already excluded CamelCase anyway.
+fn pattern_binds(pat: &tree_sitter::Node, source: &str, name: &str) -> bool {
+    let mut names = std::collections::HashSet::new();
+    collect_idents_in(pat, source, &mut names, 0);
+    names.contains(name)
+}
+
+fn collect_idents_in(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if node.kind() == "identifier" {
+        out.insert(node_text(node, source).to_string());
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(c) = node.named_child(i) {
+            collect_idents_in(&c, source, out, depth + 1);
+        }
+    }
+}
+
+thread_local! {
+    /// Memo for the per-`function_item` half of the local-name set, keyed by the
+    /// node id of the enclosing `function_item`.
+    ///
+    /// This runs on EVERY bare Rust call, and without it each call re-walks its
+    /// whole enclosing function body: measured +16% on a full index of this
+    /// repo's 109 Rust files (1.29s → 1.50s, median of 3) when the exclusion
+    /// landed uncached.
+    ///
+    /// Node ids are unique WITHIN a tree and recycled ACROSS trees, so the cache
+    /// is cleared at the top of every file's walk by
+    /// [`reset_fn_local_names_cache`] — a stale cross-file hit would silently
+    /// suppress real edges. `thread_local` (not a global) because file parsing
+    /// fans out over rayon; each worker keeps its own cache and clears it per
+    /// file it owns.
+    static FN_LOCAL_NAMES: std::cell::RefCell<
+        std::collections::HashMap<usize, std::rc::Rc<std::collections::HashSet<String>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Drop the memo. MUST be called once per file before walking its tree — see
+/// [`FN_LOCAL_NAMES`] for why a leaked entry is a correctness bug, not just
+/// stale data.
+pub(super) fn reset_fn_local_names_cache() {
+    FN_LOCAL_NAMES.with(|c| c.borrow_mut().clear());
+}
+
+/// Run `f` over the LOCAL binding names visible to `node` (M2/M2.5), without
+/// materializing a fresh set per call. A bare id equal to a local is a
+/// pass-through of that local, not a reference to a same-named global fn.
+/// Collects:
+///   - parameters of the nearest enclosing `function_item` + any enclosing
+///     closures (M2 — `type_identifier` types are excluded since only
+///     `identifier` nodes are gathered; generic `<F>` params live in
+///     `type_parameters`, not collected);
+///   - `let` binding names in the nearest function body (M2.5) — gathered from
+///     the `let_declaration` `pattern` field ONLY (never the RHS `value`), so
+///     `let db = open()` contributes `db` but not `open`. This kills the
+///     dominant Phase-1 false positive: `let db = open(); run(&db)` where an
+///     accessor fn/method `db` also exists (`conn`, `db`, `picks` … measured in
+///     dogfooding).
 ///
 /// Rust `let` scope is function-local (nested fns don't capture), so the nearest
 /// `function_item` is the correct boundary.
-fn enclosing_fn_local_names(
+///
+/// Split in two because only one half is memoizable:
+///   - enclosing CLOSURE parameters are position-dependent (two sibling closures
+///     in one fn have different params), so they are collected live — cheap, a
+///     parameter list is tiny and there is rarely more than one closure deep;
+///   - the enclosing `function_item`'s own params plus every binding in its body
+///     depend only on the fn, so they come from [`FN_LOCAL_NAMES`]. That body
+///     walk is the expensive half.
+///
+/// Memoizing the closure half too would be wrong in the recall-losing direction:
+/// a call to a global `fmt` would be suppressed because an unrelated closure
+/// elsewhere in the same fn happens to bind `fmt`.
+fn with_enclosing_fn_local_names<R>(
     node: &tree_sitter::Node,
     source: &str,
-) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
+    f: impl FnOnce(&std::collections::HashSet<String>) -> R,
+) -> R {
+    let mut closure_names = std::collections::HashSet::new();
+    let mut fn_item = None;
     let mut cur = node.parent();
     while let Some(n) = cur {
         match n.kind() {
             "closure_expression" => {
                 if let Some(p) = n.child_by_field_name("parameters") {
-                    collect_param_idents(&p, source, &mut names, 0);
+                    collect_param_idents(&p, source, &mut closure_names, 0);
                 }
             }
             "function_item" => {
-                if let Some(p) = n.child_by_field_name("parameters") {
-                    collect_param_idents(&p, source, &mut names, 0);
-                }
-                if let Some(body) = n.child_by_field_name("body") {
-                    collect_rust_binding_names(&body, source, &mut names, 0);
-                }
+                fn_item = Some(n);
                 break;
             }
             _ => {}
         }
         cur = n.parent();
     }
-    names
+
+    let Some(item) = fn_item else {
+        // No enclosing fn: closure params (if any) are all there is.
+        return f(&closure_names);
+    };
+
+    let fn_names = FN_LOCAL_NAMES.with(|cache| {
+        if let Some(hit) = cache.borrow().get(&item.id()) {
+            return std::rc::Rc::clone(hit);
+        }
+        let mut names = std::collections::HashSet::new();
+        if let Some(p) = item.child_by_field_name("parameters") {
+            collect_param_idents(&p, source, &mut names, 0);
+        }
+        if let Some(body) = item.child_by_field_name("body") {
+            collect_rust_binding_names(&body, source, &mut names, 0);
+        }
+        let rc = std::rc::Rc::new(names);
+        cache
+            .borrow_mut()
+            .insert(item.id(), std::rc::Rc::clone(&rc));
+        rc
+    });
+
+    if closure_names.is_empty() {
+        f(&fn_names)
+    } else {
+        closure_names.extend(fn_names.iter().cloned());
+        f(&closure_names)
+    }
 }
 
 /// Walk a function body collecting binding names from every pattern-introducing
@@ -681,7 +1038,23 @@ fn collect_rust_binding_names(
         "let_declaration" | "let_condition" | "match_arm" | "for_expression"
     ) {
         if let Some(pat) = node.child_by_field_name("pattern") {
-            collect_param_idents(&pat, source, out, 0);
+            // A `match_arm`'s `pattern` field is a `match_pattern`, which wraps
+            // BOTH the pattern and an optional `if` GUARD. The guard is an
+            // ordinary expression, not a binder, so sweeping it in collected
+            // every identifier it mentions — including called function names.
+            // `Ok(c) if Path::new(p).is_relative() && !is_cwd_anchored(p) =>`
+            // made `is_cwd_anchored` look like a local, suppressing the real
+            // call edge from `cmd_grep` to the fn at cli.rs:580. Over-collection
+            // is precision-safe for BINDERS (a variant name costs nothing) but
+            // not for a guard, which is where callees live.
+            let binder = if pat.kind() == "match_pattern" {
+                pat.named_child(0)
+            } else {
+                Some(pat)
+            };
+            if let Some(b) = binder {
+                collect_param_idents(&b, source, out, 0);
+            }
         }
     }
     for i in 0..node.named_child_count() {

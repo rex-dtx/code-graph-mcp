@@ -255,8 +255,18 @@ function syncLifecycleConfig() {
   // v0.49.1: also self-heal when the composite path exists but is not the one
   // we'd write now (old plugin-cache version dir that still exists on disk —
   // invisible to the existence check above; same fault class as the binary pin).
-  const { compositeCommand } = require('./lifecycle');
-  if (settings.statusLine.command !== compositeCommand()) {
+  //
+  // "Not the one we'd write now" is NOT the same as stale, and this is the
+  // second gate that had to learn it: two copies of the plugin derive different
+  // absolute paths for the same current composite, so a bare string mismatch
+  // made each session take the slot back from the other. It also has to agree
+  // with `install()`, which now refuses to rewrite a live composite belonging to
+  // another delivery surface — otherwise this reports
+  // 'self-healed-stale-statusline' every single session while install() quietly
+  // changes nothing.
+  const { compositeCommand, compositeSlotIsStale } = require('./lifecycle');
+  if (settings.statusLine.command !== compositeCommand()
+      && compositeSlotIsStale(settings.statusLine.command)) {
     installReporting();
     return 'self-healed-stale-statusline';
   }

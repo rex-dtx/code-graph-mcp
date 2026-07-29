@@ -1,5 +1,471 @@
 # Changelog
 
+## Unreleased
+
+Audit 2026-07-27 P2 batch: 20 of the ~29 observations, chosen for the ones whose
+failure mode is silence, plus the seven findings an independent review raised
+against the batch itself.
+
+**`INDEX_VERSION` 53 → 56, so upgrading rebuilds the index once.** (The 53 → 54
+step landed with the second sub-batch; this line said "no `INDEX_VERSION` change"
+until 55, which was wrong from that commit onward.) Two changes alter what the
+indexer stores for identical source: bare Rust callees that name a local binding,
+and pattern-position identifiers inside `matches!`.
+
+### Added
+- **`.gitattributes` (`* text=auto eol=lf`)** — pins LF in the working tree on
+  every platform, removing the CRLF class that cost v0.108.0 a full
+  push/CI/fix round on an otherwise green release. `git add --renormalize .`
+  changed nothing else: the repo was already all-LF, so this is purely
+  preventive for Windows checkouts. It had to be negated in `.gitignore` first —
+  the `.*` blanket rule silently refuses every new repo-root dotfile, and
+  `git add` reports that as a hint rather than a failure.
+
+**`INDEX_VERSION` 55 → 56**: two import forms that emitted no edge at all now
+emit one (see the PHP and ESM entries below), so the index changes for any repo
+containing either.
+
+### Fixed
+- **Five defects the pre-release review found, repaired before the tag.** Two
+  independent fresh-context reviewers were run over the release diff; neither
+  found a blocker, both found things worth stopping for.
+  - **`settings.json` containing a non-UTF-8 byte was silently rewritten with
+    no backup.** The byte-exactness work earlier in this batch covered only the
+    *corrupt* branch. A file that is valid JSON but carries an invalid UTF-8
+    byte — a latin-1 byte in a path, which a non-ASCII username on a legacy
+    code page produces — was classified clean, and then round-tripped through
+    `toString('utf8')` → `JSON.stringify` → atomic write, replacing every such
+    byte with U+FFFD permanently, with nothing on stderr. Detected now by
+    re-encoding the decoded text and comparing to the original bytes: a
+    lossless decode round-trips, a lossy one cannot. The true bytes are copied
+    aside first, and if the copy fails we refuse to touch the file.
+  - **The statusline slot was never healed on Windows** (a regression from this
+    batch). `cacheDirVersion`'s pattern was `/`-only, but the command it parses
+    is built with `path.join`, so on Windows it returned null for every
+    plugin-cache path and `compositeSlotIsStale` answered "not stale"
+    unconditionally. The repo's own "an older plugin-cache version dir must
+    still be healed" test could not catch it — `plugin-tests` is ubuntu-only.
+    Now separator-agnostic, with a test that asserts both spellings from any
+    platform.
+  - **The JS-test gate guarding `npm publish` was still on the non-recursive
+    glob.** Two of three gates were converted this batch; the one left behind
+    was the last gate before an irreversible publish. It also, unlike ci.yml,
+    must keep running `install-e2e` — the drift guard now covers release.yml
+    and pins both properties.
+  - **Rust local-binding call exclusion dropped real edges.** The exclusion
+    added earlier in this batch tested a whole-function name set with no scope
+    and no ordering, so a binder that cannot shadow the call suppressed it
+    anyway: a `let` *after* the call, a binder in a sibling block, a `for` /
+    `match` / `if let` binder with the call after the construct, a closure
+    parameter with the call outside it. A dropped `calls` edge is the dangerous
+    direction — dead-code reads exactly that edge. The memoized set is now only
+    a cheap over-approximation; a hit runs a precise walk of the call's own
+    ancestor chain. Edge-neutral and cost-neutral on this repository (0
+    restored, 0 lost, 4038 ms → 4060 ms).
+  - **Two CommonJS export forms bound the wrong node.** `(function (module,
+    exports) { exports.x = y })` — the UMD/webpack wrapper — was treated as a
+    module export because the object was matched by text, so it marked the
+    wrapped function exported; and a pair whose value is not a symbol
+    (`module.exports = { keyed: 42 }`) fell back to the KEY and marked a
+    same-named real function exported.
+- **CommonJS exports were invisible, so `dead-code` called them orphans.** An
+  incoming `exports` edge is what makes `find_dead_code` report an unused symbol
+  as `exported_unused` ("public surface, something outside may use it") rather
+  than `orphan` ("nothing references this"). Only the ESM `export` keyword
+  produced one. Identical dead code therefore got opposite verdicts by module
+  system — and CommonJS got the stronger, more dangerous one, the verdict a user
+  reads as *safe to delete*, on a module's public API. `module.exports = { f }`,
+  `module.exports = f`, `exports.f = g` and `module.exports.f = g` all emit the
+  edge now, targeting the identifier that names the real symbol rather than the
+  export key. Measured on this repository, whose entire plugin is CommonJS:
+  **+241 `exports` edges, 0 removed** (batch size 500; +233 at 25).
+- **PHP `require_once "lib.php"` emitted no import edge at all** — the
+  double-quoted spelling of all four include keywords (`require`,
+  `require_once`, `include`, `include_once`), while the single-quoted spelling
+  worked. tree-sitter-php gives a double-quoted string its own node kind,
+  `encapsed_string`, because that form can interpolate; the extractor only knew
+  `string`. Double quotes are the more common spelling
+  (`require_once "vendor/autoload.php"`), so PHP file-level dependencies were
+  largely invisible to deps / cycles / affected / project_map. An interpolated
+  path (`require_once "$dir/lib.php"`) is still skipped deliberately: its value
+  is not known statically, and guessing the stem would bind a real edge to
+  whatever file shares the literal tail.
+- **`import mod from './m'` emitted no import edge either** — the ESM default
+  binding, the most common ESM form there is. It is a bare `identifier` under
+  `import_clause`, so it was neither an `import_specifier` (all the specifier
+  walk looks for) nor a direct child of the statement (what the identifier arm
+  handles), and fell between the two. `import mod, { y } from './m'` emitted
+  only the named half. It now binds module-level, like the namespace form,
+  rather than as a symbol edge under the local name — the local name is
+  arbitrary (`import anything from './m'`) and the default export's own node is
+  usually called something else, so a name-based edge would either miss or bind
+  a same-named symbol elsewhere. It carries its own `q` marker rather than
+  reusing `ns_import`, because `mod.foo()` after a default import is a member of
+  the default-exported value, not a top-level symbol of that module, and must
+  not feed the namespace member-call map.
+
+  Both were found by the new import parity table below, on its first run. The
+  four `q` markers themselves were string literals written out twice — once at
+  the parser that stamps them, once at the Phase-2 branch that reads them — and
+  are now `domain::IMPORT_Q_*` constants.
+
+### Added
+- **Per-language, per-spelling import parity table** and a **per-language
+  inheritance parity table** (`tests/edge_coverage.rs`). The `calls` axis got
+  its 12-language table last batch; imports had six languages with one spelling
+  each, and the inheritance axis had no table at all — only scattered
+  single-language tests, leaving C#, Kotlin, Swift, Python, TypeScript and
+  JavaScript able to lose their arm with nothing going red. Mutation-verified:
+  disabling the C# `base_list` arm names `csharp inherits` and
+  `csharp implements`; disabling the Kotlin import arm names `kotlin import`.
+
+  The inheritance table records the modeling per (language, relation) because it
+  is not uniform — Kotlin and Swift fold interface/protocol conformance into
+  `inherits`, Go emits it for struct embedding only (interface satisfaction is
+  structural, so there is nothing to extract), Rust has `implements` and no
+  inheritance — and it asserts the zeroes too, so a future change that starts
+  emitting `implements` for every Kotlin supertype fails instead of
+  double-counting.
+
+- **Three more parity tables**, closing the axes that had no numeric guard:
+  the **method-call spelling** per OO language, **`exports` across module
+  systems** (which is what surfaced the CommonJS defect), and the **`references`
+  axis one fixture per PASS**. That last granularity was itself found by
+  mutation: a first version asserted "each reference-capable language emits ≥ 1"
+  and survived deleting Go's `type_identifier` row, because Go's other pass kept
+  the count above zero — a language with two passes made the guard vacuous for
+  both.
+
+  The call axis was swept the same way the import axis was, and came back
+  clean: 46 spellings across 15 languages (receiver calls, qualified/static
+  calls, chained calls, optional chaining, `Self::assoc`, `super()`, Kotlin
+  extension functions, C++ out-of-class definitions) all resolve. It is the
+  most-worked axis in the crate, which is the likeliest explanation. Only the
+  receiver spelling is pinned, since that is the one that has shipped broken
+  before.
+
+  All tables assert `files_with_parse_errors == 0`. tree-sitter recovers from a
+  syntax error by returning a damaged tree, so a bad fixture still yields
+  symbols and a missing edge would be ambiguous between "the arm is gone" and
+  "this fixture never parsed" — not hypothetical: a single-line Kotlin class
+  body (`class C { fun f(): Int = 1 }`) errors under the pinned grammar while
+  the identical code across three lines does not.
+
+### Changed
+- **The additive `references` passes are a table, not eleven hand-written
+  `if`s** (P1-9's other half). `walk_for_relations` carried one
+  `if config.name == "…" && kind == "…" { … }` block per language per relation
+  — the exact shape this crate's audits name as its top recurring bug class,
+  because a missing block is not a compile error but an edge that is silently
+  never emitted. The eleven are now rows in `REFERENCE_PASSES`, which makes
+  them enumerable, and `tests/reference_pass_wiring.rs` asserts that every
+  `extract_*_reference` defined under `src/parser/relations/` is wired to a
+  row. Writing the extractor and forgetting the wiring now goes red instead of
+  quietly indexing nothing.
+
+  Two distinctions the blocks encoded implicitly and the table now states:
+  some passes key on the file's raw language (where `typescript` and `tsx` are
+  different strings) and some on the `LanguageConfig` family name, which is not
+  interchangeable; and Rust's two `identifier` extractors are an either/or
+  chain while Python's two are independent passes that share a node kind.
+  `walk_for_relations` 1334 → 1216 lines. Edge sets identical before and after
+  at both batch sizes (8708 and 7998, zero line diff, 823 / 719 of them
+  `references`).
+
+### Fixed
+- **The `<external>` sentinel's node type was decided by hash-map iteration
+  order.** A name reachable from both channels in one batch — `impl Write for …`
+  (implements → `trait`) and an unresolved `use std::io::Write` (imports →
+  `module`) — was stamped by whichever relation happened to be pushed last, so
+  re-indexing an unchanged tree could flip it. Reproduced on this repo: three
+  rebuilds with the pre-fix binary disagreed on `Write` (runs 2 and 3 both
+  differed from run 1); the same three with the fix agree exactly. Two causes,
+  both closed. Every caller derives its file list from `HashMap::keys()` —
+  `run_full_index` from `scan_directory`'s map, both incremental entries from
+  `compute_diff` — so `index_files` now sorts and dedups the list at the one
+  choke point all four entry points funnel through. And the sentinel's type now
+  follows a fixed precedence (implements is the specific claim and beats an
+  import) rather than last-write-wins.
+
+  Measured in both regimes, because they behave differently. Within one batch
+  (this repo, 228 files against `BATCH_SIZE` 500) the edge set is unchanged,
+  8665 ↔ 8665 with zero line diff — only the sentinel's type moved. **Across
+  batches — which is every repo over 500 files — the ordering was costing
+  edges, not just stability.** With `BATCH_SIZE` forced to 25 over the same
+  tree, three pre-fix runs produced 7487, 7619 and 7891 edges (2402 and 2880
+  differing lines against the first run); three post-fix runs produced 7997
+  every time, zero diff. Sorted order keeps a directory's files in one batch,
+  where same-batch resolution can bind them; arbitrary order scattered them
+  across batches and the cross-batch bindings were simply lost.
+
+  "More edges" is not by itself "better", so the sets were scored against the
+  single-batch run of the same tree (8697 edges — every file in one batch, so
+  nothing is lost to a batch boundary). Three pre-fix multi-batch runs landed
+  6960 / 7487 / 7042 real edges alongside 535 / 350 / 456 wrong ones (439 / 330
+  / 405 of those `imports → <external>` phantoms, minted when the defining file
+  happened to sit in a later batch). The post-fix run: 7817 real, 170 wrong,
+  162 phantom. Both directions move — recall against the single-batch reference
+  goes 80.0–86.1% → 89.9%, and the phantom count halves at worst. So a
+  multi-batch repo does get a different index out of this — covered by the
+  53 → 56 `INDEX_VERSION` step this batch already carries, which forces the
+  rebuild that picks it up.
+- **SQL `LIKE` treated `_` as a wildcard in the test-source filter** (P2-10), so
+  `latest.cs` (`%`=`l`, `_`=`a`, then `test.`) and `attest.py` were classified as
+  tests and dropped from every production-caller count. The `'test\_%'` leg one
+  line above was already escaped, in the same string literal. Fixing it exposed
+  two more divergences in the same direction: the infix leg was a *contains* over
+  any extension while `is_test_path` is an *ends-with* over four, and the name leg
+  was ASCII-case-insensitive while `is_test_symbol` is `starts_with`, so
+  `Test_Signup` was excluded too. Both legs are now GLOB, and the infix leg is
+  generated from `INFIX_TEST_EXTS`. This was the fifth copy of the
+  test-classification rule and the only one with no mechanical guard; it has one
+  now, asserting the one-directional invariant that actually holds — the filter
+  may be narrower than `is_test_symbol` (an accepted recall gap), never broader.
+- **The release workflow's `concurrency.group` had no dispatch-tag fallback**
+  (P2-21) — the one site of seven missing it. A re-release dispatched from `main`
+  grouped under `refs/heads/main` while the tag-push run for the same version
+  grouped under `refs/tags/vX.Y.Z`, so the two did not serialize: exactly the
+  race the comment above that block says it prevents. A drift guard now covers
+  every `github.ref` expression in the file.
+- **The 24h GitHub rate-limit backoff was dead code** (P2-19). `checkForUpdate`
+  snapshotted state before the fetch and wrote it back on the null return,
+  erasing the `rateLimited: true` that the 403 handler had just set — so every
+  403 cleared the flag it raised, and polling continued on the ordinary interval.
+- **Both fail-open links in the download chains are closed.** The binary chain
+  (P2-24) treated a missing sha256 sidecar as permission to install: it now
+  retries once, then refuses. The plugin chain (P2-23) had no checksum available
+  at all — it pulled GitHub's auto-generated source tarball, for which nothing
+  publishes a digest, and it is the one chain whose payload becomes *executed
+  code* (the extracted JS is copied into the plugin cache and run as hooks).
+  `release.yml` now publishes `claude-plugin.tar.gz` with a `.sha256` sidecar,
+  and the client refuses to extract without a match. The binary update still
+  proceeds in every refusal case, so a bad plugin asset strands no one.
+- **All 21 first-party `actions/*` uses were on mutable major tags** (P2-25)
+  while all 20 third-party sites (3 distinct actions) were SHA-pinned — the harder half to justify,
+  since `actions/checkout` runs first in every job including the one holding
+  `NPM_TOKEN`. Every `uses:` is now pinned to a verified 40-hex commit, with a
+  drift guard.
+- **`similar --json` answered an exit-1 miss with a bare `[]`** (P2-14), the last
+  CLI command doing so while `impact` / `callgraph` / `trace` / `deps` all answer
+  `{error, symbol}`. Once stderr is dropped that array is indistinguishable from
+  a successful empty result. The test meant to enforce the contract was pinning
+  its violation. The sqlite-vec-absent case now discloses too: "similarity could
+  not be computed" is not "nothing is similar".
+- **`dead-code <path-with-nothing-indexed> --json` returned `[]` and exit 0**
+  (P2-15) — a clean bill of health for a path the index has never heard of, while
+  `overview` answers the same input with an error object and exit 1.
+- **`get_ast_node` did not treat an empty `file_path` as absent** (incremental
+  audit Δ1) — the one of five tools missing the filter its siblings carry, and
+  that this same function applies to `symbol_name` forty lines below. An LLM
+  client that fills every declared field with a placeholder got "File '' not
+  found" for a request naming a real symbol.
+- **`git rev-list` gained its `--` separator** (P2-26), matching the `ls-files`
+  sibling 40 lines away that already carried the comment explaining why.
+- **A lowercase tuple-variant pattern inside `matches!` produced a fake call
+  edge** (P2-3). The token-soup pass tells patterns from calls by CamelCase
+  convention, which `#[allow(non_camel_case_types)]` code (bindgen output, C-ABI
+  enum mirrors) breaks: `matches!(x, ok(v))` emitted `calls → ok`, aimed at
+  whichever same-language `fn ok` the resolver picked. Position inside a
+  `matches!` / `assert_matches!` / `debug_assert_matches!` argument list is now
+  decided structurally — everything after the first top-level `,` is a pattern —
+  while a top-level `if` returns to expression state so guard calls keep their
+  edges. Verified by rebuilding this repo's index on both sides: 5954 `calls`
+  edges before and after, nothing lost. The same comment also now records the
+  second half of the convention's cost, which it had left unstated: a type
+  constructed ONLY inside macros gets no inbound edge at all, so `find_dead_code`
+  reports it dead.
+- **One failed `stat` could delete a live file from the index** (P2-5).
+  `scan_directory_cached` derived "does this file still exist?" from its mtime
+  map, which only holds files whose `metadata()` call succeeded — so a transient
+  EACCES/EMFILE/NFS hiccup on a file the walker had just listed dropped it from
+  the carry-forward, and the diff reported it DELETED, taking its nodes and edges
+  with it. Existence now comes from the walk (which saw the file) and freshness
+  from the stat; a failed stat also stops meaning "unchanged", which had left an
+  edited file stale for as long as the failure lasted.
+- **Idle ticks aged the pending-call buffer** (P2-6). A buffered forward
+  reference gets 50 attempts before eviction, and every index pass spent one —
+  including watcher flushes and periodic rescans whose diff was empty, where no
+  node could have appeared and the sweep provably resolves nothing. Measured on
+  this repo: every row sat at attempts = 4 after 26h/4 scans, ~2 weeks to the
+  ceiling with the code untouched; an evicted row only returns if the *caller*
+  file is re-indexed. The sweep now runs only for a batch that parsed files, so
+  attempts count resolution opportunities.
+- **Betweenness centrality had no scale bound and a quadratic scratch reset**
+  (P2-12). Each BFS source cleared all *n* scratch entries whether or not the
+  search reached them — 10^10 writes on a 100K-node graph to answer all zeros.
+  The reset now touches only visited nodes, and above 5000 graph nodes the run
+  switches to a deterministic strided Brandes–Pich sample, scaled back and
+  announced on stderr rather than presented as exact. This repo (2770 non-test
+  nodes) stays exact.
+- **The fuzzy-name edit-distance fallback pooled 5000 rows with no `ORDER BY`**
+  (P2-12) — on a larger repo the `LIMIT` silently decides which names get a
+  typo-correction chance, and the planner decides the `LIMIT`. Pinned to `n.id`.
+- **One file could be a test to `dead-code`/`affected` and production to
+  `project_map` at the same time** (incremental audit Δ3). The edge-level source
+  filter carried only the anchored `tests/` prefix and the `_test.<ext>` leg,
+  while the node-level classifier had the full `is_test_path` set — so an xUnit
+  (`src/Tests/Api/AuthTests.cs`), Maven (`src/test/java/…`) or JS
+  (`foo.test.js`) layout was counted as a production caller in hot-function
+  ranking and as a test everywhere else. Measured on this repository: **792
+  `calls` edges** were classified both ways at once. Both surfaces now generate
+  their path legs from one `test_path_legs_sql`, with a differential test over
+  the parity corpus. The NAME half stays deliberately narrower (no
+  `*Test`/`*Tests` symbol suffix) and keeps its one-directional guard.
+- **`grep` blamed a missing `ripgrep` for a missing working directory**
+  (incremental audit Δ5). `current_dir` is applied during the spawn, so a
+  project root that has been moved or deleted fails with the same
+  `ErrorKind::NotFound` as an absent binary — and the message sent the user to
+  install a tool already on their PATH.
+- **`.EXE` was not recognized as the binary suffix** (incremental audit Δ5) —
+  PATHEXT is upper-case by default on Windows and `cmd.exe` echoes what it
+  resolved, so those invocations went unrecorded in the conversion metric. Only
+  the extension is case-folded; the stem stays exact.
+- **Two copies of the plugin took the statusLine slot from each other every
+  session** (P2-17). `install()` rewrote the slot whenever the command string
+  differed from the one it would write — but a plugin-cache copy and a global-npm
+  copy (or a dev checkout) derive different absolute paths for the same current
+  composite, so each run undid the other and settings.json was rewritten on every
+  SessionStart. The slot now uses the version/surface-tolerant staleness rule the
+  hooks already had: only a dead path, an unparseable command, or an older
+  plugin-cache version dir is healed. `session-init.js` carried the same
+  exact-match test and was changed with it — otherwise it would have reported
+  `self-healed-stale-statusline` every session while `install()` quietly did
+  nothing. This is the sibling of the hook ping-pong fixed in v0.104.x, whose
+  regression test asserted `settings.hooks` and nothing else.
+- **Statusline stand-down never re-armed** (P2-22). After three displacements the
+  plugin releases the slot and stops competing — correct — but the counter was
+  write-only, so when the competing provider was uninstalled and the slot went
+  EMPTY, the plugin stayed statusline-less for the life of the manifest with only
+  an undocumented env var to recover. An empty slot now re-arms it; an occupied
+  one still doesn't (both directions mutation-tested).
+- **`selfHealGlobalPkgs` treated npm's exit code as proof** (P2-22). `npm i -g`
+  installs into whichever prefix the current node resolves, which under nvm — or
+  an `npm --prefix` in the user's npmrc — need not be where the stale copy lives.
+  npm exited 0, the stale package stayed exactly where it was, and the reset
+  counter meant the retry budget could never be spent: one npm install per
+  throttle window, forever. Success is now "the stale copies are gone", re-read
+  after the install.
+- **The model download's TLS fallback had three loose ends** (incremental audit
+  Δ4). (a) The OS-trust-store retry fired on ANY failure, so a dead mirror or a
+  404 cost a second full 600s attempt — with the caller's three tries, close to an
+  hour of `doctor` reporting "download in flight" for something that failed in the
+  first minute. It now fires only for failures a different root store could
+  explain. (b) Extraction runs before the blake3 pin can be checked and the only
+  size cap was on the COMPRESSED body, so a hostile gzip ratio could write
+  gigabytes of unverified data to the user's disk; the unpacked side is now bounded
+  from the tar header, before any member is written. (c) The trust path that
+  produced the bytes is recorded in `model-download.json`, so "did this model come
+  through the OS certificate chain?" is answerable after the fact. Content
+  integrity was never affected — the blake3 pin is checked either way.
+- **Fourteen of twenty languages had no numeric guard on the call axis**
+  (P2-27). The edge baseline asserted `calls` for three languages and imports for
+  six; everything else could lose its `walk_for_relations` arm silently, which is
+  this repo's most-repeated bug shape. One table now covers every call-capable
+  language (JS, Go, Java, C#, Kotlin, Ruby, PHP, Swift, Dart, C, C++, Bash) with a
+  plain handle→helper fixture; disabling the Ruby arm turns it red and names Ruby.
+  Markdown/HTML/CSS/JSON are excluded in writing — they have no call axis.
+
+### Fixed in review (defects this batch introduced)
+- **`dead-code . --json` and `dead-code <dir>/ --json` hard-errored whenever the
+  answer was legitimately clean.** The new unindexed-path probe compared against
+  root-relative stored paths, and `.` normalizes to `""` while a tab-completed
+  `src/` keeps its slash — neither equals a stored path nor prefixes one with
+  `/`. So the fix inverted exactly the case it set out to make honest: a clean
+  repo answered "no indexed files" and exit 1, breaking anything gating CI on the
+  exit code the day it went green. The original negative control used bare `src`,
+  the one spelling of four that worked; it now covers all four, and forces the
+  report empty with `--min-lines 999` so the probe is actually reached — without
+  that the loop passed no matter what the probe did.
+- **The `concurrency.group` fix did not serialize the two runs it named.** A
+  group key is compared as a literal string, so the plain `inputs.tag ||`
+  spelling used everywhere else in the file yields `release-v0.109.0` for a
+  dispatch and `release-refs/tags/v0.109.0` for the tag push — still two keys.
+  It now rebuilds the ref with `format('refs/tags/{0}', …)`. The other six sites
+  are correct with the plain form because they feed `ref:` / `tag_name:`, where
+  both spellings resolve to the same object.
+- **`project_map`'s two inline copies of the test rule were left a fix behind.**
+  Inside one `hot_functions` query the source rows were judged by the new
+  anchored, case-sensitive GLOB and the target rows by the old unanchored,
+  case-insensitive LIKE, so `Test_Signup` and anything in `*_test.ts` /
+  `*_test.java` / `*_test.rb` vanished from `project_map` while `callgraph`
+  listed all their callers. Both now splice `domain::prod_filter_and`, which
+  takes the alias pair.
+- **Eight JS test files wrote into the real Claude config.** v0.108.1 closed
+  this in two files and missed a third; the fix for that missed seven more,
+  including `adopt.test.js`, which redirects `HOME` in-process rather than
+  spawning. Measured against a canary config dir: five `projects/<slug>/memory/`
+  trees and a fabricated `9.9.9` plugin version landed in it. Now neutralized at
+  module load, with a guard covering both the spawn and in-process shapes — the
+  first version of that guard checked only spawns, and a second version stayed
+  green when the statement was commented out because it used `contains` on the
+  whole file rather than matching a line.
+- **The 24h rate-limit backoff became load-bearing without ever having run.**
+  Fixing the state clobber (P2-19) activated a constant written for a dead path.
+  GitHub's unauthenticated quota resets *hourly*, and the backoff arm outranks
+  `--force`, so one 403 froze every update check — force included — for a full
+  day. Now one hour, with the recovery direction asserted.
+- The plugin sidecar fetch gets the same single retry the binary sidecar has, and
+  the plugin asset excludes `*.test.js`, matching the npm `files` allowlist.
+- The `uses:` vacuity floor in the pin guard was 21 against a real count of 41,
+  so a parse regression halving it would have passed.
+- **A doubled separator in a path argument corrupted the index through MCP, and
+  read as a clean answer on the CLI.** `src//a.ts` survived normalization intact:
+  `dead-code src//` returned `[]` at exit 0 on a directory with real dead code,
+  and `get_ast_node {file_path: "src//a.ts"}` did something worse than miss — the
+  freshness path indexed the file a SECOND time under the non-canonical key, so
+  `files` gained a `src//a.ts` row and one symbol became two nodes, each
+  reporting a different path for the same source line. Measured both ways.
+  Repeated separators now collapse in `merkle::normalize_rel_str_on`, the crate's
+  single separator-normalizing implementation, so the CLI, the MCP tools and the
+  write path agree. A leading `//` is preserved — that is a UNC host root, which
+  `normalize_path_display_on` asserts survives; index keys are relative and can
+  never take that branch. Known limit, stated in the test: `.//src/foo.rs` still
+  errors, because stripping `./` leaves a leading `/` — pre-existing, and not
+  reachable from tab completion.
+
+  Existing indexes may already carry a `//` row written by an earlier MCP call;
+  the next full reindex clears it, and nothing reads it in the meantime.
+- **The `CLAUDE_CONFIG_DIR` guard had two vacuity holes**, both found by planting
+  a leaking canary test file rather than by reading it. It matched
+  `...process.env` and `HOME:` on the *same line*, so the Prettier-formatted
+  spelling of the very lines it was written for went unseen; and it accepted a
+  `delete` anywhere in the file, including inside a function body that never
+  runs. It now scans a window and requires the statement at module scope, before
+  the first `test(`. Widening the window then broke the single-line case it
+  already caught — `take_while` on the closing brace dropped the first line — so
+  that is pinned too.
+
+### Internal
+- **`index_files` was decomposed** (P1-9). 1705 → 1050 lines and max brace
+  depth 13 → 10, measured on the function body at `origin/main` and at HEAD,
+  across four commits: Phase 3
+  (context strings + embeddings) and the 2d-bind / 2d-prune / 2e trio out first
+  as `build_context_strings_and_embed` and `run_global_edge_post_passes`; then
+  Phases 0 / 1a / 1b / 2b / 2b-ext / 2c as `buffer_then_delete_files`,
+  `pre_parse_batch`, `insert_batch_nodes`, `mint_external_sentinels` and
+  `restore_inbound_edges`, with the six mutable accumulators that used to live
+  across 1700 lines collected into `SkipCounters` and `BatchInserted`; then the
+  Phase-2 loop's own duplication — twelve copies of the source × target edge
+  insert into `insert_relation_edges`, three copies of the `<module>`-of-file
+  lookup into `module_node_of`, and five import branches that each re-parsed the
+  same metadata JSON down to one parse. Each step states its phases' inputs and
+  outputs in a
+  signature instead of inferred from 1700 lines of shared mutable state. Both
+  were chosen because they touch none of the caller's six accumulators, so the
+  extraction is behaviour-preserving by construction. Verified that way too:
+  indexing an identical snapshot with the before and after binaries produced
+  8665 `calls`/`imports`/… edges on both sides with a zero-line diff (relation
+  and confidence included) and 4450 nodes on both sides. The rest of the
+  decomposition debt — the batch loop, the six accumulators, brace depth 13 —
+  is untouched.
+
+### Changed
+- `project_map`'s `key_symbols` now excludes `*/tests.rs`, a side effect of
+  converging it onto the shared filter (that leg was in the shared rule and not
+  in the inline copy). `is_test_symbol` does classify that path as a test, so
+  this is convergence rather than regression, but it narrows `key_symbols` for
+  any Rust repo using the `mod tests` file layout.
+
 ## v0.108.1 — post-release review of v0.108.0
 
 No index rebuild: `INDEX_VERSION` is unchanged at 53, and nothing here changes

@@ -1,0 +1,71 @@
+#!/usr/bin/env node
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+
+// npm 7 REMOVED the `preuninstall` / `postuninstall` lifecycle scripts. This
+// package declared `preuninstall` anyway, and `engines.node >= 16` means npm 8
+// at the oldest — so it could never fire for any supported install. Measured on
+// npm 11: `npm uninstall -g` left the hook entries in ~/.claude/settings.json
+// and ~40 MB of cached binary behind, silently (the POSIX hooks are wrapped in
+// `[ -f ]`, so they no-op instead of erroring and the user never notices).
+//
+// The teardown is a user-run command instead, and the order matters: after npm
+// removes the package there is no CLI left to run. These guards pin both halves
+// — no dead lifecycle script, and docs that put the teardown first.
+
+const ROOT = path.resolve(__dirname, '..');
+const PKG = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+const README = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+
+test('no uninstall lifecycle script — npm 7+ never runs them', () => {
+  for (const hook of ['preuninstall', 'postuninstall']) {
+    assert.strictEqual(
+      PKG.scripts?.[hook],
+      undefined,
+      `package.json declares "${hook}", which npm has not run since v7. Under ` +
+        `engines.node ">=16" (npm 8+) it can never fire, so it is a promise of ` +
+        `cleanup that never happens. Document "code-graph-mcp uninstall" instead.`
+    );
+  }
+});
+
+test('engines.node still implies an npm with no uninstall hooks', () => {
+  // The guard above is only correct while the declared floor is npm 7+. If
+  // someone lowers engines.node to 14 (npm 6), preuninstall WOULD fire again and
+  // this reasoning needs revisiting rather than silently holding.
+  const min = /(\d+)/.exec(PKG.engines?.node ?? '');
+  assert.ok(min, 'engines.node must declare a minimum version');
+  assert.ok(
+    Number(min[1]) >= 16,
+    `engines.node floor is ${min[1]}; below 16 the bundled npm may still honour ` +
+      `preuninstall, so the "dead script" guard above no longer holds.`
+  );
+});
+
+test('README tells npm users to tear down before uninstalling', () => {
+  const section = README.slice(README.indexOf('### npm (Global)'));
+  const teardown = section.indexOf('code-graph-mcp uninstall');
+  const npmRemove = section.indexOf('npm uninstall -g');
+  assert.ok(teardown !== -1, 'README npm section must document `code-graph-mcp uninstall`');
+  assert.ok(npmRemove !== -1, 'README npm section must still document `npm uninstall -g`');
+  assert.ok(
+    teardown < npmRemove,
+    'README must run `code-graph-mcp uninstall` BEFORE `npm uninstall -g` — after npm ' +
+      'removes the package the teardown command no longer exists on disk.'
+  );
+});
+
+test('the teardown command the docs name actually exists', () => {
+  // Negative control against documenting a command that was renamed away: the
+  // CLI must really dispatch an `uninstall` subcommand.
+  const cli = fs.readFileSync(path.join(ROOT, 'bin/cli.js'), 'utf8');
+  assert.match(
+    cli,
+    /sub === "uninstall"/,
+    'bin/cli.js no longer intercepts an `uninstall` subcommand, so the README instruction ' +
+      'and this whole teardown path are broken.'
+  );
+});

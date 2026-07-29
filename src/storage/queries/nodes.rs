@@ -481,7 +481,7 @@ pub fn get_nodes_with_files_by_filters(
     // utility wrappers (e.g. `extract_relations` 64 test/0 prod) don't out-rank
     // real prod hot symbols. Aligned with project_map / get_module_exports.
     let prod_join = crate::domain::prod_source_join_sql("e");
-    let prod_where = crate::domain::PROD_SOURCE_FILTER_AND;
+    let prod_where = crate::domain::prod_source_filter_and();
     let sql = format!(
         "SELECT {cols}, f.path, f.language \
          FROM nodes n JOIN files f ON f.id = n.file_id{where_clause} \

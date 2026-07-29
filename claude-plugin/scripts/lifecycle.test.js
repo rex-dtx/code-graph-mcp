@@ -6,6 +6,18 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
+// `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
+//
+// Every sandbox below redirects HOME and then spawns with `{...process.env}`,
+// which passes the variable straight through — and `claudeHome()` is
+// `CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var WINS over the
+// redirected HOME. For a developer who exports it (the documented multi-profile
+// setup) these tests wrote into their LIVE config: measured, a `9.9.9` plugin
+// version landed in the real plugins cache. Deleting it here fixes every spawn
+// site at once instead of 40 call sites, and `tests/hardening.rs`'s
+// `js_test_files_neutralize_claude_config_dir` keeps new files from skipping it.
+delete process.env.CLAUDE_CONFIG_DIR;
+
 const lifecyclePath = path.join(__dirname, 'lifecycle.js');
 const statuslinePath = path.join(__dirname, 'statusline.js');
 
@@ -950,6 +962,74 @@ test('install stands down after 3 displacements; explicit install re-claims', (t
   assert.deepEqual(r.outcomes, ['claimed', 'claimed', 'stood-down', 'claimed']);
   assert.equal(r.displaced, 3, 'third displacement recorded before standing down');
   assert.equal(r.owned, false, 'ownership released on stand-down (stops the counter)');
+});
+
+test('stand-down re-arms once the slot is empty again (P2-22)', (t) => {
+  // Stand-down exists to end a tug-of-war. When the other provider is
+  // uninstalled the slot goes empty and there is nobody left to fight — but the
+  // counter was write-only, so the plugin stayed statusline-less for the life of
+  // the manifest and the only way back was an env var nobody knows to set.
+  const homeDir = mkHome(t);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+
+  const script = `
+    const fs = require('fs');
+    const { install, readManifest } = require(${JSON.stringify(lifecyclePath)});
+    const settingsPath = ${JSON.stringify(settingsPath)};
+    const slot = () => (JSON.parse(fs.readFileSync(settingsPath, 'utf8')).statusLine || {}).command || '';
+    // Already stood down (displaced past the threshold, ownership released) and
+    // the competitor has since been uninstalled: no statusLine key at all.
+    install();
+    const m = readManifest();
+    process.stdout.write(JSON.stringify({
+      claimed: slot().includes('statusline-composite'),
+      displaced: m.config.statuslineDisplaced,
+      owned: m.config.statusLine,
+    }));
+  `;
+  writeJson(settingsPath, {});
+  writeJson(manifestPath, {
+    version: '0.0.1',
+    config: { statusLine: false, statuslineDisplaced: 5 },
+  });
+
+  const r = JSON.parse(execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: homeDir },
+  }).toString());
+
+  assert.equal(r.claimed, true, 'an empty slot must be claimed — nobody is displacing us');
+  assert.equal(r.displaced, 0, 'the displacement counter re-arms');
+  assert.equal(r.owned, true, 'ownership is taken again');
+});
+
+test('stand-down HOLDS while a foreign provider still occupies the slot (P2-22)', (t) => {
+  // The negative control for the re-arm above: an occupied slot must still be
+  // left alone, or the re-arm would simply delete stand-down.
+  const homeDir = mkHome(t);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  const manifestPath = path.join(homeDir, '.cache', 'code-graph', 'install-manifest.json');
+
+  const script = `
+    const fs = require('fs');
+    const { install } = require(${JSON.stringify(lifecyclePath)});
+    const settingsPath = ${JSON.stringify(settingsPath)};
+    install();
+    const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    process.stdout.write(JSON.stringify({ cmd: (s.statusLine || {}).command || '' }));
+  `;
+  writeJson(settingsPath, { statusLine: { type: 'command', command: 'node "/peer-plugin/statusline.js"' } });
+  writeJson(manifestPath, {
+    version: '0.0.1',
+    config: { statusLine: false, statuslineDisplaced: 5 },
+  });
+
+  const r = JSON.parse(execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, HOME: homeDir },
+  }).toString());
+
+  assert.equal(r.cmd, 'node "/peer-plugin/statusline.js"',
+    'a slot another provider holds must stay theirs while stood down');
 });
 
 // ── uninstall --unadopt-all ─────────────────────────────────────────────────

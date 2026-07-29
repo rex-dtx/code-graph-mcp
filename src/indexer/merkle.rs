@@ -44,21 +44,132 @@ pub(crate) fn normalize_rel_str(rel: &str) -> String {
 ///    spellings. As a parameter, the Linux and macOS legs exercise the Windows
 ///    branch too.
 ///
-/// This is the single separator-normalizing implementation in the crate —
+/// This is the single implementation that produces INDEX KEYS —
 /// `cli::normalize_path_display_on` strips the Windows `\\?\` prefix and then
-/// delegates here, so the two cannot drift.
+/// delegates here, and `mcp::server::tools::normalize_path_arg_on` calls it
+/// directly, so no entry point can drift from it.
+///
+/// It is not the only place in the crate that rewrites `\` to `/`, and the
+/// distinction matters: `cli::worktree_main_root` builds a length-preserving
+/// copy purely to `rfind("/.git/worktrees/")` in it, then slices the ORIGINAL
+/// string so the returned path keeps its native separators. That one must not
+/// delegate here — collapsing `//` would shift the byte offsets it slices by.
+///
+/// Runs of `/` collapse to one.
+///
+/// "No stored key contains `//`" is an invariant THIS LINE ENFORCES, not one
+/// that holds on its own — do not delete the collapse as belt-and-braces. It is
+/// inherent only for keys the indexer walk produces (`scan_directory` →
+/// `normalize_rel_path` over walkdir `Path` components, which cannot emit a
+/// doubled separator). The MCP freshness path is the counterexample: it takes a
+/// user-supplied string and WRITES a row from it. Measured before this landed,
+/// `get_ast_node {file_path: "src//a.ts"}` did not miss — it indexed the file a
+/// second time under the non-canonical key:
+///
+/// ```text
+/// files before: package.json | src/a.ts
+/// files after : package.json | src//a.ts | src/a.ts
+/// ```
+///
+/// One symbol became two nodes, each reporting a different path for the same
+/// source line. On the CLI the same input merely lied — a filter matching zero
+/// files, reported as a clean empty answer. Collapsing HERE rather than at one
+/// entry point is what makes the CLI, the MCP tools and the write path agree:
+/// the first fix for this went into `cli::normalize_user_path` alone, and MCP —
+/// the failing direction that mutates — kept the bug.
 #[inline]
 pub(crate) fn normalize_rel_str_on(rel: &str, backslash_is_sep: bool) -> String {
-    if backslash_is_sep {
+    let unified = if backslash_is_sep {
         rel.replace('\\', "/")
     } else {
         rel.to_string()
+    };
+    if !unified.contains("//") {
+        return unified;
     }
+    // A LEADING `//` is preserved: that is a UNC host root (`\\server\share`
+    // arrives here as `//server/share` once backslashes are unified), and
+    // `cli::normalize_path_display_on` asserts it survives. Doubling is
+    // meaningless everywhere else in a path and meaningful only at position 0,
+    // so the collapse starts after it. Index keys are relative and never begin
+    // with a separator, so no stored key can take this branch.
+    let unc_root = unified.starts_with("//");
+    let body = if unc_root {
+        &unified[2..]
+    } else {
+        &unified[..]
+    };
+    let mut out = String::with_capacity(unified.len());
+    if unc_root {
+        out.push_str("//");
+    }
+    let mut prev_sep = false;
+    for c in body.chars() {
+        if c == '/' && prev_sep {
+            continue;
+        }
+        prev_sep = c == '/';
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
+
+    /// Doubled separators collapse, except a leading UNC host root.
+    ///
+    /// A user-supplied `src//a.ts` used to survive normalization intact. On the
+    /// CLI that produced a filter matching zero files, reported as a clean empty
+    /// answer; through MCP it was worse — the freshness path indexed the file a
+    /// SECOND time under the non-canonical key, so `files` gained a `src//a.ts`
+    /// row and one symbol became two nodes. Measured before the fix:
+    /// `files` = `package.json | src//a.ts | src/a.ts`, `alpha` nodes = 2.
+    ///
+    /// The first attempt put this in `cli::normalize_user_path`, which left the
+    /// MCP entries (`tools::normalize_path_arg`) broken — and MCP's was the
+    /// failing direction that WRITES. It belongs here, in the single
+    /// separator-normalizing implementation, so all three surfaces agree.
+    #[test]
+    fn normalize_rel_str_on_collapses_doubled_separators_but_keeps_the_unc_root() {
+        for backslash_is_sep in [true, false] {
+            for (raw, want) in [
+                ("src//a.ts", "src/a.ts"),
+                ("src///a.ts", "src/a.ts"),
+                ("a//b//c.rs", "a/b/c.rs"),
+                ("src//", "src/"),
+                ("src/a.ts", "src/a.ts"),
+            ] {
+                assert_eq!(
+                    normalize_rel_str_on(raw, backslash_is_sep),
+                    want,
+                    "{raw:?} (backslash_is_sep={backslash_is_sep})"
+                );
+            }
+        }
+        // UNC host root survives — `cli::normalize_path_display_on` asserts it,
+        // and doubling is meaningful only at position 0.
+        assert_eq!(
+            normalize_rel_str_on("//server/share/repo/a.rs", false),
+            "//server/share/repo/a.rs"
+        );
+        assert_eq!(
+            normalize_rel_str_on(r"\\server\share\repo\a.rs", true),
+            "//server/share/repo/a.rs"
+        );
+        // ...but a doubled separator INSIDE a UNC path still collapses.
+        assert_eq!(
+            normalize_rel_str_on("//server/share//repo/a.rs", false),
+            "//server/share/repo/a.rs"
+        );
+        // On Unix `\` is an ordinary filename character and must not be touched,
+        // collapse or no collapse.
+        assert_eq!(
+            normalize_rel_str_on(r"src/od\bc.rs", false),
+            r"src/od\bc.rs"
+        );
+    }
 
     /// The repo-wide index-key invariant, asserted for BOTH platforms from any
     /// host — the property the `_on` seam exists for.
@@ -237,13 +348,27 @@ pub struct DirectoryCache {
     /// Per-file mtime cache. Used to detect content modifications in directories
     /// whose own mtime hasn't changed (dir mtime only changes on file add/remove,
     /// not on content modification in ext4/btrfs).
+    ///
+    /// Only holds files whose `metadata()` call SUCCEEDED — see `seen_files` for
+    /// why the two are not the same set.
     file_mtimes: HashMap<String, SystemTime>,
+    /// Every indexable file the walk actually saw, stat outcome irrelevant.
+    ///
+    /// `run_incremental_index_cached` carries a stored hash forward when the file
+    /// still exists, and asks THIS set. Deriving existence from `file_mtimes`
+    /// instead conflates "gone" with "one `stat` failed": a transient EACCES /
+    /// EMFILE / NFS hiccup on a file the walker had just listed dropped it from
+    /// the mtime map, the carry-forward then skipped it, and `compute_diff`
+    /// reported a live file as DELETED — wiping its nodes and edges from the
+    /// index until something re-indexed it. The walk entry is the existence
+    /// evidence; the stat is only freshness evidence.
+    seen_files: HashSet<String>,
 }
 
 impl DirectoryCache {
     /// Check if a file was seen during the last directory walk.
     pub fn file_exists(&self, path: &str) -> bool {
-        self.file_mtimes.contains_key(path)
+        self.seen_files.contains(path)
     }
 }
 
@@ -339,23 +464,20 @@ pub fn scan_directory_cached(
 
             let parent_dir = rel.parent().map(normalize_rel_path).unwrap_or_default();
 
+            // The walk saw it: that alone settles EXISTENCE, independent of what
+            // `metadata()` does next (see `DirectoryCache::seen_files`).
+            new_cache.seen_files.insert(rel_str.clone());
+
             // Track file mtime in the new cache
             let file_mtime = path.metadata().ok().and_then(|m| m.modified().ok());
             if let Some(mtime) = file_mtime {
                 new_cache.file_mtimes.insert(rel_str.clone(), mtime);
             }
 
-            if !changed_dirs.contains(&parent_dir) {
-                // Directory unchanged — check if individual file mtime changed
-                let file_changed =
-                    match (file_mtime, cache.and_then(|c| c.file_mtimes.get(&rel_str))) {
-                        (Some(current), Some(cached)) => current != *cached,
-                        (Some(_), None) => true, // No cached mtime — treat as changed
-                        _ => false,
-                    };
-                if !file_changed {
-                    continue;
-                }
+            if !changed_dirs.contains(&parent_dir)
+                && !file_needs_hashing(file_mtime, cache.and_then(|c| c.file_mtimes.get(&rel_str)))
+            {
+                continue;
             }
 
             files_to_hash.push((rel_str, path.to_path_buf()));
@@ -367,6 +489,23 @@ pub fn scan_directory_cached(
     hashes.extend(hash_files_parallel(&files_to_hash));
 
     Ok((hashes, new_cache))
+}
+
+/// Does a file in an unchanged directory still need hashing?
+///
+/// `current` is this scan's mtime, `cached` the previous scan's. Both are
+/// optional and the interesting case is `current == None`: the `stat` failed on
+/// a file the walk had just listed (EACCES on a mode-changed parent, EMFILE, an
+/// NFS hiccup). Unknown is NOT unchanged — skipping there leaves an edited file
+/// stale in the index for as long as the failure persists, with nothing logged.
+/// Hashing costs one read that may itself fail, in which case
+/// `hash_files_parallel` warns and the stored hash carries forward.
+fn file_needs_hashing(current: Option<SystemTime>, cached: Option<&SystemTime>) -> bool {
+    match (current, cached) {
+        (Some(current), Some(cached)) => current != *cached,
+        (Some(_), None) => true, // No cached mtime — treat as changed
+        (None, _) => true,       // Stat failed — cannot prove unchanged
+    }
 }
 
 pub fn compute_diff(
@@ -547,6 +686,76 @@ mod tests {
         // The file mtime check (Pass 2) should detect the content change
         assert_eq!(hashes2.len(), 1);
         assert!(hashes2.contains_key("main.rs"));
+    }
+
+    /// A file the walk listed but could not `stat` must stay EXISTING.
+    ///
+    /// `run_incremental_index_cached` carries a stored hash forward only for
+    /// files `file_exists` confirms; everything else falls out of
+    /// `current_hashes` and `compute_diff` reports it DELETED — nodes and edges
+    /// dropped from a file that never went anywhere. A directory that is
+    /// readable but not searchable (mode 0o600) reproduces the transient shape
+    /// exactly: `readdir` still returns the name, `stat` on the entry fails with
+    /// EACCES.
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_directory_cached_stat_failure_is_not_deletion() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/a.rs"), "fn a(){}").unwrap();
+
+        let (hashes1, cache1) = scan_directory_cached(tmp.path(), None).unwrap();
+        assert!(hashes1.contains_key("sub/a.rs"));
+
+        let sub = tmp.path().join("sub");
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o600)).unwrap();
+        let stat_denied = fs::metadata(sub.join("a.rs")).is_err();
+        let scanned = scan_directory_cached(tmp.path(), Some(&cache1));
+        // Restore before unwrapping so a failure can't leave an undeletable dir.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        let (_hashes2, cache2) = scanned.unwrap();
+
+        if !stat_denied {
+            // root (or an FS that ignores the mode) — the precondition this test
+            // needs does not hold here, and asserting anyway would pass for the
+            // wrong reason.
+            eprintln!("skipped: stat succeeded despite mode 0o600 (running as root?)");
+            return;
+        }
+        assert!(
+            !cache2.file_mtimes.contains_key("sub/a.rs"),
+            "precondition: the stat must have failed for this test to mean anything"
+        );
+        assert!(
+            cache2.file_exists("sub/a.rs"),
+            "a walked-but-unstattable file must still count as existing — \
+             otherwise the incremental pass reports it deleted and wipes its nodes"
+        );
+    }
+
+    /// The other half of the same failure, tested where it is OBSERVABLE.
+    ///
+    /// End-to-end it is not: denying the stat needs `chmod 600` on the parent,
+    /// which denies the `open` too, so a skipped file and a hashed-but-failed
+    /// file look identical from outside `scan_directory_cached`. The decision
+    /// itself is the layer that carries the defect — `(None, _) => false` read
+    /// "stat failed" as "unchanged" and left a modified file stale — so assert
+    /// on the decision.
+    #[test]
+    fn test_file_needs_hashing_treats_unknown_mtime_as_changed() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(!file_needs_hashing(Some(t0), Some(&t0)), "same mtime");
+        assert!(file_needs_hashing(Some(t1), Some(&t0)), "mtime moved");
+        assert!(file_needs_hashing(Some(t0), None), "no cached mtime");
+        assert!(
+            file_needs_hashing(None, Some(&t0)),
+            "stat failed — unknown is not unchanged; skipping here leaves a \
+             modified file stale in the index"
+        );
+        assert!(file_needs_hashing(None, None), "nothing known either side");
     }
 
     #[test]

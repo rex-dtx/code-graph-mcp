@@ -10,8 +10,15 @@ models/
 .gsd/
 
 # Hidden files and directories (IDE, OS, tool configs)
+#
+# This is a blanket ignore with an allowlist, so EVERY new repo-root dotfile is
+# silently untracked until it is negated here — `git add` refuses it with an
+# "ignored by .gitignore" hint that is easy to read as a warning rather than a
+# refusal. `.gitattributes` hit exactly that: written, `git add`ed, and absent
+# from the commit.
 .*
 !.gitignore
+!.gitattributes
 !.npmignore
 !.github/
 !.claude-plugin/

@@ -1446,13 +1446,19 @@ impl McpServer {
                 // "never attempted" silence issue #35 describes.
                 EmbeddingModel::record_download_state("in_flight", attempt, None);
                 match EmbeddingModel::download_model_to(&url, &cache_dir) {
-                    Ok(()) => {
+                    Ok(trust_path) => {
                         tracing::info!(
-                            "[model-dl] Model downloaded successfully (attempt {}/{})",
+                            "[model-dl] Model downloaded successfully (attempt {}/{}, {} trust path)",
                             attempt,
-                            MAX_ATTEMPTS
+                            MAX_ATTEMPTS,
+                            trust_path
                         );
-                        EmbeddingModel::record_download_state("ok", attempt, None);
+                        EmbeddingModel::record_download_state_trusted(
+                            "ok",
+                            attempt,
+                            None,
+                            Some(trust_path),
+                        );
                         downloaded = true;
                         break;
                     }

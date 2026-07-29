@@ -120,7 +120,14 @@ pub fn delete_pending_unresolved_call(conn: &Connection, id: i64) -> Result<()> 
 /// Age every surviving pending row by one failed sweep and evict rows that have
 /// reached `domain::PENDING_CALL_MAX_ATTEMPTS`. Called at the END of
 /// `resolve_pending_calls` (rows resolved by that sweep are already deleted, so
-/// only genuinely-unresolved rows age). Bounds the table: ~99% of buffered rows
+/// only genuinely-unresolved rows age).
+///
+/// One attempt = one RESOLUTION OPPORTUNITY, not one tick: `index_files` runs
+/// the sweep only for a batch that parsed files, since nothing else can make a
+/// buffered row resolvable. Ungated, ambient watcher/periodic ticks spent the
+/// budget on passes where no candidate could have appeared.
+///
+/// Bounds the table: ~99% of buffered rows
 /// are never-resolvable external/builtin calls that would otherwise accumulate
 /// until the next INDEX_VERSION wipe. Returns the number of evicted rows.
 /// A re-parse of the caller file resets the clock naturally: cascade delete +

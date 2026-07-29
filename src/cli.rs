@@ -414,6 +414,21 @@ fn normalize_user_path_from_on(
     raw: &str,
     backslash_is_sep: bool,
 ) -> Result<String> {
+    // Separator normalization (including collapsing `//`) lives in
+    // `merkle::normalize_rel_str_on`, the crate's single implementation — the
+    // first fix for the doubled-separator false clean put the collapse here
+    // instead, which left the MCP entries (`tools::normalize_path_arg`) still
+    // broken, and MCP's failure was the worse one: it re-indexed the file under
+    // the non-canonical key rather than merely missing.
+    normalize_user_path_key(project_root, cwd, raw, backslash_is_sep)
+}
+
+fn normalize_user_path_key(
+    project_root: &Path,
+    cwd: &Path,
+    raw: &str,
+    backslash_is_sep: bool,
+) -> Result<String> {
     use crate::indexer::pipeline::is_safe_relative_path;
     // Single source of truth for the escape check (shared with the MCP freshness
     // path) — eliminates the three-way divergence between this fn, the MCP
@@ -1272,7 +1287,13 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     // commit_drift: how many local commits landed after the snapshot was taken.
     let commit_drift = snapshot_commit.as_deref().and_then(|c| {
         std::process::Command::new("git")
-            .args(["rev-list", "--count", &format!("{c}..HEAD")])
+            // `--` closes the revision list, same as the `ls-files` sibling at
+            // :2832 which carries this comment already. Not exploitable here —
+            // argv form, and `{c}` is a 40-hex commit id read from the snapshot
+            // meta — but a commit-ish that git could read as a pathspec would
+            // otherwise change what this counts, and the two call sites in one
+            // file disagreeing is how the next one gets written without it.
+            .args(["rev-list", "--count", &format!("{c}..HEAD"), "--"])
             .current_dir(project_root)
             .output()
             .ok()
@@ -2798,6 +2819,25 @@ fn bre_style_escapes(pattern: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// What to say when spawning `rg` fails with `ErrorKind::NotFound`.
+///
+/// Two different causes produce that one error kind, because `current_dir` is
+/// applied as part of the spawn: the `rg` binary is missing from PATH, or the
+/// working directory does not exist (an index whose project root was moved or
+/// deleted, a stale worktree). The message used to name only the first, sending
+/// the user to install a tool they already have.
+fn rg_spawn_failure_message(project_root: &Path) -> String {
+    if !project_root.is_dir() {
+        format!(
+            "cannot run ripgrep: working directory {} does not exist — \
+             the project root recorded for this index is gone (moved or deleted)",
+            project_root.display()
+        )
+    } else {
+        "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep".to_string()
+    }
+}
+
 /// Shared zero-hit note for every grep mode. Skips the dialect hint under -F,
 /// where backslashes are genuinely literal and the pattern means what it says.
 fn emit_no_match(pattern: &str, fixed_strings: bool) {
@@ -3126,6 +3166,15 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // Windows caps a whole command line at 32,767 chars; POSIX ARG_MAX is
     // ~2 MB. Budget the PATH operands conservatively under each, leaving room
     // for the flags, the pattern, and the exe path.
+    //
+    // The accounting is `len + 1` per operand — one separator, no quoting. On
+    // Windows an operand containing a space is quoted by the runtime, costing 2
+    // more chars, so the true line is longer than the budget believes. The
+    // headroom absorbs it: 32,767 − 24,000 = 8,767 chars would need ~4,400
+    // space-bearing paths in a single batch to exhaust, and `SUPPLEMENT_CAP`
+    // stops at 500. Stated rather than fixed because a tighter budget is the
+    // wrong trade — it would split batches on every repo to cover a case the cap
+    // makes unreachable.
     const ARGV_PATH_BUDGET: usize = if cfg!(windows) { 24_000 } else { 512_000 };
     // Override exists so the batching path is testable without materializing a
     // 32 KB argv, and as an escape hatch for a shell with a tighter limit.
@@ -3144,6 +3193,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         cmd.args(paths);
         cmd.output()
     };
+    // `current_dir` is part of the spawn: a missing working directory fails with
+    // the SAME ErrorKind::NotFound the missing-binary case does, so the error arm
+    // has to tell them apart before it names a cause. See
+    // `rg_spawn_failure_message`.
 
     // Batch 1 is always the walk; the supplement follows in argv-sized chunks.
     // Each batch is an independent rg run whose stdout is concatenated — every
@@ -3179,7 +3232,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                 if json_mode {
                     println!("[]");
                 }
-                eprintln!("[code-graph] ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep");
+                eprintln!("[code-graph] {}", rg_spawn_failure_message(project_root));
                 grep_exit(2);
             }
             Err(e) => return Err(e.into()),
@@ -6884,8 +6937,18 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     let conn = db.conn();
 
     if !db.vec_enabled() {
+        // Disclosure object, not `[]`. This is the CAPABILITY-missing case: a
+        // bare array under `2>/dev/null` says "no similar code exists", when the
+        // truth is that similarity could not be computed at all. Middle tier of
+        // the three-tier JSON contract (feedback_cli_json_empty_contract).
         if json_mode {
-            println!("[]");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "results": [],
+                    "unavailable": "vector search (sqlite-vec extension not loaded)",
+                })
+            );
         }
         eprintln!("[code-graph] Vector search not available (sqlite-vec extension not loaded).");
         eprintln!("  To enable: build with `cargo build --release --features embed-model`.");
@@ -6905,7 +6968,10 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         // in the default (no embed-model) build, and mirrors refs --node-id.
         if queries::get_node_by_id(conn, nid)?.is_none() {
             if json_mode {
-                println!("[]");
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": "node_id not found", "node_id": nid })
+                );
             }
             eprintln!("[code-graph] node_id {} not found in index", nid);
             std::process::exit(1);
@@ -6922,7 +6988,10 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
             Some(id) => (id, symbol.to_string()),
             None => {
                 if json_mode {
-                    println!("[]");
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": "Symbol not found", "symbol": symbol })
+                    );
                 }
                 // All-digit positional is almost certainly a node_id mistakenly passed
                 // without the flag — guide the user instead of "Symbol not found: 1010".
@@ -6947,7 +7016,15 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
         // but no embeddings generated yet) is the only one in cmd_similar that was
         // missing it — a consumer piping stdout got an empty string → parse error.
         if json_mode {
-            println!("[]");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "No embeddings found",
+                    "symbol": target_label,
+                    "embedded_count": embedded_count,
+                    "total_nodes": total_nodes,
+                })
+            );
         }
         eprintln!(
             "[code-graph] No embeddings found ({}/{} nodes embedded).",
@@ -7560,6 +7637,58 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
         // stderr: under `--json 2>/dev/null` a bare `[]` reads as "clean" even
         // when --ignore/--min-lines hid real candidates (disclosure-gap class,
         // roadmap 2026-07-18 §1.2). True clean keeps the plain `[]`.
+        // A path filter that matches NO indexed file is zero coverage, not a
+        // clean bill of health, and it is the one empty case `dead-code` still
+        // reported as `[]` + exit 0. `overview` answers the same input with an
+        // error object + exit 1 (:5641), and `normalize_user_path`'s own doc
+        // names this failure mode — a path can be in-root and well-formed while
+        // naming nothing indexed, so normalization cannot catch it. Under
+        // `--json 2>/dev/null` the old answer was indistinguishable from "this
+        // directory genuinely has no dead code".
+        //
+        // Compared in Rust rather than with SQL `LIKE`: the prefix is user
+        // input, and `_`/`%` in a filename would silently widen the match — the
+        // exact wildcard bug fixed in `prod_source_filter_and` this same batch.
+        //
+        // Two spellings must NOT reach the probe, and the first version of it
+        // failed both — turning `dead-code .` and `dead-code src/` on a clean
+        // repo from `[]`/exit 0 into a hard error, which is the inverse of the
+        // bug this is meant to fix and would break anything gating CI on the
+        // exit code the day the repo gets clean:
+        //   * `.` normalizes to `""` (whole project), and no stored path equals
+        //     `""` or begins with `/`;
+        //   * a trailing slash from tab completion gives `src/`, and no stored
+        //     path begins with `src//`.
+        // The original negative control used bare `src`, which is exactly the
+        // one spelling of the three that worked.
+        let probe = path_filter
+            .map(|p| p.trim_end_matches('/'))
+            .filter(|p| !p.is_empty());
+        let unindexed_prefix = probe.filter(|prefix| {
+            let scan = conn.prepare("SELECT path FROM files").and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            });
+            match scan {
+                // Only claim "nothing indexed here" when the scan succeeded.
+                Ok(paths) => !paths
+                    .iter()
+                    .any(|p| p == prefix || p.starts_with(&format!("{prefix}/"))),
+                Err(_) => false,
+            }
+        });
+        if let Some(prefix) = unindexed_prefix {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": "No indexed files under path", "path": prefix })
+                );
+                eprintln!("[code-graph] No indexed files under: {prefix}");
+                std::process::exit(1);
+            }
+            anyhow::bail!("[code-graph] No indexed files under: {prefix}");
+        }
+
         if report.ignored_count > 0 {
             if json_mode {
                 println!(
@@ -8458,6 +8587,33 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawning `rg` reports `ErrorKind::NotFound` for two different causes —
+    /// the binary is missing, or `current_dir` does not exist — and the message
+    /// named only the first. A user whose indexed project root had been moved was
+    /// told to install a tool that was already on their PATH.
+    #[test]
+    fn rg_spawn_failure_message_distinguishes_missing_cwd_from_missing_binary() {
+        let present = tempfile::TempDir::new().unwrap();
+        let msg = rg_spawn_failure_message(present.path());
+        assert!(
+            msg.contains("ripgrep (rg) not found"),
+            "an existing root must still point at the binary: {msg}"
+        );
+
+        let gone = tempfile::TempDir::new().unwrap();
+        let gone_path = gone.path().to_path_buf();
+        drop(gone);
+        let msg = rg_spawn_failure_message(&gone_path);
+        assert!(
+            msg.contains("does not exist"),
+            "a vanished project root must be named as the cause: {msg}"
+        );
+        assert!(
+            !msg.contains("Install"),
+            "must not tell the user to install a tool they have: {msg}"
+        );
+    }
 
     /// M2: `deps` barrel-pattern scanning must not follow a symlink that escapes
     /// the project root. The scanner reads a caller-supplied path and echoes its
@@ -9458,6 +9614,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Repeated separators collapse, because no index key contains `//`.
+    ///
+    /// `dead-code src// --json` used to answer `[]` exit 0 on a directory with
+    /// real dead code — the key matched nothing and the empty result was
+    /// reported as clean. That is the same false-clean the unindexed-path probe
+    /// exists to prevent: the probe trimmed a TRAILING slash for its own
+    /// comparison while the query kept the untrimmed filter, so they disagreed
+    /// and the disclosure never fired. `overview src//` errored on the same
+    /// input, re-splitting two surfaces that had just been aligned.
+    ///
+    /// Known limitation, stated rather than hidden: the collapse runs on the
+    /// OUTPUT (so the `\\`-prefixed UNC rejection still sees its prefix), which
+    /// means an input whose DOUBLED separator changes how the input itself is
+    /// parsed is unaffected — `.//src/foo.rs` still errors "escapes the project
+    /// root", because stripping `./` leaves a leading `/`. Pre-existing, and not
+    /// reachable from tab completion; `./src//foo.rs` is covered below.
+    #[test]
+    fn normalize_user_path_collapses_repeated_separators() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (raw, want) in [
+            ("src//foo.rs", "src/foo.rs"),
+            ("src///foo.rs", "src/foo.rs"),
+            ("src//", "src/"),
+            ("./src//foo.rs", "src/foo.rs"),
+            ("a//b//c.rs", "a/b/c.rs"),
+            // Single separators are untouched.
+            ("src/foo.rs", "src/foo.rs"),
+            // A single trailing separator round-trips unchanged, pinned by
+            // `test_normalize_user_path_passes_relative_through`; consumers
+            // prefix-match, so `src/` works wherever `src` does.
+            ("src/parser/", "src/parser/"),
+        ] {
+            for backslash_is_sep in [true, false] {
+                let got = normalize_user_path_from_on(root, root, raw, backslash_is_sep).unwrap();
+                assert_eq!(
+                    got, want,
+                    "{raw:?} (backslash_is_sep={backslash_is_sep}) must normalize to a key \
+                     the index can actually contain"
+                );
+            }
+        }
+
+        // The collapse runs on the OUTPUT, so the UNC rejection still sees its
+        // `\\` prefix. Collapsing the input first would turn `\\server\share`
+        // into `\server\share` and walk past that guard entirely.
+        assert!(
+            normalize_user_path_from_on(root, root, r"\\server\share\x.rs", false).is_err(),
+            "a UNC root must still be rejected after the collapse was added"
+        );
     }
 
     /// The WINDOWS branch of that guard, executed on the Linux CI leg.

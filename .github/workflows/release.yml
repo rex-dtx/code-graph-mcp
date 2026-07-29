@@ -21,8 +21,22 @@ permissions:
 # Serialize releases for the same ref so a tag-push run and a workflow_dispatch
 # re-run on the same tag don't race (both build + publish the same version).
 # cancel-in-progress: false — never abort an in-flight publish half-way.
+#
+# This was the ONE site in the file with no `inputs.tag` fallback: a dispatch
+# runs from the default branch, so bare `github.ref` was `refs/heads/main` while
+# the tag-push run for the same version was `refs/tags/vX.Y.Z` — two group keys,
+# no serialization, both runs publishing the same version.
+#
+# The fallback has to REBUILD the ref, not substitute the raw input. A
+# concurrency group is compared as a literal string, so the plain
+# `inputs.tag || github.ref` used everywhere else in this file yields
+# `release-v0.109.0` for the dispatch and `release-refs/tags/v0.109.0` for the
+# push — still two keys, still no serialization. The other six sites are correct
+# with the plain form because they feed `ref:` / `tag_name:`, where `v0.109.0`
+# and `refs/tags/v0.109.0` resolve to the same object; only here does the
+# spelling itself matter.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -42,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: true
           # Same redirect as `build` below: on workflow_dispatch, github.ref is
@@ -141,7 +155,7 @@ jobs:
             npm-pkg: win32-x64
             binary: code-graph-mcp.exe
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: true
           # Push trigger: github.ref = refs/tags/vX.Y.Z, checkout is a no-op.
@@ -184,7 +198,7 @@ jobs:
         run: cargo build --release --features embed-model --target ${{ matrix.target }}
 
       - name: Upload binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: binary-${{ matrix.npm-pkg }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
@@ -194,17 +208,17 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts/
 
@@ -272,7 +286,18 @@ jobs:
           mkdir -p target/release
           cp artifacts/binary-linux-x64/code-graph-mcp target/release/
           chmod +x target/release/code-graph-mcp
-          node --test --test-concurrency=1 claude-plugin/scripts/*.test.js scripts/*.test.js
+          # `find`, not a `*.test.js` shell glob — the glob is NON-RECURSIVE,
+          # so the first test file anyone puts in a subdirectory is skipped in
+          # silence. ci.yml and pre-commit were converted; this one is the LAST
+          # gate before an irreversible `npm publish`, which is the one place
+          # a silently-skipped test costs the most.
+          # NOTE the difference from ci.yml: no install-e2e exclusion. The
+          # glob this replaces matched `scripts/*.test.js`, which INCLUDES
+          # install-e2e.test.js — and the release job is exactly where an
+          # install end-to-end test should run. Recursive discovery only; the
+          # file set is otherwise identical to what the glob produced.
+          files=$(find claude-plugin/scripts scripts -type f -name '*.test.js' | sort)
+          node --test --test-concurrency=1 $files
 
       - name: Prepare release assets
         run: |
@@ -325,6 +350,31 @@ jobs:
           PINS
           tar czf release-assets/models.tar.gz -C models-pkg .
           sha256sum release-assets/models.tar.gz | cut -d' ' -f1 > release-assets/models.tar.gz.sha256
+
+      - name: Package plugin files
+        # The auto-updater used to install the plugin from GitHub's
+        # auto-generated source `tarball_url`, which has NO published checksum:
+        # the one download chain of four with zero integrity verification, and
+        # the only one whose payload is JavaScript that then runs on the user's
+        # machine (audit 2026-07-27 P2-23). Shipping the plugin tree as a real
+        # release asset gives it the same `.sha256` sidecar the five binaries and
+        # models.tar.gz already carry, so the client can fail CLOSED instead of
+        # extracting and executing unverified JS.
+        #
+        # No --strip-components on the consumer side: this archives the
+        # `claude-plugin/` directory itself, so extraction reproduces that exact
+        # layout. The source tarball needed a strip because GitHub wraps it in a
+        # `<owner>-<repo>-<sha>/` directory.
+        #
+        # `--exclude='*.test.js'` matches package.json's `files` allowlist, which
+        # already keeps the 31 test files out of the npm tarball. The old source
+        # archive shipped them (so dropping them is no regression), but there is
+        # no reason to copy test code into a plugin cache Claude Code executes
+        # from.
+        run: |
+          tar czf release-assets/claude-plugin.tar.gz --exclude='*.test.js' claude-plugin
+          sha256sum release-assets/claude-plugin.tar.gz | cut -d' ' -f1 \
+            > release-assets/claude-plugin.tar.gz.sha256
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
@@ -404,7 +454,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 20
 

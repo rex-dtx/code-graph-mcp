@@ -17,6 +17,18 @@ const GIT_ENV_VARS = [
   'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_PREFIX',
 ];
 for (const k of GIT_ENV_VARS) delete process.env[k];
+
+// `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
+//
+// The sandboxes below redirect HOME and spawn with `{...process.env}`, which
+// passes the variable straight through — and `claudeHome()` is
+// `CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var WINS over the
+// redirected HOME. For a developer who exports it (the documented multi-profile
+// setup) these tests wrote into their LIVE config: measured, a fabricated
+// `9.9.9` plugin version landed in the real plugins cache. Deleting it here
+// covers every spawn site at once; the few tests that need the variable set it
+// explicitly in their own child env, which still wins.
+delete process.env.CLAUDE_CONFIG_DIR;
 function cleanGitEnv() {
   const e = { ...process.env };
   for (const k of GIT_ENV_VARS) delete e[k];
@@ -28,6 +40,7 @@ const {
   fetchLatestRelease,
   getExtractedPluginVersion,
   parseLatestRelease,
+  PLUGIN_ASSET_NAME,
   readBinaryVersion,
   promoteVerifiedBinary,
   cachedBinaryPath,
@@ -61,6 +74,12 @@ test('getExtractedPluginVersion reads extracted plugin manifest version', (t) =>
   assert.equal(getExtractedPluginVersion(root), '1.2.3');
 });
 
+// Promotion is fail-closed, so the mechanics tests below have to hand it the
+// real digest of the fixture they just wrote.
+function sha256Of(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
 function writeFakeBinary(filePath, version, mode = 0o755) {
   const script = [
     '#!/usr/bin/env bash',
@@ -83,7 +102,9 @@ test('promoteVerifiedBinary accepts a runnable binary with the expected version'
   writeFakeBinary(tmp, '1.2.3');
 
   assert.equal(readBinaryVersion(tmp), '1.2.3');
-  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3'), true);
+  // Promotion is fail-closed, so hand it the real digest: this test pins the
+  // chmod/rename mechanics, not the integrity policy (which has its own tests).
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', sha256Of(tmp)), true);
   assert.equal(fs.existsSync(tmp), false);
   assert.equal(fs.existsSync(dst), true);
 });
@@ -112,7 +133,7 @@ test('promoteVerifiedBinary promotes a non-executable (0644) download — curl -
   writeFakeBinary(tmp, '1.2.3', 0o644);
 
   assert.equal(readBinaryVersion(tmp), null, 'precondition: 0644 binary is not executable');
-  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3'), true);
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', sha256Of(tmp)), true);
   assert.equal(fs.existsSync(dst), true);
   assert.equal(fs.statSync(dst).mode & 0o111, 0o111, 'promoted binary is executable');
   assert.equal(readBinaryVersion(dst), '1.2.3');
@@ -142,15 +163,21 @@ test('promoteVerifiedBinary rejects a binary whose sha256 mismatches the sidecar
   assert.equal(fs.existsSync(tmp), false, 'tmp cleaned up on rejection');
 });
 
-test('promoteVerifiedBinary proceeds without a sidecar (TOFU back-compat)', (t) => {
-  // Older releases ship no <asset>.sha256; a null expected hash must not block
-  // install (the size + version-exec gates still apply).
+test('promoteVerifiedBinary refuses a binary with no expected sha256 (fail-closed)', (t) => {
+  // Was the TOFU back-compat path: a null expected hash printed a warning and
+  // installed anyway, making this the only fail-OPEN link among the four
+  // download chains while src/snapshot/install.rs is fail-closed — and a warning
+  // on stderr during a background auto-update is seen by nobody. Every release
+  // back to v0.100.0 publishes a sidecar per binary and downloads always target
+  // `releases/latest`, so there is no no-sidecar case left to serve.
   const dir = mkDir(t, 'code-graph-bin-');
   const tmp = path.join(dir, 'code-graph-mcp.tmp');
   const dst = path.join(dir, 'code-graph-mcp');
   writeFakeBinary(tmp, '1.2.3');
-  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', null), true);
-  assert.equal(fs.existsSync(dst), true);
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', null), false);
+  assert.equal(fs.existsSync(dst), false, 'unverified binary must not be promoted');
+  assert.equal(fs.existsSync(tmp), false, 'tmp cleaned up on refusal');
+  // The gate runs BEFORE chmod, so nothing was ever made executable.
 });
 
 test('cachedBinaryNeedsUpdate is version-aware, not existence-only', (t) => {
@@ -223,8 +250,13 @@ test('shouldCheck re-verifies an up-to-date state on a short cadence (release-pu
   // a pending-but-unfinished update keeps the 6h steady-state interval
   assert.equal(shouldCheck({ lastCheck: minsAgo(45), updateAvailable: true }), false);
 
-  // rate-limit backoff (24h) wins even over the up-to-date short cadence
-  assert.equal(shouldCheck({ lastCheck: minsAgo(120), updateAvailable: false, rateLimited: true }), false);
+  // Rate-limit backoff wins even over the up-to-date short cadence. The window
+  // is GitHub's own unauthenticated reset period (1h), not the 24h this used to
+  // assert — that number was written while the flag was unreachable and became
+  // load-bearing only when the state clobber was fixed.
+  assert.equal(shouldCheck({ lastCheck: minsAgo(30), updateAvailable: false, rateLimited: true }), false);
+  assert.equal(shouldCheck({ lastCheck: minsAgo(61), updateAvailable: false, rateLimited: true }), true,
+    'past the reset window the backoff must clear, or a 403 stalls updates indefinitely');
 });
 
 test('shouldCheck lets a forced (session-start) check bypass the soft throttle', () => {
@@ -240,8 +272,12 @@ test('shouldCheck lets a forced (session-start) check bypass the soft throttle',
   // pound the GitHub API on every restart.
   assert.equal(shouldCheck({ lastCheck: minsAgo(0.5), updateAvailable: false }, { force: true }), false);
 
-  // Rate-limit backoff wins even over force — never push more requests into a 403.
-  assert.equal(shouldCheck({ lastCheck: minsAgo(60), updateAvailable: false, rateLimited: true }, { force: true }), false);
+  // Rate-limit backoff wins even over force — never push more requests into a
+  // 403. That ordering is only safe because the window is an hour: at 24h a
+  // single 403 made `--force` a silent no-op for a full day.
+  assert.equal(shouldCheck({ lastCheck: minsAgo(30), updateAvailable: false, rateLimited: true }, { force: true }), false);
+  assert.equal(shouldCheck({ lastCheck: minsAgo(61), updateAvailable: false, rateLimited: true }, { force: true }), true,
+    'force must work again once the reset window has passed');
 });
 
 test('selfHealStaleBinary wires the stale-binary check to a download (the v0.45.x glue)', async () => {
@@ -282,12 +318,27 @@ test('parseLatestRelease selects the matching platform asset', () => {
       { name: 'other', browser_download_url: 'https://example.com/other' },
     ],
   }, 'code-graph-mcp-linux-x64');
+  // `pluginTarballUrl` is null here BY DESIGN: this fixture publishes no
+  // claude-plugin.tar.gz, and that null is what makes downloadAndInstall refuse
+  // to extract rather than fall back to the unchecksummed source tarball.
 
   assert.deepEqual(latest, {
     version: '1.2.3',
     tarballUrl: 'https://example.com/tarball.tgz',
+    pluginTarballUrl: null,
     binaryUrl: 'https://example.com/linux-x64',
   });
+
+  // And it IS picked up when the release publishes it.
+  const withPlugin = parseLatestRelease({
+    tag_name: 'v1.2.3',
+    tarball_url: 'https://example.com/tarball.tgz',
+    assets: [
+      { name: 'code-graph-mcp-linux-x64', browser_download_url: 'https://example.com/linux-x64' },
+      { name: PLUGIN_ASSET_NAME, browser_download_url: 'https://example.com/plugin.tgz' },
+    ],
+  }, 'code-graph-mcp-linux-x64');
+  assert.equal(withPlugin.pluginTarballUrl, 'https://example.com/plugin.tgz');
 });
 
 // ── commandExists ──────────────────────────────────────────
@@ -449,10 +500,29 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
     const fs = require('fs');
     const path = require('path');
     const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
-    const latest = { version: '9.9.9', tarballUrl: 'https://example/tar', binaryUrl: null };
+    const crypto = require('crypto');
+    const latest = {
+      version: '9.9.9',
+      tarballUrl: 'https://example/tar',
+      pluginTarballUrl: 'https://example/claude-plugin.tar.gz',
+      binaryUrl: null,
+    };
     const calls = [];
+    // The stub has to satisfy the integrity gate now: write the archive, then
+    // write ITS OWN digest as the sidecar. A stub that skipped the sidecar would
+    // be exercising the refusal path, not the install path.
     const exec = (cmd, args) => {
       calls.push(cmd);
+      if (cmd === 'curl') {
+        const out = args[args.indexOf('-o') + 1];
+        if (out.endsWith('.sha256')) {
+          const archive = out.slice(0, -'.sha256'.length);
+          const sha = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+          fs.writeFileSync(out, sha + '  ' + path.basename(archive));
+        } else {
+          fs.writeFileSync(out, 'not-a-real-gzip-but-hashable');
+        }
+      }
       if (cmd === 'tar') {
         // Simulate extraction: produce claude-plugin/ with a matching version.
         const tmpDir = args[args.indexOf('-C') + 1];
@@ -554,12 +624,44 @@ test('downloadAndInstall does NOT repoint install state when the plugin copy is 
 test('selfHealGlobalPkgs refreshes stale globals and resets the attempt counter', async () => {
   const latest = { version: '0.101.0' };
   let installedSpecs = null;
+  // `readStale` reflects the world: stale before the install, clean after. The
+  // counter resets on the SECOND reading, not on npm's exit code.
+  let healed = false;
   const patch = await selfHealGlobalPkgs(latest, {}, {
-    readStale: () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }],
-    install: async (specs) => { installedSpecs = specs; return true; },
+    readStale: () => (healed ? [] : [{ name: '@sdsrs/code-graph', version: '0.46.0' }]),
+    install: async (specs) => { installedSpecs = specs; healed = true; return true; },
   });
   assert.deepEqual(installedSpecs, ['@sdsrs/code-graph@0.101.0']);
   assert.deepEqual(patch, { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 0 });
+});
+
+test('selfHealGlobalPkgs counts an install that exits 0 but heals nothing as a failure (P2-22)', async () => {
+  // `npm i -g` installs into the prefix the CURRENT node resolves. Under nvm
+  // with several node versions — or an `npm --prefix` in the user's npmrc — that
+  // is not where the stale copy lives, so npm exits 0 and the stale package is
+  // exactly where it was. Trusting the exit code reset the counter every run,
+  // and the retry budget could never be spent: one npm install per throttle
+  // window, forever, with nothing to show for it.
+  const latest = { version: '0.101.0' };
+  const stillStale = () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }];
+  let runs = 0;
+  const patch = await selfHealGlobalPkgs(latest, {}, {
+    readStale: stillStale,
+    install: async () => { runs += 1; return true; },
+  });
+  assert.equal(runs, 1, 'the heal is still attempted once');
+  assert.deepEqual(patch, { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 1 },
+    'an unverified "success" must consume an attempt, or the cap never bites');
+
+  // And the cap does bite, so the loop terminates.
+  let touched = false;
+  const capped = await selfHealGlobalPkgs(
+    latest,
+    { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 3 },
+    { readStale: stillStale, install: async () => { touched = true; return true; } },
+  );
+  assert.equal(touched, false, 'a repeatedly-ineffective heal must stop being attempted');
+  assert.deepEqual(capped, {});
 });
 
 test('selfHealGlobalPkgs never installs when nothing of ours is globally installed', async () => {
@@ -602,11 +704,12 @@ test('selfHealGlobalPkgs counts failures per target version and stops at the cap
 
   // A NEW release re-arms the counter.
   let specs = null;
+  let healed = false;
   const p3 = await selfHealGlobalPkgs(
     { version: '0.102.0' },
     { globalPkgHealVersion: '0.101.0', globalPkgHealAttempts: 3 },
-    { readStale: () => [{ name: '@sdsrs/code-graph', version: '0.46.0' }],
-      install: async (s) => { specs = s; return true; } },
+    { readStale: () => (healed ? [] : [{ name: '@sdsrs/code-graph', version: '0.46.0' }]),
+      install: async (s) => { specs = s; healed = true; return true; } },
   );
   assert.deepEqual(specs, ['@sdsrs/code-graph@0.102.0']);
   assert.deepEqual(p3, { globalPkgHealVersion: '0.102.0', globalPkgHealAttempts: 0 });
@@ -729,3 +832,145 @@ test('cached binary NEWER than latest is not downgraded; unreadable is healed', 
     cachedBinaryStaleVsState(state, { binaryPath, readVersion: () => null }),
     true, 'unreadable binary bypasses the throttle so the heal can run');
 });
+
+// ── 403 rate-limit backoff survives the check that triggered it ─────────────
+//
+// `fetchLatestRelease` writes `rateLimited: true` on a GitHub 403, and
+// `shouldCheck` reads it to hold off for RATE_LIMIT_INTERVAL_MS (1h). Between
+// those two, `checkForUpdate` took its state snapshot BEFORE the fetch and then
+// wrote `{ ...state, lastCheck: now }` on the null return — spreading the stale
+// snapshot straight over the flag the fetch had just set. The backoff was dead
+// code from the day it was written: every 403 refreshed `lastCheck` and cleared
+// `rateLimited`, so the next tick hit GitHub on the ordinary interval while
+// already rate-limited.
+//
+// Driven through a child process because CACHE_DIR (and therefore the state
+// file) is `os.homedir()/.cache/code-graph`, resolved at module load: the parent
+// has already resolved it against the REAL home, and this test must not write
+// there. `requestJsonFn` is the injected 403 — no network.
+test('a GitHub 403 leaves the rate-limit backoff armed after checkForUpdate returns', (t) => {
+  const { spawnSync } = require('child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-403-home-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const autoUpdate = path.join(__dirname, 'auto-update.js');
+  const script = `
+    const au = require(${JSON.stringify(autoUpdate)});
+    (async () => {
+      await au.checkForUpdate({
+        installMissing: true,
+        force: true,
+        requestJsonFn: async () => ({ statusCode: 403, body: '' }),
+      });
+      process.stdout.write(JSON.stringify(au.readState()));
+    })().catch(e => { process.stderr.write(String(e)); process.exit(1); });
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude') },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+
+  const state = JSON.parse(r.stdout);
+  assert.equal(state.rateLimited, true,
+    'the 403 flag must survive the saveState on checkForUpdate\'s null-return path');
+  // The flag only matters through shouldCheck — assert the behaviour, not just
+  // the field, or a rename leaves this passing while the backoff stays dead.
+  assert.equal(shouldCheck(state), false,
+    'with rateLimited set and lastCheck just now, the next check must back off');
+  assert.equal(shouldCheck(state, { force: true }), false,
+    'the backoff outranks force — a session start must not hammer a 403');
+
+  // And it RECOVERS. The backoff arm sits above the force arm, so if the window
+  // were wrong the stall would be silent and total: `--force` no-ops for its
+  // whole duration. It is one hour because that is GitHub's unauthenticated
+  // reset window; 24h was a constant that had never run (the flag was erased on
+  // the same call that set it) and became load-bearing only when that was fixed.
+  const hourAgo = new Date(Date.now() - 61 * 60 * 1000).toISOString();
+  assert.equal(shouldCheck({ ...state, lastCheck: hourAgo }), true,
+    'an hour after the 403 the backoff must clear on its own');
+  const halfHourAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  assert.equal(shouldCheck({ ...state, lastCheck: halfHourAgo }), false,
+    'half an hour is still inside the window');
+});
+
+// ── Plugin tarball integrity is fail-closed ────────────────────────────────
+//
+// This chain extracts an archive and copies its JAVASCRIPT into the plugin
+// cache, where Claude Code runs it as hooks on every tool call. It used to pull
+// GitHub's auto-generated source `tarball_url`, for which no checksum is
+// published anywhere — the only one of the four download chains with zero
+// integrity verification, and the only one whose payload becomes executed code
+// (audit 2026-07-27 P2-23). release.yml now publishes claude-plugin.tar.gz with
+// a .sha256 sidecar and this refuses to extract without a match.
+//
+// The assertion that matters is `tar` never running: a refusal that still
+// extracted would have written the untrusted JS to disk before deciding.
+for (const [label, mutate] of [
+  ['no sidecar published', (o) => { if (o.endsWith('.sha256')) throw new Error('404'); }],
+  ['sidecar does not match', (o, fsMod) => {
+    if (o.endsWith('.sha256')) fsMod.writeFileSync(o, 'de'.repeat(32));
+  }],
+  ['release publishes no plugin asset', null],
+]) {
+  test(`downloadAndInstall refuses to extract the plugin tarball when the ${label}`, (t) => {
+    const sandboxHome = mkDir(t, 'code-graph-int-');
+    const noAsset = mutate === null;
+    const script = `
+      const fs = require('fs');
+      const path = require('path');
+      const crypto = require('crypto');
+      const { downloadAndInstall } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+      const mutate = ${mutate ? mutate.toString() : 'null'};
+      const latest = {
+        version: '9.9.9',
+        tarballUrl: 'https://example/tar',
+        pluginTarballUrl: ${noAsset ? 'null' : "'https://example/claude-plugin.tar.gz'"},
+        binaryUrl: null,
+      };
+      const calls = [];
+      const exec = (cmd, args) => {
+        calls.push(cmd);
+        if (cmd === 'curl') {
+          const out = args[args.indexOf('-o') + 1];
+          if (mutate) { mutate(out, fs); }
+          if (!out.endsWith('.sha256')) fs.writeFileSync(out, 'payload');
+          else if (!fs.existsSync(out)) {
+            const archive = out.slice(0, -'.sha256'.length);
+            fs.writeFileSync(out, crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex'));
+          }
+        }
+        if (cmd === 'tar') {
+          const tmpDir = args[args.indexOf('-C') + 1];
+          const mDir = path.join(tmpDir, 'claude-plugin', '.claude-plugin');
+          fs.mkdirSync(mDir, { recursive: true });
+          fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '9.9.9' }));
+        }
+      };
+      (async () => {
+        const result = await downloadAndInstall(latest, {
+          exec,
+          cmdExists: () => true,
+          refreshMarketplace: () => true,
+          downloadBin: async () => true,
+        });
+        console.log(JSON.stringify({ result, calls }));
+      })();
+    `;
+    const out = execGit(process.execPath, ['-e', script], {
+      env: { ...process.env, HOME: sandboxHome },
+      encoding: 'utf8',
+    });
+    const { result, calls } = JSON.parse(out.trim().split('\n').pop());
+    assert.equal(result.pluginUpdated, false, `${label}: plugin must not be installed`);
+    assert.equal(calls.includes('tar'), false,
+      `${label}: refused BEFORE extraction — untrusted JS must never reach disk`);
+    // The binary chain has its own integrity gate and still runs, so a bad
+    // plugin asset does not strand the user on an old binary.
+    assert.equal(result.binaryUpdated, true, `${label}: binary update still proceeds`);
+    const dst = path.join(sandboxHome, '.claude', 'plugins', 'cache',
+      'code-graph-mcp', 'code-graph-mcp', '9.9.9');
+    assert.equal(fs.existsSync(dst), false, `${label}: nothing copied into the plugin cache`);
+  });
+}

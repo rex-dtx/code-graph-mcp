@@ -20,26 +20,37 @@ pub enum CompressedOutput {
     Directories(Vec<GroupedResult>),
 }
 
-/// Estimate token count for results using CHARS_PER_TOKEN (bytes/token) ratio.
-/// context_string already includes name, signature, and code_content,
-/// so we use it exclusively when available to avoid double-counting.
-/// `.len()` is UTF-8 byte length — see CHARS_PER_TOKEN doc for why this is
-/// CJK-correct without per-language branching.
-fn estimate_tokens(results: &[crate::storage::queries::NodeResult]) -> usize {
-    let total_bytes: usize = results
-        .iter()
-        .map(|r| {
-            r.context_string.as_ref().map_or_else(
-                || {
-                    r.code_content.len()
-                        + r.name.len()
-                        + r.signature.as_ref().map_or(0, |s| s.len())
-                },
-                |ctx| ctx.len(),
-            )
-        })
-        .sum();
-    total_bytes / crate::domain::CHARS_PER_TOKEN
+/// Bytes of JSON framing a single result costs on the wire — keys, braces,
+/// quotes, `node_id`, line numbers.
+const RESULT_FRAMING_BYTES: usize = 80;
+
+/// Token cost of ONE search result AS SERIALIZED, using the CHARS_PER_TOKEN
+/// (bytes/token) ratio.
+///
+/// The single estimator for the search surfaces: the compression gate and the
+/// compression LEVEL selector must agree, and they only agree if there is one
+/// definition. The previous level-selector estimator preferred `context_string`,
+/// which the response never carries, and so disagreed with the gate by orders of
+/// magnitude (audit 2026-07-27).
+///
+/// `code_cap` is the caller's per-result `code_content` limit — estimate what
+/// will be emitted, not what is in the row.
+///
+/// `.len()` is UTF-8 byte length, deliberately: see CHARS_PER_TOKEN's doc for
+/// why byte-counting is CJK-correct without per-language branching.
+pub fn estimate_result_tokens(
+    code_content: &str,
+    code_cap: usize,
+    signature: Option<&str>,
+    name: &str,
+    file_path: &str,
+) -> usize {
+    (code_content.len().min(code_cap)
+        + signature.map_or(0, |s| s.len())
+        + name.len()
+        + file_path.len()
+        + RESULT_FRAMING_BYTES)
+        / crate::domain::CHARS_PER_TOKEN
 }
 
 /// Estimate token count for a JSON value using CHARS_PER_TOKEN (bytes/token) ratio.
@@ -58,12 +69,25 @@ pub fn estimate_json_tokens(value: &serde_json::Value) -> usize {
 /// - Nodes (L1): tokens <= threshold * 3 (node summaries)
 /// - Files (L2): tokens <= threshold * 8 (file groups)
 /// - Directories (L3): tokens > threshold * 8 (directory groups)
+///
+/// `estimated_tokens` is supplied by the CALLER rather than recomputed here, and
+/// that is the whole point. This function used to run its own estimator that
+/// preferred `context_string` — a field the response never serializes — while
+/// the caller's gate (fixed 2026-07-24) estimated from what it actually emits:
+/// `code_content` capped at the surface's per-result limit, plus JSON framing.
+/// The two numbers could differ by orders of magnitude, so a response the gate
+/// judged barely over budget got compressed as if it were huge: ONE node with a
+/// 20,956-byte context_string against 46 bytes of code was enough to demote L1
+/// to L2. Only the caller knows the shape of its own payload, so only the caller
+/// can estimate it — taking the number as a parameter makes a second, drifting
+/// estimator impossible rather than merely unlikely.
 pub fn compress_if_needed(
     results: &[crate::storage::queries::NodeResult],
     file_paths: &[String],
     token_threshold: usize,
+    estimated_tokens: usize,
 ) -> anyhow::Result<Option<CompressedOutput>> {
-    let tokens = estimate_tokens(results);
+    let tokens = estimated_tokens;
     if tokens <= token_threshold {
         Ok(None)
     } else if tokens <= token_threshold * 3 {
@@ -317,21 +341,28 @@ mod tests {
         assert!(auth_dir.summary.contains("2 files"));
     }
 
-    #[test]
-    fn test_estimate_tokens() {
-        // Small content: should be below threshold
-        let small = vec![NodeResult {
-            code_content: "short".into(),
-            ..default_node()
-        }];
-        assert!(estimate_tokens(&small) < 2000);
+    /// Helper mirroring the search surface: cap 500 (MAX_SEARCH_CODE_LEN).
+    fn est(code: &str) -> usize {
+        estimate_result_tokens(code, 500, None, "default", "src/a.rs")
+    }
 
-        // Large content: should exceed threshold
-        let large = vec![NodeResult {
-            code_content: "x".repeat(9000),
-            ..default_node()
-        }];
-        assert!(estimate_tokens(&large) > 2000);
+    #[test]
+    fn test_estimate_result_tokens_respects_the_code_cap() {
+        // Small content stays small.
+        assert!(est("short") < 2000);
+        // Large content is CAPPED, because the response caps it too — the old
+        // estimator read the uncapped row and fired compression on payloads
+        // that would have fit.
+        let capped = est(&"x".repeat(9000));
+        assert!(
+            capped < 2000,
+            "9000 bytes of code serialize as at most 500, got {capped} tokens"
+        );
+        assert_eq!(
+            capped,
+            est(&"x".repeat(500)),
+            "anything at or over the cap must estimate identically"
+        );
     }
 
     /// CJK contract: estimator counts UTF-8 BYTES not chars, so a CJK string
@@ -340,31 +371,74 @@ mod tests {
     /// estimator to char-count and silently halving CJK budgets.
     #[test]
     fn test_estimate_tokens_cjk_byte_based() {
-        // 1000 CJK chars = 3000 UTF-8 bytes → estimate ≈ 1000 tokens
-        // (close to real BPE: ~1 token per CJK char in cl100k_base).
-        let cjk = vec![NodeResult {
-            code_content: "你".repeat(1000),
-            ..default_node()
-        }];
-        let est = estimate_tokens(&cjk);
+        // 1000 CJK chars = 3000 UTF-8 bytes, but the surface caps code at 500
+        // bytes, so compare at a length both spellings survive intact: 150 CJK
+        // chars = 450 bytes → ~150 tokens, plus the fixed JSON framing every
+        // result pays (named here rather than folded into a loose band, so the
+        // assertion still pins the bytes/3 ratio itself).
+        let framing_tokens = RESULT_FRAMING_BYTES / crate::domain::CHARS_PER_TOKEN;
+        let est_cjk = estimate_result_tokens(&"你".repeat(150), 500, None, "", "");
+        let cjk_content = est_cjk - framing_tokens;
         assert!(
-            (900..=1100).contains(&est),
-            "CJK 1000-char estimate must be ~1000 tokens (bytes/3), got {}",
-            est,
+            (140..=160).contains(&cjk_content),
+            "150 CJK chars (450 bytes) must estimate ~150 content tokens (bytes/3), got {cjk_content}",
         );
-        // ASCII 1000 chars (1000 bytes) → ~333 tokens — confirms divisor is
-        // bytes-based (an ill-fixed char-based version would also report ~333
-        // here, but would WRONGLY report ~333 for the CJK case above).
-        let ascii = vec![NodeResult {
-            code_content: "x".repeat(1000),
+        // 150 ASCII chars (150 bytes) → ~50 tokens — confirms the divisor is
+        // bytes-based (an ill-fixed char-based version would report ~50 here
+        // too, but would WRONGLY report ~50 for the CJK case above).
+        let est_ascii = estimate_result_tokens(&"x".repeat(150), 500, None, "", "");
+        assert!(
+            est_ascii < est_cjk,
+            "150 CJK chars must estimate higher than 150 ASCII chars: cjk={est_cjk} ascii={est_ascii}",
+        );
+    }
+
+    #[test]
+    fn test_compression_level_uses_the_callers_serialized_estimate() {
+        // Split brain, audit 2026-07-27: the GATE in tool_semantic_search was
+        // fixed on 07-24 to estimate from what it actually serializes
+        // (code_content capped at MAX_SEARCH_CODE_LEN + JSON framing), but the
+        // LEVEL selector inside compress_if_needed re-estimated from
+        // context_string — a field that is NOT in the response at all. Measured:
+        // ONE node with context_string 20,956 B against code_content 46 B was
+        // enough to push a response that belongs at L1 (node summaries) down to
+        // L2 (file groups), discarding per-node detail the budget could afford.
+        let threshold = 100;
+        let results = vec![NodeResult {
+            id: 1,
+            name: "tiny".into(),
+            code_content: "fn tiny() {}".into(),
+            // Deliberately enormous and deliberately never serialized.
+            context_string: Some("x".repeat(20_956)),
             ..default_node()
         }];
-        let est_ascii = estimate_tokens(&ascii);
+        let file_paths = vec!["src/a.rs".to_string()];
+
+        // The caller's own estimate — just past the threshold, so L1.
+        let out = compress_if_needed(&results, &file_paths, threshold, threshold + 1)
+            .unwrap()
+            .expect("over threshold must compress");
         assert!(
-            est_ascii < est,
-            "1000 CJK chars must estimate higher than 1000 ASCII chars: cjk={} ascii={}",
-            est,
-            est_ascii,
+            matches!(out, CompressedOutput::Nodes(_)),
+            "an estimate just over the threshold must select L1 regardless of context_string size"
+        );
+
+        // Negative control: the level still tracks the estimate it is handed, so
+        // a genuinely large payload still escalates.
+        let out = compress_if_needed(&results, &file_paths, threshold, threshold * 4)
+            .unwrap()
+            .expect("over threshold must compress");
+        assert!(
+            matches!(out, CompressedOutput::Files(_)),
+            "4x threshold must still select L2"
+        );
+
+        // And an estimate under the threshold means no compression at all.
+        assert!(
+            compress_if_needed(&results, &file_paths, threshold, threshold - 1)
+                .unwrap()
+                .is_none(),
+            "under threshold must not compress"
         );
     }
 }

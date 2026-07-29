@@ -1328,16 +1328,29 @@ fn get_preceding_comment(node: &tree_sitter::Node, source: &str) -> Option<Strin
     } else {
         comments.reverse();
         let joined = comments.join("\n");
-        // Strip NUL bytes: doc_comment is stored as SQLite TEXT and fed to the
-        // FTS5 tokenizer, which treats it as a C-string and stops at the first
-        // NUL — everything after would be unsearchable. Replace with a space
-        // (same byte length, non-NUL bytes unchanged), matching the NUL→space
-        // policy in truncate_code_content (L10). Fast path: no allocation when
-        // the comment is NUL-free (the overwhelming common case).
-        if joined.contains('\0') {
-            Some(joined.replace('\0', " "))
-        } else {
-            Some(joined)
+        // Apply the code_content policy verbatim — NUL→space AND the byte cap.
+        //
+        // NUL: doc_comment is stored as SQLite TEXT and fed to the FTS5
+        // tokenizer, which treats it as a C-string and stops at the first NUL,
+        // leaving everything after unsearchable (L10).
+        //
+        // Cap: doc_comment had none while code_content has been capped since
+        // v47, so a comment could outweigh the symbol it documents by orders of
+        // magnitude — measured MAX in this repo 20,828 bytes, the INDEX_VERSION
+        // changelog tail, which tree-sitter attaches to the 46-byte constant
+        // that follows it. Two measured costs: FTS5 recall pollution (that
+        // constant answering a query for a word that appears only in the
+        // changelog prose) and a 512-token embedding window filled with comment
+        // before any code reaches it. Unlike code_content, no SQL guard reads
+        // doc_comment via instr/LIKE, so the cap introduces no new
+        // truncation-fragile predicate — the `...` sentinel is for the reader.
+        //
+        // Fast path: `truncate_code_content` borrows when the comment is
+        // NUL-free and under the cap (the overwhelming common case), so match on
+        // the Cow to hand back the existing allocation instead of cloning it.
+        match truncate_code_content(&joined) {
+            Cow::Borrowed(_) => Some(joined),
+            Cow::Owned(s) => Some(s),
         }
     }
 }
@@ -2334,5 +2347,50 @@ const { notExported } = getObj();
             by("notExported").is_none(),
             "non-exported destructure must not be a symbol"
         );
+    }
+
+    // A doc comment had NO length cap while code_content has had one since v47
+    // (4 KB + a three-dot sentinel). Measured MAX in this repo: 20,828 bytes —
+    // the giant INDEX_VERSION changelog tail, which tree-sitter attaches as the
+    // preceding comment of whatever constant follows it. Two concrete costs:
+    // FTS5 recall pollution (a 46-byte constant answering a query for a word
+    // that appears only in the changelog prose), and a 512-token embedding
+    // window filled with comment before any code reaches it.
+    #[test]
+    fn test_preceding_comment_is_capped_like_code_content() {
+        let max = max_code_content_len();
+        let filler = "x".repeat(max * 2);
+        let src = format!("// {filler}\npub const TAIL: i32 = 1;\n");
+        let nodes = parse_code(&src, "rust").unwrap();
+        let doc = nodes
+            .iter()
+            .find(|n| n.name == "TAIL")
+            .and_then(|n| n.doc_comment.clone())
+            .expect("TAIL must carry the preceding comment");
+        assert!(
+            doc.len() <= max + 3,
+            "doc_comment must be capped at max_code_content_len (+3 sentinel), got {} bytes",
+            doc.len()
+        );
+        assert!(
+            doc.ends_with("..."),
+            "a truncated doc_comment must carry the same three-dot sentinel code_content uses, got tail {:?}",
+            &doc[doc.len().saturating_sub(8)..]
+        );
+    }
+
+    #[test]
+    fn test_short_preceding_comment_is_untouched() {
+        // Negative control: capping must not rewrite ordinary doc comments.
+        // Without this, truncating everything to zero would pass the test above.
+        let src = "/// Adds two numbers.\npub fn add(a: i32, b: i32) -> i32 { a + b }\n";
+        let nodes = parse_code(src, "rust").unwrap();
+        let doc = nodes
+            .iter()
+            .find(|n| n.name == "add")
+            .and_then(|n| n.doc_comment.clone())
+            .expect("add must carry its doc comment");
+        // Byte-identical to the pre-cap behavior, trailing newline included.
+        assert_eq!(doc, "/// Adds two numbers.\n");
     }
 }

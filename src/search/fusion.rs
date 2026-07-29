@@ -14,15 +14,24 @@ pub struct SearchResult {
 /// Base: score(node) = sum( weight_i / (k + rank_i + 1) ) across sources (classic RRF).
 ///
 /// Blending: when raw scores are available (score > 0), a small fraction of the
-/// normalized raw score is added as a TRUE tie-breaker — strictly bounded so it
-/// cannot flip adjacent RRF ranks at any k. Scale is adaptive:
+/// normalized raw score is added as a TRUE tie-breaker — bounded per source:
 ///   blend_max_per_source = 0.5 / ((k+1) * (k+2)) * weight
 /// Proof: the RRF gap between rank i and rank i+1 in one source is
 ///   1/(k+i+1) - 1/(k+i+2) = 1/((k+i+1)(k+i+2))
 /// which is minimized at i=0 as 1/((k+1)(k+2)). Setting blend_max to HALF that
 /// gap guarantees the blend contribution is strictly less than any adjacent-rank
-/// RRF gap — so a higher-ranked node can never be overtaken by a lower-ranked
-/// one with a bigger raw score.
+/// RRF gap.
+///
+/// SCOPE OF THAT GUARANTEE — it is per source, and this function fuses two.
+/// Within ONE source's ranking, two adjacent items differ by more than the
+/// blend can move them, so blending cannot reorder them. Across the FUSED
+/// ordering it can: two nodes' summed RRF totals can differ by less than one
+/// adjacent-rank gap (`1/31 + 1/36` vs `1/32 + 1/35` at k=30 differ by 0.00021,
+/// while the two-source blend ceiling is 0.00101), and there the raw scores
+/// decide. That is the intended behavior — near-ties across sources are exactly
+/// what a tie-breaker is for — but the earlier phrasing, "cannot flip adjacent
+/// RRF ranks at any k", claimed something stronger than the proof supports.
+/// `test_blend_can_reorder_a_cross_source_near_tie` pins the real boundary.
 ///
 /// Historical note: a previous version used SCORE_BLEND_FACTOR=0.1, which at k=30
 /// produced blend_max ≈ 0.1 vs adjacent-rank gap ≈ 0.001 — blend dominated RRF
@@ -294,7 +303,96 @@ mod tests {
         );
     }
 
-    /// Scientific invariant: blending must NEVER flip adjacent ranks.
+    /// Where the no-flip guarantee STOPS — the other side of
+    /// `test_blend_cannot_flip_adjacent_ranks`.
+    ///
+    /// That test uses one source, where the proof holds. With two, the fused
+    /// totals of two nodes can sit closer together than the blend ceiling, and
+    /// the raw scores then decide the order. At k=30, weights 1/1:
+    ///   A = fts rank 0 + vec rank 5 → 1/31 + 1/36 = 0.0600358
+    ///   B = fts rank 1 + vec rank 4 → 1/32 + 1/35 = 0.0598214   (gap 0.00021)
+    ///   blend ceiling for B, both sources at max raw = 0.00101
+    /// so B overtakes A. This is intended tie-breaking, and it is exactly what
+    /// the doc comment used to deny; the assertion below exists so the claim and
+    /// the code cannot drift apart again.
+    #[test]
+    fn test_blend_can_reorder_a_cross_source_near_tie() {
+        let k = 30u32;
+        // A (id 1) leads in fts, B (id 2) leads in vec — fillers pad the ranks.
+        let fts = vec![
+            SearchResult {
+                node_id: 1,
+                score: 0.0,
+            }, // rank 0
+            SearchResult {
+                node_id: 2,
+                score: 10.0,
+            }, // rank 1, max raw
+        ];
+        let vec_results = vec![
+            SearchResult {
+                node_id: 10,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 11,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 12,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 13,
+                score: 0.0,
+            },
+            SearchResult {
+                node_id: 2,
+                score: 10.0,
+            }, // rank 4, max raw
+            SearchResult {
+                node_id: 1,
+                score: 0.0,
+            }, // rank 5
+        ];
+
+        // RRF alone puts A first.
+        let no_blend = weighted_rrf_fusion(
+            &fts.iter()
+                .map(|r| SearchResult {
+                    node_id: r.node_id,
+                    score: 0.0,
+                })
+                .collect::<Vec<_>>(),
+            &vec_results
+                .iter()
+                .map(|r| SearchResult {
+                    node_id: r.node_id,
+                    score: 0.0,
+                })
+                .collect::<Vec<_>>(),
+            k,
+            5,
+            1.0,
+            1.0,
+        );
+        assert_eq!(
+            no_blend[0].node_id, 1,
+            "without raw scores the fused RRF ordering must put A first"
+        );
+
+        // With raw scores, the blend crosses the sub-gap tie.
+        let fused = weighted_rrf_fusion(&fts, &vec_results, k, 5, 1.0, 1.0);
+        assert_eq!(
+            fused[0].node_id, 2,
+            "a cross-source near-tie IS decided by the blend — the per-source \
+             no-flip proof does not extend to the fused ordering"
+        );
+    }
+
+    /// Scientific invariant: blending must NEVER flip adjacent ranks — WITHIN one
+    /// source, which is the scope the bound is proven for (see
+    /// `test_blend_can_reorder_a_cross_source_near_tie` for where it ends).
     /// A rank-0 result with a low raw score must still beat a rank-1 result with
     /// max raw score. Historically (SCORE_BLEND_FACTOR=0.1 with k=30), this
     /// invariant was violated — the blend term dominated the RRF term by ~100×.

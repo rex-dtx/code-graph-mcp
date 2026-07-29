@@ -176,3 +176,65 @@ test('smoke: mixed stale plugin-cache + dual-node bare npm orphans converge to e
     'second registration over a converged state must be a no-op');
   assert.equal(JSON.stringify(settings.hooks), after, 'converged state must be stable');
 });
+
+// --- P2-17: the statusLine slot is the hook slot's sibling --------------------
+//
+// install() claims two slots in settings.json — hooks and statusLine — and the
+// ping-pong fix above only covered one. The statusLine branch rewrote on an
+// exact string mismatch, so two copies of this plugin (plugin cache + global
+// npm, or a dev checkout) each took the slot back from the other on every
+// SessionStart. The audit found it because the regression test that proved the
+// hook fix asserted `settings.hooks` and nothing else.
+
+test('P2-17 a live composite from another delivery surface is not stale (no statusLine ping-pong)', (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-slot-'));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+
+  // A global-npm (in-place, no version dir) composite that exists on disk.
+  const npmScripts = path.join(fixture, '.nvm/versions/node/v24.18.0/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts');
+  fs.mkdirSync(npmScripts, { recursive: true });
+  const npmComposite = path.join(npmScripts, 'statusline-composite.js');
+  fs.writeFileSync(npmComposite, '// present on this surface');
+  assert.equal(lifecycle.compositeSlotIsStale(`node "${npmComposite}"`), false,
+    'an existing in-place composite is current on its own surface — taking the slot back from it is the ping-pong');
+
+  // A plugin-cache composite pinned to an OLDER version dir, present on disk.
+  const oldCache = path.join(fixture, '.claude/plugins/cache/code-graph-mcp/code-graph-mcp/0.0.1/scripts');
+  fs.mkdirSync(oldCache, { recursive: true });
+  const oldComposite = path.join(oldCache, 'statusline-composite.js');
+  fs.writeFileSync(oldComposite, '// old cache version');
+  assert.equal(lifecycle.compositeSlotIsStale(`node "${oldComposite}"`), true,
+    'an older plugin-cache version dir must still be healed');
+
+  // A path that no longer exists (node version uninstalled / checkout deleted).
+  assert.equal(lifecycle.compositeSlotIsStale(`node "${path.join(fixture, 'gone/statusline-composite.js')}"`), true,
+    'a dead path must be healed');
+
+  // Unparseable command: heal rather than trust it.
+  assert.equal(lifecycle.compositeSlotIsStale('some-wrapper --statusline-composite'), true,
+    'a command we cannot resolve to a script must be replaced');
+});
+
+// Windows: the composite command is built with path.join, so the path it
+// carries uses `\`. cacheDirVersion's pattern was `/`-only, so on Windows it
+// returned null for EVERY plugin-cache path — compositeSlotIsStale then
+// answered "not stale" unconditionally and the statusline slot was never
+// healed there. It self-corrected only once cleanupOldCacheVersions deleted
+// the old version dir. The test above cannot catch this: it builds its paths
+// with path.join, so on the ubuntu-only plugin-tests job it produces `/`.
+// This one asserts the parse directly, on both spellings, from any platform.
+test('cacheDirVersion parses a plugin-cache path with either separator', () => {
+  const posix = '/home/u/.claude/plugins/cache/code-graph-mcp/code-graph-mcp/0.100.0/scripts/statusline-composite.js';
+  const win32 = 'C:\\Users\\u\\.claude\\plugins\\cache\\code-graph-mcp\\code-graph-mcp\\0.100.0\\scripts\\statusline-composite.js';
+
+  assert.equal(lifecycle.cacheDirVersion(posix), '0.100.0');
+  assert.equal(
+    lifecycle.cacheDirVersion(win32), '0.100.0',
+    'a backslash-spelled cache path must yield the same version — returning null here makes ' +
+    'compositeSlotIsStale report "not stale" for every Windows plugin-cache install'
+  );
+
+  // In-place installs (global npm) carry no version dir on either spelling.
+  assert.equal(lifecycle.cacheDirVersion('/usr/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts/x.js'), null);
+  assert.equal(lifecycle.cacheDirVersion('C:\\npm\\node_modules\\@sdsrs\\code-graph\\claude-plugin\\scripts\\x.js'), null);
+});

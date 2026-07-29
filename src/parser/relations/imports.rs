@@ -43,6 +43,54 @@ pub(super) fn extract_import_names(
                     // (alias + specifier) that the indexer binds module-level and
                     // feeds into ns_module_map for `ns.foo()` member calls.
                     emit_namespace_import(&child, source, js_module.as_deref(), results);
+                    // ESM DEFAULT binding: `import mod from './m'`, the single most
+                    // common ESM form, used to emit NOTHING. Its binding is a bare
+                    // `identifier` sitting directly under `import_clause` — not an
+                    // `import_specifier`, which is all the specifier walk below looks
+                    // for, and not a direct child of `import_statement`, which is
+                    // what the `"identifier"` arm in the caller handles. So it fell
+                    // between the two and every `import React from 'react'` shaped
+                    // dependency was invisible to deps / cycles / affected /
+                    // project_map.
+                    //
+                    // Bound module-level (like the namespace form), NOT as a symbol
+                    // edge under the local name: the local name is arbitrary
+                    // (`import anything from './m'`) and the default export's own
+                    // node is usually named something else, so a name-based edge
+                    // would either miss or bind a same-named symbol elsewhere. Its
+                    // own marker rather than `ns_import` because a default import is
+                    // NOT a namespace: `mod.foo()` is a member of the default export,
+                    // not a top-level symbol of the module, so it must not feed the
+                    // member-call binding map the way `import * as ns` does.
+                    if child.kind() == "import_clause" {
+                        if let Some(js_module) = js_module.as_deref() {
+                            for j in 0..child.named_child_count() {
+                                let Some(binding) = child.named_child(j) else {
+                                    continue;
+                                };
+                                if binding.kind() != "identifier" {
+                                    continue;
+                                }
+                                let name = node_text(&binding, source);
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                results.push(ParsedRelation {
+                                    source_name: "<module>".into(),
+                                    target_name: name.to_string(),
+                                    relation: REL_IMPORTS.into(),
+                                    metadata: Some(
+                                        serde_json::json!({
+                                            "q": crate::domain::IMPORT_Q_DEFAULT,
+                                            "js_module": js_module,
+                                        })
+                                        .to_string(),
+                                    ),
+                                    source_language: String::new(),
+                                });
+                            }
+                        }
+                    }
                     // For named imports: import { Foo, Bar } from '...'
                     extract_import_specifiers(&child, source, results, metadata.as_deref());
                 }
@@ -99,7 +147,10 @@ fn emit_namespace_import(
         source_name: "<module>".into(),
         target_name: node_text(&alias, source).to_string(),
         relation: REL_IMPORTS.into(),
-        metadata: Some(serde_json::json!({ "q": "ns_import", "js_module": module }).to_string()),
+        metadata: Some(
+            serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_IMPORT, "js_module": module })
+                .to_string(),
+        ),
         source_language: String::new(),
     });
 }

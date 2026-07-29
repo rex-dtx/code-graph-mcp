@@ -39,7 +39,13 @@ const BINARY_CACHE_DIR = path.join(CACHE_DIR, 'bin');
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h — steady-state re-check
 const UP_TO_DATE_RECHECK_MS = 30 * 60 * 1000;        // 30min — re-verify an "up to date" result (release-race guard)
 const SESSION_START_MIN_GAP_MS = 2 * 60 * 1000;      // 2min — anti-hammer floor for forced (session-start) checks
-const RATE_LIMIT_INTERVAL_MS = 24 * 60 * 60 * 1000;  // 24h if rate-limited
+// GitHub's unauthenticated REST quota is 60 req/hr and resets HOURLY, so one
+// hour is the whole wait — 24h was written when this constant was unreachable
+// (checkForUpdate erased `rateLimited` on the same call that set it) and became
+// load-bearing the moment that was fixed, having never once been exercised. At
+// 24h a single 403 on a shared/NAT'd IP froze every update check for a day,
+// `--force` included, because the backoff arm sits above the force arm below.
+const RATE_LIMIT_INTERVAL_MS = 60 * 60 * 1000;       // 1h — GitHub's reset window
 const FETCH_TIMEOUT_MS = 3000;
 
 function isSilentMode(argv = process.argv.slice(2), env = process.env) {
@@ -92,8 +98,10 @@ function saveState(state) {
 
 // Whether to hit GitHub now. Keyed to the previous check's outcome, with a force
 // override for high-intent triggers (session start / explicit reload). Ordering:
-//   1. rate-limit backoff (24h) wins over everything — never push more requests
-//      into a GitHub 403.
+//   1. rate-limit backoff (RATE_LIMIT_INTERVAL_MS, 1h = GitHub's own reset
+//      window) wins over everything, force included — never push more requests
+//      into a GitHub 403. Safe to outrank force only because it is an hour; the
+//      24h it said before made one 403 a silent day-long no-op for `--force`.
 //   2. force → only the short SESSION_START_MIN_GAP_MS floor applies, so opening
 //      a new session re-checks immediately while a crash/reopen loop still can't
 //      hammer the API.
@@ -204,23 +212,29 @@ function requestJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
   });
 }
 
+// Published by release.yml alongside the five platform binaries, each with a
+// `.sha256` sidecar. Distinct from `tarball_url`, which is GitHub's
+// auto-generated source archive and has no checksum published anywhere.
+const PLUGIN_ASSET_NAME = 'claude-plugin.tar.gz';
+
 function parseLatestRelease(data, assetName = getPlatformAssetName()) {
   if (!data || typeof data.tag_name !== 'string' || typeof data.tarball_url !== 'string') {
     return null;
   }
 
-  let binaryUrl = null;
-  if (assetName && Array.isArray(data.assets)) {
-    const asset = data.assets.find((entry) => entry && entry.name === assetName);
-    if (asset && typeof asset.browser_download_url === 'string') {
-      binaryUrl = asset.browser_download_url;
-    }
-  }
+  const assetUrl = (name) => {
+    if (!name || !Array.isArray(data.assets)) return null;
+    const asset = data.assets.find((entry) => entry && entry.name === name);
+    return asset && typeof asset.browser_download_url === 'string'
+      ? asset.browser_download_url
+      : null;
+  };
 
   return {
     version: data.tag_name.replace(/^v/, ''),
     tarballUrl: data.tarball_url,
-    binaryUrl,
+    pluginTarballUrl: assetUrl(PLUGIN_ASSET_NAME),
+    binaryUrl: assetUrl(assetName),
   };
 }
 
@@ -330,19 +344,35 @@ async function downloadBinary(latest) {
       latest.binaryUrl,
     ], { timeout: 60000, stdio: 'pipe' });
 
-    // Best-effort fetch of the integrity sidecar (<asset>.sha256). curl -f makes
-    // a 404 (an older release with no sidecar) fail → expectedSha stays null →
-    // promoteVerifiedBinary takes the TOFU path. Same-origin, so this guards
-    // corruption in transit, not a release-asset swap (version-exec is the
-    // backstop there).
+    // Integrity sidecar (<asset>.sha256), fail-CLOSED. `curl -f` turns a 404 into
+    // a throw. One retry, because the alternative to a transient network blip is
+    // no update this cycle — the installed binary keeps working and the next
+    // check tries again, which is a strictly safer failure than exec'ing bytes
+    // nothing vouched for.
+    //
+    // This used to fall through to a TOFU path on a missing sidecar, which made
+    // it the one download chain in the repo that was fail-OPEN while
+    // `src/snapshot/install.rs` (whose comment reads "this used to warn and fail
+    // OPEN") is fail-closed. release.yml publishes a sidecar for every binary of
+    // every release — verified back to v0.100.0 — and downloads always target
+    // `releases/latest`, so there is no reachable no-sidecar case left to serve.
+    // Same-origin, so this defends transit/CDN corruption and truncation, not a
+    // release-asset swap; the version-exec check is the backstop there.
     let expectedSha = null;
     const shaTmp = binaryTmp + '.sha256';
-    try {
-      execFileSync('curl', ['-sfL', '-o', shaTmp, latest.binaryUrl + '.sha256'],
-        { timeout: 30000, stdio: 'pipe' });
-      expectedSha = (fs.readFileSync(shaTmp, 'utf8').trim().split(/\s+/)[0]) || null;
-    } catch { /* no sidecar → TOFU */ } finally {
-      try { if (fs.existsSync(shaTmp)) fs.unlinkSync(shaTmp); } catch { /* ok */ }
+    for (let attempt = 0; attempt < 2 && !expectedSha; attempt++) {
+      try {
+        execFileSync('curl', ['-sfL', '-o', shaTmp, latest.binaryUrl + '.sha256'],
+          { timeout: 30000, stdio: 'pipe' });
+        expectedSha = (fs.readFileSync(shaTmp, 'utf8').trim().split(/\s+/)[0]) || null;
+      } catch { /* retry once, then refuse below */ } finally {
+        try { if (fs.existsSync(shaTmp)) fs.unlinkSync(shaTmp); } catch { /* ok */ }
+      }
+    }
+    if (!expectedSha) {
+      console.error(`[code-graph] Refusing to install: no sha256 sidecar for ${latest.binaryUrl} (fetched twice). The current binary is unchanged; the next update check will retry.`);
+      try { fs.unlinkSync(binaryTmp); } catch { /* ok */ }
+      return false;
     }
 
     return promoteVerifiedBinary(binaryTmp, binaryDst, latest.version, expectedSha);
@@ -370,17 +400,21 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSh
     // or tampered download is never exec'd. The published <asset>.sha256 sidecar
     // is same-origin, so this defends transit/CDN corruption + truncation, not a
     // full release compromise (an attacker swapping the binary swaps the sidecar
-    // too — the version-exec check below is the backstop there). No sidecar
-    // (older release) → warn + proceed (TOFU), preserving the size + version
-    // gates. Mirrors the snapshot checksum convention (src/snapshot/install.rs).
-    if (expectedSha256) {
-      const actualSha = sha256File(binaryTmp);
-      if (actualSha.toLowerCase() !== String(expectedSha256).toLowerCase()) {
-        console.error(`[code-graph] Binary checksum mismatch (sha256): expected ${expectedSha256}, got ${actualSha} — refusing to install.`);
-        return false;
-      }
-    } else {
-      console.error('[code-graph] No binary checksum sidecar found — content not verified (size + version checks still apply).');
+    // too — the version-exec check below is the backstop there).
+    //
+    // Fail-CLOSED: no expected sha, no install. The previous "warn and proceed"
+    // arm made this the only fail-open link in the four download chains, against
+    // a fail-closed `src/snapshot/install.rs` — and a warning printed to stderr
+    // during a background auto-update is seen by nobody.
+    if (!expectedSha256) {
+      console.error('[code-graph] No expected sha256 supplied — refusing to install an unverified binary.');
+      try { fs.unlinkSync(binaryTmp); } catch { /* ok */ }
+      return false;
+    }
+    const actualSha = sha256File(binaryTmp);
+    if (actualSha.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+      console.error(`[code-graph] Binary checksum mismatch (sha256): expected ${expectedSha256}, got ${actualSha} — refusing to install.`);
+      return false;
     }
 
     // chmod BEFORE reading the version. readBinaryVersion executes the binary
@@ -460,16 +494,54 @@ async function downloadAndInstall(latest, {
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    // ── Step 1: Download and install plugin files from tarball ──
-    const tarballPath = path.join(tmpDir, 'release.tar.gz');
+    // ── Step 1: Download and install plugin files from the release asset ──
+    //
+    // Fail-CLOSED on integrity, like the binary chain. This step extracts an
+    // archive and then COPIES ITS JAVASCRIPT into the plugin cache, where Claude
+    // Code runs it as hooks on every tool call — so of the four download chains
+    // it is the one where unverified bytes become executed code, and it was the
+    // only one with no checksum at all (`tarball_url` is GitHub's generated
+    // source archive; nothing publishes a digest for it).
+    // `claude-plugin.tar.gz` + `.sha256` are published by release.yml for every
+    // release from the one carrying this change onward, and updates always
+    // target `releases/latest` — so a missing asset means something is wrong
+    // with the release, not that we are talking to an older one. Refusing leaves
+    // the user on their current, working plugin version; the binary update below
+    // still runs.
+    if (!latest.pluginTarballUrl) {
+      console.error(`[code-graph] Plugin update skipped: release ${latest.version} publishes no ${PLUGIN_ASSET_NAME} — refusing to install plugin code from an unverifiable source archive.`);
+      return { pluginUpdated: false, binaryUpdated: await downloadBin(latest), marketplaceRefreshed: false };
+    }
+    const tarballPath = path.join(tmpDir, PLUGIN_ASSET_NAME);
     exec('curl', [
       '-sL', '-o', tarballPath,
-      '-H', 'Accept: application/vnd.github+json',
-      latest.tarballUrl,
+      '-H', 'Accept: application/octet-stream',
+      latest.pluginTarballUrl,
     ], { timeout: 30000, stdio: 'pipe' });
 
+    // One retry, matching the binary sidecar at :355 — same failure mode, same
+    // argument: a transient blip should cost an update cycle, not force a
+    // refusal. The first version of this gave the binary two attempts and the
+    // plugin one, for no reason anyone could state.
+    const shaPath = tarballPath + '.sha256';
+    let expectedSha = null;
+    for (let attempt = 0; attempt < 2 && !expectedSha; attempt++) {
+      try {
+        exec('curl', ['-sfL', '-o', shaPath, latest.pluginTarballUrl + '.sha256'],
+          { timeout: 30000, stdio: 'pipe' });
+        expectedSha = (fs.readFileSync(shaPath, 'utf8').trim().split(/\s+/)[0]) || null;
+      } catch { /* retried once, then refused just below */ }
+    }
+    const actualSha = fs.existsSync(tarballPath) ? sha256File(tarballPath) : null;
+    if (!expectedSha || !actualSha || expectedSha.toLowerCase() !== actualSha.toLowerCase()) {
+      console.error(`[code-graph] Plugin tarball integrity check failed (expected ${expectedSha || '<no sidecar>'}, got ${actualSha || '<no download>'}) — refusing to extract.`);
+      return { pluginUpdated: false, binaryUpdated: await downloadBin(latest), marketplaceRefreshed: false };
+    }
+
+    // No --strip-components: the asset archives `claude-plugin/` itself, while
+    // GitHub's source tarball wraps everything in `<owner>-<repo>-<sha>/`.
     exec('tar', [
-      'xzf', tarballPath, '-C', tmpDir, '--strip-components=1',
+      'xzf', tarballPath, '-C', tmpDir,
     ], { timeout: 15000, stdio: 'pipe' });
 
     const pluginSrc = path.join(tmpDir, 'claude-plugin');
@@ -666,9 +738,18 @@ async function selfHealGlobalPkgs(latest, state, {
   const attempts = state.globalPkgHealVersion === latest.version ? (state.globalPkgHealAttempts || 0) : 0;
   if (attempts >= GLOBAL_PKG_HEAL_MAX_ATTEMPTS) return {};
   const ok = await install(stale.map((s) => `${s.name}@${latest.version}`));
+  // Success is "the stale copies are gone", not "npm exited 0". `npm i -g`
+  // installs into the prefix the CURRENT node resolves, which is not
+  // necessarily where the stale copy lives (nvm with several node versions,
+  // an `npm --prefix` in the user's npmrc, a sudo-owned /usr/local). In that
+  // shape npm reported success on every run while `staleGlobalPkgs` kept
+  // returning the same entry — the counter reset each time, so the retry
+  // budget never ran out and the install re-ran forever, once per throttle
+  // window. Re-read instead of trusting the exit code.
+  const remaining = ok ? readStale(latest.version) : stale;
   return {
     globalPkgHealVersion: latest.version,
-    globalPkgHealAttempts: ok ? 0 : attempts + 1,
+    globalPkgHealAttempts: remaining.length === 0 ? 0 : attempts + 1,
   };
 }
 
@@ -687,7 +768,11 @@ function shouldHealGlobalsOnThrottle(state, { readStale = staleGlobalPkgs } = {}
   return readStale(state.latestVersion).length > 0;
 }
 
-async function checkForUpdate({ installMissing = false, force = false } = {}) {
+// `requestJsonFn` is a test seam, forwarded to fetchLatestRelease — the same
+// injection point that function already exposes. It exists so the 403 path can
+// be driven without a network: that path is where the rate-limit backoff either
+// engages or is silently erased, and no other observable distinguishes the two.
+async function checkForUpdate({ installMissing = false, force = false, requestJsonFn } = {}) {
   let installLock = null;
   try {
     // Skip in dev mode — unless the launcher explicitly requested a missing-
@@ -729,9 +814,17 @@ async function checkForUpdate({ installMissing = false, force = false } = {}) {
     }
 
     // Check GitHub for latest release
-    const latest = await fetchLatestRelease();
+    const latest = await fetchLatestRelease(requestJsonFn || requestJson);
     if (!latest) {
-      saveState({ ...state, installedVersion, lastCheck: new Date().toISOString() });
+      // Re-read, do NOT spread the pre-fetch `state`. On a 403 fetchLatestRelease
+      // writes `rateLimited: true` to the state file, and this is the branch it
+      // returns null through — spreading the stale snapshot wrote that flag
+      // straight back to whatever it was before (normally absent). The
+      // RATE_LIMIT_INTERVAL_MS backoff in shouldCheck() therefore never engaged:
+      // it read a state where rateLimited had just been erased by the very call
+      // that set it, and kept polling GitHub on the ordinary interval while
+      // already rate-limited. Dead code since the backoff was written.
+      saveState({ ...readState(), installedVersion, lastCheck: new Date().toISOString() });
       return null;
     }
 
@@ -822,6 +915,7 @@ module.exports = {
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
   isSilentMode, isInstallMissingMode, isForceMode,
   requestJson, resolveProxy, parseLatestRelease, fetchLatestRelease,
+  PLUGIN_ASSET_NAME,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
   getPlatformAssetName,
   selfHealStaleBinary,

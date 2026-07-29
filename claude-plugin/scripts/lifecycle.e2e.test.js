@@ -12,6 +12,18 @@ const lifecycleCli = path.join(__dirname, 'lifecycle.js');
 const compositeCli = path.join(__dirname, 'statusline-composite.js');
 const currentVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
 
+// `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
+//
+// The sandboxes below redirect HOME and spawn with `{...process.env}`, which
+// passes the variable straight through — and `claudeHome()` is
+// `CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var WINS over the
+// redirected HOME. For a developer who exports it (the documented multi-profile
+// setup) these tests wrote into their LIVE config: measured, a fabricated
+// `9.9.9` plugin version landed in the real plugins cache. Deleting it here
+// covers every spawn site at once; the few tests that need the variable set it
+// explicitly in their own child env, which still wins.
+delete process.env.CLAUDE_CONFIG_DIR;
+
 // Per-test cleanup PLUS a run-end sweep. The per-test `t.after` alone left
 // exactly one `code-graph-e2e-*` directory behind per run — 154 had accumulated
 // in ~/.claude/tmp/ — and the survivor held only
@@ -584,4 +596,40 @@ test('the .corrupt-* backup is byte-identical, including non-UTF-8 bytes', (t) =
     'byte into U+FFFD and the original is then overwritten, so it must be copied ' +
     'as bytes, never as a decoded string');
   assert.equal(backup.length, original.length, 'no re-encoding growth');
+});
+
+test('settings.json with a non-UTF-8 byte is preserved before the rewrite', (t) => {
+  // The byte-exactness work above covered only the CORRUPT branch. A file that
+  // is VALID JSON but carries an invalid UTF-8 byte — a latin-1/cp1252 byte in
+  // a path, which is what a non-ASCII username on a legacy code page produces —
+  // classified as clean, so no backup was made. The object then round-tripped
+  // `toString('utf8')` -> JSON.parse -> JSON.stringify -> atomic write, and
+  // every bad byte became U+FFFD in the user's live file, permanently, with
+  // nothing on stderr. Detection is a re-encode comparison: a lossless decode
+  // round-trips to the original bytes, a lossy one cannot.
+  const homeDir = mkHome(t);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  const original = Buffer.concat([
+    Buffer.from('{\n  "model": "opus",\n  "env": { "MY_PATH": "/home/andr', 'utf8'),
+    Buffer.from([0xe9]),                       // latin-1 'é', not valid UTF-8
+    Buffer.from('/bin" },\n  "permissions": { "allow": ["Bash(ls:*)"] }\n}\n', 'utf8'),
+  ]);
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, original);
+
+  runScript(homeDir, lifecycleCli, ['install']);
+
+  const backups = fs.readdirSync(path.dirname(settingsPath))
+    .filter((f) => f.startsWith('settings.json.corrupt-'));
+  assert.equal(backups.length, 1,
+    `install() must preserve the true bytes before a rewrite that cannot round-trip them (found: ${backups.join(', ')})`);
+  assert.ok(
+    fs.readFileSync(path.join(path.dirname(settingsPath), backups[0])).equals(original),
+    'the backup must be byte-identical — a U+FFFD transcription is exactly what it exists to prevent');
+
+  // And the install must still have happened: a regression that backs up and
+  // then bails would satisfy the assertion above while leaving the plugin inert.
+  const rebuilt = readJson(settingsPath);
+  assert.equal(rebuilt.model, 'opus', 'the parsed value is usable and must be carried forward');
+  assert.ok(rebuilt.hooks, 'install() must still register its hooks');
 });

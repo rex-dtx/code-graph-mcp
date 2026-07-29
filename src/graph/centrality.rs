@@ -16,7 +16,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::VecDeque;
 
-use crate::domain::{is_test_symbol, REL_CALLS};
+use crate::domain::{self, is_test_symbol, REL_CALLS};
 
 /// A function ranked by betweenness centrality.
 pub struct CentralityNode {
@@ -45,6 +45,20 @@ pub fn betweenness_centrality(
     conn: &Connection,
     include_tests: bool,
     limit: usize,
+) -> Result<Vec<CentralityNode>> {
+    betweenness_centrality_capped(conn, include_tests, limit, domain::BETWEENNESS_MAX_PIVOTS)
+}
+
+/// Testable core of [`betweenness_centrality`]. `max_pivots` is the exact/sampled
+/// switchover, a parameter rather than a constant read inline so the sampled path
+/// can be exercised on a 10-node fixture instead of a 5001-node one — the same
+/// seam `merkle::normalize_rel_str_on` uses, for the same reason: a branch only
+/// reachable at production scale is a branch nothing tests.
+pub fn betweenness_centrality_capped(
+    conn: &Connection,
+    include_tests: bool,
+    limit: usize,
+    max_pivots: usize,
 ) -> Result<Vec<CentralityNode>> {
     // 1. Load node metadata, applying the test filter to decide membership.
     struct NodeMeta {
@@ -126,17 +140,39 @@ pub fn betweenness_centrality(
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut stack: Vec<usize> = Vec::with_capacity(n);
 
-    for s in 0..n {
-        // Reset per-source scratch (only touched entries, but full reset is simpler
-        // and the cost is dominated by the BFS/accumulation anyway).
-        for v in 0..n {
-            sigma[v] = 0.0;
-            dist[v] = -1;
-            delta[v] = 0.0;
-            preds[v].clear();
-        }
-        stack.clear();
+    // Source set. Exact = every node. Above the cap the run is a Brandes–Pich
+    // estimate from an evenly-strided sample, scaled back by n/|pivots|.
+    //
+    // Two bounds, because the cost has two terms. The per-source scratch reset
+    // below touches only nodes the BFS actually reached (it used to clear all n,
+    // which made even a graph with no edges quadratic — 100K nodes = 10^10 writes
+    // for an answer of all zeros). What remains is Brandes' own O(V·E), and that
+    // is what the pivot cap bounds. The stride is deterministic — no sampling RNG,
+    // so repeated runs on an unchanged index return identical scores, which the
+    // whole CLI contract depends on.
+    let sampled = n > max_pivots;
+    let pivots: Vec<usize> = if sampled {
+        (0..n).step_by(n.div_ceil(max_pivots)).collect()
+    } else {
+        (0..n).collect()
+    };
+    if sampled {
+        // Double-written: `tracing` output is invisible on the CLI, and a silently
+        // approximate ranking presented as exact is the "false clean" failure this
+        // repo keeps re-learning.
+        let msg = format!(
+            "graph has {n} nodes (> {}) — betweenness computed from {} sampled sources; \
+             scores are ESTIMATES and small differences in rank are not meaningful",
+            max_pivots,
+            pivots.len()
+        );
+        tracing::warn!("{msg}");
+        eprintln!("[code-graph] {msg}");
+    }
 
+    for &s in &pivots {
+        // Scratch is clean on entry — the tail of this loop restores exactly the
+        // entries the BFS dirtied, and every dirtied node is on `stack`.
         sigma[s] = 1.0;
         dist[s] = 0;
         let mut queue: VecDeque<usize> = VecDeque::new();
@@ -158,8 +194,10 @@ pub fn betweenness_centrality(
             }
         }
 
-        // Back-propagation in order of non-increasing distance from s.
-        while let Some(w) = stack.pop() {
+        // Back-propagation in order of non-increasing distance from s. Iterated by
+        // index rather than popped so `stack` survives as the dirty-entry list.
+        for idx in (0..stack.len()).rev() {
+            let w = stack[idx];
             let coeff = (1.0 + delta[w]) / sigma[w];
             for &v in &preds[w] {
                 delta[v] += sigma[v] * coeff;
@@ -167,6 +205,24 @@ pub fn betweenness_centrality(
             if w != s {
                 betweenness[w] += delta[w];
             }
+        }
+
+        // Restore the scratch for the next source: every node the BFS touched was
+        // enqueued, and every enqueued node was pushed here. Nodes it never reached
+        // still hold their initial dist = -1 / sigma = 0 / delta = 0 / empty preds.
+        for &v in &stack {
+            sigma[v] = 0.0;
+            dist[v] = -1;
+            delta[v] = 0.0;
+            preds[v].clear();
+        }
+        stack.clear();
+    }
+
+    if sampled {
+        let scale = n as f64 / pivots.len() as f64;
+        for b in betweenness.iter_mut() {
+            *b *= scale;
         }
     }
 
@@ -254,6 +310,54 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Above `max_pivots` the run must stay bounded, deterministic and honest.
+    ///
+    /// The sampled branch is unreachable at fixture scale unless the cap is a
+    /// parameter — which is the whole point of `betweenness_centrality_capped`.
+    /// Here a 6-node path with `max_pivots = 2` takes it. Three properties:
+    /// the ranking still finds the chain's middle, the same input yields the
+    /// identical answer twice (an RNG-sampled implementation would not), and the
+    /// exact run over the same graph is NOT silently replaced — it stays
+    /// available and returns the exact figures.
+    #[test]
+    fn test_sampled_pivots_stay_deterministic_and_bounded() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let fid = file(conn, "src/chain.ts");
+
+        let ids: Vec<i64> = ["N0", "N1", "N2", "N3", "N4", "N5"]
+            .iter()
+            .map(|n| insert_node(conn, &mk_node(n, fid, false)).unwrap())
+            .collect();
+        for w in ids.windows(2) {
+            insert_edge(conn, w[0], w[1], REL_CALLS, None).unwrap();
+        }
+
+        let sampled_a = betweenness_centrality_capped(conn, false, 10, 2).unwrap();
+        let sampled_b = betweenness_centrality_capped(conn, false, 10, 2).unwrap();
+        assert!(
+            !sampled_a.is_empty(),
+            "sampling must still produce a ranking"
+        );
+        let names_a: Vec<&str> = sampled_a.iter().map(|r| r.name.as_str()).collect();
+        let names_b: Vec<&str> = sampled_b.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names_a, names_b, "stride sampling must be deterministic");
+        assert_eq!(
+            sampled_a.iter().map(|r| r.score).collect::<Vec<_>>(),
+            sampled_b.iter().map(|r| r.score).collect::<Vec<_>>(),
+            "scores must be reproducible run to run"
+        );
+        assert!(
+            names_a.contains(&"N2") || names_a.contains(&"N3"),
+            "a mid-chain node must still surface, got {names_a:?}"
+        );
+
+        // The exact path is untouched: N2 and N3 tie at the middle of a 6-chain
+        // with 2×3 = 6 ordered pairs routed through each.
+        let exact = betweenness_centrality_capped(conn, false, 10, usize::MAX).unwrap();
+        assert_eq!(exact[0].score, 6.0, "exact run must report exact counts");
     }
 
     /// Path graph A→B→C→D→E. B, C, D are all on shortest paths between others;

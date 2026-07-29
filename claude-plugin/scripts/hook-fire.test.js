@@ -15,6 +15,18 @@ const { spawnSync } = require('child_process');
 const { verifyHooksFire } = require('./lifecycle');
 const { hookFireWarning, analyzeHookDark } = require('./session-init');
 
+// `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
+//
+// Every sandbox below redirects HOME and then spawns with `{...process.env}`,
+// which passes the variable straight through — and `claudeHome()` is
+// `CLAUDE_CONFIG_DIR || homedir/.claude`, so the env var WINS over the
+// redirected HOME. For a developer who exports it (the documented multi-profile
+// setup) these tests wrote into their LIVE config: measured, a `9.9.9` plugin
+// version landed in the real plugins cache. Deleting it here fixes every spawn
+// site at once instead of 40 call sites, and `tests/hardening.rs`'s
+// `js_test_files_neutralize_claude_config_dir` keeps new files from skipping it.
+delete process.env.CLAUDE_CONFIG_DIR;
+
 test('verifyHooksFire: all real registered hooks run cleanly (exit 0)', () => {
   const { ok, results } = verifyHooksFire();
   // 3 PreToolUse + 2 PostToolUse (incremental-index + compound-grep inject) + 1 UserPromptSubmit = 6 settings.json hooks

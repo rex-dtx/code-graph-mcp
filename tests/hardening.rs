@@ -704,11 +704,14 @@ fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
 #[test]
 fn release_and_cache_warm_workflows_do_not_drift() {
     let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
-    // Normalise CRLF. Without `.gitattributes` forcing LF, git checks these YAML
-    // files out with CRLF on Windows, and `workflow_job`'s exact `"\n  job:\n"`
-    // match then finds nothing — the guard failed on the windows-latest CI leg
-    // with "job `gate` not found", which reads as a rename rather than a line
-    // ending. Everything else here goes through `.lines()`, which strips `\r`.
+    // Normalise CRLF. Git used to check these YAML files out with CRLF on
+    // Windows, and `workflow_job`'s exact `"\n  job:\n"` match then found
+    // nothing — the guard failed on the windows-latest CI leg with "job `gate`
+    // not found", which reads as a rename rather than a line ending.
+    // `.gitattributes` (`* text=auto eol=lf`) now pins the working tree on every
+    // platform, but this stays: a clone made before that file landed keeps its
+    // CRLF working tree until the next checkout, and the cost here is one
+    // `replace`. Everything else goes through `.lines()`, which strips `\r`.
     let read_lf = |p: std::path::PathBuf| -> String {
         fs::read_to_string(&p)
             .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
@@ -862,4 +865,299 @@ fn release_and_cache_warm_workflows_do_not_drift() {
              so a command only the gate runs is a command the gate compiles cold."
         );
     }
+}
+
+/// Drift guard: every `github.ref` / `github.ref_name` EXPRESSION in release.yml
+/// must carry the `github.event.inputs.tag ||` fallback.
+///
+/// `workflow_dispatch` runs from the default branch, so on a re-release
+/// `github.ref` is `refs/heads/main` and `github.ref_name` is `main` — neither
+/// names the tag being released. Every site that forgets the fallback therefore
+/// acts on main's HEAD instead of the tag's source, and does so silently: the
+/// run is green, it just built and published the wrong commit.
+///
+/// This is a test rather than a comment because the site count has been wrong
+/// three separate times. It went in as five, a later audit found a sixth
+/// (checkout in `gate`), and the 2026-07-27 audit found a seventh — the
+/// top-level `concurrency.group`, where the miss meant a tag-push run and a
+/// dispatch re-run of the same version got DIFFERENT group keys and published
+/// concurrently, which is exactly what the comment above that block says it
+/// prevents. Each was found by reading, one at a time.
+#[test]
+fn release_workflow_ref_expressions_all_fall_back_to_the_dispatch_tag() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
+    let yaml = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n");
+
+    // `yaml_directives` drops whole-line comments, which is where every prose
+    // mention of `github.ref` in this file lives — including the ones explaining
+    // this very contract. Without that filter the guard would flag its own docs.
+    // Requires only that the expression CONSULTS `inputs.tag`, not that it uses
+    // the `tag ||` spelling: `concurrency.group` deliberately uses
+    // `tag && format('refs/tags/{0}', tag) || github.ref` instead, because a
+    // group key is compared as a literal string and the plain form yields a
+    // different key for the push and the dispatch (see that block's comment).
+    let offenders: Vec<&str> = yaml_directives(&yaml)
+        .into_iter()
+        .filter(|l| l.contains("${{") && l.contains("github.ref"))
+        .filter(|l| !l.contains("github.event.inputs.tag"))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "release.yml has {} `github.ref`/`github.ref_name` expression(s) with no \
+         `github.event.inputs.tag ||` fallback. On a workflow_dispatch re-release \
+         these resolve to the DEFAULT BRANCH, not the tag, and the run stays \
+         green while acting on the wrong commit:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
+
+    // Negative control: the fallback sites must actually exist. A future edit
+    // that deletes them all would otherwise leave this test green on an empty
+    // set — the vacuous pass this file exists to prevent.
+    let with_fallback = yaml_directives(&yaml)
+        .into_iter()
+        .filter(|l| l.contains("github.event.inputs.tag"))
+        .count();
+    assert!(
+        with_fallback >= 7,
+        "expected at least the 7 known `inputs.tag` fallback sites in release.yml, \
+         found {with_fallback} — if a site was legitimately removed, lower this \
+         number in the same commit and say which one"
+    );
+}
+
+/// Supply chain: every `uses:` in every workflow is pinned to a full commit SHA.
+///
+/// A mutable tag (`@v6`) is a standing write-authority grant to whoever can move
+/// that tag — and these workflows run with `contents: write` and, in the publish
+/// job, an `NPM_TOKEN`. The repo already SHA-pinned all 13 third-party uses and
+/// left all 21 first-party `actions/*` ones on major tags, which is the harder
+/// half to justify: `actions/checkout` runs first in every job, including the
+/// one holding the npm token.
+///
+/// Enforced here rather than by review because the audit flagged this twice
+/// (07-24 #17, 07-27 P2-25) and nothing changed either time. The 40-hex check
+/// also catches the likelier accident: pasting a SHORT sha, which GitHub accepts
+/// today and resolves ambiguously as the repo grows.
+#[test]
+fn every_workflow_action_is_pinned_to_a_full_commit_sha() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut checked = 0usize;
+    let mut unpinned: Vec<String> = Vec::new();
+
+    let mut files: Vec<_> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no workflow files found under {} — this guard would pass vacuously",
+        dir.display()
+    );
+
+    for path in &files {
+        let yaml = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        for line in yaml_directives(&yaml) {
+            let Some(rest) = line
+                .strip_prefix("- uses: ")
+                .or_else(|| line.strip_prefix("uses: "))
+            else {
+                continue;
+            };
+            checked += 1;
+            // `owner/repo@<ref>` — the ref runs to whitespace or the ` # vN` note.
+            let git_ref = rest
+                .split_whitespace()
+                .next()
+                .and_then(|spec| spec.split_once('@').map(|(_, r)| r))
+                .unwrap_or("");
+            let pinned = git_ref.len() == 40
+                && git_ref
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+            if !pinned {
+                unpinned.push(format!("{name}: {line}"));
+            }
+        }
+    }
+
+    // 41 is the measured count across the five workflow files, not a round
+    // number: the first version of this floor said 21 (the count of first-party
+    // uses I had just pinned), which a parse regression halving the real count
+    // would have sailed straight through.
+    assert!(
+        checked >= 41,
+        "expected at least the 41 known `uses:` sites across the workflows, found \
+         {checked} — a parse change would make this guard vacuous. If a workflow \
+         or step was legitimately removed, lower this in the same commit."
+    );
+    assert!(
+        unpinned.is_empty(),
+        "{} workflow action(s) are on a mutable ref instead of a 40-hex commit \
+         SHA. Whoever can move that tag can run code in a job that holds \
+         `contents: write` (and, in publish, NPM_TOKEN):\n  {}",
+        unpinned.len(),
+        unpinned.join("\n  ")
+    );
+}
+
+/// Every JS test file that spawns with a redirected HOME must also neutralize
+/// `CLAUDE_CONFIG_DIR`.
+///
+/// `claudeHome()` is `process.env.CLAUDE_CONFIG_DIR || homedir/.claude`, so the
+/// env var OUTRANKS a redirected HOME. A spawn built as
+/// `{ ...process.env, HOME: sandbox }` passes it straight through, and for a
+/// developer who exports it (the documented multi-profile setup) the test then
+/// operates on their live config — measured on this branch: `npm test` wrote a
+/// fabricated `9.9.9` plugin version into the real plugins cache, and a real
+/// `uninstall --unadopt-all` deleted `<config>/plugins/cache/code-graph-mcp/`.
+///
+/// A file satisfies this by deleting the variable at module load (covers every
+/// spawn) or by setting it explicitly on each child env. This is a test because
+/// the class has now been half-fixed twice: v0.108.1 closed it in
+/// `tests/cli_e2e.rs` and `doctor.test.js` while missing `install-e2e.test.js`,
+/// and the fix for that missed six more files. CI never sees it — the variable
+/// is unset on the runners — so it can only fail on a developer's machine.
+#[test]
+fn js_test_files_neutralize_claude_config_dir() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in ["claude-plugin/scripts", "scripts"] {
+        let d = root.join(dir);
+        let mut found: Vec<_> = fs::read_dir(&d)
+            .unwrap_or_else(|e| panic!("read {}: {e}", d.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".test.js"))
+            })
+            .collect();
+        found.sort();
+        files.append(&mut found);
+    }
+    assert!(
+        files.len() >= 20,
+        "expected the JS test suite to be discovered, found {} files — a path \
+         change would make this guard vacuous",
+        files.len()
+    );
+
+    let mut offenders = Vec::new();
+    for path in &files {
+        let src = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        // Three properties, each earned by a version of this guard that failed
+        // without it:
+        //   1. line-anchored, not `src.contains` — commenting the statement out
+        //      leaves the text in the file, and a `contains` check stayed green
+        //      for a file that had just stopped neutralizing anything;
+        //   2. at MODULE SCOPE (zero indentation) — a `delete` nested in a
+        //      function body may never run;
+        //   3. BEFORE the first `test(`. NOT because of a load-time race — all
+        //      three resolvers (`claude-config.js` `claudeHome`, and adopt.js's
+        //      two registry paths) read the variable at CALL time, and nothing
+        //      binds a derived constant at require time, so a delete after the
+        //      first `require` is in fact safe. It is required anyway because
+        //      "somewhere in the file" is not a property: a delete inside a test
+        //      body runs only if that test runs, and only for the tests after it.
+        let first_test = src
+            .lines()
+            .position(|l| l.trim_start().starts_with("test("))
+            .unwrap_or(usize::MAX);
+        let neutralized = src
+            .lines()
+            .enumerate()
+            .any(|(i, l)| i < first_test && l.starts_with("delete process.env.CLAUDE_CONFIG_DIR"));
+        if neutralized {
+            continue;
+        }
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            // A `process.env.HOME = …` immediately followed by a
+            // `process.env.CLAUDE_CONFIG_DIR = …` is the explicit-pairing form
+            // (install-e2e's generated child script uses it), so look one line
+            // ahead before calling it an offender.
+            let paired_next = lines
+                .get(i + 1)
+                .is_some_and(|n| n.contains("process.env.CLAUDE_CONFIG_DIR"));
+            // Two shapes leak the variable:
+            //   * a spawn spreading `...process.env` (an env object built from
+            //     scratch, `{ HOME: dir, PATH: '' }`, never inherits it);
+            //   * an IN-PROCESS redirect, `process.env.HOME = <sandbox>`, where
+            //     the module under test calls `claudeHome()` directly. The first
+            //     version of this guard checked only spawns and therefore missed
+            //     `adopt.test.js`, which wrote five `projects/<slug>/memory/`
+            //     trees into a canary config dir while the guard stayed green.
+            //
+            // The spawn check spans the ENV OBJECT LITERAL, not one line and not a
+            // fixed line count. Three versions of this got it wrong:
+            //   * one line only — `env: { ...process.env,\n HOME: home }` is the
+            //     Prettier-formatted spelling of the very lines this guard was
+            //     written for, and it went unseen;
+            //   * `take_while` including the first line — a single-line spawn
+            //     contains its own `}`, so the window came back EMPTY and the
+            //     guard went quiet on the shape it was already catching;
+            //   * a fixed 5-line window — five intervening env keys put `HOME:`
+            //     at offset 6, outside it. A magic number is not a bound.
+            // The literal ends at the first `}`; 24 is a runaway cap, not a
+            // semantic limit.
+            let window: Vec<&str> = std::iter::once(*line)
+                .chain(
+                    lines
+                        .iter()
+                        .skip(i + 1)
+                        .take(24)
+                        .take_while(|l| !l.contains('}'))
+                        .copied(),
+                )
+                .collect();
+            // The exemption must be an actual KEY in this literal. Matching bare
+            // `CLAUDE_CONFIG_DIR` anywhere in the window let two things launder a
+            // real leak: a correctly-sandboxed SECOND spawn a few lines down, and
+            // — worse, because this codebase writes exactly that — a COMMENT
+            // saying the variable is handled. Both measured green before this.
+            let mentions_key = |l: &&str| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with('*')
+                    && (l.contains("CLAUDE_CONFIG_DIR:") || l.contains("CLAUDE_CONFIG_DIR ="))
+            };
+            let leaks_via_spawn = line.contains("...process.env")
+                && window.iter().any(|l| l.contains("HOME:"))
+                && !window.iter().any(mentions_key);
+            let leaks_in_process = t.starts_with("process.env.HOME =");
+            if (leaks_via_spawn || leaks_in_process)
+                && !line.contains("CLAUDE_CONFIG_DIR")
+                && !paired_next
+            {
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    i + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "{} JS test spawn(s) redirect HOME but inherit CLAUDE_CONFIG_DIR, so they \
+         act on the real Claude config for anyone who exports it. Fix by adding \
+         `delete process.env.CLAUDE_CONFIG_DIR;` at module load, or by setting it \
+         on the child env:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
 }

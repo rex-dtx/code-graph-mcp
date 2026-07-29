@@ -2109,6 +2109,86 @@ fn test_pending_evicted_after_max_failed_sweeps() {
     );
 }
 
+/// Retention must count RESOLUTION OPPORTUNITIES, not wall-clock ticks.
+///
+/// A pending row can only become resolvable when a node appears, and nodes only
+/// appear when a batch parses files. Aging on a batch that parsed nothing spends
+/// the row's budget on passes it could never have survived differently: the
+/// file-watcher and the periodic rescan fire on their own schedule, so a repo
+/// with an unresolved forward reference burned attempts at the poll rate and
+/// evicted the row before the callee was ever written. Once evicted, only a
+/// re-index of the CALLER re-buffers it — the edge stays missing until then.
+///
+/// Measured on this repo at audit time: every buffered row sat at attempts = 4
+/// after 26h and 4 scans, i.e. ~2 weeks to the 50-attempt ceiling on ambient
+/// ticks alone.
+#[test]
+fn test_empty_incremental_tick_does_not_age_pending_rows() {
+    use crate::domain::PENDING_CALL_MAX_ATTEMPTS;
+    use crate::storage::queries::{count_pending_unresolved_calls, get_node_ids_by_name};
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { lateFoo(); }\n",
+    )
+    .unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
+    let attempts_after_index: i64 = db
+        .conn()
+        .query_row("SELECT attempts FROM pending_unresolved_calls", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+
+    // Ticks with an empty diff — the watcher/periodic-rescan shape.
+    for _ in 0..(PENDING_CALL_MAX_ATTEMPTS + 5) {
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    }
+    let attempts_now: i64 = db
+        .conn()
+        .query_row("SELECT attempts FROM pending_unresolved_calls", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(-1);
+    assert_eq!(
+        attempts_now, attempts_after_index,
+        "a batch that parsed nothing gave the row no chance to resolve, so it \
+         must not consume an attempt (-1 = the row was evicted outright)"
+    );
+
+    // The point of not aging: the callee can still arrive and bind.
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "export function lateFoo() {}\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    let caller_id = get_node_ids_by_name(db.conn(), "caller_b")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("caller_b must exist")
+        .0;
+    let foo_id = get_node_ids_by_name(db.conn(), "lateFoo")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("lateFoo must exist")
+        .0;
+    let edges = crate::storage::queries::get_edges_from(db.conn(), caller_id).unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.relation == REL_CALLS && e.target_id == foo_id),
+        "the forward reference must still bridge after idle ticks"
+    );
+}
+
 /// Boundary guard for the incremental-edge-timing guarantee under bounded
 /// retention: a row aged to ONE sweep short of eviction must still bridge —
 /// resolution in the same sweep wins over eviction (resolved rows are drained
@@ -2715,5 +2795,97 @@ fn test_dead_code_ignore_prefixes_are_separator_normalized() {
         names(&[normalized]),
         unix,
         "a backslash-spelled ignore prefix must exclude exactly what the forward-slash one does"
+    );
+}
+
+#[test]
+fn test_index_files_normalizes_caller_path_order() {
+    // Every caller builds its file list from HashMap iteration — `run_full_index`
+    // from `scan_directory`'s map, both incremental entries from `compute_diff` —
+    // so the order handed to `index_files` is arbitrary and varies run to run.
+    // `index_files` sorts (and dedups) it, which is what makes the first-wins
+    // bindings inside a batch reproducible. Node ids are minted in processing
+    // order, so "processed sorted" is observable as ids ascending with the sorted
+    // path even though this caller passes the reverse.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    for name in ["a.py", "b.py", "c.py"] {
+        fs::write(project_dir.path().join(name), "def f():\n    pass\n").unwrap();
+    }
+
+    // Reverse order, plus a duplicate: a caller-side hash map can hand over
+    // either, and neither may change what lands in the DB.
+    let caller_order: Vec<String> =
+        vec!["c.py".into(), "b.py".into(), "a.py".into(), "b.py".into()];
+    let result = index_files(
+        &db,
+        project_dir.path(),
+        &caller_order,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result.files_indexed, 3,
+        "a duplicated path must be indexed once, not twice"
+    );
+
+    let first_id = |path: &str| {
+        get_nodes_by_file_path(db.conn(), path)
+            .unwrap()
+            .iter()
+            .map(|n| n.id)
+            .min()
+            .expect("indexed file must have nodes")
+    };
+    let (a, b, c) = (first_id("a.py"), first_id("b.py"), first_id("c.py"));
+    assert!(
+        a < b && b < c,
+        "files must be processed in sorted order regardless of the caller's order; got a={a} b={b} c={c}"
+    );
+}
+
+#[test]
+fn test_external_sentinel_type_prefers_implements_over_import() {
+    // One name can reach the `<external>` sentinel from both channels: an
+    // unresolved `impl Write for …` (implements → `trait`) and an unresolved
+    // `use std::io::Write` (imports → `module`). Sorted file order puts the
+    // import LAST here, so a last-write-wins map would stamp the node `module`
+    // and the sentinel's type would track file order rather than meaning.
+    // Precedence is fixed instead: implements is the specific claim and wins.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(
+        project_dir.path().join("a_impl.rs"),
+        "pub struct Sink;\n\nimpl Write for Sink {\n    fn go(&self) {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("b_import.rs"),
+        "use std::io::Write;\n\npub fn touch() {}\n",
+    )
+    .unwrap();
+
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let ext = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
+    let writes: Vec<&crate::storage::queries::NodeResult> =
+        ext.iter().filter(|n| n.name == "Write").collect();
+    assert_eq!(
+        writes.len(),
+        1,
+        "both channels must share ONE sentinel node, got: {:?}",
+        writes.iter().map(|n| &n.node_type).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        writes[0].node_type, "trait",
+        "the implements channel must win over the later import channel"
     );
 }

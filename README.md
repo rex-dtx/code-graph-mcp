@@ -235,7 +235,14 @@ Remove the `code-graph` entry from your MCP settings file (e.g. `~/.cursor/mcp.j
 
 ### npm (Global)
 
+Run the teardown **first**, while the CLI still exists — npm 7 removed the
+`preuninstall`/`postuninstall` lifecycle scripts, so nothing runs on your behalf
+during `npm uninstall`. Doing it in the other order leaves the hook entries in
+`~/.claude/settings.json` and the ~40 MB binary cache behind, with no command
+left on disk to remove them.
+
 ```bash
+code-graph-mcp uninstall     # restore statusline, strip hooks, drop the cache
 npm uninstall -g @sdsrs/code-graph
 ```
 
