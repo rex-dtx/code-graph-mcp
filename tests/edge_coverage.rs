@@ -460,6 +460,116 @@ fn import_parity_across_languages_and_spellings() {
     );
 }
 
+/// The EXACT-count half of the import axis, for the two failure directions a
+/// `min_edges` floor structurally cannot see.
+///
+/// The table above asserts "at least N", which is the right shape for "did the
+/// arm survive" and the wrong shape for both of these:
+///
+///   * **Too many.** `import mod, * as ns from './m'` emitted two identical
+///     `<module> -> <module>@./m` rows, one per binding, because each marker
+///     claimed the module-level dependency separately and `idx_edges_unique`
+///     includes `metadata` (so the differing `q` kept both). A floor of 1 passes
+///     on 2. `deps` happens to survive it — its symbol counts are
+///     `COUNT(DISTINCT nb.id)` — but the edge totals and the per-language
+///     relation stats do not.
+///   * **Should be zero.** A dynamically built include path must produce NO
+///     edge, and a floor cannot express that. `require_once "config" . $env .
+///     ".php"` used to resolve to the literal `config` and bind a real edge to a
+///     real `src/config.php` — a file that statement never includes at runtime.
+///     A phantom aimed at a real node is worse than a missing one: `deps`,
+///     `cycles`, `affected` and `impact` all consume it as fact.
+#[test]
+fn import_forms_resolve_to_exactly_one_module_or_none() {
+    // (label, file, source, exact expected `imports` edge count)
+    let cases: &[(&str, &str, &str, i64)] = &[
+        // --- duplicate direction ---
+        (
+            "esm default + namespace (one module, one edge)",
+            "dup.ts",
+            "import mod, * as ns from './tgt';\n",
+            1,
+        ),
+        (
+            "esm default alone",
+            "d1.ts",
+            "import mod from './tgt';\n",
+            1,
+        ),
+        (
+            "esm namespace alone",
+            "d2.ts",
+            "import * as ns from './tgt';\n",
+            1,
+        ),
+        // --- dynamic-path direction: the value is not knowable, so no edge ---
+        (
+            "php concat with a variable in the middle",
+            "dyn1.php",
+            "<?php\nrequire_once \"config\" . $env . \".php\";\n",
+            0,
+        ),
+        (
+            "php concat with a variable at the tail",
+            "dyn2.php",
+            "<?php\nrequire_once \"vendor/\" . $pkg . \"/init.php\";\n",
+            0,
+        ),
+        (
+            "js require with a concatenated specifier",
+            "dyn3.js",
+            "const x = require('./tgtjs' + suffix);\n",
+            0,
+        ),
+        // --- statically knowable concatenations MUST still resolve ---
+        (
+            "php __DIR__ anchor",
+            "anch1.php",
+            "<?php\nrequire_once __DIR__ . \"/config.php\";\n",
+            1,
+        ),
+        (
+            "php dirname(__FILE__) anchor",
+            "anch2.php",
+            "<?php\nrequire_once dirname(__FILE__) . \"/config.php\";\n",
+            1,
+        ),
+        (
+            "php all-literal concatenation",
+            "anch3.php",
+            "<?php\nrequire_once \"config\" . \".php\";\n",
+            1,
+        ),
+    ];
+
+    let mut files: Vec<(&str, &str)> = cases.iter().map(|(_, f, s, _)| (*f, *s)).collect();
+    files.push((
+        "tgt.ts",
+        "export const y = 1;\nexport default function f() {}\n",
+    ));
+    files.push(("tgtjs.js", "module.exports = { y: 1 };\n"));
+    // The file a dynamic path would WRONGLY bind to if the first literal won.
+    files.push(("config.php", "<?php\nfunction cfg() { return 1; }\n"));
+
+    let (_p, counts) = imports_per_file(&files);
+
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(label, file, source, want)| {
+            let got = counts.get(&format!("src/{file}")).copied().unwrap_or(0);
+            (got != *want).then(|| format!("{label} ({file}, {source:?}): {got} != {want}"))
+        })
+        .collect();
+
+    assert!(
+        wrong.is_empty(),
+        "these import forms produced the wrong NUMBER of `imports` edges — too many means \
+         one module counted twice, zero-expected means a dynamic path was guessed at and \
+         bound to whatever file shares its first literal:\n  {}\nall counts: {counts:?}",
+        wrong.join("\n  ")
+    );
+}
+
 /// Per-language inheritance-axis parity.
 ///
 /// The `calls` axis has `call_extraction_parity_across_every_call_capable_language`

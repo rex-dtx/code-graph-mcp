@@ -62,7 +62,25 @@ pub(super) fn extract_import_names(
                     // NOT a namespace: `mod.foo()` is a member of the default export,
                     // not a top-level symbol of the module, so it must not feed the
                     // member-call binding map the way `import * as ns` does.
-                    if child.kind() == "import_clause" {
+                    //
+                    // `import mod, * as ns from './m'` carries BOTH bindings in
+                    // one clause, and each used to emit its own module-level
+                    // marker against the same module — two identical `imports`
+                    // edges (measured: 2 rows, both `<module> -> <module>@tgt`,
+                    // where `import mod` alone and `import * as ns` alone each
+                    // produce 1). They survive because `idx_edges_unique`
+                    // includes `metadata` on purpose (multiple route edges per
+                    // file), so the differing `q` keeps both rows.
+                    //
+                    // The namespace marker is the one to keep: it also feeds
+                    // ns_module_map for `ns.foo()` member calls. The default
+                    // marker deliberately feeds nothing else (see above), so
+                    // once a namespace binding has claimed the dependency edge
+                    // there is nothing left for it to contribute.
+                    let clause_has_namespace = (0..child.named_child_count())
+                        .filter_map(|j| child.named_child(j))
+                        .any(|b| b.kind() == "namespace_import");
+                    if child.kind() == "import_clause" && !clause_has_namespace {
                         if let Some(js_module) = js_module.as_deref() {
                             for j in 0..child.named_child_count() {
                                 let Some(binding) = child.named_child(j) else {

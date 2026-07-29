@@ -271,6 +271,21 @@ fn extract_string_from_subtree_inner(
         }
         return None;
     }
+    // A CONCATENATION is the same defect as interpolation wearing different
+    // syntax, and the generic recursion below walked straight into it: it
+    // returns the FIRST string literal anywhere in the subtree and discards
+    // everything after it. `require_once "config" . $env . ".php"` therefore
+    // resolved to the literal `config` and bound a real `imports` edge to a real
+    // `config.php` — a file the statement never includes at runtime. Measured
+    // before this landed, that fixture produced exactly one edge, to
+    // `src/config.php`. A phantom pointing at a real node is worse than no edge:
+    // it flows into deps / cycles / affected / impact as a fact.
+    //
+    // See `is_static_concatenation` for the rule and what it deliberately keeps.
+    if is_static_concatenation(node) {
+        return concat_static_operands(node, source, depth);
+    }
+
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             if let Some(s) = extract_string_from_subtree_inner(&child, source, depth + 1) {
@@ -279,4 +294,85 @@ fn extract_string_from_subtree_inner(
         }
     }
     None
+}
+
+/// Node kinds that join their operands into one string value.
+///
+/// `binary_expression` covers PHP `.` and JS/TS `+`, `binary_operator` Python,
+/// `binary` Ruby; `concatenated_string` is Python's adjacent-literal form
+/// (`"a" "b"`), whose operands are all literals by construction.
+fn is_static_concatenation(node: &tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "binary_expression" | "binary_operator" | "binary" | "concatenated_string"
+    )
+}
+
+/// Is this operand a string literal *this extractor itself* understands?
+///
+/// Deliberately the node's OWN kind, not "does the subtree contain a string
+/// somewhere". `getenv("FOO") . "/x.php"` has a string two levels down, and
+/// treating it as the operand's value splices the environment variable's NAME
+/// into the path.
+fn is_string_literal(node: &tree_sitter::Node) -> bool {
+    matches!(node.kind(), "string" | "encapsed_string")
+}
+
+/// Flatten a left-nested concatenation into its operands, in source order.
+/// PHP builds `"a" . $b . "c"` as `((a . b) . c)`, so the operands of interest
+/// are not all direct children of the outermost node.
+fn flatten_concat<'a>(node: &tree_sitter::Node<'a>, out: &mut Vec<tree_sitter::Node<'a>>) {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if is_static_concatenation(&child) {
+                flatten_concat(&child, out);
+            } else {
+                out.push(child);
+            }
+        }
+    }
+}
+
+/// The value of a concatenation, or `None` when it is not statically known.
+///
+/// Rule: every operand after the first must be a string literal. The FIRST may
+/// be something else, in which case it contributes nothing — that is the
+/// directory-anchor idiom, and it is why `require_once __DIR__ . "/lib.php"` and
+/// `require_once dirname(__FILE__) . "/x.php"` keep resolving exactly as they
+/// did before (both already worked, by accident of "first string wins"; here
+/// they work by rule). A non-literal anywhere else means the path genuinely is
+/// not knowable at parse time — `"config" . $env . ".php"` — and the honest
+/// answer is no edge.
+///
+/// Two shapes change behaviour on purpose:
+///   * `"lib" . ".php"` now yields `lib.php` instead of `lib` — all-literal
+///     concatenation is knowable, and the old answer was right only because
+///     extension resolution papered over it.
+///   * a route path built as `"/api/" + version` now yields nothing instead of
+///     the fragment `/api/`. Losing a route beats reporting a wrong one, which
+///     is the same call `encapsed_string` interpolation already makes above.
+fn concat_static_operands(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+    let mut operands = Vec::new();
+    flatten_concat(node, &mut operands);
+    if operands.is_empty() {
+        return None;
+    }
+    let mut joined = String::new();
+    for (i, operand) in operands.iter().enumerate() {
+        if is_string_literal(operand) {
+            // An interpolated literal still returns None here; that must fail
+            // the whole concatenation, not be waved through as an anchor.
+            match extract_string_from_subtree_inner(operand, source, depth + 1) {
+                Some(text) => joined.push_str(&text),
+                None => return None,
+            }
+        } else if i > 0 {
+            return None;
+        }
+    }
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
 }

@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased
+
+Three defects, each found by checking a claim instead of quoting one. The audit
+report's own status paragraphs were the starting point and were wrong about all
+of it; every item below was verified against `HEAD` before being worked on.
+
+**`INDEX_VERSION` 56 → 57, so upgrading rebuilds the index once.** Two of the
+three changes alter the edge set the indexer stores for identical source.
+
+### Fixed
+- **A concatenated import/include path is no longer guessed at.**
+  `extract_string_from_subtree` returned the first string literal anywhere in the
+  subtree and discarded the rest, so `require_once "config" . $env . ".php"`
+  resolved to the literal `config` and bound a real `imports` edge to a real
+  `config.php` — a file that statement never includes at runtime. `require("./x"
+  + suffix)` had the same shape in JS. A phantom aimed at a real node is worse
+  than a missing edge, because `deps` / `cycles` / `affected` / `impact` all
+  consume it as fact; it is also the exact failure the `encapsed_string`
+  interpolation guard already refused to commit, reached through different
+  syntax. Rule now: in a concatenation every operand after the first must be a
+  string literal; the first may be something else and contributes nothing, which
+  is the directory-anchor idiom that keeps `__DIR__ . "/lib.php"` and
+  `dirname(__FILE__) . "/x.php"` resolving exactly as before. Measured on a
+  fixture carrying all six shapes: 3 phantom edges removed, 3 true edges
+  unchanged. Two deliberate behaviour changes ride along — an all-literal
+  concatenation now joins (`"lib" . ".php"` → `lib.php`) instead of truncating,
+  and a route path built as `"/api/" + version` yields nothing rather than the
+  fragment `/api/`.
+- **`import mod, * as ns from './m'` emitted two identical `imports` rows**, one
+  per binding, where each spelling alone emits one. `idx_edges_unique` includes
+  `metadata` on purpose (multiple route edges per file), so the differing `q`
+  marker kept both. The namespace marker wins: it also feeds `ns_module_map` for
+  `ns.foo()` member calls, while the default marker deliberately feeds nothing
+  else and is pure duplication once a namespace binding has claimed the edge.
+  (`deps` was unaffected either way — its symbol counts are
+  `COUNT(DISTINCT nb.id)` — but edge totals and per-language relation stats were
+  not.)
+- **The cached directory scan treated an unchanged mtime as proof of
+  freshness.** `file_needs_hashing` compared mtimes alone, so a content edit
+  landing inside one filesystem timestamp granule was skipped no matter how much
+  the content moved — ordinary on HFS+ and ext3 (1s), exFAT (2s) and several
+  network filesystems. It now compares mtime **and** size, both of which the one
+  `metadata()` call already carries, so every length-changing edit is visible.
+  The residual is a same-granule edit that also preserves byte length: the rsync
+  quick-check tradeoff, kept because closing it means hashing every file on every
+  scan, which is what this cache exists to avoid. The CLI path was never
+  affected (`run_incremental_index` re-hashes everything); this is the MCP
+  server's resident-cache path.
+
+### Changed
+- The existing content-change tests for the cached scan all slept 50 ms before
+  rewriting, which guarantees a fresh mtime and so could never exercise the case
+  above. A new test freezes the mtime explicitly and asserts on the file's
+  PRESENCE in the returned hash map — a skipped file is simply absent, so the
+  natural `got != expected` comparison reads `None != Some(h)` and passes for
+  exactly the failure it is meant to catch.
+- `import_forms_resolve_to_exactly_one_module_or_none` adds the exact-count half
+  of the import axis. The existing spelling table asserts a floor, which is right
+  for "did the arm survive" and structurally blind to both directions here: a
+  floor of 1 passes on 2, and it cannot express "this must produce nothing".
+
 ## v0.109.0 (2026-07-29)
 
 Audit 2026-07-27 P2 batch: 20 of the ~29 observations, chosen for the ones whose
