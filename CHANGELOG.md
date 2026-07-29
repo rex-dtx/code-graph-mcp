@@ -22,6 +22,21 @@ and pattern-position identifiers inside `matches!`.
   `git add` reports that as a hint rather than a failure.
 
 ### Fixed
+- **The `<external>` sentinel's node type was decided by hash-map iteration
+  order.** A name reachable from both channels in one batch — `impl Write for …`
+  (implements → `trait`) and an unresolved `use std::io::Write` (imports →
+  `module`) — was stamped by whichever relation happened to be pushed last, so
+  re-indexing an unchanged tree could flip it. Reproduced on this repo: three
+  rebuilds with the pre-fix binary disagreed on `Write` (runs 2 and 3 both
+  differed from run 1); the same three with the fix agree exactly. Two causes,
+  both closed. Every caller derives its file list from `HashMap::keys()` —
+  `run_full_index` from `scan_directory`'s map, both incremental entries from
+  `compute_diff` — so `index_files` now sorts and dedups the list at the one
+  choke point all four entry points funnel through. And the sentinel's type now
+  follows a fixed precedence (implements is the specific claim and beats an
+  import) rather than last-write-wins. The edge set is unchanged before/after
+  (8665 ↔ 8665, zero line diff), so this needs no `INDEX_VERSION` step beyond
+  the 55 this batch already carries.
 - **SQL `LIKE` treated `_` as a wildcard in the test-source filter** (P2-10), so
   `latest.cs` (`%`=`l`, `_`=`a`, then `test.`) and `attest.py` were classified as
   tests and dropped from every production-caller count. The `'test\_%'` leg one

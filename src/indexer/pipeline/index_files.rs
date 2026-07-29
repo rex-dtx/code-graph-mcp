@@ -121,6 +121,23 @@ pub(super) fn index_files(
     // this makes that partial-extraction risk observable without any schema change.
     let parse_error_files = AtomicUsize::new(0);
 
+    // Every caller derives `files` from HashMap iteration — `run_full_index`
+    // from `scan_directory`'s hash map keys, both incremental entries from
+    // `compute_diff`, which walks the current/old hash maps. So the order
+    // varies run to run, and with it the batch each file lands in. Several
+    // bindings below are first-wins *within* a batch (the `<external>`
+    // sentinel's node type, same-batch callee resolution, the pending-call
+    // drain), so two indexes of an unchanged tree could disagree. Sorting
+    // here — the one choke point all four entry points funnel through — makes
+    // a given tree index the same way every time. Dedup because a duplicated
+    // path would otherwise insert, then cascade-delete, its own file's nodes.
+    let files: Vec<String> = {
+        let mut v = files.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+
     let mut total_nodes_created = 0usize;
     let mut total_edges_created = 0usize;
     let mut all_indexed: Vec<FileIndexed> = Vec::new();
@@ -1386,10 +1403,19 @@ pub(super) fn index_files(
                     .map(|n| (n.name.clone(), n.id))
                     .collect();
 
-            let unique_modules: HashSet<String> = external_python_imports
-                .iter()
-                .map(|(_, m)| m.clone())
-                .collect();
+            // Sorted, not raw set order: these nodes are minted here, so set
+            // iteration order would hand the same module a different node id
+            // on every run.
+            let unique_modules: Vec<String> = {
+                let mut v: Vec<String> = external_python_imports
+                    .iter()
+                    .map(|(_, m)| m.clone())
+                    .collect::<HashSet<String>>()
+                    .into_iter()
+                    .collect();
+                v.sort_unstable();
+                v
+            };
 
             let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
             for module_name in &unique_modules {
@@ -1448,20 +1474,35 @@ pub(super) fn index_files(
 
             let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
 
-            // Collect unique targets with inferred type
-            let unique_targets: HashMap<&str, &str> = unresolved_externals
-                .iter()
-                .map(|(_, name, rel)| {
+            // Collect unique targets with inferred type.
+            //
+            // One name can reach both channels in the same batch — `impl Write
+            // for X` alongside an unresolved `use std::io::Write`. Collecting
+            // straight into a map let the LAST push decide, so the sentinel was
+            // minted `trait` or `module` depending on relation order. Give the
+            // channels a fixed precedence instead: `implements` is the specific
+            // claim (this name IS a trait), an import only says "some external
+            // module-ish name", so implements wins regardless of arrival order.
+            // Sorted before insert so the ids are stable too.
+            let unique_targets: Vec<(&str, &str)> = {
+                let mut by_name: HashMap<&str, &str> = HashMap::new();
+                for (_, name, rel) in &unresolved_externals {
                     let node_type = if rel == REL_IMPLEMENTS {
                         "trait"
                     } else {
                         "module"
                     };
-                    (name.as_str(), node_type)
-                })
-                .collect();
+                    let slot = by_name.entry(name.as_str()).or_insert(node_type);
+                    if node_type == "trait" {
+                        *slot = "trait";
+                    }
+                }
+                let mut v: Vec<(&str, &str)> = by_name.into_iter().collect();
+                v.sort_unstable();
+                v
+            };
 
-            for (&name, &node_type) in &unique_targets {
+            for &(name, node_type) in &unique_targets {
                 if !ext_node_ids.contains_key(name) {
                     let node_id = insert_node_cached(
                         db.conn(),

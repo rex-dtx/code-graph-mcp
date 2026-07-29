@@ -2797,3 +2797,95 @@ fn test_dead_code_ignore_prefixes_are_separator_normalized() {
         "a backslash-spelled ignore prefix must exclude exactly what the forward-slash one does"
     );
 }
+
+#[test]
+fn test_index_files_normalizes_caller_path_order() {
+    // Every caller builds its file list from HashMap iteration — `run_full_index`
+    // from `scan_directory`'s map, both incremental entries from `compute_diff` —
+    // so the order handed to `index_files` is arbitrary and varies run to run.
+    // `index_files` sorts (and dedups) it, which is what makes the first-wins
+    // bindings inside a batch reproducible. Node ids are minted in processing
+    // order, so "processed sorted" is observable as ids ascending with the sorted
+    // path even though this caller passes the reverse.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    for name in ["a.py", "b.py", "c.py"] {
+        fs::write(project_dir.path().join(name), "def f():\n    pass\n").unwrap();
+    }
+
+    // Reverse order, plus a duplicate: a caller-side hash map can hand over
+    // either, and neither may change what lands in the DB.
+    let caller_order: Vec<String> =
+        vec!["c.py".into(), "b.py".into(), "a.py".into(), "b.py".into()];
+    let result = index_files(
+        &db,
+        project_dir.path(),
+        &caller_order,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result.files_indexed, 3,
+        "a duplicated path must be indexed once, not twice"
+    );
+
+    let first_id = |path: &str| {
+        get_nodes_by_file_path(db.conn(), path)
+            .unwrap()
+            .iter()
+            .map(|n| n.id)
+            .min()
+            .expect("indexed file must have nodes")
+    };
+    let (a, b, c) = (first_id("a.py"), first_id("b.py"), first_id("c.py"));
+    assert!(
+        a < b && b < c,
+        "files must be processed in sorted order regardless of the caller's order; got a={a} b={b} c={c}"
+    );
+}
+
+#[test]
+fn test_external_sentinel_type_prefers_implements_over_import() {
+    // One name can reach the `<external>` sentinel from both channels: an
+    // unresolved `impl Write for …` (implements → `trait`) and an unresolved
+    // `use std::io::Write` (imports → `module`). Sorted file order puts the
+    // import LAST here, so a last-write-wins map would stamp the node `module`
+    // and the sentinel's type would track file order rather than meaning.
+    // Precedence is fixed instead: implements is the specific claim and wins.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(
+        project_dir.path().join("a_impl.rs"),
+        "pub struct Sink;\n\nimpl Write for Sink {\n    fn go(&self) {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("b_import.rs"),
+        "use std::io::Write;\n\npub fn touch() {}\n",
+    )
+    .unwrap();
+
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let ext = get_nodes_by_file_path(db.conn(), "<external>").unwrap();
+    let writes: Vec<&crate::storage::queries::NodeResult> =
+        ext.iter().filter(|n| n.name == "Write").collect();
+    assert_eq!(
+        writes.len(),
+        1,
+        "both channels must share ONE sentinel node, got: {:?}",
+        writes.iter().map(|n| &n.node_type).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        writes[0].node_type, "trait",
+        "the implements channel must win over the later import channel"
+    );
+}
