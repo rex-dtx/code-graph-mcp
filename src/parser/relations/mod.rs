@@ -309,6 +309,182 @@ mod ruby_bare_calls {
     }
 }
 
+/// Signature every additive `references` extractor shares.
+type ReferenceExtractor = fn(&tree_sitter::Node, &str, Option<&str>) -> Option<ParsedRelation>;
+
+/// Which language name a pass matches on. The two are NOT interchangeable and
+/// swapping one for the other silently changes coverage: `Raw` is the file's
+/// own language, where `typescript` and `tsx` are DIFFERENT strings, while
+/// `Family` is the dispatch name from [`LanguageConfig`], which folds `.tsx`
+/// into its family. Each pass below keeps whichever one it was written against.
+enum LangKey {
+    Raw,
+    Family,
+}
+
+/// One additive `references` pass: when the node kind matches and the file's
+/// language is listed, run the extractors.
+struct ReferencePass {
+    key: LangKey,
+    langs: &'static [&'static str],
+    kind: &'static str,
+    /// Usually one. More than one means they are alternatives for the same
+    /// (language, kind) slot — see `first_match_wins`.
+    extract: &'static [ReferenceExtractor],
+    /// True → stop at the first extractor that returns `Some`. False → run all
+    /// of them and push every `Some`. Only meaningful with 2+ extractors, and
+    /// the difference is load-bearing: Rust's two are an either/or chain, while
+    /// Python's two are independent passes that happen to share a node kind.
+    first_match_wins: bool,
+}
+
+/// The additive `references` axis, one row per (language, node kind).
+///
+/// This used to be a run of hand-written `if config.name == "…" && kind == "…"`
+/// blocks. That shape is the top recurring bug class in this crate — one arm
+/// per language per relation, where a missing arm is not a compile error but a
+/// silently absent edge. As a table it is enumerable, so `reference_passes_
+/// cover_every_extractor` (tests/) can assert that every `extract_*_reference`
+/// defined in this module is actually wired to something.
+const REFERENCE_PASSES: &[ReferencePass] = &[
+    // Rust path-qualified value usage (`crate::domain::FOO`) — skips call
+    // callees, `use` paths, type-position paths, intermediate path segments.
+    ReferencePass {
+        key: LangKey::Raw,
+        langs: &["rust"],
+        kind: "scoped_identifier",
+        extract: &[extract_rust_path_reference],
+        first_match_wins: false,
+    },
+    // Rust type-position usage (`field: MyType`, `-> MyType`, `Vec<MyType>`) —
+    // skips the type's own definition name, the `struct_expression` name
+    // (already a `calls` edge) and `Self`.
+    ReferencePass {
+        key: LangKey::Raw,
+        langs: &["rust"],
+        kind: "type_identifier",
+        extract: &[extract_rust_type_reference],
+        first_match_wins: false,
+    },
+    // Rust bare `identifier` used as a function value (callback / fn pointer)
+    // in call-argument or address-of position. Self-excludes call callees
+    // (parent `call_expression`, not `arguments`) and enclosing-fn params (M2);
+    // path-qualified values are `scoped_identifier` (above). Inside a macro
+    // token_tree the value-reference pass never fires (parent is `token_tree`),
+    // so the macro-token-call alternative below it is disjoint, not a fallback.
+    ReferencePass {
+        key: LangKey::Raw,
+        langs: &["rust"],
+        kind: "identifier",
+        extract: &[extract_rust_value_reference, extract_rust_macro_token_call],
+        first_match_wins: true,
+    },
+    // TS/TSX type-position `type_identifier` (annotation, return type, generic
+    // arg, field type). Self-excludes the type's own definition name and
+    // heritage (extends/implements) types already covered by an
+    // inherits/implements edge. Keyed on the RAW language: JS has no type
+    // annotations so the kind never appears there anyway, but the `javascript`
+    // FAMILY would otherwise sweep value identifiers in non-type contexts.
+    ReferencePass {
+        key: LangKey::Raw,
+        langs: &["typescript", "tsx"],
+        kind: "type_identifier",
+        extract: &[extract_ts_type_reference],
+        first_match_wins: false,
+    },
+    // JS/TS/TSX bare `identifier` passed as a function value (callback) in
+    // call-argument position. Self-excludes call callees (parent is
+    // `call_expression`/`member_expression`, not `arguments`) and
+    // enclosing-function params (M2). Family-keyed, same as the call arm.
+    ReferencePass {
+        key: LangKey::Family,
+        langs: &["javascript", "typescript", "tsx"],
+        kind: "identifier",
+        extract: &[extract_js_value_reference],
+        first_match_wins: false,
+    },
+    // Python type-annotation usage. UNLIKE Rust/TS, Python annotation type
+    // names are plain `identifier` nodes (same kind as value identifiers), so
+    // this fires on `identifier` and the extractor gates on ANNOTATION CONTEXT
+    // (an enclosing `type` node) — gating on kind alone would emit a reference
+    // for every variable/function name. Self-excludes builtins/typing generics
+    // and base classes (those live under `argument_list`, not a `type` node,
+    // and are already an inherits edge).
+    ReferencePass {
+        key: LangKey::Family,
+        langs: &["python"],
+        kind: "identifier",
+        extract: &[extract_python_type_reference],
+        first_match_wins: false,
+    },
+    // Python value reference (callback / fn pointer by bare name) in call-arg /
+    // keyword / assignment-RHS / return / dict-value position. A separate row
+    // from the annotation pass above, not an alternative: the two are mutually
+    // exclusive by context (annotation vs value position), so both are always
+    // attempted.
+    ReferencePass {
+        key: LangKey::Family,
+        langs: &["python"],
+        kind: "identifier",
+        extract: &[extract_python_value_reference],
+        first_match_wins: false,
+    },
+    // Go type-position `type_identifier` (field type, param/return type, var
+    // type, slice/map element, composite literal, generic constraint,
+    // qualified-type tail). Self-excludes the type's own definition name
+    // (`type_spec[field=name]`) and Go predeclared builtins
+    // (GO_TYPE_REFERENCE_NOISE — UNLIKE TS, Go builtins are `type_identifier`).
+    // Value selectors (`pkg.Func()` / `obj.field`) are `field_identifier` /
+    // `identifier`, and the qualified-type head (`pkg` in `pkg.Type`) is a
+    // `package_identifier`, so neither reaches here.
+    ReferencePass {
+        key: LangKey::Family,
+        langs: &["go"],
+        kind: "type_identifier",
+        extract: &[extract_go_type_reference],
+        first_match_wins: false,
+    },
+    // Go bare `identifier` (Go value names are `identifier`, types are
+    // `type_identifier`) passed/stored/returned as a fn value — call-arg /
+    // `:=`-or-`=` RHS / return / `var` value. Self-excludes call callees and
+    // enclosing-fn params/locals (M2/M2.5).
+    ReferencePass {
+        key: LangKey::Family,
+        langs: &["go"],
+        kind: "identifier",
+        extract: &[extract_go_value_reference],
+        first_match_wins: false,
+    },
+    // C/C++ bare `identifier` passed/stored/returned as a function value
+    // (function pointer) — C's primary callback mechanism. Call-arg / `&fn` /
+    // designated-or-positional initializer (vtable) / init-declarator RHS /
+    // assignment RHS / return. Self-excludes call callees and enclosing-fn
+    // params/locals (M2/M2.5). Member accesses are `field_identifier`.
+    ReferencePass {
+        key: LangKey::Family,
+        langs: &["c", "cpp"],
+        kind: "identifier",
+        extract: &[extract_cpp_value_reference],
+        first_match_wins: false,
+    },
+    // Java type-position `type_identifier` (field/param/return/local type,
+    // generic arg, array element, `new` type, qualified-type tail).
+    // Self-excludes heritage types (`extends`/`implements` — already an
+    // inherits/implements edge), qualified-type package-path segments (only the
+    // chain tail emits), and JDK common reference types
+    // (JAVA_TYPE_REFERENCE_NOISE). The type's OWN definition name needs no
+    // skip: Java class/interface/enum/record names are plain `identifier`s.
+    // Primitives are distinct kinds (`integral_type` / `floating_point_type` /
+    // `boolean_type` / `void_type`) and never reach here.
+    ReferencePass {
+        key: LangKey::Family,
+        langs: &["java"],
+        kind: "type_identifier",
+        extract: &[extract_java_type_reference],
+        first_match_wins: false,
+    },
+];
+
 #[allow(clippy::too_many_arguments)]
 fn walk_for_relations(
     node: tree_sitter::Node,
@@ -431,146 +607,28 @@ fn walk_for_relations(
 
     let active_scope = scope_name.as_deref().or(current_scope);
 
-    // Additive Rust pass: emit a `references` edge for an edgeless usage.
-    // Runs before the `match kind` call-dispatch so it does not disturb
-    // existing arms or the child recursion below; both extractors self-exclude
-    // nodes already covered by a `calls`/`imports` edge.
-    //   - `scoped_identifier`: path-qualified value usage (`crate::domain::FOO`)
-    //     — skips call callees, `use` paths, type-position paths, intermediate
-    //     path segments.
-    //   - `type_identifier`: type-position usage (`field: MyType`, `-> MyType`,
-    //     `Vec<MyType>`) — skips the type's own definition name and the
-    //     `struct_expression` name (already a `calls` edge) and `Self`.
-    if language == "rust" {
-        match kind {
-            "scoped_identifier" => {
-                if let Some(r) = extract_rust_path_reference(&node, source, active_scope) {
-                    results.push(r);
+    // Additive `references` passes, table-driven (see `REFERENCE_PASSES`).
+    // They run BEFORE the `match kind` call-dispatch below so they cannot
+    // disturb its arms or the child recursion; every extractor self-excludes
+    // the nodes already covered by a `calls`/`imports`/`inherits` edge.
+    for pass in REFERENCE_PASSES {
+        if pass.kind != kind {
+            continue;
+        }
+        let lang = match pass.key {
+            LangKey::Raw => language,
+            LangKey::Family => config.name,
+        };
+        if !pass.langs.contains(&lang) {
+            continue;
+        }
+        for extract in pass.extract {
+            if let Some(r) = extract(&node, source, active_scope) {
+                results.push(r);
+                if pass.first_match_wins {
+                    break;
                 }
             }
-            "type_identifier" => {
-                if let Some(r) = extract_rust_type_reference(&node, source, active_scope) {
-                    results.push(r);
-                }
-            }
-            // Bare `identifier` used as a function value (callback / fn pointer)
-            // in call-argument or address-of position. Self-excludes call callees
-            // (parent `call_expression`, not `arguments`) and enclosing-fn params
-            // (M2). Path-qualified values are `scoped_identifier` (above).
-            "identifier" => {
-                if let Some(r) = extract_rust_value_reference(&node, source, active_scope) {
-                    results.push(r);
-                } else if let Some(r) = extract_rust_macro_token_call(&node, source, active_scope) {
-                    // Inside a macro token_tree the value-reference pass never
-                    // fires (parent is `token_tree`), so the two are disjoint.
-                    results.push(r);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Additive TS/TSX pass: emit a `references` edge for a type-position
-    // `type_identifier` (type annotation, return type, generic arg, field
-    // type). Runs before the `match kind` dispatch so it does not disturb
-    // existing arms; the extractor self-excludes the type's own definition
-    // name and heritage (extends/implements) types already covered by an
-    // inherits/implements edge. Gated to TS/TSX — JS has no type annotations
-    // so the node kind never appears there anyway, and `javascript` config
-    // would otherwise sweep value identifiers in non-type contexts.
-    if matches!(language, "typescript" | "tsx") && kind == "type_identifier" {
-        if let Some(r) = extract_ts_type_reference(&node, source, active_scope) {
-            results.push(r);
-        }
-    }
-
-    // Additive JS/TS/TSX pass: emit a `references` edge for a BARE `identifier`
-    // passed as a function value (callback) in call-argument position. Gated to
-    // the JS-family `config.name` (same as the call-expression arm). Self-excludes
-    // call callees (parent is `call_expression`/`member_expression`, not
-    // `arguments`) and enclosing-function params (M2).
-    if matches!(config.name, "javascript" | "typescript" | "tsx") && kind == "identifier" {
-        if let Some(r) = extract_js_value_reference(&node, source, active_scope) {
-            results.push(r);
-        }
-    }
-
-    // Additive Python pass: emit a `references` edge for a type-annotation usage.
-    // UNLIKE Rust/TS, Python annotation type names are plain `identifier` nodes
-    // (same kind as value identifiers), so we fire on `identifier` but the
-    // extractor gates on ANNOTATION CONTEXT (an enclosing `type` node) — gating
-    // on kind alone would emit a reference for every variable/function name.
-    // The extractor self-excludes builtins/typing generics and base classes
-    // (those live under `argument_list`, not a `type` node, and are already an
-    // inherits edge). Gated to `config.name == "python"` (matches the call arm).
-    if config.name == "python" && kind == "identifier" {
-        if let Some(r) = extract_python_type_reference(&node, source, active_scope) {
-            results.push(r);
-        }
-        // Value reference (callback / fn pointer by bare name) in call-arg / keyword
-        // / assignment-RHS / return / dict-value position. Mutually exclusive with
-        // the type-annotation pass above (annotation context vs value position).
-        if let Some(r) = extract_python_value_reference(&node, source, active_scope) {
-            results.push(r);
-        }
-    }
-
-    // Additive Go pass: emit a `references` edge for a type-position
-    // `type_identifier` (field type, param/return type, var type, slice/map
-    // element, composite literal, generic constraint, qualified-type tail).
-    // Like Rust/TS, Go uses a distinct `type_identifier` kind for type names, so
-    // this gates on kind. The extractor self-excludes the type's own definition
-    // name (`type_spec[field=name]`) and Go predeclared builtins
-    // (GO_TYPE_REFERENCE_NOISE — UNLIKE TS, Go builtins are `type_identifier`).
-    // Value selectors (`pkg.Func()` / `obj.field`) use `field_identifier` /
-    // `identifier`, never `type_identifier`, so they never reach here. The
-    // qualified-type head (`pkg` in `pkg.Type`) is a `package_identifier` (also
-    // not `type_identifier`), so only the tail type name emits. Gated to
-    // `config.name == "go"`.
-    if config.name == "go" && kind == "type_identifier" {
-        if let Some(r) = extract_go_type_reference(&node, source, active_scope) {
-            results.push(r);
-        }
-    }
-
-    // Additive Go value-reference pass: a bare `identifier` (Go value names are
-    // `identifier`, types are `type_identifier`) passed/stored/returned as a fn
-    // value — call-arg / `:=`-or-`=` RHS / return / `var` value. Self-excludes
-    // call callees and enclosing-fn params/locals (M2/M2.5).
-    if config.name == "go" && kind == "identifier" {
-        if let Some(r) = extract_go_value_reference(&node, source, active_scope) {
-            results.push(r);
-        }
-    }
-
-    // Additive C/C++ value-reference pass: a bare `identifier` passed/stored/
-    // returned as a function value (function pointer) — C's primary callback
-    // mechanism. Call-arg / `&fn` / designated-or-positional initializer (vtable) /
-    // init-declarator RHS / assignment RHS / return. Self-excludes call callees and
-    // enclosing-fn params/locals (M2/M2.5). Member accesses are `field_identifier`.
-    if matches!(config.name, "c" | "cpp") && kind == "identifier" {
-        if let Some(r) = extract_cpp_value_reference(&node, source, active_scope) {
-            results.push(r);
-        }
-    }
-
-    // Additive Java pass: emit a `references` edge for a type-position
-    // `type_identifier` (field/param/return/local type, generic arg, array
-    // element, `new` type, qualified-type tail). Like Rust/TS/Go, Java uses a
-    // distinct `type_identifier` kind for type names, so this gates on kind. The
-    // extractor self-excludes heritage types (`extends`/`implements` — already an
-    // inherits/implements edge), qualified-type package-path segments (only the
-    // chain tail emits), and JDK common reference types
-    // (JAVA_TYPE_REFERENCE_NOISE). The type's OWN definition name needs no skip:
-    // Java class/interface/enum/record names are plain `identifier`s, not
-    // `type_identifier`s. Primitives are distinct kinds
-    // (`integral_type`/`floating_point_type`/`boolean_type`/`void_type`) and never
-    // reach here. Value field-access / method calls use `identifier` /
-    // `field_access` / `method_invocation`, never `type_identifier`. Gated to
-    // `config.name == "java"`.
-    if config.name == "java" && kind == "type_identifier" {
-        if let Some(r) = extract_java_type_reference(&node, source, active_scope) {
-            results.push(r);
         }
     }
 

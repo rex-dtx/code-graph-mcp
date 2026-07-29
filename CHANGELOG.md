@@ -21,6 +21,27 @@ and pattern-position identifiers inside `matches!`.
   the `.*` blanket rule silently refuses every new repo-root dotfile, and
   `git add` reports that as a hint rather than a failure.
 
+### Changed
+- **The additive `references` passes are a table, not eleven hand-written
+  `if`s** (P1-9's other half). `walk_for_relations` carried one
+  `if config.name == "…" && kind == "…" { … }` block per language per relation
+  — the exact shape this crate's audits name as its top recurring bug class,
+  because a missing block is not a compile error but an edge that is silently
+  never emitted. The eleven are now rows in `REFERENCE_PASSES`, which makes
+  them enumerable, and `tests/reference_pass_wiring.rs` asserts that every
+  `extract_*_reference` defined under `src/parser/relations/` is wired to a
+  row. Writing the extractor and forgetting the wiring now goes red instead of
+  quietly indexing nothing.
+
+  Two distinctions the blocks encoded implicitly and the table now states:
+  some passes key on the file's raw language (where `typescript` and `tsx` are
+  different strings) and some on the `LanguageConfig` family name, which is not
+  interchangeable; and Rust's two `identifier` extractors are an either/or
+  chain while Python's two are independent passes that share a node kind.
+  `walk_for_relations` 1334 → 1216 lines. Edge sets identical before and after
+  at both batch sizes (8708 and 7998, zero line diff, 823 / 719 of them
+  `references`).
+
 ### Fixed
 - **The `<external>` sentinel's node type was decided by hash-map iteration
   order.** A name reachable from both channels in one batch — `impl Write for …`
