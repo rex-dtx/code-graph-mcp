@@ -44,9 +44,16 @@ pub(crate) fn normalize_rel_str(rel: &str) -> String {
 ///    spellings. As a parameter, the Linux and macOS legs exercise the Windows
 ///    branch too.
 ///
-/// This is the single separator-normalizing implementation in the crate —
+/// This is the single implementation that produces INDEX KEYS —
 /// `cli::normalize_path_display_on` strips the Windows `\\?\` prefix and then
-/// delegates here, so the two cannot drift.
+/// delegates here, and `mcp::server::tools::normalize_path_arg_on` calls it
+/// directly, so no entry point can drift from it.
+///
+/// It is not the only place in the crate that rewrites `\` to `/`, and the
+/// distinction matters: `cli::worktree_main_root` builds a length-preserving
+/// copy purely to `rfind("/.git/worktrees/")` in it, then slices the ORIGINAL
+/// string so the returned path keeps its native separators. That one must not
+/// delegate here — collapsing `//` would shift the byte offsets it slices by.
 ///
 /// Runs of `/` collapse to one.
 ///

@@ -2819,6 +2819,25 @@ fn bre_style_escapes(pattern: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// What to say when spawning `rg` fails with `ErrorKind::NotFound`.
+///
+/// Two different causes produce that one error kind, because `current_dir` is
+/// applied as part of the spawn: the `rg` binary is missing from PATH, or the
+/// working directory does not exist (an index whose project root was moved or
+/// deleted, a stale worktree). The message used to name only the first, sending
+/// the user to install a tool they already have.
+fn rg_spawn_failure_message(project_root: &Path) -> String {
+    if !project_root.is_dir() {
+        format!(
+            "cannot run ripgrep: working directory {} does not exist — \
+             the project root recorded for this index is gone (moved or deleted)",
+            project_root.display()
+        )
+    } else {
+        "ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep".to_string()
+    }
+}
+
 /// Shared zero-hit note for every grep mode. Skips the dialect hint under -F,
 /// where backslashes are genuinely literal and the pattern means what it says.
 fn emit_no_match(pattern: &str, fixed_strings: bool) {
@@ -3147,6 +3166,15 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // Windows caps a whole command line at 32,767 chars; POSIX ARG_MAX is
     // ~2 MB. Budget the PATH operands conservatively under each, leaving room
     // for the flags, the pattern, and the exe path.
+    //
+    // The accounting is `len + 1` per operand — one separator, no quoting. On
+    // Windows an operand containing a space is quoted by the runtime, costing 2
+    // more chars, so the true line is longer than the budget believes. The
+    // headroom absorbs it: 32,767 − 24,000 = 8,767 chars would need ~4,400
+    // space-bearing paths in a single batch to exhaust, and `SUPPLEMENT_CAP`
+    // stops at 500. Stated rather than fixed because a tighter budget is the
+    // wrong trade — it would split batches on every repo to cover a case the cap
+    // makes unreachable.
     const ARGV_PATH_BUDGET: usize = if cfg!(windows) { 24_000 } else { 512_000 };
     // Override exists so the batching path is testable without materializing a
     // 32 KB argv, and as an escape hatch for a shell with a tighter limit.
@@ -3165,6 +3193,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         cmd.args(paths);
         cmd.output()
     };
+    // `current_dir` is part of the spawn: a missing working directory fails with
+    // the SAME ErrorKind::NotFound the missing-binary case does, so the error arm
+    // has to tell them apart before it names a cause. See
+    // `rg_spawn_failure_message`.
 
     // Batch 1 is always the walk; the supplement follows in argv-sized chunks.
     // Each batch is an independent rg run whose stdout is concatenated — every
@@ -3200,7 +3232,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                 if json_mode {
                     println!("[]");
                 }
-                eprintln!("[code-graph] ripgrep (rg) not found. Install: https://github.com/BurntSushi/ripgrep");
+                eprintln!("[code-graph] {}", rg_spawn_failure_message(project_root));
                 grep_exit(2);
             }
             Err(e) => return Err(e.into()),
@@ -8555,6 +8587,33 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawning `rg` reports `ErrorKind::NotFound` for two different causes —
+    /// the binary is missing, or `current_dir` does not exist — and the message
+    /// named only the first. A user whose indexed project root had been moved was
+    /// told to install a tool that was already on their PATH.
+    #[test]
+    fn rg_spawn_failure_message_distinguishes_missing_cwd_from_missing_binary() {
+        let present = tempfile::TempDir::new().unwrap();
+        let msg = rg_spawn_failure_message(present.path());
+        assert!(
+            msg.contains("ripgrep (rg) not found"),
+            "an existing root must still point at the binary: {msg}"
+        );
+
+        let gone = tempfile::TempDir::new().unwrap();
+        let gone_path = gone.path().to_path_buf();
+        drop(gone);
+        let msg = rg_spawn_failure_message(&gone_path);
+        assert!(
+            msg.contains("does not exist"),
+            "a vanished project root must be named as the cause: {msg}"
+        );
+        assert!(
+            !msg.contains("Install"),
+            "must not tell the user to install a tool they have: {msg}"
+        );
+    }
 
     /// M2: `deps` barrel-pattern scanning must not follow a symlink that escapes
     /// the project root. The scanner reads a caller-supplied path and echoes its

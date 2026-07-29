@@ -341,7 +341,15 @@ fn cli_call(cmd: &str) -> Option<(&'static str, String)> {
 /// there is no Unix-filename ambiguity to preserve here.
 fn is_cg_binary_token(t: &str) -> bool {
     const BIN: &str = "code-graph-mcp";
-    let stem = t.strip_suffix(".exe").unwrap_or(t);
+    // `.EXE` too: PATHEXT is upper-case by default on Windows and cmd.exe echoes
+    // what it resolved, so a transcript can carry either spelling. Only the
+    // extension is case-folded — the stem comparison stays exact, because the
+    // binary name is lower-case on every platform we publish.
+    let stem = t
+        .rfind('.')
+        .filter(|i| t[*i..].eq_ignore_ascii_case(".exe"))
+        .map(|i| &t[..i])
+        .unwrap_or(t);
     stem == BIN || stem.ends_with(&format!("/{}", BIN)) || stem.ends_with(&format!("\\{}", BIN))
 }
 
@@ -1658,6 +1666,24 @@ mod tests {
             detect_cli_cg_call("code-graph-mcp.exe.bak grep Foo"),
             None,
             "only a real .exe suffix is stripped"
+        );
+        // PATHEXT is upper-case by default and cmd.exe echoes what it resolved,
+        // so a transcript can carry `.EXE`. Case-folding the suffix alone: the
+        // stem stays exact, since the published binary name is lower-case.
+        for cmd in [
+            r"C:\bin\code-graph-mcp.EXE grep Foo",
+            "code-graph-mcp.Exe grep Foo",
+        ] {
+            assert_eq!(
+                detect_cli_cg_call(cmd),
+                Some("grep"),
+                "upper-case extension not recognized: {cmd}"
+            );
+        }
+        assert_eq!(
+            detect_cli_cg_call("CODE-GRAPH-MCP.EXE grep Foo"),
+            None,
+            "the stem is not case-folded — that is a different file on Unix"
         );
     }
 

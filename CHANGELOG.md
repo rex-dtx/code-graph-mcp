@@ -113,6 +113,26 @@ and pattern-position identifiers inside `matches!`.
 - **The fuzzy-name edit-distance fallback pooled 5000 rows with no `ORDER BY`**
   (P2-12) — on a larger repo the `LIMIT` silently decides which names get a
   typo-correction chance, and the planner decides the `LIMIT`. Pinned to `n.id`.
+- **One file could be a test to `dead-code`/`affected` and production to
+  `project_map` at the same time** (incremental audit Δ3). The edge-level source
+  filter carried only the anchored `tests/` prefix and the `_test.<ext>` leg,
+  while the node-level classifier had the full `is_test_path` set — so an xUnit
+  (`src/Tests/Api/AuthTests.cs`), Maven (`src/test/java/…`) or JS
+  (`foo.test.js`) layout was counted as a production caller in hot-function
+  ranking and as a test everywhere else. Measured on this repository: **792
+  `calls` edges** were classified both ways at once. Both surfaces now generate
+  their path legs from one `test_path_legs_sql`, with a differential test over
+  the parity corpus. The NAME half stays deliberately narrower (no
+  `*Test`/`*Tests` symbol suffix) and keeps its one-directional guard.
+- **`grep` blamed a missing `ripgrep` for a missing working directory**
+  (incremental audit Δ5). `current_dir` is applied during the spawn, so a
+  project root that has been moved or deleted fails with the same
+  `ErrorKind::NotFound` as an absent binary — and the message sent the user to
+  install a tool already on their PATH.
+- **`.EXE` was not recognized as the binary suffix** (incremental audit Δ5) —
+  PATHEXT is upper-case by default on Windows and `cmd.exe` echoes what it
+  resolved, so those invocations went unrecorded in the conversion metric. Only
+  the extension is case-folded; the stem stays exact.
 
 ### Fixed in review (defects this batch introduced)
 - **`dead-code . --json` and `dead-code <dir>/ --json` hard-errored whenever the

@@ -634,44 +634,59 @@ pub const TEST_PATH_PARITY_CORPUS: &[&str] = &[
 /// test (any new leg added to either must be added here and asserted there).
 pub fn is_test_node_sql(node_alias: &str, file_alias: &str) -> String {
     let n = node_alias;
+    format!(
+        "({n}.is_test = 1 \
+         OR {n}.name GLOB 'test_*' \
+         OR {n}.name GLOB '*Test' \
+         OR {n}.name GLOB '*Tests' \
+         OR {paths})",
+        paths = test_path_legs_sql(file_alias),
+    )
+}
+
+/// The PATH half of the test classification — every leg of [`is_test_path`] that
+/// looks at the file path, OR-joined, with no surrounding parentheses.
+///
+/// Extracted because two SQL surfaces need exactly this set and had drifted
+/// apart: the node-level classifier ([`is_test_node_sql`]) carried all of it
+/// while the edge-level source filter ([`prod_filter_and`] /
+/// [`test_source_filter_or`]) had only the anchored `tests/%` prefix and the
+/// infix leg. Under an xUnit (`src/Tests/Api/AuthTests.cs`), Maven
+/// (`src/test/java/…`) or JS (`foo.test.js`) layout, one surface called a file a
+/// test and the other counted its symbols as production callers — measured on
+/// this repository, 792 `calls` edges were classified both ways at once.
+///
+/// Directory legs use LIKE (ASCII-case-insensitive in SQLite, matching Rust's
+/// `to_ascii_lowercase` compare); none of those patterns contains `_`, so LIKE's
+/// `_`-as-wildcard cannot fire. The pytest legs stay on GLOB — both for
+/// `_`-as-literal AND because they are case-SENSITIVE on the Rust side too
+/// (pytest's `fnmatch_ex` does not normcase; `Conftest.py` is not a conftest).
+/// Mixing the two is deliberate, not an oversight: see [`is_test_path`].
+pub fn test_path_legs_sql(file_alias: &str) -> String {
     let f = file_alias;
     // Generated legs — same constants the Rust predicate reads, so the two
     // cannot drift as ecosystems are added.
     let mut generated = String::new();
     for (stem, exts) in PASCAL_TEST_STEM_EXTS {
         for ext in exts {
-            generated.push_str(&format!(" OR {f}.path GLOB '*{stem}.{ext}'"));
+            generated.push_str(&format!("{f}.path GLOB '*{stem}.{ext}' OR "));
         }
     }
     for ext in INFIX_TEST_EXTS {
-        generated.push_str(&format!(" OR {f}.path GLOB '*_test.{ext}'"));
+        generated.push_str(&format!("{f}.path GLOB '*_test.{ext}' OR "));
     }
-    // Directory legs use LIKE (ASCII-case-insensitive in SQLite, matching Rust's
-    // `to_ascii_lowercase` compare); none of these patterns contains `_`, so
-    // LIKE's `_`-as-wildcard cannot fire. The pytest legs stay on GLOB — both for
-    // `_`-as-literal AND because they are case-SENSITIVE on the Rust side too
-    // (pytest's `fnmatch_ex` does not normcase; `Conftest.py` is not a conftest).
-    // Mixing the two here is deliberate, not an oversight: see `is_test_path`.
-    let case_insensitive = format!(
-        " OR {f}.path LIKE 'tests/%' \
+    format!(
+        "{generated}{f}.path LIKE 'tests/%' \
          OR {f}.path LIKE 'test/%' \
          OR {f}.path LIKE '%/tests/%' \
          OR {f}.path LIKE '%/test/%' \
          OR {f}.path GLOB 'test_*.py' \
          OR {f}.path GLOB '*/test_*.py' \
-         OR {f}.path GLOB '*conftest.py'"
-    );
-    format!(
-        "({n}.is_test = 1 \
-         OR {n}.name GLOB 'test_*' \
-         OR {n}.name GLOB '*Test' \
-         OR {n}.name GLOB '*Tests'{generated}{case_insensitive} \
+         OR {f}.path GLOB '*conftest.py' \
          OR {f}.path GLOB 'benches/*' \
          OR {f}.path GLOB 'bench/*' \
          OR {f}.path GLOB '*__tests__/*' \
          OR {f}.path GLOB '*/tests.rs' \
-         OR {f}.path GLOB '*_test.go' \
-         OR {f}.path GLOB '*_test.rs' \
          OR {f}.path GLOB '*.test.ts' \
          OR {f}.path GLOB '*.test.js' \
          OR {f}.path GLOB '*.test.tsx' \
@@ -679,7 +694,7 @@ pub fn is_test_node_sql(node_alias: &str, file_alias: &str) -> String {
          OR {f}.path GLOB '*.spec.ts' \
          OR {f}.path GLOB '*.spec.js' \
          OR {f}.path GLOB '*.spec.tsx' \
-         OR {f}.path GLOB '*.spec.jsx')"
+         OR {f}.path GLOB '*.spec.jsx'"
     )
 }
 
@@ -704,27 +719,6 @@ pub fn prod_source_join_sql(edges_alias: &str) -> String {
     )
 }
 
-/// The `foo_test.<ext>` leg, generated from [`INFIX_TEST_EXTS`] so it cannot
-/// drift from `is_test_path`'s own use of that list — the same technique
-/// [`is_test_node_sql`] already uses for this leg.
-///
-/// GLOB, not LIKE, for two independent reasons, both of which the LIKE spelling
-/// got wrong:
-///   * `_` is a LITERAL in GLOB and a single-character WILDCARD in LIKE, so
-///     `LIKE '%_test.%'` swallowed `latest.cs` (`%`=`l`, `_`=`a`, `test.`) and
-///     `attest.py` — ordinary production files, silently reclassified as tests.
-///   * GLOB is anchored, so `'*_test.go'` is an ends-with, matching the Rust
-///     side's `ends_with`. `LIKE '%_test.%'` was a contains over ANY extension,
-///     so `notes_test.txt` was excluded here while `is_test_path` called it
-///     production.
-fn infix_test_path_glob(file_alias: &str, joiner: &str) -> String {
-    INFIX_TEST_EXTS
-        .iter()
-        .map(|ext| format!("{file_alias}.path GLOB '*_test.{ext}'"))
-        .collect::<Vec<_>>()
-        .join(joiner)
-}
-
 /// AND-joined conditions that exclude test/bench source rows.
 /// Combines the AST-level `src.is_test=0` flag with name and path heuristics —
 /// kept in sync with `is_test_symbol`. Caller is expected to splice this
@@ -735,15 +729,21 @@ fn infix_test_path_glob(file_alias: &str, joiner: &str) -> String {
 /// 2026-07-27 audit the only one with no mechanical guard. Two of its legs were
 /// BROADER than `is_test_symbol`, each excluding real production rows from every
 /// prod-caller count with no error raised anywhere:
-///   * the infix path leg — see [`infix_test_path_glob`];
+///   * the infix path leg, `LIKE '%_test.%'` — `_` is a LITERAL in GLOB and a
+///     single-character WILDCARD in LIKE, so it swallowed `latest.cs` (`%`=`l`,
+///     `_`=`a`, then `test.`) and `attest.py`, and being a contains over any
+///     extension it also took `notes_test.txt`. GLOB is anchored;
 ///   * the name leg, `LIKE 'test\_%'`, which is ASCII-case-INsensitive in SQLite
 ///     while `is_test_symbol` is `starts_with("test_")`, so `Test_Signup` was
 ///     excluded here and called production there. GLOB is case-sensitive.
 ///
-/// It remains deliberately NARROWER on two legs — no `*Test`/`*Tests` name
-/// suffix, no PascalCase-stem or pytest path legs — an accepted recall gap
-/// (audit P2-3), asserted one-directionally by
-/// `prod_source_filter_never_excludes_a_production_path`.
+/// Its PATH half is no longer narrower: it shares [`test_path_legs_sql`] with the
+/// node-level classifier, because the gap was observable rather than theoretical
+/// — 792 `calls` edges in this repository were counted as production callers by
+/// this filter while `dead_code` / `affected` / `ast_search` called their source
+/// files tests. It stays deliberately narrower on the NAME half (no
+/// `*Test`/`*Tests` symbol-name suffix), an accepted recall gap asserted
+/// one-directionally by `prod_source_filter_never_excludes_a_production_path`.
 pub fn prod_source_filter_and() -> String {
     prod_filter_and("src", "sf")
 }
@@ -760,15 +760,11 @@ pub fn prod_source_filter_and() -> String {
 /// `callgraph` listed all its callers.
 pub fn prod_filter_and(node_alias: &str, file_alias: &str) -> String {
     let n = node_alias;
-    let f = file_alias;
     format!(
         "{n}.is_test = 0 \
          AND {n}.name NOT GLOB 'test_*' \
-         AND {f}.path NOT LIKE 'tests/%' \
-         AND {f}.path NOT LIKE 'benches/%' \
-         AND NOT ({infix}) \
-         AND {f}.path NOT LIKE '%/tests.rs'",
-        infix = infix_test_path_glob(f, " OR "),
+         AND NOT ({paths})",
+        paths = test_path_legs_sql(file_alias),
     )
 }
 
@@ -780,11 +776,8 @@ pub fn test_source_filter_or() -> String {
     format!(
         "src.is_test = 1 \
          OR src.name GLOB 'test_*' \
-         OR sf.path LIKE 'tests/%' \
-         OR sf.path LIKE 'benches/%' \
-         OR {infix} \
-         OR sf.path LIKE '%/tests.rs'",
-        infix = infix_test_path_glob("sf", " OR "),
+         OR {paths}",
+        paths = test_path_legs_sql("sf"),
     )
 }
 
@@ -1293,11 +1286,13 @@ mod tests {
     /// Rust↔SQL differential above covers `is_test_node_sql`, and
     /// `tests/predicate_parity.rs` covers the JS and both Python mirrors.
     ///
-    /// The invariant asserted here is ONE-DIRECTIONAL, deliberately. These
-    /// constants are narrower than `is_test_path` — no PascalCase stem leg, no
-    /// `__tests__`, no pytest leg — and that recall gap is an accepted
-    /// divergence (audit 2026-07-27 P2-3), so requiring agreement would be
-    /// asserting something the code does not claim. What must never happen is
+    /// The invariant asserted here is ONE-DIRECTIONAL, deliberately. The filter
+    /// is still narrower than `is_test_symbol` on the NAME half (no
+    /// `*Test`/`*Tests` symbol suffix), so requiring agreement would assert
+    /// something the code does not claim. Its PATH half no longer diverges —
+    /// `path_half_agrees_with_is_test_path` below pins that direction — because
+    /// the gap was measurable: 792 `calls` edges in this repo were production to
+    /// this filter and test to every node-level surface. What must never happen is
     /// the other direction: a path Rust calls PRODUCTION being excluded as a
     /// test, because that drops it from every prod-caller count with no error
     /// raised anywhere. `'%_test.%'` did exactly that — LIKE's `_` is a
@@ -1347,6 +1342,43 @@ mod tests {
             "these rows are PRODUCTION per `is_test_symbol` but the SQL source \
              filter excluded them as tests — they vanish from every prod-caller \
              count with nothing reported: {wrongly_excluded:?}"
+        );
+    }
+
+    /// The PATH half of the edge-level filter must agree with `is_test_path`
+    /// exactly, in both directions.
+    ///
+    /// It did not until this batch: the filter carried only the anchored
+    /// `tests/%` prefix and the infix leg, so an xUnit (`src/Tests/Api/…`), Maven
+    /// (`src/test/java/…`) or JS (`foo.test.js`) layout was a test to
+    /// `dead_code`/`affected` and production to `hot_functions`. Both halves now
+    /// build from `test_path_legs_sql`, so this test fails the moment one surface
+    /// grows a leg the other lacks.
+    ///
+    /// Name is held constant at a production spelling so only the path decides —
+    /// the NAME half is still deliberately narrower and is not asserted here.
+    #[test]
+    fn path_half_agrees_with_is_test_path() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = format!(
+            "SELECT ({test}) \
+             FROM (SELECT 'runQuery' AS name, 0 AS is_test) src, (SELECT ?1 AS path) sf",
+            test = test_source_filter_or(),
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let mut mismatches = Vec::new();
+        for path in TEST_PATH_PARITY_CORPUS {
+            let sql_says: i64 = stmt.query_row([path], |r| r.get(0)).unwrap();
+            let rust_says = is_test_path(path);
+            if (sql_says != 0) != rust_says {
+                mismatches.push(format!("{path}: sql={sql_says} rust={rust_says}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "edge-level path legs disagree with is_test_path — one surface counts \
+             these files' symbols as production callers while another calls them \
+             tests: {mismatches:?}"
         );
     }
 
