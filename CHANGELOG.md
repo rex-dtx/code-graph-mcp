@@ -34,9 +34,21 @@ and pattern-position identifiers inside `matches!`.
   `compute_diff` — so `index_files` now sorts and dedups the list at the one
   choke point all four entry points funnel through. And the sentinel's type now
   follows a fixed precedence (implements is the specific claim and beats an
-  import) rather than last-write-wins. The edge set is unchanged before/after
-  (8665 ↔ 8665, zero line diff), so this needs no `INDEX_VERSION` step beyond
-  the 55 this batch already carries.
+  import) rather than last-write-wins.
+
+  Measured in both regimes, because they behave differently. Within one batch
+  (this repo, 228 files against `BATCH_SIZE` 500) the edge set is unchanged,
+  8665 ↔ 8665 with zero line diff — only the sentinel's type moved. **Across
+  batches — which is every repo over 500 files — the ordering was costing
+  edges, not just stability.** With `BATCH_SIZE` forced to 25 over the same
+  tree, three pre-fix runs produced 7487, 7619 and 7891 edges (2402 and 2880
+  differing lines against the first run); three post-fix runs produced 7997
+  every time, zero diff. Sorted order keeps a directory's files in one batch,
+  where same-batch resolution can bind them; arbitrary order scattered them
+  across batches and the cross-batch bindings were simply lost. So a
+  multi-batch repo does get a different index out of this — covered by the
+  53 → 55 `INDEX_VERSION` step this batch already carries, which forces the
+  rebuild that picks it up.
 - **SQL `LIKE` treated `_` as a wildcard in the test-source filter** (P2-10), so
   `latest.cs` (`%`=`l`, `_`=`a`, then `test.`) and `attest.py` were classified as
   tests and dropped from every production-caller count. The `'test\_%'` leg one
