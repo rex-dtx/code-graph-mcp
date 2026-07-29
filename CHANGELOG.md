@@ -26,6 +26,17 @@ emit one (see the PHP and ESM entries below), so the index changes for any repo
 containing either.
 
 ### Fixed
+- **CommonJS exports were invisible, so `dead-code` called them orphans.** An
+  incoming `exports` edge is what makes `find_dead_code` report an unused symbol
+  as `exported_unused` ("public surface, something outside may use it") rather
+  than `orphan` ("nothing references this"). Only the ESM `export` keyword
+  produced one. Identical dead code therefore got opposite verdicts by module
+  system — and CommonJS got the stronger, more dangerous one, the verdict a user
+  reads as *safe to delete*, on a module's public API. `module.exports = { f }`,
+  `module.exports = f`, `exports.f = g` and `module.exports.f = g` all emit the
+  edge now, targeting the identifier that names the real symbol rather than the
+  export key. Measured on this repository, whose entire plugin is CommonJS:
+  **+241 `exports` edges, 0 removed** (batch size 500; +233 at 25).
 - **PHP `require_once "lib.php"` emitted no import edge at all** — the
   double-quoted spelling of all four include keywords (`require`,
   `require_once`, `include`, `include_once`), while the single-quoted spelling
@@ -74,7 +85,24 @@ containing either.
   emitting `implements` for every Kotlin supertype fails instead of
   double-counting.
 
-  Both tables assert `files_with_parse_errors == 0`. tree-sitter recovers from a
+- **Three more parity tables**, closing the axes that had no numeric guard:
+  the **method-call spelling** per OO language, **`exports` across module
+  systems** (which is what surfaced the CommonJS defect), and the **`references`
+  axis one fixture per PASS**. That last granularity was itself found by
+  mutation: a first version asserted "each reference-capable language emits ≥ 1"
+  and survived deleting Go's `type_identifier` row, because Go's other pass kept
+  the count above zero — a language with two passes made the guard vacuous for
+  both.
+
+  The call axis was swept the same way the import axis was, and came back
+  clean: 46 spellings across 15 languages (receiver calls, qualified/static
+  calls, chained calls, optional chaining, `Self::assoc`, `super()`, Kotlin
+  extension functions, C++ out-of-class definitions) all resolve. It is the
+  most-worked axis in the crate, which is the likeliest explanation. Only the
+  receiver spelling is pinned, since that is the one that has shipped broken
+  before.
+
+  All tables assert `files_with_parse_errors == 0`. tree-sitter recovers from a
   syntax error by returning a damaged tree, so a bad fixture still yields
   symbols and a missing edge would be ambiguous between "the arm is gone" and
   "this fixture never parsed" — not hypothetical: a single-line Kotlin class

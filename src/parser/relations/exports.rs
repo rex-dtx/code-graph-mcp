@@ -150,3 +150,108 @@ fn collect_reexport_specifiers(
         }
     }
 }
+
+/// CommonJS export forms → the same `REL_EXPORTS` edges the ESM `export`
+/// keyword produces.
+///
+/// `find_dead_code` uses an incoming `exports` edge to decide whether an unused
+/// symbol is reported as an ORPHAN ("nothing references this") or as
+/// EXPORTED_UNUSED ("this is public surface; something outside may use it").
+/// With CommonJS unhandled, identical dead code got opposite verdicts —
+/// `export function f(){}` in a `.ts` came back `exported_unused` while
+/// `module.exports = { f }` in a `.js` came back `orphan`, the stronger and more
+/// dangerous claim, inviting deletion of a module's public API. Every JS file in
+/// this repo's own plugin is CommonJS.
+///
+/// Handled, all as `<module> --exports--> <symbol>`:
+///   * `module.exports = { helper }`      (shorthand)
+///   * `module.exports = { key: helper }` (pair — the VALUE names the symbol)
+///   * `module.exports = helper`          (single binding)
+///   * `exports.name = helper` / `module.exports.name = helper`
+///
+/// The edge targets the identifier that names a real symbol, not the export
+/// key, because that is the node whose deadness is being classified. An inline
+/// `exports.f = function () {}` names no node; the edge is emitted against the
+/// key and simply drops in Phase 2 (an unresolved `exports` relation reaches no
+/// sentinel), which is the same no-op as before.
+pub(super) fn extract_cjs_exports(
+    node: &tree_sitter::Node,
+    source: &str,
+    results: &mut Vec<ParsedRelation>,
+) {
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    if left.kind() != "member_expression" {
+        return;
+    }
+    let left_text = node_text(&left, source);
+
+    let mut emit = |name: &str| {
+        if name.is_empty() {
+            return;
+        }
+        results.push(ParsedRelation {
+            source_name: "<module>".into(),
+            target_name: name.to_string(),
+            relation: REL_EXPORTS.into(),
+            metadata: None,
+            source_language: String::new(),
+        });
+    };
+
+    if left_text == "module.exports" {
+        match right.kind() {
+            // `module.exports = { a, b: c }`
+            "object" => {
+                for i in 0..right.named_child_count() {
+                    let Some(prop) = right.named_child(i) else {
+                        continue;
+                    };
+                    match prop.kind() {
+                        "shorthand_property_identifier" => emit(node_text(&prop, source)),
+                        "pair" => {
+                            // The VALUE is the symbol; fall back to the key when
+                            // the value is not a plain identifier.
+                            let named = prop
+                                .child_by_field_name("value")
+                                .filter(|v| v.kind() == "identifier")
+                                .or_else(|| prop.child_by_field_name("key"));
+                            if let Some(n) = named {
+                                emit(node_text(&n, source));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // `module.exports = helper`
+            "identifier" => emit(node_text(&right, source)),
+            _ => {}
+        }
+        return;
+    }
+
+    // `exports.name = helper` / `module.exports.name = helper`
+    let is_exports_member = left
+        .child_by_field_name("object")
+        .map(|o| {
+            let t = node_text(&o, source);
+            t == "exports" || t == "module.exports"
+        })
+        .unwrap_or(false);
+    if !is_exports_member {
+        return;
+    }
+    let named = if right.kind() == "identifier" {
+        Some(right)
+    } else {
+        left.child_by_field_name("property")
+    };
+    if let Some(n) = named {
+        emit(node_text(&n, source));
+    }
+}

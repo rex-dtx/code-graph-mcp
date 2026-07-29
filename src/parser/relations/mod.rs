@@ -81,7 +81,7 @@ mod tests;
 
 use cpp::{extract_cpp_inheritance, extract_cpp_value_reference};
 use dart::{extract_dart_call_from_selector, extract_dart_imports};
-use exports::extract_export_names;
+use exports::{extract_cjs_exports, extract_export_names};
 use go::{extract_go_inheritance, extract_go_type_reference, extract_go_value_reference};
 use helpers::{extract_callee, extract_string_from_subtree, MAX_SUBTREE_DEPTH};
 use imports::{
@@ -1352,6 +1352,14 @@ fn walk_for_relations(
         // Export statements (TS/JS)
         "export_statement" => {
             extract_export_names(&node, source, results);
+        }
+
+        // CommonJS exports (`module.exports = { f }`, `exports.f = g`). The ESM
+        // arm above has no counterpart for them, so dead-code classified an
+        // unused CJS export as an ORPHAN — "nothing references this" — while the
+        // identical ESM code came back EXPORTED_UNUSED.
+        "assignment_expression" if matches!(config.name, "javascript" | "typescript" | "tsx") => {
+            extract_cjs_exports(&node, source, results);
         }
 
         // Rust: impl Trait for Type → implements edge (type-level + method-level)

@@ -636,3 +636,246 @@ fn inheritance_parity_across_every_inheritance_capable_language() {
         unexpected.join("\n  ")
     );
 }
+
+/// The METHOD-call spelling, per OO language.
+///
+/// `call_extraction_parity_across_every_call_capable_language` exercises exactly
+/// one spelling — a free function calling a free function. The import table
+/// above exists because both defects it found lived in the *spelling* dimension
+/// rather than the language dimension, so the same question was put to the call
+/// axis: 46 spellings across 15 languages (receiver calls, qualified/static
+/// calls, chained calls, optional chaining, `Self::assoc`, `super()`, Kotlin
+/// extension functions, C++ out-of-class definitions) were measured and every
+/// one resolved. Nothing to fix — but the receiver path is the one that has
+/// actually shipped broken (intra-class method→sibling-method edges vanished
+/// once already), so the second spelling is pinned here rather than left to the
+/// next audit.
+///
+/// Callee and caller share a file on purpose: a cross-file fixture would make a
+/// zero ambiguous between "the arm is gone" and a resolution limitation. That
+/// is not hypothetical either — a C++ call to an INHERITED method extracts fine
+/// and then sits unresolved in `pending_unresolved_calls`, because binding it
+/// needs class-hierarchy awareness the resolver does not have.
+#[test]
+fn method_call_parity_across_every_oo_language() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("typescript", "m.ts", "class MTs {\n    helper(): number { return 1; }\n    handle(): number { return this.helper(); }\n}\n"),
+        ("javascript", "m.js", "class MJs {\n    helper() { return 1; }\n    handle() { return this.helper(); }\n}\n"),
+        ("python", "m.py", "class MPy:\n    def helper(self):\n        return 1\n\n    def handle(self):\n        return self.helper()\n"),
+        ("rust", "m.rs", "pub struct MRs;\nimpl MRs {\n    pub fn helper(&self) -> i32 { 1 }\n    pub fn handle(&self) -> i32 { self.helper() }\n}\n"),
+        ("go", "m.go", "package main\n\ntype MGo struct{}\n\nfunc (g MGo) helper() int { return 1 }\nfunc (g MGo) handle() int { return g.helper() }\n"),
+        ("java", "MJv.java", "class MJv {\n    int helper() { return 1; }\n    int handle() { return this.helper(); }\n}\n"),
+        ("csharp", "MCs.cs", "class MCs {\n    int Helper() { return 1; }\n    int Handle() { return this.Helper(); }\n}\n"),
+        ("kotlin", "m.kt", "class MKt {\n    fun helper(): Int {\n        return 1\n    }\n\n    fun handle(): Int {\n        return this.helper()\n    }\n}\n"),
+        ("ruby", "m.rb", "class MRb\n  def helper\n    1\n  end\n\n  def handle\n    self.helper\n  end\nend\n"),
+        ("php", "m.php", "<?php\nclass MPhp {\n    public function helper() { return 1; }\n    public function handle() { return $this->helper(); }\n}\n"),
+        ("swift", "m.swift", "class MSw {\n    func helper() -> Int {\n        return 1\n    }\n\n    func handle() -> Int {\n        return self.helper()\n    }\n}\n"),
+        ("dart", "m.dart", "class MDt {\n  int helper() => 1;\n  int handle() => this.helper();\n}\n"),
+        ("cpp", "m.cpp", "class MCpp {\npublic:\n    int helper() { return 1; }\n    int handle() { return this->helper(); }\n};\n"),
+    ];
+
+    let files: Vec<(&str, &str)> = cases.iter().map(|(_, f, s)| (*f, *s)).collect();
+    let (_p, db) = index_parity_fixture(&files);
+
+    // Per FILE, not per language: a language with two fixtures would otherwise
+    // let the free-function one satisfy the method-call assertion.
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT count(*) FROM edges e JOIN nodes s ON e.source_id = s.id \
+             JOIN files f ON s.file_id = f.id WHERE e.relation = 'calls' AND f.path = ?1",
+        )
+        .unwrap();
+    let missing: Vec<&str> = cases
+        .iter()
+        .filter(|(_, file, _)| {
+            stmt.query_row([format!("src/{file}")], |r| r.get::<_, i64>(0))
+                .unwrap_or(0)
+                < 1
+        })
+        .map(|(lang, _, _)| *lang)
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these languages lost the receiver/method call spelling — a sibling-method call \
+         inside one class produced no `calls` edge: {missing:?}"
+    );
+}
+
+/// `exports` edges for CommonJS, not just ESM — and the dead-code verdict that
+/// rides on them.
+///
+/// An incoming `exports` edge is what makes `find_dead_code` report an unused
+/// symbol as EXPORTED_UNUSED ("public surface, something outside may use it")
+/// rather than ORPHAN ("nothing references this"). Only the ESM `export`
+/// keyword produced one, so identical dead code got opposite verdicts by module
+/// system — and CommonJS got the stronger, more dangerous one, inviting deletion
+/// of a module's public API. Every JS file in this repo's own plugin is
+/// CommonJS.
+///
+/// The category is asserted, not just the edge, because the category is the
+/// thing a user acts on. `min_lines` is why the fixtures have bodies.
+#[test]
+fn exports_parity_across_module_systems() {
+    let files: &[(&str, &str)] = &[
+        (
+            "esm.ts",
+            "export function esmUnused(a: number, b: number): number {\n  const x = a + b;\n  const y = x * 2;\n  return y;\n}\n",
+        ),
+        (
+            "shorthand.js",
+            "function cjsShorthand(a, b) {\n  const x = a + b;\n  const y = x * 2;\n  return y;\n}\nmodule.exports = { cjsShorthand };\n",
+        ),
+        (
+            "pair.js",
+            "function cjsPair(a, b) {\n  const x = a + b;\n  const y = x * 2;\n  return y;\n}\nmodule.exports = { alias: cjsPair };\n",
+        ),
+        (
+            "single.js",
+            "function cjsSingle(a, b) {\n  const x = a + b;\n  const y = x * 2;\n  return y;\n}\nmodule.exports = cjsSingle;\n",
+        ),
+        (
+            "prop.js",
+            "function cjsProp(a, b) {\n  const x = a + b;\n  const y = x * 2;\n  return y;\n}\nexports.cjsProp = cjsProp;\n",
+        ),
+    ];
+    let expected_exported = [
+        "esmUnused",
+        "cjsShorthand",
+        "cjsPair",
+        "cjsSingle",
+        "cjsProp",
+    ];
+
+    let (_p, db) = index_parity_fixture(files);
+
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT count(*) FROM edges e JOIN nodes t ON e.target_id = t.id \
+             WHERE e.relation = 'exports' AND t.name = ?1",
+        )
+        .unwrap();
+    let no_edge: Vec<&str> = expected_exported
+        .iter()
+        .copied()
+        .filter(|name| stmt.query_row([name], |r| r.get::<_, i64>(0)).unwrap_or(0) < 1)
+        .collect();
+    assert!(
+        no_edge.is_empty(),
+        "these exported symbols got no `exports` edge, so dead-code will call them orphans: \
+         {no_edge:?}"
+    );
+
+    // The consequence, end to end.
+    let dead =
+        code_graph_mcp::storage::queries::find_dead_code(db.conn(), None, None, false, 3, 50)
+            .unwrap();
+    let orphaned: Vec<&str> = dead
+        .iter()
+        .filter(|d| {
+            expected_exported.contains(&d.name.as_str())
+                && !code_graph_mcp::domain::is_dead_code_exported(
+                    d.has_export_edge,
+                    &d.code_content,
+                    &d.file_path,
+                    &d.name,
+                )
+        })
+        .map(|d| d.name.as_str())
+        .collect();
+    assert!(
+        orphaned.is_empty(),
+        "dead-code called these exported symbols ORPHANS — the verdict that reads as \
+         'safe to delete': {orphaned:?}"
+    );
+}
+
+/// The `references` axis, one fixture per PASS.
+///
+/// `tests/reference_pass_wiring.rs` asserts every `extract_*_reference` appears
+/// in `REFERENCE_PASSES` — that the wiring exists. It cannot see an extractor
+/// gutted behind live wiring, so this runs the axis end to end.
+///
+/// Per pass, not per language, and that distinction was found the hard way: a
+/// first version asserted "each reference-capable language emits ≥ 1" and
+/// survived deleting Go's `type_identifier` row, because Go's OTHER pass
+/// (`identifier` → value reference) kept the count above zero. A language with
+/// two passes made the guard vacuous for both. Each row below exercises exactly
+/// one pass in its own file, so deleting any single row reddens exactly one row
+/// here.
+#[test]
+fn reference_parity_one_fixture_per_pass() {
+    let cases: &[(&str, &str, &str)] = &[
+        // rust: scoped_identifier → path reference
+        ("rust path (crate::LIMIT)", "rp.rs", "pub const LIMIT: i32 = 5;\npub fn read_limit() -> i32 {\n    crate::LIMIT\n}\n"),
+        // rust: type_identifier → type reference
+        ("rust type (&Widget)", "rt.rs", "pub struct Widget {\n    pub id: i32,\n}\npub fn take(w: &Widget) -> i32 {\n    w.id\n}\n"),
+        // rust: identifier → value reference (fn passed as a value)
+        ("rust value (use_cb(cb))", "rv.rs", "pub fn cb() -> i32 {\n    1\n}\npub fn use_cb(f: fn() -> i32) -> i32 {\n    f()\n}\npub fn run() -> i32 {\n    use_cb(cb)\n}\n"),
+        // ts: type_identifier → type reference
+        ("ts type (s: Shape)", "t.ts", "export interface Shape {\n    side: number;\n}\nexport function area(s: Shape): number {\n    return s.side;\n}\n"),
+        // js: identifier → value reference
+        ("js value (register(handler))", "v.js", "function handler() {\n    return 1;\n}\nfunction register(fn) {\n    return fn();\n}\nfunction boot() {\n    return register(handler);\n}\nmodule.exports = { boot };\n"),
+        // python: identifier in ANNOTATION context → type reference
+        ("py type (s: Shape)", "pt.py", "class Shape:\n    pass\n\ndef area(s: Shape) -> int:\n    return 1\n"),
+        // python: identifier in VALUE position → value reference
+        ("py value (register(handler))", "pv.py", "def handler():\n    return 2\n\ndef register(fn):\n    return fn()\n\ndef boot():\n    return register(handler)\n"),
+        // go: type_identifier → type reference
+        ("go type (s Shape)", "gt.go", "package main\n\ntype Shape struct{ Side int }\n\nfunc area(s Shape) int { return s.Side }\n"),
+        // go: identifier → value reference
+        ("go value (register(handler))", "gv.go", "package main\n\nfunc handler() int { return 1 }\n\nfunc register(fn func() int) int { return fn() }\n\nfunc boot() int { return register(handler) }\n"),
+        // java: type_identifier → type reference
+        ("java type (Shape s)", "Jt.java", "class Shape {\n    int side;\n}\n\nclass Jt {\n    int area(Shape s) {\n        return s.side;\n    }\n}\n"),
+        // c/cpp: identifier → value reference (function pointer)
+        ("c value (register_cb(handler))", "cv.c", "int handler(int a) { return a; }\nint register_cb(int (*fn)(int)) { return fn(1); }\nint boot(void) { return register_cb(handler); }\n"),
+    ];
+
+    // Languages with NO reference passes at all. Indexed so the zero half is
+    // exercised against real files rather than absent ones.
+    let no_pass_files: &[(&str, &str)] = &[
+        ("z.rb", "class RbShape\n  def side\n    1\n  end\nend\n\ndef rb_area(s)\n  s.side\nend\n"),
+        ("z.php", "<?php\nclass PhpShape {\n    public function side() { return 1; }\n}\n\nfunction php_area(PhpShape $s) { return $s->side(); }\n"),
+        ("z.kt", "class KtShape {\n    fun side(): Int {\n        return 1\n    }\n}\n\nfun ktArea(s: KtShape): Int {\n    return s.side()\n}\n"),
+    ];
+
+    let mut files: Vec<(&str, &str)> = cases.iter().map(|(_, f, s)| (*f, *s)).collect();
+    files.extend_from_slice(no_pass_files);
+    let (_p, db) = index_parity_fixture(&files);
+
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT count(*) FROM edges e JOIN nodes s ON e.source_id = s.id \
+             JOIN files f ON s.file_id = f.id \
+             WHERE e.relation = 'references' AND f.path = ?1",
+        )
+        .unwrap();
+    let mut count = |file: &str| -> i64 {
+        stmt.query_row([format!("src/{file}")], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+    };
+
+    let silent: Vec<&str> = cases
+        .iter()
+        .filter(|(_, file, _)| count(file) < 1)
+        .map(|(label, _, _)| *label)
+        .collect();
+    assert!(
+        silent.is_empty(),
+        "these REFERENCE_PASSES rows produced no edge — the pass is wired but not working: \
+         {silent:?}"
+    );
+
+    let unexpected: Vec<&str> = no_pass_files
+        .iter()
+        .filter(|(file, _)| count(file) > 0)
+        .map(|(file, _)| *file)
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "these languages have no REFERENCE_PASSES row yet emitted `references` edges — either a \
+         row was added (update this list) or something is manufacturing them: {unexpected:?}"
+    );
+}
