@@ -371,6 +371,64 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
     })
 }
 
+/// The `<module>` node of one file, as a target list.
+///
+/// Three import forms bind to a whole file rather than a symbol — JS namespace
+/// and star re-export, PHP `require`, C `#include` — and each had its own copy
+/// of this lookup. Returns empty when the file is not indexed, which every
+/// caller reads as "unresolved specifier, fall through".
+fn module_node_of(
+    name_to_ids: &HashMap<String, Vec<i64>>,
+    node_id_to_path: &HashMap<i64, String>,
+    file: &str,
+) -> Vec<i64> {
+    name_to_ids
+        .get("<module>")
+        .map(|ids| {
+            ids.iter()
+                .copied()
+                .filter(|id| node_id_to_path.get(id).map(|p| p == file).unwrap_or(false))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Insert the `sources` × `targets` cross-product for one relation.
+///
+/// Every Phase-2 resolution branch ends this way, and each used to carry its
+/// own copy of the double loop — twelve of them, which is exactly the shape
+/// where a later fix lands in one copy and not the other eleven.
+///
+/// `allow_self` exists for `routes_to` alone: a route's handler IS its target,
+/// and that self-edge is what carries the method/path metadata that trace and
+/// impact read. Every other branch drops self-edges. It is a parameter rather
+/// than a `relation == REL_ROUTES_TO` test inside because only the fallthrough
+/// branch ever sees a `routes_to` relation — deciding it here would silently
+/// widen the other eleven if that ever stopped being true.
+///
+/// Returns the number of rows actually created; `insert_edge_cached` dedups,
+/// so a repeat of an existing edge counts zero.
+fn insert_relation_edges(
+    db: &Database,
+    sources: &[i64],
+    targets: &[i64],
+    relation: &str,
+    metadata: Option<&str>,
+    allow_self: bool,
+) -> Result<usize> {
+    let mut created = 0usize;
+    for &src_id in sources {
+        for &tgt_id in targets {
+            if (src_id != tgt_id || allow_self)
+                && insert_edge_cached(db.conn(), src_id, tgt_id, relation, metadata)?
+            {
+                created += 1;
+            }
+        }
+    }
+    Ok(created)
+}
+
 /// Phase 0: cascade-delete `delete_paths` in a transaction of its own, after
 /// buffering the inbound calls that cascade is about to strip.
 ///
@@ -684,6 +742,20 @@ pub(super) fn index_files(
                         refine_ambiguous_targets(&same_lang, &pf.rel_path, &node_id_to_path);
                 }
 
+                // The five metadata-driven import forms below all key off the same
+                // JSON blob, and each used to parse it again — five `from_str`
+                // calls per import relation, four of them thrown away. Parse once.
+                // Order still decides: namespace/star, then Python module, then
+                // JS specifier, then PHP include, then C include, then the
+                // default name-based chain.
+                let import_meta: Option<serde_json::Value> = if rel.relation == REL_IMPORTS {
+                    rel.metadata
+                        .as_deref()
+                        .and_then(|m| serde_json::from_str(m).ok())
+                } else {
+                    None
+                };
+
                 // Module-level import markers (v51, roadmap §2.3): namespace
                 // bindings (`const m = require('./x')` q:"ns_require", `import *
                 // as ns from './x'` q:"ns_import") and star re-exports (`export *
@@ -695,106 +767,68 @@ pub(super) fn index_files(
                 // star-barrel dependency is finally visible to deps/affected/
                 // cycles/map. Unresolvable specifier (external package) → no
                 // edge, same as before. Always `continue`: never fall through.
-                if rel.relation == REL_IMPORTS {
-                    if let Some(meta_str) = rel.metadata.as_deref() {
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if matches!(
-                                meta.get("q").and_then(|v| v.as_str()),
-                                Some("ns_require") | Some("ns_import") | Some("star_reexport")
-                            ) {
-                                if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
-                                    if let Some(file) = resolve_js_specifier_path(
-                                        spec,
-                                        &pf.rel_path,
-                                        &all_file_paths,
-                                    ) {
-                                        let module_targets: Vec<i64> = name_to_ids
-                                            .get("<module>")
-                                            .map(|ids| {
-                                                ids.iter()
-                                                    .copied()
-                                                    .filter(|id| {
-                                                        node_id_to_path
-                                                            .get(id)
-                                                            .map(|p| p == &file)
-                                                            .unwrap_or(false)
-                                                    })
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default();
-                                        for &src_id in &source_ids {
-                                            for &tgt_id in &module_targets {
-                                                if src_id != tgt_id
-                                                    && insert_edge_cached(
-                                                        db.conn(),
-                                                        src_id,
-                                                        tgt_id,
-                                                        &rel.relation,
-                                                        rel.metadata.as_deref(),
-                                                    )?
-                                                {
-                                                    total_edges_created += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                continue;
+                if let Some(meta) = import_meta.as_ref() {
+                    if matches!(
+                        meta.get("q").and_then(|v| v.as_str()),
+                        Some("ns_require") | Some("ns_import") | Some("star_reexport")
+                    ) {
+                        if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
+                            if let Some(file) =
+                                resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths)
+                            {
+                                let module_targets =
+                                    module_node_of(&name_to_ids, &node_id_to_path, &file);
+                                total_edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &module_targets,
+                                    &rel.relation,
+                                    rel.metadata.as_deref(),
+                                    false,
+                                )?;
                             }
                         }
+                        continue;
                     }
                 }
 
                 // Try Python module-constrained resolution for import edges
-                if rel.relation == REL_IMPORTS {
-                    if let Some(ref meta_str) = rel.metadata {
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if let Some(python_module) =
-                                meta.get("python_module").and_then(|v| v.as_str())
-                            {
-                                let is_module_import = meta
-                                    .get("is_module_import")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                if python_module_map.contains_key(python_module) {
-                                    // Internal module — try constrained resolution
-                                    if let Some(module_targets) = resolve_python_module_targets(
-                                        python_module,
-                                        is_module_import,
-                                        &rel.target_name,
-                                        &python_module_map,
-                                        &node_id_to_path,
-                                        &name_to_ids,
-                                    ) {
-                                        for &src_id in &source_ids {
-                                            for &tgt_id in &module_targets {
-                                                if src_id != tgt_id
-                                                    && insert_edge_cached(
-                                                        db.conn(),
-                                                        src_id,
-                                                        tgt_id,
-                                                        &rel.relation,
-                                                        rel.metadata.as_deref(),
-                                                    )?
-                                                {
-                                                    total_edges_created += 1;
-                                                }
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    // Module found but symbol not found — fall through to default
-                                } else {
-                                    // External module — track for virtual node creation.
-                                    // For `from X import Y`, we track the module-level dependency (X),
-                                    // not the individual symbol (Y), since we can't index external code.
-                                    for &src_id in &source_ids {
-                                        external_python_imports
-                                            .push((src_id, python_module.to_string()));
-                                    }
-                                    continue; // No point in default resolution for external imports
-                                }
+                if let Some(meta) = import_meta.as_ref() {
+                    if let Some(python_module) = meta.get("python_module").and_then(|v| v.as_str())
+                    {
+                        let is_module_import = meta
+                            .get("is_module_import")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if python_module_map.contains_key(python_module) {
+                            // Internal module — try constrained resolution
+                            if let Some(module_targets) = resolve_python_module_targets(
+                                python_module,
+                                is_module_import,
+                                &rel.target_name,
+                                &python_module_map,
+                                &node_id_to_path,
+                                &name_to_ids,
+                            ) {
+                                total_edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &module_targets,
+                                    &rel.relation,
+                                    rel.metadata.as_deref(),
+                                    false,
+                                )?;
+                                continue;
                             }
+                            // Module found but symbol not found — fall through to default
+                        } else {
+                            // External module — track for virtual node creation.
+                            // For `from X import Y`, we track the module-level dependency (X),
+                            // not the individual symbol (Y), since we can't index external code.
+                            for &src_id in &source_ids {
+                                external_python_imports.push((src_id, python_module.to_string()));
+                            }
+                            continue; // No point in default resolution for external imports
                         }
                     }
                 }
@@ -807,40 +841,28 @@ pub(super) fn index_files(
                 // 2d-bind, this also repoints the matching bare calls. Bare/
                 // external/unindexed specifiers return None → fall through to
                 // default name-based / `<external>` resolution (unchanged).
-                if rel.relation == REL_IMPORTS {
-                    if let Some(ref meta_str) = rel.metadata {
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str())
-                            {
-                                if let Some(targets) = resolve_js_module_targets(
-                                    js_module,
-                                    &pf.rel_path,
-                                    &rel.target_name,
-                                    &all_file_paths,
-                                    &name_to_ids,
-                                    &node_id_to_path,
-                                ) {
-                                    for &src_id in &source_ids {
-                                        for &tgt_id in &targets {
-                                            if src_id != tgt_id
-                                                && insert_edge_cached(
-                                                    db.conn(),
-                                                    src_id,
-                                                    tgt_id,
-                                                    &rel.relation,
-                                                    rel.metadata.as_deref(),
-                                                )?
-                                            {
-                                                total_edges_created += 1;
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
-                                // Unresolved (bare pkg / re-export / unindexed) —
-                                // fall through to default resolution below.
-                            }
+                if let Some(meta) = import_meta.as_ref() {
+                    if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str()) {
+                        if let Some(targets) = resolve_js_module_targets(
+                            js_module,
+                            &pf.rel_path,
+                            &rel.target_name,
+                            &all_file_paths,
+                            &name_to_ids,
+                            &node_id_to_path,
+                        ) {
+                            total_edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &targets,
+                                &rel.relation,
+                                rel.metadata.as_deref(),
+                                false,
+                            )?;
+                            continue;
                         }
+                        // Unresolved (bare pkg / re-export / unindexed) —
+                        // fall through to default resolution below.
                     }
                 }
 
@@ -851,50 +873,27 @@ pub(super) fn index_files(
                 // node so deps/cycles/affected/project_map see the cross-file
                 // include dependency. Unindexed/vendored paths return None →
                 // fall through to default (`<external>`) resolution.
-                if rel.relation == REL_IMPORTS {
-                    if let Some(ref meta_str) = rel.metadata {
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if let Some(inc) = meta.get("php_include").and_then(|v| v.as_str()) {
-                                if let Some(file) =
-                                    resolve_php_include_path(inc, &pf.rel_path, &all_file_paths)
-                                {
-                                    // Bind to the resolved file's <module> node.
-                                    let module_targets: Vec<i64> = name_to_ids
-                                        .get("<module>")
-                                        .map(|ids| {
-                                            ids.iter()
-                                                .copied()
-                                                .filter(|id| {
-                                                    node_id_to_path
-                                                        .get(id)
-                                                        .map(|p| p == &file)
-                                                        .unwrap_or(false)
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    if !module_targets.is_empty() {
-                                        for &src_id in &source_ids {
-                                            for &tgt_id in &module_targets {
-                                                if src_id != tgt_id
-                                                    && insert_edge_cached(
-                                                        db.conn(),
-                                                        src_id,
-                                                        tgt_id,
-                                                        &rel.relation,
-                                                        rel.metadata.as_deref(),
-                                                    )?
-                                                {
-                                                    total_edges_created += 1;
-                                                }
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                }
-                                // Unindexed include → fall through to default.
+                if let Some(meta) = import_meta.as_ref() {
+                    if let Some(inc) = meta.get("php_include").and_then(|v| v.as_str()) {
+                        if let Some(file) =
+                            resolve_php_include_path(inc, &pf.rel_path, &all_file_paths)
+                        {
+                            // Bind to the resolved file's <module> node.
+                            let module_targets =
+                                module_node_of(&name_to_ids, &node_id_to_path, &file);
+                            if !module_targets.is_empty() {
+                                total_edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &module_targets,
+                                    &rel.relation,
+                                    rel.metadata.as_deref(),
+                                    false,
+                                )?;
+                                continue;
                             }
                         }
+                        // Unindexed include → fall through to default.
                     }
                 }
 
@@ -905,49 +904,26 @@ pub(super) fn index_files(
                 // affected/project_map see the local header dependency. System
                 // headers (`<stdio.h>`) / unindexed paths return None → fall
                 // through to default (`<external>`) resolution (M6).
-                if rel.relation == REL_IMPORTS {
-                    if let Some(ref meta_str) = rel.metadata {
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if let Some(inc) = meta.get("c_include").and_then(|v| v.as_str()) {
-                                if let Some(file) =
-                                    resolve_c_include_path(inc, &pf.rel_path, &all_file_paths)
-                                {
-                                    let module_targets: Vec<i64> = name_to_ids
-                                        .get("<module>")
-                                        .map(|ids| {
-                                            ids.iter()
-                                                .copied()
-                                                .filter(|id| {
-                                                    node_id_to_path
-                                                        .get(id)
-                                                        .map(|p| p == &file)
-                                                        .unwrap_or(false)
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    if !module_targets.is_empty() {
-                                        for &src_id in &source_ids {
-                                            for &tgt_id in &module_targets {
-                                                if src_id != tgt_id
-                                                    && insert_edge_cached(
-                                                        db.conn(),
-                                                        src_id,
-                                                        tgt_id,
-                                                        &rel.relation,
-                                                        rel.metadata.as_deref(),
-                                                    )?
-                                                {
-                                                    total_edges_created += 1;
-                                                }
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                }
-                                // Unindexed include → fall through to default.
+                if let Some(meta) = import_meta.as_ref() {
+                    if let Some(inc) = meta.get("c_include").and_then(|v| v.as_str()) {
+                        if let Some(file) =
+                            resolve_c_include_path(inc, &pf.rel_path, &all_file_paths)
+                        {
+                            let module_targets =
+                                module_node_of(&name_to_ids, &node_id_to_path, &file);
+                            if !module_targets.is_empty() {
+                                total_edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &module_targets,
+                                    &rel.relation,
+                                    rel.metadata.as_deref(),
+                                    false,
+                                )?;
+                                continue;
                             }
                         }
+                        // Unindexed include → fall through to default.
                     }
                 }
 
@@ -973,21 +949,14 @@ pub(super) fn index_files(
                                         // (would be an external trait method anyway).
                                         continue;
                                     }
-                                    for &src_id in &source_ids {
-                                        for &tgt_id in &filtered {
-                                            if src_id != tgt_id
-                                                && insert_edge_cached(
-                                                    db.conn(),
-                                                    src_id,
-                                                    tgt_id,
-                                                    &rel.relation,
-                                                    rel.metadata.as_deref(),
-                                                )?
-                                            {
-                                                total_edges_created += 1;
-                                            }
-                                        }
-                                    }
+                                    total_edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &filtered,
+                                        &rel.relation,
+                                        rel.metadata.as_deref(),
+                                        false,
+                                    )?;
                                     continue;
                                 }
                             }
@@ -1035,21 +1004,14 @@ pub(super) fn index_files(
                                     })
                                     .unwrap_or_default();
                                 if !targets.is_empty() {
-                                    for &src_id in &source_ids {
-                                        for &tgt_id in &targets {
-                                            if src_id != tgt_id
-                                                && insert_edge_cached(
-                                                    db.conn(),
-                                                    src_id,
-                                                    tgt_id,
-                                                    &rel.relation,
-                                                    rel.metadata.as_deref(),
-                                                )?
-                                            {
-                                                total_edges_created += 1;
-                                            }
-                                        }
-                                    }
+                                    total_edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &targets,
+                                        &rel.relation,
+                                        rel.metadata.as_deref(),
+                                        false,
+                                    )?;
                                     continue;
                                 }
                             }
@@ -1104,19 +1066,14 @@ pub(super) fn index_files(
                             };
                             match target {
                                 Some(tgt_id) => {
-                                    for &src_id in &source_ids {
-                                        if src_id != tgt_id
-                                            && insert_edge_cached(
-                                                db.conn(),
-                                                src_id,
-                                                tgt_id,
-                                                &rel.relation,
-                                                rel.metadata.as_deref(),
-                                            )?
-                                        {
-                                            total_edges_created += 1;
-                                        }
-                                    }
+                                    total_edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &[tgt_id],
+                                        &rel.relation,
+                                        rel.metadata.as_deref(),
+                                        false,
+                                    )?;
                                 }
                                 None => {
                                     // Ambiguous → drop without buffering (re-scan
@@ -1155,21 +1112,14 @@ pub(super) fn index_files(
                                 // re-scan will yield the same answer.
                                 continue;
                             }
-                            for &src_id in &source_ids {
-                                for &tgt_id in &filtered {
-                                    if src_id != tgt_id
-                                        && insert_edge_cached(
-                                            db.conn(),
-                                            src_id,
-                                            tgt_id,
-                                            &rel.relation,
-                                            rel.metadata.as_deref(),
-                                        )?
-                                    {
-                                        total_edges_created += 1;
-                                    }
-                                }
-                            }
+                            total_edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &filtered,
+                                &rel.relation,
+                                rel.metadata.as_deref(),
+                                false,
+                            )?;
                             continue;
                         }
                         Some(CalleeMeta::RecvType(recv_type)) => {
@@ -1208,21 +1158,14 @@ pub(super) fn index_files(
                                 .collect();
                             let filtered = self_filter_candidates(&recv_type, &same_lang, db)?;
                             if !filtered.is_empty() {
-                                for &src_id in &source_ids {
-                                    for &tgt_id in &filtered {
-                                        if src_id != tgt_id
-                                            && insert_edge_cached(
-                                                db.conn(),
-                                                src_id,
-                                                tgt_id,
-                                                &rel.relation,
-                                                rel.metadata.as_deref(),
-                                            )?
-                                        {
-                                            total_edges_created += 1;
-                                        }
-                                    }
-                                }
+                                total_edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &filtered,
+                                    &rel.relation,
+                                    rel.metadata.as_deref(),
+                                    false,
+                                )?;
                                 continue;
                             }
                             // filtered empty → fall through to default resolution
@@ -1266,21 +1209,14 @@ pub(super) fn index_files(
                             } else {
                                 filtered
                             };
-                            for &src_id in &source_ids {
-                                for &tgt_id in &final_targets {
-                                    if src_id != tgt_id
-                                        && insert_edge_cached(
-                                            db.conn(),
-                                            src_id,
-                                            tgt_id,
-                                            &rel.relation,
-                                            rel.metadata.as_deref(),
-                                        )?
-                                    {
-                                        total_edges_created += 1;
-                                    }
-                                }
-                            }
+                            total_edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &final_targets,
+                                &rel.relation,
+                                rel.metadata.as_deref(),
+                                false,
+                            )?;
                             continue;
                         }
                         _ => {} // None (Bare) or unrecognized q → falls through to default chain below.
@@ -1427,21 +1363,14 @@ pub(super) fn index_files(
                         ));
                     }
                 } else {
-                    for &src_id in &source_ids {
-                        for &tgt_id in &target_ids {
-                            if (src_id != tgt_id || rel.relation == REL_ROUTES_TO)
-                                && insert_edge_cached(
-                                    db.conn(),
-                                    src_id,
-                                    tgt_id,
-                                    &rel.relation,
-                                    rel.metadata.as_deref(),
-                                )?
-                            {
-                                total_edges_created += 1;
-                            }
-                        }
-                    }
+                    total_edges_created += insert_relation_edges(
+                        db,
+                        &source_ids,
+                        &target_ids,
+                        &rel.relation,
+                        rel.metadata.as_deref(),
+                        rel.relation == REL_ROUTES_TO,
+                    )?;
                 }
             }
         }
