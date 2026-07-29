@@ -1698,7 +1698,25 @@ pub(super) fn index_files(
     // Phase 2c: sweep pending_unresolved_calls — promote any rows whose
     // target_name now resolves against a same-language node. Cheap when the
     // table is empty (typical after a full index of a self-contained codebase).
-    let pending_resolved = resolve_pending_calls(db)?;
+    //
+    // Gated on this batch having PARSED something, because the sweep does two
+    // things and the second one is not free. Resolution: a buffered row can only
+    // start resolving once its target node exists, and nodes appear only from
+    // parsed files — so on a batch that parsed nothing the sweep provably finds
+    // nothing new. Retention: the same call ages every survivor by one attempt.
+    // Ungated, that spent the row's 50-attempt budget on ambient watcher and
+    // periodic-rescan ticks (measured on this repo: attempts = 4 after 26h /
+    // 4 scans, ~2 weeks to the ceiling with the code untouched), and an evicted
+    // row only comes back if the CALLER file is re-indexed — so a forward
+    // reference could go permanently unresolved for no reason but elapsed time.
+    // Attempts now count resolution OPPORTUNITIES.
+    //
+    // Deletions do not qualify: removing nodes can only shrink the candidate set.
+    let pending_resolved = if all_indexed.is_empty() {
+        0
+    } else {
+        resolve_pending_calls(db)?
+    };
     total_edges_created += pending_resolved;
     if pending_resolved > 0 {
         tracing::info!(
@@ -1717,21 +1735,18 @@ pub(super) fn index_files(
     // empty) don't pay for three full-graph scans on the hot path. When anything DID
     // change it must run GLOBALLY, not just over the changed files — adding/removing
     // a duplicate-named node in ONE file flips bind/prune eligibility and the
-    // ambiguity of cross-file edges in OTHER, unchanged files. (Phase 2c above stays
-    // unconditional: it early-returns on an empty pending table, so it is already
-    // cheap on a no-op pass.)
+    // ambiguity of cross-file edges in OTHER, unchanged files.
     //
     // `pending_resolved > 0` is part of the condition because Phase 2c INSERTS
     // edges, and every edge it inserts is a cross-file by-name bind — precisely
-    // the shape Phase 2e downgrades off the `extracted` column default. Today the
-    // term is unreachable: a pending row only becomes resolvable once its target
-    // node exists, which takes a non-empty batch, which already satisfies the
-    // first term. That reachability is an accident of `resolve_pending_calls`
-    // sweeping the WHOLE table in one pass — give it a per-tick cap (the natural
-    // fix for a large backlog, and adjacent to the attempts-counter work) and a
-    // spilled remainder drains on a later no-diff tick, where the first two terms
-    // are false and the edges would keep a confidence they never earned. Gating on
-    // the observable instead of on that argument keeps the invariant local.
+    // the shape Phase 2e downgrades off the `extracted` column default. Phase 2c
+    // is now itself gated on `!all_indexed.is_empty()`, so the term cannot fire
+    // alone — it is kept because it states the actual invariant (Phase 2c wrote
+    // edges ⇒ reclassify) rather than a chain of reasoning about which batches
+    // can produce them. Give the sweep a per-tick cap for large backlogs and the
+    // spilled remainder would drain on a batch whose own files are unchanged;
+    // this term is what keeps those edges from holding a confidence they never
+    // earned. Gating on the observable keeps the invariant local.
     if !all_indexed.is_empty() || !delete_paths.is_empty() || pending_resolved > 0 {
         finalize_tick();
         // Phase 2d-bind: positively resolve bare-name calls to the node an explicit

@@ -476,12 +476,31 @@ pub(super) fn extract_rust_macro_token_call(
     // Tuple-variant/tuple-struct PATTERNS (`matches!(x, Some(y))`) parse
     // identically to calls in a token soup — token_tree carries no
     // pattern-vs-expression split (audit 2026-07-24, empirically reproduced:
-    // `matches!(x, Some(y))` fabricated a calls→Some edge). Variant and type
-    // names are CamelCase by convention (non_camel_case_types lint), while the
-    // fn calls this pass exists to recover are snake_case — so skip
-    // uppercase-initial names. Cost: constructor uses like `vec![Some(1)]`
-    // stay invisible, exactly as they were before this pass existed.
+    // `matches!(x, Some(y))` fabricated a calls→Some edge).
+    //
+    // First line of defence is convention, because it is one comparison: variant
+    // and type names are CamelCase (non_camel_case_types lint), the fn calls this
+    // pass exists to recover are snake_case — so skip uppercase-initial names.
+    //
+    // The cost is two-sided, and only the first half is obvious:
+    //   1. Constructor USES like `vec![Some(1)]` stay invisible, exactly as they
+    //      were before this pass existed.
+    //   2. Because they are invisible, a type CONSTRUCTED ONLY inside macros has
+    //      no inbound edge at all — `find_dead_code` then reports it as dead.
+    //      That is a recall loss on the type, not just on the call: the same
+    //      exclusion that protects `Some` from a fake edge denies a
+    //      macro-only-constructed struct its real one. Widening the skip (e.g.
+    //      to every uppercase name anywhere) makes that worse, not better.
     if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None;
+    }
+    // The reverse gap the convention cannot see: a LOWERCASE tuple variant, which
+    // `#[allow(non_camel_case_types)]` code (bindgen output, C-ABI enum mirrors)
+    // is full of. For the matches!-family shape — which is where pattern-shaped
+    // token soup overwhelmingly comes from — argument position settles it with no
+    // convention at all. Runs second because it walks ancestors and the check
+    // above is one comparison.
+    if in_matches_pattern_position(node, source) {
         return None;
     }
     // `let cb = |v| v + 1; assert_eq!(cb(1), 2)` calls the LOCAL closure. The
@@ -497,6 +516,92 @@ pub(super) fn extract_rust_macro_token_call(
         metadata: None,
         source_language: String::new(),
     })
+}
+
+/// Macros whose second and later top-level arguments are PATTERNS, not
+/// expressions. `matches!` is std; the `assert_matches` pair is the
+/// `assert_matches` crate / unstable std spelling of the same shape.
+const PATTERN_ARG_MACROS: &[&str] = &["matches", "assert_matches", "debug_assert_matches"];
+
+/// True when `node` sits in PATTERN position of a `matches!`-family macro.
+///
+/// Case conventions cannot decide this: `#[allow(non_camel_case_types)]` code
+/// (bindgen output, C-ABI enum mirrors) has lowercase tuple variants, so
+/// `matches!(x, ok(v))` walks past the CamelCase guard in
+/// [`extract_rust_macro_token_call`] and fabricates a `calls → ok` edge aimed at
+/// whichever same-language `fn ok` the resolver picks. Argument position is
+/// structural and needs no convention.
+///
+/// Two shapes reach here. `matches!(…)` written directly is a `macro_invocation`
+/// with a `token_tree` argument list; written INSIDE another macro
+/// (`assert!(matches!(…))`) it is raw tokens — `matches` `!` `(…)` as siblings —
+/// with no `macro_invocation` node anywhere, so the argument list is recognized
+/// by its two preceding tokens instead.
+///
+/// The `if` guard is the counterweight: `matches!(x, ok(v) if is_ready(v))` puts
+/// a real expression after the pattern, and `is_ready` must keep its edge.
+/// Collecting the guard along with the pattern is precisely the over-collection
+/// that silently deleted true edges from the value-reference axis (memory
+/// `feedback_edge_exclusion_verify_by_index_diff`), so the scan returns to
+/// expression state at a top-level `if`.
+fn in_matches_pattern_position(node: &tree_sitter::Node, source: &str) -> bool {
+    let mut child = *node;
+    while let Some(parent) = child.parent() {
+        if parent.kind() == "token_tree" && is_pattern_arg_list(&parent, source) {
+            // Innermost enclosing pattern-macro argument list decides: a nested
+            // `matches!` inside a guard is judged on its OWN argument positions.
+            return child_is_after_pattern_comma(&parent, &child);
+        }
+        child = parent;
+    }
+    false
+}
+
+/// Is this `token_tree` the argument list of a [`PATTERN_ARG_MACROS`] macro?
+fn is_pattern_arg_list(tt: &tree_sitter::Node, source: &str) -> bool {
+    if source.as_bytes().get(tt.start_byte()) != Some(&b'(') {
+        return false;
+    }
+    // Shape 1: a real `macro_invocation` node (macro written at expression level).
+    if let Some(parent) = tt.parent() {
+        if parent.kind() == "macro_invocation" {
+            return parent
+                .child_by_field_name("macro")
+                .map(|m| node_text(&m, source))
+                .is_some_and(|name| PATTERN_ARG_MACROS.contains(&name));
+        }
+    }
+    // Shape 2: raw tokens inside an outer macro's token_tree — `matches` `!` `(…)`.
+    let Some(bang) = tt.prev_sibling() else {
+        return false;
+    };
+    if bang.kind() != "!" {
+        return false;
+    }
+    bang.prev_sibling()
+        .filter(|n| n.kind() == "identifier")
+        .map(|n| node_text(&n, source))
+        .is_some_and(|name| PATTERN_ARG_MACROS.contains(&name))
+}
+
+/// Walk the argument list left to right and report whether `child` (a direct
+/// child of `arg_list` — the ancestor of the identifier under test) lands in
+/// pattern state. State starts as expression (the scrutinee), flips at the first
+/// top-level `,`, and flips back at a top-level `if` (the guard).
+fn child_is_after_pattern_comma(arg_list: &tree_sitter::Node, child: &tree_sitter::Node) -> bool {
+    let mut in_pattern = false;
+    let mut cursor = arg_list.walk();
+    for c in arg_list.children(&mut cursor) {
+        if c.id() == child.id() {
+            return in_pattern;
+        }
+        match c.kind() {
+            "," => in_pattern = true,
+            "if" => in_pattern = false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// True when `node` lies inside an attribute written as RAW TOKENS — the

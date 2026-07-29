@@ -2109,6 +2109,86 @@ fn test_pending_evicted_after_max_failed_sweeps() {
     );
 }
 
+/// Retention must count RESOLUTION OPPORTUNITIES, not wall-clock ticks.
+///
+/// A pending row can only become resolvable when a node appears, and nodes only
+/// appear when a batch parses files. Aging on a batch that parsed nothing spends
+/// the row's budget on passes it could never have survived differently: the
+/// file-watcher and the periodic rescan fire on their own schedule, so a repo
+/// with an unresolved forward reference burned attempts at the poll rate and
+/// evicted the row before the callee was ever written. Once evicted, only a
+/// re-index of the CALLER re-buffers it — the edge stays missing until then.
+///
+/// Measured on this repo at audit time: every buffered row sat at attempts = 4
+/// after 26h and 4 scans, i.e. ~2 weeks to the 50-attempt ceiling on ambient
+/// ticks alone.
+#[test]
+fn test_empty_incremental_tick_does_not_age_pending_rows() {
+    use crate::domain::PENDING_CALL_MAX_ATTEMPTS;
+    use crate::storage::queries::{count_pending_unresolved_calls, get_node_ids_by_name};
+
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(
+        project_dir.path().join("b.ts"),
+        "function caller_b() { lateFoo(); }\n",
+    )
+    .unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(count_pending_unresolved_calls(db.conn()).unwrap(), 1);
+    let attempts_after_index: i64 = db
+        .conn()
+        .query_row("SELECT attempts FROM pending_unresolved_calls", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+
+    // Ticks with an empty diff — the watcher/periodic-rescan shape.
+    for _ in 0..(PENDING_CALL_MAX_ATTEMPTS + 5) {
+        run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    }
+    let attempts_now: i64 = db
+        .conn()
+        .query_row("SELECT attempts FROM pending_unresolved_calls", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(-1);
+    assert_eq!(
+        attempts_now, attempts_after_index,
+        "a batch that parsed nothing gave the row no chance to resolve, so it \
+         must not consume an attempt (-1 = the row was evicted outright)"
+    );
+
+    // The point of not aging: the callee can still arrive and bind.
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "export function lateFoo() {}\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    let caller_id = get_node_ids_by_name(db.conn(), "caller_b")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("caller_b must exist")
+        .0;
+    let foo_id = get_node_ids_by_name(db.conn(), "lateFoo")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("lateFoo must exist")
+        .0;
+    let edges = crate::storage::queries::get_edges_from(db.conn(), caller_id).unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.relation == REL_CALLS && e.target_id == foo_id),
+        "the forward reference must still bridge after idle ticks"
+    );
+}
+
 /// Boundary guard for the incremental-edge-timing guarantee under bounded
 /// retention: a row aged to ONE sweep short of eviction must still bridge —
 /// resolution in the same sweep wins over eviction (resolved rows are drained

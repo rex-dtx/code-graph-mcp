@@ -1564,6 +1564,52 @@ fn guard(e: &MyEnum) -> bool {
 }
 
 #[test]
+fn test_rust_lowercase_pattern_in_matches_is_not_a_call() {
+    // The CamelCase skip is a CONVENTION check, not a structural one: a crate
+    // that carries `#[allow(non_camel_case_types)]` (bindgen output, C-ABI enum
+    // mirrors) has lowercase tuple variants, and `matches!(x, ok(v))` walks
+    // straight past the uppercase guard into a fabricated `calls → ok` edge —
+    // pointing at whichever same-language `fn ok` the resolver likes.
+    //
+    // Pattern position IS structural here: everything after the first top-level
+    // `,` of a matches!-family macro is a pattern. The guard is the counterweight
+    // — `if is_ready(v)` after the pattern is an EXPRESSION, and swallowing it
+    // would repeat the over-collection that cost real edges in the
+    // value-reference pass (audit 2026-07-28).
+    let src = r#"
+fn check(x: Thing) -> bool {
+    matches!(x, ok(v) if is_ready(v))
+}
+fn wrapped(x: Thing) -> bool {
+    assert!(matches!(x, err(code) if reportable(code)));
+    true
+}
+fn scrutinee(x: Thing) -> bool {
+    matches!(compute(x), ok(_))
+}
+"#;
+    let rels = extract_relations(src, "rust").unwrap();
+    let calls: Vec<(&str, &str)> = rels
+        .iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| (r.source_name.as_str(), r.target_name.as_str()))
+        .collect();
+    for banned in ["ok", "err"] {
+        assert!(
+            !calls.iter().any(|(_, t)| *t == banned),
+            "lowercase pattern {banned} must not get a calls edge, got: {calls:?}"
+        );
+    }
+    // Guard expressions and the scrutinee are code and keep their edges.
+    for kept in ["is_ready", "reportable", "compute"] {
+        assert!(
+            calls.iter().any(|(_, t)| *t == kept),
+            "{kept} is an expression, not a pattern — its edge must survive, got: {calls:?}"
+        );
+    }
+}
+
+#[test]
 fn test_rust_top_level_macro_call_not_indexed() {
     // Parity with the call_expression arm: Rust calls with no enclosing named
     // scope are deliberately not indexed (no bare top-level statements in Rust;

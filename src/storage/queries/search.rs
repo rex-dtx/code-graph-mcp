@@ -187,6 +187,26 @@ pub struct NameCandidate {
 /// Find symbol names that match the given input.
 /// Uses substring matching first, then falls back to edit-distance matching.
 /// Matches all node types except modules.
+/// Candidate pool for the phase-2 edit-distance fallback.
+///
+/// The `LIMIT` is a cost bound, not a filter: on a repo with more than 5000
+/// eligible nodes it decides WHICH names get a typo-correction chance. Without an
+/// ORDER BY that choice is whatever the query planner happens to emit — stable in
+/// practice today (rowid order), not stable across an index addition, a schema
+/// change or a SQLite upgrade, and untraceable when it shifts because the symptom
+/// is only "that suggestion used to appear". `ORDER BY n.id` pins it to insertion
+/// order, which is at least a rule that can be stated and reproduced.
+///
+/// Exclusions match phase 1 exactly — a candidate the LIKE pass refuses to return
+/// must not reappear through the typo fallback.
+const FUZZY_EDIT_DISTANCE_SQL: &str = "SELECT DISTINCT n.name, f.path, n.type, n.id, n.start_line
+         FROM nodes n
+         JOIN files f ON f.id = n.file_id
+         WHERE n.type != 'module'
+           AND f.path <> '<external>'
+         ORDER BY n.id
+         LIMIT 5000";
+
 pub fn find_functions_by_fuzzy_name(
     conn: &Connection,
     partial_name: &str,
@@ -247,15 +267,7 @@ pub fn find_functions_by_fuzzy_name(
         _ => 3,
     };
 
-    // Same two exclusions as phase 1 — a candidate the LIKE pass refuses to
-    // return must not reappear through the typo fallback.
-    let sql2 = "SELECT DISTINCT n.name, f.path, n.type, n.id, n.start_line
-         FROM nodes n
-         JOIN files f ON f.id = n.file_id
-         WHERE n.type != 'module'
-           AND f.path <> '<external>'
-         LIMIT 5000";
-    let mut stmt2 = conn.prepare(sql2)?;
+    let mut stmt2 = conn.prepare(FUZZY_EDIT_DISTANCE_SQL)?;
     let rows2 = stmt2.query_map([], |row| {
         Ok(NameCandidate {
             name: row.get(0)?,
@@ -356,6 +368,26 @@ mod tests {
             .nodes;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validateToken");
+    }
+
+    /// A `LIMIT` that decides WHICH rows survive needs an ORDER BY above it.
+    ///
+    /// Behavioural coverage would need a >5000-node fixture to make the cut
+    /// bite, so this asserts the one-directional invariant on the statement
+    /// itself: the candidate pool is bounded, and the bound is ordered. Deleting
+    /// the ORDER BY (the exact regression) turns it red; rewording the query
+    /// around it does not.
+    #[test]
+    fn test_fuzzy_fallback_pool_is_deterministically_bounded() {
+        let sql = FUZZY_EDIT_DISTANCE_SQL;
+        let order_at = sql.find("ORDER BY").expect(
+            "edit-distance pool must be ordered — an unordered LIMIT picks an arbitrary subset",
+        );
+        let limit_at = sql.find("LIMIT").expect("pool must stay bounded");
+        assert!(
+            order_at < limit_at,
+            "ORDER BY must precede LIMIT to constrain which rows the cut keeps"
+        );
     }
 
     // L8: the ORDER BY prefix-LIKE bucket must escape %/_ so a wildcard in the query

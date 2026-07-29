@@ -2,9 +2,15 @@
 
 ## Unreleased
 
-Audit 2026-07-27 P2 batch: 11 of the ~29 observations, chosen for the ones whose
+Audit 2026-07-27 P2 batch: 16 of the ~29 observations, chosen for the ones whose
 failure mode is silence, plus the seven findings an independent review raised
-against the batch itself. No `INDEX_VERSION` change; no rebuild.
+against the batch itself.
+
+**`INDEX_VERSION` 53 → 55, so upgrading rebuilds the index once.** (The 53 → 54
+step landed with the second sub-batch; this line said "no `INDEX_VERSION` change"
+until 55, which was wrong from that commit onward.) Two changes alter what the
+indexer stores for identical source: bare Rust callees that name a local binding,
+and pattern-position identifiers inside `matches!`.
 
 ### Added
 - **`.gitattributes` (`* text=auto eol=lf`)** — pins LF in the working tree on
@@ -68,6 +74,45 @@ against the batch itself. No `INDEX_VERSION` change; no rebuild.
   found" for a request naming a real symbol.
 - **`git rev-list` gained its `--` separator** (P2-26), matching the `ls-files`
   sibling 40 lines away that already carried the comment explaining why.
+- **A lowercase tuple-variant pattern inside `matches!` produced a fake call
+  edge** (P2-3). The token-soup pass tells patterns from calls by CamelCase
+  convention, which `#[allow(non_camel_case_types)]` code (bindgen output, C-ABI
+  enum mirrors) breaks: `matches!(x, ok(v))` emitted `calls → ok`, aimed at
+  whichever same-language `fn ok` the resolver picked. Position inside a
+  `matches!` / `assert_matches!` / `debug_assert_matches!` argument list is now
+  decided structurally — everything after the first top-level `,` is a pattern —
+  while a top-level `if` returns to expression state so guard calls keep their
+  edges. Verified by rebuilding this repo's index on both sides: 5954 `calls`
+  edges before and after, nothing lost. The same comment also now records the
+  second half of the convention's cost, which it had left unstated: a type
+  constructed ONLY inside macros gets no inbound edge at all, so `find_dead_code`
+  reports it dead.
+- **One failed `stat` could delete a live file from the index** (P2-5).
+  `scan_directory_cached` derived "does this file still exist?" from its mtime
+  map, which only holds files whose `metadata()` call succeeded — so a transient
+  EACCES/EMFILE/NFS hiccup on a file the walker had just listed dropped it from
+  the carry-forward, and the diff reported it DELETED, taking its nodes and edges
+  with it. Existence now comes from the walk (which saw the file) and freshness
+  from the stat; a failed stat also stops meaning "unchanged", which had left an
+  edited file stale for as long as the failure lasted.
+- **Idle ticks aged the pending-call buffer** (P2-6). A buffered forward
+  reference gets 50 attempts before eviction, and every index pass spent one —
+  including watcher flushes and periodic rescans whose diff was empty, where no
+  node could have appeared and the sweep provably resolves nothing. Measured on
+  this repo: every row sat at attempts = 4 after 26h/4 scans, ~2 weeks to the
+  ceiling with the code untouched; an evicted row only returns if the *caller*
+  file is re-indexed. The sweep now runs only for a batch that parsed files, so
+  attempts count resolution opportunities.
+- **Betweenness centrality had no scale bound and a quadratic scratch reset**
+  (P2-12). Each BFS source cleared all *n* scratch entries whether or not the
+  search reached them — 10^10 writes on a 100K-node graph to answer all zeros.
+  The reset now touches only visited nodes, and above 5000 graph nodes the run
+  switches to a deterministic strided Brandes–Pich sample, scaled back and
+  announced on stderr rather than presented as exact. This repo (2770 non-test
+  nodes) stays exact.
+- **The fuzzy-name edit-distance fallback pooled 5000 rows with no `ORDER BY`**
+  (P2-12) — on a larger repo the `LIMIT` silently decides which names get a
+  typo-correction chance, and the planner decides the `LIMIT`. Pinned to `n.id`.
 
 ### Fixed in review (defects this batch introduced)
 - **`dead-code . --json` and `dead-code <dir>/ --json` hard-errored whenever the
