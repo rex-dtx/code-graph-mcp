@@ -45,7 +45,16 @@ and pattern-position identifiers inside `matches!`.
   differing lines against the first run); three post-fix runs produced 7997
   every time, zero diff. Sorted order keeps a directory's files in one batch,
   where same-batch resolution can bind them; arbitrary order scattered them
-  across batches and the cross-batch bindings were simply lost. So a
+  across batches and the cross-batch bindings were simply lost.
+
+  "More edges" is not by itself "better", so the sets were scored against the
+  single-batch run of the same tree (8697 edges — every file in one batch, so
+  nothing is lost to a batch boundary). Three pre-fix multi-batch runs landed
+  6960 / 7487 / 7042 real edges alongside 535 / 350 / 456 wrong ones (439 / 330
+  / 405 of those `imports → <external>` phantoms, minted when the defining file
+  happened to sit in a later batch). The post-fix run: 7817 real, 170 wrong,
+  162 phantom. Both directions move — recall against the single-batch reference
+  goes 80.0–86.1% → 89.9%, and the phantom count halves at worst. So a
   multi-batch repo does get a different index out of this — covered by the
   53 → 55 `INDEX_VERSION` step this batch already carries, which forces the
   rebuild that picks it up.
