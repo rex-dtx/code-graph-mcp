@@ -230,6 +230,147 @@ fn pre_parse_batch(
         .collect()
 }
 
+/// What Phase 1b hands to Phase 2 for one batch.
+struct BatchInserted {
+    parsed: Vec<FileParsed>,
+    /// Inbound cross-file edges captured BEFORE the cascade delete that
+    /// `delete_nodes_by_file` triggers, for [`restore_inbound_edges`] to re-bind.
+    /// Tuple: (source_id, source_file_id, target_file_id, target_name, relation,
+    /// metadata). `target_file_id` is the re-indexed file the edge pointed INTO;
+    /// the restore re-binds ONLY to the new same-name node in THAT file, not
+    /// every same-name node in the batch (which fanned out cross-file /
+    /// cross-language).
+    #[allow(clippy::type_complexity)]
+    saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)>,
+    /// File ids in this batch, so Phase 2c can skip intra-batch edges.
+    file_ids: HashSet<i64>,
+    nodes_created: usize,
+}
+
+/// Phase 1b: the sequential, DB-bound half of indexing one batch. Upserts each
+/// file row, replaces its nodes (a `<module>` node plus one per extracted
+/// symbol), and returns the per-file handles Phase 2 resolves relations against.
+///
+/// Sequential on purpose: it shares one connection with the enclosing savepoint,
+/// and node ids must be minted in a stable order.
+fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<BatchInserted> {
+    let mut parsed: Vec<FileParsed> = Vec::new();
+    let mut nodes_created = 0usize;
+    // Saved inbound edges from other files → batch files (to restore after cascade delete)
+    // Tuple: (source_id, source_file_id, target_file_id, target_name, relation, metadata).
+    // target_file_id is the re-indexed file the edge pointed INTO; the restore
+    // re-binds ONLY to the new same-name node in THAT file, not every same-name
+    // node in the batch (which fanned out cross-file / cross-language).
+    #[allow(clippy::type_complexity)]
+    let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> = Vec::new();
+    // Track file_ids in this batch to filter intra-batch edges in Phase 2c
+    let mut batch_file_ids: HashSet<i64> = HashSet::new();
+
+    for pp in pre_parsed {
+        let file_id = upsert_file(
+            db.conn(),
+            &FileRecord {
+                path: pp.rel_path.clone(),
+                blake3_hash: pp.hash,
+                last_modified: pp.last_modified,
+                language: Some(pp.language.clone()),
+            },
+        )?;
+
+        // Save cross-file inbound edges before cascade delete destroys them.
+        // file_id IS the target file these edges point into — attach it so the
+        // Phase 2c restore can re-bind to the same-name node in THIS file only.
+        saved_inbound_edges.extend(
+            get_inbound_cross_file_edges(db.conn(), file_id)?
+                .into_iter()
+                .map(|(src, src_file, tname, rel, meta)| {
+                    (src, src_file, file_id, tname, rel, meta)
+                }),
+        );
+        batch_file_ids.insert(file_id);
+
+        delete_nodes_by_file(db.conn(), file_id)?;
+
+        let mut node_ids = Vec::new();
+        let mut node_names = Vec::new();
+        let mut node_qualified_names: Vec<Option<String>> = Vec::new();
+        let mut node_types: Vec<String> = Vec::new();
+
+        let module_node_id = insert_node_cached(
+            db.conn(),
+            &NodeRecord {
+                file_id,
+                node_type: "module".into(),
+                name: "<module>".into(),
+                qualified_name: Some(pp.rel_path.clone()),
+                start_line: 1,
+                end_line: pp.source.lines().count() as i64,
+                code_content: String::new(),
+                signature: None,
+                doc_comment: None,
+                context_string: None,
+                name_tokens: None,
+                return_type: None,
+                param_types: None,
+                is_test: false,
+            },
+        )?;
+        node_ids.push(module_node_id);
+        node_names.push("<module>".into());
+        // <module> resolves by its bare name; no qualified form.
+        node_qualified_names.push(None);
+        node_types.push("module".into());
+        nodes_created += 1;
+
+        for pn in &pp.parsed_nodes {
+            let name_tokens = split_identifier(&pn.name);
+            let node_id = insert_node_cached(
+                db.conn(),
+                &NodeRecord {
+                    file_id,
+                    node_type: pn.node_type.clone(),
+                    name: pn.name.clone(),
+                    qualified_name: pn.qualified_name.clone(),
+                    start_line: pn.start_line as i64,
+                    end_line: pn.end_line as i64,
+                    code_content: pn.code_content.clone(),
+                    signature: pn.signature.clone(),
+                    doc_comment: pn.doc_comment.clone(),
+                    context_string: None,
+                    name_tokens: Some(name_tokens),
+                    return_type: pn.return_type.clone(),
+                    param_types: pn.param_types.clone(),
+                    is_test: pn.is_test,
+                },
+            )?;
+            node_ids.push(node_id);
+            node_names.push(pn.name.clone());
+            node_qualified_names.push(pn.qualified_name.clone());
+            node_types.push(pn.node_type.clone());
+            nodes_created += 1;
+        }
+
+        parsed.push(FileParsed {
+            rel_path: pp.rel_path,
+            source: pp.source,
+            language: pp.language,
+            tree: pp.tree,
+            file_id,
+            node_ids,
+            node_names,
+            node_qualified_names,
+            node_types,
+        });
+    }
+
+    Ok(BatchInserted {
+        parsed,
+        saved_inbound_edges,
+        file_ids: batch_file_ids,
+        nodes_created,
+    })
+}
+
 /// Phase 0: cascade-delete `delete_paths` in a transaction of its own, after
 /// buffering the inbound calls that cascade is about to strip.
 ///
@@ -387,115 +528,12 @@ pub(super) fn index_files(
         // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
         let pre_parsed = pre_parse_batch(batch, root, hashes, &counters);
 
-        let mut batch_parsed: Vec<FileParsed> = Vec::new();
-        // Saved inbound edges from other files → batch files (to restore after cascade delete)
-        // Tuple: (source_id, source_file_id, target_file_id, target_name, relation, metadata).
-        // target_file_id is the re-indexed file the edge pointed INTO; the restore
-        // re-binds ONLY to the new same-name node in THAT file, not every same-name
-        // node in the batch (which fanned out cross-file / cross-language).
-        #[allow(clippy::type_complexity)]
-        let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> =
-            Vec::new();
-        // Track file_ids in this batch to filter intra-batch edges in Phase 2c
-        let mut batch_file_ids: HashSet<i64> = HashSet::new();
-
         // --- Phase 1b: Sequential DB inserts ---
-        for pp in pre_parsed {
-            let file_id = upsert_file(
-                db.conn(),
-                &FileRecord {
-                    path: pp.rel_path.clone(),
-                    blake3_hash: pp.hash,
-                    last_modified: pp.last_modified,
-                    language: Some(pp.language.clone()),
-                },
-            )?;
-
-            // Save cross-file inbound edges before cascade delete destroys them.
-            // file_id IS the target file these edges point into — attach it so the
-            // Phase 2c restore can re-bind to the same-name node in THIS file only.
-            saved_inbound_edges.extend(
-                get_inbound_cross_file_edges(db.conn(), file_id)?
-                    .into_iter()
-                    .map(|(src, src_file, tname, rel, meta)| {
-                        (src, src_file, file_id, tname, rel, meta)
-                    }),
-            );
-            batch_file_ids.insert(file_id);
-
-            delete_nodes_by_file(db.conn(), file_id)?;
-
-            let mut node_ids = Vec::new();
-            let mut node_names = Vec::new();
-            let mut node_qualified_names: Vec<Option<String>> = Vec::new();
-            let mut node_types: Vec<String> = Vec::new();
-
-            let module_node_id = insert_node_cached(
-                db.conn(),
-                &NodeRecord {
-                    file_id,
-                    node_type: "module".into(),
-                    name: "<module>".into(),
-                    qualified_name: Some(pp.rel_path.clone()),
-                    start_line: 1,
-                    end_line: pp.source.lines().count() as i64,
-                    code_content: String::new(),
-                    signature: None,
-                    doc_comment: None,
-                    context_string: None,
-                    name_tokens: None,
-                    return_type: None,
-                    param_types: None,
-                    is_test: false,
-                },
-            )?;
-            node_ids.push(module_node_id);
-            node_names.push("<module>".into());
-            // <module> resolves by its bare name; no qualified form.
-            node_qualified_names.push(None);
-            node_types.push("module".into());
-            total_nodes_created += 1;
-
-            for pn in &pp.parsed_nodes {
-                let name_tokens = split_identifier(&pn.name);
-                let node_id = insert_node_cached(
-                    db.conn(),
-                    &NodeRecord {
-                        file_id,
-                        node_type: pn.node_type.clone(),
-                        name: pn.name.clone(),
-                        qualified_name: pn.qualified_name.clone(),
-                        start_line: pn.start_line as i64,
-                        end_line: pn.end_line as i64,
-                        code_content: pn.code_content.clone(),
-                        signature: pn.signature.clone(),
-                        doc_comment: pn.doc_comment.clone(),
-                        context_string: None,
-                        name_tokens: Some(name_tokens),
-                        return_type: pn.return_type.clone(),
-                        param_types: pn.param_types.clone(),
-                        is_test: pn.is_test,
-                    },
-                )?;
-                node_ids.push(node_id);
-                node_names.push(pn.name.clone());
-                node_qualified_names.push(pn.qualified_name.clone());
-                node_types.push(pn.node_type.clone());
-                total_nodes_created += 1;
-            }
-
-            batch_parsed.push(FileParsed {
-                rel_path: pp.rel_path,
-                source: pp.source,
-                language: pp.language,
-                tree: pp.tree,
-                file_id,
-                node_ids,
-                node_names,
-                node_qualified_names,
-                node_types,
-            });
-        }
+        let inserted = insert_batch_nodes(db, pre_parsed)?;
+        let batch_parsed = inserted.parsed;
+        let saved_inbound_edges = inserted.saved_inbound_edges;
+        let batch_file_ids = inserted.file_ids;
+        total_nodes_created += inserted.nodes_created;
 
         // --- Phase 2: Extract relations + insert edges ---
         // Build per-batch name_to_ids and node_id_to_path from the pre-loaded global map,
