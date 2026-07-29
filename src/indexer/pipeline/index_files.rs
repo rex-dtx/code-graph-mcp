@@ -1619,6 +1619,110 @@ pub(super) fn index_files(
     // Phase 3: Build context strings + embeddings (single transaction, lightweight)
     if !all_indexed.is_empty() {
         finalize_tick();
+        build_context_strings_and_embed(db, &all_indexed, model, &finalize_tick)?;
+    }
+
+    // Phase 2c: sweep pending_unresolved_calls — promote any rows whose
+    // target_name now resolves against a same-language node. Cheap when the
+    // table is empty (typical after a full index of a self-contained codebase).
+    //
+    // Gated on this batch having PARSED something, because the sweep does two
+    // things and the second one is not free. Resolution: a buffered row can only
+    // start resolving once its target node exists, and nodes appear only from
+    // parsed files — so on a batch that parsed nothing the sweep provably finds
+    // nothing new. Retention: the same call ages every survivor by one attempt.
+    // Ungated, that spent the row's 50-attempt budget on ambient watcher and
+    // periodic-rescan ticks (measured on this repo: attempts = 4 after 26h /
+    // 4 scans, ~2 weeks to the ceiling with the code untouched), and an evicted
+    // row only comes back if the CALLER file is re-indexed — so a forward
+    // reference could go permanently unresolved for no reason but elapsed time.
+    // Attempts now count resolution OPPORTUNITIES.
+    //
+    // Deletions do not qualify: removing nodes can only shrink the candidate set.
+    let pending_resolved = if all_indexed.is_empty() {
+        0
+    } else {
+        resolve_pending_calls(db)?
+    };
+    total_edges_created += pending_resolved;
+    if pending_resolved > 0 {
+        tracing::info!(
+            "[index] Phase 2c: resolved {} pending unresolved calls",
+            pending_resolved
+        );
+    }
+
+    // Phases 2d-bind, 2d-prune, and 2e are full-graph set-based passes (a JOIN over
+    // all edges, a DELETE with correlated subqueries, and a GROUP-BY over all nodes).
+    // Their result is a guaranteed no-op when this invocation indexed AND deleted
+    // nothing: the edge set is unchanged, so the import-bind finds nothing new to
+    // bind, the import-contradiction prune finds nothing to drop, and the confidence
+    // reclassification recomputes identical counts. Gate the whole block on a real
+    // change so no-diff incremental ticks (e.g. a file-watcher flush whose diff is
+    // empty) don't pay for three full-graph scans on the hot path. When anything DID
+    // change it must run GLOBALLY, not just over the changed files — adding/removing
+    // a duplicate-named node in ONE file flips bind/prune eligibility and the
+    // ambiguity of cross-file edges in OTHER, unchanged files.
+    //
+    // `pending_resolved > 0` is part of the condition because Phase 2c INSERTS
+    // edges, and every edge it inserts is a cross-file by-name bind — precisely
+    // the shape Phase 2e downgrades off the `extracted` column default. Phase 2c
+    // is now itself gated on `!all_indexed.is_empty()`, so the term cannot fire
+    // alone — it is kept because it states the actual invariant (Phase 2c wrote
+    // edges ⇒ reclassify) rather than a chain of reasoning about which batches
+    // can produce them. Give the sweep a per-tick cap for large backlogs and the
+    // spilled remainder would drain on a batch whose own files are unchanged;
+    // this term is what keeps those edges from holding a confidence they never
+    // earned. Gating on the observable keeps the invariant local.
+    if !all_indexed.is_empty() || !delete_paths.is_empty() || pending_resolved > 0 {
+        finalize_tick();
+        let post = run_global_edge_post_passes(db)?;
+        total_edges_created += post.bound;
+        total_edges_created = total_edges_created.saturating_sub(post.pruned);
+    }
+
+    // Optimize query planner statistics after bulk writes
+    if !all_indexed.is_empty() {
+        finalize_tick();
+        let _ = db.run_optimize();
+    }
+
+    let stats = IndexStats {
+        files_skipped_size: skipped_size.load(AtomicOrdering::Relaxed),
+        files_skipped_parse: skipped_parse.load(AtomicOrdering::Relaxed),
+        files_skipped_read: skipped_read.load(AtomicOrdering::Relaxed),
+        files_skipped_hash: skipped_hash.load(AtomicOrdering::Relaxed),
+        files_skipped_language: skipped_language.load(AtomicOrdering::Relaxed),
+        files_with_parse_errors: parse_error_files.load(AtomicOrdering::Relaxed),
+    };
+
+    Ok(IndexResult {
+        files_indexed: all_indexed.len(),
+        files_deleted: delete_paths.len(),
+        nodes_created: total_nodes_created,
+        edges_created: total_edges_created,
+        stats,
+    })
+}
+
+/// Phase 3: build every indexed node's context string, store it, then embed.
+///
+/// Extracted from `index_files` (audit P1-9: 12 phases, 6 accumulators and a
+/// brace depth of 13 in one 1,686-line function). This phase is a clean seam —
+/// it reads `all_indexed` and writes only the `context_string` column plus the
+/// vector table, touching none of the caller's accumulators — so the extraction
+/// is behaviour-preserving by construction rather than by inspection.
+///
+/// `tick` is the caller's finalizing heartbeat: 3a/3b run inside one savepoint
+/// and 3c can take minutes on a cold embed, so the progress consumer's mtime has
+/// to move between them or a stale-file gate reads the run as killed.
+fn build_context_strings_and_embed(
+    db: &Database,
+    all_indexed: &[FileIndexed],
+    model: Option<&EmbeddingModel>,
+    tick: &dyn Fn(),
+) -> Result<()> {
+    {
         let tx = db.savepoint("idx_context")?;
         let all_node_ids: Vec<i64> = all_indexed
             .iter()
@@ -1687,134 +1791,78 @@ pub(super) fn index_files(
         );
 
         // Phase 3c: Embed outside the committed tx — recoverable on failure via repair_null_context_strings
-        finalize_tick();
+        tick();
         if let Some(m) = model {
             if db.vec_enabled() {
                 embed_and_store_batch(db, m, &context_updates)?;
             }
         }
     }
+    Ok(())
+}
 
-    // Phase 2c: sweep pending_unresolved_calls — promote any rows whose
-    // target_name now resolves against a same-language node. Cheap when the
-    // table is empty (typical after a full index of a self-contained codebase).
-    //
-    // Gated on this batch having PARSED something, because the sweep does two
-    // things and the second one is not free. Resolution: a buffered row can only
-    // start resolving once its target node exists, and nodes appear only from
-    // parsed files — so on a batch that parsed nothing the sweep provably finds
-    // nothing new. Retention: the same call ages every survivor by one attempt.
-    // Ungated, that spent the row's 50-attempt budget on ambient watcher and
-    // periodic-rescan ticks (measured on this repo: attempts = 4 after 26h /
-    // 4 scans, ~2 weeks to the ceiling with the code untouched), and an evicted
-    // row only comes back if the CALLER file is re-indexed — so a forward
-    // reference could go permanently unresolved for no reason but elapsed time.
-    // Attempts now count resolution OPPORTUNITIES.
-    //
-    // Deletions do not qualify: removing nodes can only shrink the candidate set.
-    let pending_resolved = if all_indexed.is_empty() {
-        0
-    } else {
-        resolve_pending_calls(db)?
-    };
-    total_edges_created += pending_resolved;
-    if pending_resolved > 0 {
+/// Result of the three global edge post-passes, in the caller's accounting terms.
+struct GlobalPostPassCounts {
+    /// Bare calls newly bound to the target an explicit import names.
+    bound: usize,
+    /// Proximity-picked call edges dropped as contradicted by that import.
+    pruned: usize,
+}
+
+/// Phases 2d-bind, 2d-prune and 2e — the three passes that run over the WHOLE
+/// graph rather than over this batch.
+///
+/// Extracted from `index_files` (audit P1-9). They belong together: the bind
+/// inserts the import-named edge, the prune removes the proximity-picked one it
+/// contradicts, and only the pair repoints the call — running either alone
+/// leaves the call either double-edged or edgeless. The confidence pass follows
+/// because it reads the edge set the first two just settled.
+///
+/// The caller decides WHETHER to run them (they are a guaranteed no-op when the
+/// batch changed nothing); this decides what they do.
+fn run_global_edge_post_passes(db: &Database) -> Result<GlobalPostPassCounts> {
+    // Phase 2d-bind: positively resolve bare-name calls to the node an explicit
+    // import in the caller's file binds them to. `refine_ambiguous_targets`
+    // picks the path-closest same-name node, which can be the wrong file when
+    // the caller `from X import name`s a farther one; that wrong edge is dropped
+    // by the prune below, so without this bind the call would be left with no
+    // edge at all. Insert the import-bound edge first, then let the prune remove
+    // the contradicted proximity edge — together they repoint the call.
+    let bound = bind_calls_to_imported_targets(db)?;
+    if bound > 0 {
         tracing::info!(
-            "[index] Phase 2c: resolved {} pending unresolved calls",
-            pending_resolved
+            "[index] Phase 2d-bind: bound {} bare call(s) to their imported target",
+            bound
         );
     }
 
-    // Phases 2d-bind, 2d-prune, and 2e are full-graph set-based passes (a JOIN over
-    // all edges, a DELETE with correlated subqueries, and a GROUP-BY over all nodes).
-    // Their result is a guaranteed no-op when this invocation indexed AND deleted
-    // nothing: the edge set is unchanged, so the import-bind finds nothing new to
-    // bind, the import-contradiction prune finds nothing to drop, and the confidence
-    // reclassification recomputes identical counts. Gate the whole block on a real
-    // change so no-diff incremental ticks (e.g. a file-watcher flush whose diff is
-    // empty) don't pay for three full-graph scans on the hot path. When anything DID
-    // change it must run GLOBALLY, not just over the changed files — adding/removing
-    // a duplicate-named node in ONE file flips bind/prune eligibility and the
-    // ambiguity of cross-file edges in OTHER, unchanged files.
-    //
-    // `pending_resolved > 0` is part of the condition because Phase 2c INSERTS
-    // edges, and every edge it inserts is a cross-file by-name bind — precisely
-    // the shape Phase 2e downgrades off the `extracted` column default. Phase 2c
-    // is now itself gated on `!all_indexed.is_empty()`, so the term cannot fire
-    // alone — it is kept because it states the actual invariant (Phase 2c wrote
-    // edges ⇒ reclassify) rather than a chain of reasoning about which batches
-    // can produce them. Give the sweep a per-tick cap for large backlogs and the
-    // spilled remainder would drain on a batch whose own files are unchanged;
-    // this term is what keeps those edges from holding a confidence they never
-    // earned. Gating on the observable keeps the invariant local.
-    if !all_indexed.is_empty() || !delete_paths.is_empty() || pending_resolved > 0 {
-        finalize_tick();
-        // Phase 2d-bind: positively resolve bare-name calls to the node an explicit
-        // import in the caller's file binds them to. `refine_ambiguous_targets`
-        // picks the path-closest same-name node, which can be the wrong file when
-        // the caller `from X import name`s a farther one; that wrong edge is dropped
-        // by the prune below, so without this bind the call would be left with no
-        // edge at all. Insert the import-bound edge first, then let the prune remove
-        // the contradicted proximity edge — together they repoint the call.
-        let bound = bind_calls_to_imported_targets(db)?;
-        total_edges_created += bound;
-        if bound > 0 {
-            tracing::info!(
-                "[index] Phase 2d-bind: bound {} bare call(s) to their imported target",
-                bound
-            );
-        }
-
-        // Phase 2d: drop bare-name call edges contradicted by an explicit import in
-        // the caller's file. `refine_ambiguous_targets` keeps every tied same-name
-        // candidate when it has no disambiguating info; an import edge IS that info,
-        // so a bare `save()` in a file that does `from db import save` must bind to
-        // db.save only — the fanned-out edge to a sibling `save` elsewhere is a false
-        // caller. Removes those false positives without touching the correct edge.
-        let contradicted = prune_import_contradicted_call_edges(db)?;
-        if contradicted > 0 {
-            total_edges_created = total_edges_created.saturating_sub(contradicted);
-            tracing::info!(
-                "[index] Phase 2d: pruned {} import-contradicted call edges",
-                contradicted
-            );
-        }
-
-        // Phase 2e: classify edge confidence. Downgrades cross-file by-name
-        // `calls`/`references` edges to inferred/ambiguous; every precise edge keeps
-        // the column default `extracted`. Purely additive metadata — no edge
-        // added or removed.
-        let downgraded = classify_edge_confidence(db)?;
-        if downgraded > 0 {
-            tracing::info!(
-                "[index] Phase 2e: classified {} cross-file by-name edge(s) as inferred/ambiguous",
-                downgraded
-            );
-        }
+    // Phase 2d: drop bare-name call edges contradicted by an explicit import in
+    // the caller's file. `refine_ambiguous_targets` keeps every tied same-name
+    // candidate when it has no disambiguating info; an import edge IS that info,
+    // so a bare `save()` in a file that does `from db import save` must bind to
+    // db.save only — the fanned-out edge to a sibling `save` elsewhere is a false
+    // caller. Removes those false positives without touching the correct edge.
+    let pruned = prune_import_contradicted_call_edges(db)?;
+    if pruned > 0 {
+        tracing::info!(
+            "[index] Phase 2d: pruned {} import-contradicted call edges",
+            pruned
+        );
     }
 
-    // Optimize query planner statistics after bulk writes
-    if !all_indexed.is_empty() {
-        finalize_tick();
-        let _ = db.run_optimize();
+    // Phase 2e: classify edge confidence. Downgrades cross-file by-name
+    // `calls`/`references` edges to inferred/ambiguous; every precise edge keeps
+    // the column default `extracted`. Purely additive metadata — no edge
+    // added or removed.
+    let downgraded = classify_edge_confidence(db)?;
+    if downgraded > 0 {
+        tracing::info!(
+            "[index] Phase 2e: classified {} cross-file by-name edge(s) as inferred/ambiguous",
+            downgraded
+        );
     }
 
-    let stats = IndexStats {
-        files_skipped_size: skipped_size.load(AtomicOrdering::Relaxed),
-        files_skipped_parse: skipped_parse.load(AtomicOrdering::Relaxed),
-        files_skipped_read: skipped_read.load(AtomicOrdering::Relaxed),
-        files_skipped_hash: skipped_hash.load(AtomicOrdering::Relaxed),
-        files_skipped_language: skipped_language.load(AtomicOrdering::Relaxed),
-        files_with_parse_errors: parse_error_files.load(AtomicOrdering::Relaxed),
-    };
-
-    Ok(IndexResult {
-        files_indexed: all_indexed.len(),
-        files_deleted: delete_paths.len(),
-        nodes_created: total_nodes_created,
-        edges_created: total_edges_created,
-        stats,
-    })
+    Ok(GlobalPostPassCounts { bound, pruned })
 }
 
 #[cfg(test)]

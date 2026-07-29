@@ -248,6 +248,20 @@ and pattern-position identifiers inside `matches!`.
   already caught — `take_while` on the closing brace dropped the first line — so
   that is pinned too.
 
+### Internal
+- **`index_files` gave up its two tail phases** (P1-9, partial). Phase 3
+  (context strings + embeddings) and the 2d-bind / 2d-prune / 2e trio are now
+  `build_context_strings_and_embed` and `run_global_edge_post_passes`: 1753 →
+  1620 lines in the caller, with the two phases' inputs and outputs stated in a
+  signature instead of inferred from 1700 lines of shared mutable state. Both
+  were chosen because they touch none of the caller's six accumulators, so the
+  extraction is behaviour-preserving by construction. Verified that way too:
+  indexing an identical snapshot with the before and after binaries produced
+  8665 `calls`/`imports`/… edges on both sides with a zero-line diff (relation
+  and confidence included) and 4450 nodes on both sides. The rest of the
+  decomposition debt — the batch loop, the six accumulators, brace depth 13 —
+  is untouched.
+
 ### Changed
 - `project_map`'s `key_symbols` now excludes `*/tests.rs`, a side effect of
   converging it onto the shared filter (that leg was in the shared rule and not
