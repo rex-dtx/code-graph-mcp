@@ -752,7 +752,154 @@ pub(super) fn shadowed_by_enclosing_local(
     if name.chars().next().is_some_and(|c| c.is_uppercase()) {
         return false;
     }
-    with_enclosing_fn_local_names(node, source, |names| names.contains(name))
+    // Two stages, and the split is what makes this both correct and cheap.
+    //
+    // The memoized set is a whole-function OVER-approximation: every binder
+    // anywhere in the body, no scope, no ordering. On the `references` axis
+    // that is precision-safe. On the CALLS axis it is not — it suppresses real
+    // edges whenever the binder cannot actually shadow the call:
+    //
+    //   let a = helper(); let helper = 9;        // binder comes AFTER
+    //   { let helper = 2; }  helper()            // binder in a sibling block
+    //   for helper in v {}   helper()            // loop binder, call after
+    //   match x { Ok(helper) => {} }  helper()   // arm binder, call after
+    //   |helper| ...;        helper()            // closure param, call outside
+    //
+    // and a dropped `calls` edge is the dangerous direction: a live function
+    // reported dead. So a hit on the over-approximation is not the answer, only
+    // permission to ask the precise question — which walks the call's own
+    // ancestor chain and costs nothing for the overwhelming majority of names,
+    // because they never appear in the set at all.
+    if !with_enclosing_fn_local_names(node, source, |names| names.contains(name)) {
+        return false;
+    }
+    binder_shadows_call(node, source, name)
+}
+
+/// Is `name` bound by a binder that is BOTH in scope at `node` AND positioned
+/// before it? Rust's real shadowing rule, as opposed to the whole-body
+/// approximation [`with_enclosing_fn_local_names`] provides.
+///
+/// Walks outward from the call. At each enclosing block only the statements
+/// that PRECEDE the call can shadow it; a construct that owns the call through
+/// its body (a `for` loop, an `if let`, a `match` arm, a closure) shadows with
+/// its own pattern regardless of byte order, since the binding is live for the
+/// whole body. Stops at the enclosing `function_item` — Rust `let` scope does
+/// not cross a nested-fn boundary.
+fn binder_shadows_call(node: &tree_sitter::Node, source: &str, name: &str) -> bool {
+    let mut child = *node;
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            // Only preceding statements are in scope. `child` is the subtree the
+            // call sits in, so anything starting at or after it cannot shadow.
+            "block" => {
+                for i in 0..n.named_child_count() {
+                    let Some(stmt) = n.named_child(i) else {
+                        continue;
+                    };
+                    if stmt.start_byte() >= child.start_byte() {
+                        break;
+                    }
+                    if stmt.kind() == "let_declaration" {
+                        if let Some(pat) = stmt.child_by_field_name("pattern") {
+                            if pattern_binds(&pat, source, name) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Binding constructs: their pattern is live throughout the body, so
+            // position does not apply — but only when the call is INSIDE that
+            // body, which is exactly what walking up from the call establishes.
+            "for_expression" | "let_condition" | "match_arm" => {
+                if let Some(pat) = n.child_by_field_name("pattern") {
+                    // A `match_arm`'s pattern wraps an optional `if` guard; only
+                    // the binder half counts (the guard is an expression, and
+                    // sweeping it in is how a real call became a "local").
+                    let pat = if pat.kind() == "match_pattern" {
+                        pat.named_child(0).unwrap_or(pat)
+                    } else {
+                        pat
+                    };
+                    if pattern_binds(&pat, source, name) {
+                        return true;
+                    }
+                }
+            }
+            // `if let Some(x) = o { x() }` / `while let`: the binder lives in
+            // the CONDITION, which is a SIBLING of the body we walked up from,
+            // not an ancestor of the call. Reached only when the call is inside
+            // the guarded branch, which is what makes the binding live for it.
+            "if_expression" | "while_expression" => {
+                let guarded = n
+                    .child_by_field_name("consequence")
+                    .or_else(|| n.child_by_field_name("body"))
+                    .is_some_and(|b| b.id() == child.id());
+                if guarded {
+                    if let Some(cond) = n.child_by_field_name("condition") {
+                        if cond.kind() == "let_condition" {
+                            if let Some(pat) = cond.child_by_field_name("pattern") {
+                                if pattern_binds(&pat, source, name) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "closure_expression" => {
+                if let Some(p) = n.child_by_field_name("parameters") {
+                    let mut names = std::collections::HashSet::new();
+                    collect_param_idents(&p, source, &mut names, 0);
+                    if names.contains(name) {
+                        return true;
+                    }
+                }
+            }
+            "function_item" => {
+                if let Some(p) = n.child_by_field_name("parameters") {
+                    let mut names = std::collections::HashSet::new();
+                    collect_param_idents(&p, source, &mut names, 0);
+                    return names.contains(name);
+                }
+                return false;
+            }
+            _ => {}
+        }
+        child = n;
+        cur = n.parent();
+    }
+    false
+}
+
+/// Does this pattern introduce `name` as a binding? Identifier-only: a
+/// CamelCase variant or const in the pattern is not a binder, and the caller
+/// has already excluded CamelCase anyway.
+fn pattern_binds(pat: &tree_sitter::Node, source: &str, name: &str) -> bool {
+    let mut names = std::collections::HashSet::new();
+    collect_idents_in(pat, source, &mut names, 0);
+    names.contains(name)
+}
+
+fn collect_idents_in(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    if node.kind() == "identifier" {
+        out.insert(node_text(node, source).to_string());
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(c) = node.named_child(i) {
+            collect_idents_in(&c, source, out, depth + 1);
+        }
+    }
 }
 
 thread_local! {

@@ -151,6 +151,45 @@ fn collect_reexport_specifiers(
     }
 }
 
+/// True when the `exports` / `module` this assignment writes through is a
+/// FUNCTION PARAMETER rather than the real module object.
+///
+/// `(function (module, exports) { exports.x = y })` — the UMD/webpack wrapper —
+/// assigns to whatever the loader handed in, not to this file's exports. The
+/// object's text is identical either way, so text matching alone treated every
+/// wrapper body as a module-export site.
+fn exports_ident_is_a_parameter(node: &tree_sitter::Node, source: &str) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "function"
+                | "arrow_function"
+                | "method_definition"
+                | "generator_function"
+                | "generator_function_declaration"
+        ) {
+            if let Some(params) = n.child_by_field_name("parameters") {
+                let text = node_text(&params, source);
+                // Word-boundary check: `exports` as a whole parameter name, not
+                // a substring of `myExports`.
+                for want in ["exports", "module"] {
+                    if text
+                        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+                        .any(|t| t == want)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        cur = n.parent();
+    }
+    false
+}
+
 /// CommonJS export forms → the same `REL_EXPORTS` edges the ESM `export`
 /// keyword produces.
 ///
@@ -188,6 +227,15 @@ pub(super) fn extract_cjs_exports(
     if left.kind() != "member_expression" {
         return;
     }
+    // `exports` / `module` bound as a FUNCTION PARAMETER is not the module —
+    // it is the UMD/webpack wrapper, `(function (module, exports) { exports.x =
+    // y })`, whose `exports` is whatever the loader passed in. Matching on the
+    // object's TEXT alone made every such assignment look like a real export.
+    // An IIFE that closes over the real `module` (no parameter of that name) is
+    // still a genuine module-level export and is unaffected.
+    if exports_ident_is_a_parameter(node, source) {
+        return;
+    }
     let left_text = node_text(&left, source);
 
     let mut emit = |name: &str| {
@@ -214,14 +262,18 @@ pub(super) fn extract_cjs_exports(
                     match prop.kind() {
                         "shorthand_property_identifier" => emit(node_text(&prop, source)),
                         "pair" => {
-                            // The VALUE is the symbol; fall back to the key when
-                            // the value is not a plain identifier.
-                            let named = prop
+                            // ONLY the value, and only when it names a symbol.
+                            // Falling back to the KEY bound the wrong node:
+                            // `module.exports = { foo: 42 }` alongside a real
+                            // `function foo()` marked that function exported
+                            // when the export is a number. A non-identifier
+                            // value (inline function, literal, member chain)
+                            // names no node, so there is nothing to mark.
+                            if let Some(v) = prop
                                 .child_by_field_name("value")
                                 .filter(|v| v.kind() == "identifier")
-                                .or_else(|| prop.child_by_field_name("key"));
-                            if let Some(n) = named {
-                                emit(node_text(&n, source));
+                            {
+                                emit(node_text(&v, source));
                             }
                         }
                         _ => {}

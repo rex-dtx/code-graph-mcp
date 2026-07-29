@@ -879,3 +879,58 @@ fn reference_parity_one_fixture_per_pass() {
          row was added (update this list) or something is manufacturing them: {unexpected:?}"
     );
 }
+
+/// The two false-edge shapes the pre-release review found in CommonJS export
+/// extraction. Both understate rather than invite deletion, so neither is
+/// urgent — but both bind the WRONG node, and a wrong edge is harder to notice
+/// than a missing one.
+#[test]
+fn cjs_exports_do_not_bind_the_wrong_node() {
+    let files: &[(&str, &str)] = &[
+        // The UMD / webpack wrapper. `exports` here is the loader's object,
+        // passed in as a parameter — assigning through it exports nothing from
+        // THIS file. Matching the object by text alone treated it as a module
+        // export and marked the real `wrapped` function exported.
+        (
+            "umd.js",
+            "function wrapped(a, b) {\n  const x = a + b;\n  return x * 2;\n}\n(function (module, exports) {\n  exports.wrapped = wrapped;\n})(module, exports);\n",
+        ),
+        // A pair whose VALUE is not a symbol. Falling back to the KEY bound the
+        // same-named real function, claiming a number export marks it public.
+        (
+            "pairlit.js",
+            "function keyed(a, b) {\n  const x = a + b;\n  return x * 2;\n}\nmodule.exports = { keyed: 42 };\n",
+        ),
+        // Control: the real forms must still emit, or this test would pass by
+        // breaking the feature.
+        (
+            "real.js",
+            "function realExport(a, b) {\n  const x = a + b;\n  return x * 2;\n}\nmodule.exports = { realExport };\n",
+        ),
+    ];
+
+    let (_p, db) = index_parity_fixture(files);
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT count(*) FROM edges e JOIN nodes t ON e.target_id = t.id \
+             WHERE e.relation = 'exports' AND t.name = ?1",
+        )
+        .unwrap();
+    let mut exported =
+        |name: &str| -> i64 { stmt.query_row([name], |r| r.get::<_, i64>(0)).unwrap_or(0) };
+
+    assert_eq!(
+        exported("wrapped"),
+        0,
+        "a UMD wrapper's `exports` is a function parameter, not this module's exports"
+    );
+    assert_eq!(
+        exported("keyed"), 0,
+        "`module.exports = {{ keyed: 42 }}` exports a number; it must not mark the same-named function exported"
+    );
+    assert_eq!(
+        exported("realExport"), 1,
+        "control: a genuine shorthand export must still emit — without this the test passes by breaking the feature"
+    );
+}

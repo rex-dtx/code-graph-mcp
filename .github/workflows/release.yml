@@ -286,7 +286,18 @@ jobs:
           mkdir -p target/release
           cp artifacts/binary-linux-x64/code-graph-mcp target/release/
           chmod +x target/release/code-graph-mcp
-          node --test --test-concurrency=1 claude-plugin/scripts/*.test.js scripts/*.test.js
+          # `find`, not a `*.test.js` shell glob — the glob is NON-RECURSIVE,
+          # so the first test file anyone puts in a subdirectory is skipped in
+          # silence. ci.yml and pre-commit were converted; this one is the LAST
+          # gate before an irreversible `npm publish`, which is the one place
+          # a silently-skipped test costs the most.
+          # NOTE the difference from ci.yml: no install-e2e exclusion. The
+          # glob this replaces matched `scripts/*.test.js`, which INCLUDES
+          # install-e2e.test.js — and the release job is exactly where an
+          # install end-to-end test should run. Recursive discovery only; the
+          # file set is otherwise identical to what the glob produced.
+          files=$(find claude-plugin/scripts scripts -type f -name '*.test.js' | sort)
+          node --test --test-concurrency=1 $files
 
       - name: Prepare release assets
         run: |

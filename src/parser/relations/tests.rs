@@ -6062,6 +6062,84 @@ fn test_rust_local_closure_call_is_not_a_global_edge() {
 }
 
 #[test]
+fn test_rust_local_exclusion_respects_scope_and_position() {
+    // The exclusion's name set is a whole-body over-approximation: every binder
+    // anywhere in the function, with no scope and no ordering. That is
+    // precision-safe on the `references` axis and NOT on the calls axis, where
+    // it silently drops real edges — and a missing calls edge is the dangerous
+    // direction, because dead-code reads exactly that edge and a live function
+    // becomes a deletion candidate.
+    //
+    // Each case binds `helper` somewhere that CANNOT shadow the call, so the
+    // call is a genuine call of the global `helper` and must still emit.
+    let cases: &[(&str, &str)] = &[
+        (
+            "binder comes after the call",
+            "fn helper() -> i32 { 1 }\nfn run() -> i32 { let a = helper(); let helper = 9; a + helper }",
+        ),
+        (
+            "binder in a sibling block",
+            "fn helper() -> i32 { 1 }\nfn run() -> i32 { { let helper = 2; let _ = helper; } helper() }",
+        ),
+        (
+            "for-loop binder, call after the loop",
+            "fn helper() -> i32 { 1 }\nfn run(v: Vec<i32>) -> i32 { for helper in v { let _ = helper; } helper() }",
+        ),
+        (
+            "match-arm binder, call after the match",
+            "fn helper() -> i32 { 1 }\nfn run(x: Result<i32, i32>) -> i32 { match x { Ok(helper) => { let _ = helper; } Err(_) => {} } helper() }",
+        ),
+        (
+            "if-let binder, call after",
+            "fn helper() -> i32 { 1 }\nfn run(o: Option<i32>) -> i32 { if let Some(helper) = o { let _ = helper; } helper() }",
+        ),
+        (
+            "closure param, call outside the closure",
+            "fn helper() -> i32 { 1 }\nfn run() -> i32 { let f = |helper: i32| helper + 1; let _ = f(1); helper() }",
+        ),
+    ];
+
+    let mut lost = Vec::new();
+    for (label, src) in cases {
+        let rels = extract_relations(src, "rust").unwrap();
+        let calls: Vec<&str> = rels
+            .iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        if !calls.contains(&"helper") {
+            lost.push(*label);
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "these shapes bind `helper` where it cannot shadow the call, so the call is genuine \
+         and must emit — the exclusion is over-firing on them: {lost:?}"
+    );
+
+    // The other direction, unchanged: a binder that GENUINELY shadows still
+    // suppresses. Without this the fix above could be "never exclude anything".
+    let shadowed = [
+        "fn helper() -> i32 { 1 }\nfn run() -> i32 { let helper = || 2; helper() }",
+        "fn helper() -> i32 { 1 }\nfn run(v: Vec<fn() -> i32>) -> i32 { for helper in v { let _ = helper(); } 0 }",
+        "fn helper() -> i32 { 1 }\nfn run(o: Option<fn() -> i32>) -> i32 { if let Some(helper) = o { helper() } else { 0 } }",
+        "fn helper() -> i32 { 1 }\nfn run(f: fn() -> i32) -> i32 { let g = |helper: fn() -> i32| helper(); g(f) }",
+    ];
+    for src in shadowed {
+        let rels = extract_relations(src, "rust").unwrap();
+        let calls: Vec<&str> = rels
+            .iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| r.target_name.as_str())
+            .collect();
+        assert!(
+            !calls.contains(&"helper"),
+            "a binder that really does shadow the call must still suppress it, got: {calls:?}\nsrc: {src}"
+        );
+    }
+}
+
+#[test]
 fn test_rust_local_exclusion_keeps_genuine_calls() {
     // Negative control for the exclusion above: suppressing everything would
     // pass the previous test. A bare call whose name is NOT a local binding

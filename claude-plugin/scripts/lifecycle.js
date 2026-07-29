@@ -90,6 +90,21 @@ function readJsonResult(filePath) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return { value: null, missing: false, corrupt: true, raw: bytes };
     }
+    // VALID JSON can still have been decoded lossily. `toString('utf8')`
+    // substitutes U+FFFD for every invalid byte, and a latin-1/cp1252 byte
+    // inside a path (a non-ASCII username on a legacy code page, a hand-edited
+    // file) parses fine — so the object round-trips through JSON.stringify and
+    // the atomic write replaces those bytes with U+FFFD PERMANENTLY. The
+    // byte-exactness work above only covered the corrupt branch; this branch
+    // rewrote the file with no backup and no message at all.
+    //
+    // Re-encoding the decoded text and comparing to the original bytes detects
+    // exactly that: a lossless decode round-trips, a lossy one cannot. Reported
+    // as `lossy` rather than `corrupt` because the VALUE is usable — the caller
+    // preserves the true bytes first, then proceeds with it.
+    if (!Buffer.from(raw, 'utf8').equals(bytes)) {
+      return { value, missing: false, corrupt: false, lossy: true, raw: bytes };
+    }
     return { value, missing: false, corrupt: false, raw: bytes };
   } catch (err) {
     return { value: null, missing: false, corrupt: true, raw: bytes, error: err };
@@ -145,6 +160,27 @@ function backupCorruptFile(filePath, raw) {
 function readSettingsForWrite() {
   const p = settingsPath();
   const res = readJsonResult(p);
+  if (res.value && res.lossy) {
+    // Usable JSON whose bytes will not survive our rewrite (see readJsonResult).
+    // Preserve the true bytes, then proceed with the parsed value — refusing
+    // outright would strand the plugin over a byte we can still work around.
+    // If even the copy fails, refuse: silently destroying bytes is worse than
+    // skipping the settings work.
+    const backup = backupCorruptFile(p, res.raw);
+    if (!backup) {
+      console.error(
+        `[code-graph] ${p} contains bytes that are not valid UTF-8, and no backup copy ` +
+        `could be made. Leaving it untouched and skipping settings changes — rewriting it ` +
+        `would replace those bytes permanently.`
+      );
+      return { settings: null, backedUpTo: null };
+    }
+    console.error(
+      `[code-graph] ${p} contains bytes that are not valid UTF-8; rewriting it will replace ` +
+      `them. Saved the original to ${backup} first.`
+    );
+    return { settings: res.value, backedUpTo: backup };
+  }
   if (res.value) return { settings: res.value, backedUpTo: null };
   if (res.missing) return { settings: {}, backedUpTo: null };
   const why = res.error ? res.error.message : 'it does not contain a JSON object';
@@ -673,7 +709,16 @@ function hookCmdScript(cmd) {
 // dir — npm overwrites the same path on upgrade, so such a path never goes
 // version-stale (only dead-path-stale, caught separately by fs.existsSync).
 function cacheDirVersion(scriptPath) {
-  const m = (scriptPath || '').match(/\/code-graph-mcp\/code-graph-mcp\/(\d+\.\d+\.\d+[^/]*)\//);
+  // Separator-agnostic: the command string we parse is built with path.join,
+  // which yields `\` on Windows. A `/`-only pattern returned null there, so
+  // `compositeSlotIsStale` answered "not stale" for EVERY plugin-cache path
+  // and the statusline slot was never healed on Windows — it self-corrected
+  // only once cleanupOldCacheVersions eventually deleted the old version dir.
+  // The repo's own `an older plugin-cache version dir must still be healed`
+  // test could not catch it: plugin-tests runs on ubuntu only.
+  const m = (scriptPath || '')
+    .replace(/\\/g, '/')
+    .match(/\/code-graph-mcp\/code-graph-mcp\/(\d+\.\d+\.\d+[^/]*)\//);
   return m ? m[1] : null;
 }
 
@@ -1435,6 +1480,8 @@ module.exports = {
   removeHooksFromSettings, isOurHookEntry,
   registerHooksToSettings, buildSettingsHookEntries,                  // v0.32.0
   surveyHookCoverage, compositeCommand, compositeSlotIsStale,          // v0.49.1 — version-aware self-heal
+  cacheDirVersion,                                                     // exported for the separator-agnostic test
+
   verifyHooksFire, defaultHookFireProbes,                              // v0.67.0 — firing self-test
   activeInstallPath, isStaleRelicContext,                              // v0.49.1 — stale-relic downgrade guard
   SETTINGS_HOOK_DESC, OUR_HOOK_SCRIPTS, OUR_DESCRIPTIONS,              // v0.32.0 — for tests

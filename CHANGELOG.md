@@ -6,7 +6,7 @@ Audit 2026-07-27 P2 batch: 20 of the ~29 observations, chosen for the ones whose
 failure mode is silence, plus the seven findings an independent review raised
 against the batch itself.
 
-**`INDEX_VERSION` 53 → 55, so upgrading rebuilds the index once.** (The 53 → 54
+**`INDEX_VERSION` 53 → 56, so upgrading rebuilds the index once.** (The 53 → 54
 step landed with the second sub-batch; this line said "no `INDEX_VERSION` change"
 until 55, which was wrong from that commit onward.) Two changes alter what the
 indexer stores for identical source: bare Rust callees that name a local binding,
@@ -26,6 +26,48 @@ emit one (see the PHP and ESM entries below), so the index changes for any repo
 containing either.
 
 ### Fixed
+- **Five defects the pre-release review found, repaired before the tag.** Two
+  independent fresh-context reviewers were run over the release diff; neither
+  found a blocker, both found things worth stopping for.
+  - **`settings.json` containing a non-UTF-8 byte was silently rewritten with
+    no backup.** The byte-exactness work earlier in this batch covered only the
+    *corrupt* branch. A file that is valid JSON but carries an invalid UTF-8
+    byte — a latin-1 byte in a path, which a non-ASCII username on a legacy
+    code page produces — was classified clean, and then round-tripped through
+    `toString('utf8')` → `JSON.stringify` → atomic write, replacing every such
+    byte with U+FFFD permanently, with nothing on stderr. Detected now by
+    re-encoding the decoded text and comparing to the original bytes: a
+    lossless decode round-trips, a lossy one cannot. The true bytes are copied
+    aside first, and if the copy fails we refuse to touch the file.
+  - **The statusline slot was never healed on Windows** (a regression from this
+    batch). `cacheDirVersion`'s pattern was `/`-only, but the command it parses
+    is built with `path.join`, so on Windows it returned null for every
+    plugin-cache path and `compositeSlotIsStale` answered "not stale"
+    unconditionally. The repo's own "an older plugin-cache version dir must
+    still be healed" test could not catch it — `plugin-tests` is ubuntu-only.
+    Now separator-agnostic, with a test that asserts both spellings from any
+    platform.
+  - **The JS-test gate guarding `npm publish` was still on the non-recursive
+    glob.** Two of three gates were converted this batch; the one left behind
+    was the last gate before an irreversible publish. It also, unlike ci.yml,
+    must keep running `install-e2e` — the drift guard now covers release.yml
+    and pins both properties.
+  - **Rust local-binding call exclusion dropped real edges.** The exclusion
+    added earlier in this batch tested a whole-function name set with no scope
+    and no ordering, so a binder that cannot shadow the call suppressed it
+    anyway: a `let` *after* the call, a binder in a sibling block, a `for` /
+    `match` / `if let` binder with the call after the construct, a closure
+    parameter with the call outside it. A dropped `calls` edge is the dangerous
+    direction — dead-code reads exactly that edge. The memoized set is now only
+    a cheap over-approximation; a hit runs a precise walk of the call's own
+    ancestor chain. Edge-neutral and cost-neutral on this repository (0
+    restored, 0 lost, 4038 ms → 4060 ms).
+  - **Two CommonJS export forms bound the wrong node.** `(function (module,
+    exports) { exports.x = y })` — the UMD/webpack wrapper — was treated as a
+    module export because the object was matched by text, so it marked the
+    wrapped function exported; and a pair whose value is not a symbol
+    (`module.exports = { keyed: 42 }`) fell back to the KEY and marked a
+    same-named real function exported.
 - **CommonJS exports were invisible, so `dead-code` called them orphans.** An
   incoming `exports` edge is what makes `find_dead_code` report an unused symbol
   as `exported_unused` ("public surface, something outside may use it") rather
@@ -165,7 +207,7 @@ containing either.
   162 phantom. Both directions move — recall against the single-batch reference
   goes 80.0–86.1% → 89.9%, and the phantom count halves at worst. So a
   multi-batch repo does get a different index out of this — covered by the
-  53 → 55 `INDEX_VERSION` step this batch already carries, which forces the
+  53 → 56 `INDEX_VERSION` step this batch already carries, which forces the
   rebuild that picks it up.
 - **SQL `LIKE` treated `_` as a wildcard in the test-source filter** (P2-10), so
   `latest.cs` (`%`=`l`, `_`=`a`, then `test.`) and `attest.py` were classified as
@@ -199,7 +241,7 @@ containing either.
   and the client refuses to extract without a match. The binary update still
   proceeds in every refusal case, so a bad plugin asset strands no one.
 - **All 21 first-party `actions/*` uses were on mutable major tags** (P2-25)
-  while all 13 third-party ones were SHA-pinned — the harder half to justify,
+  while all 20 third-party sites (3 distinct actions) were SHA-pinned — the harder half to justify,
   since `actions/checkout` runs first in every job including the one holding
   `NPM_TOKEN`. Every `uses:` is now pinned to a verified 40-hex commit, with a
   drift guard.
@@ -348,7 +390,7 @@ containing either.
   `*_test.java` / `*_test.rb` vanished from `project_map` while `callgraph`
   listed all their callers. Both now splice `domain::prod_filter_and`, which
   takes the alias pair.
-- **Seven more JS test files wrote into the real Claude config.** v0.108.1 closed
+- **Eight JS test files wrote into the real Claude config.** v0.108.1 closed
   this in two files and missed a third; the fix for that missed seven more,
   including `adopt.test.js`, which redirects `HOME` in-process rather than
   spawning. Measured against a canary config dir: five `projects/<slug>/memory/`
@@ -394,10 +436,20 @@ containing either.
   that is pinned too.
 
 ### Internal
-- **`index_files` gave up its two tail phases** (P1-9, partial). Phase 3
-  (context strings + embeddings) and the 2d-bind / 2d-prune / 2e trio are now
-  `build_context_strings_and_embed` and `run_global_edge_post_passes`: 1753 →
-  1620 lines in the caller, with the two phases' inputs and outputs stated in a
+- **`index_files` was decomposed** (P1-9). 1705 → 1050 lines and max brace
+  depth 13 → 10, measured on the function body at `origin/main` and at HEAD,
+  across four commits: Phase 3
+  (context strings + embeddings) and the 2d-bind / 2d-prune / 2e trio out first
+  as `build_context_strings_and_embed` and `run_global_edge_post_passes`; then
+  Phases 0 / 1a / 1b / 2b / 2b-ext / 2c as `buffer_then_delete_files`,
+  `pre_parse_batch`, `insert_batch_nodes`, `mint_external_sentinels` and
+  `restore_inbound_edges`, with the six mutable accumulators that used to live
+  across 1700 lines collected into `SkipCounters` and `BatchInserted`; then the
+  Phase-2 loop's own duplication — twelve copies of the source × target edge
+  insert into `insert_relation_edges`, three copies of the `<module>`-of-file
+  lookup into `module_node_of`, and five import branches that each re-parsed the
+  same metadata JSON down to one parse. Each step states its phases' inputs and
+  outputs in a
   signature instead of inferred from 1700 lines of shared mutable state. Both
   were chosen because they touch none of the caller's six accumulators, so the
   extraction is behaviour-preserving by construction. Verified that way too:

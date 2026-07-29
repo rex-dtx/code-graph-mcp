@@ -214,3 +214,27 @@ test('P2-17 a live composite from another delivery surface is not stale (no stat
   assert.equal(lifecycle.compositeSlotIsStale('some-wrapper --statusline-composite'), true,
     'a command we cannot resolve to a script must be replaced');
 });
+
+// Windows: the composite command is built with path.join, so the path it
+// carries uses `\`. cacheDirVersion's pattern was `/`-only, so on Windows it
+// returned null for EVERY plugin-cache path — compositeSlotIsStale then
+// answered "not stale" unconditionally and the statusline slot was never
+// healed there. It self-corrected only once cleanupOldCacheVersions deleted
+// the old version dir. The test above cannot catch this: it builds its paths
+// with path.join, so on the ubuntu-only plugin-tests job it produces `/`.
+// This one asserts the parse directly, on both spellings, from any platform.
+test('cacheDirVersion parses a plugin-cache path with either separator', () => {
+  const posix = '/home/u/.claude/plugins/cache/code-graph-mcp/code-graph-mcp/0.100.0/scripts/statusline-composite.js';
+  const win32 = 'C:\\Users\\u\\.claude\\plugins\\cache\\code-graph-mcp\\code-graph-mcp\\0.100.0\\scripts\\statusline-composite.js';
+
+  assert.equal(lifecycle.cacheDirVersion(posix), '0.100.0');
+  assert.equal(
+    lifecycle.cacheDirVersion(win32), '0.100.0',
+    'a backslash-spelled cache path must yield the same version — returning null here makes ' +
+    'compositeSlotIsStale report "not stale" for every Windows plugin-cache install'
+  );
+
+  // In-place installs (global npm) carry no version dir on either spelling.
+  assert.equal(lifecycle.cacheDirVersion('/usr/lib/node_modules/@sdsrs/code-graph/claude-plugin/scripts/x.js'), null);
+  assert.equal(lifecycle.cacheDirVersion('C:\\npm\\node_modules\\@sdsrs\\code-graph\\claude-plugin\\scripts\\x.js'), null);
+});
