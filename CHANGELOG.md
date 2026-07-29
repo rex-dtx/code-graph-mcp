@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.109.0 (2026-07-29)
 
 Audit 2026-07-27 P2 batch: 20 of the ~29 observations, chosen for the ones whose
 failure mode is silence, plus the seven findings an independent review raised

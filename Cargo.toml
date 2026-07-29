@@ -1,6 +1,6 @@
 [package]
 name = "code-graph-mcp"
-version = "0.108.1"
+version = "0.109.0"
 edition = "2021"
 license = "MIT"
 
