@@ -12,6 +12,7 @@ const path = require('path');
 const fs = require('fs');
 const { isNonProjectCwd } = require('./project-detect');
 const { serveEmptyMcpStub } = require('./mcp-stub');
+const { hidden } = require('./proc-opts');
 
 // Set plugin root so find-binary.js can locate bundled/dev binaries
 // Always derive from __dirname — CLAUDE_PLUGIN_ROOT can leak from other plugins
@@ -78,7 +79,7 @@ if (process.env.CODE_GRAPH_FORCE_PLUGIN_MCP !== '1' && isNonProjectCwd(process.c
         const bin = findBinary();
         if (!bin) return null;
         process.stderr.write(`[code-graph] cwd became a project — upgrading plugin MCP to real tools via ${bin} (restart Claude Code for full tool steering)\n`);
-        return spawn(bin, ['serve'], { stdio: ['pipe', 'pipe', 'inherit'], env: process.env });
+        return spawn(bin, ['serve'], hidden({ stdio: ['pipe', 'pipe', 'inherit'], env: process.env }));
       },
     },
   });
@@ -159,7 +160,7 @@ if (!binary) {
         const bin = findBinary();
         if (!bin) return null;
         process.stderr.write(`[code-graph] binary ready at ${bin} — upgrading plugin MCP to real tools (restart Claude Code for full tool steering)\n`);
-        return spawn(bin, ['serve'], { stdio: ['pipe', 'pipe', 'inherit'], env: process.env });
+        return spawn(bin, ['serve'], hidden({ stdio: ['pipe', 'pipe', 'inherit'], env: process.env }));
       },
     },
   });
@@ -205,10 +206,10 @@ try {
 }
 
 // Spawn binary with stdio inheritance for MCP JSON-RPC
-const child = spawn(binary, ['serve'], {
+const child = spawn(binary, ['serve'], hidden({
   stdio: 'inherit',
   env: process.env,
-});
+}));
 
 child.on('error', (err) => {
   process.stderr.write(`[code-graph] Failed to start: ${err.message}\n`);

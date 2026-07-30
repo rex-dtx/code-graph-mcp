@@ -19,9 +19,34 @@ const ROOT = path.resolve(__dirname, '..');
 const PLUGIN_ROOT = path.join(ROOT, 'claude-plugin');
 const BIN_CLI = path.join(ROOT, 'bin', 'cli.js');
 const FIND_BINARY = path.join(PLUGIN_ROOT, 'scripts', 'find-binary.js');
-const VERSION_UTILS = path.join(PLUGIN_ROOT, 'scripts', 'version-utils.js');
 const LIFECYCLE = path.join(PLUGIN_ROOT, 'scripts', 'lifecycle.js');
 const CURRENT_VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
+
+/**
+ * Copy `entry` and its transitive local (`./x`) requires into `destDir`.
+ *
+ * Replaces a hand-written list of find-binary.js's dependencies. That list went
+ * stale the moment find-binary picked up a new sibling module (proc-opts.js),
+ * and the failure surfaced as "Cannot find module" inside a fixture rather than
+ * anywhere near the change — the same shape as the copy-list in
+ * find-binary.test.js, which had to be edited for the same reason. Walking the
+ * requires means the fixture tracks the real dependency closure by itself.
+ * @param {string} entry - absolute path to a .js file
+ * @param {string} destDir - directory to copy into
+ * @param {Set<string>} [seen]
+ * @returns {Set<string>} basenames copied
+ */
+function copyWithLocalDeps(entry, destDir, seen = new Set()) {
+  const name = path.basename(entry);
+  if (seen.has(name)) return seen;
+  seen.add(name);
+  fs.copyFileSync(entry, path.join(destDir, name));
+  const src = fs.readFileSync(entry, 'utf8');
+  for (const m of src.matchAll(/require\(\s*['"]\.\/([\w.-]+?)(?:\.js)?['"]\s*\)/g)) {
+    copyWithLocalDeps(path.join(path.dirname(entry), `${m[1]}.js`), destDir, seen);
+  }
+  return seen;
+}
 const PLATFORM = os.platform();
 const BINARY_NAME = PLATFORM === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp';
 
@@ -662,12 +687,12 @@ test('§2.8 bin/cli.js shows install instructions when binary is missing', () =>
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.mkdirSync(fakePlugin, { recursive: true });
 
-  // Copy find-binary.js + its module deps to fake root.
-  // (find-binary.js requires ./version-utils for B fix's cache version check,
-  // and ./npm-exec for the Windows npm shell shim.)
-  fs.copyFileSync(FIND_BINARY, path.join(fakePlugin, 'find-binary.js'));
-  fs.copyFileSync(VERSION_UTILS, path.join(fakePlugin, 'version-utils.js'));
-  fs.copyFileSync(path.join(PLUGIN_ROOT, 'scripts', 'npm-exec.js'), path.join(fakePlugin, 'npm-exec.js'));
+  // Copy find-binary.js + whatever it actually requires (version-utils for the
+  // cache version check, npm-exec for the Windows npm shim, proc-opts for
+  // windowsHide, and anything added later — see copyWithLocalDeps).
+  const copied = copyWithLocalDeps(FIND_BINARY, fakePlugin);
+  assert.ok(copied.has('find-binary.js') && copied.size >= 2,
+    `fixture must carry find-binary.js plus its deps, got: ${[...copied].join(', ')}`);
 
   // Create a minimal cli.js that uses the fake find-binary
   const cliScript = `

@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { claudeHome } = require('./claude-config');
+const { hidden } = require('./proc-opts');
 
 const PLUGIN_ID = 'code-graph-mcp@code-graph-mcp';
 const OLD_PLUGIN_IDS = [
@@ -879,13 +880,13 @@ function verifyHooksFire({ hooks, env, timeoutMs = 4000, tmpBase } = {}) {
   for (const h of probes) {
     let error = null, ok = false, emitted = false, code = null, signal = null;
     try {
-      const r = spawnSync(process.execPath, [h.script], {
+      const r = spawnSync(process.execPath, [h.script], hidden({
         input: JSON.stringify(h.payload || {}),
         cwd: fixture,
         env: baseEnv,
         timeout: timeoutMs,
         encoding: 'utf8',
-      });
+      }));
       code = r.status;
       signal = r.signal;
       ok = !r.error && r.status === 0;
@@ -1061,11 +1062,10 @@ function installedGlobalPkgs() {
 
 function defaultRunNpm(args) {
   const { spawnSync } = require('child_process');
-  const { npmSpawnOpts } = require('./npm-exec');
+  const { npmInvocation } = require('./npm-exec');
   try {
-    const r = spawnSync('npm', args, npmSpawnOpts({
-      timeout: 120000, stdio: 'pipe', encoding: 'utf8',
-    }));
+    const npm = npmInvocation(args, { timeout: 120000, stdio: 'pipe', encoding: 'utf8' });
+    const r = spawnSync(npm.file, npm.args, npm.opts);
     return !r.error && r.status === 0;
   } catch { return false; }
 }
@@ -1311,9 +1311,9 @@ function readActiveProcessCmdlines() {
   } catch { /* fall through to ps */ }
   try {
     const { execFileSync } = require('child_process');
-    return execFileSync('ps', ['-axww', '-o', 'command='], {
+    return execFileSync('ps', ['-axww', '-o', 'command='], hidden({
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
-    }).split('\n').filter(Boolean);
+    })).split('\n').filter(Boolean);
   } catch { /* unsupported platform — caller falls back to recency-only */ }
   return [];
 }

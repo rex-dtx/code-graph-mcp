@@ -199,9 +199,24 @@ test('getPackageVersion falls back to .claude-plugin/plugin.json (marketplace la
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(root, '.claude-plugin'), { recursive: true });
-  for (const f of ['find-binary.js', 'version-utils.js', 'npm-exec.js']) {
-    fs.copyFileSync(path.join(__dirname, f), path.join(root, 'scripts', f));
-  }
+  // Copy find-binary.js plus whatever it actually requires, walking `./x`
+  // requires transitively. The hand-written list this replaces went stale the
+  // moment find-binary picked up a new sibling (proc-opts.js) and failed as
+  // "Cannot find module" inside the fixture, far from the change — the same
+  // shape as the copy-list in scripts/install-e2e.test.js.
+  const copyWithLocalDeps = (entry, destDir, seen = new Set()) => {
+    const name = path.basename(entry);
+    if (seen.has(name)) return seen;
+    seen.add(name);
+    fs.copyFileSync(entry, path.join(destDir, name));
+    for (const m of fs.readFileSync(entry, 'utf8')
+      .matchAll(/require\(\s*['"]\.\/([\w.-]+?)(?:\.js)?['"]\s*\)/g)) {
+      copyWithLocalDeps(path.join(path.dirname(entry), `${m[1]}.js`), destDir, seen);
+    }
+    return seen;
+  };
+  const copied = copyWithLocalDeps(path.join(__dirname, 'find-binary.js'), path.join(root, 'scripts'));
+  assert.ok(copied.size >= 2, `fixture must carry find-binary.js plus its deps, got: ${[...copied].join(', ')}`);
   fs.writeFileSync(path.join(root, '.claude-plugin', 'plugin.json'),
     JSON.stringify({ name: 'code-graph-mcp', version: '9.8.7' }));
   const script = `process.stdout.write(String(require(${

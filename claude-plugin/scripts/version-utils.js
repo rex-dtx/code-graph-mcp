@@ -2,6 +2,7 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { hidden } = require('./proc-opts');
 
 // Tolerant match: the version line anywhere in the output (m flag), optional
 // "v" prefix, and anything after the numeric triple (build-metadata suffixes
@@ -13,12 +14,12 @@ const VERSION_OUTPUT_RE = /^code-graph-mcp\s+v?(\d+\.\d+\.\d+)/m;
 
 function readBinaryVersion(binaryPath) {
   try {
-    const out = execFileSync(binaryPath, ['--version'], {
+    const out = execFileSync(binaryPath, ['--version'], hidden({
       // 5s: a cold exec of a freshly-written ~40MB binary (page-in, Windows AV
       // scan) regularly exceeded the old 2s, misclassifying a good binary.
       timeout: 5000,
       stdio: ['pipe', 'pipe', 'pipe'],
-    }).toString().trim();
+    })).toString().trim();
     const match = out.match(VERSION_OUTPUT_RE);
     return match ? match[1] : null;
   } catch {

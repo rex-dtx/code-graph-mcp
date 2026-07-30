@@ -135,6 +135,23 @@ test('launchBackgroundAutoUpdate forwards --force only when asked (session-start
   assert.deepEqual(calls[1].args.slice(1), ['check', '--silent']);
 });
 
+test('CODE_GRAPH_NO_AUTO_UPDATE=1 stops the updater from being spawned at all', () => {
+  // The opt-out is enforced inside auto-update.js too; checking it here as well
+  // means an opted-out user doesn't pay for a node process per session just to
+  // have it exit immediately (issue #40).
+  const calls = [];
+  const capture = (_command, args) => { calls.push({ args }); return { unref() {} }; };
+
+  const ok = launchBackgroundAutoUpdate(capture, { CODE_GRAPH_NO_AUTO_UPDATE: '1' }, { force: true });
+  assert.equal(ok, false, 'opted out → reports "not launched"');
+  assert.equal(calls.length, 0, 'opted out → no updater process');
+
+  // Control: the same call WITHOUT the variable does spawn, so the assertion
+  // above is about the opt-out and not about the fixture being inert.
+  assert.equal(launchBackgroundAutoUpdate(capture, {}, { force: true }), true);
+  assert.equal(calls.length, 1);
+});
+
 test('isHighIntentSource forces on session start/resume/clear but not automatic compaction', () => {
   assert.equal(isHighIntentSource('startup'), true);
   assert.equal(isHighIntentSource('resume'), true);

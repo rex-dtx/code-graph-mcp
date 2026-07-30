@@ -16,6 +16,7 @@
 // cg-answer.js).
 
 const { spawnSync } = require('child_process');
+const { hidden } = require('./proc-opts');
 
 const MARKER = '<!-- code-graph-impact-review -->';
 const SPAWN_TIMEOUT_MS = 60_000;
@@ -88,7 +89,7 @@ function resolveBinary() {
 }
 
 function runAffected(binary, args, cwd, stdin) {
-  const res = spawnSync(binary, args, {
+  const res = spawnSync(binary, args, hidden({
     cwd,
     input: stdin,
     timeout: SPAWN_TIMEOUT_MS,
@@ -96,7 +97,7 @@ function runAffected(binary, args, cwd, stdin) {
     maxBuffer: 16 * 1024 * 1024,
     stdio: ['pipe', 'pipe', 'ignore'],
     env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-  });
+  }));
   if (res.error || res.signal || res.status !== 0) return null;
   try {
     return JSON.parse((res.stdout || '').trim());
@@ -201,10 +202,10 @@ function renderMarkdown(review) {
 /// Upsert a sticky comment: find an existing comment containing MARKER and PATCH
 /// it, else POST a new one. Uses `gh api` (preinstalled on GitHub runners).
 function upsertComment(repo, prNumber, body) {
-  const gh = (args, input) => spawnSync('gh', args, {
+  const gh = (args, input) => spawnSync('gh', args, hidden({
     encoding: 'utf8', input, timeout: SPAWN_TIMEOUT_MS,
     env: { ...process.env },
-  });
+  }));
 
   const list = gh(['api', '--paginate', `repos/${repo}/issues/${prNumber}/comments`]);
   let existingId = null;

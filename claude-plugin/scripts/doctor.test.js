@@ -473,3 +473,37 @@ for (const entry of ENTRY_POINTS) {
       '--check-only must not claim to have addressed anything');
   });
 }
+
+// ── Suspended auto-update is reported honestly (issue #40) ─────────────────
+//
+// When the updater has given up on a release (MAX_UPDATE_ATTEMPTS consecutive
+// failed installs of the SAME version), doctor used to report "Auto-update: ok
+// — up-to-date" and, on the neighbouring `update-incomplete` path, offer a
+// repair that re-runs exactly the check that was suspended — printing
+// "✅ Update check complete" and counting a fix that cannot happen.
+test('doctor warns (with no phantom fix) when auto-update has suspended a release', (t) => {
+  const home = freshHome(t);
+  const cacheDir = path.join(home, '.cache', 'code-graph');
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const { MAX_UPDATE_ATTEMPTS } = require('./auto-update');
+  fs.writeFileSync(path.join(cacheDir, 'update-state.json'), JSON.stringify({
+    latestVersion: '9.9.9',
+    updateAvailable: true,
+    updateAttempts: MAX_UPDATE_ATTEMPTS,
+    binaryUpdated: true,
+  }));
+
+  const r = runDoctorCli(home, ['--check-only']);
+  assert.match(r.stdout, /Auto-update/);
+  assert.match(r.stdout, /failed to install 5×/, 'must name the failure count, not claim "up-to-date"');
+  assert.match(r.stdout, /npm install -g @sdsrs\/code-graph/, 'must hand the user the manual route');
+
+  // Control: one attempt below the cap is NOT reported as suspended — otherwise
+  // this test would pass on any state file at all.
+  const home2 = freshHome(t);
+  fs.mkdirSync(path.join(home2, '.cache', 'code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(home2, '.cache', 'code-graph', 'update-state.json'), JSON.stringify({
+    latestVersion: '9.9.9', updateAvailable: true, updateAttempts: MAX_UPDATE_ATTEMPTS - 1, binaryUpdated: true,
+  }));
+  assert.doesNotMatch(runDoctorCli(home2, ['--check-only']).stdout, /auto-retry suspended/);
+});

@@ -11,6 +11,8 @@ const {
   installedGlobalPkgs, GLOBAL_INSTALL_MARKER, SHELL_PKG,
 } = require('./lifecycle');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
+const { hidden } = require('./proc-opts');
+const { MAX_UPDATE_ATTEMPTS } = require('./auto-update');
 
 // ── Diagnostics ───────────────────────────────────────────
 
@@ -136,12 +138,12 @@ function runDiagnostics({ checkOnly = false } = {}) {
     if (execOk) {
       try {
         const cwd = process.cwd();
-        const hcOutput = execFileSync(binary, ['health-check', '--json'], {
+        const hcOutput = execFileSync(binary, ['health-check', '--json'], hidden({
           cwd,
           timeout: 5000,
           encoding: 'utf8',
           stdio: ['pipe', 'pipe', 'pipe'],
-        }).trim();
+        })).trim();
         const hc = JSON.parse(hcOutput);
 
         // No-index short-circuit — binary deliberately returns a structured
@@ -202,7 +204,20 @@ function runDiagnostics({ checkOnly = false } = {}) {
   // 5. Auto-update state
   try {
     const state = readJson(path.join(CACHE_DIR, 'update-state.json'));
-    if (state && state.updateAvailable && state.binaryUpdated === false) {
+    const attempts = (state && state.updateAttempts) || 0;
+    if (state && state.updateAvailable && attempts >= MAX_UPDATE_ATTEMPTS) {
+      // The updater has given up on this release (issue #40). Deliberately NO
+      // fixId: re-running `auto-update.js check` is precisely the thing that was
+      // suspended, so offering it as a repair would print "✅ Update check
+      // complete" and count a fix that cannot happen. Say what is true and hand
+      // the user the manual route.
+      results.push({
+        name: 'Auto-update',
+        status: 'warn',
+        detail: `v${state.latestVersion} failed to install ${attempts}× — auto-retry suspended until a newer release. `
+          + 'Update manually: `npm install -g @sdsrs/code-graph` (or `/plugin update code-graph-mcp`)',
+      });
+    } else if (state && state.updateAvailable && state.binaryUpdated === false) {
       results.push({
         name: 'Auto-update',
         status: 'warn',
@@ -492,10 +507,10 @@ function runRepairs(results) {
         if (!isDevMode()) {
           console.log('\n  Triggering binary update...');
           try {
-            execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], {
+            execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], hidden({
               timeout: 60000,
               stdio: 'inherit',
-            });
+            }));
             console.log('  \u2705 Update check complete');
             fixed++;
           } catch {
@@ -516,11 +531,11 @@ function runRepairs(results) {
         console.log(`    \u2192 ${buildCmd}`);
         try {
           const projectRoot = path.resolve(__dirname, '..', '..');
-          execSync(buildCmd, {
+          execSync(buildCmd, hidden({
             cwd: projectRoot,
             stdio: 'inherit',
             timeout: 600000,  // embed-model (Candle) builds exceed the old 5min
-          });
+          }));
           clearBinaryCache();
           console.log('  \u2705 Build complete');
           fixed++;
@@ -539,11 +554,11 @@ function runRepairs(results) {
           console.log('      (for semantic search: cargo build --release --features embed-model)');
           try {
             const projectRoot = path.resolve(__dirname, '..', '..');
-            execSync('cargo build --release --no-default-features', {
+            execSync('cargo build --release --no-default-features', hidden({
               cwd: projectRoot,
               stdio: 'inherit',
               timeout: 600000,
-            });
+            }));
             clearBinaryCache();
             console.log('  \u2705 Build complete');
             fixed++;
@@ -580,11 +595,11 @@ function runRepairs(results) {
           console.log('\n  Rebuilding index...');
           console.log('    \u2192 code-graph-mcp incremental-index');
           try {
-            execFileSync(binary, ['incremental-index'], {
+            execFileSync(binary, ['incremental-index'], hidden({
               cwd: process.cwd(),
               stdio: 'inherit',
               timeout: 120000,
-            });
+            }));
             console.log('  \u2705 Index rebuilt');
             fixed++;
           } catch {
@@ -597,10 +612,10 @@ function runRepairs(results) {
       case 'update-incomplete': {
         console.log('\n  Completing auto-update...');
         try {
-          execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], {
+          execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], hidden({
             timeout: 60000,
             stdio: 'inherit',
-          });
+          }));
           console.log('  \u2705 Update check complete');
           fixed++;
         } catch {

@@ -13,6 +13,7 @@ const os = require('os');
 // diagnostic blindness + the §8 recursive-grep footgun (see tmp-dir.js). The
 // other hook scripts already route through here; this one was the lone holdout.
 const { cgTmpDir } = require('./tmp-dir');
+const { hidden } = require('./proc-opts');
 
 // Mid-session install detection: hook fires but no manifest yet.
 const MANIFEST_PATH = path.join(os.homedir(), '.cache', 'code-graph', 'install-manifest.json');
@@ -467,13 +468,13 @@ function runMain() {
   };
 
   function run(cmd, args) {
-    return execFileSync(cmd, args, {
+    return execFileSync(cmd, args, hidden({
       cwd,
       timeout: 3000,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildRunEnv(),
-    });
+    }));
   }
 
   try {

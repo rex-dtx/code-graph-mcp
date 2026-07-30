@@ -9,6 +9,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 const os = require('os');
 const lifecycle = require('./lifecycle');
+const { hidden } = require('./proc-opts');
 const { readRegistry } = lifecycle;
 const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
@@ -79,12 +80,12 @@ function runProvider(command, needsStdin, stdin) {
     const cwd = cwdFromStdin(stdin);
     const env = cwd ? { ...process.env, CODE_GRAPH_STATUSLINE_CWD: cwd } : process.env;
 
-    const out = execFileSync(argv[0], argv.slice(1), {
+    const out = execFileSync(argv[0], argv.slice(1), hidden({
       timeout: 3000,
       stdio: ['pipe', 'pipe', 'pipe'],
       input: needsStdin ? stdin : '',
       env,
-    }).toString().trim();
+    })).toString().trim();
 
     return out || null;
   } catch { return null; }

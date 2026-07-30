@@ -2,6 +2,7 @@
 'use strict';
 const { execFileSync } = require('child_process');
 const { findBinary } = require('./find-binary');
+const { hidden } = require('./proc-opts');
 
 // v0.21 — gated default-off. v0.18.0 added query-time freshness
 // (ensure_file_indexed) inside MCP tools that take a file_path arg, so a
@@ -29,10 +30,10 @@ function runMain() {
   if (!bin) return; // silent — binary not installed yet
 
   try {
-    execFileSync(bin, ['incremental-index', '--quiet'], {
+    execFileSync(bin, ['incremental-index', '--quiet'], hidden({
       timeout: 8000,
       stdio: ['pipe', 'pipe', 'pipe']
-    });
+    }));
   } catch { /* timeout or error — silent for hook */ }
 }
 

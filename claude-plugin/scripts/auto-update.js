@@ -12,7 +12,8 @@ const { claudeHome } = require('./claude-config');
 const { clearCache: clearBinaryCache, globalNodeModulesCandidates, nvmNodeModulesDirs, PLATFORM_PKG, detectLibc } = require('./find-binary');
 const { readBinaryVersion, compareVersions, isDevMode } = require('./version-utils');
 const { cgTmpDir } = require('./tmp-dir');
-const { npmSpawnOpts } = require('./npm-exec');
+const { npmInvocation } = require('./npm-exec');
+const { hidden } = require('./proc-opts');
 const { acquireLock } = require('./install-lock');
 
 // ── Environment Checks ────────────────────────────────────
@@ -25,7 +26,7 @@ const { acquireLock } = require('./install-lock');
 function commandExists(cmd) {
   try {
     const whichCmd = process.platform === 'win32' ? 'where' : 'which';
-    execFileSync(whichCmd, [cmd], { stdio: 'ignore' });
+    execFileSync(whichCmd, [cmd], hidden({ stdio: 'ignore' }));
     return true;
   } catch {
     return false;
@@ -47,9 +48,28 @@ const SESSION_START_MIN_GAP_MS = 2 * 60 * 1000;      // 2min — anti-hammer flo
 // `--force` included, because the backoff arm sits above the force arm below.
 const RATE_LIMIT_INTERVAL_MS = 60 * 60 * 1000;       // 1h — GitHub's reset window
 const FETCH_TIMEOUT_MS = 3000;
+// After this many consecutive FAILED install cycles for the SAME target version,
+// stop re-running the download chain and go check-only until a new release moves
+// the target. Some failures are permanent for a given machine (a GNU tar that
+// cannot open `C:\...`, a locked plugin cache, a full disk) and every retry was
+// a fresh ~MB download plus — before the windowsHide sweep — a burst of console
+// windows, once per session, forever (issue #40). Kept equal to statusline.js's
+// STUCK_UPDATE_ATTEMPTS (drift-guarded in statusline.test.js) so the moment the
+// updater gives up is the moment the statusline stops promising "↻ updating".
+const MAX_UPDATE_ATTEMPTS = 5;
 
 function isSilentMode(argv = process.argv.slice(2), env = process.env) {
   return argv.includes('--silent') || env.CODE_GRAPH_AUTO_UPDATE_SILENT === '1';
+}
+
+// Documented opt-out. Until now the only way to stop auto-update was the
+// accidental one — CODE_GRAPH_DEV=1, which also changes binary resolution and
+// several unrelated code paths (issue #40). This one does exactly what it says.
+// It does NOT block --install-missing: that path exists to put a binary on disk
+// for a server that has none, and disabling *updates* must not wedge a fresh
+// install with no engine.
+function isAutoUpdateDisabled(env = process.env) {
+  return env.CODE_GRAPH_NO_AUTO_UPDATE === '1';
 }
 
 function isInstallMissingMode(argv = process.argv.slice(2)) {
@@ -342,7 +362,7 @@ async function downloadBinary(latest) {
     execFileSync('curl', [
       '-sL', '-o', binaryTmp,
       latest.binaryUrl,
-    ], { timeout: 60000, stdio: 'pipe' });
+    ], hidden({ timeout: 60000, stdio: 'pipe' }));
 
     // Integrity sidecar (<asset>.sha256), fail-CLOSED. `curl -f` turns a 404 into
     // a throw. One retry, because the alternative to a transient network blip is
@@ -363,7 +383,7 @@ async function downloadBinary(latest) {
     for (let attempt = 0; attempt < 2 && !expectedSha; attempt++) {
       try {
         execFileSync('curl', ['-sfL', '-o', shaTmp, latest.binaryUrl + '.sha256'],
-          { timeout: 30000, stdio: 'pipe' });
+          hidden({ timeout: 30000, stdio: 'pipe' }));
         expectedSha = (fs.readFileSync(shaTmp, 'utf8').trim().split(/\s+/)[0]) || null;
       } catch { /* retry once, then refuse below */ } finally {
         try { if (fs.existsSync(shaTmp)) fs.unlinkSync(shaTmp); } catch { /* ok */ }
@@ -464,7 +484,7 @@ function refreshMarketplaceClone({ dir = marketplaceCloneDir(), exec = execFileS
   try {
     if (!fs.existsSync(path.join(dir, '.git'))) return false;
     if (!commandExists('git')) return false;
-    exec('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], { timeout: timeoutMs, stdio: 'pipe' });
+    exec('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], hidden({ timeout: timeoutMs, stdio: 'pipe' }));
     return true;
   } catch {
     return false;
@@ -517,7 +537,7 @@ async function downloadAndInstall(latest, {
       '-sL', '-o', tarballPath,
       '-H', 'Accept: application/octet-stream',
       latest.pluginTarballUrl,
-    ], { timeout: 30000, stdio: 'pipe' });
+    ], hidden({ timeout: 30000, stdio: 'pipe' }));
 
     // One retry, matching the binary sidecar at :355 — same failure mode, same
     // argument: a transient blip should cost an update cycle, not force a
@@ -528,7 +548,7 @@ async function downloadAndInstall(latest, {
     for (let attempt = 0; attempt < 2 && !expectedSha; attempt++) {
       try {
         exec('curl', ['-sfL', '-o', shaPath, latest.pluginTarballUrl + '.sha256'],
-          { timeout: 30000, stdio: 'pipe' });
+          hidden({ timeout: 30000, stdio: 'pipe' }));
         expectedSha = (fs.readFileSync(shaPath, 'utf8').trim().split(/\s+/)[0]) || null;
       } catch { /* retried once, then refused just below */ }
     }
@@ -540,9 +560,18 @@ async function downloadAndInstall(latest, {
 
     // No --strip-components: the asset archives `claude-plugin/` itself, while
     // GitHub's source tarball wraps everything in `<owner>-<repo>-<sha>/`.
+    //
+    // Relative archive name + `cwd`, never an absolute path with `-C`: GNU tar
+    // (git-for-Windows / MSYS, first on PATH for many Windows users) reads the
+    // drive letter in `C:\Users\...\claude-plugin.tar.gz` as a REMOTE HOST and
+    // fails with "Cannot connect to C: resolve failed" — the same colon-parsing
+    // family as issues #34/#35. Windows' built-in bsdtar accepts both spellings,
+    // so this form is the portable one. On a failing GNU tar this was the step
+    // that made plugin updates unachievable, which is what put the whole
+    // download chain on a per-session repeat loop (issue #40).
     exec('tar', [
-      'xzf', tarballPath, '-C', tmpDir,
-    ], { timeout: 15000, stdio: 'pipe' });
+      'xzf', PLUGIN_ASSET_NAME,
+    ], hidden({ cwd: tmpDir, timeout: 15000, stdio: 'pipe' }));
 
     const pluginSrc = path.join(tmpDir, 'claude-plugin');
     const pluginDst = path.join(
@@ -587,9 +616,9 @@ async function downloadAndInstall(latest, {
       try {
         const newLifecycle = path.join(pluginDst, 'scripts', 'lifecycle.js');
         if (fs.existsSync(newLifecycle)) {
-          exec(process.execPath, [newLifecycle, 'update'], {
+          exec(process.execPath, [newLifecycle, 'update'], hidden({
             timeout: 5000, stdio: 'pipe',
-          });
+          }));
         }
       } catch { /* not fatal — syncLifecycleConfig will self-heal on next session */ }
     }
@@ -698,10 +727,11 @@ function inactiveNodeGlobalRelics({ dirs = null, activeDir = null } = {}) {
 function npmInstallGlobal(specs) {
   return new Promise((resolve) => {
     if (!commandExists('npm')) { resolve(false); return; }
-    const child = spawn('npm', ['install', '-g', ...specs], npmSpawnOpts({
+    const npm = npmInvocation(['install', '-g', ...specs], {
       timeout: GLOBAL_PKG_HEAL_TIMEOUT_MS,
       stdio: ['ignore', 'ignore', 'pipe'],
-    }));
+    });
+    const child = spawn(npm.file, npm.args, npm.opts);
     let stderr = '';
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     child.on('error', () => resolve(false));
@@ -775,10 +805,11 @@ function shouldHealGlobalsOnThrottle(state, { readStale = staleGlobalPkgs } = {}
 async function checkForUpdate({ installMissing = false, force = false, requestJsonFn } = {}) {
   let installLock = null;
   try {
-    // Skip in dev mode — unless the launcher explicitly requested a missing-
-    // binary install, in which case we MUST proceed regardless of mode (the
-    // alternative is wedging the MCP server with no binary on disk).
-    if (!installMissing && isDevMode()) return null;
+    // Skip in dev mode / when the user opted out — unless the launcher
+    // explicitly requested a missing-binary install, in which case we MUST
+    // proceed regardless of mode (the alternative is wedging the MCP server
+    // with no binary on disk).
+    if (!installMissing && (isDevMode() || isAutoUpdateDisabled())) return null;
 
     const state = readState();
     // manifest.version is authoritative — /plugin update writes it directly and
@@ -845,6 +876,35 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
     }
 
     if (hasUpdate) {
+      // Attempts are counted PER target version, so a newly published release
+      // always starts with a full budget. The counter used to be unscoped, which
+      // only mattered because nothing ever read it: the download chain re-ran on
+      // every single session no matter how many times it had already failed.
+      const attempts = state.latestVersion === latest.version ? (state.updateAttempts || 0) : 0;
+      if (attempts >= MAX_UPDATE_ATTEMPTS) {
+        // Suspended — check-only from here until a newer release moves the
+        // target. The one thing still worth attempting is a MISSING cached
+        // binary: without it the MCP server has no engine at all, so that
+        // self-heal stays reachable while the (separately failing) plugin
+        // tarball chain and the global-npm heal stay parked.
+        const healedMissing = !fs.existsSync(cachedBinaryPath()) && await downloadBinary(latest);
+        saveState({
+          ...state,
+          installedVersion,
+          lastCheck: new Date().toISOString(),
+          latestVersion: latest.version,
+          updateAvailable: true,
+          updateAttempts: attempts,
+          rateLimited: false,
+          binaryUpdated: healedMissing || state.binaryUpdated,
+        });
+        console.error(
+          `[code-graph] Auto-update to v${latest.version} suspended after ${attempts} failed attempts on this machine. ` +
+          'Update manually (`/plugin update code-graph-mcp`, or `npm install -g @sdsrs/code-graph`) or run `code-graph-mcp doctor`. ' +
+          'Retries resume automatically when a newer release is published.'
+        );
+        return { updateAvailable: true, suspended: true, from: installedVersion, to: latest.version };
+      }
       const result = await downloadAndInstall(latest);
       const success = result.pluginUpdated;
       const newState = {
@@ -857,7 +917,7 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
         // update (missing tar/curl, full disk, blocked network) pins "updating"
         // forever, asserting a self-heal that never happens. The statusline stops
         // trusting it past STUCK_UPDATE_ATTEMPTS; success resets to 0.
-        updateAttempts: success ? 0 : (state.updateAttempts || 0) + 1,
+        updateAttempts: success ? 0 : attempts + 1,
         lastUpdate: success ? new Date().toISOString() : state.lastUpdate,
         rateLimited: false,
         binaryUpdated: result.binaryUpdated,
@@ -913,7 +973,8 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
 module.exports = {
   checkForUpdate, commandExists, isDevMode, readState, compareVersions, shouldCheck,
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
-  isSilentMode, isInstallMissingMode, isForceMode,
+  isSilentMode, isInstallMissingMode, isForceMode, isAutoUpdateDisabled,
+  MAX_UPDATE_ATTEMPTS,
   requestJson, resolveProxy, parseLatestRelease, fetchLatestRelease,
   PLUGIN_ASSET_NAME,
   downloadBinary, cachedBinaryPath, cachedBinaryNeedsUpdate, cachedBinaryStaleVsState,
@@ -941,10 +1002,14 @@ if (require.main === module) {
       if (silent) return;
       if (result && result.updated) {
         console.log(`Updated: v${result.from} → v${result.to} (binary: ${result.binaryUpdated ? 'yes' : 'no'})`);
+      } else if (result && result.suspended) {
+        console.log(`Update available: v${result.to} — auto-install SUSPENDED after ${MAX_UPDATE_ATTEMPTS} failed attempts. Update manually; retries resume on the next release.`);
       } else if (result && result.updateAvailable) {
         console.log(`Update available: v${result.to} (auto-install failed)`);
       } else if (result && result.binaryUpdated) {
         console.log(`Repaired binary cache (v${result.to})`);
+      } else if (!installMissing && isAutoUpdateDisabled()) {
+        console.log('CODE_GRAPH_NO_AUTO_UPDATE=1 — auto-update skipped');
       } else if (!installMissing && isDevMode()) {
         console.log('Dev mode — auto-update skipped');
       } else {

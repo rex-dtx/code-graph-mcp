@@ -22,7 +22,8 @@
  */
 const { spawn } = require('child_process');
 const path = require('path');
-const { NPM_NEEDS_SHELL } = require('./npm-exec');
+const { npmInvocation } = require('./npm-exec');
+const { hidden } = require('./proc-opts');
 const { acquireLock } = require('./install-lock');
 
 const NPM_TIMEOUT_MS = 60000;
@@ -48,11 +49,11 @@ function runStep(cmd, args, timeoutMs, prefix, spawnFn, cb, spawnOpts = {}) {
 
   let child;
   try {
-    child = spawnFn(cmd, args, {
+    child = spawnFn(cmd, args, hidden({
       timeout: timeoutMs,
       stdio: ['ignore', 'ignore', 'pipe'],
       ...spawnOpts,
-    });
+    }));
   } catch (e) {
     process.stderr.write(`[code-graph] install step ${cmd} failed to start: ${e.message}\n`);
     done();
@@ -124,7 +125,12 @@ function installBinaryInBackground({
     return findBinary();
   };
 
-  runStep('npm', ['install', '-g', `@sdsrs/code-graph@${version}`], npmTimeoutMs, '[code-graph][npm]', spawnFn, (npmExit) => {
+  // npmInvocation, not a bare ('npm', args, { shell }) pair: on Windows npm is
+  // `npm.cmd` (needs a shell) and passing `args` alongside `shell: true` is
+  // DEP0190 — runtime-deprecated in Node 24, and unescaped. It pre-quotes the
+  // whole command into `file` with empty `args`, and carries windowsHide.
+  const npm = npmInvocation(['install', '-g', `@sdsrs/code-graph@${version}`]);
+  runStep(npm.file, npm.args, npmTimeoutMs, '[code-graph][npm]', spawnFn, (npmExit) => {
     if (resolved()) {
       if (npmExit === 0 && recordGlobalInstall) {
         try { recordGlobalInstall(); } catch { /* marker is best-effort */ }
@@ -140,7 +146,7 @@ function installBinaryInBackground({
       // The child would otherwise try to take the same install lock we hold.
       env: { ...process.env, CODE_GRAPH_INSTALL_LOCK_HELD: '1' },
     });
-  }, NPM_NEEDS_SHELL ? { shell: true } : {});
+  }, npm.opts);
 }
 
 module.exports = { installBinaryInBackground, runStep, NPM_TIMEOUT_MS, GITHUB_TIMEOUT_MS };

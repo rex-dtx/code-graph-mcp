@@ -7,6 +7,7 @@ const path = require('path');
 const { findBinary } = require('./find-binary');
 const { resolveProjectRoot } = require('./project-root');
 const lifecycle = require('./lifecycle');
+const { hidden } = require('./proc-opts');
 const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
 // True when auto-update has a newer release queued or in flight (the background
@@ -155,14 +156,14 @@ try {
   // health-check (e.g. CPU saturated by the embedding backfill) and the segment
   // silently vanished. Keeping the inner budget well under the outer one turns
   // "slow health-check" into a rendered "offline"/"updating" instead of a blank.
-  report = parseReport(execFileSync(bin, ['health-check', '--format', 'json'], {
+  report = parseReport(execFileSync(bin, ['health-check', '--format', 'json'], hidden({
     timeout: 1500,
     stdio: ['pipe', 'pipe', 'pipe'],
     // Run the binary FROM the resolved root so its own project-root resolution
     // lands on the same DB the gate above picked (a subdir cwd would otherwise
     // re-resolve to a stray nested index inside the binary).
     cwd: root
-  }).toString());
+  })).toString());
 } catch (e) {
   // health-check exits NON-ZERO on an unhealthy/empty index but still writes the
   // full JSON report to stdout. The binary ran fine \u2014 recover the report from the

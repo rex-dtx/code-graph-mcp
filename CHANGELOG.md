@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.111.0 (2026-07-30)
+
+Windows-only fixes, all from one field report ([#40]). Nothing here changes
+behaviour on macOS/Linux except the new opt-out and the retry cap.
+
+**No action required to upgrade** — the plugin auto-updates as usual, and this
+release changes no CLI flag, tool schema, or on-disk format. Windows users
+stuck on the flashing-console workaround `CODE_GRAPH_DEV=1` should drop it: it
+also rewires binary resolution. Use `CODE_GRAPH_NO_AUTO_UPDATE=1` if the intent
+was only to stop auto-update. Users whose updates have been failing repeatedly
+will now see a one-line stderr notice naming the manual update command instead
+of a silent retry every session.
+
+### Fixed
+- **Auto-update flashed 5–7 console windows per session start and stole
+  keyboard focus.** Node's `windowsHide` defaults to `false` on every
+  `child_process` API, and Windows gives any console-subsystem child of a
+  console-less parent a NEW visible console window — our parents (MCP server,
+  hooks, statusline) are all launched hidden by Claude Code, so every `where` /
+  `curl` / `tar` / `npm` child flashed one. All ~30 child-process call sites in
+  `claude-plugin/scripts/` now route through `proc-opts.hidden()`;
+  `windows-hide.test.js` re-derives the call-site list from source on every run,
+  so a new spawn fails the build instead of shipping a flash.
+- **`tar` could never extract the plugin asset under GNU tar**, which is first on
+  PATH for anyone with git-for-Windows/MSYS: `tar xzf C:\Users\...\claude-plugin.tar.gz`
+  reads `C:` as a REMOTE HOST (same colon-parsing family as #34/#35). It now
+  passes a relative archive name with `cwd` set — the spelling both GNU tar and
+  Windows' bundled bsdtar accept. This was the step that made plugin updates
+  permanently unachievable on those machines, which is what kept the whole
+  download chain re-running.
+- **A permanently-failing update retried forever.** `updateAttempts` was
+  counted but never read: the field report showed it at 8 and climbing, with the
+  full download chain (and its console flashes) repeating every session. The
+  counter is now scoped to the target version and the chain stops after 5 failed
+  installs of the same release, going check-only until a newer release is
+  published. A missing binary is still downloaded — that one is existential.
+  `doctor` reports the suspension with the manual update command instead of
+  "up-to-date", and deliberately offers no auto-fix for it.
+- **`DEP0190` deprecation warning on every npm spawn** (Node 24 runtime
+  deprecation): npm needs a shell on Windows because it is `npm.cmd`, and Node
+  space-joins `args` into the command line unescaped in that mode. npm calls now
+  go through `npmInvocation()`, which pre-quotes the whole command and passes an
+  empty `args` array — refusing outright any argument that cannot be safely
+  quoted for `cmd.exe`.
+
+### Added
+- **`CODE_GRAPH_NO_AUTO_UPDATE=1`** — a documented auto-update opt-out. Until
+  now the only working one was the accidental `CODE_GRAPH_DEV=1`, which also
+  rewires binary resolution. No version check, no download, and no updater
+  process is spawned; a missing binary is still installed so the MCP server
+  cannot be left with no engine.
+
+[#40]: https://github.com/sdsrss/code-graph-mcp/issues/40
+
 ## v0.110.0 (2026-07-30)
 
 Two defects, both found by checking a claim instead of quoting one. A third fix

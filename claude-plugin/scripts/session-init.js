@@ -11,6 +11,7 @@ const {
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const { maybeAutoAdopt, isAdopted, unadopt } = require('./adopt');
 const { isNonProjectCwd } = require('./project-detect');
+const { hidden } = require('./proc-opts');
 
 // v0.17.0 — quietHooks: unconditional quiet 默认。
 // 项目地图与 MEMORY.md plugin contract + on-demand `project_map` 工具高度重叠，
@@ -168,16 +169,20 @@ function formatRecentImpact(changed, affected, dependentCap = 6) {
 
 function launchBackgroundAutoUpdate(spawnFn = spawn, env = process.env, { force = false } = {}) {
   try {
+    // Documented opt-out (issue #40). Checked HERE as well as inside
+    // auto-update.js so an opted-out user doesn't pay for a node process per
+    // session just to have it exit immediately.
+    if (env.CODE_GRAPH_NO_AUTO_UPDATE === '1') return false;
     const args = [path.join(__dirname, 'auto-update.js'), 'check', '--silent'];
     // A session start / reload forces an immediate check (bypasses the soft
     // throttle down to auto-update.js's short anti-hammer floor + rate-limit
     // backoff), so an available update is picked up now rather than on the next tick.
     if (force) args.push('--force');
-    const child = spawnFn(process.execPath, args, {
+    const child = spawnFn(process.execPath, args, hidden({
       detached: true,
       stdio: 'ignore',
       env: { ...env, CODE_GRAPH_AUTO_UPDATE_SILENT: '1' },
-    });
+    }));
     if (child && typeof child.unref === 'function') child.unref();
     return true;
   } catch {
@@ -322,7 +327,7 @@ function indexNeedsRevalidation(bin, cwd) {
     let out;
     try {
       out = execFileSync(bin, ['health-check', '--format', 'json'],
-        { cwd, timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+        hidden({ cwd, timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] })).toString();
     } catch (e) {
       // health-check exits non-zero on an unhealthy index but still writes JSON.
       out = ((e && e.stdout) || '').toString();
@@ -363,7 +368,7 @@ function ensureIndexFresh() {
   try {
     const dbMtime = fs.statSync(dbPath).mtimeMs;
     const gitTs = parseInt(
-      execSync('git log -1 --format=%ct', { cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim()
+      execSync('git log -1 --format=%ct', hidden({ cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] })).trim()
     ) * 1000;
     if (gitTs > dbMtime) needsRefresh = true;
   } catch { /* no git / not a repo — fall through to the version probe */ }
@@ -373,11 +378,11 @@ function ensureIndexFresh() {
 
   if (!needsRefresh) return 'fresh';
 
-  const child = spawn(bin, ['incremental-index', '--quiet'], {
+  const child = spawn(bin, ['incremental-index', '--quiet'], hidden({
     cwd,
     detached: true,
     stdio: 'ignore',
-  });
+  }));
   if (child && typeof child.unref === 'function') child.unref();
   return 'refreshing';
 }
@@ -415,7 +420,7 @@ function verifyBinary() {
   // On macOS, verify the binary can actually run (Gatekeeper may block it)
   if (process.platform === 'darwin') {
     try {
-      execFileSync(binary, ['--version'], { timeout: 3000, stdio: 'pipe' });
+      execFileSync(binary, ['--version'], hidden({ timeout: 3000, stdio: 'pipe' }));
     } catch (err) {
       const msg = (err.message || '') + (err.stderr ? err.stderr.toString() : '');
       if (msg.includes('quarantine') || msg.includes('not permitted') ||
@@ -674,7 +679,7 @@ function injectProjectMap() {
     const bin = findBinary();
     if (!bin) return false;
 
-    const output = execFileSync(bin, ['map', '--compact'], {
+    const output = execFileSync(bin, ['map', '--compact'], hidden({
       cwd,
       timeout: 5000,
       encoding: 'utf8',
@@ -682,7 +687,7 @@ function injectProjectMap() {
       // Hook-internal delivery, not a model conversion — keep record_cli_use from
       // logging this `map` run as a phantom `use` (mirror injectRecentImpact's affected call).
       env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-    });
+    }));
 
     if (output && output.trim()) {
       process.stdout.write(
@@ -723,7 +728,7 @@ function injectRecentImpact({ source } = {}) {
     // last commit. Timeouts tightened (finding #1): worst-case cap sum is now
     // status(1s) + HEAD~1(1s) + affected(1.5s) = 3.5s, comfortably under the 5s
     // SessionStart hook budget; the old 2+2+3=7s could get the whole hook killed.
-    const gitOpts = { cwd: sessionDir, timeout: 1000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] };
+    const gitOpts = hidden({ cwd: sessionDir, timeout: 1000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
     let changed = [];
     let isWip = false;
     try {
@@ -749,10 +754,10 @@ function injectRecentImpact({ source } = {}) {
 
     let affected;
     try {
-      const raw = execFileSync(bin, ['affected', ...changed, '--json'], {
+      const raw = execFileSync(bin, ['affected', ...changed, '--json'], hidden({
         cwd, timeout: 1500, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-      });
+      }));
       affected = JSON.parse(raw);
     } catch {
       return false;
@@ -803,9 +808,9 @@ function checkHookFiring({ now = Date.now() } = {}) {
       // surface from the next start. Re-checks daily (catches post-install drift,
       // e.g. a node upgrade that breaks a hook).
       try {
-        const child = spawn(process.execPath, [path.join(__dirname, 'lifecycle.js'), 'verify-hooks-fire'], {
+        const child = spawn(process.execPath, [path.join(__dirname, 'lifecycle.js'), 'verify-hooks-fire'], hidden({
           detached: true, stdio: 'ignore',
-        });
+        }));
         if (child && typeof child.unref === 'function') child.unref();
       } catch { /* ok */ }
     }

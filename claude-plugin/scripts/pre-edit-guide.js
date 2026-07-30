@@ -15,6 +15,7 @@ const { resolveProjectRoot } = require('./project-root');
 const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
 const { emitPreToolAllowContext } = require('./hook-emit');
+const { hidden } = require('./proc-opts');
 
 // v0.49 — walk up from the shell cwd (subdir-cwd fix). The per-cwd index.db
 // gate kept this hook dark for entire sessions after `cd backend/` — daagu
@@ -81,10 +82,10 @@ if (!symbol || symbol.length < 3) {
         .sort((a, b) => b.length - a.length);
       for (const candidate of candidates.slice(0, 5)) {
         try {
-          const raw = execFileSync(binary, ['grep', candidate, filePath, '--json'], {
+          const raw = execFileSync(binary, ['grep', candidate, filePath, '--json'], hidden({
             cwd, timeout: 2000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
             env: internalEnv,
-          });
+          }));
           const grepResult = JSON.parse(raw);
           // Pick this candidate if it has few matches (precise location)
           const withContainer = (grepResult || []).filter(m => m.container && m.container.name);
@@ -136,13 +137,13 @@ try {
   if (relFile && !relFile.startsWith('..')) args.push('--file', relFile);
   // v0.49 — use the resolved binary (bare 'code-graph-mcp' was PATH-dependent,
   // diverging from the findBinary() result the rest of the hook trusts).
-  const raw = execFileSync(binary, args, {
+  const raw = execFileSync(binary, args, hidden({
     cwd,
     timeout: 2500,
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
     env: internalEnv,
-  });
+  }));
   jsonResult = JSON.parse(raw);
 } catch {
   // Symbol not found, timeout, or parse error — exit silently

@@ -151,6 +151,19 @@ Then reconnect the MCP server in Claude Code with `/mcp`.
 
 > **Note:** Auto-update is disabled in the source repo directory (dev mode). Use manual update when developing the plugin itself.
 
+#### Turning auto-update off
+
+| Environment variable | Effect |
+|----------------------|--------|
+| `CODE_GRAPH_NO_AUTO_UPDATE=1` | Skips the update check entirely — no version check, no download, and no updater process is started. A **missing** binary is still installed on first run, so the MCP server can't be left with no engine. Update manually with the command above. |
+
+Set it in the `env` block of `~/.claude/settings.json` (the environment of the
+process hosting the MCP server), then reconnect with `/mcp`.
+
+An update that keeps failing also stops retrying on its own: after 5 failed
+attempts at the *same* release, the updater goes check-only until a newer
+release is published. Run `code-graph-mcp doctor` to see the state.
+
 #### Invited-memory mode (quieter prompts)
 
 By default, every user prompt the plugin deems code-related gets a small context injection from `code-graph` CLI output. If you'd rather rely on MEMORY.md + explicit tool calls, opt into invited-memory mode:

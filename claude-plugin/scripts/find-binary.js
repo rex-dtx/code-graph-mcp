@@ -5,7 +5,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { readBinaryVersion, compareVersions } = require('./version-utils');
-const { npmSpawnOpts } = require('./npm-exec');
+const { npmInvocation } = require('./npm-exec');
+const { hidden } = require('./proc-opts');
 
 const PLATFORM = os.platform();
 const ARCH = os.arch();
@@ -108,11 +109,12 @@ function globalNodeModulesCandidates() {
   // 4. Last resort: ask npm directly. Slow (~50-200ms) but most accurate when
   //    user has a non-standard prefix. Cached at the disk-cache layer above.
   try {
-    const root = execFileSync('npm', ['root', '-g'], npmSpawnOpts({
+    const npm = npmInvocation(['root', '-g'], {
       timeout: 2000,
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf8',
-    })).trim();
+    });
+    const root = execFileSync(npm.file, npm.args, npm.opts).trim();
     if (root) out.push(root);
   } catch { /* npm not on PATH or timed out */ }
 
@@ -351,7 +353,7 @@ function findBinaryUncached() {
   // --- PATH lookup (last resort for intentionally installed binaries) ---
   try {
     const which = PLATFORM === 'win32' ? 'where' : 'which';
-    const found = execFileSync(which, [BINARY_NAME], { stdio: ['pipe', 'pipe', 'pipe'] })
+    const found = execFileSync(which, [BINARY_NAME], hidden({ stdio: ['pipe', 'pipe', 'pipe'] }))
       .toString().trim().split('\n')[0];
     const hit = gate.consider(found);
     if (hit) return hit;

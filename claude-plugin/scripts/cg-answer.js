@@ -19,6 +19,7 @@
 // runs cannot inflate the deny→use conversion funnel.
 
 const { spawnSync } = require('child_process');
+const { hidden } = require('./proc-opts');
 
 // 2000 ms is a product decision, not a tuning knob: a PreToolUse hook that
 // stalls longer than this costs the user more than the answer is worth, so the
@@ -124,7 +125,7 @@ function runGrepAnswer(opts = {}) {
     const scope = sanitizeSearchPath(searchPath);
     const args = ['grep', pattern];
     if (scope) args.push(scope);
-    const res = spawnSync(binary, args, {
+    const res = spawnSync(binary, args, hidden({
       cwd,
       timeout: timeoutMs,
       encoding: 'utf8',
@@ -133,7 +134,7 @@ function runGrepAnswer(opts = {}) {
       // Hook-internal run: a delivered answer, not a model-initiated conversion.
       // The CLI skips its recommendations.jsonl `use` record when this is set.
       env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-    });
+    }));
     if (res.error || res.signal) {
       return { status: 'unavailable' };
     }
@@ -190,14 +191,14 @@ function runShowAnswer(opts = {}) {
     const parts = [];
     for (const sym of symbols.slice(0, 3)) {
       if (typeof sym !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(sym)) continue;
-      const res = spawnSync(binary, ['show', sym], {
+      const res = spawnSync(binary, ['show', sym], hidden({
         cwd,
         timeout: timeoutMs,
         encoding: 'utf8',
         maxBuffer: 4 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'ignore'],
         env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-      });
+      }));
       if (res.error || res.signal || res.status !== 0) continue;
       const out = (res.stdout || '').trim();
       if (!out || out.startsWith(NO_MATCH_PREFIX)) continue;
@@ -238,14 +239,14 @@ function runOverviewAnswer(opts = {}) {
       binary = process.env._CG_ANSWER_BINARY || require('./find-binary').findBinary();
     }
     if (!binary) return { status: 'no-binary' };
-    const res = spawnSync(binary, ['overview', dir], {
+    const res = spawnSync(binary, ['overview', dir], hidden({
       cwd,
       timeout: timeoutMs,
       encoding: 'utf8',
       maxBuffer: 4 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'ignore'],
       env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-    });
+    }));
     if (res.error || res.signal || res.status !== 0) {
       return { status: 'unavailable' };
     }
@@ -293,14 +294,14 @@ function runCallgraphAnswer(opts = {}) {
     }
     if (!binary) return { status: 'no-binary' };
 
-    const res = spawnSync(binary, ['callgraph', symbol], {
+    const res = spawnSync(binary, ['callgraph', symbol], hidden({
       cwd,
       timeout: timeoutMs,
       encoding: 'utf8',
       maxBuffer: 4 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'ignore'],
       env: { ...process.env, CODE_GRAPH_INTERNAL: '1' },
-    });
+    }));
     if (res.error || res.signal) return { status: 'unavailable' };
     // grep-parity exit codes: 1 = symbol not found (no graph node).
     if (res.status === 1) return { status: 'no-hits' };

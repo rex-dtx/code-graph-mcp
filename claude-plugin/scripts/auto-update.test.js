@@ -38,6 +38,8 @@ function cleanGitEnv() {
 const {
   commandExists,
   fetchLatestRelease,
+  isAutoUpdateDisabled,
+  MAX_UPDATE_ATTEMPTS,
   getExtractedPluginVersion,
   parseLatestRelease,
   PLUGIN_ASSET_NAME,
@@ -508,10 +510,11 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
       binaryUrl: null,
     };
     const calls = [];
+    let tarCall = null;
     // The stub has to satisfy the integrity gate now: write the archive, then
     // write ITS OWN digest as the sidecar. A stub that skipped the sidecar would
     // be exercising the refusal path, not the install path.
-    const exec = (cmd, args) => {
+    const exec = (cmd, args, opts) => {
       calls.push(cmd);
       if (cmd === 'curl') {
         const out = args[args.indexOf('-o') + 1];
@@ -524,8 +527,11 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
         }
       }
       if (cmd === 'tar') {
+        tarCall = { args, opts };
         // Simulate extraction: produce claude-plugin/ with a matching version.
-        const tmpDir = args[args.indexOf('-C') + 1];
+        // Extraction target comes from opts.cwd — the archive is named
+        // RELATIVELY (see the assertions below).
+        const tmpDir = opts.cwd;
         const mDir = path.join(tmpDir, 'claude-plugin', '.claude-plugin');
         fs.mkdirSync(mDir, { recursive: true });
         fs.writeFileSync(path.join(mDir, 'plugin.json'), JSON.stringify({ version: '9.9.9' }));
@@ -540,15 +546,27 @@ test('downloadAndInstall wires the marketplace refresh + binary download (orches
         refreshMarketplace: () => { refreshed++; return true; },
         downloadBin: async () => { binDownloads++; return true; },
       });
-      console.log(JSON.stringify({ result, refreshed, binDownloads, calls }));
+      console.log(JSON.stringify({ result, refreshed, binDownloads, calls, tarCall }));
     })();
   `;
   const out = execGit(process.execPath, ['-e', script], {
     env: { ...process.env, HOME: sandboxHome },
     encoding: 'utf8',
   });
-  const { result, refreshed, binDownloads } = JSON.parse(out.trim().split('\n').pop());
+  const { result, refreshed, binDownloads, tarCall } = JSON.parse(out.trim().split('\n').pop());
   assert.equal(result.pluginUpdated, true, 'plugin files must install from the extracted tarball');
+  // Issue #40 / #34-#35 family: GNU tar (git-for-Windows, MSYS) reads the drive
+  // letter in `C:\...\claude-plugin.tar.gz` as a REMOTE HOST and refuses to
+  // open it, which is what made plugin updates permanently unachievable there.
+  // The portable spelling is a relative archive name resolved via `cwd` — so
+  // assert on the SHAPE (no path separators, no colon, no -C), not just that
+  // extraction happened.
+  assert.ok(tarCall, 'tar must be invoked to extract the plugin asset');
+  assert.equal(tarCall.args.includes('-C'), false, 'tar must not take -C with an absolute dir');
+  assert.equal(typeof tarCall.opts.cwd, 'string', 'tar must extract via opts.cwd');
+  for (const a of tarCall.args) {
+    assert.equal(/[\\/:]/.test(a), false, `tar arg must stay relative/flag-only, got: ${a}`);
+  }
   assert.equal(refreshed, 1, 'marketplace refresh must run exactly once after a plugin update');
   assert.equal(result.marketplaceRefreshed, true);
   assert.equal(binDownloads, 1, 'binary download must run');
@@ -974,3 +992,150 @@ for (const [label, mutate] of [
     assert.equal(fs.existsSync(dst), false, `${label}: nothing copied into the plugin cache`);
   });
 }
+
+// ── Failed-update backoff (issue #40) ───────────────────────────────────────
+//
+// `updateAttempts` was counted from the first release that shipped it and never
+// read by anything but the statusline. So an update that CANNOT succeed on a
+// given machine — a GNU tar that refuses `C:\...`, a locked plugin cache, a
+// full disk — re-ran the whole download chain on every single session, forever:
+// the field report saw `updateAttempts: 8` and climbing, with a burst of
+// console windows each time. The counter is now per-target-version and the
+// download chain stops once it hits MAX_UPDATE_ATTEMPTS.
+//
+// Child process + sandboxed HOME because CACHE_DIR is resolved from
+// os.homedir() at module load. `PATH: ''` makes the run hermetic: curl/tar/npm
+// resolve to nothing, so downloadAndInstall takes its missing-tools failure arm
+// and the global-npm heal short-circuits — no network, no global installs, and
+// the failure path under test is reached deterministically.
+function runCheckWithState(t, seedState, { installedVersion = '1.0.0', tag = 'v9.9.9' } = {}) {
+  const { spawnSync } = require('child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-backoff-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const cacheDir = path.join(home, '.cache', 'code-graph');
+  fs.mkdirSync(cacheDir, { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, 'update-state.json'), JSON.stringify(seedState));
+  fs.writeFileSync(path.join(cacheDir, 'install-manifest.json'),
+    JSON.stringify({ version: installedVersion, config: {} }));
+
+  const script = `
+    const au = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    (async () => {
+      const result = await au.checkForUpdate({
+        installMissing: true, // bypass the dev-mode gate; this repo IS a dev tree
+        force: true,
+        requestJsonFn: async () => ({
+          statusCode: 200,
+          body: JSON.stringify({ tag_name: ${JSON.stringify(tag)}, tarball_url: 'https://127.0.0.1:1/t', assets: [] }),
+        }),
+      });
+      process.stdout.write(JSON.stringify({ result, state: au.readState() }));
+    })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    env: { ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'), PATH: '' },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+  return JSON.parse(r.stdout.trim().split('\n').pop());
+}
+
+test('a repeatedly failing update keeps retrying below the attempt cap', (t) => {
+  const { result, state } = runCheckWithState(t,
+    { latestVersion: '9.9.9', updateAvailable: true, updateAttempts: MAX_UPDATE_ATTEMPTS - 1 });
+  assert.notEqual(result.suspended, true, 'one attempt short of the cap must still try');
+  assert.equal(state.updateAttempts, MAX_UPDATE_ATTEMPTS, 'a failed attempt increments the counter');
+  assert.equal(state.updateAvailable, true);
+});
+
+test('a failing update is SUSPENDED once it hits the attempt cap', (t) => {
+  const { result, state } = runCheckWithState(t,
+    { latestVersion: '9.9.9', updateAvailable: true, updateAttempts: MAX_UPDATE_ATTEMPTS });
+  assert.equal(result.suspended, true, 'at the cap the download chain must stop running');
+  assert.equal(result.updateAvailable, true, 'the update is still reported as available');
+  assert.equal(state.updateAttempts, MAX_UPDATE_ATTEMPTS,
+    'a suspended cycle must not keep inflating the counter');
+  assert.ok(state.lastCheck, 'the check itself still happened (cheap, network-only)');
+});
+
+test('a NEWER release re-arms the attempt budget (counter is per target version)', (t) => {
+  // Seeded above the cap, but for the PREVIOUS version — a fresh release must
+  // never inherit the old one's exhausted budget.
+  const { result, state } = runCheckWithState(t,
+    { latestVersion: '9.9.8', updateAvailable: true, updateAttempts: MAX_UPDATE_ATTEMPTS + 4 });
+  assert.notEqual(result.suspended, true, 'a new target version must be attempted');
+  assert.equal(state.updateAttempts, 1, 'the counter restarts at 1 for the new version');
+  assert.equal(state.latestVersion, '9.9.9');
+});
+
+test('statusline STUCK_UPDATE_ATTEMPTS matches auto-update MAX_UPDATE_ATTEMPTS', () => {
+  // Two files, one number: the statusline stops promising "↻ updating" at
+  // STUCK_UPDATE_ATTEMPTS and the updater stops trying at MAX_UPDATE_ATTEMPTS.
+  // If they drift apart, one of the two states is a lie — either the statusline
+  // claims an in-flight self-heal that has been abandoned, or it goes quiet
+  // while retries are still running.
+  const src = fs.readFileSync(path.join(__dirname, 'statusline.js'), 'utf8');
+  const m = /STUCK_UPDATE_ATTEMPTS\s*=\s*(\d+)/.exec(src);
+  assert.ok(m, 'statusline.js must still define STUCK_UPDATE_ATTEMPTS');
+  assert.equal(Number(m[1]), MAX_UPDATE_ATTEMPTS);
+});
+
+// ── Documented opt-out: CODE_GRAPH_NO_AUTO_UPDATE=1 (issue #40) ─────────────
+//
+// Until this existed the only working opt-out was the accidental one —
+// CODE_GRAPH_DEV=1, which also rewires binary resolution. Both arms run from a
+// COPY of the plugin tree in a tmpdir: in the real repo isDevMode() is true
+// (Cargo.toml + target/ at the parent), which would make the opt-out arm pass
+// for the wrong reason.
+test('CODE_GRAPH_NO_AUTO_UPDATE=1 skips the update check entirely', (t) => {
+  const { spawnSync } = require('child_process');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-optout-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.cpSync(__dirname, path.join(root, 'plugin', 'scripts'), { recursive: true });
+
+  const run = (extraEnv) => {
+    const home = fs.mkdtempSync(path.join(root, 'home-'));
+    const script = `
+      const au = require(${JSON.stringify('/PLUGIN/scripts/auto-update.js')}.replace('/PLUGIN', process.env.CG_PLUGIN_ROOT));
+      (async () => {
+        const result = await au.checkForUpdate({
+          requestJsonFn: async () => ({ statusCode: 500, body: '' }),
+        });
+        process.stdout.write(JSON.stringify({ result, devMode: au.isDevMode() }));
+      })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
+    `;
+    const r = spawnSync(process.execPath, ['-e', script], {
+      env: {
+        ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+        CG_PLUGIN_ROOT: path.join(root, 'plugin'), PATH: '', ...extraEnv,
+      },
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+    assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+    return {
+      ...JSON.parse(r.stdout.trim().split('\n').pop()),
+      stateWritten: fs.existsSync(path.join(home, '.cache', 'code-graph', 'update-state.json')),
+    };
+  };
+
+  const off = run({});
+  assert.equal(off.devMode, false, 'control: the tmpdir copy must NOT be classified as a dev tree');
+  assert.equal(off.stateWritten, true, 'control: without the opt-out the check runs and records state');
+
+  const on = run({ CODE_GRAPH_NO_AUTO_UPDATE: '1' });
+  assert.equal(on.result, null, 'opted out → no update work');
+  assert.equal(on.stateWritten, false, 'opted out → the updater does not even touch its state file');
+});
+
+test('the opt-out does NOT block --install-missing (a server with no binary must still get one)', () => {
+  assert.equal(isAutoUpdateDisabled({ CODE_GRAPH_NO_AUTO_UPDATE: '1' }), true);
+  assert.equal(isAutoUpdateDisabled({ CODE_GRAPH_NO_AUTO_UPDATE: '0' }), false);
+  assert.equal(isAutoUpdateDisabled({}), false);
+  // The gate in checkForUpdate reads `!installMissing && (isDevMode() || isAutoUpdateDisabled())`
+  // — asserted here as source, because the behavioural arm needs a binary-less
+  // sandbox that would download ~40MB to prove it.
+  const src = fs.readFileSync(path.join(__dirname, 'auto-update.js'), 'utf8');
+  assert.match(src, /if \(!installMissing && \(isDevMode\(\) \|\| isAutoUpdateDisabled\(\)\)\) return null;/);
+});
