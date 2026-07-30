@@ -276,14 +276,13 @@ fn extract_string_from_subtree_inner(
     // returns the FIRST string literal anywhere in the subtree and discards
     // everything after it. `require_once "config" . $env . ".php"` therefore
     // resolved to the literal `config` and bound a real `imports` edge to a real
-    // `config.php` — a file the statement never includes at runtime. Measured
-    // before this landed, that fixture produced exactly one edge, to
-    // `src/config.php`. A phantom pointing at a real node is worse than no edge:
-    // it flows into deps / cycles / affected / impact as a fact.
+    // `config.php` — a file the statement never includes at runtime. A phantom
+    // pointing at a real node is worse than no edge: it flows into deps /
+    // cycles / affected / impact as a fact.
     //
-    // See `is_static_concatenation` for the rule and what it deliberately keeps.
-    if is_static_concatenation(node) {
-        return concat_static_operands(node, source, depth);
+    // See `resolve_concatenated_path` for the rule and what it deliberately keeps.
+    if let Some(op) = concatenation_operator(node) {
+        return resolve_concatenated_path(node, source, depth, op);
     }
 
     for i in 0..node.child_count() {
@@ -296,16 +295,35 @@ fn extract_string_from_subtree_inner(
     None
 }
 
-/// Node kinds that join their operands into one string value.
+/// The operator token of a binary node, when that operator CONCATENATES.
 ///
-/// `binary_expression` covers PHP `.` and JS/TS `+`, `binary_operator` Python,
-/// `binary` Ruby; `concatenated_string` is Python's adjacent-literal form
-/// (`"a" "b"`), whose operands are all literals by construction.
-fn is_static_concatenation(node: &tree_sitter::Node) -> bool {
-    matches!(
+/// Matching on node kind alone was a defect: `binary_expression` in
+/// tree-sitter-php and tree-sitter-javascript is also the kind for `||`, `&&`,
+/// `??` and every comparison. `require(opts.a || opts.b || './fallback.js')` was
+/// therefore run through the concatenation rule and dropped, while the
+/// two-operand `require(process.env.CFG || './fallback.js')` survived — the
+/// verdict depended on how many `||` terms there were, which is not a defensible
+/// distinction. Only `.` (PHP) and `+` (JS/TS, Python, Ruby) build a string;
+/// anything else falls through to the generic walk with its previous behaviour.
+///
+/// `concatenated_string` is Python's adjacent-literal form (`"a" "b"`), which
+/// has no operator token and is all-literal by construction.
+fn concatenation_operator(node: &tree_sitter::Node) -> Option<&'static str> {
+    if node.kind() == "concatenated_string" {
+        return Some("");
+    }
+    if !matches!(
         node.kind(),
-        "binary_expression" | "binary_operator" | "binary" | "concatenated_string"
-    )
+        "binary_expression" | "binary_operator" | "binary"
+    ) {
+        return None;
+    }
+    let op = node.child_by_field_name("operator")?;
+    match op.kind() {
+        "." => Some("."),
+        "+" => Some("+"),
+        _ => None,
+    }
 }
 
 /// Is this operand a string literal *this extractor itself* understands?
@@ -318,14 +336,33 @@ fn is_string_literal(node: &tree_sitter::Node) -> bool {
     matches!(node.kind(), "string" | "encapsed_string")
 }
 
+/// Operands whose VALUE is a path separator, even though it is not a literal.
+///
+/// `__DIR__ . DIRECTORY_SEPARATOR . "bootstrap.php"` is the Windows-portable
+/// spelling of the anchor idiom and is entirely knowable: whatever the separator
+/// expands to, the basename is still `bootstrap.php`. Treating it as an unknown
+/// deleted a true, resolved edge — and `ROOT_PATH . DS . "helper.php"` with it,
+/// which is the house style of a whole generation of PHP frameworks.
+fn is_path_separator_operand(node: &tree_sitter::Node, source: &str) -> bool {
+    matches!(
+        node_text(node, source).trim(),
+        "DIRECTORY_SEPARATOR" | "DS" | "path.sep" | "os.sep" | "File::SEPARATOR"
+    )
+}
+
 /// Flatten a left-nested concatenation into its operands, in source order.
 /// PHP builds `"a" . $b . "c"` as `((a . b) . c)`, so the operands of interest
-/// are not all direct children of the outermost node.
-fn flatten_concat<'a>(node: &tree_sitter::Node<'a>, out: &mut Vec<tree_sitter::Node<'a>>) {
+/// are not all direct children of the outermost node. Only nodes joined by the
+/// SAME operator are flattened; a nested `||` keeps its own subtree.
+fn flatten_concat<'a>(
+    node: &tree_sitter::Node<'a>,
+    op: &str,
+    out: &mut Vec<tree_sitter::Node<'a>>,
+) {
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            if is_static_concatenation(&child) {
-                flatten_concat(&child, out);
+            if concatenation_operator(&child) == Some(op) {
+                flatten_concat(&child, op, out);
             } else {
                 out.push(child);
             }
@@ -333,46 +370,64 @@ fn flatten_concat<'a>(node: &tree_sitter::Node<'a>, out: &mut Vec<tree_sitter::N
     }
 }
 
-/// The value of a concatenation, or `None` when it is not statically known.
+/// The value of a concatenated path, or `None` when it is not statically known.
 ///
-/// Rule: every operand after the first must be a string literal. The FIRST may
-/// be something else, in which case it contributes nothing — that is the
-/// directory-anchor idiom, and it is why `require_once __DIR__ . "/lib.php"` and
-/// `require_once dirname(__FILE__) . "/x.php"` keep resolving exactly as they
-/// did before (both already worked, by accident of "first string wins"; here
-/// they work by rule). A non-literal anywhere else means the path genuinely is
-/// not knowable at parse time — `"config" . $env . ".php"` — and the honest
-/// answer is no edge.
+/// Every consumer of this function resolves on the BASENAME — the PHP arm takes
+/// `raw.rsplit(['/','\\'])`, the JS arm the last specifier segment — so the
+/// question is not "is every operand a literal" but "**is the text after the
+/// last path separator statically known**". Reading right to left answers it
+/// directly and stops as soon as it can:
 ///
-/// Two shapes change behaviour on purpose:
-///   * `"lib" . ".php"` now yields `lib.php` instead of `lib` — all-literal
-///     concatenation is knowable, and the old answer was right only because
-///     extension resolution papered over it.
-///   * a route path built as `"/api/" + version` now yields nothing instead of
-///     the fragment `/api/`. Losing a route beats reporting a wrong one, which
-///     is the same call `encapsed_string` interpolation already makes above.
-fn concat_static_operands(node: &tree_sitter::Node, source: &str, depth: usize) -> Option<String> {
+///   * a literal containing a separator ends the walk — everything the basename
+///     needs is to its right, and whatever precedes it cannot matter.
+///     `__DIR__ . "/lib.php"` → `/lib.php`, as before.
+///   * a separator-valued operand ends it too, for the same reason.
+///     `__DIR__ . DIRECTORY_SEPARATOR . "bootstrap.php"` → `bootstrap.php`.
+///   * a literal without a separator is prepended and the walk continues left.
+///   * anything else CONTAMINATES the basename and the answer is `None`.
+///     `"config" . $env . ".php"` → the runtime file is `config<env>.php`, not
+///     `config.php`; `$dir . "lib.php"` → the directory is unknown, but so is
+///     whether `lib.php` is even the whole basename.
+///
+/// The earlier version of this rule exempted the FIRST operand by position
+/// rather than by meaning, which got both directions wrong: it kept the
+/// `$dir . "lib.php"` phantom (position 0, so waved through) and deleted the
+/// three-operand anchor forms (separator in the middle, so rejected). Position
+/// is not the property that matters.
+///
+/// `"lib" . ".php"` yields `lib.php` — an all-literal concatenation is knowable,
+/// and the old first-string-wins answer `lib` was right only because extension
+/// resolution papered over it.
+fn resolve_concatenated_path(
+    node: &tree_sitter::Node,
+    source: &str,
+    depth: usize,
+    op: &str,
+) -> Option<String> {
     let mut operands = Vec::new();
-    flatten_concat(node, &mut operands);
+    flatten_concat(node, op, &mut operands);
     if operands.is_empty() {
         return None;
     }
-    let mut joined = String::new();
-    for (i, operand) in operands.iter().enumerate() {
+    let mut basename = String::new();
+    for operand in operands.iter().rev() {
         if is_string_literal(operand) {
-            // An interpolated literal still returns None here; that must fail
-            // the whole concatenation, not be waved through as an anchor.
-            match extract_string_from_subtree_inner(operand, source, depth + 1) {
-                Some(text) => joined.push_str(&text),
-                None => return None,
+            // An interpolated literal yields None here. It is an unknown like
+            // any other, and must contaminate rather than be waved through.
+            let text = extract_string_from_subtree_inner(operand, source, depth + 1)?;
+            basename.insert_str(0, &text);
+            if text.contains('/') || text.contains('\\') {
+                break;
             }
-        } else if i > 0 {
+        } else if is_path_separator_operand(operand, source) {
+            break;
+        } else {
             return None;
         }
     }
-    if joined.is_empty() {
+    if basename.is_empty() {
         None
     } else {
-        Some(joined)
+        Some(basename)
     }
 }

@@ -479,6 +479,20 @@ fn import_parity_across_languages_and_spellings() {
 ///     real `src/config.php` — a file that statement never includes at runtime.
 ///     A phantom aimed at a real node is worse than a missing one: `deps`,
 ///     `cycles`, `affected` and `impact` all consume it as fact.
+///
+/// The MUST-STILL-RESOLVE half of this table matters as much as the zero half,
+/// and its first version was blind in a specific direction: every preserved-shape
+/// row was a TWO-operand form, which is exactly the shape the first attempt at
+/// the fix happened to keep. An independent review measured what the table could
+/// not see — three-operand anchored paths
+/// (`__DIR__ . DIRECTORY_SEPARATOR . "bootstrap.php"`, `ROOT_PATH . DS . "x.php"`)
+/// and `||` fallback chains were being deleted, four true edges lost against one
+/// phantom removed, all of it green here. Rows below are grouped so the arity and
+/// operator axes are both exercised: two- AND three-operand, `.`/`+` AND `||`.
+///
+/// Non-discriminating rows are marked. They are boundary documentation, not
+/// guards — they pass identically with and without the fix, so do not read their
+/// green as coverage.
 #[test]
 fn import_forms_resolve_to_exactly_one_module_or_none() {
     // (label, file, source, exact expected `imports` edge count)
@@ -510,10 +524,21 @@ fn import_forms_resolve_to_exactly_one_module_or_none() {
             0,
         ),
         (
-            "php concat with a variable at the tail",
+            "php concat with an unknown LEADING operand — the runtime directory              is unknown, so the file is too",
+            "dyn4.php",
+            "<?php\nrequire_once $dir . \"lib.php\";\n",
+            0,
+        ),
+        (
+            // RECALL GAIN, measured 0 -> 1: the unknown `$pkg` sits BEFORE the
+            // last separator, so the basename `init.php` is statically known
+            // even though the directory is not — and every consumer of this
+            // value resolves on the basename. The old first-string-wins answer
+            // was `vendor/`, which resolved to nothing.
+            "php concat with the unknown before the last separator",
             "dyn2.php",
             "<?php\nrequire_once \"vendor/\" . $pkg . \"/init.php\";\n",
-            0,
+            1,
         ),
         (
             "js require with a concatenated specifier",
@@ -535,10 +560,65 @@ fn import_forms_resolve_to_exactly_one_module_or_none() {
             1,
         ),
         (
+            // NON-DISCRIMINATING: the PHP arm strips `.php` to a stem, so
+            // `config` and `config.php` both resolve to src/config.php and the
+            // edge count is 1 either way. It documents the shape; it cannot pin
+            // the "joins instead of truncating" claim, which is invisible to an
+            // edge count.
             "php all-literal concatenation",
             "anch3.php",
             "<?php\nrequire_once \"config\" . \".php\";\n",
             1,
+        ),
+        // --- three-operand anchors: the arity axis the first table missed ---
+        (
+            "php __DIR__ . DIRECTORY_SEPARATOR . file (Windows-portable anchor)",
+            "anch4.php",
+            "<?php\nrequire_once __DIR__ . DIRECTORY_SEPARATOR . \"lib.php\";\n",
+            1,
+        ),
+        (
+            "php ROOT_PATH . DS . file (framework house style)",
+            "anch5.php",
+            "<?php\nrequire_once ROOT_PATH . DS . \"lib.php\";\n",
+            1,
+        ),
+        (
+            "php anchor with the separator inside the literal, three operands",
+            "anch6.php",
+            "<?php\nrequire_once ROOT . $mid . \"/lib.php\";\n",
+            1,
+        ),
+        // --- `||` is NOT concatenation, at any arity. Both must be untouched. ---
+        // A `||` chain shares the `binary_expression` node kind with `+` but is
+        // not concatenation. Both arities emit 2 (one `<external>`, one resolved)
+        // before AND after — the point of these rows is that the count is
+        // IDENTICAL at both arities, which is what the kind-only test broke.
+        //
+        // These two do NOT discriminate the operator check on their own: with
+        // the operator ignored, the right-to-left walk still lands on a
+        // separator-bearing literal at the tail and returns the same answer. The
+        // row that pins it is `or_tail.js` below, whose tail operand is a
+        // variable — concatenation semantics say "unknown", `||` semantics say
+        // "the literal on the left". Verified: with the operator test removed,
+        // only that row reddens.
+        (
+            "js require with a two-term || fallback",
+            "or2.js",
+            "const a = require(process.env.CFG || './tgtjs');\n",
+            2,
+        ),
+        (
+            "js require with a three-term || fallback",
+            "or3.js",
+            "const b = require(o.a || o.b || './tgtjs');\n",
+            2,
+        ),
+        (
+            "js require whose || tail is a variable — `||` is not concatenation",
+            "or_tail.js",
+            "const c = require('./tgtjs' || userMod);\n",
+            2,
         ),
     ];
 
@@ -550,6 +630,8 @@ fn import_forms_resolve_to_exactly_one_module_or_none() {
     files.push(("tgtjs.js", "module.exports = { y: 1 };\n"));
     // The file a dynamic path would WRONGLY bind to if the first literal won.
     files.push(("config.php", "<?php\nfunction cfg() { return 1; }\n"));
+    files.push(("lib.php", "<?php\nfunction libFn() { return 1; }\n"));
+    files.push(("init.php", "<?php\nfunction initFn() { return 1; }\n"));
 
     let (_p, counts) = imports_per_file(&files);
 

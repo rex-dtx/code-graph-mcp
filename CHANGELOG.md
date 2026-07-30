@@ -10,24 +10,28 @@ of it; every item below was verified against `HEAD` before being worked on.
 three changes alter the edge set the indexer stores for identical source.
 
 ### Fixed
-- **A concatenated import/include path is no longer guessed at.**
-  `extract_string_from_subtree` returned the first string literal anywhere in the
-  subtree and discarded the rest, so `require_once "config" . $env . ".php"`
-  resolved to the literal `config` and bound a real `imports` edge to a real
-  `config.php` — a file that statement never includes at runtime. `require("./x"
-  + suffix)` had the same shape in JS. A phantom aimed at a real node is worse
-  than a missing edge, because `deps` / `cycles` / `affected` / `impact` all
-  consume it as fact; it is also the exact failure the `encapsed_string`
-  interpolation guard already refused to commit, reached through different
-  syntax. Rule now: in a concatenation every operand after the first must be a
-  string literal; the first may be something else and contributes nothing, which
-  is the directory-anchor idiom that keeps `__DIR__ . "/lib.php"` and
-  `dirname(__FILE__) . "/x.php"` resolving exactly as before. Measured on a
-  fixture carrying all six shapes: 3 phantom edges removed, 3 true edges
-  unchanged. Two deliberate behaviour changes ride along — an all-literal
-  concatenation now joins (`"lib" . ".php"` → `lib.php`) instead of truncating,
-  and a route path built as `"/api/" + version` yields nothing rather than the
-  fragment `/api/`.
+- **A concatenated import/include path is resolved by rule instead of by "first
+  string literal in the subtree wins".** The old walk returned the first literal
+  and discarded the rest, so `require_once "config" . $env . ".php"` resolved to
+  `config` and bound a real `imports` edge to a real `config.php` — a file that
+  statement never includes at runtime. `require("./x" + suffix)` had the same
+  shape in JS. A phantom aimed at a real node is worse than a missing edge,
+  because `deps` / `cycles` / `affected` / `impact` all consume it as fact.
+
+  Every consumer of this value resolves on the **basename** — the PHP arm takes
+  `raw.rsplit(['/','\\'])`, the JS arm the last specifier segment — so the rule
+  reads the operands **right to left** and asks whether the text after the last
+  path separator is known. A literal containing a separator ends the walk
+  (`__DIR__ . "/lib.php"` → `/lib.php`); a separator-valued operand ends it too
+  (`__DIR__ . DIRECTORY_SEPARATOR . "bootstrap.php"` → `bootstrap.php`); a
+  separator-free literal is prepended and the walk continues left; anything else
+  contaminates the basename and the answer is no edge.
+
+  Measured on a fixture of ordinary PHP/JS idioms: **4 phantom edges removed, 0
+  true edges lost.** One recall gain rides along — `"vendor/" . $pkg .
+  "/init.php"` now binds `init.php` (0 → 1 edge), because the unknown sits
+  *before* the last separator and the basename genuinely is known.
+
 - **`import mod, * as ns from './m'` emitted two identical `imports` rows**, one
   per binding, where each spelling alone emits one. `idx_edges_unique` includes
   `metadata` on purpose (multiple route edges per file), so the differing `q`
@@ -48,6 +52,44 @@ three changes alter the edge set the indexer stores for identical source.
   scan, which is what this cache exists to avoid. The CLI path was never
   affected (`run_incremental_index` re-hashes everything); this is the MCP
   server's resident-cache path.
+
+### Corrected before release
+An independent review of the first version of the concatenation rule returned
+BLOCKERS, and it was right on all three. Reproduced independently before acting:
+that version was a net **loss of 4 true edges against 1 phantom removed** on
+ordinary idioms. Both root causes were the same mistake — testing a proxy for the
+property that actually mattered.
+
+- **The concatenation test matched the node KIND, not the operator.**
+  `binary_expression` in tree-sitter-php and tree-sitter-javascript is also the
+  kind for `||`, `&&`, `??` and every comparison, so
+  `require(opts.a || opts.b || './fallback.js')` was run through the
+  concatenation rule and deleted — while the two-operand
+  `require(process.env.CFG || './fallback.js')` survived. The verdict depended on
+  how many `||` terms there were. It now matches on the operator token (`.` /
+  `+`); everything else falls through to the previous behaviour untouched.
+- **The first-operand exemption was positional, not semantic.** "The first
+  operand may be non-literal" both kept the `$dir . "lib.php"` phantom (position
+  0, so waved through — structurally identical to the headline
+  `"config" . $env . ".php"` case this change exists to kill) and deleted the
+  three-operand anchor forms `__DIR__ . DIRECTORY_SEPARATOR . "file.php"` and
+  `ROOT_PATH . DS . "file.php"`, which are the house style of a generation of PHP
+  frameworks and were resolving correctly before. Position is not the property
+  that matters; distance from the last separator is.
+- **Routes lost whole relations.** `routes.rs` propagates `?` from the path
+  extractor, so a Python `@app.route("/api/" + VERSION + "/items")` stopped
+  emitting `routes_to` entirely and its handler no longer looked like a route
+  handler. Under the new rule the relation survives. The path metadata for a
+  concatenated route remains an approximation (`PREFIX + "/orders"` records
+  `/orders`, not `/api/orders`) — that is pre-existing and unchanged in either
+  direction; it is now recorded as a known gap rather than an unexamined one.
+
+Test-side, the review's sharpest point was directional: **every "must still
+resolve" row in the new table was a two-operand form**, which is exactly the
+shape the broken rule happened to preserve — which is why four deleted edges
+shipped green. The table now exercises arity (two- and three-operand) and
+operator (`.`/`+` versus `||`) as separate axes, and marks its
+non-discriminating rows instead of letting their green read as coverage.
 
 ### Changed
 - The existing content-change tests for the cached scan all slept 50 ms before
