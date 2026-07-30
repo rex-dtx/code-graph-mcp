@@ -160,9 +160,11 @@ Then reconnect the MCP server in Claude Code with `/mcp`.
 Set it in the `env` block of `~/.claude/settings.json` (the environment of the
 process hosting the MCP server), then reconnect with `/mcp`.
 
-An update that keeps failing also stops retrying on its own: after 5 failed
-attempts at the *same* release, the updater goes check-only until a newer
-release is published. Run `code-graph-mcp doctor` to see the state.
+An update that keeps failing also stops hammering: after 5 failed attempts at
+the *same* release the updater drops to one retry per day (and retries
+immediately when a newer release is published), instead of re-downloading on
+every session. While it is in that state the statusline shows `⚠ update stuck`
+and `code-graph-mcp doctor` prints the manual update command.
 
 #### Invited-memory mode (quieter prompts)
 

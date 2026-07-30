@@ -57,6 +57,20 @@ const FETCH_TIMEOUT_MS = 3000;
 // STUCK_UPDATE_ATTEMPTS (drift-guarded in statusline.test.js) so the moment the
 // updater gives up is the moment the statusline stops promising "↻ updating".
 const MAX_UPDATE_ATTEMPTS = 5;
+// ...but suspension is not permanent. The cap alone assumed every repeated
+// failure is permanent, and the causes are not distinguishable at the failure
+// site: a briefly-missing `.sha256` sidecar, a captive portal, a temporarily
+// full disk burn the budget just as fast as a broken tar — and SessionStart
+// forces a check with only a 2-minute floor, so ~5 Claude Code restarts in ~10
+// minutes exhaust it. Before this, recovery required a NEWER release (or
+// hand-deleting update-state.json, which nothing tells the user to do), so a
+// ten-minute outage could park the updater for days. One retry per day keeps
+// the per-session treadmill dead while guaranteeing self-heal.
+//
+// Note the retry can NOT be keyed to `--force`: session-init passes --force on
+// every session start, so re-arming there would restore the exact treadmill
+// this cap exists to stop.
+const SUSPENSION_RETRY_MS = 24 * 60 * 60 * 1000;
 
 function isSilentMode(argv = process.argv.slice(2), env = process.env) {
   return argv.includes('--silent') || env.CODE_GRAPH_AUTO_UPDATE_SILENT === '1';
@@ -880,8 +894,17 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
       // always starts with a full budget. The counter used to be unscoped, which
       // only mattered because nothing ever read it: the download chain re-ran on
       // every single session no matter how many times it had already failed.
-      const attempts = state.latestVersion === latest.version ? (state.updateAttempts || 0) : 0;
-      if (attempts >= MAX_UPDATE_ATTEMPTS) {
+      const sameTarget = state.latestVersion === latest.version;
+      const attempts = sameTarget ? (state.updateAttempts || 0) : 0;
+      // A suspended release gets one retry per day (SUSPENSION_RETRY_MS), so a
+      // transient cause — sidecar blip, captive portal, briefly-full disk —
+      // heals itself instead of parking the updater until the next release.
+      // Spend the retry by entering the attempt path with the budget one short:
+      // if it fails again it re-suspends immediately (and re-stamps the clock),
+      // costing at most one download per day rather than one per session.
+      const suspendedAt = sameTarget && state.suspendedAt ? Date.parse(state.suspendedAt) : NaN;
+      const retryDue = Number.isFinite(suspendedAt) && (Date.now() - suspendedAt) >= SUSPENSION_RETRY_MS;
+      if (attempts >= MAX_UPDATE_ATTEMPTS && !retryDue) {
         // Suspended — check-only from here until a newer release moves the
         // target. The one thing still worth attempting is a MISSING cached
         // binary: without it the MCP server has no engine at all, so that
@@ -895,18 +918,32 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
           latestVersion: latest.version,
           updateAvailable: true,
           updateAttempts: attempts,
+          // Stamp on ENTRY to suspension, then leave it alone: the retry clock
+          // must measure time since we gave up, not time since the last check
+          // (which every session would reset, making the retry unreachable).
+          suspendedAt: (sameTarget && state.suspendedAt) || new Date().toISOString(),
           rateLimited: false,
           binaryUpdated: healedMissing || state.binaryUpdated,
         });
         console.error(
           `[code-graph] Auto-update to v${latest.version} suspended after ${attempts} failed attempts on this machine. ` +
           'Update manually (`/plugin update code-graph-mcp`, or `npm install -g @sdsrs/code-graph`) or run `code-graph-mcp doctor`. ' +
-          'Retries resume automatically when a newer release is published.'
+          'Retried automatically once a day, and immediately when a newer release is published.'
         );
         return { updateAvailable: true, suspended: true, from: installedVersion, to: latest.version };
       }
       const result = await downloadAndInstall(latest);
       const success = result.pluginUpdated;
+      // Suspension clock. It restarts when the daily retry is spent and fails,
+      // which is what keeps `retryDue` from staying true and turning the retry
+      // back into a per-session treadmill; it clears on success and on a new
+      // target version, so a stale stamp from the previous release cannot make
+      // the next one look instantly retry-due.
+      let nextSuspendedAt;
+      if (success) nextSuspendedAt = null;
+      else if (retryDue) nextSuspendedAt = new Date().toISOString();
+      else if (!sameTarget) nextSuspendedAt = null;
+      else nextSuspendedAt = state.suspendedAt || null;
       const newState = {
         lastCheck: new Date().toISOString(),
         installedVersion: success ? latest.version : installedVersion,
@@ -918,6 +955,7 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
         // forever, asserting a self-heal that never happens. The statusline stops
         // trusting it past STUCK_UPDATE_ATTEMPTS; success resets to 0.
         updateAttempts: success ? 0 : attempts + 1,
+        suspendedAt: nextSuspendedAt,
         lastUpdate: success ? new Date().toISOString() : state.lastUpdate,
         rateLimited: false,
         binaryUpdated: result.binaryUpdated,

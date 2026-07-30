@@ -21,6 +21,44 @@ const path = require('path');
 const CALL_NAMES = ['spawnSync', 'spawn', 'execFileSync', 'execFile', 'execSync', 'exec', 'spawnFn'];
 const CALL_RE = new RegExp(`(?<![.\\w$])(${CALL_NAMES.join('|')})\\s*\\(`, 'g');
 
+// MEMBER-expression spellings — `cp.spawn(...)`, `require('child_process').execSync(...)`.
+// The direct-call regex above deliberately excludes anything after a `.` so that
+// `RE.exec(raw)` is not a call site, and that exclusion silently covered the
+// member form too: an independent review fed this scanner
+// `require('child_process').execSync('npm root -g')` and got back "clean". Since
+// `.exec(` is overwhelmingly a regex, the bare `exec` member form only counts
+// when the receiver is a binding this file took from child_process.
+const MEMBER_RE = /(?<![\w$])([\w$]+|\)|['"]\s*\))\s*\.\s*(spawnSync|spawn|execFileSync|execFile|execSync|exec)\s*\(/g;
+const NEVER_REGEX_METHODS = new Set(['spawnSync', 'spawn', 'execFileSync', 'execFile', 'execSync']);
+
+/**
+ * Identifiers in `src` bound to the child_process module or to one of its
+ * functions under another name — `const cp = require('child_process')`,
+ * `const { execFileSync: run } = require('child_process')`.
+ *
+ * Takes RAW source, not masked: the module name it keys on lives inside a
+ * string literal, and the masker blanks string CONTENTS — running this on the
+ * masked text made every binding invisible (`require('               ')`), which
+ * is why the alias form was still slipping through after the member-call fix.
+ * @param {string} src - raw, unmasked source
+ * @returns {{namespaces: Set<string>, aliases: Set<string>}}
+ */
+function childProcessBindings(src) {
+  const namespaces = new Set();
+  const aliases = new Set();
+  const req = String.raw`require\(\s*['"](?:node:)?child_process['"]\s*\)`;
+  for (const m of src.matchAll(new RegExp(String.raw`(?:const|let|var)\s+([\w$]+)\s*=\s*${req}`, 'g'))) {
+    namespaces.add(m[1]);
+  }
+  for (const m of src.matchAll(new RegExp(String.raw`(?:const|let|var)\s*\{([^}]*)\}\s*=\s*${req}`, 'g'))) {
+    for (const part of m[1].split(',')) {
+      const [orig, alias] = part.split(':').map((s) => s.trim());
+      if (alias && CALL_NAMES.includes(orig)) aliases.add(alias);
+    }
+  }
+  return { namespaces, aliases };
+}
+
 // Accepted spellings inside the argument list: the shared helper, the npm
 // invocation builder (which folds windowsHide in), or an explicit literal.
 const GUARDED_RE = /(?<![.\w$])(hidden|npmInvocation)\s*\(|windowsHide/;
@@ -114,24 +152,42 @@ function argText(masked, openIdx) {
  */
 function findUnguarded(src) {
   const masked = maskLiterals(src);
+  const { namespaces, aliases } = childProcessBindings(src);
   const bad = [];
-  let m;
-  CALL_RE.lastIndex = 0;
-  while ((m = CALL_RE.exec(masked)) !== null) {
-    const open = masked.indexOf('(', m.index + m[1].length);
+  const hits = [];
+
+  const directRe = aliases.size
+    ? new RegExp(`(?<![.\\w$])(${[...CALL_NAMES, ...aliases].join('|')})\\s*\\(`, 'g')
+    : CALL_RE;
+  directRe.lastIndex = 0;
+  for (let m = directRe.exec(masked); m; m = directRe.exec(masked)) {
+    hits.push({ name: m[1], index: m.index, nameLen: m[1].length });
+  }
+  MEMBER_RE.lastIndex = 0;
+  for (let m = MEMBER_RE.exec(masked); m; m = MEMBER_RE.exec(masked)) {
+    const [receiver, method] = [m[1], m[2]];
+    if (!NEVER_REGEX_METHODS.has(method) && !namespaces.has(receiver) && !/\)$/.test(receiver)) continue;
+    hits.push({ name: `${receiver}.${method}`, index: m.index, nameLen: m[0].length - 1 });
+  }
+
+  for (const hit of hits) {
+    const open = masked.indexOf('(', hit.index + hit.nameLen);
     const args = argText(masked, open);
     if (args === null) continue;
     let ok = GUARDED_RE.test(args);
     if (!ok) {
       // Options passed as a variable (`gitOpts`, `npm.opts`): resolve the
-      // binding in the same file and test its initializer instead.
+      // binding in the same file and test its initializer instead. EVERY
+      // declaration of that name must be guarded, not the first one found —
+      // a shadowed inner `const o = { timeout: 1 }` used to hide behind an
+      // outer `const o = hidden({})` (stricter reading wins).
       const last = args.split(',').pop().trim().replace(/\.opts$/, '');
       if (/^[A-Za-z_$][\w$]*$/.test(last)) {
-        const decl = new RegExp(`(?:const|let|var)\\s+${last}\\s*=([^;]*)`).exec(masked);
-        ok = !!decl && GUARDED_RE.test(decl[1]);
+        const decls = [...masked.matchAll(new RegExp(`(?:const|let|var)\\s+${last}\\s*=([^;]*)`, 'g'))];
+        ok = decls.length > 0 && decls.every((d) => GUARDED_RE.test(d[1]));
       }
     }
-    if (!ok) bad.push({ name: m[1], line: src.slice(0, m.index).split('\n').length });
+    if (!ok) bad.push({ name: hit.name, line: src.slice(0, hit.index).split('\n').length });
   }
   return bad;
 }
@@ -160,6 +216,32 @@ test('the guard rejects an unguarded spawn (negative control)', () => {
     ['execFileSync']);
   // ...and division must still be division, not an unterminated regex.
   assert.deepEqual(findUnguarded("const half = total / 2;\nspawn(f, a, hidden({}));"), []);
+});
+
+// ── Spellings an independent review got past the first version of this scanner ──
+// Every one of these is a genuinely unguarded child_process call that the
+// scanner reported as clean, which made the guard's promise ("a new spawn fails
+// the build") weaker than it was stated to be. The member-expression form is
+// the likeliest way someone actually adds one.
+test('the guard catches indirect spawn spellings, not just the direct call', () => {
+  const caught = (src) => findUnguarded(src).length > 0;
+  assert.ok(caught("require('child_process').execSync('npm root -g');"),
+    'member call straight off require()');
+  assert.ok(caught("const cp = require('child_process');\ncp.spawn(f, a, { stdio: 'pipe' });"),
+    'namespace binding');
+  assert.ok(caught("const { execFileSync: run } = require('child_process');\nrun('curl', a, { timeout: 1 });"),
+    'renamed destructure');
+  assert.ok(caught("const o = hidden({});\nfunction g(){ const o = { timeout: 1 }; spawnSync(x, [], o); }"),
+    'inner shadowed options binding must not hide behind an outer guarded one');
+  assert.ok(caught("const cp = require('child_process');\ncp.exec('git status', { timeout: 1 });"),
+    'bare .exec counts when the receiver is a child_process binding');
+
+  // The reason `.exec(` is not simply added to the call names: it is
+  // overwhelmingly a regex method, and flagging those would make the guard
+  // noise that gets muted.
+  assert.deepEqual(findUnguarded("const m = RE.exec(raw);\nconst n = /x/.exec(s);"), []);
+  // Guarded spellings of the same indirect forms stay clean.
+  assert.deepEqual(findUnguarded("const cp = require('child_process');\ncp.spawn(f, a, hidden({}));"), []);
 });
 
 test('the masker sees every file that spawns (guard-of-the-guard)', () => {

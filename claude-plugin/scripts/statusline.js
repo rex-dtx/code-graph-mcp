@@ -19,15 +19,28 @@ const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => 
 // real status instead. Without this, a persistently-failing update (missing
 // tar/curl, full disk, blocked network) pins "updating" forever.
 const STUCK_UPDATE_ATTEMPTS = 5;
-function updatePending() {
+function readUpdateState() {
   try {
-    const st = JSON.parse(fs.readFileSync(
+    return JSON.parse(fs.readFileSync(
       path.join(os.homedir(), '.cache', 'code-graph', 'update-state.json'), 'utf8'));
-    if ((st.updateAttempts || 0) >= STUCK_UPDATE_ATTEMPTS) return false;
-    if (st.updateAvailable) return true;
-    if (st.latestVersion && st.installedVersion && st.latestVersion !== st.installedVersion) return true;
-  } catch { /* no state file or unreadable — treat as no pending update */ }
+  } catch { return null; /* no state file or unreadable */ }
+}
+function updatePending(st = readUpdateState()) {
+  if (!st) return false;
+  if ((st.updateAttempts || 0) >= STUCK_UPDATE_ATTEMPTS) return false;
+  if (st.updateAvailable) return true;
+  if (st.latestVersion && st.installedVersion && st.latestVersion !== st.installedVersion) return true;
   return false;
+}
+// The updater has given up on this release (auto-update.js MAX_UPDATE_ATTEMPTS).
+// This has to be SHOWN, not merely not-lied-about: the updater's own stderr
+// notice is written by a process session-init spawns `detached` with
+// `stdio: 'ignore'`, so nobody ever sees it, and updatePending() going quiet
+// above means the only remaining signal was running `doctor` by hand. A user
+// who never runs doctor would sit on a permanently parked updater with no way
+// to know (found by pre-release review of v0.111.0, fixed in v0.111.1).
+function updateStuck(st = readUpdateState()) {
+  return !!(st && st.updateAvailable && (st.updateAttempts || 0) >= STUCK_UPDATE_ATTEMPTS);
 }
 
 const disabledCleanup = cleanupDisabledStatusline();
@@ -94,7 +107,10 @@ const bin = findBinary();
 if (!bin) {
   // No usable binary yet. If an update is queued, the background downloader is
   // still fetching it \u2014 that is "updating", not a broken "offline" state.
-  process.stdout.write(updatePending() ? 'code-graph: \u21bb updating' : 'code-graph: offline');
+  process.stdout.write(
+    updateStuck() ? 'code-graph: \u26a0 update stuck'
+      : updatePending() ? 'code-graph: \u21bb updating'
+        : 'code-graph: offline');
   process.exit(0);
 }
 
@@ -121,6 +137,8 @@ function renderHealth(s) {
   // index doesn't masquerade as fully current.
   if (s.index_version_stale) line += ' | \u21bb rebuilding';
   if (s.watching) line += ' | watching';
+  // A parked updater is otherwise invisible in normal use — see updateStuck().
+  if (updateStuck()) line += ' | \u26a0 update stuck';
   return line;
 }
 
@@ -144,7 +162,8 @@ function statusUnavailable(errText) {
   // phrase so a cached binary predating the marker still reads as "updating".
   const errStr = errText || '';
   const binaryOutdated = errStr.includes('code-graph:schema-too-new') || /schema version/i.test(errStr);
-  return (binaryOutdated || updatePending()) ? 'code-graph: \u21bb updating' : 'code-graph: offline';
+  if (binaryOutdated || updatePending()) return 'code-graph: \u21bb updating';
+  return updateStuck() ? 'code-graph: \u26a0 update stuck' : 'code-graph: offline';
 }
 
 let report = null;

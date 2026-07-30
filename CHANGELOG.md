@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.111.1 (2026-07-30)
+
+An independent review of v0.111.0 landed after that release went out. It found
+no Critical and no High, but two of the things v0.111.0 *said* were not true,
+and one of them hid a real gap. Corrections first.
+
+### Fixed
+- **A failing update could park itself for days.** v0.111.0 stopped retrying
+  after 5 failed installs of the same release and only re-armed when a NEWER
+  release appeared. But the five causes are indistinguishable at the failure
+  site — a briefly-missing `.sha256` sidecar, a captive portal, a temporarily
+  full disk all burn the budget as fast as a genuinely broken `tar` — and
+  SessionStart forces a check with only a 2-minute floor, so roughly five
+  Claude Code restarts inside ten minutes exhaust it. A ten-minute outage could
+  therefore park auto-update until the next release. It now retries once a day
+  while suspended, which keeps the per-session treadmill dead and still
+  self-heals. (The retry deliberately is NOT keyed to `--force`: session-init
+  passes `--force` on every session start, so re-arming there would restore the
+  exact treadmill the cap exists to stop.)
+- **A suspended update was invisible.** v0.111.0's CHANGELOG said users "will
+  see a one-line stderr notice"; **that was false**. The notice is written by
+  the updater process, which session-init spawns `detached` with
+  `stdio: 'ignore'` — nothing reads that stderr — and the statusline goes quiet
+  at the same threshold, so the only remaining signal was running
+  `code-graph-mcp doctor` by hand. The statusline now shows `⚠ update stuck`,
+  on the healthy line as well as the degraded ones.
+- **The windowsHide guard was weaker than v0.111.0 claimed.** It said a new
+  spawn "fails the build"; that held only for the direct-call spelling. The
+  review got four genuinely unguarded calls past the scanner:
+  `require('child_process').execSync(…)`, `cp.spawn(…)` via a namespace
+  binding, a renamed destructure (`const { execFileSync: run } = …`), and an
+  inner shadowed options variable hiding behind an outer guarded one. All four
+  are now caught and pinned as regression tests. (Nothing was actually shipping
+  unguarded — the sweep itself was complete; the guard's promise was not.)
+- **`quoteCmdArg` mishandled a trailing backslash.** `"C:\x\"` is read by the
+  receiving program's MSVCRT argv parser as an escaped quote, swallowing the
+  rest of the command line. Trailing backslash runs are now doubled. Not
+  reachable from any current call site — all args are flags and package specs —
+  but the helper reads as general-purpose.
+- **A bad `version` string could kill the MCP server instead of failing an
+  install.** `npmInvocation` throws on an unquotable argument, and the
+  launcher's cold-start path called it outside any `try`, so the throw escaped
+  and took down a server that was already serving the 0-tool stub. Now caught
+  and reported as a failed install step.
+
 ## v0.111.0 (2026-07-30)
 
 Windows-only fixes, all from one field report ([#40]). Nothing here changes
@@ -10,8 +55,12 @@ release changes no CLI flag, tool schema, or on-disk format. Windows users
 stuck on the flashing-console workaround `CODE_GRAPH_DEV=1` should drop it: it
 also rewires binary resolution. Use `CODE_GRAPH_NO_AUTO_UPDATE=1` if the intent
 was only to stop auto-update. Users whose updates have been failing repeatedly
-will now see a one-line stderr notice naming the manual update command instead
-of a silent retry every session.
+will stop seeing a silent retry every session.
+
+> **Correction (v0.111.1):** this entry originally claimed those users "will see
+> a one-line stderr notice naming the manual update command". They do not — that
+> stderr is discarded by the detached updater process. v0.111.1 makes the state
+> visible in the statusline instead.
 
 ### Fixed
 - **Auto-update flashed 5–7 console windows per session start and stole

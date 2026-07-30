@@ -129,7 +129,20 @@ function installBinaryInBackground({
   // `npm.cmd` (needs a shell) and passing `args` alongside `shell: true` is
   // DEP0190 — runtime-deprecated in Node 24, and unescaped. It pre-quotes the
   // whole command into `file` with empty `args`, and carries windowsHide.
-  const npm = npmInvocation(['install', '-g', `@sdsrs/code-graph@${version}`]);
+  // try/catch because quoteCmdArg THROWS on an argument it cannot quote, and
+  // `version` is read from plugin.json — our own file, but a parse of somebody
+  // else's disk. Uncaught, the throw escapes mcp-launcher.js and kills the MCP
+  // server AFTER the 0-tool stub is already serving, turning a bad version
+  // string into a dead server instead of a failed install. Every sibling call
+  // in auto-update.js is already inside a try.
+  let npm;
+  try {
+    npm = npmInvocation(['install', '-g', `@sdsrs/code-graph@${version}`]);
+  } catch (e) {
+    process.stderr.write(`[code-graph] cannot build the npm install command: ${e.message}\n`);
+    finish(onFailed);
+    return;
+  }
   runStep(npm.file, npm.args, npmTimeoutMs, '[code-graph][npm]', spawnFn, (npmExit) => {
     if (resolved()) {
       if (npmExit === 0 && recordGlobalInstall) {

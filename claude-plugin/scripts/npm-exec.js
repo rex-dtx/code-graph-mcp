@@ -30,7 +30,13 @@ function quoteCmdArg(arg) {
   if (/["%!\r\n]/.test(s)) {
     throw new Error(`npm argument cannot be safely quoted for cmd.exe: ${JSON.stringify(s)}`);
   }
-  return `"${s}"`;
+  // Double a trailing run of backslashes. cmd.exe itself does not treat `\` as
+  // an escape, but the RECEIVING program's MSVCRT argv parser does: `"C:\x\"`
+  // reads the final `\"` as an escaped quote and swallows the rest of the
+  // command line into that argument. Only reachable for path-shaped args, which
+  // no current call site passes — but this helper reads as general-purpose.
+  const trailing = /\\+$/.exec(s);
+  return `"${trailing ? s + trailing[0] : s}"`;
 }
 
 /**

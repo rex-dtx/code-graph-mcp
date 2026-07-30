@@ -129,15 +129,34 @@ test('no report + update pending → updating', (t) => {
   assert.equal(runStatusline(home, project), 'code-graph: ↻ updating');
 });
 
-test('stuck update (updateAttempts exhausted) → offline, not updating', (t) => {
-  // A persistently-failing update must not pin "↻ updating" forever. Past
-  // STUCK_UPDATE_ATTEMPTS the statusline drops the optimistic state and surfaces
-  // the real one (here: no report → offline).
+test('stuck update (updateAttempts exhausted) → says stuck, not "updating" and not a bare "offline"', (t) => {
+  // A persistently-failing update must not pin "↻ updating" forever — that
+  // asserts a self-heal that is not happening. It must not go SILENT either:
+  // pre-release review of v0.111.0 found that the updater's own stderr notice
+  // is written by a process session-init spawns detached with stdio:'ignore',
+  // so a suspended user's only remaining signal was running doctor by hand.
   const home = mkHome(t);
   const project = mkProject(home);
   installStubBinary(home, { report: 'boom', exitCode: 1 });
   setUpdateState(home, { updateAvailable: true, updateAttempts: 5 });
-  assert.equal(runStatusline(home, project), 'code-graph: offline');
+  assert.equal(runStatusline(home, project), 'code-graph: ⚠ update stuck');
+});
+
+test('stuck update is surfaced on the HEALTHY line too', (t) => {
+  // The common shape: the index is fine and the binary works, only the UPDATE
+  // is parked. Without this the marker would only ever appear in the states
+  // where something else is already broken.
+  const home = mkHome(t);
+  const project = mkProject(home);
+  installStubBinary(home, { report: { healthy: true, nodes: 12, files: 3 } });
+  setUpdateState(home, { updateAvailable: true, updateAttempts: 5 });
+  assert.equal(runStatusline(home, project),
+    'code-graph: ✓ 12 nodes | 3 files | ⚠ update stuck');
+
+  // Control: same state one attempt below the cap is still an in-flight update,
+  // so the healthy line stays clean.
+  setUpdateState(home, { updateAvailable: true, updateAttempts: 4 });
+  assert.equal(runStatusline(home, project), 'code-graph: ✓ 12 nodes | 3 files');
 });
 
 test('schema-version error on stderr (no report) → updating', (t) => {

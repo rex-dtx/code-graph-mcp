@@ -214,7 +214,7 @@ function runDiagnostics({ checkOnly = false } = {}) {
       results.push({
         name: 'Auto-update',
         status: 'warn',
-        detail: `v${state.latestVersion} failed to install ${attempts}× — auto-retry suspended until a newer release. `
+        detail: `v${state.latestVersion} failed to install ${attempts}× — auto-retry throttled to once a day. `
           + 'Update manually: `npm install -g @sdsrs/code-graph` (or `/plugin update code-graph-mcp`)',
       });
     } else if (state && state.updateAvailable && state.binaryUpdated === false) {

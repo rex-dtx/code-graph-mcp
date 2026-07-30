@@ -1139,3 +1139,56 @@ test('the opt-out does NOT block --install-missing (a server with no binary must
   const src = fs.readFileSync(path.join(__dirname, 'auto-update.js'), 'utf8');
   assert.match(src, /if \(!installMissing && \(isDevMode\(\) \|\| isAutoUpdateDisabled\(\)\)\) return null;/);
 });
+
+// ── Suspension is throttled, not permanent (post-v0.111.0 review, M1) ───────
+//
+// The cap alone treated every repeated failure as permanent, and the causes are
+// not distinguishable at the failure site: a briefly-missing .sha256 sidecar, a
+// captive portal, a temporarily full disk burn the budget as fast as a broken
+// tar — and SessionStart forces a check with only a 2-minute floor, so ~5
+// restarts in ~10 minutes exhaust it. Recovery then required a NEWER release,
+// so a ten-minute outage could park the updater for days.
+
+test('a suspended release is retried once the daily timer expires', (t) => {
+  const dayAgo = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  const { result, state } = runCheckWithState(t, {
+    latestVersion: '9.9.9', updateAvailable: true,
+    updateAttempts: MAX_UPDATE_ATTEMPTS, suspendedAt: dayAgo,
+  });
+  assert.notEqual(result.suspended, true, 'past the daily timer the download must be attempted again');
+  assert.equal(state.updateAttempts, MAX_UPDATE_ATTEMPTS + 1, 'the spent retry counts');
+  // ...and the clock RESTARTS, or `retryDue` would stay true and the retry
+  // would fire every session — the treadmill this cap exists to stop.
+  assert.notEqual(state.suspendedAt, dayAgo, 'a failed retry must re-stamp the suspension clock');
+  assert.ok(Date.now() - Date.parse(state.suspendedAt) < 60_000, 'clock restarts at now');
+});
+
+test('a suspended release is NOT retried before the daily timer expires', (t) => {
+  const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const { result, state } = runCheckWithState(t, {
+    latestVersion: '9.9.9', updateAvailable: true,
+    updateAttempts: MAX_UPDATE_ATTEMPTS, suspendedAt: hourAgo,
+  });
+  assert.equal(result.suspended, true, 'an hour in, the download chain must stay parked');
+  assert.equal(state.updateAttempts, MAX_UPDATE_ATTEMPTS, 'a parked cycle does not inflate the counter');
+  assert.equal(state.suspendedAt, hourAgo, 'the clock must NOT be reset by an ordinary check');
+});
+
+test('entering suspension stamps the retry clock', (t) => {
+  const { result, state } = runCheckWithState(t,
+    { latestVersion: '9.9.9', updateAvailable: true, updateAttempts: MAX_UPDATE_ATTEMPTS });
+  assert.equal(result.suspended, true);
+  assert.ok(state.suspendedAt, 'without a stamp the daily retry can never become due');
+});
+
+test('a new target version clears a stale suspension clock', (t) => {
+  // Seeded suspended on the PREVIOUS version. The new one must neither inherit
+  // the exhausted budget nor look instantly retry-due from the old stamp.
+  const dayAgo = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  const { state } = runCheckWithState(t, {
+    latestVersion: '9.9.8', updateAvailable: true,
+    updateAttempts: MAX_UPDATE_ATTEMPTS + 3, suspendedAt: dayAgo,
+  });
+  assert.equal(state.updateAttempts, 1, 'fresh budget for the new release');
+  assert.equal(state.suspendedAt, null, 'stale stamp from the old release must be dropped');
+});
