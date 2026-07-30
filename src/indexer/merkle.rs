@@ -350,10 +350,20 @@ fn hash_files_parallel(files: &[(String, std::path::PathBuf)]) -> HashMap<String
 /// Size is free (the same `metadata()` already carries it) and catches every
 /// length-changing edit, which is nearly all of them.
 ///
-/// Residual, on purpose: a same-granule edit that also preserves byte length
-/// stays invisible here. That is the rsync quick-check tradeoff — closing it
-/// means hashing every file every scan, which is exactly the cost this cache
-/// exists to avoid.
+/// Residual, on purpose — and more reachable than "same granule AND same byte
+/// length" sounds, so do not read it as closed. Equal-length edits are ordinary:
+/// renaming `foo` to `bar`, flipping `if (x > 0)` to `if (x < 0)`. On a
+/// coarse-mtime filesystem, either one landing in the same tick as the previous
+/// scan leaves the stamp identical and the file unhashed. The only backstop is
+/// `ensure_file_indexed`, which re-hashes content with no mtime shortcut but
+/// fires only when that specific file is queried — structural queries
+/// (`callgraph`, `project_map`, `find_dead_code`) keep serving the stale symbols
+/// until something unrelated moves the mtime. On nanosecond-mtime filesystems
+/// (ext4, APFS, NTFS) it is close to unreachable.
+///
+/// Kept anyway: it is the rsync quick-check tradeoff, closing it means hashing
+/// every file on every scan — exactly the cost this cache exists to avoid — and
+/// `metadata()` carries no third free signal (ctime shares mtime's granularity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     mtime: SystemTime,
@@ -374,13 +384,14 @@ pub struct DirectoryCache {
     /// Every indexable file the walk actually saw, stat outcome irrelevant.
     ///
     /// `run_incremental_index_cached` carries a stored hash forward when the file
-    /// still exists, and asks THIS set. Deriving existence from `file_mtimes`
+    /// still exists, and asks THIS set. Deriving existence from `file_stamps`
     /// instead conflates "gone" with "one `stat` failed": a transient EACCES /
     /// EMFILE / NFS hiccup on a file the walker had just listed dropped it from
-    /// the mtime map, the carry-forward then skipped it, and `compute_diff`
+    /// the stamp map, the carry-forward then skipped it, and `compute_diff`
     /// reported a live file as DELETED — wiping its nodes and edges from the
     /// index until something re-indexed it. The walk entry is the existence
-    /// evidence; the stat is only freshness evidence.
+    /// evidence; the stat is only freshness evidence. Guarded by
+    /// `test_scan_directory_cached_stat_failure_is_not_deletion`.
     seen_files: HashSet<String>,
 }
 
