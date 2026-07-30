@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.110.0 (2026-07-30)
 
 Two defects, both found by checking a claim instead of quoting one. A third fix
 was written, reviewed, rewritten, reviewed again, and then **removed** — see
