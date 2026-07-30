@@ -460,44 +460,30 @@ fn import_parity_across_languages_and_spellings() {
     );
 }
 
-/// The EXACT-count half of the import axis, for the two failure directions a
-/// `min_edges` floor structurally cannot see.
+/// The EXACT-count half of the import axis: one module, one edge.
 ///
-/// The table above asserts "at least N", which is the right shape for "did the
-/// arm survive" and the wrong shape for both of these:
+/// The spelling table above asserts "at least N", which is the right shape for
+/// "did the arm survive" and cannot see the opposite failure.
+/// `import mod, * as ns from './m'` emitted two identical
+/// `<module> -> <module>@./m` rows, one per binding, because each marker claimed
+/// the module-level dependency separately and `idx_edges_unique` includes
+/// `metadata` (so the differing `q` kept both). A floor of 1 passes on 2. `deps`
+/// happens to survive it — its symbol counts are `COUNT(DISTINCT nb.id)` — but
+/// the edge totals and the per-language relation stats do not.
 ///
-///   * **Too many.** `import mod, * as ns from './m'` emitted two identical
-///     `<module> -> <module>@./m` rows, one per binding, because each marker
-///     claimed the module-level dependency separately and `idx_edges_unique`
-///     includes `metadata` (so the differing `q` kept both). A floor of 1 passes
-///     on 2. `deps` happens to survive it — its symbol counts are
-///     `COUNT(DISTINCT nb.id)` — but the edge totals and the per-language
-///     relation stats do not.
-///   * **Should be zero.** A dynamically built include path must produce NO
-///     edge, and a floor cannot express that. `require_once "config" . $env .
-///     ".php"` used to resolve to the literal `config` and bind a real edge to a
-///     real `src/config.php` — a file that statement never includes at runtime.
-///     A phantom aimed at a real node is worse than a missing one: `deps`,
-///     `cycles`, `affected` and `impact` all consume it as fact.
-///
-/// The MUST-STILL-RESOLVE half of this table matters as much as the zero half,
-/// and its first version was blind in a specific direction: every preserved-shape
-/// row was a TWO-operand form, which is exactly the shape the first attempt at
-/// the fix happened to keep. An independent review measured what the table could
-/// not see — three-operand anchored paths
-/// (`__DIR__ . DIRECTORY_SEPARATOR . "bootstrap.php"`, `ROOT_PATH . DS . "x.php"`)
-/// and `||` fallback chains were being deleted, four true edges lost against one
-/// phantom removed, all of it green here. Rows below are grouped so the arity and
-/// operator axes are both exercised: two- AND three-operand, `.`/`+` AND `||`.
-///
-/// Non-discriminating rows are marked. They are boundary documentation, not
-/// guards — they pass identically with and without the fix, so do not read their
-/// green as coverage.
+/// A note on what is NOT here. This table briefly also asserted that dynamically
+/// built include paths produce no edge (`require_once "config" . $env . ".php"`
+/// must not bind `config.php`). That rule was reverted before release: two
+/// independent reviews each measured it as a NET LOSS of true edges on ordinary
+/// idioms, and both times the fixture used to validate it happened not to
+/// contain the shapes it broke. Any future attempt needs a fixture with a FLAT
+/// layout — targets that can actually bind — and rows for the parenthesized
+/// operand, the interpolated literal left of the last separator, and the route
+/// whose path ends in a variable. See CHANGELOG "Known gap".
 #[test]
 fn import_forms_resolve_to_exactly_one_module_or_none() {
     // (label, file, source, exact expected `imports` edge count)
     let cases: &[(&str, &str, &str, i64)] = &[
-        // --- duplicate direction ---
         (
             "esm default + namespace (one module, one edge)",
             "dup.ts",
@@ -516,109 +502,13 @@ fn import_forms_resolve_to_exactly_one_module_or_none() {
             "import * as ns from './tgt';\n",
             1,
         ),
-        // --- dynamic-path direction: the value is not knowable, so no edge ---
         (
-            "php concat with a variable in the middle",
-            "dyn1.php",
-            "<?php\nrequire_once \"config\" . $env . \".php\";\n",
-            0,
-        ),
-        (
-            "php concat with an unknown LEADING operand — the runtime directory              is unknown, so the file is too",
-            "dyn4.php",
-            "<?php\nrequire_once $dir . \"lib.php\";\n",
-            0,
-        ),
-        (
-            // RECALL GAIN, measured 0 -> 1: the unknown `$pkg` sits BEFORE the
-            // last separator, so the basename `init.php` is statically known
-            // even though the directory is not — and every consumer of this
-            // value resolves on the basename. The old first-string-wins answer
-            // was `vendor/`, which resolved to nothing.
-            "php concat with the unknown before the last separator",
-            "dyn2.php",
-            "<?php\nrequire_once \"vendor/\" . $pkg . \"/init.php\";\n",
+            // The guard must not over-fire: a clause with no namespace binding
+            // keeps its default marker.
+            "esm default alone under a second module",
+            "d3.ts",
+            "import only from './tgt2';\n",
             1,
-        ),
-        (
-            "js require with a concatenated specifier",
-            "dyn3.js",
-            "const x = require('./tgtjs' + suffix);\n",
-            0,
-        ),
-        // --- statically knowable concatenations MUST still resolve ---
-        (
-            "php __DIR__ anchor",
-            "anch1.php",
-            "<?php\nrequire_once __DIR__ . \"/config.php\";\n",
-            1,
-        ),
-        (
-            "php dirname(__FILE__) anchor",
-            "anch2.php",
-            "<?php\nrequire_once dirname(__FILE__) . \"/config.php\";\n",
-            1,
-        ),
-        (
-            // NON-DISCRIMINATING: the PHP arm strips `.php` to a stem, so
-            // `config` and `config.php` both resolve to src/config.php and the
-            // edge count is 1 either way. It documents the shape; it cannot pin
-            // the "joins instead of truncating" claim, which is invisible to an
-            // edge count.
-            "php all-literal concatenation",
-            "anch3.php",
-            "<?php\nrequire_once \"config\" . \".php\";\n",
-            1,
-        ),
-        // --- three-operand anchors: the arity axis the first table missed ---
-        (
-            "php __DIR__ . DIRECTORY_SEPARATOR . file (Windows-portable anchor)",
-            "anch4.php",
-            "<?php\nrequire_once __DIR__ . DIRECTORY_SEPARATOR . \"lib.php\";\n",
-            1,
-        ),
-        (
-            "php ROOT_PATH . DS . file (framework house style)",
-            "anch5.php",
-            "<?php\nrequire_once ROOT_PATH . DS . \"lib.php\";\n",
-            1,
-        ),
-        (
-            "php anchor with the separator inside the literal, three operands",
-            "anch6.php",
-            "<?php\nrequire_once ROOT . $mid . \"/lib.php\";\n",
-            1,
-        ),
-        // --- `||` is NOT concatenation, at any arity. Both must be untouched. ---
-        // A `||` chain shares the `binary_expression` node kind with `+` but is
-        // not concatenation. Both arities emit 2 (one `<external>`, one resolved)
-        // before AND after — the point of these rows is that the count is
-        // IDENTICAL at both arities, which is what the kind-only test broke.
-        //
-        // These two do NOT discriminate the operator check on their own: with
-        // the operator ignored, the right-to-left walk still lands on a
-        // separator-bearing literal at the tail and returns the same answer. The
-        // row that pins it is `or_tail.js` below, whose tail operand is a
-        // variable — concatenation semantics say "unknown", `||` semantics say
-        // "the literal on the left". Verified: with the operator test removed,
-        // only that row reddens.
-        (
-            "js require with a two-term || fallback",
-            "or2.js",
-            "const a = require(process.env.CFG || './tgtjs');\n",
-            2,
-        ),
-        (
-            "js require with a three-term || fallback",
-            "or3.js",
-            "const b = require(o.a || o.b || './tgtjs');\n",
-            2,
-        ),
-        (
-            "js require whose || tail is a variable — `||` is not concatenation",
-            "or_tail.js",
-            "const c = require('./tgtjs' || userMod);\n",
-            2,
         ),
     ];
 
@@ -627,11 +517,10 @@ fn import_forms_resolve_to_exactly_one_module_or_none() {
         "tgt.ts",
         "export const y = 1;\nexport default function f() {}\n",
     ));
-    files.push(("tgtjs.js", "module.exports = { y: 1 };\n"));
-    // The file a dynamic path would WRONGLY bind to if the first literal won.
-    files.push(("config.php", "<?php\nfunction cfg() { return 1; }\n"));
-    files.push(("lib.php", "<?php\nfunction libFn() { return 1; }\n"));
-    files.push(("init.php", "<?php\nfunction initFn() { return 1; }\n"));
+    files.push((
+        "tgt2.ts",
+        "export const z = 1;\nexport default function g() {}\n",
+    ));
 
     let (_p, counts) = imports_per_file(&files);
 
@@ -645,9 +534,9 @@ fn import_forms_resolve_to_exactly_one_module_or_none() {
 
     assert!(
         wrong.is_empty(),
-        "these import forms produced the wrong NUMBER of `imports` edges — too many means \
-         one module counted twice, zero-expected means a dynamic path was guessed at and \
-         bound to whatever file shares its first literal:\n  {}\nall counts: {counts:?}",
+        "these import forms produced the wrong NUMBER of `imports` edges — more than \
+         one means a single module was counted twice, once per binding:\n  {}\n\
+         all counts: {counts:?}",
         wrong.join("\n  ")
     );
 }
