@@ -323,7 +323,7 @@ pub fn run_incremental_index_cached(
     // Merge stored hashes for files in unchanged directories.
     // scan_directory_cached skips files in unchanged dirs, so we need to
     // carry forward their stored hashes to prevent false "deleted" diffs.
-    // Use new_cache.file_mtimes (populated for ALL walked files) to check existence
+    // Use new_cache.seen_files (populated for ALL walked files) to check existence
     // without per-file stat calls.
     for (path, hash) in &stored_hashes {
         if !current_hashes.contains_key(path) && new_cache.file_exists(path) {

@@ -1,5 +1,98 @@
 # Changelog
 
+## Unreleased
+
+Two defects, both found by checking a claim instead of quoting one. A third fix
+was written, reviewed, rewritten, reviewed again, and then **removed** — see
+"Known gap" below; that story is the most useful thing in this entry.
+
+**`INDEX_VERSION` 56 → 57**, so upgrading rebuilds the index once.
+
+### Fixed
+- **`import mod, * as ns from './m'` emitted two identical `imports` rows**, one
+  per binding, where each spelling alone emits one. `idx_edges_unique` includes
+  `metadata` on purpose (multiple route edges per file), so the differing `q`
+  marker kept both. The namespace marker wins: it also feeds `ns_module_map` for
+  `ns.foo()` member calls, while the default marker deliberately feeds nothing
+  else and is pure duplication once a namespace binding has claimed the edge.
+  Note the originally reported impact did not hold — `deps` counts
+  `COUNT(DISTINCT nb.id)` and was never affected; edge totals and per-language
+  relation stats were. An independent review measured the risky direction
+  (does the guard drop a real edge?) as clean, including for unresolvable
+  specifiers such as `import React, * as ReactNS from 'react'`, where neither
+  marker produces an edge in the first place.
+- **The cached directory scan treated an unchanged mtime as proof of freshness.**
+  `file_needs_hashing` compared mtimes alone, so a content edit landing inside
+  one filesystem timestamp granule was skipped no matter how much the content
+  moved — ordinary on HFS+/ext3 (1s), exFAT (2s) and several network
+  filesystems. It now compares mtime **and** size, both already carried by the
+  one `metadata()` call. The CLI path was never affected
+  (`run_incremental_index` re-hashes everything); this is the MCP server's
+  resident-cache path, which every tool reaches through `ensure_indexed`.
+
+  Residual, and more reachable than "same granule AND same byte length" sounds:
+  equal-length edits are ordinary (renaming `foo` to `bar`, flipping `>` to
+  `<`). The only backstop is `ensure_file_indexed`, which fires just for the file
+  being queried, so structural queries keep serving stale symbols until something
+  moves the mtime. Kept anyway — it is the rsync quick-check tradeoff, and
+  closing it means hashing every file on every scan.
+
+### Changed
+- The existing content-change tests for the cached scan all slept 50 ms before
+  rewriting, which guarantees a fresh mtime and so could never exercise the case
+  above. A new test freezes the mtime explicitly and asserts on the file's
+  PRESENCE in the returned hash map — a skipped file is simply absent, so the
+  natural `got != expected` comparison reads `None != Some(h)` and passes for
+  exactly the failure it is meant to catch.
+- A second test drives the same defect end to end through
+  `run_incremental_index_cached` and asserts the user-visible outcome
+  (`files_indexed == 1`, the new symbol present, the old one gone). The scan-level
+  test pins the decision; only this one shows the consequence. Under the
+  mtime-only mutation it fails `left: 0, right: 1`.
+
+### Known gap — dynamically built include paths still produce phantom edges
+`extract_string_from_subtree` returns the first string literal anywhere in the
+subtree and discards the rest, so `require_once "config" . $env . ".php"` binds a
+real `imports` edge to a real `config.php` — a file that statement never includes
+at runtime. `require("./x" + suffix)` is the same shape in JS. A phantom aimed at
+a real node is worse than a missing edge, because `deps` / `cycles` / `affected` /
+`impact` all consume it as fact. This is **unchanged and still open.**
+
+Two attempts to close it were made in this batch and both were removed, each
+after an independent review measured it as a NET LOSS of true edges on ordinary
+idioms:
+
+1. *"Every operand after the first must be a literal."* Deleted
+   `__DIR__ . DIRECTORY_SEPARATOR . "bootstrap.php"` and
+   `ROOT_PATH . DS . "helper.php"` (the house style of a generation of PHP
+   frameworks), and deleted `require(a || b || "./fallback.js")` while keeping
+   the two-operand form — because the test matched the node KIND, and
+   `binary_expression` is also `||`, `&&`, `??` and every comparison. It also
+   failed to remove the `$dir . "lib.php"` phantom, which is the headline shape,
+   because the exemption was positional and that operand sits at position 0.
+2. *"Read right to left; the basename after the last separator must be known."*
+   Fixed all of the above, and introduced its own: it deleted a fully static
+   `require(("./par") + ".js")` (a parenthesized operand is not a string literal
+   node), deleted `"$base/dir/" . "x.php"` (an interpolated literal contaminates
+   even when it sits left of a separator, contradicting the rule's own stated
+   principle), still dropped routes whose path ends in a variable
+   (`@app.get("/g/" + VERSION)`), and manufactured a NEW phantom —
+   `"vendor/" . $pkg . "/init.php"` bound to an unrelated `src/init.php`, because
+   a known basename with an unknown directory is still a guess.
+
+The transferable lesson is about measurement, not about strings: both times the
+fixture used to validate the change happened not to contain the shapes it broke,
+and both times the full-repo edge diff was zero because this repository contains
+none of these spellings. A zero diff on one corpus is not evidence.
+
+Whoever picks this up: the extractor is likely the wrong layer. It must answer
+with a single string, which forces it to choose between "guess" and "give up"
+before the resolver — the component that actually knows what files exist — ever
+sees the expression. Validate with a FLAT fixture where targets can bind, and
+include rows for the parenthesized operand, the interpolated literal left of a
+separator, the `||` chain at two and three terms, and the route path ending in a
+variable.
+
 ## v0.109.0 (2026-07-29)
 
 Audit 2026-07-27 P2 batch: 20 of the ~29 observations, chosen for the ones whose

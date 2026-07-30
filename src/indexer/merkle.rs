@@ -341,27 +341,57 @@ fn hash_files_parallel(files: &[(String, std::path::PathBuf)]) -> HashMap<String
         .collect()
 }
 
+/// What one `metadata()` call tells us about a file's freshness.
+///
+/// Mtime alone is not enough. `st_mtime` granularity is 1s on HFS+ and ext3, 2s
+/// on exFAT, and coarse on several network filesystems, so two writes inside one
+/// granule are indistinguishable — the second edit is skipped and the index
+/// serves the first one's symbols until something unrelated moves the mtime.
+/// Size is free (the same `metadata()` already carries it) and catches every
+/// length-changing edit, which is nearly all of them.
+///
+/// Residual, on purpose — and more reachable than "same granule AND same byte
+/// length" sounds, so do not read it as closed. Equal-length edits are ordinary:
+/// renaming `foo` to `bar`, flipping `if (x > 0)` to `if (x < 0)`. On a
+/// coarse-mtime filesystem, either one landing in the same tick as the previous
+/// scan leaves the stamp identical and the file unhashed. The only backstop is
+/// `ensure_file_indexed`, which re-hashes content with no mtime shortcut but
+/// fires only when that specific file is queried — structural queries
+/// (`callgraph`, `project_map`, `find_dead_code`) keep serving the stale symbols
+/// until something unrelated moves the mtime. On nanosecond-mtime filesystems
+/// (ext4, APFS, NTFS) it is close to unreachable.
+///
+/// Kept anyway: it is the rsync quick-check tradeoff, closing it means hashing
+/// every file on every scan — exactly the cost this cache exists to avoid — and
+/// `metadata()` carries no third free signal (ctime shares mtime's granularity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: SystemTime,
+    size: u64,
+}
+
 /// Cache of directory and file modification times for skipping unchanged subtrees.
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryCache {
     dir_mtimes: HashMap<String, SystemTime>,
-    /// Per-file mtime cache. Used to detect content modifications in directories
-    /// whose own mtime hasn't changed (dir mtime only changes on file add/remove,
-    /// not on content modification in ext4/btrfs).
+    /// Per-file freshness stamp. Used to detect content modifications in
+    /// directories whose own mtime hasn't changed (dir mtime only changes on
+    /// file add/remove, not on content modification in ext4/btrfs).
     ///
     /// Only holds files whose `metadata()` call SUCCEEDED — see `seen_files` for
     /// why the two are not the same set.
-    file_mtimes: HashMap<String, SystemTime>,
+    file_stamps: HashMap<String, FileStamp>,
     /// Every indexable file the walk actually saw, stat outcome irrelevant.
     ///
     /// `run_incremental_index_cached` carries a stored hash forward when the file
-    /// still exists, and asks THIS set. Deriving existence from `file_mtimes`
+    /// still exists, and asks THIS set. Deriving existence from `file_stamps`
     /// instead conflates "gone" with "one `stat` failed": a transient EACCES /
     /// EMFILE / NFS hiccup on a file the walker had just listed dropped it from
-    /// the mtime map, the carry-forward then skipped it, and `compute_diff`
+    /// the stamp map, the carry-forward then skipped it, and `compute_diff`
     /// reported a live file as DELETED — wiping its nodes and edges from the
     /// index until something re-indexed it. The walk entry is the existence
-    /// evidence; the stat is only freshness evidence.
+    /// evidence; the stat is only freshness evidence. Guarded by
+    /// `test_scan_directory_cached_stat_failure_is_not_deletion`.
     seen_files: HashSet<String>,
 }
 
@@ -375,13 +405,16 @@ impl DirectoryCache {
 /// Scan directory with optional mtime cache. Directories whose mtime
 /// hasn't changed since the cached value can skip file hashing.
 ///
-/// Known blind spot (accepted tradeoff, audit 2026-07-24): the skip decision
-/// compares mtimes for equality, so a content edit landing within the same
-/// filesystem timestamp tick as the previous scan (coarse-mtime filesystems,
-/// two edits inside one tick) is invisible to this path. The interactive flow
-/// is covered anyway — `ensure_file_indexed` always re-hashes content with no
-/// mtime shortcut — but background/periodic freshness for files nobody
-/// explicitly re-queries can lag until the next real mtime change.
+/// Narrowed blind spot (audit 2026-07-24, narrowed 2026-07-29): the skip
+/// decision used to compare mtimes alone, so a content edit landing within the
+/// same filesystem timestamp tick as the previous scan (coarse-mtime
+/// filesystems, two edits inside one tick) was invisible to this path
+/// regardless of how much the content moved. It now compares the whole
+/// [`FileStamp`], so only a same-tick edit that ALSO preserves byte length is
+/// still missed. The interactive flow is covered either way —
+/// `ensure_file_indexed` always re-hashes content with no mtime shortcut — but
+/// background/periodic freshness for files nobody explicitly re-queries can
+/// still lag for that residual shape until the next real mtime change.
 pub fn scan_directory_cached(
     root: &Path,
     cache: Option<&DirectoryCache>,
@@ -468,14 +501,21 @@ pub fn scan_directory_cached(
             // `metadata()` does next (see `DirectoryCache::seen_files`).
             new_cache.seen_files.insert(rel_str.clone());
 
-            // Track file mtime in the new cache
-            let file_mtime = path.metadata().ok().and_then(|m| m.modified().ok());
-            if let Some(mtime) = file_mtime {
-                new_cache.file_mtimes.insert(rel_str.clone(), mtime);
+            // Track this file's freshness stamp in the new cache. One
+            // `metadata()` call yields both halves; taking only the mtime threw
+            // the free half away.
+            let file_stamp = path.metadata().ok().and_then(|m| {
+                m.modified().ok().map(|mtime| FileStamp {
+                    mtime,
+                    size: m.len(),
+                })
+            });
+            if let Some(stamp) = file_stamp {
+                new_cache.file_stamps.insert(rel_str.clone(), stamp);
             }
 
             if !changed_dirs.contains(&parent_dir)
-                && !file_needs_hashing(file_mtime, cache.and_then(|c| c.file_mtimes.get(&rel_str)))
+                && !file_needs_hashing(file_stamp, cache.and_then(|c| c.file_stamps.get(&rel_str)))
             {
                 continue;
             }
@@ -493,17 +533,22 @@ pub fn scan_directory_cached(
 
 /// Does a file in an unchanged directory still need hashing?
 ///
-/// `current` is this scan's mtime, `cached` the previous scan's. Both are
-/// optional and the interesting case is `current == None`: the `stat` failed on
+/// `current` is this scan's stamp, `cached` the previous scan's. Both are
+/// optional and one interesting case is `current == None`: the `stat` failed on
 /// a file the walk had just listed (EACCES on a mode-changed parent, EMFILE, an
 /// NFS hiccup). Unknown is NOT unchanged — skipping there leaves an edited file
 /// stale in the index for as long as the failure persists, with nothing logged.
 /// Hashing costs one read that may itself fail, in which case
 /// `hash_files_parallel` warns and the stored hash carries forward.
-fn file_needs_hashing(current: Option<SystemTime>, cached: Option<&SystemTime>) -> bool {
+///
+/// The other is a stamp that matches on mtime but not on size. Comparing the
+/// whole [`FileStamp`] rather than its mtime alone is what makes a within-one-
+/// timestamp-granule edit visible; see the type's docs for why mtime by itself
+/// is not sufficient evidence and what residual remains.
+fn file_needs_hashing(current: Option<FileStamp>, cached: Option<&FileStamp>) -> bool {
     match (current, cached) {
         (Some(current), Some(cached)) => current != *cached,
-        (Some(_), None) => true, // No cached mtime — treat as changed
+        (Some(_), None) => true, // No cached stamp — treat as changed
         (None, _) => true,       // Stat failed — cannot prove unchanged
     }
 }
@@ -725,7 +770,7 @@ mod tests {
             return;
         }
         assert!(
-            !cache2.file_mtimes.contains_key("sub/a.rs"),
+            !cache2.file_stamps.contains_key("sub/a.rs"),
             "precondition: the stat must have failed for this test to mean anything"
         );
         assert!(
@@ -747,15 +792,92 @@ mod tests {
     fn test_file_needs_hashing_treats_unknown_mtime_as_changed() {
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + std::time::Duration::from_secs(1);
-        assert!(!file_needs_hashing(Some(t0), Some(&t0)), "same mtime");
-        assert!(file_needs_hashing(Some(t1), Some(&t0)), "mtime moved");
-        assert!(file_needs_hashing(Some(t0), None), "no cached mtime");
+        let s = |mtime, size| FileStamp { mtime, size };
         assert!(
-            file_needs_hashing(None, Some(&t0)),
+            !file_needs_hashing(Some(s(t0, 10)), Some(&s(t0, 10))),
+            "same mtime and same size"
+        );
+        assert!(
+            file_needs_hashing(Some(s(t1, 10)), Some(&s(t0, 10))),
+            "mtime moved"
+        );
+        assert!(
+            file_needs_hashing(Some(s(t0, 20)), Some(&s(t0, 10))),
+            "size moved under a frozen mtime — the coarse-granularity case; \
+             mtime equality alone would call this unchanged"
+        );
+        assert!(file_needs_hashing(Some(s(t0, 10)), None), "no cached stamp");
+        assert!(
+            file_needs_hashing(None, Some(&s(t0, 10))),
             "stat failed — unknown is not unchanged; skipping here leaves a \
              modified file stale in the index"
         );
         assert!(file_needs_hashing(None, None), "nothing known either side");
+    }
+
+    /// A content edit that does not move the mtime is invisible to the cached
+    /// scan, because mtime equality is its ONLY freshness signal.
+    ///
+    /// The existing content-change tests all sleep 50ms before rewriting, which
+    /// guarantees a fresh mtime and therefore never exercises this. That is not
+    /// a hypothetical: `st_mtime` granularity is 1s on HFS+ and ext3, 2s on
+    /// exFAT, and coarse on several network filesystems, so two writes inside
+    /// one granule are indistinguishable there — the second one is dropped and
+    /// the index serves the first one's symbols until something unrelated
+    /// touches the file. On ext4/APFS (nanosecond mtimes) the same shape needs
+    /// an explicit restamp, which is what this test does: it pins the DECISION,
+    /// not one filesystem's clock resolution.
+    ///
+    /// Size is the cheap second signal — `metadata()` is already being called,
+    /// so reading `len()` costs nothing and catches every length-changing edit.
+    /// A same-granule edit that also preserves length stays invisible; that is
+    /// the documented residual (the rsync quick-check tradeoff), not an
+    /// oversight.
+    #[test]
+    fn test_scan_directory_cached_detects_content_change_under_frozen_mtime() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        let file = tmp.path().join("main.rs");
+        fs::write(&file, "fn main(){}").unwrap();
+
+        let (hashes1, cache1) = scan_directory_cached(tmp.path(), None).unwrap();
+        let frozen = fs::metadata(&file).unwrap().modified().unwrap();
+
+        fs::write(&file, "fn main(){ println!(\"changed\"); }").unwrap();
+        // Put the clock back exactly where it was: same mtime, different bytes.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(frozen)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&file).unwrap().modified().unwrap(),
+            frozen,
+            "precondition: the restamp must actually freeze the mtime, else this \
+             test passes for the wrong reason"
+        );
+
+        let (hashes2, _cache2) = scan_directory_cached(tmp.path(), Some(&cache1)).unwrap();
+        // Assert PRESENCE first. A skipped file is simply absent from the
+        // returned map, so comparing `hashes2.get(..) != hashes1.get(..)`
+        // would read `None != Some(h)` and pass for exactly the failure this
+        // test exists to catch.
+        let after = hashes2.get("main.rs").unwrap_or_else(|| {
+            panic!(
+                "a content edit under an unchanged mtime was SKIPPED — the file \
+                 never got hashed, so mtime equality was taken as proof of \
+                 freshness. On any filesystem whose mtime granularity is coarser \
+                 than the edit interval (1s on HFS+/ext3, 2s on exFAT) this is \
+                 the ordinary case, not a contrived one."
+            )
+        });
+        assert_ne!(
+            Some(after),
+            hashes1.get("main.rs"),
+            "the file was re-hashed but the hash did not move — the rewrite did \
+             not take, so this test proves nothing"
+        );
     }
 
     #[test]

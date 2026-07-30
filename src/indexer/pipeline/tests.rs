@@ -2889,3 +2889,73 @@ fn test_external_sentinel_type_prefers_implements_over_import() {
         "the implements channel must win over the later import channel"
     );
 }
+
+/// The frozen-mtime skip, asserted where a USER would notice it.
+///
+/// `merkle::test_scan_directory_cached_detects_content_change_under_frozen_mtime`
+/// pins the same defect one layer down, at the scan. That is the right place for
+/// the decision, but it cannot show the consequence: the scan returning a short
+/// hash map is only a bug because `run_incremental_index_cached` then reports
+/// zero files indexed and leaves the previous symbols in the database. Every MCP
+/// tool reaches this function through `ensure_indexed` →
+/// `run_incremental_with_cache_restore`, so a file stuck here is a file whose
+/// stale symbols `callgraph` / `project_map` / `find_dead_code` keep serving.
+///
+/// The edit is length-changing, which is what the size half of `FileStamp`
+/// catches; the mtime is restamped to the previous value byte-for-byte, which is
+/// what a coarse-granularity filesystem does for free.
+#[test]
+fn test_cached_incremental_sees_a_content_edit_under_a_frozen_mtime() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+    let file = project_dir.path().join("src/a.ts");
+    fs::write(&file, "function alpha(): number { return 1; }\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    let (_first, cache) =
+        run_incremental_index_cached(&db, project_dir.path(), None, None, None).unwrap();
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "alpha").unwrap().len(),
+        1,
+        "precondition: the first pass must index the original symbol"
+    );
+
+    let frozen = fs::metadata(&file).unwrap().modified().unwrap();
+    fs::write(
+        &file,
+        "function beta(): number { return 2; }\nfunction gamma(): number { return 3; }\n",
+    )
+    .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(frozen)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&file).unwrap().modified().unwrap(),
+        frozen,
+        "precondition: the restamp must actually freeze the mtime, else this test \
+         passes for the wrong reason"
+    );
+
+    let (second, _cache2) =
+        run_incremental_index_cached(&db, project_dir.path(), None, Some(&cache), None).unwrap();
+
+    assert_eq!(
+        second.files_indexed, 1,
+        "the edited file was skipped, so the incremental pass was a no-op — mtime \
+         equality was taken as proof of freshness"
+    );
+    assert_eq!(
+        get_nodes_by_name(db.conn(), "beta").unwrap().len(),
+        1,
+        "the new symbol never reached the database"
+    );
+    assert!(
+        get_nodes_by_name(db.conn(), "alpha").unwrap().is_empty(),
+        "the deleted symbol is still being served — every MCP tool reads through \
+         this path"
+    );
+}

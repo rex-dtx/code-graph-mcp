@@ -460,6 +460,87 @@ fn import_parity_across_languages_and_spellings() {
     );
 }
 
+/// The EXACT-count half of the import axis: one module, one edge.
+///
+/// The spelling table above asserts "at least N", which is the right shape for
+/// "did the arm survive" and cannot see the opposite failure.
+/// `import mod, * as ns from './m'` emitted two identical
+/// `<module> -> <module>@./m` rows, one per binding, because each marker claimed
+/// the module-level dependency separately and `idx_edges_unique` includes
+/// `metadata` (so the differing `q` kept both). A floor of 1 passes on 2. `deps`
+/// happens to survive it — its symbol counts are `COUNT(DISTINCT nb.id)` — but
+/// the edge totals and the per-language relation stats do not.
+///
+/// A note on what is NOT here. This table briefly also asserted that dynamically
+/// built include paths produce no edge (`require_once "config" . $env . ".php"`
+/// must not bind `config.php`). That rule was reverted before release: two
+/// independent reviews each measured it as a NET LOSS of true edges on ordinary
+/// idioms, and both times the fixture used to validate it happened not to
+/// contain the shapes it broke. Any future attempt needs a fixture with a FLAT
+/// layout — targets that can actually bind — and rows for the parenthesized
+/// operand, the interpolated literal left of the last separator, and the route
+/// whose path ends in a variable. See CHANGELOG "Known gap".
+#[test]
+fn import_forms_resolve_to_exactly_one_module_or_none() {
+    // (label, file, source, exact expected `imports` edge count)
+    let cases: &[(&str, &str, &str, i64)] = &[
+        (
+            "esm default + namespace (one module, one edge)",
+            "dup.ts",
+            "import mod, * as ns from './tgt';\n",
+            1,
+        ),
+        (
+            "esm default alone",
+            "d1.ts",
+            "import mod from './tgt';\n",
+            1,
+        ),
+        (
+            "esm namespace alone",
+            "d2.ts",
+            "import * as ns from './tgt';\n",
+            1,
+        ),
+        (
+            // The guard must not over-fire: a clause with no namespace binding
+            // keeps its default marker.
+            "esm default alone under a second module",
+            "d3.ts",
+            "import only from './tgt2';\n",
+            1,
+        ),
+    ];
+
+    let mut files: Vec<(&str, &str)> = cases.iter().map(|(_, f, s, _)| (*f, *s)).collect();
+    files.push((
+        "tgt.ts",
+        "export const y = 1;\nexport default function f() {}\n",
+    ));
+    files.push((
+        "tgt2.ts",
+        "export const z = 1;\nexport default function g() {}\n",
+    ));
+
+    let (_p, counts) = imports_per_file(&files);
+
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(label, file, source, want)| {
+            let got = counts.get(&format!("src/{file}")).copied().unwrap_or(0);
+            (got != *want).then(|| format!("{label} ({file}, {source:?}): {got} != {want}"))
+        })
+        .collect();
+
+    assert!(
+        wrong.is_empty(),
+        "these import forms produced the wrong NUMBER of `imports` edges — more than \
+         one means a single module was counted twice, once per binding:\n  {}\n\
+         all counts: {counts:?}",
+        wrong.join("\n  ")
+    );
+}
+
 /// Per-language inheritance-axis parity.
 ///
 /// The `calls` axis has `call_extraction_parity_across_every_call_capable_language`
