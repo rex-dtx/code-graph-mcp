@@ -78,6 +78,17 @@ fn looks_like_cpp_header(source: &str) -> bool {
 /// then drops heavyweight data (ASTs, source strings) before the next batch.
 pub(super) const BATCH_SIZE: usize = 500;
 
+/// Files touched in one run before it refreshes query-planner statistics.
+///
+/// Set from the two measured ends rather than picked round: at 1 file the
+/// ANALYZE is pure overhead on the `ensure_file_indexed` query path (+10 ms of
+/// ~70 ms), and by a couple of hundred files it has already paid for itself
+/// (this repo's 232-file full index went 1.45 s -> 1.35 s, and a real
+/// 2 052-file repo 13.16 s -> 8.58 s). Anything in between is cheap either way,
+/// so the exact value is not load-bearing — only that a single-file refresh
+/// falls below it and a real indexing run does not.
+const STATS_REFRESH_MIN_FILES: usize = 50;
+
 // CPU-bound parse result — produced in parallel, consumed sequentially for DB insert
 struct FilePreParsed {
     rel_path: String,
@@ -1768,6 +1779,23 @@ pub(super) fn index_files(
     // earned. Gating on the observable keeps the invariant local.
     if !all_indexed.is_empty() || !delete_paths.is_empty() || pending_resolved > 0 {
         finalize_tick();
+        // The post-passes below are the first big correlated-subquery joins over
+        // the graph this run just wrote, and on a fresh index there is no
+        // `sqlite_stat1` for the planner to use — `run_optimize()` only runs at
+        // the very END of the run, after they are done. Measured on a real
+        // 2,052-file TypeScript repo: prune took 5.14 s of a 13.5 s full index
+        // without statistics and 0.187 s with them. Paying ~30 ms here to make
+        // them available is the whole difference (13.16 s -> 8.58 s end to end).
+        //
+        // Gated by size because `ensure_file_indexed` reaches this same block on
+        // every query that touches an edited file: an unconditional ANALYZE cost
+        // that path ~10 ms of its ~70 ms (measured on this repo), for no gain —
+        // a one-file refresh inherits perfectly good statistics from whatever
+        // run last crossed the threshold, and its own edge delta is far too
+        // small to shift them.
+        if all_indexed.len() + delete_paths.len() >= STATS_REFRESH_MIN_FILES {
+            db.refresh_query_stats();
+        }
         let post = run_global_edge_post_passes(db)?;
         total_edges_created += post.bound;
         total_edges_created = total_edges_created.saturating_sub(post.pruned);

@@ -549,6 +549,31 @@ If you see this repeatedly, another code-graph server of a different version is 
         Ok(())
     }
 
+    /// Refresh query-planner statistics MID-RUN, before the global edge
+    /// post-passes read the tables the batch loop just filled.
+    ///
+    /// Those passes are the first thing to run big correlated-subquery joins
+    /// over a freshly written graph, and on a brand-new index there is no
+    /// `sqlite_stat1` yet, so SQLite plans them by its built-in guesses. On a
+    /// real 2,052-file TypeScript repo that costs
+    /// `prune_import_contradicted_call_edges` **5.14 s of a 13.5 s full index**.
+    /// The same DELETE against the same database with statistics present takes
+    /// **0.187 s**; dropping `sqlite_stat1` from that copy reproduces 5.17 s, so
+    /// the cost is the query plan, not the predicate.
+    ///
+    /// `ANALYZE`, not `PRAGMA optimize`: optimize decides what to analyze from
+    /// per-connection change counters and is a no-op on a connection that has
+    /// not yet accumulated them, which is exactly the fresh-index case this
+    /// exists for. Measured at 30 ms on that repo — it buys back ~5 s.
+    ///
+    /// Best-effort: statistics are an optimization, never correctness, so a
+    /// failure here must not fail the index run.
+    pub fn refresh_query_stats(&self) {
+        if let Err(e) = self.conn.execute_batch("ANALYZE;") {
+            tracing::debug!("[db] ANALYZE before edge post-passes failed (continuing): {e}");
+        }
+    }
+
     /// Compare the stored embedding dimension (meta table) against the
     /// compile-time EMBEDDING_DIM. Mismatch → drop node_vectors and recreate
     /// at the new dim so the next indexing run re-embeds cleanly.
