@@ -3002,7 +3002,13 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                 _ => resolved,
             },
         };
-        if !canonical.starts_with(&root_canonical) {
+        // Dual-root: `canonical` is only LEXICAL for a nonexistent path (the
+        // canonicalize above failed), and on Windows a short-name cwd join can
+        // never lexically start_with the long-form canonical root. Accept the
+        // raw-root spelling too — the path then flows to rg, which reports the
+        // honest "No such file" / partial error instead of a bogus traversal
+        // rejection (windows CI leg, first lit in v0.112.0).
+        if !canonical.starts_with(&root_canonical) && !canonical.starts_with(project_root) {
             if json_mode {
                 println!("[]");
             }
@@ -3012,7 +3018,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             );
             grep_exit(2);
         }
-        if let Ok(rel) = canonical.strip_prefix(&root_canonical) {
+        if let Ok(rel) = canonical
+            .strip_prefix(&root_canonical)
+            .or_else(|_| canonical.strip_prefix(project_root))
+        {
             // `/`-separated: these go out as `git ls-files` / `rg --files`
             // pathspecs (git pathspecs are always `/`) and are compared against
             // relativized output rows in `-c` mode, which is also `/`.
@@ -3095,7 +3104,12 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // Walk operands: the user's paths, or the whole root.
     let mut walk_operands: Vec<std::ffi::OsString> = Vec::new();
     if search_paths.is_empty() {
-        walk_operands.push(project_root.into());
+        // root_canonical, not the raw root: rg echoes back the spelling it was
+        // handed, and the raw root can be an 8.3 short name on Windows while
+        // every explicit search path above is canonicalized long-form. One
+        // spelling for everything keeps the relativize below single-rooted for
+        // the common case (dual-root fallback covers the rest).
+        walk_operands.push(root_canonical.clone().into());
     } else {
         for p in &search_paths {
             walk_operands.push(p.into());
@@ -3313,18 +3327,18 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
 
     // -l mode: rg already printed one path per line; relativize and pass through.
     if files_with_matches {
-        // root_canonical, not project_root: rg is handed CANONICALIZED search
-        // paths (see :2984) and echoes them back. On Windows the raw root can be
-        // an 8.3 short name (GitHub runners: TEMP=…\RUNNER~1\…) while canonical
-        // output is the long form — a lexical relativize can never equate the
-        // two, so every row stayed absolute and the annotation/zero-fill/dedup
-        // logic downstream all missed (first surfaced when CI gained ripgrep
-        // and the 43 grep tests actually RAN on windows-latest, v0.112.0).
+        // Dual-root relativize: rg rows echo whichever spelling the operand
+        // carried — canonical long-form for explicit/walk paths, but a raw
+        // (possibly 8.3-short on Windows) spelling can still appear for paths
+        // that never canonicalized. Try canonical first, raw second; a single
+        // lexical root can never equate the two spellings (first surfaced when
+        // CI gained ripgrep and the grep tests actually RAN on windows-latest).
         let root_str = root_canonical.to_string_lossy().into_owned();
+        let root_raw_str = project_root.to_string_lossy().into_owned();
         let mut files: Vec<String> = String::from_utf8_lossy(&rg_output.stdout)
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| relativize_path(l, &root_str))
+            .map(|l| relativize_path_dual(l, &root_str, &root_raw_str))
             .collect();
         files.sort(); // global ascending-path order (walk + supplement + multi-path)
         files.dedup(); // overlapping/repeated path args can list one file twice
@@ -3360,14 +3374,18 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // -c mode: rg --count printed `path:N` per file with a match; relativize and
     // pass through. No AST annotation (like -l); the count is exhaustive.
     if count_mode {
-        // Same root_canonical rationale as the -l branch above (8.3 vs long).
+        // Same dual-root rationale as the -l branch above (8.3 vs long).
         let root_str = root_canonical.to_string_lossy().into_owned();
+        let root_raw_str = project_root.to_string_lossy().into_owned();
         let mut counts: Vec<(String, u64)> = String::from_utf8_lossy(&rg_output.stdout)
             .lines()
             .filter(|l| !l.is_empty())
             .filter_map(|l| {
                 let (path, n) = l.rsplit_once(':')?;
-                Some((relativize_path(path, &root_str), n.trim().parse().ok()?))
+                Some((
+                    relativize_path_dual(path, &root_str, &root_raw_str),
+                    n.trim().parse().ok()?,
+                ))
             })
             .collect();
         // GNU parity: every explicitly named FILE arg gets a count row, zero
@@ -3426,7 +3444,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     }
 
     // Parse rg JSON output into matches
-    let mut matches = parse_rg_json(&rg_output.stdout, &root_canonical);
+    let mut matches = parse_rg_json(&rg_output.stdout, &root_canonical, project_root);
     // Global ascending order by (path, line). rg already emits a file's lines in
     // order (sequential scan), so this only reorders ACROSS files (supplement /
     // multi-path); context lines carry their own line number and stay adjacent to
@@ -3736,6 +3754,23 @@ fn relativize_path(path_str: &str, root_str: &str) -> String {
     relativize_path_on(path_str, root_str, cfg!(windows))
 }
 
+/// Relativize against the canonical root first, the raw root second.
+///
+/// rg echoes back the spelling each operand was handed. Explicit and default
+/// walk operands are canonical (long-form on Windows), but a nonexistent path
+/// stays a raw lexical join — and on Windows the raw project root can be an
+/// 8.3 short name (GitHub runners: `…\RUNNER~1\…`) that no lexical compare
+/// can equate with the canonical long form. "Primary missed" is detected by
+/// comparing against the empty-root normalization, which relativize returns
+/// unchanged when the prefix does not match.
+fn relativize_path_dual(path_str: &str, root_primary: &str, root_fallback: &str) -> String {
+    let stripped = relativize_path(path_str, root_primary);
+    if stripped != relativize_path(path_str, "") {
+        return stripped;
+    }
+    relativize_path(path_str, root_fallback)
+}
+
 /// Testable core of [`relativize_path`] — see [`normalize_path_display_on`] for
 /// why the platform is a parameter rather than a `cfg!`.
 fn relativize_path_on(path_str: &str, root_str: &str, windows: bool) -> String {
@@ -3763,8 +3798,9 @@ fn relativize_path_on(path_str: &str, root_str: &str, windows: bool) -> String {
 
 /// Parse ripgrep JSON output into structured matches (and context lines when
 /// -A/-B/-C were passed — rg interleaves `context` records in print order).
-fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
-    let root_str = project_root.to_string_lossy().into_owned();
+fn parse_rg_json(stdout: &[u8], root_canonical: &Path, root_raw: &Path) -> Vec<GrepMatch> {
+    let root_str = root_canonical.to_string_lossy().into_owned();
+    let root_raw_str = root_raw.to_string_lossy().into_owned();
     let mut matches = Vec::new();
     for line in stdout.split(|&b| b == b'\n') {
         if line.is_empty() {
@@ -3788,7 +3824,7 @@ fn parse_rg_json(stdout: &[u8], project_root: &Path) -> Vec<GrepMatch> {
         let text = data["lines"]["text"].as_str().unwrap_or("").to_string();
 
         matches.push(GrepMatch {
-            file: relativize_path(path_str, &root_str),
+            file: relativize_path_dual(path_str, &root_str, &root_raw_str),
             line: line_number,
             text,
             is_context,
@@ -9975,14 +10011,14 @@ mod tests {
     #[test]
     fn test_parse_rg_json_empty() {
         let root = Path::new("/project");
-        assert!(parse_rg_json(b"", root).is_empty());
+        assert!(parse_rg_json(b"", root, root).is_empty());
     }
 
     #[test]
     fn test_parse_rg_json_match() {
         let root = Path::new("/project");
         let json_line = br#"{"type":"match","data":{"path":{"text":"/project/src/main.rs"},"line_number":42,"lines":{"text":"fn main() {\n"}}}"#;
-        let matches = parse_rg_json(json_line, root);
+        let matches = parse_rg_json(json_line, root, root);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].file, "src/main.rs");
         assert_eq!(matches[0].line, 42);
@@ -10478,6 +10514,29 @@ mod tests {
         assert_eq!(
             relativize_path_on(r"c:\proj\x.rs", r"C:\proj", true),
             "x.rs"
+        );
+    }
+
+    #[test]
+    fn test_relativize_path_dual_falls_back_to_raw_root() {
+        // A nonexistent path never canonicalizes, so its rg echo keeps the RAW
+        // (possibly 8.3-short) root spelling; the canonical long form misses
+        // lexically and the raw fallback must strip it instead. Unmatched by
+        // both roots → normalized passthrough.
+        assert_eq!(
+            relativize_path_dual("/repo/src/a.rs", "/repo", "/elsewhere"),
+            "src/a.rs"
+        );
+        assert_eq!(
+            relativize_path_dual("/short/form/src/a.rs", "/canonical/long", "/short/form"),
+            "src/a.rs",
+            "canonical miss must fall back to the raw root"
+        );
+        assert_eq!(
+            relativize_path_dual("/outside/a.rs", "/repo", "/elsewhere"),
+            // Unmatched passthrough keeps relativize_path's historical shape:
+            // normalized with the leading separator trimmed.
+            "outside/a.rs"
         );
     }
 
