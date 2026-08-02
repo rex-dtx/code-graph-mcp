@@ -462,6 +462,11 @@ impl McpServer {
 
         if !should_skip_indexing(args) {
             self.ensure_indexed()?;
+            // Edit-aware: this tool emits start_line/end_line, and it was the
+            // ONE path-taking tool without the query-time refresh — post-Edit
+            // dead-code line numbers went stale where every sibling resynced
+            // (audit 2026-08-02 MED-6; its CLI twin already refreshes).
+            self.ensure_file_fresh_opt(path)?;
         }
 
         let report = crate::storage::queries::dead_code_report(

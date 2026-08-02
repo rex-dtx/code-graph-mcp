@@ -207,12 +207,34 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
     // one: a full index into an explicit path, and the incremental refresh.
     const ALLOWED_ANCHORS: [&str; 2] = ["fn build_full_index_at", "fn cmd_incremental_index"];
 
+    // `Database::open` is the SAME destructive constructor with a different
+    // vec flag (open_impl(path, false, revalidate=TRUE)) — the guard's first
+    // version matched only `open_with_vec` and a mutation experiment showed a
+    // `Database::open(&db_path)` planted in a read command left it green
+    // (audit 2026-08-02 MED-5). cmd_benchmark opens its OWN temp DB, which is
+    // fine — it never touches the user's index.
+    const ALLOWED_OPEN_ANCHORS: [&str; 3] = [
+        "fn build_full_index_at",
+        "fn cmd_incremental_index",
+        "fn cmd_benchmark",
+    ];
+
     let lines: Vec<&str> = src.lines().collect();
     let mut current_fn = "<file scope>";
     let mut offenders: Vec<String> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix("fn ").or_else(|| t.strip_prefix("pub fn ")) {
+        // The same mutation round showed `pub(crate) fn` slipping past a
+        // `fn `/`pub fn `-only tracker: current_fn stayed at the PREVIOUS
+        // declaration, inheriting its allowlist exemption.
+        let decl = t
+            .strip_prefix("pub(crate) fn ")
+            .or_else(|| t.strip_prefix("pub(super) fn "))
+            .or_else(|| t.strip_prefix("pub async fn "))
+            .or_else(|| t.strip_prefix("async fn "))
+            .or_else(|| t.strip_prefix("pub fn "))
+            .or_else(|| t.strip_prefix("fn "));
+        if let Some(rest) = decl {
             current_fn = rest.split('(').next().unwrap_or(rest);
         }
         // Skip doc comments and ordinary comments: several of them name the
@@ -220,20 +242,28 @@ fn only_indexer_entry_points_use_the_destructive_constructor() {
         if t.starts_with("//") {
             continue;
         }
-        if line.contains("Database::open_with_vec")
-            && !ALLOWED_ANCHORS
+        let hits_destructive = line.contains("Database::open_with_vec")
+            || (line.contains("Database::open(") && !line.contains("open_nondestructive"));
+        let allowed = if line.contains("Database::open_with_vec") {
+            ALLOWED_ANCHORS
                 .iter()
                 .any(|a| a.trim_start_matches("fn ") == current_fn)
-        {
+        } else {
+            ALLOWED_OPEN_ANCHORS
+                .iter()
+                .any(|a| a.trim_start_matches("fn ") == current_fn)
+        };
+        if hits_destructive && !allowed {
             offenders.push(format!("src/cli.rs:{} (in fn {current_fn})", i + 1));
         }
     }
     assert!(
         offenders.is_empty(),
-        "`Database::open_with_vec` performs the destructive INDEX_VERSION \
-         revalidation. Reached from a read command it wipes the user's index and \
-         nothing rebuilds it (the daagu failure; `similar` shipped this way). Use \
-         CliContext::open / open_with_vec instead. Offending sites: {offenders:?}"
+        "`Database::open_with_vec` / `Database::open` perform the destructive \
+         INDEX_VERSION revalidation. Reached from a read command they wipe the \
+         user's index and nothing rebuilds it (the daagu failure; `similar` \
+         shipped this way). Use CliContext::open / open_with_vec instead. \
+         Offending sites: {offenders:?}"
     );
 }
 

@@ -1172,7 +1172,16 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     // even when the index is missing — bailing with a stderr-only anyhow error
     // forces them to grep messages instead of reading JSON fields.
     if format == "json" {
-        let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
+        // Worktree-aware, like every read command: the raw project_root check
+        // reported {"healthy":false,"reason":"no_index"} from a linked worktree
+        // whose MAIN checkout has a perfectly good index, while the human
+        // format (via CliContext::open below) said "OK" — same command, two
+        // formats, opposite verdicts, and doctor.js consumes the JSON one, so
+        // every worktree showed a phantom broken install (audit 2026-08-02
+        // MED-3).
+        let db_path = effective_read_root(project_root)
+            .join(CODE_GRAPH_DIR)
+            .join("index.db");
         if !db_path.exists() {
             let payload = serde_json::json!({
                 "healthy": false,
@@ -3933,7 +3942,7 @@ pub fn cmd_search(project_root: &Path, args: SearchArgs) -> Result<()> {
         .iter()
         .map(|nwf| nwf.file_path.clone())
         .collect();
-    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
         let (f, n) = run_query(conn)?;
         fts_result = f;
@@ -4300,7 +4309,7 @@ pub fn cmd_ast_search(project_root: &Path, args: AstSearchArgs) -> Result<()> {
         .iter()
         .map(|nwf| nwf.file_path.clone())
         .collect();
-    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
         let (r, e, d) = run_query(conn)?;
         results_with_files = r;
@@ -4885,7 +4894,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         for c in &callers {
             files.push(c.file_path.clone());
         }
-        let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+        let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
         if outcome.any_changed {
             callers = crate::graph::routes::get_callers_with_route_info(
                 conn,
@@ -5673,7 +5682,7 @@ pub fn cmd_overview(project_root: &Path, args: OverviewArgs) -> Result<()> {
     // file edited since indexing so the printed L{start}-{end} ranges are post-edit,
     // then re-run the query against the refreshed index.
     let files: Vec<String> = exports.iter().map(|e| e.file_path.clone()).collect();
-    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
         exports = run_query(conn)?;
     }
@@ -6109,7 +6118,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         if let Some(fp) = file_filter {
             files.push(fp.to_string());
         }
-        let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+        let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
         if outcome.any_changed {
             nodes = resolve_show_nodes(conn, symbol, file_filter)?;
         }
@@ -6465,7 +6474,7 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     };
     let mut rows = run_query(conn)?;
     let files: Vec<String> = rows.iter().map(|rm| rm.file_path.clone()).collect();
-    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
         rows = run_query(conn)?;
     }
@@ -6778,24 +6787,30 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
             });
             println!("{}", serde_json::to_string(&result)?);
         }
-        if file_exists {
-            anyhow::bail!(
+        let msg = if file_exists {
+            format!(
                 "[code-graph] No tracked dependencies for: {} (not a barrel/import file \u{2014} try `code-graph-mcp overview {}` or Read directly)",
-                file_path,
-                file_path
-            );
+                file_path, file_path
+            )
         } else if is_dir {
-            anyhow::bail!(
+            format!(
                 "[code-graph] {} is a directory \u{2014} `deps` analyzes a single file. Try `code-graph-mcp overview {}` for a directory, or pass a file path.",
-                file_path,
-                file_path
-            );
+                file_path, file_path
+            )
         } else {
-            anyhow::bail!(
+            format!(
                 "[code-graph] File not found: {} (run `code-graph-mcp incremental-index` if you just created it, or check the path)",
                 file_path
-            );
+            )
+        };
+        if json_mode {
+            // The disclosure object above IS this command's JSON answer;
+            // exiting through Err would make main's tier-3 catch (audit
+            // 2026-08-02 P1-7) print a SECOND error object on stdout.
+            eprintln!("{msg}");
+            std::process::exit(1);
         }
+        anyhow::bail!(msg);
     }
 
     // Filter out cross-language false edges (name-based resolution artifacts)
@@ -7103,7 +7118,7 @@ pub fn cmd_similar(project_root: &Path, args: SimilarArgs) -> Result<()> {
     // line numbers in place by matching name+file in the refreshed index, preserving
     // the similarity ranking and set.
     let files: Vec<String> = similar.iter().map(|(_, fp, _)| fp.clone()).collect();
-    let outcome = refresh_files_if_stale(db, project_root, &files);
+    let outcome = refresh_files_if_stale(db, &ctx.project_root, &files);
     if outcome.any_changed {
         for (node, fp, _) in similar.iter_mut() {
             if let Ok(fresh) = queries::get_nodes_by_file_path(conn, fp) {
@@ -7300,6 +7315,15 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             }
             (matched, base.to_string())
         } else {
+            // Exact-name ambiguity guard — shared with callgraph/impact and the
+            // MCP twin via crate::resolve so every surface gives ONE answer for
+            // one input (audit 2026-08-02 P1-6: refs was the third consumer and
+            // skipped this gate, silently MERGING all same-name definitions'
+            // references into a single total while callgraph/MCP errored
+            // Ambiguous on the same symbol — the 2026-06-03 #6 shape).
+            if let Some(cands) = crate::resolve::detect_ambiguity(conn, base)? {
+                emit_exact_ambiguity(base, &cands, json_mode);
+            }
             let ids = queries::get_node_ids_by_name(conn, base)?;
             if ids.is_empty() {
                 // Fuzzy auto-resolve: unique match → promote; multi → suggest; none → bail
@@ -7423,7 +7447,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         };
     let (mut all_refs, mut conf_filtered) = build_refs(conn)?;
     let files: Vec<String> = all_refs.iter().map(|r| r.file_path.clone()).collect();
-    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
         let (a, c) = build_refs(conn)?;
         all_refs = a;
@@ -7469,6 +7493,14 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             "by_relation": by_relation,
             "references": items,
         });
+        // Machine surface must not be LESS informative than the human one:
+        // human mode prints the hidden count below, and the sibling commands
+        // disclose theirs in-band (callgraph ambiguous_edges_hidden, impact
+        // ambiguous_callers_excluded, ast-search filtered_out) — audit
+        // 2026-08-02 MED-1.
+        if conf_filtered > 0 {
+            envelope["confidence_filtered"] = serde_json::json!(conf_filtered);
+        }
         outcome.attach_partial(&mut envelope);
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
@@ -7626,7 +7658,7 @@ pub fn cmd_dead_code(project_root: &Path, args: DeadCodeArgs) -> Result<()> {
     // candidate's file edited since indexing so its start_line/end_line are post-edit,
     // then re-run against the refreshed index.
     let files: Vec<String> = report.items.iter().map(|it| it.file_path.clone()).collect();
-    let outcome = refresh_files_if_stale(&ctx.db, project_root, &files);
+    let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
         report = run_query(conn)?;
     }

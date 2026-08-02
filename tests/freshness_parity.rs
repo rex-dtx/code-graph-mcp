@@ -405,6 +405,11 @@ const CLI_FRESHNESS_HANDLERS: &[&str] = &[
 /// read. ADD NEW FILE-PATH-ACCEPTING MCP TOOLS HERE.
 const MCP_FRESHNESS_TOOLS: &[(&str, &str)] = &[
     ("src/mcp/server/tools/advanced.rs", "tool_dependency_graph"),
+    // find_dead_code was the SIXTH path-taking tool and the one this
+    // hand-list missed — the same tool the v0.107.0 entry-normalization
+    // hand-enum missed (audit 2026-08-02 MED-6). If you add a path-taking
+    // tool, it goes here AND calls ensure_file_fresh_opt.
+    ("src/mcp/server/tools/advanced.rs", "tool_find_dead_code"),
     ("src/mcp/server/tools/ast_node.rs", "tool_get_ast_node"),
     ("src/mcp/server/tools/callgraph.rs", "tool_get_call_graph"),
     ("src/mcp/server/tools/overview.rs", "tool_module_overview"),
@@ -459,7 +464,7 @@ fn mcp_file_path_tools_call_ensure_fresh() {
 fn cli_freshness_guard_detects_missing_refresh() {
     let src = fs::read_to_string(CLI_SRC).expect("read cli.rs");
     let broken = src.replace(
-        "refresh_files_if_stale(&ctx.db, project_root, &files);",
+        "refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);",
         "/* neutralized for negative control */;",
     );
     let missing = cli_handlers_missing_refresh(&broken);

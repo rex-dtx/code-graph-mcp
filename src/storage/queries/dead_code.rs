@@ -409,18 +409,26 @@ pub fn dead_code_report(
         .into_iter()
         .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
         .collect();
-    let ignored_count = pre_count - filtered.len();
+    let mut ignored_count = pre_count - filtered.len();
 
-    // Byte-identical to the original CLI/MCP surfaces: both probe for
-    // threshold-hidden candidates ONLY when nothing is visible AND nothing was
-    // ignore-suppressed (the "No dead code found …" disclosure path). On any
-    // non-empty or partly-ignored result the field is never read, so the extra
-    // min_lines=1 query is skipped entirely — no wasted DB work on the common path.
+    // Probe for threshold-hidden candidates ONLY when nothing is visible AND
+    // nothing was ignore-suppressed (the "No dead code found …" disclosure
+    // path). On any non-empty or partly-ignored result the fields are never
+    // read, so the extra min_lines=1 query is skipped entirely.
+    //
+    // A candidate hidden by BOTH filters used to be counted by NEITHER: the
+    // probe applied the ignore filter and threw the intersection away, so
+    // `--ignore X` plus the default --min-lines answered a bare "[]" — a
+    // false clean — while either filter alone disclosed the same 3 candidates
+    // (audit 2026-08-02 MED-4). The probe now splits: past-the-ignore-filter →
+    // below_threshold, caught-by-ignore → ignored.
     let hidden_below_threshold = if filtered.is_empty() && ignored_count == 0 && min_lines > 1 {
-        find_dead_code(conn, path, node_type, include_tests, 1, 200)?
+        let probe = find_dead_code(conn, path, node_type, include_tests, 1, 200)?;
+        let (kept, ignored_short): (Vec<_>, Vec<_>) = probe
             .into_iter()
-            .filter(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)))
-            .count()
+            .partition(|r| !ignore_prefixes.iter().any(|p| r.file_path.starts_with(p)));
+        ignored_count += ignored_short.len();
+        kept.len()
     } else {
         0
     };
@@ -2248,6 +2256,25 @@ mod tests {
         let rep1 = dead_code_report(conn, None, None, false, 1, &[]).unwrap();
         assert_eq!(rep1.items.len(), 1);
         assert_eq!(rep1.hidden_below_threshold, 0);
+    }
+
+    #[test]
+    fn dead_code_report_candidate_hidden_by_both_filters_still_disclosed() {
+        // Audit 2026-08-02 MED-4: a candidate that is BOTH below --min-lines
+        // AND under an --ignore prefix used to be counted by NEITHER
+        // disclosure counter — either filter alone disclosed it, both
+        // together answered a bare "[]" false clean.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('scripts/s.rs', 'h1', 0, 'rust', 0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'tiny', 'tiny', 1, 2, 'fn tiny() {}')", []).unwrap();
+        let ignores = vec!["scripts/".to_string()];
+        let rep = dead_code_report(conn, None, None, false, 3, &ignores).unwrap();
+        assert!(rep.is_empty());
+        assert!(
+            rep.ignored_count + rep.hidden_below_threshold > 0,
+            "both-filter candidate vanished from every disclosure counter (false clean)"
+        );
     }
 
     #[test]

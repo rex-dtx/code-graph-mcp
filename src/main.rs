@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         init_tracing("warn");
     }
 
-    match subcommand {
+    let result = match subcommand {
         Some("serve") | None => run_serve(),
         Some("--help" | "-h" | "help") => {
             print_help();
@@ -321,7 +321,22 @@ fn main() -> Result<()> {
             eprintln!("Run 'code-graph-mcp --help' for available commands.");
             std::process::exit(1);
         }
+    };
+
+    // Tier-3 empty contract, error leg (audit 2026-08-02 P1-7): with --json,
+    // ANY pre-handler bail (no index yet, path outside root, open failure)
+    // used to leave stdout at 0 bytes — a machine consumer got a JSON parse
+    // failure instead of an error object, on the single most common error
+    // path a fresh checkout hits. One catch here covers every command and
+    // every future bail site; commands that already emitted their own JSON
+    // error object exit via std::process::exit and never reach this.
+    // stderr keeps the human-readable line via anyhow's Termination below.
+    if let Err(e) = &result {
+        if args.iter().skip(2).any(|a| a == "--json") {
+            println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
+        }
     }
+    result
 }
 
 fn print_version() {

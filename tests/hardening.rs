@@ -476,11 +476,22 @@ fn every_tool_path_arg_read_is_normalized_in_source() {
     const PATH_KEYS: [&str; 2] = ["path", "file_path"];
     let tools_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/server/tools");
 
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&tools_dir)
-        .expect("tools dir must exist — did the module move?")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
+    // Recursive, not read_dir: a tool module moved into a subdirectory would
+    // silently leave the scan (audit 2026-08-02 mutation experiment showed
+    // exactly that blind spot, alongside the `.get("path")` accessor spelling
+    // handled below — the same spelling that produced the ignore_paths hole).
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).expect("tools dir must exist — did the module move?") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                collect_rs(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    collect_rs(&tools_dir, &mut files);
     files.sort();
     assert!(
         files.len() >= 8,
@@ -496,10 +507,10 @@ fn every_tool_path_arg_read_is_normalized_in_source() {
         let src = std::fs::read_to_string(file).unwrap();
         let lines: Vec<&str> = src.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            let Some(key) = PATH_KEYS
-                .iter()
-                .find(|k| line.contains(&format!("args[\"{k}\"]")))
-            else {
+            let Some(key) = PATH_KEYS.iter().find(|k| {
+                line.contains(&format!("args[\"{k}\"]"))
+                    || line.contains(&format!("args.get(\"{k}\")"))
+            }) else {
                 continue;
             };
             checked += 1;

@@ -73,10 +73,10 @@ pub fn get_project_map(
                 GROUP_CONCAT(DISTINCT f.language) \
          FROM nodes n JOIN files f ON f.id = n.file_id \
          WHERE n.type != 'module' AND n.name != '<module>' \
-           AND n.is_test = 0 \
+           AND {prod_filter} \
            AND f.path != '<external>' \
          GROUP BY f.path"
-        .to_string();
+        .replace("{prod_filter}", &crate::domain::prod_filter_and("n", "f"));
     let mut dir_files: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     let mut dir_funcs: HashMap<String, usize> = HashMap::new();
     let mut dir_classes: HashMap<String, usize> = HashMap::new();

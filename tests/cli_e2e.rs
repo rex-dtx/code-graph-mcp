@@ -1306,7 +1306,19 @@ fn test_cli_search_top_k_alias_matches_limit() {
 // ============================================================
 
 fn has_ripgrep() -> bool {
-    Command::new("rg").arg("--version").output().is_ok()
+    let present = Command::new("rg").arg("--version").output().is_ok();
+    // On CI an absent rg must REDDEN the run, not silently skip: 43 grep
+    // tests gate on this helper, and every runner image ships without
+    // ripgrep — the whole cmd_grep surface (largest CLI handler) ran with
+    // zero executed coverage on all OS legs AND the release gate while
+    // reporting green (audit 2026-08-02 P1-8). The workflows now install
+    // rg; this assert keeps the skip from going dark again if a job loses
+    // that step. Same pattern as tests/predicate_parity.rs.
+    assert!(
+        present || std::env::var_os("CI").is_none(),
+        "ripgrep must be installed on CI (the grep suite would silently skip)"
+    );
+    present
 }
 
 #[test]
@@ -7318,5 +7330,180 @@ fn test_cli_map_hot_functions_agree_with_is_test_symbol() {
              dropped it — the target-side filter has drifted from \
              `domain::prod_filter_and`: {names:?}"
         );
+    }
+}
+
+#[test]
+fn test_cli_worktree_reader_never_writes_worktree_content_into_main_index() {
+    // Audit 2026-08-02 P1-1: read commands in a linked worktree resolve the
+    // MAIN checkout's index (cc655aa read-side fallback) but the freshness
+    // check hashed WORKTREE files against it — divergent branch content read
+    // as "stale" and ensure_file_indexed wrote the worktree's version into
+    // the main index (hash swapped, lines shifted, files absent on the branch
+    // CASCADE-deleted). The sibling test above uses a same-commit worktree,
+    // so every hash matches and that write path is unreachable by
+    // construction; this one DIVERGES the branch first and pins that a read
+    // command leaves the main index byte-identical.
+    if !has_git() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let main = root.path().join("main");
+    let src = main.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("auth.ts"),
+        "export function hashPassword(p: string): string { return p; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("other.ts"),
+        "export function sideHelper(): number { return 1; }\n",
+    )
+    .unwrap();
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"], &main);
+    git(&["add", "."], &main);
+    git(&["commit", "-qm", "init"], &main);
+    let db_dir = main.join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, &main, None, None).unwrap();
+    let baseline: Vec<(String, String)> = {
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT path, blake3_hash FROM files ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    drop(db);
+    assert!(
+        baseline.iter().any(|(p, _)| p == "src/other.ts"),
+        "precondition: other.ts indexed"
+    );
+
+    // Diverge the worktree: edit auth.ts (lines shift) and DELETE other.ts.
+    let wt = root.path().join("wt");
+    git(
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"],
+        &main,
+    );
+    std::fs::write(
+        wt.join("src/auth.ts"),
+        "// divergent branch content\n// shifting every line\n\n\n\nexport function hashPassword(p: string): string { return p + p; }\n",
+    )
+    .unwrap();
+    std::fs::remove_file(wt.join("src/other.ts")).unwrap();
+
+    // Two reads from the worktree (the reproduction needed two: the first
+    // marked stale, the second surfaced the corrupted state).
+    for _ in 0..2 {
+        let out = Command::new(binary_path())
+            .args(["show", "hashPassword"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "worktree read must succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The MAIN index must be untouched: same file set, same hashes.
+    let db2 = code_graph_mcp::storage::db::Database::open_nondestructive(&db_dir.join("index.db"))
+        .unwrap();
+    let after: Vec<(String, String)> = {
+        let mut stmt = db2
+            .conn()
+            .prepare("SELECT path, blake3_hash FROM files ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        baseline, after,
+        "a READ command from a divergent worktree mutated the main checkout's index"
+    );
+}
+
+#[test]
+fn test_cli_json_error_no_index_emits_error_object() {
+    // Audit 2026-08-02 P1-7: with --json, a pre-handler bail (here: no index)
+    // used to leave stdout at 0 bytes with exit 1 — a machine consumer got a
+    // JSON parse failure on the single most common error path. The contract's
+    // third tier is an {"error": ...} object on stdout + exit 1.
+    let project = TempDir::new().unwrap();
+    for cmd in [
+        vec!["show", "foo"],
+        vec!["overview", "src"],
+        vec!["callgraph", "x"],
+        vec!["refs", "y"],
+        vec!["map"],
+        vec!["dead-code"],
+        vec!["cycles"],
+        vec!["impact", "z"],
+    ] {
+        let mut args = cmd.clone();
+        args.push("--json");
+        let (out, _err, code) = run_cli(&project, &args);
+        assert_eq!(code, 1, "{cmd:?} --json must exit 1 without an index");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|_| {
+            panic!("{cmd:?} --json must emit parseable JSON on stdout, got: {out:?}")
+        });
+        assert!(
+            v.get("error").is_some(),
+            "{cmd:?} --json must carry an error key; got: {v}"
+        );
+    }
+}
+
+#[test]
+fn test_cli_json_error_path_outside_root_emits_error_object() {
+    // Same tier-3 contract, out-of-root leg (the 8 path-taking commands used
+    // to bail before any JSON-aware code ran).
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.ts"), "export function alpha() {}\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+    for args in [
+        vec!["overview", "/etc", "--json"],
+        vec!["deps", "/etc/passwd", "--json"],
+        vec!["tour", "../..", "--json"],
+    ] {
+        let (out, _err, code) = run_cli(&project, &args);
+        assert_eq!(code, 1, "{args:?} must exit 1");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|_| {
+            panic!("{args:?} must emit parseable JSON on stdout, got: {out:?}")
+        });
+        assert!(v.get("error").is_some(), "{args:?} error key; got: {v}");
     }
 }
