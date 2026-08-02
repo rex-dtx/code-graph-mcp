@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.114.0 (2026-08-02)
+
+Follow-up to the v0.113.0 audit remediation: the two places that batch left
+unfinished, plus the reader-side half of an invariant this project has claimed
+since the daagu incident. **No `INDEX_VERSION` bump** — both performance changes
+were verified to produce byte-identical node and edge sets (confidence column
+included) on a 232-file and a 2,052-file repository, at two different batch
+sizes.
+
+### Fixed
+- **A read-only command could delete your index.** `health-check`, which the
+  statusline polls on every render, opened the database through a constructor
+  documented as non-destructive — but that promise was only enforced for the
+  `INDEX_VERSION` sweep. The two other wipes in the same function ran for
+  readers as well, so an index whose header had been damaged (a crash mid-write,
+  a bad sector) was deleted and replaced with an empty one by a status poll.
+  Nothing rebuilds after a poll, so the index simply stayed empty; worse, the
+  integrity probes added in v0.113.0 then reported `quick_check: ok`, because
+  they were inspecting the blank replacement. Destroying the file is now
+  confined to callers that rebuild it in the same breath. Readers report the
+  corruption instead, and the message carries the one command that fixes it.
+  `grep` no longer claims "No index found" about an index that is still there —
+  that sentence used to be true only because the open had just deleted it.
+- **`doctor` blamed the binary for a corrupt index.** `health-check --json`
+  prints its full report and *then* exits non-zero when the index is unhealthy;
+  doctor treated the exit code as a crash and discarded the report, showing
+  `Schema: error — health-check failed` with no repair offered. It now reads the
+  report, shows an `Integrity` row (page-level corruption, FTS drift, orphaned
+  vectors — each at its own severity), and can rebuild a corrupt index, counting
+  it fixed only after re-checking.
+- **The version gate could not see a version site that had stopped being
+  updated.** Every site is rewritten by a rule that assumes the file still looks
+  a certain way; when it does not, the rewrite matches nothing and "unchanged"
+  is indistinguishable from "already correct" — on both the write and `--check`
+  paths. For the shipped CI template fixed in v0.113.0 that mattered: reverting
+  it to the unscoped package name would have passed every check and shipped.
+  Each site now asserts its expected end state, and a site that can no longer be
+  written fails with its own exit code instead of reporting agreement.
+
+### Performance
+- **Indexing a large repository is ~35% faster.** The global edge post-passes are
+  the first large joins to run over a freshly written graph, and the statistics
+  refresh happened at the very end of the run — after them — so on a new index
+  they planned against SQLite's built-in guesses. On a 2,052-file TypeScript
+  repository that cost the import-contradiction prune 5.14s of a 13.5s full
+  index; the identical statement against the identical database takes 0.187s
+  once statistics exist. Building them first costs ~30ms. Full index of that
+  repository: 13.16s → 8.52s. Single-file refreshes are excluded, so the
+  query-time path is unaffected.
+- **Repositories with a widely-repeated symbol name no longer create edges only
+  to delete them.** A bare call to a name defined in many files fanned out to
+  every candidate, and a later pass removed the contradicted ones. With 60 files
+  exporting the same name, that meant creating 32,900 edges to keep 1,680. The
+  binding decision now happens before the edges are written, when the caller's
+  file imports that name. A 600-file case of that shape went from 2.79s to
+  0.17s; a repository without repeated names is unaffected.
+
 ## v0.113.0 (2026-08-02)
 
 **Migration note: this release bumps INDEX_VERSION (58 → 59).** The MCP server wipes and
