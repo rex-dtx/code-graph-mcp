@@ -1,5 +1,130 @@
 # Changelog
 
+## v0.112.0 (2026-08-02)
+
+**Migration note: this release bumps INDEX_VERSION (57 → 58). The MCP server
+wipes and rebuilds the index automatically on its first start; a CLI-only
+setup rebuilds on the next `incremental-index` / `rebuild-index`. No action
+needed beyond letting that rebuild run. If you need to stay on the old index
+format, pin `@sdsrs/code-graph@0.111.1`.** For repositories over 500 files
+the rebuild is the point of this release: the old index deterministically
+carried phantom and missing cross-batch edges (below).
+
+A full audit of v0.111.1 (7 parallel reviewers + main-thread cross-verification,
+report in `docs/AUDIT-REPORT-2026-08-02.md`) found one P0 and nine P1s. All are
+fixed here, in four commits, each with regression tests that were verified to
+go red against the pre-fix code.
+
+### Fixed — index correctness (the P0)
+- **A fresh index of any repository larger than one batch (500 files) silently
+  corrupted cross-batch relations — deterministically, and rebuilds reproduced
+  it byte-for-byte.** Phase 2 resolved every relation against a pool that could
+  not contain later batches' nodes: `implements`/`imports` whose target sat
+  batches ahead bound to `<external>` phantoms, `inherits`/`exports`/
+  `routes_to`/`references` dropped outright, and bare names wrong-bound to
+  whichever same-name twin an earlier batch happened to hold. Measured: the
+  same four files that produce four true edges alone produced two phantoms
+  plus one missing edge with 600 filler files. Batch-time resolution now
+  decides only pool-complete facts (same-file binds, noise drops, resolved
+  file-constrained binds); everything else is re-resolved once after the batch
+  loop against the complete name map, branch-for-branch identical to the
+  batch-time chain. Verified on this repository's own tree: indexing at
+  BATCH_SIZE 25 versus 500 now diffs to **zero nodes and zero edges**, and the
+  new binary is byte-identical to v0.111.1 on single-batch trees, where the
+  bug could not fire.
+- **Renaming a symbol permanently orphaned its callers' edges under
+  incremental indexing.** The by-name edge restore had nothing to bind after a
+  rename and silently dropped; a full rebuild would have re-resolved the
+  surviving caller against the whole tree. Misses are now requeued through the
+  normal resolution channels, and a new whole-graph parity test pins
+  incremental == full rebuild for the rename case.
+- **`<external>` sentinel nodes were never garbage-collected**, lingering in
+  the name-resolution pool forever and making incrementally-grown indexes
+  diverge from fresh rebuilds. Zero-edge sentinels are now reaped every run,
+  and a sentinel first minted as `module` upgrades to `trait` when an
+  `implements` claim arrives later.
+
+### Fixed — reads that wrote, and answers that disagreed
+- **A read command run inside a linked git worktree wrote the worktree's file
+  content into the MAIN checkout's index** (hash swapped, line numbers
+  shifted, files absent on the branch cascade-deleted) whenever the branch had
+  diverged. All nine freshness call sites now use the worktree-fallback root;
+  a new end-to-end test diverges a branch first — the old worktree test used
+  the same commit, so every hash matched and this write path was structurally
+  unreachable.
+- **`refs` silently merged every same-name definition's references into one
+  total** while `callgraph` and the MCP tool errored `Ambiguous` on the same
+  input. It now takes the same shared ambiguity gate, and `--json` discloses
+  the `--min-confidence` hidden count the human format already printed.
+- **With `--json`, any pre-handler error (no index yet, path outside root)
+  left stdout at zero bytes** on 19 of 22 commands — a JSON parse failure for
+  machine consumers on the most common error path a fresh checkout hits. Every
+  command now emits an `{"error": ...}` object with exit 1.
+- `health-check --json` answered `no_index` from a linked worktree whose main
+  checkout had a healthy index (the human format said OK — doctor consumed the
+  broken one). A dead-code candidate hidden by `--ignore` and `--min-lines`
+  together was counted by neither disclosure and answered a bare `[]` false
+  clean. `find_dead_code` (MCP) gains the query-time file refresh every
+  sibling path tool had. `project_map` module counts use the shared test
+  filter (a `tests/` directory no longer shows as a 154-function module with
+  an empty symbol list).
+
+### Fixed — plugin
+- **Corrupt-tolerant settings writes reached only half the write sites.**
+  `cleanupDisabledStatusline` and `uninstall` still round-tripped a
+  lossy-decoded settings.json straight back to disk, permanently replacing
+  invalid bytes with U+FFFD — the exact destruction the v0.108.1 guarded
+  reader was built to stop. Both now probe first and take the guarded
+  read+write only when a write is certain; a read-only `~/.claude` no longer
+  crashes the statusline process.
+- **The prompt-context injection hook could never find the binary on a
+  plugin-marketplace-only install.** It spawned `code-graph-mcp` by bare PATH
+  name with an empty catch; installs whose binary lives in
+  `~/.cache/code-graph/bin/` got zero injections, forever, silently. It now
+  resolves through `findBinary()` like every sibling hook, reads stdin from
+  fd 0 (the lone `/dev/stdin` holdout — inert under the plugin's own hook-fire
+  self-test), and stamps its cooldown on attempt so a slow index cannot re-run
+  the query on every prompt.
+- Hook cooldown flags are now project-scoped (a grep in one repository no
+  longer suppressed another repository's hooks for 60 seconds); the shared
+  tmp directory gets a 24-hour prune wired to SessionStart and uninstall
+  (675 stale flag files on the dev machine → 27); the global-npm heal
+  counter survives the update-available save path instead of resetting its
+  3-attempt cap forever; `windowsHide` now also covers `bin/cli.js` (the
+  `npx` entry point), doctor's injected-seam call, and `scripts/`, with the
+  guard scanning all three roots.
+
+### Changed — two answers that scripts may have depended on
+- `refs <name>` on a symbol with multiple non-test definitions now **exits 1
+  with an `Ambiguous` error object** (same answer `callgraph` and the MCP tool
+  already gave) instead of returning every definition's references merged into
+  one total with exit 0. Pass `--file` or `--node-id` to disambiguate. If a
+  script consumed the merged total, it was summing references of unrelated
+  symbols that happen to share a name.
+- `project_map` / `map` module counts now apply the full test filter, so
+  per-directory function/class counts no longer include `test_*` symbols and
+  test-path files. Directories of tests stop appearing as large production
+  modules with an empty key-symbol list.
+
+### Fixed — CI actually runs what the gate runs
+- Every CI job that runs `cargo test` now installs ripgrep: 43 grep
+  end-to-end tests were silently skipping on all three runner images — the
+  whole `cmd_grep` surface had zero executed CI coverage, release gate
+  included — while passing on dev machines that have `rg`. The skip now
+  asserts CI is unset, so this class cannot go dark again. Both CI clippy
+  legs and the embed `cargo check` gain `--all-targets`, closing the gap
+  where a tests/benches violation passed every PR and reddened the gate only
+  after the tag existed.
+
+### Docs
+- The README's MCP tool table now lists the seven tools `tools/list` actually
+  advertises (`impact_analysis` was removed long ago; calling it returns
+  `Unknown tool`), documents the still-dispatchable hidden aliases, and maps
+  CLI commands to their real MCP equivalents. Language table: Rust drops
+  `inherits` (never emitted) and gains `routes_to` (axum); C++ gains
+  `.hh`/`.hxx`; the `references` axis and CommonJS `exports` are documented;
+  test-marker claims are scoped to what the AST layer actually detects.
+
 ## v0.111.1 (2026-07-30)
 
 An independent review of v0.111.0 landed after that release went out. It found
