@@ -607,6 +607,14 @@ pub(super) fn index_files(
         buffer_then_delete_files(db, delete_paths)?;
     }
 
+    // Every file THIS RUN will (re)index — restore_inbound_edges consults it:
+    // a restore-miss whose source file is in here must NOT be requeued, because
+    // that file's own batch re-extracts its relations with fresh node ids. The
+    // captured source_id would otherwise dangle once a LATER batch
+    // cascade-deletes the source file's old nodes, and the deferred pass's
+    // insert then aborts the whole run on the FK (pre-tag review, Critical-1).
+    let run_file_paths: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
+
     // Pre-build Python module map once (used in all batches for import resolution)
     let mut all_python_paths: HashSet<String> = files
         .iter()
@@ -1423,6 +1431,7 @@ pub(super) fn index_files(
             &batch_parsed,
             &batch_file_ids,
             &saved_inbound_edges,
+            &run_file_paths,
             &mut deferred,
         )?;
 
@@ -1825,6 +1834,7 @@ fn restore_inbound_edges(
     batch_parsed: &[FileParsed],
     batch_file_ids: &HashSet<i64>,
     saved_inbound_edges: &[(i64, i64, i64, String, String, Option<String>)],
+    run_file_paths: &HashSet<&str>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<usize> {
     let mut edges_created = 0usize;
@@ -1904,6 +1914,20 @@ fn restore_inbound_edges(
                     .clone();
                 if src_path.is_empty() {
                     continue; // source file row gone — nothing to requeue for
+                }
+                if run_file_paths.contains(src_path.as_str()) {
+                    // The source file is in THIS RUN's changed set (an earlier
+                    // OR a later batch): its own batch (re)extracts every
+                    // relation with fresh node ids, so there is nothing to
+                    // requeue — and requeuing would capture a source_id that a
+                    // LATER batch's cascade-delete turns dangling, aborting the
+                    // whole run on the edges FK when the deferred pass inserts
+                    // (pre-tag review Critical-1: >500 changed files + a
+                    // rename reproduced `FOREIGN KEY constraint failed`, with
+                    // the index left missing every deferred edge and no
+                    // self-heal).
+                    skipped_intra_batch += 1;
+                    continue;
                 }
                 if relation.as_str() == REL_CALLS {
                     crate::storage::queries::insert_pending_unresolved_call(

@@ -129,7 +129,12 @@ jobs:
       # tag. Runtime-only (rg is spawned, not linked), so it does not affect the
       # cached artifacts.
       - name: Install ripgrep (cli_e2e grep tests self-skip without it)
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: |
+          # Short-circuit keeps an apt mirror hiccup off this critical path
+          # (ci.yml's step has the same guard).
+          if command -v rg >/dev/null 2>&1; then rg --version; exit 0; fi
+          sudo apt-get update && sudo apt-get install -y ripgrep
+          rg --version
 
       - name: Clippy (no default features)
         run: cargo clippy --no-default-features --all-targets -- -D warnings

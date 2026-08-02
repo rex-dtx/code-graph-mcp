@@ -3208,3 +3208,67 @@ fn test_incremental_rename_converges_to_full_rebuild() {
         "incremental edge set diverged from a fresh full rebuild"
     );
 }
+
+#[test]
+fn test_multi_batch_incremental_rename_survives_and_converges() {
+    // Pre-tag review Critical-1 (2026-08-02): a restore-miss requeue captured
+    // the source node's CURRENT id; when the source file sat in a LATER batch
+    // of the same run, that batch's cascade-delete turned the id dangling and
+    // the deferred pass aborted the whole run on the edges FK — leaving the
+    // index missing every deferred edge with no self-heal. Needs BOTH legs the
+    // earlier tests lacked: >BATCH_SIZE changed files AND a pre-existing index.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("aaa_target.py"), "def save():\n    pass\n").unwrap();
+    fs::write(
+        src.join("zzz_caller.py"),
+        "from aaa_target import save\n\ndef f():\n    save()\n",
+    )
+    .unwrap();
+    let filler = super::index_files::BATCH_SIZE;
+    for i in 0..filler {
+        fs::write(src.join(format!("mmm_{i:04}.py")), "# filler\n").unwrap();
+    }
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    let (_, edges) = graph_projection(&db);
+    assert!(
+        edges
+            .iter()
+            .any(|(_, sn, r, t, _)| sn == "f" && r == REL_CALLS && t == "src/aaa_target.py:save"),
+        "precondition: cross-batch call edge must exist, got {edges:?}"
+    );
+
+    // Rename the batch-1 symbol AND rewrite every file, so the whole tree is
+    // in the changed set and the caller lands in a later batch than the
+    // renamed target.
+    fs::write(src.join("aaa_target.py"), "def store():\n    pass\n").unwrap();
+    fs::write(
+        src.join("zzz_caller.py"),
+        "from aaa_target import save\n\n# touched\ndef f():\n    save()\n",
+    )
+    .unwrap();
+    for i in 0..filler {
+        fs::write(src.join(format!("mmm_{i:04}.py")), "# filler touched\n").unwrap();
+    }
+    run_incremental_index(&db, project_dir.path(), None, None)
+        .expect("multi-batch incremental with a rename must not abort (dangling requeue FK)");
+
+    // And it must converge to what a fresh rebuild of the final tree says.
+    let control_db_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&control_db);
+    assert_eq!(
+        inc_nodes, full_nodes,
+        "node set diverged from fresh rebuild"
+    );
+    assert_eq!(
+        inc_edges, full_edges,
+        "edge set diverged from fresh rebuild"
+    );
+}
