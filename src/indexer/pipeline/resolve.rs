@@ -485,15 +485,20 @@ pub(super) struct ImportNarrowCache {
 /// leaves alone.
 ///
 /// NOT edge-neutral, and the first version of this said it was. The caller
-/// applies this INSTEAD of `refine_ambiguous_targets`, so the old chain's
-/// refine-then-reconcile is skipped, and the reconcile could not repair every
-/// case it produced: when a file imports one name from two places and a third
-/// same-name definition is path-closer, `refine` picked that third node, `bind`
-/// declined (it wants exactly one import target) and `prune` deleted the refined
-/// edge — the call ended up with no edge at all. Here it binds to both imported
-/// definitions. That is why `INDEX_VERSION` moved to 60; see the note there.
-/// Every OTHER narrowing outcome does self-heal through bind+prune, which is
-/// what made whole-graph diffs miss this one.
+/// applies this INSTEAD of `refine_ambiguous_targets`, so the old
+/// refine-then-reconcile chain is skipped — and that chain could not reproduce
+/// this result whenever the caller's file imports one name from TWO OR MORE
+/// distinct definitions (`try`/`except ImportError` fallbacks, conditional
+/// requires, a re-export pair). There the old chain refined to the single
+/// path-closest candidate and then either kept it (1 edge) or, when that
+/// candidate was not itself imported, let `prune` delete it as
+/// import-contradicted (0 edges), because `bind` declines unless there is
+/// exactly one import target. This binds to all of them. Both shapes are
+/// reproduced in `tests.rs`; `INDEX_VERSION` moved to 60 for it.
+///
+/// With a SINGLE imported definition the outcome does self-heal through
+/// bind+prune, which is why whole-graph diffs over repositories that only
+/// contain that shape showed no difference at all.
 pub(super) fn import_narrowed_targets(
     db: &Database,
     caller_rel_path: &str,

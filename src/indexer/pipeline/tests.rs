@@ -3850,3 +3850,53 @@ fn test_import_narrowing_binds_both_when_one_name_is_imported_twice() {
          non-imported definition and not to nothing"
     );
 }
+
+#[test]
+fn test_import_narrowing_binds_all_imports_even_without_a_third_definition() {
+    // Second half of the INDEX_VERSION 60 behaviour change, and the one the
+    // FIRST correction still got wrong by calling the change "one case".
+    //
+    // No third definition here: the caller imports `save` from two places, and
+    // one of them shares its `app/` path prefix. `refine_ambiguous_targets`
+    // therefore had a unique winner rather than a tie, so the old chain bound
+    // exactly that one (`bind` declines with two import targets, and `prune`
+    // kept it because the caller does import it) — 1 edge. Narrowing binds both.
+    //
+    // Sibling of `test_import_narrowing_binds_both_when_one_name_is_imported_twice`,
+    // which covers the 0-edge variant (closest candidate NOT imported). Two
+    // fixtures because the two old outcomes have different causes.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let root = project_dir.path();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::create_dir_all(root.join("zy")).unwrap();
+    fs::write(
+        root.join("app/aaa_main.py"),
+        "try:\n    from app.helper import save\nexcept ImportError:\n    from zy.mod import save\n\ndef run():\n    save()\n",
+    )
+    .unwrap();
+    fs::write(root.join("app/helper.py"), "def save():\n    pass\n").unwrap();
+    fs::write(root.join("zy/mod.py"), "def save():\n    pass\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let (_, edges) = graph_projection(&db);
+    let mut targets: Vec<String> = edges
+        .iter()
+        .filter(|(_, sn, r, _, m)| {
+            sn == "run" && r == REL_CALLS && m.as_deref().map(str::is_empty).unwrap_or(true)
+        })
+        .map(|(_, _, _, t, _)| t.clone())
+        .collect();
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec![
+            "app/helper.py:save".to_string(),
+            "zy/mod.py:save".to_string()
+        ],
+        "both imported definitions must bind; binding only the path-closest one \
+         is the pre-v60 behaviour"
+    );
+}

@@ -60,15 +60,17 @@ since the daagu incident.
   pass, which is where the fan-out is concentrated; the batch-time path still
   reconciles afterwards, and was measured to carry no residual cost.
 
-  **This changes which edges are produced in one case**, which is why
-  `INDEX_VERSION` moves. When a file imports the same name from two places — the
-  `try`/`except ImportError` fallback idiom — and a third definition of that name
-  sits closer on the path, the old chain narrowed to the closer definition and
-  then deleted it as contradicted, leaving the call with no edge at all. It now
-  binds to both imported definitions. Everything else about the change is
-  edge-neutral, verified on a 232-file and a 2,052-file repository at two batch
-  sizes; that pair of repositories does not contain this shape, which is why the
-  case was found in review rather than by those diffs.
+  **This changes which edges are produced**, which is why `INDEX_VERSION` moves.
+  Whenever a file imports one name from two or more different places — the
+  `try`/`except ImportError` fallback idiom, conditional requires, a re-export
+  pair — the call now binds to all of those definitions. Previously it bound to
+  whichever single definition sat closest on the path, and if that closest one
+  happened not to be among the imported definitions, the call was left with no
+  edge at all. Both outcomes are corrected. Calls whose name is imported from
+  exactly one place are unaffected, which is the overwhelmingly common case and
+  the reason a diff over a 232-file and a 2,052-file repository showed no
+  difference: neither contains the shape. That measurement was real but could
+  not have detected this, and the case was found in review instead.
 
 ## v0.113.0 (2026-08-02)
 
