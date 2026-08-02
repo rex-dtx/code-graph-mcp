@@ -3430,3 +3430,159 @@ fn test_multi_batch_incremental_rename_survives_and_converges() {
         "edge set diverged from fresh rebuild"
     );
 }
+
+/// Fixture for the two `buffer_inbound_before_node_purge` dangling-source guards.
+///
+/// `aaa_base.ts` is the delete target; `mid_user.ts` and `zzz_user.ts` hold
+/// NON-`calls` inbound edges into it (`imports` + `inherits`), which is the edge
+/// class Phase 0 buffers into `deferred` with the source node's CURRENT id.
+///
+/// The `BATCH_SIZE` filler files are NOT decoration: with a tiny tree SQLite
+/// hands the just-freed rowid straight back on reinsert, so a dangling id
+/// silently lands on a live row and the FK never fires — the defect hides
+/// itself. The filler also forces the holders into a later batch than the
+/// delete, which is the ordering that makes the captured id go stale at all.
+fn dangling_source_fixture(src: &std::path::Path) -> usize {
+    fs::create_dir_all(src).unwrap();
+    fs::write(src.join("aaa_base.ts"), "export class Base {}\n").unwrap();
+    for name in ["mid_user.ts", "zzz_user.ts"] {
+        fs::write(
+            src.join(name),
+            "import { Base } from './aaa_base';\n\nexport class Child extends Base {}\n",
+        )
+        .unwrap();
+    }
+    let filler = super::index_files::BATCH_SIZE;
+    for i in 0..filler {
+        fs::write(src.join(format!("fil_{i:04}.ts")), "export const x = 1;\n").unwrap();
+    }
+    filler
+}
+
+/// Both holders must really own the buffered edge class before either leg can
+/// claim the guard did anything — otherwise "the run did not abort" passes
+/// vacuously on a tree that never had an edge to dangle.
+fn assert_inbound_precondition(db: &Database) {
+    let (_, edges) = graph_projection(db);
+    for holder in ["src/mid_user.ts", "src/zzz_user.ts"] {
+        assert!(
+            edges.iter().any(|(sp, _, r, t, _)| sp == holder
+                && r == crate::domain::REL_IMPORTS
+                && t == "src/aaa_base.ts:Base"),
+            "precondition: {holder} must import aaa_base.ts:Base, got {edges:?}"
+        );
+    }
+}
+
+#[test]
+fn test_delete_with_holder_in_same_run_does_not_dangle_on_fk() {
+    // Guard leg 1: `run_file_paths.contains(source_path)`.
+    //
+    // Phase 0 buffers a deleted file's inbound non-`calls` edges so an unchanged
+    // holder does not lose them (audit P1-5). It captures the holder's CURRENT
+    // node id. When the holder is ALSO in this run's changed set, a later batch
+    // purges and reinserts its nodes under fresh ids, so the buffered id is
+    // dangling by the time the deferred pass runs — `FOREIGN KEY constraint
+    // failed` (787) aborts the WHOLE index run, not just this one edge.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    let filler = dangling_source_fixture(&src);
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_inbound_precondition(&db);
+
+    // Delete the target AND rewrite every other file, so both holders land in
+    // this run's changed set and in a batch after the delete.
+    fs::remove_file(src.join("aaa_base.ts")).unwrap();
+    for name in ["mid_user.ts", "zzz_user.ts"] {
+        fs::write(
+            src.join(name),
+            "import { Base } from './aaa_base';\n\n// touched\nexport class Child extends Base {}\n",
+        )
+        .unwrap();
+    }
+    for i in 0..filler {
+        fs::write(src.join(format!("fil_{i:04}.ts")), "export const x = 2;\n").unwrap();
+    }
+
+    run_incremental_index(&db, project_dir.path(), None, None).expect(
+        "deleting a file whose inbound-edge holders are themselves in this run's changed set \
+         must not buffer their pre-purge node ids (edges FK 787 aborts the entire run)",
+    );
+
+    // Not aborting is necessary but not sufficient: the run could have survived
+    // by dropping the edges instead. Converge with a fresh rebuild.
+    let control_db_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&control_db);
+    assert_eq!(
+        inc_nodes, full_nodes,
+        "node set diverged from fresh rebuild"
+    );
+    assert_eq!(
+        inc_edges, full_edges,
+        "edge set diverged from fresh rebuild"
+    );
+}
+
+#[test]
+fn test_delete_with_holder_also_deleted_does_not_dangle_on_fk() {
+    // Guard leg 2: `delete_set.contains(source_path)`.
+    //
+    // Same buffer, different way for the id to go stale: the holder is deleted
+    // in the SAME run. Phase 0 walks `delete_paths` in order, so a holder deleted
+    // after the target still has live nodes when its edges are buffered — and no
+    // nodes at all by the time the deferred pass tries to insert them. Distinct
+    // from leg 1: the holder is never re-indexed, so `run_file_paths` does not
+    // cover it and leg 1's clause alone leaves this open.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    let filler = dangling_source_fixture(&src);
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert_inbound_precondition(&db);
+
+    // Delete the target and ONE holder (sorting after it), leaving the other
+    // holder untouched so the buffer still has real work to do.
+    fs::remove_file(src.join("aaa_base.ts")).unwrap();
+    fs::remove_file(src.join("mid_user.ts")).unwrap();
+    for i in 0..filler {
+        fs::write(src.join(format!("fil_{i:04}.ts")), "export const x = 3;\n").unwrap();
+    }
+
+    run_incremental_index(&db, project_dir.path(), None, None).expect(
+        "deleting a file together with one of its inbound-edge holders must not buffer the \
+         holder's about-to-be-purged node ids (edges FK 787 aborts the entire run)",
+    );
+
+    let control_db_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&control_db);
+    // The surviving holder must still carry the re-resolved import; a run that
+    // "passed" by losing it is the P1-5 regression wearing a green badge.
+    assert!(
+        inc_edges
+            .iter()
+            .any(|(sp, _, r, t, _)| sp == "src/zzz_user.ts"
+                && r == crate::domain::REL_IMPORTS
+                && t == "<external>:Base"),
+        "surviving holder lost its import instead of re-resolving to the sentinel: {inc_edges:?}"
+    );
+    assert_eq!(
+        inc_nodes, full_nodes,
+        "node set diverged from fresh rebuild"
+    );
+    assert_eq!(
+        inc_edges, full_edges,
+        "edge set diverged from fresh rebuild"
+    );
+}
+
