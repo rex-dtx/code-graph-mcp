@@ -220,6 +220,169 @@ test('unresolvedCount: --check-only reports every found issue (never repairs)', 
   assert.equal(unresolvedCount({ checkOnly: true, issueCount: 0, fixed: 0 }), 0);
 });
 
+// ── Integrity (audit DB-1) ─────────────────────────────────────────────────
+//
+// The `integrity` block shipped in v0.113.0 and nothing here consumed it: when
+// the index is unhealthy the binary prints the full report to stdout and THEN
+// exits 1, execFileSync throws on the exit code, and the catch arm reported
+// `Schema: error … fixId:'binary-broken'` — a fixId runRepairs has no case for.
+// A genuinely corrupt index was blamed on the binary, with no repair offered.
+
+test('parseHealthPayload recovers the report from a nonzero-exit stdout, and only a report', () => {
+  const { parseHealthPayload } = require('./doctor');
+  const report = JSON.stringify({ healthy: false, schema_version: 10, nodes: 5 });
+  assert.equal(parseHealthPayload(Buffer.from(report)).schema_version, 10,
+    'a real report on stdout must be recovered even though the process exited 1');
+  assert.equal(parseHealthPayload(`  ${report}\n`).nodes, 5, 'string input + surrounding whitespace');
+  assert.equal(parseHealthPayload(JSON.stringify({ reason: 'no_index' })).reason, 'no_index');
+
+  // Anything that is not this command's payload must NOT be read as one — a
+  // panic or a wrapper's noise becoming "a clean bill of health" is worse than
+  // the bug being fixed.
+  assert.equal(parseHealthPayload(null), null);
+  assert.equal(parseHealthPayload(''), null);
+  assert.equal(parseHealthPayload('thread panicked at src/cli.rs:1'), null);
+  assert.equal(parseHealthPayload('{"ok":true}'), null, 'JSON without a report key is not a report');
+  assert.equal(parseHealthPayload('[1,2,3]'), null, 'an array is not a report');
+  assert.equal(parseHealthPayload('null'), null);
+});
+
+test('classifyIntegrity: severity differs per probe, and an absent block is not a pass', () => {
+  const { classifyIntegrity } = require('./doctor');
+  const of = (integrity) => classifyIntegrity({ integrity });
+
+  // quick_check complaining = pages do not read back.
+  const corrupt = of({ quick_check: 'row 12 missing from index nodes_fts', fts_drift: 0, orphan_vectors: 0 });
+  assert.equal(corrupt.status, 'error');
+  assert.equal(corrupt.fixId, 'index-corrupt', 'must route to a repair that exists');
+  assert.match(corrupt.detail, /CORRUPT/);
+
+  // FTS drift = wrong search answers, no crash.
+  const drift = of({ quick_check: 'ok', fts_drift: -3, orphan_vectors: 0 });
+  assert.equal(drift.status, 'warn');
+  assert.equal(drift.fixId, 'index-corrupt');
+  assert.match(drift.detail, /drifted from nodes by -3/);
+
+  // Orphan vectors alone: disclosed, but NOT an issue. Answers stay correct and
+  // the only repair is a full rebuild — a permanent warn with a disproportionate
+  // fix is how doctor ends up exiting 1 forever on an install that is fine.
+  const orphans = of({ quick_check: 'ok', fts_drift: 0, orphan_vectors: 7 });
+  assert.equal(orphans.status, 'ok', 'orphan vectors must not raise an issue on their own');
+  assert.match(orphans.detail, /7 orphan vector\(s\)/, '...but the count must still be visible');
+
+  // Deliberate skips and unmeasurable probes are not verdicts either way.
+  assert.equal(of({ quick_check: 'skipped_large', fts_drift: 0, orphan_vectors: 0 }).status, 'skip');
+  assert.equal(of({ quick_check: null, fts_drift: null, orphan_vectors: null }).status, 'skip');
+  assert.equal(classifyIntegrity({}).status, 'skip', 'binary too old to report = skip, never ok');
+  assert.match(classifyIntegrity({}).detail, /not reported by this binary version/);
+
+  // Healthy.
+  assert.equal(of({ quick_check: 'ok', fts_drift: 0, orphan_vectors: 0 }).status, 'ok');
+});
+
+test('healthRows: a nonzero exit carrying a report is a DIAGNOSIS, not a broken binary', () => {
+  // The seam the bug actually lived in. `health-check --json` prints the report
+  // and then exits 1 when unhealthy; execFileSync throws on the exit code.
+  const { healthRows } = require('./doctor');
+  const exitOne = (stdout, stderr = '') => () => {
+    const err = new Error('Command failed');
+    err.status = 1; err.stdout = stdout; err.stderr = stderr;
+    throw err;
+  };
+  const report = JSON.stringify({
+    healthy: false, schema_version: 10, nodes: 4422, edges: 9001, files: 232,
+    embedding_progress: '0/0', model_available: true,
+    integrity: { quick_check: 'database disk image is malformed', fts_drift: 0, orphan_vectors: 0 },
+  });
+
+  const rows = healthRows('/bin/cg', { runHealthCheck: exitOne(report) });
+  const byName = Object.fromEntries(rows.map((r) => [r.name, r]));
+  assert.equal(byName.Integrity.status, 'error');
+  assert.equal(byName.Integrity.fixId, 'index-corrupt');
+  assert.notEqual(byName.Schema.fixId, 'binary-broken',
+    'the binary ran fine and told us exactly what is wrong — do not blame it');
+  assert.equal(byName.Index.status, 'ok', 'Index must not be `skip: health-check failed`');
+
+  // A genuine binary failure (no payload on stdout) must STILL report broken.
+  const broken = healthRows('/bin/cg', { runHealthCheck: exitOne('', 'Segmentation fault') });
+  assert.equal(broken.find((r) => r.name === 'Schema').fixId, 'binary-broken',
+    'negative control: without a recoverable report the old diagnosis is still right');
+
+  // And "no index" still routes to index-empty rather than binary-broken.
+  const noIndex = healthRows('/bin/cg', { runHealthCheck: exitOne('', 'No index found at .code-graph') });
+  assert.equal(noIndex.find((r) => r.name === 'Index').fixId, 'index-empty');
+
+  // Healthy path: exit 0, plain payload.
+  const ok = healthRows('/bin/cg', {
+    runHealthCheck: () => JSON.stringify({
+      healthy: true, schema_version: 10, nodes: 10, edges: 20, files: 3,
+      embedding_progress: '0/0', model_available: true,
+      integrity: { quick_check: 'ok', fts_drift: 0, orphan_vectors: 0 },
+    }),
+  });
+  assert.equal(ok.find((r) => r.name === 'Integrity').status, 'ok');
+});
+
+test('classifyHealthReport routes a corrupt index to index-corrupt, not binary-broken', () => {
+  const { classifyHealthReport } = require('./doctor');
+  const rows = classifyHealthReport({
+    healthy: false, schema_version: 10, nodes: 4422, edges: 9001, files: 232,
+    embedding_progress: '0/0', model_available: true,
+    integrity: { quick_check: 'database disk image is malformed', fts_drift: 0, orphan_vectors: 0 },
+    issue: 'database integrity check failed: database disk image is malformed. …',
+  });
+  const byName = Object.fromEntries(rows.map((r) => [r.name, r]));
+  assert.equal(byName.Integrity.fixId, 'index-corrupt');
+  assert.equal(byName.Schema.status, 'ok',
+    'schema is fine — the OLD code reported `Schema: error … binary-broken` for exactly this payload');
+  assert.equal(byName.Index.status, 'ok', 'the index has rows; it is the pages that are bad');
+});
+
+test('runRepairs: index-corrupt counts fixed only when the post-rebuild probe is clean', () => {
+  // Same discipline as the hooks-invalid arm: `rebuild-index` exiting 0 says the
+  // command ran, not that the corruption cleared (failing hardware reproduces it
+  // immediately). Both the spawn and the re-probe are injected — doctor.js
+  // destructures execFileSync at load, so patching child_process afterwards
+  // stubs nothing and would run the real rebuild against this repo's index.
+  const { runRepairs } = require('./doctor');
+  const corrupt = [{ name: 'Integrity', status: 'error', fixId: 'index-corrupt' }];
+
+  let rebuilds = 0;
+  const ran = () => { rebuilds++; return true; };
+
+  assert.equal(
+    runRepairs(corrupt, { rebuildIndex: () => { throw new Error('index is locked by another process'); },
+                          integrityOk: () => true }),
+    0, 'a rebuild that threw must not count as fixed even when the probe would pass');
+
+  assert.equal(runRepairs(corrupt, { rebuildIndex: ran, integrityOk: () => false }), 0,
+    'rebuild ran but integrity still fails → not fixed (exit 0 is not evidence)');
+
+  assert.equal(runRepairs(corrupt, { rebuildIndex: ran, integrityOk: () => true }), 1,
+    'rebuild ran and the re-probe is clean → fixed');
+
+  assert.equal(runRepairs(corrupt, { rebuildIndex: () => false, integrityOk: () => true }), 0,
+    'no binary to rebuild with → not fixed, and the probe must not be consulted');
+
+  assert.equal(rebuilds, 2, 'precondition: the spawn injection is live, not inert');
+});
+
+test('integrityResolved re-classifies with the SAME function the diagnosis used', () => {
+  // If "resolved" were its own predicate it could drift from "not raised", and
+  // doctor would count a repair that left the issue standing.
+  const { integrityResolved } = require('./doctor');
+  const probe = (integrity) => () => ({ schema_version: 10, integrity });
+
+  assert.equal(integrityResolved({ probe: probe({ quick_check: 'ok', fts_drift: 0, orphan_vectors: 0 }) }), true);
+  assert.equal(integrityResolved({ probe: probe({ quick_check: 'malformed', fts_drift: 0, orphan_vectors: 0 }) }), false);
+  assert.equal(integrityResolved({ probe: probe({ quick_check: 'ok', fts_drift: 5, orphan_vectors: 0 }) }), false,
+    'a warn-level finding is still unresolved');
+  assert.equal(integrityResolved({ probe: probe({ quick_check: 'ok', fts_drift: 0, orphan_vectors: 9 }) }), true,
+    'orphan vectors alone never raised an issue, so they cannot block resolution either');
+  assert.equal(integrityResolved({ probe: () => null }), false,
+    'no payload at all is not evidence of repair');
+});
+
 test('runRepairs: hooks-invalid counts fixed only when the post-install re-scan is clean', () => {
   // hooks-invalid is raised only after diagnosis already ran install()+re-scan
   // and paths were STILL broken. The repair arm must re-verify, else it reports

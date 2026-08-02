@@ -56,6 +56,173 @@ function classifyEmbeddings(hc) {
 }
 
 /**
+ * Classify the `integrity` block that `health-check --json` has carried since
+ * v0.113.0 (audit DB-1). Pure, same as `classifyEmbeddings`.
+ *
+ * Severity is deliberately NOT uniform across the three probes:
+ *  - `quick_check` complaining means pages do not read back — the index is
+ *    corrupt, and only a rebuild fixes it. Error + fixId.
+ *  - `fts_drift != 0` means the FTS5 index and `nodes` disagree, so search
+ *    silently misses (or invents) symbols. Wrong answers, no crash. Warn + fixId.
+ *  - `orphan_vectors != 0` is dead weight that skews coverage math; answers stay
+ *    correct. It is DISCLOSED in the detail but does not raise an issue on its
+ *    own: the only repair is a full rebuild, and a permanent warn with a
+ *    disproportionate fix is how `doctor` ends up exiting 1 forever on installs
+ *    that are fine (the MCP server already reaps these at startup; a CLI-only
+ *    install is exactly who would be stuck with it).
+ * `null` on any probe means "could not be measured", never a fault.
+ * @returns {{name:string, status:'ok'|'warn'|'error'|'skip', detail:string, fixId?:string}}
+ */
+function classifyIntegrity(hc) {
+  const it = hc && hc.integrity;
+  if (!it || typeof it !== 'object') {
+    // Binary predates the probes. Say so rather than inventing a verdict — an
+    // absent measurement is not a passing one.
+    return { name: 'Integrity', status: 'skip', detail: 'not reported by this binary version' };
+  }
+  const orphanNote = it.orphan_vectors ? `; ${it.orphan_vectors} orphan vector(s)` : '';
+  const qc = it.quick_check;
+  if (typeof qc === 'string' && qc !== 'ok' && qc !== 'skipped_large') {
+    return {
+      name: 'Integrity', status: 'error', fixId: 'index-corrupt',
+      detail: `database is CORRUPT — quick_check: ${qc}${orphanNote}`,
+    };
+  }
+  if (typeof it.fts_drift === 'number' && it.fts_drift !== 0) {
+    return {
+      name: 'Integrity', status: 'warn', fixId: 'index-corrupt',
+      detail: `FTS index drifted from nodes by ${it.fts_drift} row(s) — search silently misses symbols${orphanNote}`,
+    };
+  }
+  if (qc === 'skipped_large') {
+    // The size gate skipped the page scan on purpose. Reporting `ok` here would
+    // claim a check that never ran.
+    return { name: 'Integrity', status: 'skip',
+      detail: `page check skipped (index over the size gate) — run: code-graph-mcp health-check --deep${orphanNote}` };
+  }
+  if (qc == null) {
+    return { name: 'Integrity', status: 'skip', detail: `page check unavailable${orphanNote}` };
+  }
+  return { name: 'Integrity', status: 'ok', detail: `quick_check ok, FTS in sync${orphanNote}` };
+}
+
+/**
+ * Turn a parsed `health-check --json` payload into doctor rows.
+ *
+ * Extracted so the success path and the recovered-from-stdout path (below)
+ * cannot classify the same payload differently. Pure.
+ */
+function classifyHealthReport(hc) {
+  // No-index short-circuit — binary deliberately returns a structured JSON with
+  // reason='no_index' instead of bailing, so we can route to the index-empty fix
+  // without grepping stderr.
+  if (hc.reason === 'no_index') {
+    return [
+      { name: 'Schema', status: 'ok', detail: 'binary ok (no index yet)' },
+      { name: 'Index', status: 'warn', detail: 'missing — not indexed yet', fixId: 'index-empty' },
+      { name: 'Embeddings', status: 'skip', detail: 'no index' },
+    ];
+  }
+  const rows = [];
+  if (hc.issue && String(hc.issue).includes('schema')) {
+    rows.push({ name: 'Schema', status: 'warn', detail: hc.issue, fixId: 'schema-mismatch' });
+  } else {
+    rows.push({ name: 'Schema', status: 'ok', detail: `v${hc.schema_version}` });
+  }
+  if (hc.nodes === 0) {
+    rows.push({ name: 'Index', status: 'warn', detail: 'empty', fixId: 'index-empty' });
+  } else {
+    const age = hc.index_age ? ` (${hc.index_age})` : '';
+    rows.push({
+      name: 'Index', status: 'ok',
+      detail: `${hc.nodes} nodes, ${hc.edges} edges, ${hc.files} files${age}`,
+    });
+  }
+  // Embeddings / vector availability — pure classifier; warns on FTS5-only
+  // degradation (model missing/not loaded) instead of false-greening it.
+  rows.push(classifyEmbeddings(hc));
+  rows.push(classifyIntegrity(hc));
+  return rows;
+}
+
+/**
+ * Recover a health-check payload from a buffer, or null if it isn't one.
+ *
+ * `health-check --json` prints the FULL report to stdout and THEN exits 1 when
+ * the index is unhealthy, so `execFileSync` throwing does not mean there is no
+ * report — it means there is a report saying something is wrong. Requiring a
+ * key only this command emits keeps unrelated stdout (a panic, a wrapper's
+ * noise) from being read as a clean bill of health.
+ */
+function parseHealthPayload(buf) {
+  if (!buf) return null;
+  try {
+    const obj = JSON.parse(buf.toString().trim());
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+    const looksLikeReport = 'schema_version' in obj || obj.reason === 'no_index';
+    return looksLikeReport ? obj : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Spawn `health-check --json`. Separate + injectable: see `rebuildIndexInPlace`. */
+function runHealthCheckCli(binary) {
+  // Deliberately NOT `--deep`. That flag forces the integrity pragmas the
+  // default path skips above INTEGRITY_PRAGMA_MAX_BYTES, and quick_check reads
+  // every page at ~2.4 ms/MB — a multi-GB index would blow the 5 s budget below
+  // and report a phantom "health-check failed" instead of the integrity answer
+  // it went looking for. Raising the timeout to fit trades that for a doctor run
+  // that appears hung. `--deep` stays a user-invoked escape hatch until this
+  // call can size its own budget from the index.
+  return execFileSync(binary, ['health-check', '--json'], hidden({
+    cwd: process.cwd(),
+    timeout: 5000,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })).trim();
+}
+
+/**
+ * Schema / Index / Embeddings / Integrity rows from the binary's health-check.
+ *
+ * The failure branches are the point of this function existing separately.
+ * `health-check --json` prints the FULL report to stdout and THEN exits 1 when
+ * the index is unhealthy, so `execFileSync` throwing does not mean the probe
+ * failed. The old code read the throw as "the binary is broken" and emitted
+ * `Schema: error … fixId:'binary-broken'` — a fixId `runRepairs` has no case
+ * for. Net effect: the integrity probes added in v0.113.0 never reached the
+ * consumer they were built for, and a genuinely corrupt index was reported as a
+ * binary problem with no repair offered.
+ */
+function healthRows(binary, { runHealthCheck = runHealthCheckCli } = {}) {
+  try {
+    return classifyHealthReport(JSON.parse(runHealthCheck(binary)));
+  } catch (e) {
+    const recovered = parseHealthPayload(e.stdout);
+    if (recovered) return classifyHealthReport(recovered);
+
+    const rawStderr = e.stderr ? e.stderr.toString() : '';
+    const msg = rawStderr ? rawStderr.trim().slice(0, 100) : e.message.slice(0, 100);
+    // "No index found" is a missing-index situation, not a broken binary — the
+    // index-empty fix path knows how to create one. Without this branch the
+    // fixId routes to nothing and the report shows "0/1 addressed".
+    if (rawStderr.includes('No index found')) {
+      return [
+        { name: 'Schema', status: 'ok', detail: 'binary ok (no index yet)' },
+        { name: 'Index', status: 'warn', detail: 'missing — not indexed yet', fixId: 'index-empty' },
+        { name: 'Embeddings', status: 'skip', detail: 'no index' },
+      ];
+    }
+    return [
+      { name: 'Schema', status: 'error', detail: `health-check failed: ${msg}`, fixId: 'binary-broken' },
+      { name: 'Index', status: 'skip', detail: 'health-check failed' },
+      { name: 'Embeddings', status: 'skip', detail: 'health-check failed' },
+    ];
+  }
+}
+
+/**
  * Run all diagnostic checks. Returns an array of:
  *   { name: string, status: 'ok'|'warn'|'error'|'skip', detail: string, fixId?: string }
  */
@@ -134,73 +301,9 @@ function runDiagnostics({ checkOnly = false } = {}) {
       results.push({ name: 'Source fresh', status: 'skip', detail: 'not dev mode' });
     }
 
-    // 4. health-check (schema, index, embeddings) via binary --json
+    // 4. health-check (schema, index, embeddings, integrity) via binary --json
     if (execOk) {
-      try {
-        const cwd = process.cwd();
-        // Deliberately NOT `--deep`. That flag forces the integrity pragmas the
-        // default path skips above INTEGRITY_PRAGMA_MAX_BYTES, and quick_check
-        // reads every page at ~2.4 ms/MB — a multi-GB index would blow the 5 s
-        // budget below and report a phantom "health-check failed" instead of the
-        // integrity answer it went looking for. Raising the timeout to fit trades
-        // that for a doctor run that appears hung. `--deep` stays a user-invoked
-        // escape hatch until this call can size its own budget from the index.
-        const hcOutput = execFileSync(binary, ['health-check', '--json'], hidden({
-          cwd,
-          timeout: 5000,
-          encoding: 'utf8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-        })).trim();
-        const hc = JSON.parse(hcOutput);
-
-        // No-index short-circuit — binary deliberately returns a structured
-        // JSON with reason='no_index' instead of bailing, so we can route to
-        // the index-empty fix without grepping stderr. Falls through to the
-        // rest of runDiagnostics so Auto-update / Hooks still report.
-        if (hc.reason === 'no_index') {
-          results.push({ name: 'Schema', status: 'ok', detail: 'binary ok (no index yet)' });
-          results.push({ name: 'Index', status: 'warn', detail: 'missing — not indexed yet', fixId: 'index-empty' });
-          results.push({ name: 'Embeddings', status: 'skip', detail: 'no index' });
-        } else {
-          // Schema
-          if (hc.issue && hc.issue.includes('schema')) {
-            results.push({ name: 'Schema', status: 'warn', detail: hc.issue, fixId: 'schema-mismatch' });
-          } else {
-            results.push({ name: 'Schema', status: 'ok', detail: `v${hc.schema_version}` });
-          }
-
-          // Index
-          if (hc.nodes === 0) {
-            results.push({ name: 'Index', status: 'warn', detail: 'empty', fixId: 'index-empty' });
-          } else {
-            const age = hc.index_age ? ` (${hc.index_age})` : '';
-            results.push({
-              name: 'Index',
-              status: 'ok',
-              detail: `${hc.nodes} nodes, ${hc.edges} edges, ${hc.files} files${age}`,
-            });
-          }
-
-          // Embeddings / vector availability — pure classifier; warns on FTS5-only
-          // degradation (model missing/not loaded) instead of false-greening it.
-          results.push(classifyEmbeddings(hc));
-        }
-      } catch (e) {
-        const rawStderr = e.stderr ? e.stderr.toString() : '';
-        const msg = rawStderr ? rawStderr.trim().slice(0, 100) : e.message.slice(0, 100);
-        // "No index found" is a missing-index situation, not a broken binary —
-        // the index-empty fix path knows how to create one. Without this branch
-        // the fixId routes to nothing and the report shows "0/1 addressed".
-        if (rawStderr.includes('No index found')) {
-          results.push({ name: 'Schema', status: 'ok', detail: 'binary ok (no index yet)' });
-          results.push({ name: 'Index', status: 'warn', detail: 'missing — not indexed yet', fixId: 'index-empty' });
-          results.push({ name: 'Embeddings', status: 'skip', detail: 'no index' });
-        } else {
-          results.push({ name: 'Schema', status: 'error', detail: `health-check failed: ${msg}`, fixId: 'binary-broken' });
-          results.push({ name: 'Index', status: 'skip', detail: 'health-check failed' });
-          results.push({ name: 'Embeddings', status: 'skip', detail: 'health-check failed' });
-        }
-      }
+      results.push(...healthRows(binary));
     } else {
       results.push({ name: 'Schema', status: 'skip', detail: 'binary not executable' });
       results.push({ name: 'Index', status: 'skip', detail: 'binary not executable' });
@@ -542,6 +645,54 @@ function updateIncompleteResolved({ readStateFile = readUpdateState } = {}) {
   return !(state && state.updateAvailable && state.binaryUpdated === false);
 }
 
+/**
+ * Mirror of the `index-corrupt` diagnosis: re-run the probes against the
+ * database the rebuild just produced and re-classify with the SAME function the
+ * diagnosis used, so "resolved" cannot mean something different from "not
+ * raised". A rebuild that exits 0 over failing hardware still fails this.
+ */
+function integrityResolved({ probe = probeHealth, classify = classifyIntegrity } = {}) {
+  const hc = probe();
+  if (!hc) return false;
+  const row = classify(hc);
+  return row.status !== 'error' && row.status !== 'warn';
+}
+
+/**
+ * Run `rebuild-index --confirm`. Returns false when there is no binary to run
+ * it with; throws whatever the child failed with (including the deliberate bail
+ * when another process holds the index lock, added in v0.113.0).
+ *
+ * Separate + injectable because `execFileSync` is destructured at load here, so
+ * a test that patches `child_process.execFileSync` after the fact stubs nothing
+ * and silently exercises the real spawn.
+ */
+function rebuildIndexInPlace({ find = findBinary } = {}) {
+  const binary = find();
+  if (!binary) return false;
+  execFileSync(binary, ['rebuild-index', '--confirm'], hidden({
+    cwd: process.cwd(),
+    stdio: 'inherit',
+    timeout: 600000,  // full reindex, not a diff — same budget as a build
+  }));
+  return true;
+}
+
+/**
+ * Read a `health-check --json` payload, tolerating the exit-1-on-unhealthy
+ * contract (the report is on stdout either way). null when there is no payload.
+ */
+function probeHealth({ find = findBinary } = {}) {
+  const binary = find();
+  if (!binary) return null;
+  const opts = hidden({ cwd: process.cwd(), timeout: 5000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  try {
+    return parseHealthPayload(execFileSync(binary, ['health-check', '--json'], opts));
+  } catch (e) {
+    return parseHealthPayload(e.stdout);
+  }
+}
+
 function readUpdateState() {
   try { return readJson(path.join(CACHE_DIR, 'update-state.json')); } catch { return null; }
 }
@@ -580,6 +731,8 @@ function runRepairs(results, {
   runAutoUpdate = triggerAutoUpdateCheck,
   binaryResolved = binaryVersionResolved,
   updateResolved = updateIncompleteResolved,
+  integrityOk = integrityResolved,
+  rebuildIndex = rebuildIndexInPlace,
 } = {}) {
   const fixable = results.filter(r => r.fixId);
   if (fixable.length === 0) return 0;
@@ -785,6 +938,32 @@ function runRepairs(results, {
         break;
       }
 
+      case 'index-corrupt': {
+        // `incremental-index` (the index-empty arm) cannot help here: it opens
+        // the same damaged file and diffs against it. The index is a rebuildable
+        // cache, and this is the command health-check itself prints.
+        console.log('\n  Rebuilding corrupt index from scratch...');
+        console.log('    → code-graph-mcp rebuild-index --confirm');
+        try {
+          if (!rebuildIndex()) break;   // no binary to run it with
+        } catch {
+          // Includes the deliberate bail when another process holds the index
+          // lock (v0.113.0), which is a refusal, not a failure to repair.
+          console.log('  ❌ Index rebuild failed — see the error above');
+          break;
+        }
+        // Exit 0 says the command ran, not that the corruption cleared. Ask the
+        // database again, the same way the hooks arm re-scans after install().
+        if (integrityOk()) {
+          console.log('  ✅ Index rebuilt — integrity checks now pass');
+          fixed++;
+        } else {
+          console.log('  ❌ Rebuild completed but the integrity check still fails');
+          console.log('     The problem may be the filesystem or disk, not the index.');
+        }
+        break;
+      }
+
       case 'schema-mismatch': {
         console.log('\n  Schema migration happens automatically when the binary runs.');
         console.log('  If binary is older than DB, update the binary first.');
@@ -832,7 +1011,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length, unresolved };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, autoUpdateNoOpReason };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, classifyIntegrity, classifyHealthReport, parseHealthPayload, integrityResolved, healthRows, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, autoUpdateNoOpReason };
 
 // Shared by BOTH doctor entry points: `node doctor.js …` and `node lifecycle.js
 // doctor …`. It exists as one function because the first version of this guard

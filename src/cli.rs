@@ -1262,9 +1262,11 @@ pub fn recommendation_metric_state(project_root: &Path) -> &'static str {
 /// largest indexes, which is what the gate exists to prevent.
 ///
 /// Above the limit the probe reports `"skipped_large"` — visibly absent, never
-/// silently. Full verification stays reachable and routine: `--deep` ignores the
-/// gate, and `doctor` passes it, so the one-shot diagnosis (where a second of
-/// scanning costs nothing) always does the complete check.
+/// silently, and `doctor` renders that as a skipped row rather than a pass.
+/// Full verification stays reachable via `--deep`, which ignores the gate.
+/// `doctor` deliberately does NOT pass it: doctor's own budget for this call is
+/// 5 s, and a multi-GB index would time out and report a phantom
+/// "health-check failed" instead of the integrity answer it went looking for.
 const INTEGRITY_PRAGMA_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Cheap read-only integrity probes for `health-check` (audit 2026-08-02 DB-1:
