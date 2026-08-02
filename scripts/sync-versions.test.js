@@ -244,6 +244,95 @@ test('--check exits 1, flags the drifted file, and writes nothing', (t) => {
     '--check must leave package.json untouched');
 });
 
+// A site's transform is conditional on the file still matching the shape the
+// rule was written against. When it stops matching, the transform is a no-op and
+// "nothing changed" is byte-identical to "already correct" on BOTH faces. These
+// three tests pin the post-state assertion that tells them apart.
+
+test('the SHIPPED CI template pins the scoped package at the real repo version', () => {
+  // Every other test here runs against a temp fixture, so all of them stayed
+  // green while the real template said whatever it liked. This one reads the
+  // file that actually goes into the npm tarball. The unscoped `code-graph-mcp`
+  // name on npm belongs to an unrelated publisher; a consumer whose release
+  // workflow `npx -y`s it hands a stranger's package a `contents: write` token.
+  const repoRoot = path.resolve(__dirname, '..');
+  const version = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
+  const template = fs.readFileSync(
+    path.join(repoRoot, 'claude-plugin/templates/code-graph-snapshot.yml'), 'utf8');
+
+  assert.match(template, new RegExp(`-p @sdsrs/code-graph@${version.replace(/\./g, '\\.')}(?![\\d.])`),
+    `shipped template must pin @sdsrs/code-graph@${version} (package.json version)`);
+  assert.doesNotMatch(template, /npx[^\n]*(?<!@sdsrs\/)\bcode-graph-mcp@/,
+    'shipped template must never npx the unscoped code-graph-mcp package');
+});
+
+test('--check exits 3 (UNMANAGED) when a site stops matching its own rewrite rule', (t) => {
+  const root = setupFixture(t, '1.2.3');
+  // Revert the template to the pre-fix spelling: the version regex no longer
+  // matches, so the transform is a no-op and the old code printed `OK`.
+  fs.writeFileSync(
+    path.join(root, 'claude-plugin/templates/code-graph-snapshot.yml'),
+    '          npx -y code-graph-mcp@latest snapshot create --out snapshot.db\n',
+  );
+
+  const result = require('child_process').spawnSync(
+    process.execPath,
+    [path.join(root, 'scripts', 'sync-versions.js'), '--check'],
+    { cwd: root, stdio: 'pipe', encoding: 'utf8' },
+  );
+  assert.equal(result.status, 3,
+    'an unwritable site must exit 3, distinct from drift (1) and unreadable (2)');
+  assert.match(result.stdout, /code-graph-snapshot\.yml\s+UNMANAGED/,
+    'the table must not show the rotted site as OK');
+  assert.match(result.stderr, /Re-running this script will NOT fix these/,
+    'stderr must not tell the operator to re-run the script that cannot fix it');
+  assert.match(result.stderr, /no `-p @sdsrs\/code-graph@1\.2\.3` pin/,
+    'stderr must name the specific expectation that failed');
+});
+
+test('write mode exits 3 when a site reports "unchanged" because nothing matched', (t) => {
+  // This is the face release.yml runs. Same rot, opposite command.
+  const root = setupFixture(t, '0.0.1');
+  fs.writeFileSync(
+    path.join(root, 'claude-plugin/templates/code-graph-snapshot.yml'),
+    '          npx -y code-graph-mcp@latest snapshot create --out snapshot.db\n',
+  );
+
+  const result = require('child_process').spawnSync(
+    process.execPath,
+    [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'],
+    { cwd: root, stdio: 'pipe', encoding: 'utf8', env: SKIP_BUILD_ENV },
+  );
+  assert.equal(result.status, 3, 'write mode must fail the release, not shrug');
+  assert.match(result.stdout, /unchanged: claude-plugin\/templates\/code-graph-snapshot\.yml/,
+    'precondition: the rotted site does report "unchanged" — that is the whole trap');
+  assert.match(result.stderr, /UNMANAGED: a version site could not be written by its own rule/);
+  assert.doesNotMatch(result.stdout, /Rebuilding release binary/,
+    'must stop before the rebuild so the diagnostic is the last thing printed');
+});
+
+test('--check exits 3 when a JSON site\'s conditional write silently skips', (t) => {
+  // marketplace.json writes both versions behind `if (obj.metadata)` /
+  // `if (obj.plugins && obj.plugins[0])`. Rename either container and the
+  // transform quietly does nothing — same class as the regex rot above, which
+  // is why the guard is a shared post-state assertion, not a template special.
+  const root = setupFixture(t, '1.2.3');
+  writeJson(path.join(root, '.claude-plugin/marketplace.json'), {
+    metadata: { version: '1.2.3' },
+    plugins: [], // was [{version}] — now nothing to write into
+  });
+
+  const result = require('child_process').spawnSync(
+    process.execPath,
+    [path.join(root, 'scripts', 'sync-versions.js'), '--check'],
+    { cwd: root, stdio: 'pipe', encoding: 'utf8' },
+  );
+  assert.equal(result.status, 3, 'a silently-skipped JSON write must not read as agreement');
+  assert.match(result.stderr, /plugins\.0\.version/,
+    'stderr must name the path that never got written');
+});
+
 test('default (no SKIP env) attempts cargo build — fixture is not a crate so build fails with exit 2', (t) => {
   const root = setupFixture(t);
   // Sanity: this fixture has Cargo.toml [package] but no src/, so a real

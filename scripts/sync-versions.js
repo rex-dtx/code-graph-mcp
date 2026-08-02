@@ -45,10 +45,39 @@ const PLATFORM_PACKAGES = [
   'npm/win32-x64/package.json',
 ];
 
+/**
+ * Every transform here is conditional on the site still LOOKING the way it did
+ * when the rule was written — a regex that must match, an `if (obj.metadata)`
+ * that must hold. When that shape drifts, the transform quietly does nothing,
+ * and "nothing changed" is byte-identical to "already correct": write mode
+ * prints `unchanged:` and --check prints `OK`. The site silently stops being
+ * managed, and the release still ships.
+ *
+ * `verify` closes that hole by asserting the POST-state instead of inferring it
+ * from the absence of a diff. It runs on the exact bytes that would land on
+ * disk, in both --check and write mode, and returns a problem string or null.
+ * A failure is NOT drift (re-running the script cannot fix it), so it gets its
+ * own exit code — see EXIT_UNMANAGED.
+ */
+const EXIT_UNMANAGED = 3;
+
+/** Assert `version` sits at each dotted path (array indices allowed) of a JSON site. */
+const expectJsonVersion = (...paths) => (text) => {
+  const obj = JSON.parse(text);
+  const bad = paths.filter(
+    (p) => p.split('.').reduce((o, k) => (o == null ? o : o[k]), obj) !== version
+  );
+  return bad.length ? `expected "${version}" at ${bad.join(', ')}` : null;
+};
+
 const updates = [
   {
     file: 'Cargo.toml',
     transform: (content) => content.replace(/^version = ".*"/m, `version = "${version}"`),
+    verify: (content) =>
+      new RegExp(`^version = "${version.replace(/\./g, '\\.')}"$`, 'm').test(content)
+        ? null
+        : `no \`version = "${version}"\` line — the [package] version pattern no longer matches`,
   },
   {
     file: 'package.json',
@@ -63,11 +92,22 @@ const updates = [
       }
       return obj;
     },
+    verify: (text) => {
+      const obj = JSON.parse(text);
+      if (obj.version !== version) return `top-level version is ${JSON.stringify(obj.version)}`;
+      // The platform binaries are resolved through optionalDependencies; one
+      // left behind means `npm i` pulls a mismatched binary for that platform.
+      const deps = obj.optionalDependencies || {};
+      const lagging = Object.keys(deps).filter((k) => deps[k] !== version);
+      if (!Object.keys(deps).length) return 'optionalDependencies is empty or absent';
+      return lagging.length ? `optionalDependencies out of sync: ${lagging.join(', ')}` : null;
+    },
   },
   {
     file: 'claude-plugin/.claude-plugin/plugin.json',
     json: true,
     transform: (obj) => { obj.version = version; return obj; },
+    verify: expectJsonVersion('version'),
   },
   {
     file: '.claude-plugin/marketplace.json',
@@ -77,6 +117,9 @@ const updates = [
       if (obj.plugins && obj.plugins[0]) obj.plugins[0].version = version;
       return obj;
     },
+    // Both writes sit behind an `if`. Renaming either key made this file report
+    // "unchanged" forever while shipping a stale version to the marketplace.
+    verify: expectJsonVersion('metadata.version', 'plugins.0.version'),
   },
   {
     // The shipped GitHub Actions template pins the npm package it runs. A pin
@@ -91,14 +134,43 @@ const updates = [
         /-p @sdsrs\/code-graph@\d+\.\d+\.\d+/,
         `-p @sdsrs/code-graph@${version}`
       ),
+    // This is the one site where a silent no-op is a SUPPLY-CHAIN event, not a
+    // cosmetic one: revert the line to `npx -y code-graph-mcp@latest` and the
+    // regex stops matching, so the template sails through both faces unchanged
+    // and every consumer's release workflow executes a stranger's package with
+    // `contents: write` in hand. Assert the pin positively AND assert the
+    // unscoped spelling is absent — a rewrite is not the only way it can appear.
+    verify: (content) => {
+      // Trailing (?![\d.]) so `@1.2.3` does not satisfy a check for `@1.2` —
+      // matching on a prefix would greenlight a half-rewritten pin.
+      const pinned = new RegExp(`-p @sdsrs/code-graph@${version.replace(/\./g, '\\.')}(?![\\d.])`);
+      if (!pinned.test(content)) {
+        return `no \`-p @sdsrs/code-graph@${version}\` pin — the npx invocation no longer matches the rewrite pattern`;
+      }
+      if (/npx[^\n]*(?<!@sdsrs\/)\bcode-graph-mcp@/.test(content)) {
+        return 'template invokes the UNSCOPED `code-graph-mcp` npm package (belongs to an unrelated publisher)';
+      }
+      return null;
+    },
   },
   // Platform npm packages
   ...PLATFORM_PACKAGES.map(file => ({
     file,
     json: true,
     transform: (obj) => { obj.version = version; return obj; },
+    verify: expectJsonVersion('version'),
   })),
 ];
+
+/** Run a site's `verify` against its post-transform bytes. Returns null or a reason. */
+function verifySite(site, text) {
+  if (!site.verify) return null;
+  try {
+    return site.verify(text);
+  } catch (err) {
+    return `verify threw (${err.code || err.name}: ${err.message.split('\n')[0]})`;
+  }
+}
 
 // --check: read-only drift report. A site is DRIFT exactly when a write would
 // change it (same transform, compared against the current bytes), so --check and
@@ -107,7 +179,9 @@ if (CHECK_MODE) {
   const rows = [];
   let drift = false;
   let unreadable = false;
-  for (const { file, json, transform } of updates) {
+  const unmanaged = [];
+  for (const site of updates) {
+    const { file, json, transform } = site;
     const filePath = path.join(root, file);
     // A site that is expected but absent is NOT agreement. This used to
     // `continue` without setting drift, so deleting a platform package.json made
@@ -132,7 +206,15 @@ if (CHECK_MODE) {
         : transform(original);
       const ok = result === original;
       if (!ok) drift = true;
-      status = ok ? 'OK' : 'DRIFT';
+      // Verify BEFORE deciding the row is clean: a site whose pattern stopped
+      // matching produces result === original, i.e. the exact shape of "OK".
+      const problem = verifySite(site, result);
+      if (problem) {
+        unmanaged.push({ file, problem });
+        status = 'UNMANAGED';
+      } else {
+        status = ok ? 'OK' : 'DRIFT';
+      }
     } catch (err) {
       unreadable = true;
       status = `UNREADABLE (${err.code || err.name}: ${err.message.split('\n')[0]})`;
@@ -150,6 +232,15 @@ if (CHECK_MODE) {
     console.error(`\nUNREADABLE: one or more version sites could not be parsed. Drift status for them is UNKNOWN${drift ? ' (and at least one readable site is out of sync)' : ''}.`);
     process.exit(2);
   }
+  // Reported before DRIFT because the remediation is different in kind: an
+  // UNMANAGED site is one this script can no longer write, so telling the
+  // operator to re-run it would be a lie.
+  if (unmanaged.length) {
+    console.error('\nUNMANAGED: a version site no longer matches the rule that maintains it.');
+    console.error('Re-running this script will NOT fix these — the transform is a silent no-op:');
+    for (const { file, problem } of unmanaged) console.error(`  ${file}: ${problem}`);
+    process.exit(EXIT_UNMANAGED);
+  }
   if (drift) {
     console.error(`\nDRIFT: one or more files disagree with package.json (${version}). Fix with: node scripts/sync-versions.js ${version}`);
     process.exit(1);
@@ -162,7 +253,9 @@ if (CHECK_MODE) {
 }
 
 let changed = 0;
-for (const { file, json, transform } of updates) {
+const unmanaged = [];
+for (const site of updates) {
+  const { file, json, transform } = site;
   const filePath = path.join(root, file);
   if (!fs.existsSync(filePath)) {
     console.warn(`  skip: ${file} (not found)`);
@@ -183,9 +276,23 @@ for (const { file, json, transform } of updates) {
   } else {
     console.log(`  unchanged: ${file}`);
   }
+  // release.yml runs THIS face, not --check. Without the post-state assertion a
+  // site whose pattern rotted reports `unchanged:` and the release ships it.
+  const problem = verifySite(site, result);
+  if (problem) unmanaged.push({ file, problem });
 }
 
 console.log(`\nVersion synced to ${version} (${changed} file${changed !== 1 ? 's' : ''} updated)`);
+
+// Fail before the rebuild so the diagnostic is the last thing on screen and the
+// release job stops here. Files already written stay written — same partial-
+// failure contract the cargo-build branch below has always had.
+if (unmanaged.length) {
+  console.error('\nUNMANAGED: a version site could not be written by its own rule.');
+  console.error('It reported "unchanged" because the transform matched nothing, not because it was correct:');
+  for (const { file, problem } of unmanaged) console.error(`  ${file}: ${problem}`);
+  process.exit(EXIT_UNMANAGED);
+}
 
 // Keep the dev MCP binary (.mcp.json → ./target/release/code-graph-mcp) aligned
 // with the version we just wrote into Cargo.toml. Without this, every release
