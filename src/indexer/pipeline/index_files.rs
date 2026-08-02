@@ -76,7 +76,7 @@ fn looks_like_cpp_header(source: &str) -> bool {
 
 /// Batch size for streaming indexing. Each batch processes Phase 1+2
 /// then drops heavyweight data (ASTs, source strings) before the next batch.
-const BATCH_SIZE: usize = 500;
+pub(super) const BATCH_SIZE: usize = 500;
 
 // CPU-bound parse result — produced in parallel, consumed sequentially for DB insert
 struct FilePreParsed {
@@ -489,6 +489,56 @@ pub(super) struct FileIndexed {
     pub node_names: Vec<String>,
 }
 
+/// A relation whose target (or, for `routes_to`, whose handler source) failed
+/// batch-time resolution.
+///
+/// On a fresh multi-batch index the per-batch pool cannot contain any LATER
+/// batch's nodes, so batch-time "unresolved" proves nothing (audit 2026-08-02
+/// P0-1: implements/imports minted `<external>` phantoms and inherits/exports/
+/// routes_to/references dropped outright whenever source and target landed in
+/// different batches — deterministically, and rebuild never healed it). Only
+/// REL_CALLS had a recovery channel (`pending_unresolved_calls`). Everything
+/// else is buffered here and re-run once after the batch loop, when
+/// `global_name_map` finally holds the whole tree
+/// (`resolve_deferred_relations`).
+struct DeferredRelation {
+    /// Source node ids resolved at batch time (the source side is same-file,
+    /// so it is complete then). Empty only for the `routes_to` imported-handler
+    /// case, whose source recovery itself needs the full pool.
+    source_ids: Vec<i64>,
+    source_name: String,
+    target_name: String,
+    relation: String,
+    metadata: Option<String>,
+    rel_path: String,
+    language: String,
+    /// For a JS `m.foo()` whose receiver `m` is a require/import-namespace
+    /// binding: the RESOLVED module file the call must bind into. The per-file
+    /// `ns_module_map` is gone by the time the deferred pass runs, so the
+    /// resolved constraint is captured here instead.
+    ns_file: Option<String>,
+}
+
+impl DeferredRelation {
+    fn of(
+        source_ids: &[i64],
+        rel: &crate::parser::relations::ParsedRelation,
+        rel_path: &str,
+        language: &str,
+    ) -> Self {
+        DeferredRelation {
+            source_ids: source_ids.to_vec(),
+            source_name: rel.source_name.clone(),
+            target_name: rel.target_name.clone(),
+            relation: rel.relation.clone(),
+            metadata: rel.metadata.clone(),
+            rel_path: rel_path.to_string(),
+            language: language.to_string(),
+            ns_file: None,
+        }
+    }
+}
+
 pub(super) fn index_files(
     db: &Database,
     root: &Path,
@@ -535,6 +585,22 @@ pub(super) fn index_files(
     let mut total_nodes_created = 0usize;
     let mut total_edges_created = 0usize;
     let mut all_indexed: Vec<FileIndexed> = Vec::new();
+
+    // Relations that failed batch-time resolution; re-run after the batch loop
+    // against the complete pool (see `DeferredRelation`).
+    let mut deferred: Vec<DeferredRelation> = Vec::new();
+
+    // Same sort+dedup rationale as `files` above: `delete_paths` arrives from
+    // `compute_diff`'s HashMap walk, and the pending-buffer rows Phase 0 writes
+    // reach a first-wins unique index — unsorted input made their insertion
+    // order (and thus which duplicate wins) vary run to run.
+    let delete_paths: Vec<String> = {
+        let mut v = delete_paths.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let delete_paths = delete_paths.as_slice();
 
     // Phase 0: Delete removed files in own transaction.
     if !delete_paths.is_empty() {
@@ -741,6 +807,14 @@ pub(super) fn index_files(
                         .unwrap_or_default();
                     source_ids =
                         refine_ambiguous_targets(&same_lang, &pf.rel_path, &node_id_to_path);
+                    if source_ids.is_empty() {
+                        // Imported handler may sit in a later batch — the recovery
+                        // above can only see the pool visible NOW. Defer with empty
+                        // source_ids; the post-loop pass re-runs this recovery
+                        // against the whole tree.
+                        deferred.push(DeferredRelation::of(&[], rel, &pf.rel_path, &pf.language));
+                        continue;
+                    }
                 }
 
                 // The five metadata-driven import forms below all key off the same
@@ -776,21 +850,37 @@ pub(super) fn index_files(
                             | Some(crate::domain::IMPORT_Q_STAR_REEXPORT)
                             | Some(crate::domain::IMPORT_Q_DEFAULT)
                     ) {
+                        let mut resolved = false;
                         if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
                             if let Some(file) =
                                 resolve_js_specifier_path(spec, &pf.rel_path, &all_file_paths)
                             {
                                 let module_targets =
                                     module_node_of(&name_to_ids, &node_id_to_path, &file);
-                                total_edges_created += insert_relation_edges(
-                                    db,
-                                    &source_ids,
-                                    &module_targets,
-                                    &rel.relation,
-                                    rel.metadata.as_deref(),
-                                    false,
-                                )?;
+                                if !module_targets.is_empty() {
+                                    resolved = true;
+                                    total_edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &module_targets,
+                                        &rel.relation,
+                                        rel.metadata.as_deref(),
+                                        false,
+                                    )?;
+                                }
                             }
+                        }
+                        if !resolved {
+                            // The specifier's file (or its <module> node) may sit
+                            // in a later batch — retry after the loop. A genuinely
+                            // external specifier fails there too and drops, same
+                            // as before.
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
                         }
                         continue;
                     }
@@ -824,7 +914,17 @@ pub(super) fn index_files(
                                 )?;
                                 continue;
                             }
-                            // Module found but symbol not found — fall through to default
+                            // Module found but symbol not visible IN THIS BATCH —
+                            // the module file may sit batches ahead. Defer; the
+                            // post-loop pass retries constrained resolution and
+                            // only then falls back exactly as this chain would.
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                            continue;
                         } else {
                             // External module — track for virtual node creation.
                             // For `from X import Y`, we track the module-level dependency (X),
@@ -865,7 +965,24 @@ pub(super) fn index_files(
                             )?;
                             continue;
                         }
-                        // Unresolved (bare pkg / re-export / unindexed) —
+                        // The specifier resolves to an INDEXED file whose nodes
+                        // are just not visible to this batch — falling through
+                        // to bare-name resolution here bound the WRONG same-name
+                        // symbol from another file cross-batch. Defer; the
+                        // post-loop pass retries the constrained resolution and
+                        // only then falls back exactly as this chain would.
+                        if resolve_js_specifier_path(js_module, &pf.rel_path, &all_file_paths)
+                            .is_some()
+                        {
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                            continue;
+                        }
+                        // Genuinely unresolved (bare pkg / unindexed) —
                         // fall through to default resolution below.
                     }
                 }
@@ -896,6 +1013,15 @@ pub(super) fn index_files(
                                 )?;
                                 continue;
                             }
+                            // File resolved but its <module> node sits in a later
+                            // batch — defer rather than fall to bare-name guessing.
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                            continue;
                         }
                         // Unindexed include → fall through to default.
                     }
@@ -926,6 +1052,15 @@ pub(super) fn index_files(
                                 )?;
                                 continue;
                             }
+                            // Header resolved but its <module> node sits in a later
+                            // batch — defer rather than fall to bare-name guessing.
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                            continue;
                         }
                         // Unindexed include → fall through to default.
                     }
@@ -940,29 +1075,22 @@ pub(super) fn index_files(
                 if rel.relation == REL_IMPLEMENTS {
                     if let Some(ref meta_str) = rel.metadata {
                         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                            if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method") {
-                                if let Some(impl_type) = meta.get("v").and_then(|v| v.as_str()) {
-                                    use super::resolve::self_filter_candidates;
-                                    let all = name_to_ids
-                                        .get(&rel.target_name)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    let filtered = self_filter_candidates(impl_type, &all, db)?;
-                                    if filtered.is_empty() {
-                                        // No project method belongs to this type — drop
-                                        // (would be an external trait method anyway).
-                                        continue;
-                                    }
-                                    total_edges_created += insert_relation_edges(
-                                        db,
-                                        &source_ids,
-                                        &filtered,
-                                        &rel.relation,
-                                        rel.metadata.as_deref(),
-                                        false,
-                                    )?;
-                                    continue;
-                                }
+                            if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method")
+                                && meta.get("v").and_then(|v| v.as_str()).is_some()
+                            {
+                                // The impl type's methods can span batches, so
+                                // both a non-empty filtered set and an empty one
+                                // are partial views here. Defer unconditionally;
+                                // the post-loop pass runs the identical
+                                // self_filter against the complete pool (a
+                                // genuinely external trait method still drops).
+                                deferred.push(DeferredRelation::of(
+                                    &source_ids,
+                                    rel,
+                                    &pf.rel_path,
+                                    &pf.language,
+                                ));
+                                continue;
                             }
                         }
                     }
@@ -973,10 +1101,7 @@ pub(super) fn index_files(
                 // chain. See spec
                 // docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md.
                 if rel.relation == REL_CALLS {
-                    use super::resolve::{
-                        method_candidates, parse_callee_metadata, path_filter_candidates,
-                        self_filter_candidates, CalleeMeta,
-                    };
+                    use super::resolve::{method_candidates, parse_callee_metadata, CalleeMeta};
                     match parse_callee_metadata(rel.metadata.as_deref()) {
                         Some(CalleeMeta::Receiver(recv))
                             if matches!(
@@ -1018,6 +1143,20 @@ pub(super) fn index_files(
                                     )?;
                                     continue;
                                 }
+                                // The namespace binding names a concrete file, but
+                                // that file's nodes may sit in a later batch —
+                                // falling through to bare-name resolution here
+                                // bound the WRONG same-name symbol cross-batch.
+                                // Defer with the resolved file as a constraint.
+                                let mut d = DeferredRelation::of(
+                                    &source_ids,
+                                    rel,
+                                    &pf.rel_path,
+                                    &pf.language,
+                                );
+                                d.ns_file = Some(module_file.clone());
+                                deferred.push(d);
+                                continue;
                             }
                             // Not a namespace binding → fall through to default.
                         }
@@ -1061,166 +1200,84 @@ pub(super) fn index_files(
                                 .copied()
                                 .filter(|id| local_ids.contains(id))
                                 .collect();
-                            let target = if same_file_methods.len() == 1 {
-                                Some(same_file_methods[0])
-                            } else if same_file_methods.is_empty() && methods.len() == 1 {
-                                Some(methods[0])
-                            } else {
-                                None
-                            };
-                            match target {
-                                Some(tgt_id) => {
-                                    total_edges_created += insert_relation_edges(
-                                        db,
-                                        &source_ids,
-                                        &[tgt_id],
-                                        &rel.relation,
-                                        rel.metadata.as_deref(),
-                                        false,
-                                    )?;
-                                }
-                                None => {
-                                    // Ambiguous → drop without buffering (re-scan
-                                    // won't change it). "Multiple" here covers BOTH
-                                    // shapes: (a) >1 cross-file methods with no
-                                    // same-file candidate, and (b) >1 same-file
-                                    // methods (two structs in one file each defining
-                                    // a method of this name) — the same-file>1 case
-                                    // is intentionally ambiguous, not resolved, since
-                                    // the receiver's type still can't pick between them.
-                                    // (a) is also reached for zero method candidates.
-                                }
-                            }
-                            continue;
-                        }
-                        Some(CalleeMeta::SelfRecv(impl_type))
-                        | Some(CalleeMeta::SelfType(impl_type)) => {
-                            let all = name_to_ids
-                                .get(&rel.target_name)
-                                .cloned()
-                                .unwrap_or_default();
-                            let same_lang: Vec<i64> = all
-                                .iter()
-                                .filter(|id| {
-                                    matches!(
-                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                        Some(l) if l == pf.language.as_str()
-                                    )
-                                })
-                                .copied()
-                                .collect();
-                            let filtered = self_filter_candidates(&impl_type, &same_lang, db)?;
-                            if filtered.is_empty() {
-                                // No method on this impl type found in the project.
-                                // Drop without buffering — qualifier is fixed and a
-                                // re-scan will yield the same answer.
-                                continue;
-                            }
-                            total_edges_created += insert_relation_edges(
-                                db,
-                                &source_ids,
-                                &filtered,
-                                &rel.relation,
-                                rel.metadata.as_deref(),
-                                false,
-                            )?;
-                            continue;
-                        }
-                        Some(CalleeMeta::RecvType(recv_type)) => {
-                            // Python receiver with a locally-inferred constructor
-                            // type (issue #32 cause 2). Restrict same-language
-                            // candidates to that type's OWN methods
-                            // (self_filter_candidates → qualified_name LIKE
-                            // 'Type.%'). When the type declares the method
-                            // directly → bind precisely, disambiguating same-named
-                            // methods on sibling classes (the whole point: pick
-                            // DataWriter.write out of {DataWriter,Profile,Scenario}
-                            // .write). When it does NOT — an INHERITED method
-                            // (`Base.method` reached via a `Derived()` receiver) or
-                            // a mis-inferred type — the filter is empty and we DO
-                            // NOT continue: control falls through to the default
-                            // bare resolution below. That keeps rtype strictly
-                            // ADDITIVE precision — it can pick the right target
-                            // among duplicates but can never DROP an edge the bare
-                            // path would have resolved. (Contrast SelfRecv/SelfType,
-                            // which drop on empty: a Rust `self.m()` whose `m` isn't
-                            // on the impl type is a compile error, not an inherited
-                            // hit, so there is nothing to fall back to.)
-                            let all = name_to_ids
-                                .get(&rel.target_name)
-                                .cloned()
-                                .unwrap_or_default();
-                            let same_lang: Vec<i64> = all
-                                .iter()
-                                .filter(|id| {
-                                    matches!(
-                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                        Some(l) if l == pf.language.as_str()
-                                    )
-                                })
-                                .copied()
-                                .collect();
-                            let filtered = self_filter_candidates(&recv_type, &same_lang, db)?;
-                            if !filtered.is_empty() {
+                            if same_file_methods.len() == 1 {
+                                // Strongest locality signal, and the same-file pool
+                                // is COMPLETE at batch time — safe to decide here.
                                 total_edges_created += insert_relation_edges(
                                     db,
                                     &source_ids,
-                                    &filtered,
+                                    &[same_file_methods[0]],
                                     &rel.relation,
                                     rel.metadata.as_deref(),
                                     false,
                                 )?;
-                                continue;
-                            }
-                            // filtered empty → fall through to default resolution
-                            // (inherited method / unique bare match / pending buffer).
-                        }
-                        Some(CalleeMeta::Path(segments)) => {
-                            let all = name_to_ids
-                                .get(&rel.target_name)
-                                .cloned()
-                                .unwrap_or_default();
-                            // Same-file candidates take precedence per the bare-name
-                            // qualifier design ("same-file matches still take precedence").
-                            // Previously this filtered them out, so `Foo::helper()` in the
-                            // same file as `impl Foo { fn helper }` produced no edge —
-                            // the same-file pool was excluded before the Path filter,
-                            // and the cross-file Path filter (which scans /Foo/ in the
-                            // path) couldn't match a single-file project either.
-                            let same_lang: Vec<i64> = all
-                                .iter()
-                                .filter(|id| {
-                                    matches!(
-                                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                                        Some(l) if l == pf.language.as_str()
-                                    )
-                                })
-                                .copied()
-                                .collect();
-                            let filtered = path_filter_candidates(
-                                &segments,
-                                &same_lang,
-                                &node_id_to_path,
-                                db,
-                            )?;
-                            if filtered.is_empty() {
-                                // No project candidate matches the Path qualifier.
-                                // External crate (or unmatched module) — drop without buffering.
-                                continue;
-                            }
-                            let final_targets = if filtered.len() > 1 {
-                                refine_ambiguous_targets(&filtered, &pf.rel_path, &node_id_to_path)
+                            } else if same_file_methods.len() > 1 {
+                                // >1 same-file methods (two structs in one file each
+                                // defining this name) — intentionally ambiguous, the
+                                // receiver's type still can't pick between them.
+                                // Same-file pool is complete, so drop is final.
                             } else {
-                                filtered
-                            };
-                            total_edges_created += insert_relation_edges(
-                                db,
+                                // No same-file method. The "globally unique method"
+                                // decision depends on the WHOLE pool, and this batch
+                                // cannot see later batches (a unique-in-view method
+                                // may have cross-batch twins, and a zero-in-view
+                                // name may exist one batch ahead — the old comment
+                                // "re-scan won't change it" was false there). Defer;
+                                // the post-loop pass applies the identical rule
+                                // against the complete pool.
+                                deferred.push(DeferredRelation::of(
+                                    &source_ids,
+                                    rel,
+                                    &pf.rel_path,
+                                    &pf.language,
+                                ));
+                            }
+                            continue;
+                        }
+                        Some(CalleeMeta::SelfRecv(_)) | Some(CalleeMeta::SelfType(_)) => {
+                            // The impl type's methods can span batches, so even a
+                            // non-empty filtered set here is a PARTIAL view (and an
+                            // empty one proves nothing — the old "a re-scan will
+                            // yield the same answer" held only within one batch).
+                            // Defer unconditionally; the post-loop pass applies the
+                            // identical self_filter against the complete pool.
+                            deferred.push(DeferredRelation::of(
                                 &source_ids,
-                                &final_targets,
-                                &rel.relation,
-                                rel.metadata.as_deref(),
-                                false,
-                            )?;
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                            continue;
+                        }
+                        Some(CalleeMeta::RecvType(_)) => {
+                            // Same partial-view argument as SelfRecv/SelfType
+                            // above; additionally this arm's EMPTY case falls
+                            // through to bare default resolution rather than
+                            // dropping, and that decision too needs the whole
+                            // pool. Defer unconditionally; the post-loop pass
+                            // replicates bind-precisely-or-fall-through.
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                            continue;
+                        }
+                        Some(CalleeMeta::Path(_)) => {
+                            // Path-qualified call (`Alpha::foo()`). The path filter
+                            // scans candidate FILE PATHS, which span batches, so
+                            // both its match set and its empty verdict are partial
+                            // views. Defer unconditionally; the post-loop pass
+                            // runs the identical filter + refine on the whole pool
+                            // (an external crate path still resolves to nothing
+                            // there and drops, as before).
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
                             continue;
                         }
                         _ => {} // None (Bare) or unrecognized q → falls through to default chain below.
@@ -1262,18 +1319,17 @@ pub(super) fn index_files(
                     .collect();
 
                 let source_lang = pf.language.as_str();
-                let same_language_targets: Vec<i64> = all_target_ids
-                    .iter()
-                    .filter(|id| !local_ids.contains(id))
-                    .filter(|id| {
-                        matches!(
-                            node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                            Some(l) if l == source_lang
-                        )
-                    })
-                    .copied()
-                    .collect();
 
+                // Same-file binds are decided HERE (a file's nodes are atomic
+                // within its batch, so that pool is complete); the cross-file
+                // noise drop is pool-independent. EVERY other cross-file
+                // name-based decision is deferred to the post-loop pass: a
+                // batch's view of same-language candidates is a PREFIX of the
+                // tree, and refining/uniqueness/fan-out decisions on a partial
+                // pool bound the wrong same-name symbol whenever the right one
+                // sat batches ahead (audit 2026-08-02 P0-1; measured on this
+                // repo at BATCH_SIZE 25: `test_db` bound three src/graph/*
+                // twins instead of the path-closest helpers.rs one).
                 let target_ids = if !same_file_targets.is_empty() {
                     same_file_targets
                 } else if rel.relation == REL_CALLS
@@ -1284,89 +1340,64 @@ pub(super) fn index_files(
                     // contains) so user methods resolve; all else drops regardless
                     // of language (a Rust `hasher.update()` must not bind a JS fn).
                     continue;
-                } else if !same_language_targets.is_empty() {
-                    // Ambiguous cross-file same-language candidates (e.g. a helper
-                    // name like `readJson` defined in multiple JS files) used to
-                    // fan out — every same-name target got an edge, producing
-                    // phantom callers across unrelated modules. Refine by
-                    // non-test preference + longest common path prefix with the
-                    // caller file. See `refine_ambiguous_targets` for fallback
-                    // policy (keeps remaining pool on ambiguity to avoid
-                    // regressing dead-code on bare-name Rust scoped calls).
-                    refine_ambiguous_targets(&same_language_targets, &pf.rel_path, &node_id_to_path)
                 } else if rel.relation == REL_CALLS {
-                    // No same-file, no same-language candidate → buffer in
-                    // pending_unresolved_calls instead of silently dropping.
-                    // The post-Phase-2 sweep below promotes the row to a real
-                    // edge as soon as a same-language target appears (e.g.
-                    // sibling file added in a later incremental pass). Memory
-                    // `feedback_incremental_edge_timing.md` documented the bug
-                    // this closes: B's bare-name call to `foo()` got dropped
-                    // when foo didn't exist yet, and never re-resolved when A
-                    // later added `foo`. Schema cascade on source_id self-cleans
-                    // when callers are removed/reindexed.
-                    for &src_id in &source_ids {
-                        crate::storage::queries::insert_pending_unresolved_call(
-                            db.conn(),
-                            src_id,
-                            &rel.target_name,
-                            &pf.language,
-                            rel.metadata.as_deref(),
-                        )?;
-                    }
+                    // No same-file, no same-language candidate VISIBLE TO THIS
+                    // BATCH. Defer — the target may sit in a later batch, and
+                    // resolving it there uses the same rules as here (the
+                    // pending sweep's binding rules are deliberately narrower,
+                    // so buffering directly at this point made a multi-batch
+                    // tree resolve differently from a single-batch one). The
+                    // deferred pass buffers into pending_unresolved_calls only
+                    // what is STILL unresolved after seeing the whole tree —
+                    // preserving the cross-invocation channel that memory
+                    // `feedback_incremental_edge_timing.md` documents (B's call
+                    // to a `foo` that A only adds in a later indexing run).
+                    deferred.push(DeferredRelation::of(
+                        &source_ids,
+                        rel,
+                        &pf.rel_path,
+                        &pf.language,
+                    ));
                     continue;
                 } else if rel.relation == REL_REFERENCES {
                     // Bare-name value references (callbacks / fn pointers) share the
                     // cross-language collision risk of bare-name calls: short common
                     // names like `process` / `handler` / `run` exist in many
-                    // languages. Without a same-file or same-language target, DROP
-                    // rather than fall through to the global pool — a Rust
-                    // `references → process` must never bind a JS `function
-                    // process()` (feedback_edge_resolution_same_language). Precision
-                    // over recall; no pending buffer in Phase 1 (full rebuild
-                    // resolves; incremental-timing gap is the documented calls limit).
+                    // languages. Without a same-file or same-language target, do NOT
+                    // fall through to the global pool — a Rust `references → process`
+                    // must never bind a JS `function process()`
+                    // (feedback_edge_resolution_same_language). Precision over
+                    // recall. Defer rather than drop: the same-language target may
+                    // sit in a later batch (the old "full rebuild resolves" comment
+                    // here was false above one batch — audit 2026-08-02 P0-1).
+                    deferred.push(DeferredRelation::of(
+                        &source_ids,
+                        rel,
+                        &pf.rel_path,
+                        &pf.language,
+                    ));
                     continue;
                 } else {
                     // Structural relations (imports / inherits / implements /
-                    // exports / routes_to) with no same-file and no same-EXACT-
-                    // language target. Previously this fell through to the GLOBAL
-                    // all-language pool, binding cross-LANGUAGE phantoms (Rust
-                    // `use anyhow::Result` → a markdown "Result" heading; JS
-                    // `require('fs')` → a Rust `fs` symbol) stamped `extracted`
-                    // (unfilterable), polluting deps / project_map / cycles /
-                    // find_references. Bind to same-language-FAMILY targets only:
-                    // `detect_language` gives DIFFERENT strings within one family
-                    // (`.ts`→typescript, `.tsx`→tsx, `.js`→javascript), so exact
-                    // equality would wrongly DROP a real `.tsx` class extending a
-                    // `.ts` base. Family filtering keeps those cross-family edges
-                    // while still dropping genuinely cross-language phantoms
-                    // (different families). Empty → IMPORTS/IMPLEMENTS reach the
-                    // `<external>` sentinel below; the rest drop.
-                    all_target_ids.iter()
-                        .filter(|id| !local_ids.contains(id))
-                        .filter(|id| matches!(
-                            node_id_to_language.get(id).and_then(|l| l.as_deref()),
-                            Some(l) if crate::utils::config::languages_compatible(l, source_lang)
-                        ))
-                        .copied()
-                        .collect()
+                    // exports / routes_to) with no same-file target: the
+                    // same-language / language-FAMILY pool this arm used to
+                    // bind against is a PARTIAL view (this batch + earlier
+                    // ones), so decide in the deferred pass instead, where the
+                    // identical family rules (see `resolve_deferred_relations`
+                    // branch 7 — cross-LANGUAGE phantom protection unchanged)
+                    // run against the complete pool. Still-unresolved
+                    // implements/imports mint their `<external>` sentinel
+                    // there; the rest drop.
+                    deferred.push(DeferredRelation::of(
+                        &source_ids,
+                        rel,
+                        &pf.rel_path,
+                        &pf.language,
+                    ));
+                    continue;
                 };
 
-                if target_ids.is_empty()
-                    && (rel.relation == REL_IMPLEMENTS || rel.relation == REL_IMPORTS)
                 {
-                    // Unresolved implements target (external trait like Write, Default)
-                    // OR unresolved import target (JS `require('fs')`, unresolved JS
-                    // ES-import binding). Phase 2b-ext creates `<external>/<name>`
-                    // sentinel nodes so the dependency graph shows the link.
-                    for &src_id in &source_ids {
-                        unresolved_externals.push((
-                            src_id,
-                            rel.target_name.clone(),
-                            rel.relation.clone(),
-                        ));
-                    }
-                } else {
                     total_edges_created += insert_relation_edges(
                         db,
                         &source_ids,
@@ -1387,8 +1418,13 @@ pub(super) fn index_files(
         total_edges_created += ext_edges;
 
         // Phase 2c: restore cross-file inbound edges that cascade-delete stripped.
-        total_edges_created +=
-            restore_inbound_edges(db, &batch_parsed, &batch_file_ids, &saved_inbound_edges)?;
+        total_edges_created += restore_inbound_edges(
+            db,
+            &batch_parsed,
+            &batch_file_ids,
+            &saved_inbound_edges,
+            &mut deferred,
+        )?;
 
         tx.commit()?;
 
@@ -1434,6 +1470,30 @@ pub(super) fn index_files(
                 total_edges_created
             );
         }
+    }
+
+    // Phase 2b-final: re-run resolution for relations deferred at batch time
+    // (cross-batch targets — audit 2026-08-02 P0-1). Must run BEFORE Phase 3 so
+    // context strings see the recovered edges.
+    if !deferred.is_empty() {
+        let deferred_count = deferred.len();
+        let tx = db.savepoint("idx_deferred")?;
+        let (d_edges, d_nodes) = resolve_deferred_relations(
+            db,
+            &deferred,
+            &global_name_map,
+            &all_file_paths,
+            &python_module_map,
+        )?;
+        tx.commit()?;
+        total_edges_created += d_edges;
+        total_nodes_created += d_nodes;
+        tracing::debug!(
+            "[index] Phase 2b-final: {} deferred relation(s) → {} edge(s), {} sentinel node(s)",
+            deferred_count,
+            d_edges,
+            d_nodes
+        );
     }
 
     // Finalizing heartbeat: every phase below is a full-graph pass with no
@@ -1514,6 +1574,22 @@ pub(super) fn index_files(
         let post = run_global_edge_post_passes(db)?;
         total_edges_created += post.bound;
         total_edges_created = total_edges_created.saturating_sub(post.pruned);
+    }
+
+    // Reap `<external>` sentinel nodes that no edge points at any more. Pruning
+    // and deferred re-resolution can orphan them, and nothing else ever deleted
+    // them — a lingering orphan stays in the name-resolution pool and makes an
+    // incrementally-grown node set diverge from a fresh rebuild forever (audit
+    // 2026-08-02 P1-9).
+    if !all_indexed.is_empty() || !delete_paths.is_empty() {
+        finalize_tick();
+        let reaped = crate::storage::queries::reap_orphan_external_nodes(db.conn())?;
+        if reaped > 0 {
+            tracing::debug!(
+                "[index] reaped {} orphan <external> sentinel node(s)",
+                reaped
+            );
+        }
     }
 
     // Optimize query planner statistics after bulk writes
@@ -1641,13 +1717,14 @@ fn mint_external_sentinels(
             },
         )?;
 
-        let existing_ext_nodes: HashMap<String, i64> =
-            get_nodes_by_file_path(db.conn(), "<external>")?
-                .into_iter()
-                .map(|n| (n.name.clone(), n.id))
-                .collect();
-
-        let mut ext_node_ids: HashMap<String, i64> = existing_ext_nodes;
+        let existing_ext: Vec<crate::storage::queries::NodeResult> =
+            get_nodes_by_file_path(db.conn(), "<external>")?;
+        let existing_types: HashMap<String, String> = existing_ext
+            .iter()
+            .map(|n| (n.name.clone(), n.node_type.clone()))
+            .collect();
+        let mut ext_node_ids: HashMap<String, i64> =
+            existing_ext.into_iter().map(|n| (n.name, n.id)).collect();
 
         // Collect unique targets with inferred type.
         //
@@ -1678,7 +1755,26 @@ fn mint_external_sentinels(
         };
 
         for &(name, node_type) in &unique_targets {
-            if !ext_node_ids.contains_key(name) {
+            if let Some(&existing_id) = ext_node_ids.get(name) {
+                // The precedence above only decided ties WITHIN this call. The
+                // node may pre-exist from an earlier mint (another batch, the
+                // deferred pass, or a previous incremental run) that only had
+                // the weaker import claim — apply the same precedence across
+                // calls: an implements claim upgrades `module` → `trait`.
+                // Never the reverse (audit 2026-08-02, claims P2-8: a node
+                // first minted `module` was never upgraded, so full and
+                // incremental indexes disagreed on its type).
+                if node_type == "trait"
+                    && existing_types.get(name).map(String::as_str) == Some("module")
+                {
+                    db.conn().execute(
+                        "UPDATE nodes SET type = 'trait' WHERE id = ?1 AND type = 'module'",
+                        [existing_id],
+                    )?;
+                }
+                continue;
+            }
+            {
                 let node_id = insert_node_cached(
                     db.conn(),
                     &NodeRecord {
@@ -1729,6 +1825,7 @@ fn restore_inbound_edges(
     batch_parsed: &[FileParsed],
     batch_file_ids: &HashSet<i64>,
     saved_inbound_edges: &[(i64, i64, i64, String, String, Option<String>)],
+    deferred: &mut Vec<DeferredRelation>,
 ) -> Result<usize> {
     let mut edges_created = 0usize;
     // Phase 2c: Restore cross-file inbound edges lost to cascade delete.
@@ -1751,8 +1848,12 @@ fn restore_inbound_edges(
             }
         }
 
+        // Memoized source-file lookup for the requeue path below.
+        let mut src_file_info: HashMap<i64, (String, String)> = HashMap::new();
+
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
+        let mut requeued = 0usize;
         for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in
             saved_inbound_edges
         {
@@ -1779,18 +1880,532 @@ fn restore_inbound_edges(
                         restored += 1;
                     }
                 }
+            } else {
+                // The symbol this edge pointed at no longer exists in the changed
+                // file (renamed or removed). A full rebuild would RE-RESOLVE the
+                // surviving caller's relation against the whole tree — possibly
+                // binding a same-name candidate elsewhere — so dropping here made
+                // incremental diverge permanently (audit 2026-08-02 P1-2: the
+                // delete-path got this buffering in v0.18.2, the far more common
+                // edit path never did). Requeue instead: calls through the
+                // persistent pending buffer, everything else through the deferred
+                // pass, both of which apply the normal resolution rules.
+                let (src_path, src_lang) = src_file_info
+                    .entry(*source_file_id)
+                    .or_insert_with(|| {
+                        db.conn()
+                            .query_row(
+                                "SELECT path, COALESCE(language, '') FROM files WHERE id = ?1",
+                                [*source_file_id],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .unwrap_or_default()
+                    })
+                    .clone();
+                if src_path.is_empty() {
+                    continue; // source file row gone — nothing to requeue for
+                }
+                if relation.as_str() == REL_CALLS {
+                    crate::storage::queries::insert_pending_unresolved_call(
+                        db.conn(),
+                        *source_id,
+                        target_name,
+                        &src_lang,
+                        metadata.as_deref(),
+                    )?;
+                } else {
+                    deferred.push(DeferredRelation {
+                        source_ids: vec![*source_id],
+                        source_name: String::new(),
+                        target_name: target_name.clone(),
+                        relation: relation.clone(),
+                        metadata: metadata.clone(),
+                        rel_path: src_path,
+                        language: src_lang,
+                        ns_file: None,
+                    });
+                }
+                requeued += 1;
             }
         }
-        if restored > 0 || skipped_intra_batch > 0 {
+        if restored > 0 || skipped_intra_batch > 0 || requeued > 0 {
             tracing::debug!(
-                "[index] Restored {} cross-file inbound edges, skipped {} intra-batch",
+                "[index] Restored {} cross-file inbound edges, skipped {} intra-batch, requeued {} misses",
                 restored,
-                skipped_intra_batch
+                skipped_intra_batch,
+                requeued
             );
         }
     }
 
     Ok(edges_created)
+}
+
+/// Phase 2b-final: post-loop resolution for `DeferredRelation`s (audit
+/// 2026-08-02 P0-1).
+///
+/// Mirrors the batch-time Phase-2 chain BRANCH FOR BRANCH, in the same order,
+/// against the complete `global_name_map`. Kept in lockstep by the multi-batch
+/// parity tests in `pipeline/tests.rs` (a multi-batch fixture must produce the
+/// same edge set as its single-batch control) — if you change one chain, change
+/// the other. Still-unresolved imports/implements mint their `<external>`
+/// sentinels HERE (the batch loop no longer mints for empty-resolution cases —
+/// a later batch's real node must beat a phantom); everything else drops,
+/// exactly as the batch-time chain would.
+///
+/// Returns `(edges_created, nodes_created)`.
+fn resolve_deferred_relations(
+    db: &Database,
+    deferred: &[DeferredRelation],
+    global_name_map: &HashMap<String, Vec<crate::storage::queries::NameEntry>>,
+    all_file_paths: &HashSet<String>,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> Result<(usize, usize)> {
+    use super::resolve::{
+        method_candidates, parse_callee_metadata, path_filter_candidates, self_filter_candidates,
+        CalleeMeta,
+    };
+
+    let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
+    let mut node_id_to_language: HashMap<i64, Option<String>> = HashMap::new();
+    for (name, entries) in global_name_map {
+        for (id, path, language) in entries {
+            name_to_ids.entry(name.clone()).or_default().push(*id);
+            node_id_to_path.insert(*id, path.clone());
+            node_id_to_language.insert(*id, language.clone());
+        }
+    }
+    for ids in name_to_ids.values_mut() {
+        ids.sort();
+        ids.dedup();
+    }
+    let same_lang_of = |ids: &[i64], lang: &str, exclude: &[i64]| -> Vec<i64> {
+        ids.iter()
+            .filter(|id| !exclude.contains(id))
+            .filter(|id| {
+                matches!(
+                    node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                    Some(l) if l == lang
+                )
+            })
+            .copied()
+            .collect()
+    };
+
+    let mut edges_created = 0usize;
+    let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
+
+    for d in deferred {
+        // routes_to whose imported-handler source never resolved at batch time.
+        let source_ids: Vec<i64> = if d.relation == REL_ROUTES_TO && d.source_ids.is_empty() {
+            let all = name_to_ids.get(&d.source_name).cloned().unwrap_or_default();
+            let same_lang = same_lang_of(&all, &d.language, &[]);
+            refine_ambiguous_targets(&same_lang, &d.rel_path, &node_id_to_path)
+        } else {
+            d.source_ids.clone()
+        };
+        if source_ids.is_empty() {
+            continue;
+        }
+
+        let import_meta: Option<serde_json::Value> = if d.relation == REL_IMPORTS {
+            d.metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok())
+        } else {
+            None
+        };
+
+        // 1. Namespace / star / default module-level import markers → module node.
+        if let Some(meta) = import_meta.as_ref() {
+            if matches!(
+                meta.get("q").and_then(|v| v.as_str()),
+                Some(crate::domain::IMPORT_Q_NS_REQUIRE)
+                    | Some(crate::domain::IMPORT_Q_NS_IMPORT)
+                    | Some(crate::domain::IMPORT_Q_STAR_REEXPORT)
+                    | Some(crate::domain::IMPORT_Q_DEFAULT)
+            ) {
+                if let Some(spec) = meta.get("js_module").and_then(|v| v.as_str()) {
+                    if let Some(file) = resolve_js_specifier_path(spec, &d.rel_path, all_file_paths)
+                    {
+                        let module_targets = module_node_of(&name_to_ids, &node_id_to_path, &file);
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &module_targets,
+                            &d.relation,
+                            d.metadata.as_deref(),
+                            false,
+                        )?;
+                    }
+                }
+                continue; // still-unresolved marker imports drop (external package)
+            }
+        }
+
+        // 2. Python module-constrained resolution (external modules were
+        //    sentinel'd at batch time; only internal-module symbol misses defer).
+        if let Some(meta) = import_meta.as_ref() {
+            if let Some(python_module) = meta.get("python_module").and_then(|v| v.as_str()) {
+                let is_module_import = meta
+                    .get("is_module_import")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if python_module_map.contains_key(python_module) {
+                    if let Some(module_targets) = resolve_python_module_targets(
+                        python_module,
+                        is_module_import,
+                        &d.target_name,
+                        python_module_map,
+                        &node_id_to_path,
+                        &name_to_ids,
+                    ) {
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &module_targets,
+                            &d.relation,
+                            d.metadata.as_deref(),
+                            false,
+                        )?;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 3. JS/TS relative-specifier resolution.
+        if let Some(meta) = import_meta.as_ref() {
+            if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str()) {
+                if let Some(targets) = resolve_js_module_targets(
+                    js_module,
+                    &d.rel_path,
+                    &d.target_name,
+                    all_file_paths,
+                    &name_to_ids,
+                    &node_id_to_path,
+                ) {
+                    edges_created += insert_relation_edges(
+                        db,
+                        &source_ids,
+                        &targets,
+                        &d.relation,
+                        d.metadata.as_deref(),
+                        false,
+                    )?;
+                    continue;
+                }
+            }
+        }
+
+        // 4. PHP / C file includes → resolved file's <module> node.
+        if let Some(meta) = import_meta.as_ref() {
+            let inc_file = meta
+                .get("php_include")
+                .and_then(|v| v.as_str())
+                .and_then(|inc| resolve_php_include_path(inc, &d.rel_path, all_file_paths))
+                .or_else(|| {
+                    meta.get("c_include")
+                        .and_then(|v| v.as_str())
+                        .and_then(|inc| resolve_c_include_path(inc, &d.rel_path, all_file_paths))
+                });
+            if let Some(file) = inc_file {
+                let module_targets = module_node_of(&name_to_ids, &node_id_to_path, &file);
+                if !module_targets.is_empty() {
+                    edges_created += insert_relation_edges(
+                        db,
+                        &source_ids,
+                        &module_targets,
+                        &d.relation,
+                        d.metadata.as_deref(),
+                        false,
+                    )?;
+                    continue;
+                }
+            }
+        }
+
+        // 5. Rust trait-impl method edges (q:"impl_method").
+        if d.relation == REL_IMPLEMENTS {
+            if let Some(ref meta_str) = d.metadata {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                    if meta.get("q").and_then(|v| v.as_str()) == Some("impl_method") {
+                        if let Some(impl_type) = meta.get("v").and_then(|v| v.as_str()) {
+                            let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+                            let filtered = self_filter_candidates(impl_type, &all, db)?;
+                            if !filtered.is_empty() {
+                                edges_created += insert_relation_edges(
+                                    db,
+                                    &source_ids,
+                                    &filtered,
+                                    &d.relation,
+                                    d.metadata.as_deref(),
+                                    false,
+                                )?;
+                            }
+                            continue; // external trait method → drop, as at batch time
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Calls — full qualifier dispatch mirroring the batch-time arms.
+        if d.relation == REL_CALLS {
+            let all = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+
+            // 6a. JS namespace-receiver constraint captured at batch time
+            //     (`m.foo()` where `m` is a require/import-namespace binding).
+            if let Some(ns_file) = d.ns_file.as_deref() {
+                let targets: Vec<i64> = all
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        node_id_to_path
+                            .get(id)
+                            .map(|p| p == ns_file)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if !targets.is_empty() {
+                    edges_created += insert_relation_edges(
+                        db,
+                        &source_ids,
+                        &targets,
+                        &d.relation,
+                        d.metadata.as_deref(),
+                        false,
+                    )?;
+                    continue;
+                }
+                // Method not in the bound file even with the full pool —
+                // fall through to the default chain, as the batch arm would.
+            }
+
+            let mut handled = true;
+            match parse_callee_metadata(d.metadata.as_deref()) {
+                Some(CalleeMeta::Receiver(_))
+                    if matches!(d.language.as_str(), "javascript" | "typescript" | "tsx") =>
+                {
+                    // ns miss (or no ns binding) → default chain below.
+                    handled = false;
+                }
+                Some(CalleeMeta::Chain) | Some(CalleeMeta::Receiver(_)) => {
+                    // Unique-method rule, now against the complete pool.
+                    if !is_cross_file_call_noise(&d.target_name, &d.language) {
+                        let same_lang = same_lang_of(&all, &d.language, &[]);
+                        let methods = method_candidates(&same_lang, db)?;
+                        let same_file_methods: Vec<i64> = methods
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                node_id_to_path.get(id).map(|p| p.as_str())
+                                    == Some(d.rel_path.as_str())
+                            })
+                            .collect();
+                        let target = if same_file_methods.len() == 1 {
+                            Some(same_file_methods[0])
+                        } else if same_file_methods.is_empty() && methods.len() == 1 {
+                            Some(methods[0])
+                        } else {
+                            None // ambiguous either way → drop, as at batch time
+                        };
+                        if let Some(tgt_id) = target {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &[tgt_id],
+                                &d.relation,
+                                d.metadata.as_deref(),
+                                false,
+                            )?;
+                        }
+                    }
+                }
+                Some(CalleeMeta::SelfRecv(impl_type)) | Some(CalleeMeta::SelfType(impl_type)) => {
+                    let same_lang = same_lang_of(&all, &d.language, &[]);
+                    let filtered = self_filter_candidates(&impl_type, &same_lang, db)?;
+                    if !filtered.is_empty() {
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &filtered,
+                            &d.relation,
+                            d.metadata.as_deref(),
+                            false,
+                        )?;
+                    }
+                    // empty → drop: qualifier is fixed and the pool is now complete.
+                }
+                Some(CalleeMeta::RecvType(recv_type)) => {
+                    // Bind precisely to the inferred type's own methods; an EMPTY
+                    // filter (inherited method / mis-inferred type) falls through
+                    // to the bare default chain below — rtype is strictly additive
+                    // precision and must never drop an edge the bare path would
+                    // have resolved (mirrors the batch-time arm).
+                    let same_lang = same_lang_of(&all, &d.language, &[]);
+                    let filtered = self_filter_candidates(&recv_type, &same_lang, db)?;
+                    if !filtered.is_empty() {
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &filtered,
+                            &d.relation,
+                            d.metadata.as_deref(),
+                            false,
+                        )?;
+                    } else {
+                        handled = false;
+                    }
+                }
+                Some(CalleeMeta::Path(segments)) => {
+                    let same_lang = same_lang_of(&all, &d.language, &[]);
+                    let filtered =
+                        path_filter_candidates(&segments, &same_lang, &node_id_to_path, db)?;
+                    if !filtered.is_empty() {
+                        let final_targets = if filtered.len() > 1 {
+                            refine_ambiguous_targets(&filtered, &d.rel_path, &node_id_to_path)
+                        } else {
+                            filtered
+                        };
+                        edges_created += insert_relation_edges(
+                            db,
+                            &source_ids,
+                            &final_targets,
+                            &d.relation,
+                            d.metadata.as_deref(),
+                            false,
+                        )?;
+                    }
+                    // empty → drop: external crate path, as at batch time.
+                }
+                _ => {
+                    handled = false; // bare call → default chain below
+                }
+            }
+            if handled {
+                continue;
+            }
+
+            // 6b. Default chain for bare calls (and JS receiver ns-misses):
+            //     same-file → noise → same-language(refined) → pending buffer.
+            let same_file_targets: Vec<i64> = all
+                .iter()
+                .copied()
+                .filter(|id| {
+                    node_id_to_path.get(id).map(|p| p.as_str()) == Some(d.rel_path.as_str())
+                })
+                .collect();
+            if !same_file_targets.is_empty() {
+                edges_created += insert_relation_edges(
+                    db,
+                    &source_ids,
+                    &same_file_targets,
+                    &d.relation,
+                    d.metadata.as_deref(),
+                    false,
+                )?;
+                continue;
+            }
+            if is_cross_file_call_noise(&d.target_name, &d.language) {
+                continue;
+            }
+            // Cross-file pool: batch-time exclusion is BY SOURCE FILE (local_ids),
+            // not by source node ids — mirror that (a routes_to self-target from
+            // another file must stay in the pool; insert_relation_edges handles
+            // self-pairs via allow_self).
+            let cross_file: Vec<i64> = all
+                .iter()
+                .copied()
+                .filter(|id| {
+                    node_id_to_path.get(id).map(|p| p.as_str()) != Some(d.rel_path.as_str())
+                })
+                .collect();
+            let same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
+            if !same_language_targets.is_empty() {
+                let final_targets =
+                    refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
+                edges_created += insert_relation_edges(
+                    db,
+                    &source_ids,
+                    &final_targets,
+                    &d.relation,
+                    d.metadata.as_deref(),
+                    false,
+                )?;
+                continue;
+            }
+            // Still unresolved after seeing the WHOLE tree — this is what the
+            // persistent pending buffer is for (cross-INVOCATION forward
+            // references: the callee's file arrives in a later indexing run).
+            for &src_id in &source_ids {
+                crate::storage::queries::insert_pending_unresolved_call(
+                    db.conn(),
+                    src_id,
+                    &d.target_name,
+                    &d.language,
+                    d.metadata.as_deref(),
+                )?;
+            }
+            continue;
+        }
+
+        // 7. Default name chain: same-file → same-language (refined) →
+        //    (references: drop) / (structural: family pool → sentinel/drop).
+        let all_target_ids = name_to_ids.get(&d.target_name).cloned().unwrap_or_default();
+        let same_file_targets: Vec<i64> = all_target_ids
+            .iter()
+            .filter(|id| node_id_to_path.get(id).map(|p| p.as_str()) == Some(d.rel_path.as_str()))
+            .copied()
+            .collect();
+        // Batch-time exclusion is BY SOURCE FILE, not by source node ids — a
+        // routes_to whose target IS its (cross-file) source must stay in the
+        // pool; insert_relation_edges handles self-pairs via allow_self.
+        let cross_file: Vec<i64> = all_target_ids
+            .iter()
+            .copied()
+            .filter(|id| node_id_to_path.get(id).map(|p| p.as_str()) != Some(d.rel_path.as_str()))
+            .collect();
+        let same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
+
+        let target_ids: Vec<i64> = if !same_file_targets.is_empty() {
+            same_file_targets
+        } else if !same_language_targets.is_empty() {
+            refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path)
+        } else if d.relation == REL_REFERENCES {
+            continue; // precision over recall, as at batch time
+        } else {
+            cross_file
+                .iter()
+                .filter(|id| {
+                    matches!(
+                        node_id_to_language.get(id).and_then(|l| l.as_deref()),
+                        Some(l) if crate::utils::config::languages_compatible(l, &d.language)
+                    )
+                })
+                .copied()
+                .collect()
+        };
+
+        if target_ids.is_empty() && (d.relation == REL_IMPLEMENTS || d.relation == REL_IMPORTS) {
+            for &src_id in &source_ids {
+                unresolved_externals.push((src_id, d.target_name.clone(), d.relation.clone()));
+            }
+        } else {
+            edges_created += insert_relation_edges(
+                db,
+                &source_ids,
+                &target_ids,
+                &d.relation,
+                d.metadata.as_deref(),
+                d.relation == REL_ROUTES_TO,
+            )?;
+        }
+    }
+
+    let (nodes_created, sentinel_edges) = mint_external_sentinels(db, &[], &unresolved_externals)?;
+    Ok((edges_created + sentinel_edges, nodes_created))
 }
 
 /// Phase 3: build every indexed node's context string, store it, then embed.

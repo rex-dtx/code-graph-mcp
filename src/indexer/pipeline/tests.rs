@@ -2959,3 +2959,252 @@ fn test_cached_incremental_sees_a_content_edit_under_a_frozen_mtime() {
          this path"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cross-batch resolution (audit 2026-08-02 P0-1 / P1-2 / P1-9).
+//
+// The fixture shapes here are the measured P0 reproduction: the SAME four
+// meaningful files must produce the SAME graph whether they share a batch or
+// sit in different ones. A single-batch corpus is a null control for anything
+// touching "which batch a file lands in" (feedback_edge_exclusion_verify_by_
+// index_diff), so the multi-batch leg pads past BATCH_SIZE with filler files.
+// ---------------------------------------------------------------------------
+
+/// (path, name, type) for every node; (src_path, src_name, relation,
+/// target_path:target_name, metadata) for every edge — both sorted, ids and
+/// timestamps projected away so two independently-built DBs can be compared.
+#[allow(clippy::type_complexity)]
+fn graph_projection(
+    db: &Database,
+) -> (
+    Vec<(String, String, String)>,
+    Vec<(String, String, String, String, Option<String>)>,
+) {
+    let mut nodes: Vec<(String, String, String)> = db
+        .conn()
+        .prepare("SELECT f.path, n.name, n.type FROM nodes n JOIN files f ON f.id = n.file_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    nodes.sort();
+    let mut edges: Vec<(String, String, String, String, Option<String>)> = db
+        .conn()
+        .prepare(
+            "SELECT sf.path, sn.name, e.relation, tf.path || ':' || tn.name, e.metadata
+             FROM edges e
+             JOIN nodes sn ON sn.id = e.source_id
+             JOIN files sf ON sf.id = sn.file_id
+             JOIN nodes tn ON tn.id = e.target_id
+             JOIN files tf ON tf.id = tn.file_id",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    edges.sort();
+    (nodes, edges)
+}
+
+fn write_cross_batch_fixture(root: &std::path::Path, filler_count: usize) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("aaa_impl.rs"),
+        "use crate::zzz_trait::MyTrait;\npub struct Foo;\nimpl MyTrait for Foo {}\n",
+    )
+    .unwrap();
+    fs::write(src.join("zzz_trait.rs"), "pub trait MyTrait {}\n").unwrap();
+    fs::write(
+        src.join("aaa_child.ts"),
+        "import { Base } from './zzz_base';\nexport class Child extends Base {}\n",
+    )
+    .unwrap();
+    fs::write(src.join("zzz_base.ts"), "export class Base {}\n").unwrap();
+    // Sorted order puts aaa_* + mmm_* in batch 1 and zzz_* in batch 2 once the
+    // total crosses BATCH_SIZE.
+    for i in 0..filler_count {
+        fs::write(src.join(format!("mmm_{i:04}.js")), "// filler\n").unwrap();
+    }
+}
+
+#[test]
+fn test_cross_batch_relations_match_single_batch_control() {
+    let filler = super::index_files::BATCH_SIZE - 2; // 4 meaningful files → total = BATCH_SIZE + 2
+    let multi_dir = TempDir::new().unwrap();
+    let multi_db_dir = TempDir::new().unwrap();
+    write_cross_batch_fixture(multi_dir.path(), filler);
+    let multi_db = Database::open(&multi_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&multi_db, multi_dir.path(), None, None).unwrap();
+
+    let control_dir = TempDir::new().unwrap();
+    let control_db_dir = TempDir::new().unwrap();
+    write_cross_batch_fixture(control_dir.path(), 0);
+    let control_db = Database::open(&control_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, control_dir.path(), None, None).unwrap();
+
+    let meaningful = [
+        "src/aaa_impl.rs",
+        "src/zzz_trait.rs",
+        "src/aaa_child.ts",
+        "src/zzz_base.ts",
+    ];
+    let (multi_nodes, multi_edges) = graph_projection(&multi_db);
+    let (control_nodes, control_edges) = graph_projection(&control_db);
+
+    // The multi-batch tree's graph, restricted to the four meaningful files,
+    // must equal the single-batch control's graph over the same files. Before
+    // the deferred pass this failed three ways at once: implements/imports
+    // bound to `<external>` phantoms and the inherits edge vanished.
+    let restrict_nodes = |nodes: &[(String, String, String)]| -> Vec<(String, String, String)> {
+        nodes
+            .iter()
+            .filter(|(p, _, _)| meaningful.contains(&p.as_str()))
+            .cloned()
+            .collect()
+    };
+    let restrict_edges = |edges: &[(String, String, String, String, Option<String>)]| -> Vec<_> {
+        edges
+            .iter()
+            .filter(|(sp, _, _, tgt, _)| {
+                meaningful.contains(&sp.as_str())
+                    && meaningful.iter().any(|m| tgt.starts_with(&format!("{m}:")))
+            })
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        restrict_nodes(&multi_nodes),
+        restrict_nodes(&control_nodes),
+        "multi-batch node set diverged from the single-batch control"
+    );
+    assert_eq!(
+        restrict_edges(&multi_edges),
+        restrict_edges(&control_edges),
+        "multi-batch edge set diverged from the single-batch control"
+    );
+
+    // The three specific edges the P0 reproduction lost, asserted positively
+    // (presence-first: an empty projection comparison could pass vacuously if
+    // extraction itself broke — feedback_mutation_test_the_guard).
+    let has_edge = |edges: &[(String, String, String, String, Option<String>)],
+                    src_name: &str,
+                    relation: &str,
+                    tgt: &str| {
+        edges
+            .iter()
+            .any(|(_, sn, r, t, _)| sn == src_name && r == relation && t == tgt)
+    };
+    for (edges, label) in [(&multi_edges, "multi"), (&control_edges, "control")] {
+        assert!(
+            has_edge(
+                edges,
+                "Foo",
+                crate::domain::REL_IMPLEMENTS,
+                "src/zzz_trait.rs:MyTrait"
+            ),
+            "{label}: implements Foo→MyTrait missing or bound to a phantom"
+        );
+        assert!(
+            has_edge(
+                edges,
+                "Child",
+                crate::domain::REL_INHERITS,
+                "src/zzz_base.ts:Base"
+            ),
+            "{label}: inherits Child→Base missing"
+        );
+        assert!(
+            has_edge(
+                edges,
+                "<module>",
+                crate::domain::REL_IMPORTS,
+                "src/zzz_base.ts:Base"
+            ) || has_edge(
+                edges,
+                "Child",
+                crate::domain::REL_IMPORTS,
+                "src/zzz_base.ts:Base"
+            ),
+            "{label}: imports of Base did not bind to the real node"
+        );
+    }
+
+    // P1-9: nothing in either tree is genuinely external, so no `<external>`
+    // sentinel may survive the run (the multi-batch tree minted them for
+    // MyTrait/Base before the deferred pass existed, and nothing ever reaped
+    // them). aaa_impl.rs's `use crate::…` is statically-internal, aaa_child's
+    // specifier resolves — both must end on real nodes.
+    for (nodes, label) in [(&multi_nodes, "multi"), (&control_nodes, "control")] {
+        let sentinels: Vec<_> = nodes
+            .iter()
+            .filter(|(p, _, _)| p == crate::domain::EXTERNAL_FILE_PATH)
+            .collect();
+        assert!(
+            sentinels.is_empty(),
+            "{label}: orphan/phantom <external> sentinels survived: {sentinels:?}"
+        );
+    }
+}
+
+#[test]
+fn test_incremental_rename_converges_to_full_rebuild() {
+    // Audit 2026-08-02 P1-2 reproduction: renaming a symbol inside a CHANGED
+    // file must re-resolve the unchanged caller's edges the way a full rebuild
+    // would — before the fix the calls edge vanished (restore missed by name,
+    // nothing requeued) and the graph diverged from a fresh rebuild forever.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("db.py"), "def save():\n    pass\n").unwrap();
+    fs::write(src.join("other.py"), "def save():\n    pass\n").unwrap();
+    fs::write(
+        src.join("x.py"),
+        "from db import save\n\ndef f():\n    save()\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Presence first (a missing-map assertion reads None != Some as pass —
+    // feedback_mutation_test_the_guard).
+    let (_, edges) = graph_projection(&db);
+    assert!(
+        edges
+            .iter()
+            .any(|(_, sn, r, t, _)| sn == "f" && r == REL_CALLS && t == "src/db.py:save"),
+        "precondition: f → db.py:save call edge must exist, got {edges:?}"
+    );
+
+    // Rename save → store in db.py only; x.py and other.py stay untouched.
+    fs::write(src.join("db.py"), "def store():\n    pass\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Control: fresh full index of the SAME final tree.
+    let control_db_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&control_db);
+    assert!(
+        inc_edges
+            .iter()
+            .any(|(_, sn, r, t, _)| sn == "f" && r == REL_CALLS && t == "src/other.py:save"),
+        "incremental rename dropped the caller's edge instead of re-resolving it: {inc_edges:?}"
+    );
+    assert_eq!(
+        inc_nodes, full_nodes,
+        "incremental node set diverged from a fresh full rebuild"
+    );
+    assert_eq!(
+        inc_edges, full_edges,
+        "incremental edge set diverged from a fresh full rebuild"
+    );
+}

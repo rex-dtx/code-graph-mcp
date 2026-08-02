@@ -234,7 +234,8 @@ pub fn get_inbound_calls_for_pending(
          JOIN nodes ns ON ns.id = e.source_id
          JOIN files fs ON fs.id = ns.file_id
          WHERE nt.file_id = ?1 AND ns.file_id != ?1 AND e.relation = 'calls'
-           AND fs.language IS NOT NULL",
+           AND fs.language IS NOT NULL
+         ORDER BY e.source_id, nt.name",
     )?;
     let rows = stmt.query_map([file_id], |row| {
         Ok((
@@ -248,6 +249,29 @@ pub fn get_inbound_calls_for_pending(
         .filter(|(_, _, lang, _)| !lang.is_empty())
         .map(Ok)
         .collect()
+}
+
+/// Delete `<external>` sentinel nodes that no edge touches any more.
+///
+/// Sentinels are minted as edge TARGETS only, but pruning
+/// (`prune_import_contradicted_call_edges`), re-resolution, and source-file
+/// deletion can strip their last edge — and nothing ever deleted the node
+/// (audit 2026-08-02 P1-9). A lingering orphan stays in the name-resolution
+/// pool as a live candidate and makes an incrementally-grown node set diverge
+/// from a fresh rebuild forever. Both edge directions are checked as a belt:
+/// a sentinel should never source an edge, but if one ever does, reaping it
+/// would silently drop that edge via cascade.
+///
+/// Returns the number of nodes deleted.
+pub fn reap_orphan_external_nodes(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM nodes
+         WHERE file_id = (SELECT id FROM files WHERE path = ?1)
+           AND id NOT IN (SELECT target_id FROM edges)
+           AND id NOT IN (SELECT source_id FROM edges)",
+        [crate::domain::EXTERNAL_FILE_PATH],
+    )?;
+    Ok(n)
 }
 
 #[cfg(test)]
