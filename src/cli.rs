@@ -3313,7 +3313,14 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
 
     // -l mode: rg already printed one path per line; relativize and pass through.
     if files_with_matches {
-        let root_str = project_root.to_string_lossy().into_owned();
+        // root_canonical, not project_root: rg is handed CANONICALIZED search
+        // paths (see :2984) and echoes them back. On Windows the raw root can be
+        // an 8.3 short name (GitHub runners: TEMP=…\RUNNER~1\…) while canonical
+        // output is the long form — a lexical relativize can never equate the
+        // two, so every row stayed absolute and the annotation/zero-fill/dedup
+        // logic downstream all missed (first surfaced when CI gained ripgrep
+        // and the 43 grep tests actually RAN on windows-latest, v0.112.0).
+        let root_str = root_canonical.to_string_lossy().into_owned();
         let mut files: Vec<String> = String::from_utf8_lossy(&rg_output.stdout)
             .lines()
             .filter(|l| !l.is_empty())
@@ -3353,7 +3360,8 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // -c mode: rg --count printed `path:N` per file with a match; relativize and
     // pass through. No AST annotation (like -l); the count is exhaustive.
     if count_mode {
-        let root_str = project_root.to_string_lossy().into_owned();
+        // Same root_canonical rationale as the -l branch above (8.3 vs long).
+        let root_str = root_canonical.to_string_lossy().into_owned();
         let mut counts: Vec<(String, u64)> = String::from_utf8_lossy(&rg_output.stdout)
             .lines()
             .filter(|l| !l.is_empty())
@@ -3418,7 +3426,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     }
 
     // Parse rg JSON output into matches
-    let mut matches = parse_rg_json(&rg_output.stdout, project_root);
+    let mut matches = parse_rg_json(&rg_output.stdout, &root_canonical);
     // Global ascending order by (path, line). rg already emits a file's lines in
     // order (sequential scan), so this only reorders ACROSS files (supplement /
     // multi-path); context lines carry their own line number and stay adjacent to
@@ -10439,6 +10447,38 @@ mod tests {
         let err = normalize_user_path(tmp_root.path(), abs_outside.to_str().unwrap()).unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("outside the project root"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_relativize_path_windows_verbatim_and_case() {
+        // cmd_grep hands rg CANONICALIZED search paths; on Windows canonicalize
+        // yields the \\?\ verbatim long form while the raw root may be plain
+        // (or vice versa when rg echoes verbatim), and drive letters vary in
+        // case. The lexical relativize must equate every combination — the
+        // remaining 8.3-short-name vs long-name pairing is filesystem-only and
+        // is covered by cmd_grep relativizing against root_canonical (the same
+        // canonical spelling the rg args were built from), exercised by the
+        // grep e2e suite on the windows CI leg (first lit in v0.112.0).
+        assert_eq!(
+            relativize_path_on(
+                r"C:\Users\dev\proj\src\a.rs",
+                r"\\?\C:\Users\dev\proj",
+                true
+            ),
+            "src/a.rs"
+        );
+        assert_eq!(
+            relativize_path_on(
+                r"\\?\C:\Users\dev\proj\src\a.rs",
+                r"C:\Users\dev\proj",
+                true
+            ),
+            "src/a.rs"
+        );
+        assert_eq!(
+            relativize_path_on(r"c:\proj\x.rs", r"C:\proj", true),
+            "x.rs"
+        );
     }
 
     #[test]
