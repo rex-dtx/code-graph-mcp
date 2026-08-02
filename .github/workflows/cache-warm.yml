@@ -122,6 +122,15 @@ jobs:
           shared-key: release-gate
           cache-on-failure: true
 
+      # Mirrors release.yml `gate`: the 43 ripgrep-backed tests in
+      # tests/cli_e2e.rs self-skip when `rg` is missing. Without this the warm
+      # job would run a strictly weaker test set than the gate it primes, so a
+      # grep regression on main would stay green here and only surface on the
+      # tag. Runtime-only (rg is spawned, not linked), so it does not affect the
+      # cached artifacts.
+      - name: Install ripgrep (cli_e2e grep tests self-skip without it)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Clippy (no default features)
         run: cargo clippy --no-default-features --all-targets -- -D warnings
 

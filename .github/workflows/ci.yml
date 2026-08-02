@@ -75,6 +75,28 @@ jobs:
         with:
           node-version: 20
 
+      # `code-graph-mcp grep` shells out to `rg`, and every one of the 43
+      # ripgrep-backed tests in tests/cli_e2e.rs is wrapped in
+      # `if !has_ripgrep() { eprintln!("skipping: rg not installed"); return; }`.
+      # No runner ships ripgrep, so the whole grep surface — argv normalization,
+      # flag rejection, cwd anchoring, error passthrough — reported green on all
+      # three OSes while running nothing (audit 2026-08-02). Installing it is what
+      # makes those tests exist in CI.
+      - name: Install ripgrep (cli_e2e grep tests self-skip without it)
+        shell: bash
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "ripgrep already present: $(rg --version | head -1)"
+            exit 0
+          fi
+          case "$RUNNER_OS" in
+            Linux)   sudo apt-get update && sudo apt-get install -y ripgrep ;;
+            macOS)   brew install ripgrep ;;
+            Windows) choco install ripgrep -y ;;
+            *)       echo "::error::unhandled RUNNER_OS '$RUNNER_OS' — add its ripgrep install here"; exit 1 ;;
+          esac
+          rg --version
+
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: clippy
@@ -91,8 +113,12 @@ jobs:
       - name: Check
         run: cargo check ${{ matrix.feature-flag }} --all-targets
 
+      # --all-targets here too: without it clippy lints lib+bins only, so a
+      # violation in tests/ or benches/ passes every PR and then reddens
+      # release.yml's `gate` (which does pass --all-targets) AFTER the tag is
+      # cut — the one place a lint failure costs a re-release.
       - name: Clippy
-        run: cargo clippy ${{ matrix.feature-flag }} -- -D warnings
+        run: cargo clippy ${{ matrix.feature-flag }} --all-targets -- -D warnings
 
       - name: Test
         run: cargo test ${{ matrix.feature-flag }}
@@ -134,11 +160,18 @@ jobs:
         with:
           key: ubuntu-latest-with-embed
 
+      # Same reason as the matrix job above: the 43 ripgrep-backed cli_e2e tests
+      # self-skip when `rg` is absent, so this leg ran them as no-ops too.
+      - name: Install ripgrep (cli_e2e grep tests self-skip without it)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      # --all-targets matches the no-embed leg (:92): without it the embed
+      # feature's test and bench targets are never type-checked here.
       - name: Check
-        run: cargo check --features embed-model
+        run: cargo check --features embed-model --all-targets
 
       - name: Clippy
-        run: cargo clippy --features embed-model -- -D warnings
+        run: cargo clippy --features embed-model --all-targets -- -D warnings
 
       - name: Test
         # CODE_GRAPH_DISABLE_MODEL_DOWNLOAD: the spawned `serve` integration tests

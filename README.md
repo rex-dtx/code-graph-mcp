@@ -5,14 +5,16 @@ A high-performance code knowledge graph server implementing the [Model Context P
 ## Features
 
 - **Multi-language parsing** — Tree-sitter AST extraction across tiers of depth:
-  - **Full** (calls + imports + inheritance + test markers): TypeScript/TSX, JavaScript, Go, Python, Rust, Java. HTTP route extraction additionally covers TypeScript/TSX + JavaScript (Express/Connect), Go (`net/http`), and Python (Flask/FastAPI) only — Rust and Java web frameworks are not yet route-extracted
+  - **Full** (calls + imports + inheritance): TypeScript/TSX, JavaScript, Go, Python, Rust, Java. HTTP route extraction additionally covers TypeScript/TSX + JavaScript (Express/Connect), Go (`net/http`), Python (Flask/FastAPI), and Rust axum (`.route()` chains with inline `.nest()` prefixes; named handlers only) — actix/rocket and Java Spring are not yet route-extracted
   - **Smoke-tested** (calls + imports + inheritance): C#, Kotlin, Ruby, PHP, Swift, Dart
-  - **Limited** (functions + calls + `#include` imports + gtest test markers + C++ base-class inheritance; `Class::method` scope qualification deferred): C, C++
+  - **Limited** (functions + calls + `#include` imports + gtest test markers + C++ base-class inheritance + `Class::method` scope qualification): C, C++
   - **Scripting**: Bash (functions + commands + `source`/`.` imports), Markdown (headings)
   - **File-FTS only** (no AST symbol extraction): HTML, CSS, JSON
+  - **Test markers** — detected from the AST for Rust (`#[test]` / `#[cfg(test)]`), JavaScript/TypeScript/TSX (`describe`/`it`/`test` blocks and their callbacks) and C/C++ (gtest `TEST` macros). Go, Python, Java and the rest fall back to path/name heuristics (`tests/`, `src/test/java/`, `*_test.*`, `*.test.js`, `test_*`, `*Test`)
+  - **Value/type references** — a `references` relation for symbols that are used without being called, imported or inherited (path-qualified constants, type-position uses, functions passed as values): Rust, TypeScript/TSX, JavaScript, Python, Go, Java, C, C++
 - **Semantic code search** — Hybrid BM25 full-text + vector semantic search with Reciprocal Rank Fusion (RRF), powered by sqlite-vec
 - **Call graph traversal** — Recursive CTE queries to trace callers/callees with cycle detection
-- **HTTP route tracing** — Map route paths to backend handler functions (Express, Flask/FastAPI, Go `net/http`)
+- **HTTP route tracing** — Map route paths to backend handler functions (Express, Flask/FastAPI, Go `net/http`, Rust axum)
 - **Dead code detection** — Find unreferenced symbols with smart Orphan/Exported-Unused classification
 - **Impact analysis** — Determine the blast radius of code changes by tracing all dependents
 - **Incremental indexing** — Merkle tree change detection with file system watcher for real-time updates. Smart event filtering skips metadata-only changes (chmod, xattr)
@@ -36,11 +38,11 @@ Combines BM25 full-text ranking (FTS5) with vector semantic similarity (sqlite-v
 
 ### Scope-Aware Relation Extraction
 
-The parser doesn't just find function calls — it tracks them within their proper scope context. Extracts calls, imports, inheritance, interface implementations, exports, and HTTP route bindings. Same-file targets are preferred over cross-file matches to minimize false-positive edges.
+The parser doesn't just find function calls — it tracks them within their proper scope context. Extracts calls, imports, inheritance, interface implementations, exports (ESM `export` **and** CommonJS `module.exports = { … }` / `exports.name = …`), value/type references, and HTTP route bindings. Same-file targets are preferred over cross-file matches to minimize false-positive edges.
 
 ### HTTP Request Flow Tracing
 
-Unique to code-graph-mcp: trace from `GET /api/users` → route handler → service layer → database call in a single query. Supports Express, Flask/FastAPI, and Go HTTP frameworks.
+Unique to code-graph-mcp: trace from `GET /api/users` → route handler → service layer → database call in a single query. Supports Express/Connect, Flask/FastAPI, Go `net/http`, and Rust axum.
 
 ### Zero External Dependencies at Runtime
 
@@ -73,10 +75,10 @@ Real-world benchmarks comparing code-graph-mcp tools against traditional approac
 | Project architecture overview | 5-8 calls | 1 call (`project_map`) | **~85%** |
 | Find function by concept | 3-5 calls | 1 call (`semantic_code_search`) | **~75%** |
 | Trace 2-level call chain | 8-15 calls | 1 call (`get_call_graph`) | **~90%** |
-| Pre-change impact analysis | 10-20+ calls | 1 call (`impact_analysis`) | **~95%** |
+| Pre-change impact analysis | 10-20+ calls | 1 call (`get_ast_node` + `include_impact`) | **~95%** |
 | Module structure & exports | 5+ calls | 1 call (`module_overview`) | **~80%** |
-| File dependency mapping | 3-5 calls | 1 call (`dependency_graph`) | **~75%** |
-| Similar code detection | N/A | 1 call (`find_similar_code`) | **unique** |
+| File dependency mapping | 3-5 calls | 1 call (`module_overview` + `include_deps`) | **~75%** |
+| Similar code detection | N/A | 1 call (`get_ast_node` + `include_similar`) | **unique** |
 
 ### Overall Session Efficiency
 
@@ -263,20 +265,19 @@ npm uninstall -g @sdsrs/code-graph
 
 ## MCP Tools
 
+`tools/list` advertises exactly these seven. Several older niche tools were folded into flags on them, so one call now covers what used to take a separate tool:
+
 | Tool | Description |
 |------|-------------|
-| `project_map` | Full project architecture: modules, dependencies, entry points, hot functions |
-| `semantic_code_search` | Hybrid BM25 + vector + graph search for AST nodes |
-| `get_call_graph` | Trace upstream/downstream call chains for a function |
-| `trace_http_chain` | Full request flow: route → handler → downstream call chain |
-| `impact_analysis` | Analyze the blast radius of changing a symbol |
-| `module_overview` | High-level overview of a module's structure and exports |
-| `dependency_graph` | Visualize dependency relationships between modules. Supports `compact` mode |
-| `find_similar_code` | Find semantically similar code via embeddings. Requires `symbol_name` or `node_id` |
-| `get_ast_node` | Extract a specific code symbol with signature, body, and relations. Supports `compact` mode |
+| `project_map` | Full project architecture: modules, dependencies, entry points, hot functions. `include_centrality` adds architectural chokepoints |
+| `semantic_code_search` | Hybrid BM25 + vector search (RRF) for AST nodes. Supports `compact` mode |
+| `get_call_graph` | Trace upstream/downstream call chains for a function. Pass `route_path='GET /api/x'` to trace an HTTP route → handler → downstream instead |
+| `get_ast_node` | One symbol with signature, body and relations. `include_impact` adds the blast radius, `include_similar` embedding-similar nodes, `include_references` callers/callees. Supports `compact` mode |
+| `module_overview` | Symbols in a directory or file, grouped by type and caller count. `include_dead` lists unreferenced symbols under the path; `include_deps` adds the file dependency graph (single-file paths only) |
 | `ast_search` | Search AST nodes by text and/or structural filters (type, return type, params) |
-| `find_references` | Find all references to a symbol (callers, importers, inheritors). Supports `compact` mode |
-| `find_dead_code` | Find unused code — orphan symbols and exported-but-unused public APIs |
+| `find_references` | Find all references to a symbol (callers, importers, inheritors, implementors, value/type references). Supports `compact` mode |
+
+**Hidden aliases.** These names are not in `tools/list` but still dispatch via `tools/call`, so existing clients keep working: `trace_http_chain` / `find_http_route` (→ `get_call_graph` with `route_path`), `read_snippet` (→ `get_ast_node`), `dependency_graph`, `find_similar_code`, `find_dead_code`, plus the management tools `start_watch`, `stop_watch`, `get_index_status` and `rebuild_index`. `impact_analysis` is **removed** — calling it returns `Unknown tool`; use `get_ast_node` with `include_impact=true`, or the CLI's `impact --json` for the full report.
 
 ## CLI Commands
 
@@ -287,15 +288,15 @@ All tools are also available as CLI subcommands for shell scripts, hooks, and te
 | `search <query>` | `semantic_code_search` | FTS5 search by concept |
 | `ast-search [query]` | `ast_search` | Structural search with `--type`/`--returns`/`--params` filters |
 | `callgraph <symbol>` | `get_call_graph` | Show call graph (callers/callees) |
-| `impact <symbol>` | `impact_analysis` | Impact analysis (callers, routes, risk level) |
+| `impact <symbol>` | `get_ast_node` (`include_impact=true`) | Impact analysis (callers, routes, risk level) |
 | `show <symbol>` | `get_ast_node` | Show symbol details (code, type, signature) |
 | `map` | `project_map` | Project architecture map |
 | `overview <path>` | `module_overview` | Module symbols grouped by file and type |
-| `deps <file>` | `dependency_graph` | File-level dependency graph |
-| `trace <route>` | `trace_http_chain` | Trace HTTP route → handler → downstream calls |
-| `similar <symbol>` | `find_similar_code` | Find semantically similar code (requires embeddings) |
+| `deps <file>` | `module_overview` (`include_deps=true`) | File-level dependency graph |
+| `trace <route>` | `get_call_graph` (`route_path=…`) | Trace HTTP route → handler → downstream calls |
+| `similar <symbol>` | `get_ast_node` (`include_similar=true`) | Find semantically similar code (requires embeddings) |
 | `refs <symbol>` | `find_references` | Find all references to a symbol |
-| `dead-code [path]` | `find_dead_code` | Find unused code (orphans and exported-unused) |
+| `dead-code [path]` | `module_overview` (`include_dead=true`) | Find unused code (orphans and exported-unused) |
 | `grep <pattern>` | — | AST-context grep (ripgrep + containing function/class) |
 | `incremental-index` | — | Run incremental index update (auto-creates DB if needed) |
 | `health-check` | `get_index_status` | Query index status and freshness |
@@ -321,20 +322,20 @@ Available when installed as a Claude Code plugin:
 
 | Language | Extensions | Relations Extracted |
 |----------|-----------|-------------------|
-| TypeScript | .ts, .tsx | calls, imports, exports, inherits, implements, routes_to |
-| JavaScript | .js, .jsx, .mjs, .cjs | calls, imports, exports, inherits, routes_to |
-| Go | .go | calls, imports, inherits, routes_to |
-| Python | .py, .pyi | calls, imports, inherits, routes_to |
-| Rust | .rs | calls, imports, inherits, implements |
-| Java | .java | calls, imports, inherits, implements |
+| TypeScript | .ts, .tsx | calls, imports, exports, inherits, implements, routes_to, references |
+| JavaScript | .js, .jsx, .mjs, .cjs | calls, imports, exports (ESM + CommonJS), inherits, routes_to, references |
+| Go | .go | calls, imports, inherits, routes_to, references |
+| Python | .py, .pyi | calls, imports, inherits, routes_to, references |
+| Rust | .rs | calls, imports, implements, routes_to (axum), references |
+| Java | .java | calls, imports, inherits, implements, references |
 | C# | .cs | calls, imports, inherits, implements |
 | Kotlin | .kt, .kts | calls, imports, inherits |
 | Ruby | .rb | calls, imports, inherits |
 | PHP | .php | calls, imports, inherits, implements |
 | Swift | .swift | calls, imports, inherits |
 | Dart | .dart | calls, imports, inherits, implements |
-| C | .c, .h | calls, imports |
-| C++ | .cpp, .cc, .cxx, .hpp | calls, imports, inherits |
+| C | .c, .h | calls, imports, references |
+| C++ | .cpp, .cc, .cxx, .hpp, .hh, .hxx | calls, imports, inherits, references |
 | Bash | .sh, .bash | functions, commands, `source`/`.` imports |
 | Markdown | .md, .mdx, .markdown | headings |
 | HTML | .html, .htm | file-FTS only (no AST symbols) |
@@ -342,6 +343,7 @@ Available when installed as a Claude Code plugin:
 | JSON | .json | file-FTS only (no AST symbols) |
 
 **Known limitations:**
+- **Rust has no `inherits` edges** — the language has no class inheritance, so `impl Trait for Type` is recorded as `implements` and an `inherits`-filtered query returns empty for Rust.
 - **Kotlin/Swift interface conformance** is recorded as `inherits` (both use a single `: Type` grammar for base classes and protocols/interfaces), so `implements`-filtered queries return empty for these two languages.
 - **Cross-file dead-code detection** may false-positive a type whose only cross-file reference sits beyond the 4096-byte stored-content cap per node (documented accepted limitation, v0.97.1).
 

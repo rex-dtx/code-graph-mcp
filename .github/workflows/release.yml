@@ -84,6 +84,16 @@ jobs:
           shared-key: release-gate
           save-if: false
 
+      # The 43 ripgrep-backed tests in tests/cli_e2e.rs are each guarded by
+      # `if !has_ripgrep() { … return; }`, and no runner ships `rg` — so the
+      # `cargo test` step below certified the entire `code-graph-mcp grep`
+      # surface without executing one of its tests (audit 2026-08-02). This is
+      # the last check before an irreversible npm publish, so a silently empty
+      # test class is exactly what it must not have. Mirrored in cache-warm.yml
+      # `warm-gate`, which runs the same test command.
+      - name: Install ripgrep (cli_e2e grep tests self-skip without it)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       # ci.yml has this same assertion, but ci.yml never runs on a tag — and the
       # mode reverted invisibly once already in the batch that added it (a
       # `git stash` round-trip under `core.fileMode=false`). Without it here, a
