@@ -45,12 +45,146 @@ const _: () = assert!(
     "MCP noisy instructions exceed 1500-byte budget; Claude Code will truncate."
 );
 
+/// Verdict of a best-effort liveness probe for the PID recorded in `index.lock`.
+///
+/// `Unknown` exists so a probe that could not run never has to lie: only a
+/// POSITIVE `Dead` releases another process's lock, so a spawn failure, a
+/// timeout or unparsable output all stay on the safe side of the
+/// no-dual-primary invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PidProbe {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+/// Decide whether the PID recorded in an existing lock file must block this
+/// process from taking the lock.
+///
+/// Deliberately platform-independent. The non-Unix lock path cannot be
+/// exercised on the dev/CI host, and its previous hard-coded "always alive"
+/// probe made the stale-lock reclaim at the call site unreachable: after one
+/// unclean exit on Windows every later server instance for that project stayed
+/// secondary forever (no indexing, no watcher, `rebuild_index` refusing) with
+/// no message telling the user to delete `.code-graph/index.lock`. Keeping the
+/// decision here — with the probe injected — makes both outcomes unit-testable
+/// on every platform.
+#[allow(dead_code)] // called only from the non-Unix lock path; tested everywhere
+pub(super) fn lock_holder_blocks_acquire(
+    recorded_pid: u32,
+    my_pid: u32,
+    probe: impl FnOnce(u32) -> PidProbe,
+) -> bool {
+    // Our own PID in the file is a leftover from this process — never blocking.
+    if recorded_pid == my_pid {
+        return false;
+    }
+    probe(recorded_pid) != PidProbe::Dead
+}
+
+/// Wall-clock budget for one liveness-probe subprocess. A hung probe must not
+/// stall server startup, and "took too long" is `Unknown`, i.e. conservative.
+#[allow(dead_code)]
+const PID_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run `cmd` to completion, killing it if it outlives `timeout`.
+///
+/// Returns `None` for every "cannot decide" case: spawn failure, timeout, or a
+/// broken wait. Assumes the command's output fits the OS pipe buffer (it is
+/// used for a single-row `tasklist` query); a command that fills the pipe would
+/// block before exiting and be reported as a timeout, which is still safe.
+#[allow(dead_code)]
+fn run_probe_command(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+    child.wait_with_output().ok()
+}
+
+/// Interpret `tasklist /NH /FO CSV /FI "PID eq <pid>"` output.
+///
+/// A successful run listing a CSV row whose PID column matches is `Alive`. A
+/// successful run with no such row is `Dead` — we key on the ABSENCE of a row
+/// rather than on the "INFO: No tasks are running…" line, which is localized.
+/// Anything else is `Unknown`.
+#[allow(dead_code)]
+fn parse_tasklist_output(success: bool, stdout: &str, pid: u32) -> PidProbe {
+    if !success {
+        return PidProbe::Unknown;
+    }
+    for line in stdout.lines() {
+        // `"code-graph-mcp.exe","1234","Console","1","10,240 K"` — PID is field 2.
+        let mut fields = line.split("\",\"");
+        let (Some(_image), Some(pid_field)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if pid_field
+            .trim()
+            .trim_matches('"')
+            .parse::<u32>()
+            .is_ok_and(|p| p == pid)
+        {
+            return PidProbe::Alive;
+        }
+    }
+    PidProbe::Dead
+}
+
+/// Best-effort process-liveness probe for the non-Unix lock path.
+///
+/// Compiled on every platform (dead on Unix) so the whole body except the
+/// two console-suppression lines type-checks on the dev host.
+#[allow(dead_code)]
+fn probe_pid_liveness(pid: u32) -> PidProbe {
+    let mut cmd = std::process::Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    #[cfg(windows)]
+    {
+        // Without CREATE_NO_WINDOW every probe flashes a console window: the
+        // MCP server is launched by Claude Code with no console of its own, and
+        // Rust's Command (like Node's `windowsHide`) does not suppress it by
+        // default — the same class of defect as [[feedback_windows_child_flash]].
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match run_probe_command(cmd, PID_PROBE_TIMEOUT) {
+        Some(out) => parse_tasklist_output(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            pid,
+        ),
+        None => PidProbe::Unknown,
+    }
+}
+
 /// Check if a process with the given PID is alive (used by non-Unix lock fallback).
-/// On non-Unix platforms, conservatively assumes the process is alive to prevent dual-primary.
+/// Unresolvable probes count as alive, keeping the no-dual-primary invariant.
 #[cfg(not(unix))]
 fn pid_is_alive(pid: u32) -> bool {
-    let _ = pid;
-    true
+    probe_pid_liveness(pid) != PidProbe::Dead
 }
 
 /// Try to acquire the index lock (`.code-graph/index.lock`) using flock().
@@ -123,7 +257,7 @@ fn try_acquire_index_lock(code_graph_dir: &Path) -> Option<std::fs::File> {
     // Lock exists — check if holder is alive
     if let Ok(content) = std::fs::read_to_string(&lock_path) {
         if let Ok(pid) = content.trim().parse::<u32>() {
-            if pid != my_pid && pid_is_alive(pid) {
+            if lock_holder_blocks_acquire(pid, my_pid, probe_pid_liveness) {
                 tracing::info!("Another instance (PID {}) holds the index lock — running in secondary (read-only) mode", pid);
                 return None;
             }
@@ -232,11 +366,67 @@ pub(super) struct WatcherState {
 }
 
 /// Debounce interval for no-watcher incremental checks.
-/// In tests, use 0s so incremental checks always run immediately.
-#[cfg(not(test))]
 pub(super) const INCREMENTAL_DEBOUNCE_SECS: u64 = 30;
-#[cfg(test)]
-pub(super) const INCREMENTAL_DEBOUNCE_SECS: u64 = 0;
+
+/// Upper bound on how long a session may answer from an index that no
+/// incremental scan has revalidated, *while a watcher is active*.
+///
+/// The watcher is trusted but not infallible: `notify` reports backend errors
+/// (inotify watch-limit exhaustion, network filesystems, container bind mounts)
+/// through the error callback, which only logs — the `FileWatcher` object stays
+/// in place, so `is_watching()` keeps reporting true while no event ever
+/// arrives again. Before this backstop the no-event branch simply skipped the
+/// rescan, making staleness in that state unbounded for the whole session.
+/// Five minutes is far above the cost of a merkle stat pass and far below "the
+/// rest of the session".
+pub(super) const WATCHER_BACKSTOP_SECS: u64 = 300;
+
+/// Minimum spacing between secondary → primary lock re-acquisition attempts.
+pub(super) const PROMOTION_RETRY_SECS: u64 = 30;
+
+/// Freshness timings, held as server state rather than read from consts at the
+/// use site.
+///
+/// These used to be `#[cfg(test)]`-swapped constants, which made the branches
+/// they gate untestable: with every interval compiled to 0 in test builds,
+/// deleting a debounce branch outright left the suite green. As fields, a test
+/// can set a *non-zero* interval and observe suppression, and a zero one and
+/// observe the rescan — so each branch has a case that turns red when it is
+/// removed.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TimingConfig {
+    /// Debounce for the rescan taken when no watcher is active.
+    pub(super) incremental_debounce: std::time::Duration,
+    /// Backstop rescan interval while a watcher IS active (see [`WATCHER_BACKSTOP_SECS`]).
+    pub(super) watcher_backstop: std::time::Duration,
+    /// Throttle for secondary → primary re-acquisition attempts.
+    pub(super) promotion_retry: std::time::Duration,
+}
+
+impl Default for TimingConfig {
+    fn default() -> Self {
+        Self {
+            incremental_debounce: std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS),
+            watcher_backstop: std::time::Duration::from_secs(WATCHER_BACKSTOP_SECS),
+            promotion_retry: std::time::Duration::from_secs(PROMOTION_RETRY_SECS),
+        }
+    }
+}
+
+impl TimingConfig {
+    /// Timings for unit tests: preserves the pre-existing test behaviour (the
+    /// no-watcher debounce was compiled to 0, and no backstop existed at all)
+    /// so tests that don't care about timing keep their old semantics. Tests
+    /// that DO care set the field they exercise explicitly.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        Self {
+            incremental_debounce: std::time::Duration::ZERO,
+            watcher_backstop: std::time::Duration::from_secs(3600),
+            promotion_retry: std::time::Duration::ZERO,
+        }
+    }
+}
 
 /// How long an incremental waits for an in-flight embedding backfill to release the write
 /// path before skipping (and leaving the incremental owed via `pending_incremental`).
@@ -331,6 +521,22 @@ fn apply_backfill_outcome(
 /// rebuild recovery — regressing to the v0.11–0.14 "raw FK bubbles to the tool handler" bug.
 fn is_fk_constraint_error(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("FOREIGN KEY constraint failed")
+}
+
+/// Whether an indexing error is "another connection holds the write path right
+/// now", as opposed to a real failure.
+///
+/// The server writes from more than one connection (the startup-repair thread,
+/// the embedding backfill, and — after a secondary→primary promotion — the
+/// read-write handle opened at promotion). WAL absorbs most of that through
+/// `busy_timeout`, but a deferred read transaction that must upgrade to a write
+/// after another connection committed fails immediately with
+/// `SQLITE_BUSY_SNAPSHOT`, which the busy handler never retries. Surfacing that
+/// as a tool error would fail a perfectly good query for a transient condition;
+/// the caller instead keeps the incremental owed and retries on the next call.
+fn is_db_busy_error(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    msg.contains("database is locked") || msg.contains("database table is locked")
 }
 
 /// Token threshold for auto-compressing tool results.
@@ -435,7 +641,12 @@ impl CacheState {
 ///   4. watcher
 ///   5. cache.cached_project_map / cache.cached_module_overviews
 ///   6. embedding_model
-///   7. notify_writer / metrics
+///   7. promoted_db (innermost; `write_db()` may be called under 6 but never
+///      the reverse, and it must NOT be re-entered while a `WriteDb` is alive)
+///   8. notify_writer / metrics
+///
+/// `last_promotion_attempt` is leaf-only (taken and released inside
+/// `try_promote_to_primary` before any other lock).
 ///
 /// In practice, only one lock is held at a time due to the single-threaded
 /// stdio loop. This ordering documents the safe sequence if concurrency is added.
@@ -464,9 +675,51 @@ pub struct McpServer {
     pub(super) metrics: Mutex<super::metrics::SessionMetrics>,
     /// True if this instance holds the index lock (primary indexer).
     /// Secondary instances skip indexing/watching and read the DB in read-only mode.
-    pub(super) is_primary: bool,
+    ///
+    /// Mutable state, not a construction-time constant: a secondary re-attempts
+    /// the lock from `ensure_indexed` (throttled by `timing.promotion_retry`)
+    /// and flips this on when the previous primary is gone. Read through
+    /// [`McpServer::is_primary`].
+    is_primary: AtomicBool,
     /// Held lock file handle — on Unix, flock is released when this is dropped.
-    _index_lock: Option<std::fs::File>,
+    /// Behind a mutex because promotion installs it after construction.
+    _index_lock: Mutex<Option<std::fs::File>>,
+    /// Read-write DB handle opened at promotion time. `None` for an instance
+    /// that was primary from the start (its `db` is already read-write) and for
+    /// a secondary that never won the lock. See [`McpServer::write_db`].
+    promoted_db: Mutex<Option<Database>>,
+    /// Last secondary → primary re-acquisition attempt (throttle anchor).
+    last_promotion_attempt: Mutex<std::time::Instant>,
+    /// Freshness/debounce timings (see [`TimingConfig`]).
+    pub(super) timing: TimingConfig,
+    /// Max files re-indexed per result-set refresh (see [`RESULT_REFRESH_BUDGET`]).
+    /// Overridable via `CODE_GRAPH_RESYNC_BUDGET`, the same knob the CLI resync uses.
+    pub(super) result_refresh_budget: usize,
+}
+
+/// A database handle valid for WRITES.
+///
+/// For an instance that was primary from the start this is just `&self.db`. An
+/// instance promoted from secondary keeps `db` read-only — SQLite cannot
+/// re-flag an already-open connection — and writes through the read-write
+/// connection opened at promotion. Both live in this process, so the read-only
+/// handle sees the writer's commits through WAL.
+pub(super) enum WriteDb<'a> {
+    Startup(&'a Database),
+    Promoted(MutexGuard<'a, Option<Database>>),
+}
+
+impl std::ops::Deref for WriteDb<'_> {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        match self {
+            WriteDb::Startup(db) => db,
+            // Only ever constructed from a `Some`; see `McpServer::write_db`.
+            WriteDb::Promoted(guard) => guard
+                .as_ref()
+                .expect("promoted write handle is present by construction"),
+        }
+    }
 }
 
 impl McpServer {
@@ -518,30 +771,12 @@ impl McpServer {
         std::fs::create_dir_all(&db_dir)?;
         let db_path = db_dir.join("index.db");
 
-        // Ensure .code-graph/ is in .gitignore (atomic append to avoid read-modify-write race)
-        let gitignore_path = project_root.join(".gitignore");
-        {
-            let content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
-            if !content.lines().any(|line| {
-                let trimmed = line.trim();
-                trimmed.trim_end_matches('/') == CODE_GRAPH_DIR
-            }) {
-                use std::io::Write as _;
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&gitignore_path);
-                if let Ok(mut f) = f {
-                    // Add newline separator if the file doesn't end with one
-                    if !content.ends_with('\n') && !content.is_empty() {
-                        let _ = f.write_all(b"\n");
-                    }
-                    let _ = f.write_all(format!("{}/\n", CODE_GRAPH_DIR).as_bytes());
-                } else if let Err(e) = f {
-                    tracing::warn!("Could not update .gitignore: {}", e);
-                }
-            }
-        }
+        // Ensure .code-graph/ is in .gitignore. Shared with the CLI index
+        // commands so the two entry points cannot drift: this used to be the
+        // ONLY writer, which left pure-CLI installs (hook-driven
+        // `incremental-index`, MCP server never started) one `git add -A` away
+        // from committing a multi-hundred-MB index (audit 2026-08-02 DB-4).
+        crate::utils::gitignore::ensure_code_graph_dir_ignored(project_root);
 
         let index_lock = try_acquire_index_lock(&db_dir);
         let is_primary = index_lock.is_some();
@@ -576,9 +811,92 @@ impl McpServer {
             cache: CacheState::new(),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
-            is_primary,
-            _index_lock: index_lock,
+            is_primary: AtomicBool::new(is_primary),
+            _index_lock: Mutex::new(index_lock),
+            promoted_db: Mutex::new(None),
+            last_promotion_attempt: Mutex::new(std::time::Instant::now()),
+            timing: TimingConfig::default(),
+            result_refresh_budget: resync_budget_from_env(),
         })
+    }
+
+    /// Whether this instance currently holds the index lock (primary indexer).
+    pub(super) fn is_primary(&self) -> bool {
+        self.is_primary.load(Ordering::Acquire)
+    }
+
+    /// Handle to use for WRITES (indexing, repair, rebuild). See [`WriteDb`].
+    ///
+    /// Callers must bind the result to a local before using it across more than
+    /// one expression, and must not call `write_db()` again while that local is
+    /// alive — the promoted variant holds a non-reentrant mutex.
+    pub(super) fn write_db(&self) -> WriteDb<'_> {
+        let guard = lock_or_recover(&self.promoted_db, "promoted_db");
+        if guard.is_some() {
+            WriteDb::Promoted(guard)
+        } else {
+            drop(guard);
+            WriteDb::Startup(&self.db)
+        }
+    }
+
+    /// Re-attempt the index lock from a secondary instance, throttled.
+    ///
+    /// `try_acquire_index_lock` used to run exactly once, in the constructor, so
+    /// a secondary stayed read-only for its entire process lifetime: once the
+    /// primary exited, the session answered every query from a frozen index for
+    /// the rest of the session, with no upper bound and — on the success path —
+    /// no disclosure at all (only "not found" errors carry the secondary hint).
+    /// Running here bounds that to `timing.promotion_retry` while keeping the
+    /// common case (primary alive) to one throttled `flock` probe rather than
+    /// one per tool call.
+    ///
+    /// Returns true when this call won the lock and the instance is now primary.
+    fn try_promote_to_primary(&self) -> bool {
+        let Some(root) = self.project_root.clone() else {
+            return false;
+        };
+        {
+            let mut last = lock_or_recover(&self.last_promotion_attempt, "last_promotion_attempt");
+            if last.elapsed() < self.timing.promotion_retry {
+                return false;
+            }
+            *last = std::time::Instant::now();
+        }
+        let db_dir = root.join(CODE_GRAPH_DIR);
+        let Some(lock) = try_acquire_index_lock(&db_dir) else {
+            return false;
+        };
+        // Writes need their own read-write connection: `self.db` was opened
+        // read-only and stays the read path for the rest of the session.
+        let write_db = match Database::open_with_vec(&db_dir.join("index.db")) {
+            Ok(db) => db,
+            Err(e) => {
+                // Dropping `lock` releases the flock, so the next live primary
+                // (or the next attempt) can take it.
+                tracing::warn!(
+                    "Won the index lock but could not open the DB read-write ({}) — staying secondary",
+                    e
+                );
+                return false;
+            }
+        };
+        *lock_or_recover(&self.promoted_db, "promoted_db") = Some(write_db);
+        *lock_or_recover(&self._index_lock, "index_lock") = Some(lock);
+        self.is_primary.store(true, Ordering::Release);
+        // The index we inherited is as stale as the moment the old primary died;
+        // arm the owed flag so the caller's very next step is an authoritative
+        // merkle rescan rather than a debounced one.
+        self.indexing
+            .pending_incremental
+            .store(true, Ordering::Release);
+        self.send_log(
+            "info",
+            "Acquired the index lock — promoted from secondary to primary; \
+             indexing and file watching are now active.",
+        );
+        self.start_post_index_services(&root);
+        true
     }
 
     /// Attempt to install a snapshot for `project_root` without logging (no `&self`).
@@ -663,8 +981,12 @@ impl McpServer {
             cache: CacheState::new(),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
-            is_primary: true,
-            _index_lock: None,
+            is_primary: AtomicBool::new(true),
+            _index_lock: Mutex::new(None),
+            promoted_db: Mutex::new(None),
+            last_promotion_attempt: Mutex::new(std::time::Instant::now()),
+            timing: TimingConfig::for_tests(),
+            result_refresh_budget: RESULT_REFRESH_BUDGET,
         }
     }
 
@@ -690,8 +1012,12 @@ impl McpServer {
             cache: CacheState::new(),
             last_index_stats: Mutex::new(IndexStats::default()),
             metrics: Mutex::new(super::metrics::SessionMetrics::new()),
-            is_primary: true,
-            _index_lock: None,
+            is_primary: AtomicBool::new(true),
+            _index_lock: Mutex::new(None),
+            promoted_db: Mutex::new(None),
+            last_promotion_attempt: Mutex::new(std::time::Instant::now()),
+            timing: TimingConfig::for_tests(),
+            result_refresh_budget: RESULT_REFRESH_BUDGET,
         }
     }
 
@@ -714,7 +1040,7 @@ impl McpServer {
             if !metrics.is_empty() || metrics.has_recs_in_window(&cg_dir) {
                 metrics.flush(&cg_dir.join("usage.jsonl"), env!("CARGO_PKG_VERSION"));
             }
-            if self.is_primary {
+            if self.is_primary() {
                 release_index_lock(&cg_dir);
             }
         }
@@ -743,7 +1069,7 @@ impl McpServer {
             };
 
             // Secondary instances: skip indexing/watcher, but still do embedding
-            if !self.is_primary {
+            if !self.is_primary() {
                 // Secondaries never index, so nothing on this path would ever clear
                 // a progress file orphaned by a killed primary. Stale-only removal:
                 // a LIVE primary's file has a fresh mtime and is left untouched.
@@ -1068,7 +1394,7 @@ impl McpServer {
     /// (post-node-insert, before context_string/embedding commit). Primary-only:
     /// secondary instances can't write.
     fn spawn_startup_repair(&self, project_root: &Path) {
-        if !self.is_primary {
+        if !self.is_primary() {
             return;
         }
         if self
@@ -1174,7 +1500,7 @@ impl McpServer {
     /// `context_string` but yield no vector). An idle tick (no new work) is a single
     /// cheap COUNT; only a tick that finds new work pays for a drain + a residue re-count.
     fn spawn_periodic_backfill(&self) {
-        if !self.is_primary {
+        if !self.is_primary() {
             return;
         }
         if self
@@ -1589,8 +1915,10 @@ impl McpServer {
             None => return Ok(()),
         };
 
-        // Secondary instances: read-only — just check if DB has data
-        if !self.is_primary {
+        // Secondary instances: re-attempt the lock (throttled) before settling for
+        // read-only. Winning it falls through to the primary path below, which the
+        // promotion armed `pending_incremental` for.
+        if !self.is_primary() && !self.try_promote_to_primary() {
             let is_indexed = *lock_or_recover(&self.indexed, "indexed");
             if !is_indexed {
                 let has_data = queries::get_index_status(self.db.conn(), false)
@@ -1649,18 +1977,20 @@ impl McpServer {
             let progress_cb = |_phase: IndexPhase, current: usize, total: usize| {
                 self.send_progress("indexing", current, total);
             };
+            let write_db = self.write_db();
             let result = if has_existing {
                 self.send_log(
                     "info",
                     "Snapshot data present — running incremental drift-check...",
                 );
                 use crate::indexer::pipeline::run_incremental_index;
-                run_incremental_index(&self.db, &project_root, None, Some(&progress_cb))?
+                run_incremental_index(&write_db, &project_root, None, Some(&progress_cb))?
             } else {
                 self.send_log("info", "Scanning and indexing project files...");
                 // Skip inline embedding for full index (too slow), background thread handles it
-                run_full_index(&self.db, &project_root, None, Some(&progress_cb))?
+                run_full_index(&write_db, &project_root, None, Some(&progress_cb))?
             };
+            drop(write_db);
             *lock_or_recover(&self.last_index_stats, "last_index_stats") = result.stats;
             *lock_or_recover(&self.indexed, "indexed") = true;
             // Invalidate caches after re-index
@@ -1678,21 +2008,33 @@ impl McpServer {
             if has_changes || owed {
                 // Skip inline embedding — background thread handles it (avoids holding model lock across I/O)
                 self.run_incremental_with_cache_restore(&project_root, None)?;
+                // An authoritative merkle pass just ran; restart both debounce
+                // windows from here so the backstop below measures "time since
+                // the index was last revalidated", not "time since the last
+                // event-less tool call".
+                *lock_or_recover(&self.last_incremental_check, "last_incremental_check") =
+                    std::time::Instant::now();
             } else {
-                // No watcher or no events: still run incremental (cheap if nothing changed)
+                // No events. Two different debounces, never a permanent skip:
+                //   - no watcher: the only rescan trigger there is, so it runs often.
+                //   - watcher active: a watcher can be present yet deaf (notify
+                //     reports backend errors through a callback that only logs —
+                //     inotify limits, network FS, container bind mounts), and its
+                //     absent events are indistinguishable from "nothing changed".
+                //     The longer backstop bounds that staleness instead of trusting
+                //     the watcher for the rest of the session.
                 let has_watcher = lock_or_recover(&self.watcher, "watcher").is_some();
-                if !has_watcher {
-                    // No watcher active — debounce to avoid rescanning on every tool call
-                    let mut last_check =
-                        lock_or_recover(&self.last_incremental_check, "last_incremental_check");
-                    if last_check.elapsed()
-                        > std::time::Duration::from_secs(INCREMENTAL_DEBOUNCE_SECS)
-                    {
-                        self.run_incremental_with_cache_restore(&project_root, None)?;
-                        *last_check = std::time::Instant::now();
-                    }
+                let debounce = if has_watcher {
+                    self.timing.watcher_backstop
+                } else {
+                    self.timing.incremental_debounce
+                };
+                let mut last_check =
+                    lock_or_recover(&self.last_incremental_check, "last_incremental_check");
+                if last_check.elapsed() > debounce {
+                    self.run_incremental_with_cache_restore(&project_root, None)?;
+                    *last_check = std::time::Instant::now();
                 }
-                // Watcher active but no events → index is up-to-date, skip
             }
         }
         Ok(())
@@ -1710,7 +2052,7 @@ impl McpServer {
     ///
     /// Reindex caches are invalidated only when the call actually re-indexed.
     pub(super) fn ensure_file_fresh_opt(&self, path: Option<&str>) -> Result<()> {
-        if !self.is_primary {
+        if !self.is_primary() {
             return Ok(());
         }
         let Some(rel_path) = path else {
@@ -1733,8 +2075,9 @@ impl McpServer {
 
         let did_reindex = {
             let model_guard = lock_or_recover(&self.embedding_model, "embedding_model");
+            let write_db = self.write_db();
             crate::indexer::pipeline::ensure_file_indexed(
-                &self.db,
+                &write_db,
                 root,
                 rel_path,
                 model_guard.as_ref(),
@@ -1788,7 +2131,8 @@ impl McpServer {
         let cache = cache_guard.take();
         drop(cache_guard); // Release lock during I/O
 
-        match run_incremental_index_cached(&self.db, project_root, model, cache.as_ref(), None) {
+        let write_db = self.write_db();
+        match run_incremental_index_cached(&write_db, project_root, model, cache.as_ref(), None) {
             Ok((result, new_cache)) => {
                 if result.files_indexed > 0 {
                     // Invalidate caches when files actually changed
@@ -1829,8 +2173,10 @@ impl McpServer {
                     *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
                     lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
                     // CASCADE nodes→edges→node_vectors via FK ON DELETE CASCADE.
+                    // `write_db` is still the live handle from above — re-entering
+                    // `self.write_db()` here would deadlock on the promoted-handle mutex.
                     {
-                        let tx = self.db.conn().unchecked_transaction()?;
+                        let tx = write_db.conn().unchecked_transaction()?;
                         tx.execute("DELETE FROM files", [])?;
                         tx.commit()?;
                     }
@@ -1838,7 +2184,7 @@ impl McpServer {
                     let progress_cb = |_phase: IndexPhase, current: usize, total: usize| {
                         self.send_progress("indexing", current, total);
                     };
-                    match run_full_index(&self.db, project_root, model, Some(&progress_cb)) {
+                    match run_full_index(&write_db, project_root, model, Some(&progress_cb)) {
                         Ok(result) => {
                             *lock_or_recover(&self.last_index_stats, "last_index_stats") =
                                 result.stats;
@@ -1856,6 +2202,19 @@ impl McpServer {
                             Err(e2)
                         }
                     }
+                } else if is_db_busy_error(&e) {
+                    // Transient: another connection (startup repair, embedding
+                    // backfill) held the write path. The incremental stays owed
+                    // via `pending_incremental`, so the next tool call retries it
+                    // — same precedent as the embedding-in-progress skip above.
+                    // Returning Err here would turn a healthy query into a tool
+                    // error for a condition that resolves in milliseconds.
+                    tracing::info!(
+                        "Skipping incremental re-index: database busy ({}); incremental still owed",
+                        e
+                    );
+                    *lock_or_recover(&self.dir_cache, "dir_cache") = cache_snapshot;
+                    Ok(())
                 } else {
                     tracing::error!("Incremental index failed, restoring cache: {}", e);
                     *lock_or_recover(&self.dir_cache, "dir_cache") = cache_snapshot;
@@ -1872,8 +2231,18 @@ impl McpServer {
         let watcher_guard = lock_or_recover(&self.watcher, "watcher");
         if let Some(ref state) = *watcher_guard {
             let mut has_changes = false;
-            while state.receiver.try_recv().is_ok() {
-                has_changes = true;
+            // The payload matters: this used to discard it and treat ANY event as
+            // a change, so the server's own `.code-graph/` writes (usage.jsonl,
+            // recommendations.jsonl, SQLite WAL) reported changes continuously and
+            // every tool call paid a full-tree merkle stat. Keep draining after the
+            // first real change — leftovers would re-trigger on the next call.
+            while let Ok(WatchEvent::Changed(paths)) = state.receiver.try_recv() {
+                if paths
+                    .iter()
+                    .any(|p| !crate::indexer::watcher::is_ignored_watch_path(p))
+                {
+                    has_changes = true;
+                }
             }
             has_changes
         } else {
@@ -2089,7 +2458,7 @@ impl McpServer {
                 // Secondary (read-only) instances never reindex, so a "not found"
                 // can mean the symbol exists on disk but the primary hasn't indexed
                 // it yet — otherwise indistinguishable from a typo. Disambiguate it.
-                if !self.is_primary && err_str.contains("not found in") {
+                if !self.is_primary() && err_str.contains("not found in") {
                     text.push_str(
                         " Note: this code-graph instance is in read-only secondary mode \
                          (another instance holds the index lock) and does not reindex on \
@@ -2307,23 +2676,13 @@ impl McpServer {
 
     fn handle_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
         let start = std::time::Instant::now();
-        let result = match name {
-            "semantic_code_search" => self.tool_semantic_search(args),
-            "get_call_graph" => self.tool_get_call_graph(args),
-            "find_http_route" | "trace_http_chain" => self.tool_trace_http_chain(args),
-            "get_ast_node" | "read_snippet" => self.tool_get_ast_node(args),
-            "start_watch" => self.tool_start_watch(),
-            "stop_watch" => self.tool_stop_watch(),
-            "get_index_status" => self.tool_get_index_status(),
-            "rebuild_index" => self.tool_rebuild_index(args),
-            "module_overview" => self.tool_module_overview(args),
-            "dependency_graph" => self.tool_dependency_graph(args),
-            "find_similar_code" => self.tool_find_similar_code(args),
-            "project_map" => self.tool_project_map(args),
-            "ast_search" => self.tool_ast_search(args),
-            "find_references" => self.tool_find_references(args),
-            "find_dead_code" => self.tool_find_dead_code(args),
-            _ => Err(anyhow!("Unknown tool: {}", name)),
+        let result = self.dispatch_tool(name, args);
+        // FRS-2: tools without a `file_path` argument get result-set freshness here.
+        let result = match result {
+            Ok(value) if RESULT_REFRESH_TOOLS.contains(&name) => {
+                Ok(self.refresh_result_set(name, args, value))
+            }
+            other => other,
         };
         let elapsed = start.elapsed();
         let err_msg = result.as_ref().err().map(|e| e.to_string());
@@ -2344,12 +2703,242 @@ impl McpServer {
         // already return results with a "mode" key when compressed — those are left unchanged.
         result.map(centralized_compress)
     }
+
+    fn dispatch_tool(&self, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+        match name {
+            "semantic_code_search" => self.tool_semantic_search(args),
+            "get_call_graph" => self.tool_get_call_graph(args),
+            "find_http_route" | "trace_http_chain" => self.tool_trace_http_chain(args),
+            "get_ast_node" | "read_snippet" => self.tool_get_ast_node(args),
+            "start_watch" => self.tool_start_watch(),
+            "stop_watch" => self.tool_stop_watch(),
+            "get_index_status" => self.tool_get_index_status(),
+            "rebuild_index" => self.tool_rebuild_index(args),
+            "module_overview" => self.tool_module_overview(args),
+            "dependency_graph" => self.tool_dependency_graph(args),
+            "find_similar_code" => self.tool_find_similar_code(args),
+            "project_map" => self.tool_project_map(args),
+            "ast_search" => self.tool_ast_search(args),
+            "find_references" => self.tool_find_references(args),
+            "find_dead_code" => self.tool_find_dead_code(args),
+            _ => Err(anyhow!("Unknown tool: {}", name)),
+        }
+    }
+
+    /// FRS-2: re-index the files a result set points at, and re-run the tool if
+    /// any of them actually changed.
+    ///
+    /// Tools that take a `file_path` argument close the post-Edit window with
+    /// `ensure_file_fresh_opt`. The tools in [`RESULT_REFRESH_TOOLS`] have no
+    /// such argument: which files matter is only known once the query has run.
+    /// Watcher delivery is asynchronous, so a query issued immediately after an
+    /// Edit legitimately sees `drain_watcher_events() == false` and answers with
+    /// pre-edit line numbers — previously with no disclosure at all.
+    ///
+    /// Budget and failure policy deliberately mirror the CLI's
+    /// `refresh_files_if_stale`: at most [`RESULT_REFRESH_BUDGET`] files per
+    /// call, a short `busy_timeout` so a concurrent writer can't stall the tool,
+    /// and stale data KEPT (never dropped) with a disclosure whenever the budget
+    /// or an error prevents the refresh.
+    fn refresh_result_set(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        value: serde_json::Value,
+    ) -> serde_json::Value {
+        // Secondaries hold a read-only DB; nothing to refresh with.
+        if !self.is_primary() {
+            return value;
+        }
+        let Some(root) = self.project_root.clone() else {
+            return value;
+        };
+        let mut paths = Vec::new();
+        collect_result_paths(&value, &mut paths);
+        paths.sort_unstable();
+        paths.dedup();
+        // Bound the hashing cost on large result sets. Anything past the cap is
+        // left unchecked and said so — silently checking a prefix would be the
+        // same "false clean" the disclosure exists to avoid.
+        let unchecked = paths.len().saturating_sub(RESULT_REFRESH_SCAN_CAP);
+        paths.truncate(RESULT_REFRESH_SCAN_CAP);
+        if paths.is_empty() {
+            return value;
+        }
+
+        let outcome = self.reindex_stale_result_files(&root, &paths);
+        let mut value = if outcome.refreshed > 0 {
+            // Line numbers/snippets in the old result are now wrong; re-run once.
+            // A failing re-run keeps the first (stale) answer rather than turning
+            // a working query into an error — disclosed below.
+            match self.dispatch_tool(name, args) {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    tracing::warn!("[fresh] re-run of {} after refresh failed: {}", name, e);
+                    value
+                }
+            }
+        } else {
+            value
+        };
+
+        let stale_kept = outcome.failed + outcome.skipped_over_budget + unchecked;
+        if stale_kept > 0 {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "freshness".to_string(),
+                    json!({
+                        "refreshed": outcome.refreshed,
+                        "stale_kept": stale_kept,
+                        "note": "Some files in this result changed on disk and were not re-indexed \
+                                 (per-call budget or a busy database). Their line numbers and \
+                                 snippets may predate your last edit — re-run the query, or pass \
+                                 an explicit file_path tool for those files.",
+                    }),
+                );
+            }
+        }
+        value
+    }
+
+    /// Re-index result-set files whose on-disk hash no longer matches the index.
+    fn reindex_stale_result_files(&self, root: &Path, paths: &[String]) -> ResultRefreshOutcome {
+        let mut outcome = ResultRefreshOutcome::default();
+        let write_db = self.write_db();
+        // Never let a concurrent writer (background embedding, another index run)
+        // stall a tool call for the default 5s busy_timeout — fail fast and keep
+        // the stale row. Restored on drop: this connection is long-lived, unlike
+        // the CLI's short process where the same PRAGMA is set and forgotten.
+        let _busy = BusyTimeoutGuard::apply(write_db.conn(), RESULT_REFRESH_BUSY_TIMEOUT_MS);
+        let mut budget = self.result_refresh_budget;
+        for f in paths {
+            // Only files already in the index are candidates — parity with the CLI
+            // path. It also makes non-file entries (project_map's module `path`
+            // values, `<external>` placeholders) harmless no-ops.
+            let stored: Option<String> = write_db
+                .conn()
+                .query_row("SELECT blake3_hash FROM files WHERE path = ?1", [f], |r| {
+                    r.get(0)
+                })
+                .ok();
+            let Some(stored_hash) = stored else { continue };
+            let abs = root.join(f);
+            if crate::indexer::merkle::hash_file(&abs).ok().as_deref() == Some(stored_hash.as_str())
+            {
+                continue; // already fresh
+            }
+            if budget == 0 {
+                outcome.skipped_over_budget += 1;
+                continue;
+            }
+            match crate::indexer::pipeline::ensure_file_indexed(&write_db, root, f, None) {
+                Ok(true) => {
+                    outcome.refreshed += 1;
+                    budget -= 1;
+                }
+                // Hash differed but no node changed — nothing stale to re-query.
+                Ok(false) => {}
+                // SQLITE_BUSY / parse failure: keep the stale node, disclose it.
+                Err(_) => outcome.failed += 1,
+            }
+        }
+        if outcome.refreshed > 0 {
+            *lock_or_recover(&self.cache.cached_project_map, "cached_pmap") = None;
+            lock_or_recover(&self.cache.cached_module_overviews, "cached_movw").clear();
+        }
+        outcome
+    }
+}
+
+/// Tools that return file/line data but take no `file_path` argument, so
+/// [`McpServer::ensure_file_fresh_opt`] cannot cover them (FRS-2).
+/// `find_http_route` is the alias of `trace_http_chain`.
+const RESULT_REFRESH_TOOLS: &[&str] = &[
+    "semantic_code_search",
+    "ast_search",
+    "project_map",
+    "find_similar_code",
+    "trace_http_chain",
+    "find_http_route",
+];
+
+/// Read the per-call refresh budget, honouring the same env override as the CLI
+/// resync path so both surfaces can be tuned together.
+fn resync_budget_from_env() -> usize {
+    std::env::var("CODE_GRAPH_RESYNC_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RESULT_REFRESH_BUDGET)
+}
+
+/// Max files re-indexed for one result set (same budget as the CLI resync).
+const RESULT_REFRESH_BUDGET: usize = 8;
+/// Max files hashed for one result set before the rest is reported unchecked.
+const RESULT_REFRESH_SCAN_CAP: usize = 32;
+/// Short busy_timeout for the refresh, so a concurrent writer cannot stall a
+/// tool call. Restored to the connection default afterwards.
+const RESULT_REFRESH_BUSY_TIMEOUT_MS: u32 = 250;
+/// Connection default set by `Database::open` — what the guard restores.
+const DEFAULT_BUSY_TIMEOUT_MS: u32 = 5000;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResultRefreshOutcome {
+    pub(super) refreshed: usize,
+    pub(super) failed: usize,
+    pub(super) skipped_over_budget: usize,
+}
+
+/// Restores the connection's default `busy_timeout` when dropped.
+struct BusyTimeoutGuard<'a>(&'a rusqlite::Connection);
+
+impl<'a> BusyTimeoutGuard<'a> {
+    fn apply(conn: &'a rusqlite::Connection, ms: u32) -> Self {
+        let _ = conn.execute_batch(&format!("PRAGMA busy_timeout = {ms};"));
+        Self(conn)
+    }
+}
+
+impl Drop for BusyTimeoutGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .execute_batch(&format!("PRAGMA busy_timeout = {DEFAULT_BUSY_TIMEOUT_MS};"));
+    }
+}
+
+/// Collect every file-ish path string in a tool result.
+///
+/// Keys mirror what the handlers emit: `file_path` (search / ast_search /
+/// similar / trace), `file` (project_map hotspots + entrypoints) and `path`
+/// (project_map modules — a directory, filtered out downstream by the
+/// "must already be an indexed file" rule).
+fn collect_result_paths(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if matches!(k.as_str(), "file_path" | "file" | "path") {
+                    if let Some(s) = v.as_str() {
+                        if !s.is_empty() && !s.starts_with('<') {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+                collect_result_paths(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_result_paths(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl Drop for McpServer {
     fn drop(&mut self) {
         // Release the index lock on drop (covers panics, not SIGKILL)
-        if self.is_primary {
+        if self.is_primary() {
             if let Some(ref root) = self.project_root {
                 release_index_lock(&root.join(CODE_GRAPH_DIR));
             }
@@ -2838,8 +3427,13 @@ function handleLogin(req: Request) {
         );
 
         // Secondary: same DB file, is_primary flipped off → hint appended.
+        // No project_root-less server here, so keep promotion from firing and
+        // flipping the role back: this test is about the hint, not the role.
         let mut secondary = McpServer::new_test_with_project(project_dir.path());
-        secondary.is_primary = false;
+        secondary.is_primary.store(false, Ordering::SeqCst);
+        secondary.timing.promotion_retry = std::time::Duration::from_secs(3600);
+        *lock_or_recover(&secondary.last_promotion_attempt, "last_promotion_attempt") =
+            std::time::Instant::now();
         let resp = secondary.handle_message(&req).unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
@@ -3982,6 +4576,462 @@ app.post('/api/login', handleLogin);
         assert!(
             !caller_nodes.is_empty(),
             "snapshot_caller must be present after drift-check"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // P1-2: non-Unix lock liveness. The Windows lock path cannot run on this
+    // host, so the decision it hinges on is factored out and tested here.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_lock_holder_dead_pid_releases_the_lock() {
+        // The regression this guards: `pid_is_alive` returned an unconditional
+        // `true` on non-Unix, so the "Reclaiming stale index lock" branch was
+        // dead code and a single unclean exit left EVERY later instance for that
+        // project secondary — no indexing, no watcher, rebuild_index refusing.
+        assert!(
+            !lock_holder_blocks_acquire(4321, 99, |_| PidProbe::Dead),
+            "a positively-dead holder must not block acquisition"
+        );
+    }
+
+    #[test]
+    fn test_lock_holder_live_pid_blocks() {
+        assert!(
+            lock_holder_blocks_acquire(4321, 99, |_| PidProbe::Alive),
+            "a live holder must keep this instance secondary"
+        );
+    }
+
+    #[test]
+    fn test_lock_holder_undecidable_probe_stays_conservative() {
+        // Probe could not run (no tasklist, timeout, garbage output): we must not
+        // infer "dead" from "don't know", or two primaries index the same DB.
+        assert!(
+            lock_holder_blocks_acquire(4321, 99, |_| PidProbe::Unknown),
+            "an undecidable probe must block, preserving the no-dual-primary invariant"
+        );
+    }
+
+    #[test]
+    fn test_lock_holder_own_pid_never_blocks_and_skips_probe() {
+        assert!(
+            !lock_holder_blocks_acquire(77, 77, |_| panic!("probe must not run for our own PID")),
+            "our own PID in the lock file is our leftover, never a blocker"
+        );
+    }
+
+    #[test]
+    fn test_parse_tasklist_output_verdicts() {
+        let row = "\"code-graph-mcp.exe\",\"4321\",\"Console\",\"1\",\"12,345 K\"\r\n";
+        assert_eq!(parse_tasklist_output(true, row, 4321), PidProbe::Alive);
+        // Row for a DIFFERENT pid must not be read as our holder being alive.
+        assert_eq!(parse_tasklist_output(true, row, 9999), PidProbe::Dead);
+        // tasklist prints a localized "no tasks match" line and still exits 0;
+        // we key on the absence of a CSV row, not on that English text.
+        assert_eq!(
+            parse_tasklist_output(true, "INFO: No tasks are running which match.\r\n", 4321),
+            PidProbe::Dead
+        );
+        assert_eq!(parse_tasklist_output(true, "", 4321), PidProbe::Dead);
+        // A failed run decides nothing.
+        assert_eq!(parse_tasklist_output(false, row, 4321), PidProbe::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_probe_command_collects_output_and_enforces_timeout() {
+        // The probe's process plumbing is platform-independent; only the
+        // console-suppression flag is Windows-only. Exercise both outcomes with
+        // stand-in commands so the timeout path isn't taken on faith.
+        let mut ok = std::process::Command::new("sh");
+        ok.args(["-c", "printf 'hello'"]);
+        let out = run_probe_command(ok, std::time::Duration::from_secs(5))
+            .expect("a fast command must produce output");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+        assert!(out.status.success());
+
+        let mut slow = std::process::Command::new("sh");
+        slow.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        assert!(
+            run_probe_command(slow, std::time::Duration::from_millis(150)).is_none(),
+            "a probe that outlives its timeout must report 'cannot decide', not hang"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the timeout must actually kill the child, not wait for it: {:?}",
+            started.elapsed()
+        );
+
+        let missing = std::process::Command::new("code-graph-no-such-probe-binary");
+        assert!(
+            run_probe_command(missing, std::time::Duration::from_secs(1)).is_none(),
+            "an unspawnable probe must report 'cannot decide'"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // P1-4: a secondary must re-evaluate its role instead of answering from a
+    // frozen index for the rest of the session.
+    // ---------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn test_secondary_promotes_to_primary_after_lock_frees() {
+        use std::os::unix::io::AsRawFd;
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+
+        // Bootstrap an on-disk index so the read-only secondary open succeeds.
+        {
+            let boot = McpServer::new_test_with_project(project.path());
+            boot.ensure_indexed().unwrap();
+        }
+
+        // Stand in for a live primary: hold the flock from a separate fd. flock is
+        // tied to the open file description, so this excludes us in-process too.
+        let cg_dir = project.path().join(CODE_GRAPH_DIR);
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cg_dir.join("index.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let mut server = McpServer::from_project_root(project.path()).unwrap();
+        assert!(
+            !server.is_primary(),
+            "precondition: the held lock must force secondary mode"
+        );
+
+        // A change made while the primary is alive stays unindexed by us.
+        std::fs::write(project.path().join("beta.rs"), "fn beta_fn() {}\n").unwrap();
+        server.timing.promotion_retry = std::time::Duration::ZERO;
+        server.ensure_indexed().unwrap();
+        assert!(
+            !server.is_primary(),
+            "must not steal the lock while another process holds it"
+        );
+
+        // Primary exits. With the retry throttle wide open, the next tool call
+        // must still NOT re-probe — this is the "one flock attempt per tool call"
+        // cost the throttle exists to prevent.
+        drop(holder);
+        server.timing.promotion_retry = std::time::Duration::from_secs(3600);
+        *lock_or_recover(&server.last_promotion_attempt, "last_promotion_attempt") =
+            std::time::Instant::now();
+        server.ensure_indexed().unwrap();
+        assert!(
+            !server.is_primary(),
+            "throttled window must suppress the re-acquire attempt"
+        );
+        assert!(
+            crate::storage::queries::get_node_ids_by_name(server.db().conn(), "beta_fn")
+                .unwrap()
+                .is_empty(),
+            "still secondary: nothing may have been indexed yet"
+        );
+
+        // Throttle window elapsed → promote, and the promotion must leave the
+        // index actually caught up (not merely flip a flag).
+        *lock_or_recover(&server.last_promotion_attempt, "last_promotion_attempt") =
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(7200))
+                .unwrap();
+        server.ensure_indexed().unwrap();
+        assert!(
+            server.is_primary(),
+            "with the lock free and the throttle elapsed, the secondary must promote"
+        );
+        // Promotion also starts the background startup-repair thread, which writes
+        // through its own connection; if it wins the write path first, the owed
+        // incremental is skipped (not failed) and retried. Poll rather than assume
+        // the first attempt got through — bounded, so a genuine failure to index
+        // still fails the test.
+        let mut indexed = false;
+        for _ in 0..40 {
+            server.ensure_indexed().unwrap();
+            indexed = !crate::storage::queries::get_node_ids_by_name(server.db().conn(), "beta_fn")
+                .unwrap()
+                .is_empty();
+            if indexed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            indexed,
+            "promotion must run the owed incremental — and the read-only `db` handle \
+             must see the promoted write handle's commits"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // FRS-1 / FRS-3 / P3-2: freshness debounces are now state, not cfg(test)
+    // constants, so each branch has a case that turns red when it is removed.
+    // ---------------------------------------------------------------------
+
+    /// Install a REAL watcher on an unrelated idle dir (so `is_watching()` is true)
+    /// whose events go to a sink we never read, and hand the server a receiver
+    /// nothing ever sends to. That is a watcher which is present but deaf — the
+    /// inotify-limit / network-FS / bind-mount failure mode, made deterministic.
+    fn attach_deaf_watcher(server: &McpServer, idle: &TempDir) {
+        let (sink_tx, _sink_rx) =
+            mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        let fw = FileWatcher::start(idle.path(), sink_tx).expect("watcher must start");
+        let (_quiet_tx, quiet_rx) =
+            mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        std::mem::forget(_quiet_tx); // keep the channel connected, never send
+        *lock_or_recover(&server.watcher, "watcher") = Some(WatcherState {
+            _watcher: fw,
+            receiver: quiet_rx,
+        });
+    }
+
+    #[test]
+    fn test_deaf_watcher_is_bounded_by_the_backstop_debounce() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let idle = TempDir::new().unwrap();
+        attach_deaf_watcher(&server, &idle);
+        assert!(
+            !server.drain_watcher_events(),
+            "precondition: the deaf watcher delivers no events"
+        );
+        std::fs::write(project.path().join("late.rs"), "fn late_fn() {}\n").unwrap();
+
+        // Negative control — without it this test would also pass if the code
+        // rescanned unconditionally, which would defeat the debounce entirely.
+        server.ensure_indexed().unwrap();
+        assert!(
+            crate::storage::queries::get_node_ids_by_name(server.db().conn(), "late_fn")
+                .unwrap()
+                .is_empty(),
+            "inside the backstop window a watcher-active call must NOT rescan"
+        );
+
+        // Backstop window elapsed: the session must not stay stale indefinitely
+        // just because a FileWatcher object exists.
+        server.timing.watcher_backstop = std::time::Duration::ZERO;
+        server.ensure_indexed().unwrap();
+        assert!(
+            !crate::storage::queries::get_node_ids_by_name(server.db().conn(), "late_fn")
+                .unwrap()
+                .is_empty(),
+            "once the backstop elapses, a deaf watcher must not suppress the rescan"
+        );
+    }
+
+    #[test]
+    fn test_no_watcher_debounce_suppresses_then_allows_rescan() {
+        // P3-2: with the interval hard-compiled to 0 in test builds, deleting the
+        // debounce branch left the suite green. As state, both directions bite.
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+        assert!(
+            !server.is_watching(),
+            "precondition: no watcher in this test"
+        );
+
+        std::fs::write(project.path().join("mid.rs"), "fn mid_fn() {}\n").unwrap();
+        server.timing.incremental_debounce = std::time::Duration::from_secs(3600);
+        *lock_or_recover(&server.last_incremental_check, "last_incremental_check") =
+            std::time::Instant::now();
+        server.ensure_indexed().unwrap();
+        assert!(
+            crate::storage::queries::get_node_ids_by_name(server.db().conn(), "mid_fn")
+                .unwrap()
+                .is_empty(),
+            "inside the debounce window the no-watcher path must skip the rescan"
+        );
+
+        server.timing.incremental_debounce = std::time::Duration::ZERO;
+        server.ensure_indexed().unwrap();
+        assert!(
+            !crate::storage::queries::get_node_ids_by_name(server.db().conn(), "mid_fn")
+                .unwrap()
+                .is_empty(),
+            "past the debounce window the no-watcher path must rescan"
+        );
+    }
+
+    #[test]
+    fn test_drain_watcher_events_ignores_our_own_data_dir_writes() {
+        // FRS-3: the payload used to be discarded, so `.code-graph/` WAL and
+        // usage.jsonl writes reported "changes" continuously — every tool call
+        // paid a full-tree merkle stat and the debounce above was unreachable.
+        let project = TempDir::new().unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        let idle = TempDir::new().unwrap();
+        let (sink_tx, _sink_rx) =
+            mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        let fw = FileWatcher::start(idle.path(), sink_tx).expect("watcher must start");
+        let (tx, rx) = mpsc::sync_channel(crate::indexer::watcher::WATCHER_CHANNEL_BOUND);
+        *lock_or_recover(&server.watcher, "watcher") = Some(WatcherState {
+            _watcher: fw,
+            receiver: rx,
+        });
+
+        for p in [
+            ".code-graph/index.db-wal",
+            ".code-graph/usage.jsonl",
+            ".git/index",
+        ] {
+            tx.send(WatchEvent::Changed(vec![p.to_string()])).unwrap();
+        }
+        assert!(
+            !server.drain_watcher_events(),
+            "self-inflicted .code-graph/.git writes must not count as project changes"
+        );
+
+        tx.send(WatchEvent::Changed(vec!["src/a.rs".to_string()]))
+            .unwrap();
+        assert!(
+            server.drain_watcher_events(),
+            "a real source change must still register"
+        );
+
+        // Mixed batch: a real path alongside ignored ones still counts.
+        tx.send(WatchEvent::Changed(vec![
+            ".code-graph/usage.jsonl".to_string(),
+            "src/b.rs".to_string(),
+        ]))
+        .unwrap();
+        assert!(
+            server.drain_watcher_events(),
+            "an ignored path must not mask a real one in the same event"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // FRS-2: the 5 tools that take no `file_path` argument get result-set
+    // freshness, so a query issued right after an Edit doesn't answer with
+    // pre-edit line numbers (and says so when it cannot refresh).
+    // ---------------------------------------------------------------------
+
+    /// Shut every OTHER freshness path so a test can only pass through the
+    /// result-set refresh: no watcher exists, and the no-watcher debounce is
+    /// closed. This is the production shape of FRS-2 — a watcher IS active there,
+    /// but its event for the edit has not been delivered yet.
+    fn close_other_freshness_paths(server: &mut McpServer) {
+        assert!(
+            !server.is_watching(),
+            "precondition: no watcher in this test"
+        );
+        server.timing.incremental_debounce = std::time::Duration::from_secs(3600);
+        *lock_or_recover(&server.last_incremental_check, "last_incremental_check") =
+            std::time::Instant::now();
+    }
+
+    fn ast_search_first_line(server: &McpServer, query: &str) -> (serde_json::Value, Option<i64>) {
+        let req = tool_call_json("ast_search", json!({ "query": query }));
+        let resp = server.handle_message(&req).unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        let line = payload["results"][0]["start_line"].as_i64();
+        (payload, line)
+    }
+
+    #[test]
+    fn test_result_set_refresh_answers_with_post_edit_line_numbers() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(&file, "fn frs_two_target() {}\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let (_, before) = ast_search_first_line(&server, "frs_two_target");
+        assert_eq!(before, Some(1), "precondition: indexed at line 1");
+
+        close_other_freshness_paths(&mut server);
+        // Edit pushes the symbol down three lines — exactly the "Edit then ask"
+        // sequence that used to be answered from the pre-edit index.
+        std::fs::write(&file, "\n\n\nfn frs_two_target() {}\n").unwrap();
+
+        let (payload, after) = ast_search_first_line(&server, "frs_two_target");
+        assert_eq!(
+            after,
+            Some(4),
+            "result-set refresh must re-index the edited file and re-run the query: {payload}"
+        );
+        assert!(
+            payload.get("freshness").is_none(),
+            "a fully refreshed result needs no staleness disclosure: {payload}"
+        );
+    }
+
+    #[test]
+    fn test_result_set_refresh_keeps_and_discloses_stale_data_over_budget() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(&file, "fn frs_budget_target() {}\n").unwrap();
+        let mut server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        close_other_freshness_paths(&mut server);
+        server.result_refresh_budget = 0; // every stale file is over budget
+        std::fs::write(&file, "\n\n\nfn frs_budget_target() {}\n").unwrap();
+
+        let (payload, after) = ast_search_first_line(&server, "frs_budget_target");
+        assert_eq!(
+            after,
+            Some(1),
+            "over budget the STALE row must be kept, not dropped: {payload}"
+        );
+        assert_eq!(
+            payload["freshness"]["stale_kept"].as_u64(),
+            Some(1),
+            "an unrefreshed stale file must be disclosed, not silently returned: {payload}"
+        );
+    }
+
+    #[test]
+    fn test_db_busy_is_classified_as_transient_not_failure() {
+        // The distinction decides whether a tool call returns an error or keeps
+        // the incremental owed and retries. SQLITE_BUSY_SNAPSHOT is not retried
+        // by SQLite's busy handler, so it reaches us as a plain error.
+        assert!(is_db_busy_error(&anyhow!("database is locked")));
+        assert!(is_db_busy_error(&anyhow!(
+            "index sqlite failure: database table is locked: files"
+        )));
+        assert!(!is_db_busy_error(&anyhow!("FOREIGN KEY constraint failed")));
+        assert!(!is_db_busy_error(&anyhow!("no such column: blake3_hash")));
+        // The two classifiers must stay disjoint — an FK error routed into the
+        // "transient, retry later" arm would silently skip the truncate+rebuild
+        // recovery it needs.
+        let fk = anyhow!("FOREIGN KEY constraint failed");
+        assert!(is_fk_constraint_error(&fk) && !is_db_busy_error(&fk));
+    }
+
+    #[test]
+    fn test_collect_result_paths_covers_every_emitted_key() {
+        let value = json!({
+            "results": [{"file_path": "src/a.rs", "start_line": 1}],
+            "hotspots": [{"file": "src/b.rs"}],
+            "modules": [{"path": "src/mod_dir"}],
+            "nested": {"chain": [{"handler": {"file_path": "src/c.rs"}}]},
+            "external": [{"file_path": "<external>"}, {"file_path": ""}],
+        });
+        let mut paths = Vec::new();
+        collect_result_paths(&value, &mut paths);
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/mod_dir"],
+            "all three key spellings, nested arbitrarily deep; `<external>` and \
+             empty placeholders excluded"
         );
     }
 }

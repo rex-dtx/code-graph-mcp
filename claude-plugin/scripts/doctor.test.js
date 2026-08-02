@@ -507,3 +507,96 @@ test('doctor warns (with no phantom fix) when auto-update has suspended a releas
   }));
   assert.doesNotMatch(runDoctorCli(home2, ['--check-only']).stdout, /auto-retry suspended/);
 });
+
+// ── The binary repairs re-scan instead of trusting exit 0 (audit BIN-2) ─────
+//
+// `auto-update.js check` has no non-zero exit path at all: dev mode, the
+// CODE_GRAPH_NO_AUTO_UPDATE opt-out, a suspended release, the rate-limit backoff
+// and plain offline each print a line and exit 0. Both arms below counted "the
+// spawn did not throw" as a fix, so doctor reported ✅ and exited 0 ("healthy")
+// for a repair that provably could not have run — including the case the
+// suspension notice sends the user here to try. Sibling of the hooks-invalid
+// post-install re-scan, and of #8916 (exit code must reflect what REMAINS).
+
+function captureStdout(t) {
+  const lines = [];
+  const orig = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  t.after(() => { console.log = orig; });
+  return lines;
+}
+
+for (const [fixId, resolvedKey, stillBroken] of [
+  ['version-mismatch', 'binaryResolved', /binary version still does not match/],
+  ['binary-stale', 'binaryResolved', /binary version still does not match/],
+  ['update-incomplete', 'updateResolved', /binary download is still recorded as incomplete/],
+]) {
+  test(`runRepairs: ${fixId} counts a fix only when the post-check re-scan agrees`, (t) => {
+    const { runRepairs } = require('./doctor');
+    const issue = [{ name: 'x', status: 'warn', fixId }];
+    // devMode false: the dev arm rebuilds with cargo, and this repo IS a dev
+    // tree, so without this the test would compile Rust instead of testing.
+    const base = { devMode: () => false, runAutoUpdate: () => { /* exits 0, does nothing */ } };
+
+    const said = captureStdout(t);
+    assert.equal(runRepairs(issue, { ...base, [resolvedKey]: () => false }), 0,
+      'auto-update exiting 0 without repairing anything must not count as fixed');
+    assert.match(said.join('\n'), stillBroken,
+      'and the user must be told the check ran and changed nothing');
+    assert.doesNotMatch(said.join('\n'), /✅/, 'no success tick for a repair that did not happen');
+
+    assert.equal(runRepairs(issue, { ...base, [resolvedKey]: () => true }), 1,
+      'control: a re-scan that comes back clean does count');
+  });
+}
+
+test('runRepairs: a THROWING auto-update check is still reported as a failure', (t) => {
+  const { runRepairs } = require('./doctor');
+  const said = captureStdout(t);
+  const fixed = runRepairs([{ fixId: 'version-mismatch' }], {
+    devMode: () => false,
+    runAutoUpdate: () => { throw new Error('spawn failed'); },
+    // A throw must short-circuit BEFORE the re-scan, or a machine whose binary
+    // happens to look fine would count a spawn failure as a repair.
+    binaryResolved: () => { throw new Error('re-scan must not run after a throw'); },
+  });
+  assert.equal(fixed, 0);
+  assert.match(said.join('\n'), /Update check failed/);
+});
+
+test('binaryVersionResolved mirrors the version-mismatch diagnosis', () => {
+  const { binaryVersionResolved } = require('./doctor');
+  const stub = (o) => ({ find: () => '/bin/cg', readVersion: () => '1.0.0', pluginVersion: () => '1.0.0', ...o });
+  assert.equal(binaryVersionResolved(stub({})), true, 'versions agree → resolved');
+  assert.equal(binaryVersionResolved(stub({ readVersion: () => '0.9.0' })), false, 'still behind → unresolved');
+  assert.equal(binaryVersionResolved(stub({ readVersion: () => null })), false, 'unreadable → unresolved');
+  assert.equal(binaryVersionResolved(stub({ find: () => null })), false, 'gone → unresolved');
+});
+
+test('updateIncompleteResolved mirrors the update-incomplete diagnosis', () => {
+  const { updateIncompleteResolved } = require('./doctor');
+  const at = (state) => updateIncompleteResolved({ readStateFile: () => state });
+  assert.equal(at({ updateAvailable: true, binaryUpdated: false }), false,
+    'the exact state that raised the issue is still unresolved');
+  assert.equal(at({ updateAvailable: true, binaryUpdated: true }), true, 'the binary landed');
+  assert.equal(at({ updateAvailable: false, binaryUpdated: false }), true, 'no update pending');
+  assert.equal(at(null), true, 'no state file → nothing left to complete');
+});
+
+test('autoUpdateNoOpReason names why the updater did nothing (closes the doctor loop)', () => {
+  const { autoUpdateNoOpReason } = require('./doctor');
+  const { MAX_UPDATE_ATTEMPTS } = require('./auto-update');
+  const suspended = {
+    latestVersion: '9.9.9', updateAttempts: MAX_UPDATE_ATTEMPTS,
+    suspendedAt: new Date().toISOString(),
+  };
+  // The suspension notice tells the user to run doctor; doctor must not then be
+  // the one surface that fails to mention the suspension.
+  assert.match(autoUpdateNoOpReason(suspended, {}), /SUSPENDED after 5 failed attempts on v9\.9\.9/);
+  assert.match(autoUpdateNoOpReason({ rateLimited: true }, {}), /rate-limit backoff/);
+  assert.match(autoUpdateNoOpReason(suspended, { CODE_GRAPH_NO_AUTO_UPDATE: '1' }),
+    /CODE_GRAPH_NO_AUTO_UPDATE=1/, 'the opt-out outranks every state, since nothing runs at all');
+  assert.equal(autoUpdateNoOpReason({ updateAvailable: true, updateAttempts: 1 }, {}), null,
+    'no known blocker → say nothing rather than invent a cause');
+  assert.equal(autoUpdateNoOpReason(null, {}), null);
+});

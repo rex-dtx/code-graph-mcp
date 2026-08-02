@@ -7507,3 +7507,575 @@ fn test_cli_json_error_path_outside_root_emits_error_object() {
         assert!(v.get("error").is_some(), "{args:?} error key; got: {v}");
     }
 }
+
+// --- health-check integrity + version-staleness parity (audit DB-1 / DB-3) ---
+
+/// Build a tiny indexed project and return it. Separate from
+/// `setup_indexed_project` so these tests own a minimal, fast fixture.
+fn setup_tiny_indexed_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.ts"),
+        "export function alpha(): number { return 1; }\nexport function beta(): number { return alpha(); }\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+    project
+}
+
+/// Rewind `application_id` (where INDEX_VERSION lives) so a reader open reports
+/// `index_version_stale`, exactly as it would for an index built by an older
+/// extractor generation. Must be the LAST write: a later indexer open restamps it.
+fn make_index_version_stale(project: &TempDir) {
+    let db_path = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open_nondestructive(&db_path).unwrap();
+    db.conn()
+        .execute_batch(&format!(
+            "PRAGMA application_id = {};",
+            code_graph_mcp::domain::INDEX_VERSION - 1
+        ))
+        .unwrap();
+    drop(db);
+}
+
+/// DB-1: `healthy` used to be `schema_ok && nodes>0 && files>0` — no integrity
+/// signal at all. Both output faces must now carry the three probes.
+#[test]
+fn test_cli_health_check_reports_integrity_in_json_face() {
+    let project = setup_tiny_indexed_project();
+    let (out, err, code) = run_cli(&project, &["health-check", "--json"]);
+    assert_eq!(code, 0, "healthy index; stderr: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let integ = v
+        .get("integrity")
+        .unwrap_or_else(|| panic!("health-check --json must carry integrity; got: {v}"));
+    assert_eq!(
+        integ.get("quick_check").and_then(|q| q.as_str()),
+        Some("ok"),
+        "a freshly built index must pass quick_check; got: {integ}"
+    );
+    assert_eq!(
+        integ.get("fts_drift").and_then(|d| d.as_i64()),
+        Some(0),
+        "nodes and the FTS index must agree on a fresh build; got: {integ}"
+    );
+    // Structure-only builds have no vec table → null, never a bogus 0 count.
+    let orphans = integ.get("orphan_vectors").unwrap();
+    assert!(
+        orphans.is_null() || orphans.as_i64() == Some(0),
+        "orphan_vectors must be 0 or unavailable on a fresh index; got: {integ}"
+    );
+}
+
+#[test]
+fn test_cli_health_check_reports_integrity_in_text_face() {
+    let project = setup_tiny_indexed_project();
+    let (out, err, code) = run_cli(&project, &["health-check"]);
+    assert_eq!(code, 0, "healthy index; stderr: {err}");
+    assert!(
+        out.contains("Integrity: quick_check ok"),
+        "the human face must state the integrity verdict too; got:\n{out}"
+    );
+    assert!(
+        out.contains("FTS drift 0"),
+        "FTS drift must be visible in the text face; got:\n{out}"
+    );
+}
+
+/// DB-3: the JSON face has reported `issue: "…rebuild pending"` for a
+/// version-lagging index all along while the text face printed a bare `OK:` —
+/// the same command answering a script and a human differently. Assert BOTH.
+#[test]
+fn test_cli_health_check_index_version_stale_appears_in_both_faces() {
+    let project = setup_tiny_indexed_project();
+    make_index_version_stale(&project);
+
+    let (json_out, _e, json_code) = run_cli(&project, &["health-check", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(json_out.trim()).unwrap();
+    assert_eq!(
+        v.get("index_version_stale").and_then(|s| s.as_bool()),
+        Some(true),
+        "fixture precondition: the index must read as version-stale; got: {v}"
+    );
+    assert!(
+        v.get("issue")
+            .and_then(|i| i.as_str())
+            .unwrap_or_default()
+            .contains("rebuild pending"),
+        "JSON face must keep naming the owed rebuild; got: {v}"
+    );
+    // Version staleness is not an unhealthy index — the data is usable.
+    assert_eq!(json_code, 0, "a stale-but-usable index stays exit 0");
+
+    let (text_out, text_err, text_code) = run_cli(&project, &["health-check"]);
+    assert_eq!(text_code, 0);
+    let text = format!("{text_out}{text_err}");
+    assert!(
+        text.contains("Index version: STALE"),
+        "the text face must report the SAME stale verdict as the JSON face \
+         (DB-3: it said only `OK:`); got:\n{text}"
+    );
+    assert!(
+        text.contains("reindex"),
+        "the stale line must name the fix; got:\n{text}"
+    );
+}
+
+/// The discriminating case for DB-1: an index whose PAGES no longer read back.
+/// Before the integrity probe, this exact database reported `"healthy": true`
+/// with exit 0 — `healthy` only ever meant "right schema, non-empty".
+///
+/// Fixture note: page 4 (offset 4096*3) of this fixture is a live table b-tree
+/// page. That is deliberate and narrow — corrupting the whole file instead would
+/// break `get_index_status` first and never reach the probe, while corrupting
+/// page 1 would make SQLite refuse to open at all. If a schema change relocates
+/// the page this test fails loudly rather than silently passing.
+#[test]
+fn test_cli_health_check_flags_page_level_corruption() {
+    use std::io::{Seek, SeekFrom, Write};
+    let project = setup_tiny_indexed_project();
+    let db_path = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+
+    const CORRUPT_AT: u64 = 4096 * 3;
+    let len = std::fs::metadata(&db_path).unwrap().len();
+    assert!(
+        len > CORRUPT_AT + 300,
+        "fixture precondition: the index must be big enough to hold page 4 (got {len} bytes)"
+    );
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db_path)
+        .unwrap();
+    f.seek(SeekFrom::Start(CORRUPT_AT)).unwrap();
+    f.write_all(&[0xAB; 300]).unwrap();
+    drop(f);
+
+    let (out, err, code) = run_cli(&project, &["health-check", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|_| panic!("must still emit JSON on a corrupt index; got {out:?} {err:?}"));
+    let quick = v
+        .pointer("/integrity/quick_check")
+        .and_then(|q| q.as_str())
+        .unwrap_or("");
+    assert!(
+        quick != "ok" && !quick.is_empty(),
+        "quick_check must report the damaged page; got integrity: {}",
+        v.get("integrity").unwrap()
+    );
+    assert_eq!(
+        v.get("healthy").and_then(|h| h.as_bool()),
+        Some(false),
+        "a database whose pages do not read back is not healthy; got: {v}"
+    );
+    assert!(
+        v.get("issue")
+            .and_then(|i| i.as_str())
+            .unwrap_or_default()
+            .contains("integrity check failed"),
+        "the issue must name corruption so the caller knows to rebuild; got: {v}"
+    );
+    assert_eq!(code, 1, "unhealthy must exit 1");
+
+    // The read-only poll must not have destroyed the evidence.
+    assert!(
+        db_path.exists(),
+        "health-check is a reader — it must report corruption, not delete the index"
+    );
+
+    // Text face reaches the SAME verdict (the DB-3 class of bug is two faces
+    // disagreeing; a new check must not reintroduce it).
+    let (t_out, t_err, t_code) = run_cli(&project, &["health-check"]);
+    let text = format!("{t_out}{t_err}");
+    assert!(
+        text.contains("integrity check failed"),
+        "text face must report corruption too; got:\n{text}"
+    );
+    assert_eq!(t_code, 1);
+}
+
+/// Proves the FTS drift probe is DISCRIMINATING. The obvious spelling —
+/// `COUNT(*) FROM nodes` vs `COUNT(*) FROM nodes_fts` — cannot fail: `nodes_fts`
+/// is an external-content table (`content='nodes'`), so counting it reads
+/// through to `nodes` and returns the same number no matter what the FTS index
+/// actually holds. This test drops one document from the FTS5 shadow table,
+/// leaving `nodes` untouched: the vacuous spelling still reports drift 0, the
+/// shipped one reports 1.
+#[test]
+fn test_cli_health_check_fts_drift_detects_a_lost_fts_document() {
+    let project = setup_tiny_indexed_project();
+    let db_path = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    {
+        let db = code_graph_mcp::storage::db::Database::open_nondestructive(&db_path).unwrap();
+        db.conn()
+            .execute_batch(
+                "DELETE FROM nodes_fts_docsize WHERE id = (SELECT MIN(id) FROM nodes_fts_docsize);",
+            )
+            .unwrap();
+    }
+
+    let (out, err, _code) = run_cli(&project, &["health-check", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|_| panic!("got {out:?} {err:?}"));
+    assert_eq!(
+        v.pointer("/integrity/fts_drift").and_then(|d| d.as_i64()),
+        Some(1),
+        "one node indexed by `nodes` but missing from the FTS index must read as \
+         drift 1 — search silently misses that symbol; got: {}",
+        v.get("integrity").unwrap()
+    );
+    let (t_out, _t_err, _c) = run_cli(&project, &["health-check"]);
+    assert!(
+        t_out.contains("FTS drift 1"),
+        "the text face must carry the same number; got:\n{t_out}"
+    );
+}
+
+// --- report freshness (audit FRS-5) + CLI .gitignore (DB-4) ---
+
+/// `report` prints dead-code `file:line` straight from the index and had NO
+/// query-time refresh, while its standalone sibling `dead-code` has had one
+/// since the shared resync landed. Editing above a dead symbol therefore made
+/// `report` cite a line the symbol no longer occupies — with no disclosure.
+#[test]
+fn test_cli_report_refreshes_dead_code_line_numbers_after_an_edit() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // `orphan` is called by nobody and spans >3 lines, so find_dead_code's
+    // min_lines=3 floor (hard-coded in cmd_report) keeps it.
+    let orphan =
+        "export function orphan(): number {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}\n";
+    std::fs::write(src.join("a.ts"), orphan).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let line_of = |out: &str| -> i64 {
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        v["dead_code"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "orphan")
+            .unwrap_or_else(|| panic!("orphan must be reported as dead code; got: {v}"))["line"]
+            .as_i64()
+            .unwrap()
+    };
+
+    let (before, _e, code) = run_cli(&project, &["report", "--json"]);
+    assert_eq!(code, 0);
+    let before_line = line_of(&before);
+    assert_eq!(before_line, 1, "fixture: orphan starts at line 1");
+
+    // Push the symbol down by 3 lines WITHOUT reindexing — the "edited, then
+    // immediately queried" shape the resync exists for.
+    std::fs::write(src.join("a.ts"), format!("// x\n// y\n// z\n{orphan}")).unwrap();
+
+    let (after, _e2, code2) = run_cli(&project, &["report", "--json"]);
+    assert_eq!(code2, 0);
+    assert_eq!(
+        line_of(&after),
+        before_line + 3,
+        "report must re-index the edited file before printing its line numbers \
+         (FRS-5); got:\n{after}"
+    );
+}
+
+/// DB-4: writing `.code-graph/` to `.gitignore` lived only in the MCP server's
+/// `from_project_root`, so a pure-CLI user (hook-driven indexing, server never
+/// started) got an untracked 100 MB index that `git add -A` would commit.
+#[test]
+fn test_cli_incremental_index_gitignores_the_index_dir() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.ts"), "export function alpha() {}\n").unwrap();
+    // main.rs skips indexing a root with neither .git nor an existing index.
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+
+    let (_o, err, code) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let gitignore = project.path().join(".gitignore");
+    let content = std::fs::read_to_string(&gitignore)
+        .unwrap_or_else(|e| panic!("CLI indexing must create .gitignore: {e}"));
+    assert!(
+        content
+            .lines()
+            .any(|l| l.trim().trim_end_matches('/') == ".code-graph"),
+        "the index dir must be ignored; got: {content:?}"
+    );
+
+    // Idempotent: a second run must not append a duplicate line.
+    let (_o2, _e2, code2) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
+    assert_eq!(code2, 0);
+    let content2 = std::fs::read_to_string(&gitignore).unwrap();
+    assert_eq!(content, content2, "second run must not re-append");
+}
+
+// --- worktree read-side root split (audit FRS-4, sibling of 5eb80c6) ---
+
+/// The write-side worktree fix (5eb80c6) routed all 9 refresh call sites through
+/// `ctx.project_root`, but `show --context-lines` still sliced source bytes out
+/// of the RAW `project_root` while its line numbers came from the main
+/// checkout's index — so the moment the branch's content diverged, `show`
+/// printed whatever happened to sit on those lines in the worktree.
+///
+/// The existing worktree e2e (`..._falls_back_to_main_index`) cannot see this:
+/// its worktree is on the same commit, so both roots hold identical bytes. This
+/// one forks the content on purpose.
+#[test]
+fn test_cli_show_context_lines_reads_the_indexed_checkout_not_the_worktree() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let main = root.path().join("main");
+    let src = main.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("auth.ts"),
+        "export function hashPassword(p: string): string { return MAIN_MARKER(p); }\n",
+    )
+    .unwrap();
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"], &main);
+    git(&["add", "."], &main);
+    git(&["commit", "-qm", "init"], &main);
+
+    // Index the MAIN checkout only — the worktree gets no index of its own, so
+    // reads fall back to this one (effective_read_root).
+    let db_dir = main.join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, &main, None, None).unwrap();
+    drop(db);
+
+    let wt = root.path().join("wt");
+    git(
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"],
+        &main,
+    );
+    assert!(
+        wt.join(".git").is_file(),
+        "fixture must be a LINKED worktree"
+    );
+    // THE FORK: same path, different bytes, and hashPassword no longer sits on
+    // line 1. Line 1 in the worktree is now unrelated content.
+    std::fs::write(
+        wt.join("src/auth.ts"),
+        "// worktree-only line A\n// worktree-only line B\n\
+         export function hashPassword(p: string): string { return WORKTREE_MARKER(p); }\n",
+    )
+    .unwrap();
+
+    // --context-lines MUST be > 0: at 0, cmd_show prints the index's stored
+    // code_content and never calls read_source_context, so the divergence this
+    // test exists for is unreachable (the first draft used 0 and stayed green
+    // against the unfixed code).
+    let out = Command::new(binary_path())
+        .args(["show", "hashPassword", "--context-lines", "1", "--json"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("show --json must parse; got {stdout:?} {stderr:?}"));
+    let code_content = v[0]["code_content"].as_str().unwrap_or_default();
+
+    assert!(
+        code_content.contains("MAIN_MARKER"),
+        "start_line comes from the MAIN checkout's index, so the bytes must come \
+         from the main checkout too (FRS-4); got code_content: {code_content:?}"
+    );
+    assert!(
+        !code_content.contains("worktree-only line"),
+        "slicing the WORKTREE's bytes at the main index's line numbers prints \
+         unrelated lines — the exact defect; got: {code_content:?}"
+    );
+
+    // Parallel path: the human arm reads source through the same helper and was
+    // changed in the same way, so it needs its own assertion — a green JSON arm
+    // says nothing about it.
+    let text_out = Command::new(binary_path())
+        .args(["show", "hashPassword", "--context-lines", "1"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text_out.stdout).to_string();
+    assert!(
+        text.contains("MAIN_MARKER") && !text.contains("worktree-only line"),
+        "the text arm must read the indexed checkout too; got:\n{text}"
+    );
+}
+
+/// `deps`' barrel fallback is the sibling reader: it echoes source lines WITH
+/// line numbers, from the same raw root.
+#[test]
+fn test_cli_deps_barrel_scan_reads_the_indexed_checkout_not_the_worktree() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let main = root.path().join("main");
+    let src = main.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // A Rust-style barrel: `pub mod` lines with no tracked dep edges, which is
+    // what drives cmd_deps into scan_barrel_patterns.
+    std::fs::write(src.join("mod.rs"), "pub mod main_only;\n").unwrap();
+    std::fs::write(src.join("main_only.rs"), "pub fn f() {}\n").unwrap();
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"], &main);
+    git(&["add", "."], &main);
+    git(&["commit", "-qm", "init"], &main);
+    let db_dir = main.join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, &main, None, None).unwrap();
+    drop(db);
+
+    let wt = root.path().join("wt");
+    git(
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"],
+        &main,
+    );
+    std::fs::write(wt.join("src/mod.rs"), "pub mod worktree_only;\n").unwrap();
+
+    let out = Command::new(binary_path())
+        .args(["deps", "src/mod.rs", "--json"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Only assert the divergence when the barrel-scan fallback actually fired —
+    // if the graph gained tracked edges for this file the branch is not reached,
+    // and asserting on it would be testing a path that did not run.
+    if stdout.contains("barrel_scan") {
+        assert!(
+            stdout.contains("main_only"),
+            "barrel_scan must echo the checkout the index describes (FRS-4); got:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("worktree_only"),
+            "echoing the WORKTREE's lines under the main index's numbering is the \
+             defect; got:\n{stdout}"
+        );
+    } else {
+        assert!(
+            stdout.contains("main_only") && !stdout.contains("worktree_only"),
+            "deps answered from the graph; it must still describe the indexed \
+             checkout; got:\n{stdout} {stderr}"
+        );
+    }
+
+    // Third reader in the same command: the "does this file exist?" probe that
+    // picks between the "not a barrel/import file" and "File not found"
+    // diagnoses. Delete the file from the WORKTREE only — it still exists in the
+    // checkout the index describes, so the honest answer is the former.
+    std::fs::remove_file(wt.join("src/main_only.rs")).unwrap();
+    let out2 = Command::new(binary_path())
+        .args(["deps", "src/main_only.rs", "--json"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout2.trim())
+        .unwrap_or_else(|_| panic!("deps --json must parse; got {stdout2:?}"));
+    let err_msg = v.get("error").and_then(|e| e.as_str()).unwrap_or_default();
+    assert!(
+        !err_msg.contains("File not found"),
+        "the file exists in the indexed checkout — judging existence against the \
+         worktree reports a phantom missing file (FRS-4); got: {v}"
+    );
+}
+
+/// The size gate must be VISIBLE, not silent, and `--deep` must defeat it —
+/// otherwise a large index quietly loses the integrity signal with no way to
+/// ask for it. `CODE_GRAPH_INTEGRITY_MAX_BYTES` stands in for a 128 MB index.
+#[test]
+fn test_cli_health_check_size_gate_is_disclosed_and_deep_overrides_it() {
+    let project = setup_tiny_indexed_project();
+
+    let (skipped, _e, _c) = run_cli_env(
+        &project,
+        &["health-check", "--json"],
+        &[("CODE_GRAPH_INTEGRITY_MAX_BYTES", "1")],
+    );
+    let v: serde_json::Value = serde_json::from_str(skipped.trim()).unwrap();
+    assert_eq!(
+        v.pointer("/integrity/quick_check").and_then(|q| q.as_str()),
+        Some("skipped_large"),
+        "over the ceiling the skip must be stated, not blank; got: {v}"
+    );
+    assert_eq!(
+        v.get("healthy").and_then(|h| h.as_bool()),
+        Some(true),
+        "a SKIPPED check is not a failed check — it must not flip healthy; got: {v}"
+    );
+
+    let (deep, _e2, _c2) = run_cli_env(
+        &project,
+        &["health-check", "--json", "--deep"],
+        &[("CODE_GRAPH_INTEGRITY_MAX_BYTES", "1")],
+    );
+    let v2: serde_json::Value = serde_json::from_str(deep.trim()).unwrap();
+    assert_eq!(
+        v2.pointer("/integrity/quick_check")
+            .and_then(|q| q.as_str()),
+        Some("ok"),
+        "--deep must run the pragma regardless of the ceiling; got: {v2}"
+    );
+}

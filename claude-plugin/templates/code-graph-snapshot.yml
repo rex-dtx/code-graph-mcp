@@ -3,7 +3,13 @@
 # small (~3-5MB) zstd-compressed SQLite database that lets first-time
 # clones of your repo skip the initial full code-graph index.
 #
-# Requires: code-graph-mcp >= 0.23.0 published to npm.
+# Requires: @sdsrs/code-graph >= 0.23.0 published to npm.
+#
+# The package name is `@sdsrs/code-graph` (the `code-graph-mcp` binary lives
+# inside it). Do NOT shorten this to `npx -y code-graph-mcp` — that unscoped
+# name belongs to an unrelated publisher on npm, and `npx -y` would install and
+# execute their package in your CI with whatever permissions this job holds.
+# Bump the pinned version below when you want a newer snapshot format.
 
 name: Code Graph Snapshot
 on:
@@ -24,7 +30,7 @@ jobs:
           node-version: '20'
       - name: Build snapshot
         run: |
-          npx -y code-graph-mcp@latest snapshot create --out snapshot.db
+          npx -y -p @sdsrs/code-graph@0.113.0 code-graph-mcp snapshot create --out snapshot.db
           zstd -9 snapshot.db -o snapshot.db.zst
           mv snapshot.db.zst "code-graph-snapshot-${GITHUB_SHA:0:7}.db.zst"
       - name: Upload to release

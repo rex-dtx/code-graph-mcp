@@ -886,6 +886,10 @@ fn build_full_index_at(
         std::fs::create_dir_all(parent)?;
         cleanup_legacy_db_files(parent);
     }
+    // Same `.gitignore` upkeep the MCP server does when IT creates the dir — a
+    // pure-CLI install (hook-driven indexing, server never started) otherwise
+    // leaves `?? .code-graph/` for `git add -A` to commit (audit DB-4).
+    crate::utils::gitignore::ensure_code_graph_dir_ignored(project_root);
     // Open with vec support so embeddings can be stored.
     let db = Database::open_with_vec(db_path)?;
     use crate::indexer::pipeline::run_full_index;
@@ -929,28 +933,95 @@ fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Result<()> {
     embed_missing_nodes(db, quiet)
 }
 
-/// Warn (stderr) if another process holds the index lock. A running MCP server holds
-/// the flock for its whole lifetime, so a CLI rebuild/incremental now would race its
-/// writes. Best-effort and non-blocking — the run still proceeds (the user may have
-/// stopped the server or accept the risk); we only surface the hazard. Silenced by
-/// `quiet`. (P2 L7)
+/// Warn if another process holds the index lock. A running MCP server holds the
+/// flock for its whole lifetime, so a CLI incremental index now would race its
+/// writes. Best-effort and non-blocking — the run still proceeds (the incremental
+/// path shares one index.db through SQLite's own locking, so the worst case is
+/// contention, not loss); we only surface the hazard.
+///
+/// `quiet` suppresses the stderr line ONLY. The probe itself always runs and the
+/// finding always reaches `tracing` (same split as `warn_parse_errors`): a flag
+/// whose job is to keep hook output clean must not also decide whether a hazard
+/// is looked for. Destructive callers use
+/// [`ensure_index_unlocked_for_replace`] instead — for them this is a refusal,
+/// not a warning.
 fn warn_if_index_locked(code_graph_dir: &Path, quiet: bool) {
-    if quiet {
+    if !crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
         return;
     }
-    if crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
+    let lock = code_graph_dir.join("index.lock");
+    tracing::warn!(
+        "another process holds the index lock at {} — indexing now may race its writes",
+        lock.display()
+    );
+    if !quiet {
         eprintln!(
             "[code-graph] Warning: another process (likely a running MCP server) holds \
              the index lock at {}. Indexing now may race its writes — stop the server \
              first if results look inconsistent.",
-            code_graph_dir.join("index.lock").display()
+            lock.display()
         );
     }
+}
+
+/// Gate for commands that REPLACE `index.db` wholesale (`rebuild-index`'s atomic
+/// rename, `reindex --from-snapshot`'s unlink).
+///
+/// A running MCP server holds an open fd on `index.db`. POSIX `rename(2)` /
+/// `unlink(2)` swap the directory entry but leave that fd pointing at the old,
+/// now-unlinked inode — so every subsequent write from that server (watcher
+/// increments, embedding backfill) lands in a deleted file and is lost the
+/// moment it closes, while its queries keep answering from the pre-rebuild
+/// snapshot. Nothing detects it; the user sees a rebuild that "worked" and a
+/// server that never picks it up. The MCP `rebuild_index` tool avoids the same
+/// inode trap by rebuilding inside one transaction, and snapshot install avoids
+/// it by landing before the DB is opened — this path was the one left unguarded
+/// (audit 2026-08-02 P1-3).
+///
+/// Refusing is therefore the safe default; `--force` is the escape hatch for a
+/// user who knows the lock holder is defunct. As with `warn_if_index_locked`,
+/// `quiet` gates printing, never probing.
+fn ensure_index_unlocked_for_replace(
+    code_graph_dir: &Path,
+    force: bool,
+    quiet: bool,
+) -> Result<()> {
+    if !crate::mcp::server::other_process_holds_index_lock(code_graph_dir) {
+        return Ok(());
+    }
+    let lock = code_graph_dir.join("index.lock");
+    if !force {
+        anyhow::bail!(
+            "another process (likely a running MCP server) holds the index lock at {}. \
+             Replacing index.db now would leave that process writing into a deleted file — \
+             its indexing and embedding work would be lost silently, and its answers would \
+             stay on the pre-rebuild index until it restarts.\n  \
+             Stop the MCP server first (end the Claude Code session using this project), \
+             then rerun. Pass --force to replace the index anyway.",
+            lock.display()
+        );
+    }
+    tracing::warn!(
+        "--force: replacing index.db while another process holds {} — its pending writes will be lost",
+        lock.display()
+    );
+    if !quiet {
+        eprintln!(
+            "[code-graph] --force: another process holds the index lock at {}. \
+             Replacing the index anyway — that process's pending writes will be lost.",
+            lock.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn cmd_incremental_index(project_root: &Path, quiet: bool, no_embed: bool) -> Result<()> {
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     warn_if_index_locked(&project_root.join(CODE_GRAPH_DIR), quiet);
+    // Covers the incremental path too, not just the full-index one inside
+    // build_full_index_at: an index created before this existed (or by a user
+    // who removed the line) gets the entry back on the next run (audit DB-4).
+    crate::utils::gitignore::ensure_code_graph_dir_ignored(project_root);
 
     // The plugin hooks run this command periodically even when no MCP server is
     // alive — exactly the window where a killed server's indexing-status.json
@@ -1022,6 +1093,10 @@ pub struct RebuildIndexArgs {
     /// Index structure only and skip embeddings (vectors backfill later).
     #[arg(long)]
     pub no_embed: bool,
+    /// Rebuild even while another process holds the index lock (its pending
+    /// writes are lost — stop the MCP server instead when you can).
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<()> {
@@ -1048,7 +1123,8 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
     }
     let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
     let db_path = code_graph_dir.join("index.db");
-    warn_if_index_locked(&code_graph_dir, quiet);
+    // Before any work: refuse to rename over an index another process has open.
+    ensure_index_unlocked_for_replace(&code_graph_dir, args.force, quiet)?;
 
     // Atomic rebuild: build the fresh index into a temp file in the SAME dir,
     // then rename it over index.db in one syscall. Concurrent readers (a second
@@ -1127,6 +1203,9 @@ pub struct HealthCheckArgs {
     /// Output format: oneline (default) or json
     #[arg(long)]
     pub format: Option<String>,
+    /// Run `PRAGMA quick_check` regardless of index size (see INTEGRITY_PRAGMA_MAX_BYTES)
+    #[arg(long)]
+    pub deep: bool,
 }
 
 impl HealthCheckArgs {
@@ -1166,8 +1245,148 @@ pub fn recommendation_metric_state(project_root: &Path) -> &'static str {
     }
 }
 
+/// Size ceiling above which `health-check` skips `PRAGMA quick_check`.
+///
+/// quick_check reads every page, and this command is not only a diagnostic — the
+/// statusline polls `health-check --format json` on every render, under a
+/// 1500 ms inner budget (statusline.js) whose overrun renders the segment as
+/// "offline". A/B on this repo's 110 MB index with the same binary: 0.02 s with
+/// the pragma skipped, 0.28 s with it — ~2.4 ms/MB, so an unbounded scan would
+/// trade a real signal for a broken one on exactly the largest indexes.
+///
+/// 32 MB keeps the polled path near 80 ms even when the page cache is cold,
+/// which is the case that matters: the 2.4 ms/MB above was measured warm, and a
+/// quick_check reads EVERY page, so the first render after a cold boot pays disk
+/// latency for the whole file. At 128 MB that is the exact shape that makes the
+/// statusline segment vanish — trading a real signal for a broken one on the
+/// largest indexes, which is what the gate exists to prevent.
+///
+/// Above the limit the probe reports `"skipped_large"` — visibly absent, never
+/// silently. Full verification stays reachable and routine: `--deep` ignores the
+/// gate, and `doctor` passes it, so the one-shot diagnosis (where a second of
+/// scanning costs nothing) always does the complete check.
+const INTEGRITY_PRAGMA_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Cheap read-only integrity probes for `health-check` (audit 2026-08-02 DB-1:
+/// the command's `healthy` was `schema_ok && nodes>0 && files>0`, so page-level
+/// corruption, an FTS index that stopped tracking `nodes`, and orphaned vectors
+/// were all invisible).
+///
+/// Every field is `Option`: `None` means "could not be measured" (pragma error
+/// under writer contention, table absent in a no-vec index), which must never be
+/// reported as a fault. Only a quick_check that *ran* and *complained* counts as
+/// corruption.
+struct IndexIntegrity {
+    /// `PRAGMA quick_check` verdict: `"ok"`, SQLite's first complaint, or
+    /// `"skipped_large"` when the DB exceeds [`INTEGRITY_PRAGMA_MAX_BYTES`].
+    quick_check: Option<String>,
+    /// `COUNT(nodes)` − rows the FTS5 index actually holds. Non-zero means
+    /// search silently misses (or invents) symbols.
+    fts_drift: Option<i64>,
+    /// Vectors whose node is gone — dead weight that also skews coverage math.
+    orphan_vectors: Option<i64>,
+}
+
+impl IndexIntegrity {
+    fn probe(conn: &rusqlite::Connection, db_size_bytes: u64, deep: bool) -> Self {
+        // Overridable so the skip branch is testable without materializing a
+        // 128 MB index (same escape-hatch shape as CODE_GRAPH_RESYNC_BUDGET and
+        // CODE_GRAPH_RG_ARGV_BUDGET), and so a user on slow storage can tighten
+        // it without waiting for a release.
+        let ceiling = std::env::var("CODE_GRAPH_INTEGRITY_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(INTEGRITY_PRAGMA_MAX_BYTES);
+        let quick_check = if !deep && db_size_bytes > ceiling {
+            Some("skipped_large".to_string())
+        } else {
+            conn.query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0))
+                .ok()
+        };
+
+        // NOT `COUNT(*) FROM nodes_fts`: `nodes_fts` is an EXTERNAL-CONTENT table
+        // (`content='nodes'`, schema.rs:64), so counting it reads through to
+        // `nodes` and can only ever return `COUNT(nodes)` — a control that
+        // cannot fail, which is how a drift check gets shipped that never
+        // detects drift. `nodes_fts_docsize` is the FTS5 shadow table with one
+        // row per document the index really holds, maintained by the triggers,
+        // so it moves independently of the content table.
+        let fts_drift = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM nodes) - (SELECT COUNT(*) FROM nodes_fts_docsize)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok();
+
+        // Guarded by the sqlite_master probe (same shape as
+        // queries::count_nodes_with_vectors): `node_vectors` is a vec0 virtual
+        // table, absent from a structure-only index.
+        let orphan_vectors = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_vectors'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+            .filter(|present: &i64| *present > 0)
+            .and_then(|_| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM node_vectors WHERE node_id NOT IN (SELECT id FROM nodes)",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+            });
+
+        Self {
+            quick_check,
+            fts_drift,
+            orphan_vectors,
+        }
+    }
+
+    /// The one finding severe enough to flip `healthy` — the DB pages themselves
+    /// do not read back. A skipped or unmeasurable check is NOT corruption.
+    fn corruption_reason(&self) -> Option<&str> {
+        match self.quick_check.as_deref() {
+            Some("ok") | Some("skipped_large") | None => None,
+            Some(msg) => Some(msg),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "quick_check": self.quick_check,
+            "fts_drift": self.fts_drift,
+            "orphan_vectors": self.orphan_vectors,
+        })
+    }
+
+    /// One human line, printed on the healthy and unhealthy paths alike so the
+    /// two output faces never disagree about what was checked.
+    fn to_line(&self) -> String {
+        let fmt_count = |v: Option<i64>| match v {
+            Some(n) => n.to_string(),
+            None => "unavailable".to_string(),
+        };
+        format!(
+            "Integrity: quick_check {} · FTS drift {} · orphan vectors {}",
+            self.quick_check.as_deref().unwrap_or("unavailable"),
+            fmt_count(self.fts_drift),
+            fmt_count(self.orphan_vectors),
+        )
+    }
+}
+
 /// Run health check and print status, including index freshness.
 pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
+    cmd_health_check_opts(project_root, format, false)
+}
+
+/// `cmd_health_check` with the `--deep` toggle. Kept as a separate entry point so
+/// the existing two-argument signature (main.rs, tests) stays intact.
+pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> Result<()> {
     // JSON callers (doctor.js, scripts, MCP UIs) need a parseable response
     // even when the index is missing — bailing with a stderr-only anyhow error
     // forces them to grep messages instead of reading JSON fields.
@@ -1214,7 +1433,11 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
     let expected_schema = crate::storage::schema::SCHEMA_VERSION;
     let schema_ok = status.schema_version == expected_schema;
     let has_data = status.nodes_count > 0 && status.files_count > 0;
-    let healthy = schema_ok && has_data;
+    // DB-1: `healthy` used to mean only "right schema, non-empty". A database
+    // whose pages no longer read back reported OK right up until a query hit the
+    // damaged page.
+    let integrity = IndexIntegrity::probe(conn, status.db_size_bytes.max(0) as u64, deep);
+    let healthy = schema_ok && has_data && integrity.corruption_reason().is_none();
 
     // Compute index age from last_indexed_at (unix timestamp in seconds)
     let age_str = status.last_indexed_at.map(|ts| {
@@ -1347,6 +1570,7 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                 "snapshot": snapshot_block,
                 "conversion_metric": recommendation_metric_state(project_root),
                 "index_version_stale": index_version_stale.is_some(),
+                "integrity": integrity.to_json(),
             });
             // Additive field: absent when no download was ever recorded, which
             // is itself the "never attempted" diagnosis.
@@ -1362,7 +1586,15 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
             if let Some(ref age) = age_str {
                 json["index_age"] = serde_json::json!(age);
             }
-            if !schema_ok {
+            // Corruption outranks the other diagnoses: a bad page makes the
+            // schema/emptiness verdicts unreliable in the first place.
+            if let Some(reason) = integrity.corruption_reason() {
+                json["issue"] = serde_json::json!(format!(
+                    "database integrity check failed: {}. The index is a rebuildable cache — run: \
+                     code-graph-mcp rebuild-index --confirm",
+                    reason
+                ));
+            } else if !schema_ok {
                 json["issue"] = serde_json::json!(format!(
                     "schema version mismatch: got {}, expected {}",
                     status.schema_version, expected_schema
@@ -1449,16 +1681,40 @@ pub fn cmd_health_check(project_root: &Path, format: &str) -> Result<()> {
                         other => other.to_string(),
                     }
                 );
+                println!("{}", integrity.to_line());
+                // DB-3: the JSON face has reported `issue: "…rebuild pending"`
+                // for a version-lagging index since it was added, while this one
+                // printed a bare "OK" — the same command telling a human and a
+                // script opposite things about the same database.
+                if let Some(old) = index_version_stale {
+                    println!(
+                        "Index version: STALE (built by v{} ≠ v{}); results sharpen after a \
+                         rebuild — run: code-graph-mcp reindex",
+                        old,
+                        crate::domain::INDEX_VERSION
+                    );
+                }
                 print_resolution();
+            } else if let Some(reason) = integrity.corruption_reason() {
+                eprintln!(
+                    "UNHEALTHY: database integrity check failed: {}. The index is a rebuildable \
+                     cache — run: code-graph-mcp rebuild-index --confirm",
+                    reason
+                );
+                eprintln!("{}", integrity.to_line());
+                print_resolution();
+                std::process::exit(1);
             } else if !schema_ok {
                 eprintln!(
                     "UNHEALTHY: schema version mismatch (got {}, expected {})",
                     status.schema_version, expected_schema
                 );
+                eprintln!("{}", integrity.to_line());
                 print_resolution();
                 std::process::exit(1);
             } else {
                 eprintln!("UNHEALTHY: index is empty");
+                eprintln!("{}", integrity.to_line());
                 print_resolution();
                 std::process::exit(1);
             }
@@ -6230,7 +6486,13 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             });
             if !compact {
                 if context_lines > 0 {
-                    if let Some(code) = read_source_context(project_root, fp, node.start_line, node.end_line, context_lines) {
+                    // ctx.project_root, NOT the raw one: from a linked worktree
+                    // with no own index, CliContext reads the MAIN checkout's
+                    // index (effective_read_root), so start_line/end_line below
+                    // are the main checkout's. Slicing the WORKTREE's bytes at
+                    // those offsets prints whatever happens to sit on those lines
+                    // on the other branch (audit 2026-08-02 FRS-4).
+                    if let Some(code) = read_source_context(&ctx.project_root, fp, node.start_line, node.end_line, context_lines) {
                         obj["code_content"] = serde_json::json!(code);
                     } else {
                         obj["code_content"] = serde_json::json!(node.code_content);
@@ -6289,8 +6551,9 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         writeln!(stdout, "{}", format_node_compact(node, fp))?;
         if !compact {
             if context_lines > 0 {
+                // Same worktree-aware root as the JSON arm above (FRS-4).
                 if let Some(code) = read_source_context(
-                    project_root,
+                    &ctx.project_root,
                     fp,
                     node.start_line,
                     node.end_line,
@@ -6784,7 +7047,11 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
     if deps.is_empty() {
         // Barrel / index-file fallback — scan source for re-export / import lines.
         // Rust `mod.rs` with only `pub mod X;` has no tracked edges in the graph.
-        if let Some(lines) = scan_barrel_patterns(project_root, file_path) {
+        // ctx.project_root: the barrel scan echoes source lines WITH line
+        // numbers, so it must read the same checkout the index describes — the
+        // main one when this runs from a linked worktree (FRS-4, sibling of the
+        // `show --context-lines` fix).
+        if let Some(lines) = scan_barrel_patterns(&ctx.project_root, file_path) {
             let mut stdout = std::io::stdout().lock();
             if json_mode {
                 let result = serde_json::json!({
@@ -6809,7 +7076,10 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
             }
             return Ok(());
         }
-        let abs_path = project_root.join(file_path);
+        // Existence is judged against the checkout the index describes too —
+        // otherwise a file that exists only on the worktree's branch is reported
+        // as "no tracked dependencies" instead of "not found", and vice versa.
+        let abs_path = ctx.project_root.join(file_path);
         let file_exists = abs_path.is_file();
         // A directory reaches here too (get_import_tree finds no file-node, the
         // barrel scan can't read it). Distinguish it from a genuinely missing path
@@ -8235,6 +8505,25 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
+    // Dead code is computed FIRST so the query-time freshness resync can run
+    // before the rest of the report: this command prints dead-code start_line
+    // (JSON `line` below, and the text `file:line` rows) straight from the
+    // index, and was the one line-printing subcommand with no refresh at all —
+    // its own standalone `dead-code` command has had one since the shared resync
+    // landed (audit 2026-08-02 FRS-5). Refreshing here rather than after the
+    // other analyses also keeps the whole report on ONE index state instead of
+    // mixing pre- and post-reindex counts.
+    let run_dead = |conn: &rusqlite::Connection| {
+        crate::storage::queries::find_dead_code(conn, None, None, include_tests, 3, top as i64)
+    };
+    let mut dead = run_dead(conn)?;
+    let files: Vec<String> = dead.iter().map(|d| d.file_path.clone()).collect();
+    let freshness = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
+    if freshness.any_changed {
+        dead = run_dead(conn)?;
+    }
+    freshness.disclose();
+
     let status = crate::storage::queries::get_index_status(conn, false)?;
 
     // Edge-confidence breakdown.
@@ -8258,14 +8547,12 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
     };
     cycles.truncate(top);
     let surprising = crate::graph::surprising::surprising_connections(conn, include_tests, top)?;
-    let dead =
-        crate::storage::queries::find_dead_code(conn, None, None, include_tests, 3, top as i64)?;
 
     let mut stdout = std::io::stdout().lock();
 
     if json_mode {
         // Object envelope (sections may be empty arrays), per the CLI JSON contract.
-        let report = serde_json::json!({
+        let mut report = serde_json::json!({
             "summary": {
                 "files": status.files_count,
                 "nodes": status.nodes_count,
@@ -8293,6 +8580,9 @@ pub fn cmd_report(project_root: &Path, args: ReportArgs) -> Result<()> {
                 "name": d.name, "type": d.node_type, "file": d.file_path, "line": d.start_line,
             })).collect::<Vec<_>>(),
         });
+        // Object-shaped envelope, so the in-band marker applies (the stderr note
+        // from `disclose()` is invisible under `--json 2>/dev/null`).
+        freshness.attach_partial(&mut report);
         writeln!(stdout, "{}", serde_json::to_string(&report)?)?;
         return Ok(());
     }
@@ -8623,6 +8913,10 @@ pub struct ReindexArgs {
     /// Index structure only and skip embeddings (vectors backfill later).
     #[arg(long)]
     pub no_embed: bool,
+    /// With --from-snapshot: drop the index even while another process holds the
+    /// index lock (its pending writes are lost).
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// `reindex [--from-snapshot]` — wipe `.code-graph/` index files and re-fetch
@@ -8637,6 +8931,10 @@ pub fn cmd_reindex(project_root: &Path, args: ReindexArgs) -> Result<()> {
     let cg_dir = project_root.join(crate::domain::CODE_GRAPH_DIR);
 
     if from_snapshot && cg_dir.exists() {
+        // Same door as `rebuild-index`: unlinking index.db under a running
+        // server strands its open fd on the deleted inode (audit P1-3). Checked
+        // BEFORE the removal so a refusal leaves the index untouched.
+        ensure_index_unlocked_for_replace(&cg_dir, args.force, false)?;
         // Remove just index.db + WAL files; leave usage.jsonl etc. intact.
         for name in ["index.db", "index.db-wal", "index.db-shm"] {
             let _ = std::fs::remove_file(cg_dir.join(name));
@@ -10726,5 +11024,188 @@ mod tests {
                 "{pat} is not a long-flag spelling and must not be explained as one"
             );
         }
+    }
+
+    // --- rebuild-index / reindex concurrency gate (audit 2026-08-02 P1-3) ---
+
+    /// A project dir with one source file and an index already built, plus a
+    /// HELD `index.lock`. The guard file is returned: flock is released when it
+    /// drops, so the caller must keep it alive for the length of the assertion.
+    #[cfg(unix)]
+    fn locked_project() -> (tempfile::TempDir, std::fs::File) {
+        use std::os::unix::io::AsRawFd;
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(
+            project.path().join("src/a.ts"),
+            "export function alpha(): number { return 1; }\n",
+        )
+        .unwrap();
+        let cg = project.path().join(CODE_GRAPH_DIR);
+        std::fs::create_dir_all(&cg).unwrap();
+        // Built through the CLI's own indexer entry point rather than a raw
+        // `Database::open`: the reader_nondestructive drift guard scans this
+        // whole file (test module included) for the destructive constructor, and
+        // it is right to — the fixture does not need an exemption when the real
+        // command builds the same index.
+        cmd_incremental_index(project.path(), true, true).unwrap();
+
+        // flock is held per OPEN FILE DESCRIPTION, not per process: a second
+        // `open()` of the same path — which is exactly what
+        // `other_process_holds_index_lock` does — conflicts with this one even
+        // from inside this same test process. That makes the "another server is
+        // running" state reproducible without spawning anything.
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cg.join("index.lock"))
+            .unwrap();
+        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test fixture failed to take the index lock");
+        assert!(
+            crate::mcp::server::other_process_holds_index_lock(&cg),
+            "fixture precondition: the probe must SEE the held lock, else every \
+             assertion below passes vacuously"
+        );
+        (project, lock)
+    }
+
+    /// The P1-3 defect: `rebuild-index` warned and then renamed a fresh index
+    /// over the one a running MCP server still had open, stranding that server's
+    /// writes on a deleted inode. Refusal is the default now.
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_index_refuses_while_another_process_holds_the_index_lock() {
+        let (project, _lock) = locked_project();
+        let before = std::fs::metadata(project.path().join(CODE_GRAPH_DIR).join("index.db"))
+            .unwrap()
+            .len();
+
+        let err = cmd_rebuild_index(
+            project.path(),
+            RebuildIndexArgs {
+                confirm: true,
+                quiet: false,
+                no_embed: true,
+                force: false,
+            },
+        )
+        .expect_err("a held index lock must block the rename");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("holds the index lock"),
+            "the refusal must name the cause: {msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "the refusal must name the escape hatch: {msg}"
+        );
+        // The refusal happens BEFORE any mutation — the live index is untouched.
+        let after = std::fs::metadata(project.path().join(CODE_GRAPH_DIR).join("index.db"))
+            .unwrap()
+            .len();
+        assert_eq!(before, after, "a refused rebuild must not touch index.db");
+    }
+
+    /// `--quiet` used to `return` out of `warn_if_index_locked` before the probe
+    /// ran, so the noisiest-path caller (hooks) was the one with NO protection.
+    /// quiet governs printing only.
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_index_quiet_still_detects_the_lock() {
+        let (project, _lock) = locked_project();
+        let err = cmd_rebuild_index(
+            project.path(),
+            RebuildIndexArgs {
+                confirm: true,
+                quiet: true,
+                no_embed: true,
+                force: false,
+            },
+        )
+        .expect_err("--quiet must silence output, not the check");
+        assert!(
+            err.to_string().contains("holds the index lock"),
+            "got: {err}"
+        );
+    }
+
+    /// The escape hatch has to actually work, or users with a defunct lock file
+    /// are stuck with no way to rebuild.
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_index_force_proceeds_despite_the_lock() {
+        let (project, _lock) = locked_project();
+        cmd_rebuild_index(
+            project.path(),
+            RebuildIndexArgs {
+                confirm: true,
+                quiet: true,
+                no_embed: true,
+                force: true,
+            },
+        )
+        .expect("--force must override the refusal");
+        let db =
+            Database::open_nondestructive(&project.path().join(CODE_GRAPH_DIR).join("index.db"))
+                .unwrap();
+        let nodes: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap();
+        assert!(nodes > 0, "the forced rebuild must produce a usable index");
+    }
+
+    /// Sibling path: `reindex --from-snapshot` unlinks index.db outright, which
+    /// strands the same open fd. It had no warning at all before this.
+    #[cfg(unix)]
+    #[test]
+    fn reindex_from_snapshot_refuses_while_locked_and_keeps_the_index() {
+        let (project, _lock) = locked_project();
+        let db_path = project.path().join(CODE_GRAPH_DIR).join("index.db");
+
+        let err = cmd_reindex(
+            project.path(),
+            ReindexArgs {
+                from_snapshot: true,
+                no_embed: true,
+                force: false,
+            },
+        )
+        .expect_err("a held index lock must block the unlink");
+        assert!(
+            err.to_string().contains("holds the index lock"),
+            "got: {err}"
+        );
+        assert!(
+            db_path.exists(),
+            "the refusal must come BEFORE the remove_file, or the damage is done anyway"
+        );
+    }
+
+    /// Negative control: with no lock held, the same call goes through. Without
+    /// it, a guard that refused unconditionally would pass every test above.
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_index_proceeds_when_no_one_holds_the_lock() {
+        let (project, lock) = locked_project();
+        drop(lock); // release
+        assert!(
+            !crate::mcp::server::other_process_holds_index_lock(
+                &project.path().join(CODE_GRAPH_DIR)
+            ),
+            "control precondition: the lock must read as free once released"
+        );
+        cmd_rebuild_index(
+            project.path(),
+            RebuildIndexArgs {
+                confirm: true,
+                quiet: true,
+                no_embed: true,
+                force: false,
+            },
+        )
+        .expect("an unlocked index must rebuild without --force");
     }
 }

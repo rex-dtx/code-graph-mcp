@@ -130,26 +130,56 @@ function saveState(state) {
 
 // ── Throttle ───────────────────────────────────────────────
 
+// The updater has given up on the current target release (MAX_UPDATE_ATTEMPTS
+// consecutive failed installs of the SAME version, retried once a day).
+// `suspendedAt` is stamped only on entry to that state and cleared on success
+// and on a new target, so it alone identifies it; `updateAttempts` is required
+// too so a hand-edited or half-written state file cannot park the updater.
+function isUpdateSuspended(state) {
+  return Boolean(state && state.suspendedAt) && (state.updateAttempts || 0) >= MAX_UPDATE_ATTEMPTS;
+}
+
 // Whether to hit GitHub now. Keyed to the previous check's outcome, with a force
-// override for high-intent triggers (session start / explicit reload). Ordering:
+// override for high-intent triggers (session start / explicit reload) and two
+// binary-health overrides. EVERY bypass is decided here — the caller used to
+// short-circuit `binaryMissing`/`binaryStale` outside this function, which put
+// them above the rate-limit arm and made the "wins over everything" below false:
+// a stale binary plus `rateLimited: true` hit the API on every session start
+// (measured: 1 request per check, vs 0 for the same state with a current
+// binary). Ordering:
 //   1. rate-limit backoff (RATE_LIMIT_INTERVAL_MS, 1h = GitHub's own reset
-//      window) wins over everything, force included — never push more requests
-//      into a GitHub 403. Safe to outrank force only because it is an hour; the
-//      24h it said before made one 403 a silent day-long no-op for `--force`.
-//   2. force → only the short SESSION_START_MIN_GAP_MS floor applies, so opening
+//      window) wins over everything — force and both binary overrides included.
+//      Never push more requests into a GitHub 403; a 403 cannot hand us a
+//      download URL either, so the bypasses have nothing to gain by outranking
+//      it. Safe to outrank force only because it is an hour; the 24h it said
+//      before made one 403 a silent day-long no-op for `--force`.
+//   2. binaryMissing → check now. This is the one repair still reachable while
+//      the download chain is otherwise parked (the suspension branch in
+//      checkForUpdate keeps that heal alive), so it outranks suspension.
+//   3. suspension → neither `binaryStale` nor `force` applies. A stale binary
+//      cannot be healed while the chain is parked, and since suspension makes
+//      `cachedBinaryStaleVsState` permanently true, that bypass otherwise
+//      fired on every single session forever and did nothing with the answer.
+//      Both fall through to the ordinary interval, which still notices a newer
+//      release (that un-suspends) and still lets the daily retry come due.
+//   4. force → only the short SESSION_START_MIN_GAP_MS floor applies, so opening
 //      a new session re-checks immediately while a crash/reopen loop still can't
 //      hammer the API.
-//   3. otherwise → an "up to date" result is re-verified on a short cadence
+//   5. otherwise → an "up to date" result is re-verified on a short cadence
 //      (UP_TO_DATE_RECHECK_MS). This is the release-publish race guard: a version
 //      can go live seconds AFTER a check that said "up to date", and the plain 6h
 //      interval left it invisible for the full 6h (observed live — v0.85.7
 //      published 8s after a check pinned v0.85.6). A pending-but-unfinished update
 //      keeps the 6h steady-state interval.
-function shouldCheck(state, { force = false } = {}) {
+function shouldCheck(state, { force = false, binaryMissing = false, binaryStale = false } = {}) {
   if (!state.lastCheck) return true;
   const elapsed = Date.now() - new Date(state.lastCheck).getTime();
   if (state.rateLimited) return elapsed >= RATE_LIMIT_INTERVAL_MS;
-  if (force) return elapsed >= SESSION_START_MIN_GAP_MS;
+  if (binaryMissing) return true;
+  if (!isUpdateSuspended(state)) {
+    if (binaryStale) return true;
+    if (force) return elapsed >= SESSION_START_MIN_GAP_MS;
+  }
   const interval = state.updateAvailable === false ? UP_TO_DATE_RECHECK_MS : CHECK_INTERVAL_MS;
   return elapsed >= interval;
 }
@@ -373,8 +403,12 @@ async function downloadBinary(latest) {
 
   try {
     fs.mkdirSync(BINARY_CACHE_DIR, { recursive: true });
+    // `-f` (fail on HTTP >= 400), same as the sidecar fetch below. Without it
+    // curl writes GitHub's 404/503 HTML body to binaryTmp and exits 0, so the
+    // error page travelled on as a candidate binary and was only caught two
+    // gates later — by the silent size check, which reported nothing about why.
     execFileSync('curl', [
-      '-sL', '-o', binaryTmp,
+      '-sfL', '-o', binaryTmp,
       latest.binaryUrl,
     ], hidden({ timeout: 60000, stdio: 'pipe' }));
 
@@ -427,8 +461,20 @@ function sha256File(filePath) {
 
 function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSha256) {
   try {
+    // Size floor: every published binary is tens of MB, so anything under 1 MB
+    // is a truncated transfer or an error page. It used to return false without
+    // a word — and it sits ABOVE the two gates that DO explain themselves, so
+    // the most common download failures were also the only silent ones, each
+    // burning one of MAX_UPDATE_ATTEMPTS with nothing on stderr to explain it.
     const stat = fs.statSync(binaryTmp);
-    if (stat.size <= 1_000_000) return false;
+    if (stat.size <= 1_000_000) {
+      console.error(
+        `[code-graph] Refusing to install: downloaded binary is ${stat.size} bytes — far below the ~1 MB floor, ` +
+        'so the transfer was truncated or the server returned an error page. ' +
+        'The current binary is unchanged; the next update check retries.'
+      );
+      return false;
+    }
 
     // Integrity gate BEFORE the file is made executable or run, so a corrupted
     // or tampered download is never exec'd. The published <asset>.sha256 sidecar
@@ -462,13 +508,26 @@ function promoteVerifiedBinary(binaryTmp, binaryDst, expectedVersion, expectedSh
 
     const actualVersion = readBinaryVersion(binaryTmp);
     if (!actualVersion || (expectedVersion && actualVersion !== expectedVersion)) {
+      // Sibling of the size floor above: silent for the same reason and with the
+      // same cost. `--version` failing to run at all (wrong arch, missing libc)
+      // reads identically to a version mismatch without this.
+      console.error(
+        `[code-graph] Refusing to install: downloaded binary reports ${actualVersion ? `v${actualVersion}` : 'no runnable --version'}` +
+        `${expectedVersion ? `, expected v${expectedVersion}` : ''} — not installing it.`
+      );
       return false;
     }
 
     fs.renameSync(binaryTmp, binaryDst);
     clearBinaryCache();
     return true;
-  } catch {
+  } catch (e) {
+    // `e.code` is the whole diagnosis for this arm: ENOSPC (full disk), EACCES /
+    // EPERM (locked cache dir, or Windows refusing to replace the .exe the MCP
+    // server is running), EBUSY, EXDEV. A bare `catch { return false }` made all
+    // of them one indistinguishable failure that the caller counted as an
+    // attempt and printed nothing about.
+    console.error(`[code-graph] Binary promote failed${e && e.code ? ` (${e.code})` : ''}: ${e && e.message}`);
     return false;
   } finally {
     try {
@@ -834,10 +893,13 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
     // (launcher cannot start) and a present-but-stale binary (otherwise it stays
     // pinned to the old version for up to a full check interval — the binary
     // self-heal would never run inside the throttle window). Both bypass to the
-    // fetch + self-heal path below.
+    // fetch + self-heal path below — but they are ARGUMENTS to shouldCheck, not
+    // `||`-ed around it: as short-circuits out here they sat above the
+    // rate-limit backoff and the suspension state, the two conditions under
+    // which a fetch cannot accomplish anything at all.
     const binaryMissing = !fs.existsSync(cachedBinaryPath());
     const binaryStale = cachedBinaryStaleVsState(state);
-    if (!binaryMissing && !binaryStale && !shouldCheck(state, { force })) {
+    if (!shouldCheck(state, { force, binaryMissing, binaryStale })) {
       if (state.installedVersion !== installedVersion) {
         saveState({ ...state, installedVersion });
       }
@@ -1031,6 +1093,7 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
 
 module.exports = {
   checkForUpdate, commandExists, isDevMode, readState, compareVersions, shouldCheck,
+  isUpdateSuspended,
   getExtractedPluginVersion, readBinaryVersion, promoteVerifiedBinary,
   isSilentMode, isInstallMissingMode, isForceMode, isAutoUpdateDisabled,
   MAX_UPDATE_ATTEMPTS,

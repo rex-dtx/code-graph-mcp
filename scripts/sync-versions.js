@@ -78,6 +78,20 @@ const updates = [
       return obj;
     },
   },
+  {
+    // The shipped GitHub Actions template pins the npm package it runs. A pin
+    // that rots is a pin users will "fix" by reaching for a floating tag, so it
+    // tracks the release like every other version site. The scoped package name
+    // is part of the pattern on purpose: the unscoped `code-graph-mcp` name on
+    // npm belongs to an unrelated publisher, so a rewrite must never be able to
+    // land on it.
+    file: 'claude-plugin/templates/code-graph-snapshot.yml',
+    transform: (content) =>
+      content.replace(
+        /-p @sdsrs\/code-graph@\d+\.\d+\.\d+/,
+        `-p @sdsrs/code-graph@${version}`
+      ),
+  },
   // Platform npm packages
   ...PLATFORM_PACKAGES.map(file => ({
     file,

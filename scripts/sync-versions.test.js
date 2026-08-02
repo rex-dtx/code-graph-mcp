@@ -75,6 +75,12 @@ function setupFixture(t, oldVersion = '0.0.1') {
     plugins: [{ name: 'code-graph-mcp', version: oldVersion }],
   });
 
+  fs.mkdirSync(path.join(root, 'claude-plugin/templates'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, 'claude-plugin/templates/code-graph-snapshot.yml'),
+    `          npx -y -p @sdsrs/code-graph@${oldVersion} code-graph-mcp snapshot create --out snapshot.db\n`,
+  );
+
   for (const rel of PLATFORM_TARGETS) {
     writeJson(path.join(root, rel), { name: `@sdsrs/${path.basename(path.dirname(rel))}`, version: oldVersion });
   }
@@ -92,19 +98,30 @@ function readJson(p) {
 // SYNC_VERSIONS_SKIP_BUILD=1. Dedicated build/skip tests live further down.
 const SKIP_BUILD_ENV = { ...process.env, SYNC_VERSIONS_SKIP_BUILD: '1' };
 
-test('sync-versions bumps Cargo.toml + 8 JSON files atomically', (t) => {
+test('sync-versions bumps Cargo.toml + 8 JSON files + the CI template atomically', (t) => {
   const root = setupFixture(t);
   const stdout = execFileSync(
     process.execPath,
     [path.join(root, 'scripts', 'sync-versions.js'), '1.2.3'],
     { cwd: root, stdio: 'pipe', encoding: 'utf8', env: SKIP_BUILD_ENV },
   );
-  // Lock the success-path total. A regression that drops one of the 9 targets
+  // Lock the success-path total. A regression that drops one of the 10 targets
   // without removing the per-target assertions below would otherwise pass
   // (each remaining target gets checked individually) — the count assertion
   // is the only thing that flags "we silently stopped touching one of them".
-  assert.match(stdout, /\(9 files updated\)/,
-    'atomic-bump on a complete fixture must report exactly 9 files updated');
+  assert.match(stdout, /\(10 files updated\)/,
+    'atomic-bump on a complete fixture must report exactly 10 files updated');
+
+  // The shipped CI template pins the SCOPED package. The unscoped
+  // `code-graph-mcp` name on npm belongs to an unrelated publisher, so a
+  // rewrite that lands on it would make every user's release workflow
+  // `npx -y` a stranger's package with `contents: write` in hand.
+  const template = fs.readFileSync(
+    path.join(root, 'claude-plugin/templates/code-graph-snapshot.yml'), 'utf8');
+  assert.match(template, /-p @sdsrs\/code-graph@1\.2\.3\b/,
+    'template pin must track the release version');
+  assert.doesNotMatch(template, /npx[^\n]*(?<!@sdsrs\/)\bcode-graph-mcp@/,
+    'template must never invoke the unscoped code-graph-mcp package from npm');
 
   // Cargo.toml uses regex replace, not JSON
   const cargoToml = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
@@ -161,8 +178,8 @@ test('sync-versions skips files that are missing without erroring', (t) => {
   // skip messages go to stderr (console.warn); success summary lands on stdout.
   assert.match(result.stderr, /skip: npm\/win32-x64\/package\.json/,
     'stderr must surface the skipped file via console.warn');
-  assert.match(result.stdout, /\(8 files updated\)/,
-    'success summary should reflect the 8 files that did get bumped');
+  assert.match(result.stdout, /\(9 files updated\)/,
+    'success summary should reflect the 9 files that did get bumped');
 
   // Remaining platform packages still got bumped
   for (const rel of PLATFORM_TARGETS.filter(p => !p.includes('win32-x64'))) {

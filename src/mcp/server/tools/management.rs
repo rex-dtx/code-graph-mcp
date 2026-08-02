@@ -5,7 +5,7 @@ use super::super::*;
 
 impl McpServer {
     pub(in crate::mcp::server) fn tool_start_watch(&self) -> Result<serde_json::Value> {
-        if !self.is_primary {
+        if !self.is_primary() {
             return Ok(json!({
                 "status": "secondary",
                 "message": "This instance is in secondary (read-only) mode. File watching is handled by the primary instance."
@@ -38,7 +38,7 @@ impl McpServer {
     }
 
     pub(in crate::mcp::server) fn tool_stop_watch(&self) -> Result<serde_json::Value> {
-        if !self.is_primary {
+        if !self.is_primary() {
             return Ok(json!({
                 "status": "secondary",
                 "message": "This instance is in secondary (read-only) mode. File watching is handled by the primary instance."
@@ -141,7 +141,7 @@ impl McpServer {
             }
             obj.insert(
                 "instance_mode".into(),
-                json!(if self.is_primary {
+                json!(if self.is_primary() {
                     "primary"
                 } else {
                     "secondary"
@@ -186,7 +186,7 @@ impl McpServer {
         &self,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        if !self.is_primary {
+        if !self.is_primary() {
             return Ok(json!({
                 "status": "secondary",
                 "message": "This instance is in secondary (read-only) mode. Rebuild must be done from the primary instance."
@@ -243,10 +243,15 @@ impl McpServer {
         // inode-swap note in server/mod.rs. So we get atomicity from one transaction
         // on the live connection instead.)
         let result = {
-            let tx = self.db.conn().unchecked_transaction()?;
+            // `write_db()` is `self.db` for a normal primary and the read-write
+            // handle opened at promotion for an instance that started as a
+            // secondary — `self.db` is read-only in that case and every write
+            // below would fail with SQLITE_READONLY.
+            let write_db = self.write_db();
+            let tx = write_db.conn().unchecked_transaction()?;
             tx.execute("DELETE FROM files", [])?; // CASCADE handles nodes→edges
                                                   // Skip inline embedding; the background thread (spawned below) handles it.
-            let result = run_full_index(&self.db, project_root, None, Some(&progress_cb))?;
+            let result = run_full_index(&write_db, project_root, None, Some(&progress_cb))?;
             tx.commit()?;
             result
         };

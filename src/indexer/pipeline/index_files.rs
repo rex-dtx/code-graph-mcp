@@ -125,34 +125,97 @@ struct SkipCounters {
     parse_errors: AtomicUsize,
 }
 
+/// A file Phase 1a could not turn into symbols, but whose CONTENT IDENTITY it
+/// nonetheless established (oversize, or readable-but-unparsable).
+///
+/// Phase 1b records these with their current hash and purges whatever nodes the
+/// file had before. Without that, the old nodes stayed in the graph forever —
+/// `upsert_file` and `delete_nodes_by_file` both live on the parsed path, so a
+/// file that grew past `max_file_size` (or stopped parsing) kept answering
+/// `show` / `callgraph` / `dead-code` with symbols that no longer exist. The
+/// stored hash never advanced either, so `compute_diff` re-reported the file as
+/// changed on every single run and `ensure_file_indexed` re-ran the whole
+/// pipeline on every query touching it (indexing audit 2026-08-02 IDX-1).
+///
+/// Read and hash failures deliberately do NOT land here: those are the
+/// transient, environmental failures (a permission blip, a file being rewritten
+/// under us), and purging a file's symbols because one read failed is the same
+/// destructive-on-transient-state mistake the `<external>` exemption exists for.
+struct SkippedFile {
+    rel_path: String,
+    hash: String,
+    last_modified: i64,
+    language: String,
+}
+
+/// Phase 1a output: files that produced symbols, plus files whose identity is
+/// known but whose symbols are not (see [`SkippedFile`]).
+#[derive(Default)]
+struct PreParsed {
+    parsed: Vec<FilePreParsed>,
+    skipped: Vec<SkippedFile>,
+}
+
+/// One file's Phase 1a verdict. `Nothing` covers the skips we must not act on
+/// (unknown language, read error, hash error) — the file keeps whatever the
+/// index already knows about it.
+enum PreParseOutcome {
+    Parsed(Box<FilePreParsed>),
+    Skipped(SkippedFile),
+    Nothing,
+}
+
 /// Phase 1a: the parallel, CPU-bound half of indexing one batch — read, parse,
 /// extract nodes. Touches no DB state (Phase 1b does the inserts sequentially),
 /// which is what makes it safe to fan out over rayon. Files it cannot handle
-/// are dropped from the result and counted in `counters`.
+/// are counted in `counters`; those whose hash is nonetheless known come back
+/// as [`SkippedFile`] so Phase 1b can record them instead of leaving stale
+/// nodes and a stale hash behind.
 fn pre_parse_batch(
     batch: &[String],
     root: &Path,
     hashes: &HashMap<String, String>,
     counters: &SkipCounters,
-) -> Vec<FilePreParsed> {
-    batch
+) -> PreParsed {
+    let outcomes: Vec<PreParseOutcome> = batch
         .par_iter()
-        .filter_map(|rel_path| {
+        .map(|rel_path| {
             let mut language = match detect_language(rel_path) {
                 Some(l) => l,
                 None => {
                     counters.language.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                    return PreParseOutcome::Nothing;
                 }
             };
             let abs_path = root.join(rel_path);
 
             let file_meta = std::fs::metadata(&abs_path).ok();
+            let last_modified = file_meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // Resolve the hash up front so an oversize file can still be
+            // RECORDED (we know exactly which bytes we are declining to parse).
+            // Falls back to hashing only when the caller did not supply one.
+            let known_hash = match hashes.get(rel_path.as_str()) {
+                Some(h) => Some(h.clone()),
+                None => hash_file(&abs_path).ok(),
+            };
             if let Some(ref meta) = file_meta {
                 if meta.len() > max_file_size() {
                     tracing::debug!("Skipping large file ({} bytes): {}", meta.len(), rel_path);
                     counters.size.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                    return match known_hash {
+                        Some(hash) => PreParseOutcome::Skipped(SkippedFile {
+                            rel_path: rel_path.clone(),
+                            hash,
+                            last_modified,
+                            language: language.to_string(),
+                        }),
+                        None => PreParseOutcome::Nothing,
+                    };
                 }
             }
 
@@ -161,7 +224,7 @@ fn pre_parse_batch(
                 Err(e) => {
                     tracing::warn!("Skipping file {}: {}", rel_path, e);
                     counters.read.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                    return PreParseOutcome::Nothing;
                 }
             };
 
@@ -176,16 +239,13 @@ fn pre_parse_batch(
                 language = "cpp";
             }
 
-            let hash = match hashes.get(rel_path.as_str()) {
-                Some(h) => h.clone(),
-                None => match hash_file(&abs_path) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::warn!("Skipping file (hash error): {}: {}", rel_path, e);
-                        counters.hash.fetch_add(1, AtomicOrdering::Relaxed);
-                        return None;
-                    }
-                },
+            let hash = match known_hash {
+                Some(h) => h,
+                None => {
+                    tracing::warn!("Skipping file (hash error): {}", rel_path);
+                    counters.hash.fetch_add(1, AtomicOrdering::Relaxed);
+                    return PreParseOutcome::Nothing;
+                }
             };
 
             let tree = match parse_tree(&source, language) {
@@ -193,7 +253,15 @@ fn pre_parse_batch(
                 Err(e) => {
                     tracing::warn!("Parse failed for {}: {}", rel_path, e);
                     counters.parse.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
+                    // Readable and hashed, just not parseable by this grammar:
+                    // record the identity so its stale symbols go away and the
+                    // file stops re-diffing on every run.
+                    return PreParseOutcome::Skipped(SkippedFile {
+                        rel_path: rel_path.clone(),
+                        hash,
+                        last_modified,
+                        language: language.to_string(),
+                    });
                 }
             };
 
@@ -209,15 +277,9 @@ fn pre_parse_batch(
                 counters.parse_errors.fetch_add(1, AtomicOrdering::Relaxed);
             }
 
-            let last_modified = file_meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-
             let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
 
-            Some(FilePreParsed {
+            PreParseOutcome::Parsed(Box::new(FilePreParsed {
                 rel_path: rel_path.clone(),
                 source,
                 language: language.to_string(),
@@ -225,9 +287,19 @@ fn pre_parse_batch(
                 hash,
                 last_modified,
                 parsed_nodes,
-            })
+            }))
         })
-        .collect()
+        .collect();
+
+    let mut out = PreParsed::default();
+    for outcome in outcomes {
+        match outcome {
+            PreParseOutcome::Parsed(p) => out.parsed.push(*p),
+            PreParseOutcome::Skipped(s) => out.skipped.push(s),
+            PreParseOutcome::Nothing => {}
+        }
+    }
+    out
 }
 
 /// What Phase 1b hands to Phase 2 for one batch.
@@ -430,7 +502,7 @@ fn insert_relation_edges(
 }
 
 /// Phase 0: cascade-delete `delete_paths` in a transaction of its own, after
-/// buffering the inbound calls that cascade is about to strip.
+/// buffering the inbound edges that cascade is about to strip.
 ///
 /// Without the buffering, deleting file A wipes B's edge to A.foo while B is
 /// not in `delete_paths` (so Phase 2 never re-extracts it), leaving B with
@@ -438,8 +510,34 @@ fn insert_relation_edges(
 /// "callee added later" buffering closes, just from the deletion side. Both
 /// directions need to round-trip through pending or the v0.18.2 fix is only
 /// half-complete.
-fn buffer_then_delete_files(db: &Database, delete_paths: &[String]) -> Result<()> {
+///
+/// Two channels, because there are two kinds of edge:
+/// - `calls` → the persistent `pending_unresolved_calls` table (survives across
+///   invocations, since the callee's file may come back in a much later run).
+/// - everything else → `deferred`, re-resolved after this run's batch loop
+///   against the complete name map. That half was missing entirely: the calls
+///   buffer is hardcoded to `relation = 'calls'`, so imports/implements/
+///   inherits/references/exports/routes_to just disappeared and incremental
+///   diverged from a full rebuild of the same tree forever (indexing audit
+///   2026-08-02 P1-5 — the sibling face of the edit-path requeue in
+///   `restore_inbound_edges`).
+///
+/// Two source files are deliberately NOT requeued, both to keep the deferred
+/// pass's `source_ids` insertable:
+/// - a source in `run_file_paths`: its own batch re-extracts every relation
+///   with fresh node ids, so requeuing would duplicate that work AND capture a
+///   node id that its own cascade-delete is about to invalidate;
+/// - a source in `delete_paths`: its nodes are going away in this very
+///   function, so the captured id would dangle and abort the deferred insert on
+///   the edges FK (the failure mode `aaa238f` fixed on the edit path).
+fn buffer_then_delete_files(
+    db: &Database,
+    delete_paths: &[String],
+    run_file_paths: &HashSet<&str>,
+    deferred: &mut Vec<DeferredRelation>,
+) -> Result<()> {
     let tx = db.savepoint("idx_delete")?;
+    let delete_set: HashSet<&str> = delete_paths.iter().map(|s| s.as_str()).collect();
 
     // Resolve file IDs once (delete_files_by_paths drops them) so we can
     // query inbound calls before cascade fires.
@@ -456,23 +554,18 @@ fn buffer_then_delete_files(db: &Database, delete_paths: &[String]) -> Result<()
     }
 
     let mut buffered = 0usize;
+    let mut requeued = 0usize;
     for fid in &deleted_file_ids {
-        let inbound = crate::storage::queries::get_inbound_calls_for_pending(db.conn(), *fid)?;
-        for (source_id, target_name, source_language, metadata) in inbound {
-            crate::storage::queries::insert_pending_unresolved_call(
-                db.conn(),
-                source_id,
-                &target_name,
-                &source_language,
-                metadata.as_deref(),
-            )?;
-            buffered += 1;
-        }
+        let (b, r) =
+            buffer_inbound_before_node_purge(db, *fid, run_file_paths, &delete_set, deferred)?;
+        buffered += b;
+        requeued += r;
     }
-    if buffered > 0 {
+    if buffered > 0 || requeued > 0 {
         tracing::info!(
-            "[index] Phase 0: buffered {} inbound calls before cascade-deleting {} file(s)",
+            "[index] Phase 0: buffered {} inbound calls, requeued {} other inbound relations before cascade-deleting {} file(s)",
             buffered,
+            requeued,
             deleted_file_ids.len()
         );
     }
@@ -480,6 +573,68 @@ fn buffer_then_delete_files(db: &Database, delete_paths: &[String]) -> Result<()
     delete_files_by_paths(db.conn(), delete_paths)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Buffer every inbound cross-file edge into `file_id` before its nodes are
+/// purged, so the cascade cannot destroy an edge whose SOURCE file is not being
+/// re-extracted this run.
+///
+/// Two channels because there are two kinds of edge: `calls` go to the
+/// persistent `pending_unresolved_calls` table (they must survive across
+/// invocations — the callee's file may only come back in a much later run),
+/// everything else goes to this run's `deferred` list and is re-resolved against
+/// the complete name map after the batch loop.
+///
+/// Sources in `run_file_paths` or `delete_set` are skipped: their node ids are
+/// about to be invalidated (their own batch re-extracts them, or they are being
+/// deleted outright), and a deferred insert against a dangling `source_id`
+/// aborts the whole run on the edges FK.
+///
+/// Returns `(calls_buffered, other_relations_requeued)`.
+fn buffer_inbound_before_node_purge(
+    db: &Database,
+    file_id: i64,
+    run_file_paths: &HashSet<&str>,
+    delete_set: &HashSet<&str>,
+    deferred: &mut Vec<DeferredRelation>,
+) -> Result<(usize, usize)> {
+    let mut buffered = 0usize;
+    let mut requeued = 0usize;
+
+    let inbound = crate::storage::queries::get_inbound_calls_for_pending(db.conn(), file_id)?;
+    for (source_id, target_name, source_language, metadata) in inbound {
+        crate::storage::queries::insert_pending_unresolved_call(
+            db.conn(),
+            source_id,
+            &target_name,
+            &source_language,
+            metadata.as_deref(),
+        )?;
+        buffered += 1;
+    }
+
+    let inbound_rest =
+        crate::storage::queries::get_inbound_relations_for_requeue(db.conn(), file_id)?;
+    for (source_id, source_path, source_language, target_name, relation, metadata) in inbound_rest {
+        if run_file_paths.contains(source_path.as_str())
+            || delete_set.contains(source_path.as_str())
+        {
+            continue;
+        }
+        deferred.push(DeferredRelation {
+            source_ids: vec![source_id],
+            source_name: String::new(),
+            target_name,
+            relation,
+            metadata,
+            rel_path: source_path,
+            language: source_language,
+            ns_file: None,
+        });
+        requeued += 1;
+    }
+
+    Ok((buffered, requeued))
 }
 
 /// Lightweight post-batch record — no Tree or source string.
@@ -602,18 +757,19 @@ pub(super) fn index_files(
     };
     let delete_paths = delete_paths.as_slice();
 
-    // Phase 0: Delete removed files in own transaction.
-    if !delete_paths.is_empty() {
-        buffer_then_delete_files(db, delete_paths)?;
-    }
-
-    // Every file THIS RUN will (re)index — restore_inbound_edges consults it:
-    // a restore-miss whose source file is in here must NOT be requeued, because
-    // that file's own batch re-extracts its relations with fresh node ids. The
-    // captured source_id would otherwise dangle once a LATER batch
+    // Every file THIS RUN will (re)index — `restore_inbound_edges` and Phase 0
+    // both consult it: a requeue whose source file is in here must NOT happen,
+    // because that file's own batch re-extracts its relations with fresh node
+    // ids. The captured source_id would otherwise dangle once a LATER batch
     // cascade-deletes the source file's old nodes, and the deferred pass's
     // insert then aborts the whole run on the FK (pre-tag review, Critical-1).
+    // Computed BEFORE Phase 0 because the delete path needs the same guard.
     let run_file_paths: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
+
+    // Phase 0: Delete removed files in own transaction.
+    if !delete_paths.is_empty() {
+        buffer_then_delete_files(db, delete_paths, &run_file_paths, &mut deferred)?;
+    }
 
     // Pre-build Python module map once (used in all batches for import resolution)
     let mut all_python_paths: HashSet<String> = files
@@ -660,8 +816,40 @@ pub(super) fn index_files(
         // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
         let pre_parsed = pre_parse_batch(batch, root, hashes, &counters);
 
+        // Files we know the identity of but not the symbols (oversize /
+        // unparsable): record the hash so they stop re-diffing forever, and
+        // purge whatever symbols the index still claims for them — those are
+        // provably stale, since the content hash just changed (audit IDX-1).
+        // Their inbound edges go through the same buffer the delete path uses,
+        // so an unchanged caller's edge is re-resolved instead of cascaded away.
+        for sk in &pre_parsed.skipped {
+            let file_id = upsert_file(
+                db.conn(),
+                &FileRecord {
+                    path: sk.rel_path.clone(),
+                    blake3_hash: sk.hash.clone(),
+                    last_modified: sk.last_modified,
+                    language: Some(sk.language.clone()),
+                },
+            )?;
+            let (b, r) = buffer_inbound_before_node_purge(
+                db,
+                file_id,
+                &run_file_paths,
+                &HashSet::new(),
+                &mut deferred,
+            )?;
+            if b > 0 || r > 0 {
+                tracing::debug!(
+                    "[index] unparsable/oversize {}: buffered {} calls, requeued {} relations before purge",
+                    sk.rel_path, b, r
+                );
+            }
+            delete_nodes_by_file(db.conn(), file_id)?;
+        }
+
         // --- Phase 1b: Sequential DB inserts ---
-        let inserted = insert_batch_nodes(db, pre_parsed)?;
+        let inserted = insert_batch_nodes(db, pre_parsed.parsed)?;
         let batch_parsed = inserted.parsed;
         let saved_inbound_edges = inserted.saved_inbound_edges;
         let batch_file_ids = inserted.file_ids;

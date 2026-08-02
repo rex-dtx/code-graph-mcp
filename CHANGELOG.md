@@ -1,5 +1,141 @@
 # Changelog
 
+## v0.113.0 (2026-08-02)
+
+**Migration note: this release bumps INDEX_VERSION (58 → 59).** The MCP server wipes and
+rebuilds the index automatically on its first start; a CLI-only setup rebuilds on
+the next `incremental-index` / `rebuild-index`.
+
+Remediation of the indexing/database/binary-chain domain audit
+(`docs/AUDIT-INDEXING-DB-2026-08-02.md`).
+
+### Security
+- **The shipped GitHub Actions template told users to `npx -y code-graph-mcp`,
+  which is a DIFFERENT publisher's package.** This project publishes
+  `@sdsrs/code-graph` (`code-graph-mcp` is only a bin name inside it); the
+  unscoped `code-graph-mcp` on npm belongs to someone else entirely. Anyone who
+  copied `claude-plugin/templates/code-graph-snapshot.yml` into their repo — the
+  documented way to publish snapshots — had a release job installing and
+  executing a stranger's package, with `contents: write` in hand, on every
+  release. The command failed afterwards on unrecognized arguments, so the only
+  visible symptom was a red job, long after the third-party install script had
+  run. The template now uses the scoped name pinned to the released version,
+  `sync-versions.js` keeps that pin current (a 10th version site), and the
+  release test asserts the template can never name the unscoped package again.
+
+### Fixed
+- **Deleting a file silently destroyed the non-`calls` edges pointing into it,
+  and the index never recovered.** Phase 0 buffered only `calls` before the
+  cascade delete, because the buffer table it writes to is calls-only. So
+  `imports` / `implements` / `inherits` / `references` / `exports` / `routes_to`
+  edges from files that had NOT changed were cascaded away with no recovery
+  channel — and since those source files' hashes still matched, nothing ever
+  re-extracted them. A full rebuild of the same final tree kept the edges (they
+  re-resolve onto the `<external>` sentinel once the target file is gone), so
+  `deps` / `cycles` / `project_map` answered differently depending on whether the
+  index had been grown incrementally or rebuilt. Those edges now go through the
+  same post-batch deferred pass the edit path uses. This is the delete-side
+  sibling of the edit-side requeue added in v0.112.0.
+- **A file that grew past the size limit (or stopped parsing) kept answering with
+  symbols it no longer contains, forever.** Both `upsert_file` and
+  `delete_nodes_by_file` live on the parsed path, so a skipped file kept its old
+  nodes AND its old hash: `show` / `callgraph` / `dead-code` reported symbols that
+  had been renamed or deleted, and `compute_diff` re-reported the file as changed
+  on every single run (with `ensure_file_indexed` re-running the whole pipeline on
+  every query that touched it). Oversize and unparsable files are now recorded
+  with their current hash and their stale symbols purged; their inbound edges go
+  through the same buffer the delete path uses. Read and hash failures are
+  deliberately excluded — those are the transient, environmental failures, and
+  purging a file's symbols because one read failed would be destructive on
+  exactly the states that recover by themselves.
+
+- **A stale `index.lock` left every future MCP server on Windows read-only,
+  permanently.** The non-Unix liveness probe returned "alive" unconditionally, so
+  after any unclean exit the recorded PID always looked live and every later
+  instance became a secondary: no indexing, no watcher, `rebuild_index` refusing
+  with `{"status":"secondary"}`, and nothing telling the user that deleting one
+  file would fix it. Windows now really probes the PID, and only a positive "dead"
+  verdict releases someone else's lock — an undecidable probe stays conservative
+  and keeps treating the holder as alive. Two caveats, both Windows-only and both
+  known: this is not verified on real Windows (the decision logic is
+  platform-independent and unit-tested, the `tasklist` invocation is not), and
+  reclaiming a stale lock is not itself atomic — two processes that judge the same
+  dead PID simultaneously can both proceed, because the `remove_file` before the
+  exclusive create discards the very atomicity that create was providing. That
+  path was unreachable before (the probe always answered "alive"), so this trades
+  a certain permanent failure for a rare race; the Unix path is unaffected, it
+  holds a real `flock`.
+- **A secondary instance never re-competed for the lock, so it answered from a
+  frozen index for the rest of the session.** Two windows on one repo: close the
+  first and the second kept serving whatever the index held at its own startup,
+  with no disclosure on any query that returned results. It now retries promotion
+  (throttled) and, on success, starts indexing and the watcher. Promotion also had
+  to solve a problem the audit did not see: a secondary's connection is opened
+  `query_only`, and SQLite cannot clear that on a live connection, so a promoted
+  instance now writes through a connection opened at promotion time.
+- **`rebuild-index` renamed a fresh index over one a running server had open**,
+  stranding that server's writes on a deleted inode — its watcher and embedding
+  work vanished silently and its queries kept serving the pre-rebuild snapshot
+  until restart. It now refuses when another process holds the index lock, with
+  `--force` to override; `reindex --from-snapshot` got the same gate (it had no
+  warning at all), and `--quiet` no longer skips the probe itself.
+- **`health-check` reported `healthy: true` on a corrupt database.** Its verdict
+  was schema version plus non-zero counts, so page-level corruption, an FTS index
+  that had stopped tracking `nodes`, and orphaned vectors were all invisible — and
+  the human and JSON faces disagreed about a version-stale index. All three probes
+  are now reported on both faces, and `healthy` accounts for corruption. Note for
+  anyone extending this: `COUNT(nodes_fts)` cannot detect FTS drift — it is an
+  external-content table and the count reads through to `nodes`, so it is equal by
+  construction; the shadow table `nodes_fts_docsize` is what actually holds the
+  index's own rows.
+- **`.code-graph/` went un-ignored on CLI-only installs**, so `git add -A` would
+  commit a multi-hundred-MB index. The `.gitignore` write lived only in the MCP
+  server's startup path; it is now shared with the CLI index commands.
+- **The watcher woke on its own writes.** It watched the whole project root with
+  no path filter and the drain discarded event payloads, so `.code-graph/`'s own
+  usage log and SQLite WAL kept `has_changes` true — every MCP tool call paid a
+  full-tree stat walk, and the 30 s debounce was unreachable because it was gated
+  on there being no watcher at all. Events under `.code-graph/` and `.git/` are now
+  filtered at the source, and a watcher that has gone deaf (inotify limits,
+  network filesystems, container mounts — all silent) is bounded by a backstop
+  rescan instead of leaving the session stale forever.
+- **Five MCP tools answered from pre-edit line numbers with no disclosure.** The
+  six tools that take a `file_path` were refreshed; `semantic_code_search`,
+  `ast_search`, `project_map`, `find_similar_code` and `trace_http_chain` were
+  not, so a query issued right after an edit could report stale positions. They
+  now refresh the files their own results name, under the same budget the CLI
+  uses, and disclose when something was left stale rather than dropping it.
+- `refs`/`show`/`deps` read source bytes from the worktree while taking line
+  numbers from the main checkout's index, printing the wrong lines once the two
+  diverged.
+- A transient `SQLITE_BUSY` during promotion is now classified as retry-later
+  rather than surfacing as a tool error.
+
+### Changed
+- `health-check` skips the page-scanning integrity pragma above 32 MB and says so
+  (`"skipped_large"`), because the statusline polls this command on every render
+  under a 1.5 s budget and a full scan costs ~2.4 ms/MB warm — more when the page
+  cache is cold, which is exactly the first render after boot. `--deep` runs it
+  regardless. Measured on this repo's 110 MB index: 280 ms → ~25 ms polled, 207 ms
+  with `--deep`.
+- The auto-update rate-limit backoff now actually applies to a stale binary. The
+  "binary is stale" and "binary is missing" bypasses were evaluated *around* the
+  throttle rather than inside it, so a suspended updater still spent one GitHub
+  API call per session start doing nothing.
+- `doctor` no longer counts a no-op auto-update as a repair. Its CLI has no
+  non-zero exit path, so suspended, rate-limited, offline and opted-out runs all
+  looked like success; doctor now re-checks the diagnostic afterwards and names
+  the real reason. This closes a loop where the suspension notice told the user to
+  run doctor and doctor replied with a checkmark.
+- Binary downloads use `curl -f` (the sidecar fetch already did), and the size
+  gate, version gate and outer failure path in the promotion step now say why they
+  rejected a download instead of returning silently.
+- `bind_calls_to_imported_targets` binds in one set-based statement instead of
+  round-tripping every candidate pair through Rust. The predicate is unchanged
+  (same SELECT, same `INSERT OR IGNORE` dedup), so the edges created are
+  identical; it removes work that was re-proving already-existing edges — on the
+  audit's 1,456-file measurement, 10,960 round trips to create 3 edges.
+
 ## v0.112.1 (2026-08-02)
 
 ### Fixed

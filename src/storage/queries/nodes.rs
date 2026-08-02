@@ -251,6 +251,55 @@ pub fn get_inbound_calls_for_pending(
         .collect()
 }
 
+/// Returns inbound NON-`calls` edges into nodes of the given file from sources
+/// in OTHER files, projected as (source_id, source_path, source_language,
+/// target_name, relation, metadata) — what the deferred pass needs to re-resolve
+/// them against the whole tree.
+///
+/// The sibling of [`get_inbound_calls_for_pending`], and the reason it exists:
+/// that one is hardcoded to `relation = 'calls'` because `pending_unresolved_calls`
+/// is a calls-only buffer. Everything else (imports / implements / inherits /
+/// references / exports / routes_to) was cascade-deleted with no recovery
+/// channel at all, so deleting file A silently dropped B's `imports A.Base`
+/// edge while B itself never changed — and no later run re-extracted it, because
+/// B's hash still matched. A full rebuild of the same final tree kept the edge
+/// (re-resolved to an `<external>` sentinel), so incremental and full diverged
+/// permanently (indexing audit 2026-08-02 P1-5).
+///
+/// Rows are ORDERed for the same reason every other resolution input is sorted:
+/// the deferred pass is first-wins in places, so a HashMap-order arrival would
+/// make two indexes of one tree disagree.
+#[allow(clippy::type_complexity)]
+pub fn get_inbound_relations_for_requeue(
+    conn: &Connection,
+    file_id: i64,
+) -> Result<Vec<(i64, String, String, String, String, Option<String>)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.source_id, fs.path, COALESCE(fs.language, ''), nt.name, e.relation, e.metadata
+         FROM edges e
+         JOIN nodes nt ON nt.id = e.target_id
+         JOIN nodes ns ON ns.id = e.source_id
+         JOIN files fs ON fs.id = ns.file_id
+         WHERE nt.file_id = ?1 AND ns.file_id != ?1 AND e.relation != 'calls'
+           AND fs.language IS NOT NULL
+         ORDER BY e.source_id, e.relation, nt.name",
+    )?;
+    let rows = stmt.query_map([file_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    rows.filter_map(Result::ok)
+        .filter(|(_, path, lang, ..)| !lang.is_empty() && !path.is_empty())
+        .map(Ok)
+        .collect()
+}
+
 /// Delete `<external>` sentinel nodes that no edge touches any more.
 ///
 /// Sentinels are minted as edge TARGETS only, but pruning

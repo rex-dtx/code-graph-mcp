@@ -138,6 +138,13 @@ function runDiagnostics({ checkOnly = false } = {}) {
     if (execOk) {
       try {
         const cwd = process.cwd();
+        // Deliberately NOT `--deep`. That flag forces the integrity pragmas the
+        // default path skips above INTEGRITY_PRAGMA_MAX_BYTES, and quick_check
+        // reads every page at ~2.4 ms/MB — a multi-GB index would blow the 5 s
+        // budget below and report a phantom "health-check failed" instead of the
+        // integrity answer it went looking for. Raising the timeout to fit trades
+        // that for a doctor run that appears hung. `--deep` stays a user-invoked
+        // escape hatch until this call can size its own budget from the index.
         const hcOutput = execFileSync(binary, ['health-check', '--json'], hidden({
           cwd,
           timeout: 5000,
@@ -495,7 +502,85 @@ function devBuildCommand(embed) {
     : 'cargo build --release --no-default-features';
 }
 
-function runRepairs(results) {
+// ── Post-repair re-scan for the auto-update-driven arms ────────────────────
+//
+// `auto-update.js check` has NO non-zero exit path: dev mode, the opt-out,
+// suspension, the rate-limit backoff and plain offline all print a line and exit
+// 0. So "execFileSync did not throw" carries no information about whether
+// anything was repaired, and the two arms below counted every one of those
+// no-ops as a fix — including the one the suspension notice sends the user here
+// to run, producing "✅ Update check complete" for a check that is suspended.
+// Re-read the same predicate the DIAGNOSIS used and let that decide, exactly as
+// the `hooks-invalid` arm does with its post-install re-scan.
+
+function triggerAutoUpdateCheck() {
+  execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], hidden({
+    timeout: 60000,
+    stdio: 'inherit',
+  }));
+}
+
+/**
+ * Mirror of the `version-mismatch` diagnosis (runDiagnostics step 2): the binary
+ * on disk reports the version the plugin expects. find-binary memoizes, and the
+ * promote happened in a CHILD process, so the cache has to be dropped first or
+ * this re-reads the pre-repair answer.
+ */
+function binaryVersionResolved({
+  find = findBinary, readVersion = readBinaryVersion, pluginVersion = getPluginVersion,
+} = {}) {
+  clearBinaryCache();
+  const binary = find();
+  if (!binary) return false;
+  const actual = readVersion(binary);
+  return Boolean(actual) && actual === pluginVersion();
+}
+
+/** Mirror of the `update-incomplete` diagnosis (runDiagnostics step 5). */
+function updateIncompleteResolved({ readStateFile = readUpdateState } = {}) {
+  const state = readStateFile();
+  return !(state && state.updateAvailable && state.binaryUpdated === false);
+}
+
+function readUpdateState() {
+  try { return readJson(path.join(CACHE_DIR, 'update-state.json')); } catch { return null; }
+}
+
+/**
+ * Why a just-run `auto-update.js check` can have done nothing, in the updater's
+ * own terms. Without this the user is told to update manually with no idea that
+ * the updater is deliberately parked — which is the state the doctor prompt
+ * itself came from.
+ * @returns {string|null} one clause, or null when nothing is known to block it
+ */
+function autoUpdateNoOpReason(state = readUpdateState(), env = process.env) {
+  if (env.CODE_GRAPH_NO_AUTO_UPDATE === '1') {
+    return 'auto-update is switched off by CODE_GRAPH_NO_AUTO_UPDATE=1';
+  }
+  if (!state) return null;
+  if (state.suspendedAt && (state.updateAttempts || 0) >= MAX_UPDATE_ATTEMPTS) {
+    return `auto-update is SUSPENDED after ${state.updateAttempts} failed attempts on v${state.latestVersion} `
+      + '(it retries once a day, and immediately when a newer release is published)';
+  }
+  if (state.rateLimited) {
+    return 'the updater is in its GitHub rate-limit backoff (up to 1h)';
+  }
+  return null;
+}
+
+function reportAutoUpdateNoOp(what) {
+  console.log(`  ❌ ${what}`);
+  const why = autoUpdateNoOpReason();
+  if (why) console.log(`     Why: ${why}.`);
+  console.log('     Update manually: `npm install -g @sdsrs/code-graph` (or `/plugin update code-graph-mcp`)');
+}
+
+function runRepairs(results, {
+  devMode = isDevMode,
+  runAutoUpdate = triggerAutoUpdateCheck,
+  binaryResolved = binaryVersionResolved,
+  updateResolved = updateIncompleteResolved,
+} = {}) {
   const fixable = results.filter(r => r.fixId);
   if (fixable.length === 0) return 0;
 
@@ -504,17 +589,21 @@ function runRepairs(results) {
     switch (issue.fixId) {
       case 'binary-stale':
       case 'version-mismatch': {
-        if (!isDevMode()) {
+        if (!devMode()) {
           console.log('\n  Triggering binary update...');
           try {
-            execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], hidden({
-              timeout: 60000,
-              stdio: 'inherit',
-            }));
-            console.log('  \u2705 Update check complete');
-            fixed++;
+            runAutoUpdate();
           } catch {
             console.log('  \u274c Update check failed — install manually');
+            break;
+          }
+          // Exited 0 — which says nothing about whether the binary moved (see
+          // the re-scan note above). Ask the disk, not the exit code.
+          if (binaryResolved()) {
+            console.log('  \u2705 Binary now matches the version the plugin expects');
+            fixed++;
+          } else {
+            reportAutoUpdateNoOp('Update check ran, but the binary version still does not match the plugin');
           }
           break;
         }
@@ -547,7 +636,7 @@ function runRepairs(results) {
 
       case 'binary-missing': {
         console.log('\n  Installing binary...');
-        if (isDevMode()) {
+        if (devMode()) {
           // No binary to probe \u2014 build the fast FTS5 binary, but point at the
           // hybrid option so FTS5 isn't silently presented as the only choice.
           console.log('    \u2192 cargo build --release --no-default-features');
@@ -612,14 +701,18 @@ function runRepairs(results) {
       case 'update-incomplete': {
         console.log('\n  Completing auto-update...');
         try {
-          execFileSync(process.execPath, [path.join(__dirname, 'auto-update.js'), 'check'], hidden({
-            timeout: 60000,
-            stdio: 'inherit',
-          }));
-          console.log('  \u2705 Update check complete');
-          fixed++;
+          runAutoUpdate();
         } catch {
           console.log('  \u274c Update check failed');
+          break;
+        }
+        // Same as the version-mismatch arm: exit 0 is not evidence. Re-read
+        // the state file the diagnosis read.
+        if (updateResolved()) {
+          console.log('  \u2705 Auto-update completed — the binary download is no longer pending');
+          fixed++;
+        } else {
+          reportAutoUpdateNoOp('Update check ran, but the binary download is still recorded as incomplete');
         }
         break;
       }
@@ -739,7 +832,7 @@ function runDoctor(opts = {}) {
   return { results, issueCount: issues.length, unresolved };
 }
 
-module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, detectEmbedModel, devBuildCommand };
+module.exports = { runDiagnostics, formatReport, runRepairs, runDoctor, runDoctorCli, parseDoctorArgs, unresolvedCount, surveyHookCoverage, relicRepairGuard, classifyEmbeddings, detectEmbedModel, devBuildCommand, binaryVersionResolved, updateIncompleteResolved, autoUpdateNoOpReason };
 
 // Shared by BOTH doctor entry points: `node doctor.js …` and `node lifecycle.js
 // doctor …`. It exists as one function because the first version of this guard

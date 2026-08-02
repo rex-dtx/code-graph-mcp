@@ -27,6 +27,26 @@ pub enum WatchEvent {
     Changed(Vec<String>),
 }
 
+/// Root-relative paths whose changes must never count as a project change.
+///
+/// `.code-graph/` is our OWN data directory: `index.db` plus its WAL/SHM
+/// sidecars, `usage.jsonl` and `recommendations.jsonl` are written by the
+/// server itself, often several times per tool call. The merkle scan skips the
+/// directory entirely, so an event there can only ever produce a no-op rescan —
+/// but the server counted it as a change, which kept `has_changes` true almost
+/// continuously: every tool call paid a full-tree stat pass and the debounce
+/// branch was effectively unreachable.
+///
+/// `.git/` is the same shape (never indexed, see merkle's scan skip) and churns
+/// on every git command. Note the exact-segment test: `.gitignore` and
+/// `.code-graph.toml` are ordinary files and stay watched.
+pub fn is_ignored_watch_path(rel: &str) -> bool {
+    let rel = rel.trim_start_matches("./");
+    [crate::domain::CODE_GRAPH_DIR, ".git"]
+        .iter()
+        .any(|dir| rel == *dir || rel.strip_prefix(dir).is_some_and(|r| r.starts_with('/')))
+}
+
 /// Bound on pending watcher events. A full channel means the main-loop consumer
 /// is lagging; subsequent events are dropped (logged). This is safe because the
 /// downstream merkle rescan is idempotent — as long as *any* event remains in
@@ -72,7 +92,16 @@ impl FileWatcher {
                                 // Normalize `\` → `/` on Windows so the downstream
                                 // pipeline and DB consumers see the same path
                                 // shape they see on Unix (see merkle::normalize_rel_path).
-                                Ok(rel) => Some(crate::indexer::merkle::normalize_rel_path(rel)),
+                                Ok(rel) => {
+                                    let rel = crate::indexer::merkle::normalize_rel_path(rel);
+                                    // Drop self-inflicted churn at the source, so
+                                    // `.code-graph/` WAL traffic can never fill the
+                                    // bounded channel and push out a real edit.
+                                    if is_ignored_watch_path(&rel) {
+                                        return None;
+                                    }
+                                    Some(rel)
+                                }
                                 Err(_) => {
                                     tracing::debug!("watcher: dropping out-of-root path {:?}", p);
                                     None
@@ -178,5 +207,23 @@ mod tests {
         assert!(!is_content_event(&EventKind::Modify(ModifyKind::Metadata(
             MetadataKind::Any
         ))));
+    }
+
+    #[test]
+    fn test_is_ignored_watch_path_matches_whole_segments_only() {
+        // Our own data dir: the server writes here several times per tool call.
+        assert!(is_ignored_watch_path(".code-graph"));
+        assert!(is_ignored_watch_path(".code-graph/index.db-wal"));
+        assert!(is_ignored_watch_path(".code-graph/usage.jsonl"));
+        assert!(is_ignored_watch_path("./.code-graph/recommendations.jsonl"));
+        assert!(is_ignored_watch_path(".git"));
+        assert!(is_ignored_watch_path(".git/refs/heads/main"));
+
+        // Prefix-only matches are real project files and must stay watched —
+        // a blanket `starts_with` here would silently stop indexing them.
+        assert!(!is_ignored_watch_path(".gitignore"));
+        assert!(!is_ignored_watch_path(".code-graph.toml"));
+        assert!(!is_ignored_watch_path("src/code-graph/mod.rs"));
+        assert!(!is_ignored_watch_path("src/main.rs"));
     }
 }

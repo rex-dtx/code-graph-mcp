@@ -353,7 +353,7 @@ Skip the full local index for team members and CI runners by publishing a
 ~3-5MB graph snapshot with each GitHub release.
 
 **Setup (one-time):**
-1. Copy `node_modules/code-graph-mcp/templates/code-graph-snapshot.yml`
+1. Copy `node_modules/@sdsrs/code-graph/claude-plugin/templates/code-graph-snapshot.yml`
    into your repo's `.github/workflows/`.
 2. Push a release tag. The workflow uploads
    `code-graph-snapshot-<sha>.db.zst` as a release asset.
@@ -361,7 +361,7 @@ Skip the full local index for team members and CI runners by publishing a
 **Verify:**
 
 ```bash
-npx code-graph-mcp snapshot inspect ./code-graph-snapshot-<sha>.db.zst
+npx -y -p @sdsrs/code-graph code-graph-mcp snapshot inspect ./code-graph-snapshot-<sha>.db.zst
 ```
 
 After setup, the auto-fetch is **opt-in per consumer**: an untrusted repo could

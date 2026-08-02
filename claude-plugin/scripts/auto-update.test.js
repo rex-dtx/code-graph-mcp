@@ -1305,3 +1305,258 @@ test('an out-of-band manual update clears the failure record', (t) => {
   assert.equal(after.updateAttempts, 0, 'the failure counter describes an update that is no longer pending');
   assert.equal(after.suspendedAt, null, 'and the suspension clock must not outlive the suspension');
 });
+
+// ── Binary bypasses are INSIDE the throttle, not around it (audit BIN-1) ────
+//
+// `checkForUpdate` used to read
+//   `if (!binaryMissing && !binaryStale && !shouldCheck(state, { force }))`
+// which put both binary bypasses ABOVE shouldCheck's rate-limit arm — directly
+// contradicting the "wins over everything, force included" comment on it. Two
+// states are affected, and both are self-sustaining:
+//   * rateLimited: a 403 cannot hand back a download URL, so the bypass spent a
+//     request per check to learn nothing (measured: 1 request with a stale
+//     binary vs 0 with a current one, same 403 state).
+//   * suspended: the download chain is parked, so the cached binary stays
+//     behind forever and `cachedBinaryStaleVsState` is therefore permanently
+//     true — one GitHub request per session start, in perpetuity, discarded.
+// A MISSING binary is the exception in both directions: it is the one repair
+// the suspension branch deliberately keeps alive, so it still bypasses.
+
+const { isUpdateSuspended } = require('./auto-update');
+
+function runThrottleProbe(t, { state, cachedBinary = false, force = true }) {
+  const { spawnSync } = require('child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-au-throttle-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const cacheDir = path.join(home, '.cache', 'code-graph');
+  fs.mkdirSync(path.join(cacheDir, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, 'update-state.json'), JSON.stringify(state));
+  fs.writeFileSync(path.join(cacheDir, 'install-manifest.json'),
+    JSON.stringify({ version: '1.0.0', config: {} }));
+  if (cachedBinary) {
+    // Present but with an unreadable `--version` → `cachedBinaryStaleVsState`
+    // true, which is exactly the shape a suspended machine is stuck in.
+    fs.writeFileSync(
+      path.join(cacheDir, 'bin', os.platform() === 'win32' ? 'code-graph-mcp.exe' : 'code-graph-mcp'),
+      'not a real binary');
+  }
+
+  // The ONLY observable that separates "backed off" from "checked and did
+  // nothing" is whether the request function ran, so count it.
+  const script = `
+    const au = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    let fetches = 0;
+    (async () => {
+      await au.checkForUpdate({
+        installMissing: true, // bypass the dev-mode gate; this repo IS a dev tree
+        force: ${force ? 'true' : 'false'},
+        requestJsonFn: async () => {
+          fetches++;
+          return { statusCode: 200, body: JSON.stringify({
+            tag_name: 'v9.9.9', tarball_url: 'https://127.0.0.1:1/t', assets: [] }) };
+        },
+      });
+      process.stdout.write(JSON.stringify({ fetches }));
+    })().catch(e => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    env: {
+      ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+      NPM_CONFIG_PREFIX: path.join(home, 'npm-prefix'), PATH: '',
+    },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+  return JSON.parse(r.stdout.trim().split('\n').pop()).fetches;
+}
+
+const JUST_NOW = () => new Date().toISOString();
+
+test('a stale cached binary does NOT punch through the rate-limit backoff (BIN-1)', (t) => {
+  const base = {
+    latestVersion: '9.9.9', updateAvailable: true, lastCheck: JUST_NOW(),
+  };
+  assert.equal(
+    runThrottleProbe(t, { state: { ...base, rateLimited: true }, cachedBinary: true }),
+    0, 'rateLimited must outrank the stale-binary bypass — a 403 has no URL to give');
+
+  // Control, and it has to be here: without it a child that crashed early, or a
+  // dev-mode short-circuit, would also read as 0 requests. Identical state minus
+  // the 403 flag → the bypass fires and the request happens.
+  assert.equal(
+    runThrottleProbe(t, { state: base, cachedBinary: true }),
+    1, 'control: with no backoff armed, the stale binary DOES bypass the throttle');
+});
+
+test('a suspended update stops re-checking GitHub once per session (BIN-1)', (t) => {
+  const base = {
+    latestVersion: '9.9.9', updateAvailable: true, lastCheck: JUST_NOW(),
+    suspendedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+  };
+  assert.equal(
+    runThrottleProbe(t, { state: { ...base, updateAttempts: MAX_UPDATE_ATTEMPTS }, cachedBinary: true }),
+    0, 'while the chain is parked a stale binary cannot be healed — the request buys nothing');
+
+  // Control: one attempt below the cap is not suspended, so the same stale
+  // binary and the same forced check DO reach GitHub. Without this the test
+  // would pass against a build that simply never checks.
+  assert.equal(
+    runThrottleProbe(t, { state: { ...base, updateAttempts: MAX_UPDATE_ATTEMPTS - 1 }, cachedBinary: true }),
+    1, 'control: below the cap the stale-binary bypass still fires');
+});
+
+test('a suspended update still checks when the cached binary is MISSING (BIN-1 over-suppression guard)', (t) => {
+  // The suspension branch downloads a missing binary on purpose (without it the
+  // MCP server has no engine at all), so suppressing this fetch would break the
+  // one repair suspension is meant to leave reachable.
+  assert.equal(
+    runThrottleProbe(t, {
+      state: {
+        latestVersion: '9.9.9', updateAvailable: true, lastCheck: JUST_NOW(),
+        updateAttempts: MAX_UPDATE_ATTEMPTS,
+        suspendedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      },
+      cachedBinary: false,
+    }),
+    1, 'a missing binary must still reach the release metadata it needs');
+});
+
+test('shouldCheck orders the binary bypasses below the backoff and the suspension (BIN-1)', () => {
+  const minsAgo = (m) => new Date(Date.now() - m * 60 * 1000).toISOString();
+  const suspended = {
+    lastCheck: minsAgo(1), updateAvailable: true,
+    updateAttempts: MAX_UPDATE_ATTEMPTS, suspendedAt: minsAgo(120),
+  };
+
+  // 1. rate limit outranks both bypasses AND force.
+  const limited = { lastCheck: minsAgo(1), rateLimited: true, updateAvailable: true };
+  assert.equal(shouldCheck(limited, { binaryStale: true }), false);
+  assert.equal(shouldCheck(limited, { binaryMissing: true }), false);
+  assert.equal(shouldCheck(limited, { binaryMissing: true, binaryStale: true, force: true }), false);
+  assert.equal(shouldCheck({ ...limited, lastCheck: minsAgo(61) }, { binaryStale: true }), true,
+    'and it still releases after its hour');
+
+  // 2. suspension suppresses the stale bypass and force, but not missing.
+  assert.equal(shouldCheck(suspended, { binaryStale: true, force: true }), false);
+  assert.equal(shouldCheck(suspended, { binaryMissing: true }), true);
+  assert.equal(shouldCheck({ ...suspended, lastCheck: minsAgo(7 * 60) }, {}), true,
+    'the ordinary 6h cadence keeps running, so a newer release still un-suspends it');
+
+  // 3. not suspended → the bypasses behave as before (no over-suppression).
+  const plain = { lastCheck: minsAgo(1), updateAvailable: true, updateAttempts: 1 };
+  assert.equal(shouldCheck(plain, { binaryStale: true }), true);
+  assert.equal(shouldCheck(plain, { binaryMissing: true }), true);
+  assert.equal(shouldCheck(plain, {}), false);
+
+  // 4. the suspension predicate needs BOTH markers, so a stale stamp alone
+  //    cannot park the updater.
+  assert.equal(isUpdateSuspended({ suspendedAt: minsAgo(10), updateAttempts: 1 }), false);
+  assert.equal(isUpdateSuspended({ updateAttempts: MAX_UPDATE_ATTEMPTS }), false);
+  assert.equal(isUpdateSuspended({ suspendedAt: minsAgo(10), updateAttempts: MAX_UPDATE_ATTEMPTS }), true);
+});
+
+// ── Download failures explain themselves (audit BIN-4) ──────────────────────
+//
+// The two most common ways a download dies — a truncated transfer and an HTTP
+// error page written to the output file — were also the only two that printed
+// nothing. Each one burns one of MAX_UPDATE_ATTEMPTS, so five silent failures
+// suspend the updater with no record anywhere of what went wrong.
+
+function captureStderr(t) {
+  const lines = [];
+  const orig = console.error;
+  console.error = (...args) => lines.push(args.join(' '));
+  t.after(() => { console.error = orig; });
+  return lines;
+}
+
+test('promoteVerifiedBinary says WHY it discards a sub-1MB download (BIN-4)', (t) => {
+  const dir = mkDir(t, 'cg-au-sizefloor-');
+  const tmp = path.join(dir, 'download.tmp');
+  fs.writeFileSync(tmp, '<html>404: Not Found</html>');
+  const dst = path.join(dir, 'code-graph-mcp');
+  const errs = captureStderr(t);
+
+  const size = fs.statSync(tmp).size;   // read now; promote unlinks the tmp file
+
+  assert.equal(promoteVerifiedBinary(tmp, dst, '1.2.3', sha256Of(tmp)), false);
+  const said = errs.join('\n');
+  assert.match(said, new RegExp(`${size} bytes`),
+    'the observed size is the whole diagnosis — print it');
+  assert.match(said, /Refusing to install/);
+  assert.equal(fs.existsSync(dst), false, 'and nothing is promoted');
+});
+
+test('promoteVerifiedBinary names the version it got instead of failing mute (BIN-4)', (t) => {
+  const dir = mkDir(t, 'cg-au-versionarm-');
+  const tmp = path.join(dir, 'download.tmp');
+  writeFakeBinary(tmp, '0.0.1');
+  const errs = captureStderr(t);
+
+  assert.equal(promoteVerifiedBinary(tmp, path.join(dir, 'code-graph-mcp'), '9.9.9', sha256Of(tmp)), false);
+  const said = errs.join('\n');
+  assert.match(said, /0\.0\.1/, 'what arrived');
+  assert.match(said, /9\.9\.9/, 'what was expected');
+});
+
+test('promoteVerifiedBinary reports the errno when the promote itself throws (BIN-4)', (t) => {
+  const dir = mkDir(t, 'cg-au-promoteerr-');
+  const errs = captureStderr(t);
+  // A tmp path that never materialised: statSync throws ENOENT. ENOSPC, EACCES
+  // and the Windows EPERM-on-a-running-.exe all land in the same bare catch, and
+  // without the code they were one indistinguishable "false".
+  assert.equal(
+    promoteVerifiedBinary(path.join(dir, 'never-downloaded'), path.join(dir, 'dst'), '1.2.3', 'de'.repeat(32)),
+    false);
+  assert.match(errs.join('\n'), /ENOENT/, 'the errno is the diagnosis');
+});
+
+test('downloadBinary fetches the binary with curl -f, like the sidecar (BIN-4)', { skip: os.platform() === 'win32' ? 'POSIX shell fixture' : false }, (t) => {
+  // Without `-f`, curl writes a 404/503 body to the output file and exits 0, so
+  // the error page travels on as a candidate binary. The sidecar fetch has used
+  // `-sfL` since it was written; the binary fetch used `-sL`.
+  const root = mkDir(t, 'cg-au-curlf-');
+  const fakeBin = path.join(root, 'fakebin');
+  fs.mkdirSync(fakeBin);
+  const curlLog = path.join(root, 'curl.log');
+  fs.writeFileSync(path.join(fakeBin, 'curl'), [
+    '#!/bin/sh',
+    'printf "%s\\n" "$*" >> "$CURL_LOG"',
+    'out=""; prev=""',
+    'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done',
+    'if [ -n "$out" ]; then printf x > "$out"; fi',
+    'exit 0',
+    '',
+  ].join('\n'));
+  fs.chmodSync(path.join(fakeBin, 'curl'), 0o755);
+  const home = path.join(root, 'home');
+  fs.mkdirSync(home);
+
+  const { spawnSync } = require('child_process');
+  const script = `
+    const { downloadBinary } = require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))});
+    downloadBinary({ version: '9.9.9', binaryUrl: 'https://example/code-graph-mcp-linux-x64' })
+      .then(r => process.stdout.write(String(r)));
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    env: {
+      ...cleanGitEnv(), HOME: home, CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+      CURL_LOG: curlLog, PATH: `${fakeBin}:/usr/bin:/bin`,
+    },
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  assert.equal(r.status, 0, `child failed: ${r.stderr}`);
+  assert.equal(r.stdout.trim().split('\n').pop(), 'false', 'the 1-byte result must not be installed');
+
+  const calls = fs.readFileSync(curlLog, 'utf8').trim().split('\n');
+  const binaryCall = calls.find(c => !c.includes('.sha256'));
+  assert.ok(binaryCall, `the binary fetch must have run; log was:\n${calls.join('\n')}`);
+  assert.match(binaryCall, /(^|\s)-sfL(\s|$)/,
+    'the binary fetch must fail-fast on HTTP >= 400, exactly as the sidecar fetch does');
+  const sidecarCall = calls.find(c => c.includes('.sha256'));
+  assert.match(sidecarCall, /(^|\s)-sfL(\s|$)/, 'control: the sidecar fetch already did');
+  // Same run proves the size floor now speaks (the fake curl writes 1 byte).
+  assert.match(r.stderr, /1 bytes/, 'and the discard is explained on stderr');
+});

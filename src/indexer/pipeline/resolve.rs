@@ -367,13 +367,25 @@ pub(super) fn resolve_pending_calls(db: &Database) -> Result<usize> {
 pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
     use crate::domain::{REL_CALLS, REL_IMPORTS};
 
-    // Collect (caller_fn_id, imported_target_id) pairs to bind. A bare call
-    // whose name is bound by a unique internal import in the caller's file —
-    // and is NOT shadowed by a same-file definition of that name — resolves to
-    // the imported node.
-    let pairs: Vec<(i64, i64)> = {
+    // Bind in ONE set-based statement. This used to SELECT the pairs and then
+    // call `insert_edge_cached` per row from Rust; because the SELECT returns
+    // every pair that COULD bind (not just the new ones) and the insert is
+    // `INSERT OR IGNORE`, the overwhelming majority of those round trips were
+    // no-ops re-proving edges that already existed. Measured on a 1,456-file
+    // tree: 10,960 pairs round-tripped to create 3 edges, ~0.24 s — paid on
+    // every single-file refresh, i.e. on every query that touches an edited
+    // file (indexing audit 2026-08-02 P1-6). The predicate below is the
+    // original SELECT verbatim; only the delivery changed, so which edges get
+    // created is unaffected — `INSERT OR IGNORE` applies the same
+    // `idx_edges_unique` dedup `insert_edge_cached` relied on.
+    //
+    // A bare call whose name is bound by a unique internal import in the
+    // caller's file — and is NOT shadowed by a same-file definition of that
+    // name — resolves to the imported node.
+    let inserted = {
         let mut stmt = db.conn().prepare(
-            "SELECT DISTINCT c.source_id, it.import_target_id
+            "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
+             SELECT DISTINCT c.source_id, it.import_target_id, ?2, NULL
              FROM (
                  SELECT e.source_id AS source_id, tn.name AS call_name,
                         sn.file_id AS caller_file
@@ -390,7 +402,7 @@ pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
                  JOIN nodes mn  ON mn.id  = ie.source_id
                  JOIN nodes itn ON itn.id = ie.target_id
                  JOIN files itf ON itf.id = itn.file_id
-                 WHERE ie.relation = ?2
+                 WHERE ie.relation = ?3
                    AND itf.path <> '<external>'
                  GROUP BY mn.file_id, itn.name
                  HAVING COUNT(DISTINCT itn.id) = 1
@@ -403,18 +415,8 @@ pub(super) fn bind_calls_to_imported_targets(db: &Database) -> Result<usize> {
                    WHERE ln.file_id = c.caller_file AND ln.name = c.call_name
                )",
         )?;
-        let rows = stmt.query_map(rusqlite::params![REL_CALLS, REL_IMPORTS], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        rows.filter_map(std::result::Result::ok).collect()
+        stmt.execute(rusqlite::params![REL_CALLS, REL_CALLS, REL_IMPORTS])?
     };
-
-    let mut inserted = 0usize;
-    for (src, tgt) in pairs {
-        if insert_edge_cached(db.conn(), src, tgt, REL_CALLS, None)? {
-            inserted += 1;
-        }
-    }
     Ok(inserted)
 }
 

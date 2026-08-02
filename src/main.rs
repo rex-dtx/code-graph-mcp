@@ -107,7 +107,11 @@ fn main() -> Result<()> {
             // else oneline), keeping cmd_health_check's `format: &str` contract.
             let hc_args = code_graph_mcp::cli::HealthCheckArgs::parse_from(args.iter().skip(1));
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
-            code_graph_mcp::cli::cmd_health_check(&project_root, hc_args.resolved_format())
+            code_graph_mcp::cli::cmd_health_check_opts(
+                &project_root,
+                hc_args.resolved_format(),
+                hc_args.deep,
+            )
         }
         Some("grep") => {
             let project_root = code_graph_mcp::cli::resolve_project_root()?;
@@ -469,6 +473,13 @@ fn print_help() {
     println!("    --relation <type>   Filter: calls, imports, inherits, implements (refs)");
     println!("    --min-confidence <t> Min edge confidence: extracted|inferred|ambiguous (refs; default: all)");
     println!("    --last N            Limit to last N sessions (stats; default: all)");
+    println!(
+        "    --deep              Run PRAGMA quick_check regardless of index size (health-check)"
+    );
+    println!(
+        "    --force             Replace the index even while another process holds the index lock"
+    );
+    println!("                        (rebuild-index, reindex --from-snapshot; that process's pending writes are lost)");
     println!("    -h, --help          Show this help message");
     println!("    -V, --version       Show version");
 }

@@ -3210,6 +3210,164 @@ fn test_incremental_rename_converges_to_full_rebuild() {
 }
 
 #[test]
+fn test_file_grown_past_size_limit_stops_lying_and_stops_rediffing() {
+    // Indexing audit 2026-08-02 IDX-1. A file that grows past max_file_size is
+    // skipped by Phase 1a, which used to mean `upsert_file` and
+    // `delete_nodes_by_file` never ran for it: the index kept answering with
+    // symbols the file no longer contains, AND its stored hash never advanced,
+    // so compute_diff re-reported it as changed on every single run forever.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("big.ts"), "export class Wide {}\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Presence first: the symbol must really be in the graph before we assert
+    // that it leaves (feedback_mutation_test_the_guard).
+    let (nodes, _) = graph_projection(&db);
+    assert!(
+        nodes
+            .iter()
+            .any(|(p, n, _)| p == "src/big.ts" && n == "Wide"),
+        "precondition: Wide must be indexed while the file is small, got {nodes:?}"
+    );
+
+    // Grow it past the 1 MiB default limit, renaming the symbol on the way so a
+    // stale node is unmistakable. Padding goes in a comment so the file stays
+    // valid TypeScript — the ONLY reason it is skipped is its size.
+    let padding = "// ".to_string() + &"x".repeat(1_100_000) + "\n";
+    fs::write(
+        src.join("big.ts"),
+        format!("{padding}export class Renamed {{}}\n"),
+    )
+    .unwrap();
+    let first = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        first.stats.files_skipped_size, 1,
+        "the grown file must be skipped for size, not indexed"
+    );
+
+    let (nodes, _) = graph_projection(&db);
+    assert!(
+        !nodes
+            .iter()
+            .any(|(p, n, _)| p == "src/big.ts" && n == "Wide"),
+        "stale symbol survived in a file that is no longer parsed: {nodes:?}"
+    );
+
+    // And the hash must have advanced: a second incremental over an unchanged
+    // tree has nothing to do. Before the fix this re-hashed and re-ran the whole
+    // pipeline on every run, forever.
+    let second = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        second.stats.files_skipped_size, 0,
+        "an unchanged oversize file must not be re-processed on the next run"
+    );
+    assert_eq!(
+        second.files_indexed, 0,
+        "an unchanged tree must report no work"
+    );
+
+    // Converge with a fresh rebuild of the same final tree.
+    let control_db_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&control_db);
+    assert_eq!(
+        inc_nodes, full_nodes,
+        "node set diverged from fresh rebuild"
+    );
+    assert_eq!(
+        inc_edges, full_edges,
+        "edge set diverged from fresh rebuild"
+    );
+}
+
+#[test]
+fn test_incremental_delete_converges_to_full_rebuild_for_non_call_edges() {
+    // Indexing audit 2026-08-02 P1-5 reproduction. Phase 0 buffered ONLY
+    // `calls` before the cascade-delete, so deleting b.ts destroyed a.ts's
+    // `imports`/`inherits` edges into it while a.ts itself never changed —
+    // and a.ts's hash still matched, so nothing re-extracted them. A full
+    // rebuild of the same final tree re-resolves them onto the `<external>`
+    // sentinel, so incremental and full diverged permanently.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("b.ts"), "export class Base {}\n").unwrap();
+    fs::write(
+        src.join("a.ts"),
+        "import { Base } from './b';\n\nexport class Child extends Base {}\n\n\
+         export function useIt() { return new Child(); }\n",
+    )
+    .unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Presence first: assert the real cross-file edges exist BEFORE the delete,
+    // so a later "they are gone" assertion cannot pass vacuously by matching
+    // nothing at either end (feedback_mutation_test_the_guard).
+    let (_, edges) = graph_projection(&db);
+    assert!(
+        edges.iter().any(|(sp, _, r, t, _)| sp == "src/a.ts"
+            && r == crate::domain::REL_IMPORTS
+            && t == "src/b.ts:Base"),
+        "precondition: a.ts must import b.ts:Base, got {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|(sp, sn, r, _, _)| sp == "src/a.ts" && sn == "Child" && r == "inherits"),
+        "precondition: Child must inherit Base, got {edges:?}"
+    );
+
+    // Delete the target file. a.ts is untouched and stays out of the changed set.
+    fs::remove_file(src.join("b.ts")).unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Control: fresh full index of the SAME final tree (a.ts alone).
+    let control_db_dir = TempDir::new().unwrap();
+    let control_db = Database::open(&control_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&control_db, project_dir.path(), None, None).unwrap();
+
+    let (inc_nodes, inc_edges) = graph_projection(&db);
+    let (full_nodes, full_edges) = graph_projection(&control_db);
+    // Direct statement of the defect: the import survives as an <external>
+    // binding rather than evaporating. Asserted explicitly (not only via the
+    // set equality below) so the failure message names the lost edge.
+    assert!(
+        full_edges
+            .iter()
+            .any(|(sp, _, r, t, _)| sp == "src/a.ts"
+                && r == crate::domain::REL_IMPORTS
+                && t == "<external>:Base"),
+        "control: a fresh rebuild should bind the now-missing import to the sentinel, got {full_edges:?}"
+    );
+    assert!(
+        inc_edges
+            .iter()
+            .any(|(sp, _, r, t, _)| sp == "src/a.ts"
+                && r == crate::domain::REL_IMPORTS
+                && t == "<external>:Base"),
+        "incremental delete dropped the unchanged file's import edge instead of re-resolving it: {inc_edges:?}"
+    );
+    assert_eq!(
+        inc_nodes, full_nodes,
+        "incremental node set diverged from a fresh full rebuild after a delete"
+    );
+    assert_eq!(
+        inc_edges, full_edges,
+        "incremental edge set diverged from a fresh full rebuild after a delete"
+    );
+}
+
+#[test]
 fn test_multi_batch_incremental_rename_survives_and_converges() {
     // Pre-tag review Critical-1 (2026-08-02): a restore-miss requeue captured
     // the source node's CURRENT id; when the source file sat in a LATER batch
