@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.112.1 (2026-08-02)
+
+### Fixed
+- **`grep` on Windows returned absolute paths — and with them lost the AST
+  annotations, `-c` zero-fill, and dedup.** Latent on every prior version;
+  surfaced the moment v0.112.0's CI installed ripgrep and the 43 grep
+  end-to-end tests actually ran on windows-latest for the first time (10
+  failed). ripgrep echoes back the path spelling each operand was handed, and
+  the operands came in TWO spellings: explicit search paths canonicalized to
+  the long form, the default walk operand in the raw project-root spelling —
+  which on Windows can be an 8.3 short name (`…\RUNNER~1\…`). No single
+  lexical root string can equate the two, so output rows kept their absolute
+  paths and everything keyed on repo-relative paths downstream missed. The
+  default walk operand is now canonicalized like every explicit path, the
+  path-traversal guard and `-c` scoping accept either root spelling for the
+  nonexistent-path fallback (rg then reports the honest "No such file"
+  partial instead of a bogus outside-project rejection), and output
+  relativization tries the canonical root first, the raw root second.
+  Verified where it can only be verified — the windows CI leg: 10 failures →
+  0 across the two fixes. Linux/macOS output is unchanged (the fallback fires
+  only when the canonical root misses, which requires the two spellings to
+  differ).
+
 ## v0.112.0 (2026-08-02)
 
 **Migration note: this release bumps INDEX_VERSION (57 → 58). The MCP server
