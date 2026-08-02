@@ -2207,12 +2207,6 @@ fn resolve_deferred_relations(
         CalleeMeta,
     };
 
-    // One per pass: the import lookup and the per-source carve-out probe are
-    // both per-(file, name) constants, and a fan-out repeats them thousands of
-    // times over the same few files.
-    let mut narrow_cache_owned = super::resolve::ImportNarrowCache::default();
-    let narrow_cache = &mut narrow_cache_owned;
-
     let mut name_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
     let mut node_id_to_path: HashMap<i64, String> = HashMap::new();
     let mut node_id_to_language: HashMap<i64, Option<String>> = HashMap::new();
@@ -2571,31 +2565,8 @@ fn resolve_deferred_relations(
                 .collect();
             let same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
             if !same_language_targets.is_empty() {
-                // Ask prune's question here, while the edges are still
-                // hypothetical. Gated on empty metadata because that is prune's
-                // own eligibility test — a JS receiver ns-miss lands in this
-                // same chain WITH metadata, and prune never touches those.
-                let bare = d.metadata.as_deref().map(str::is_empty).unwrap_or(true);
-                let narrowed = if bare {
-                    super::resolve::import_narrowed_targets(
-                        db,
-                        &d.rel_path,
-                        &d.target_name,
-                        &source_ids,
-                        &same_language_targets,
-                        narrow_cache,
-                    )?
-                } else {
-                    None
-                };
-                let final_targets = match narrowed {
-                    Some(t) => t,
-                    None => refine_ambiguous_targets(
-                        &same_language_targets,
-                        &d.rel_path,
-                        &node_id_to_path,
-                    ),
-                };
+                let final_targets =
+                    refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
                 edges_created += insert_relation_edges(
                     db,
                     &source_ids,

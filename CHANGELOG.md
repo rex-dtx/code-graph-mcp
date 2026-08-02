@@ -2,10 +2,6 @@
 
 ## v0.114.0 (2026-08-02)
 
-**Migration note: this release bumps INDEX_VERSION (59 → 60).** The MCP server
-wipes and rebuilds the index automatically on its first start; a CLI-only setup
-rebuilds on the next `incremental-index` / `rebuild-index`.
-
 Follow-up to the v0.113.0 audit remediation: the two places that batch left
 unfinished, plus the reader-side half of an invariant this project has claimed
 since the daagu incident.
@@ -50,27 +46,6 @@ since the daagu incident.
   once statistics exist. Building them first costs ~30ms. Full index of that
   repository: 13.16s → 8.52s. Single-file refreshes are excluded, so the
   query-time path is unaffected.
-- **A bare call to a widely-repeated symbol name no longer creates edges only to
-  delete them.** Such a call fanned out to every same-name candidate, and a later
-  pass removed the contradicted ones: with 60 files exporting one name, one pass
-  created 32,900 edges and the next deleted 31,860 of them. The binding decision
-  now happens before the edges are written, when the caller's file imports that
-  name. A 600-file case of that shape went from 2.79s to 0.17s; a repository
-  without repeated names is unaffected. This covers the post-batch resolution
-  pass, which is where the fan-out is concentrated; the batch-time path still
-  reconciles afterwards, and was measured to carry no residual cost.
-
-  **This changes which edges are produced**, which is why `INDEX_VERSION` moves.
-  Whenever a file imports one name from two or more different places — the
-  `try`/`except ImportError` fallback idiom, conditional requires, a re-export
-  pair — the call now binds to all of those definitions. Previously it bound to
-  whichever single definition sat closest on the path, and if that closest one
-  happened not to be among the imported definitions, the call was left with no
-  edge at all. Both outcomes are corrected. Calls whose name is imported from
-  exactly one place are unaffected, which is the overwhelmingly common case and
-  the reason a diff over a 232-file and a 2,052-file repository showed no
-  difference: neither contains the shape. That measurement was real but could
-  not have detected this, and the case was found in review instead.
 
 ## v0.113.0 (2026-08-02)
 
