@@ -351,3 +351,141 @@ fn show_does_not_resolve_a_name_that_exists_only_as_an_import() {
         "a real project symbol must still resolve: {ok_stdout}"
     );
 }
+
+/// Byte offset 0 of a SQLite file holds the magic header string; clobbering it
+/// makes `Connection::open` itself fail (`file is not a database`), which is the
+/// trigger for the corruption branch. This is a DIFFERENT trigger from the
+/// `INDEX_VERSION` wipe the tests above cover, and it reached the same
+/// `open_impl` for readers as for indexers.
+fn clobber_header(db_path: &std::path::Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(db_path)
+        .unwrap();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    f.write_all(b"NOTSQLITE".repeat(4).as_slice()).unwrap();
+}
+
+fn indexed_fixture() -> (TempDir, std::path::PathBuf) {
+    let project = fixture_project();
+    let db_path = project.path().join(CODE_GRAPH_DIR).join("index.db");
+    let status = Command::new(cli_bin())
+        .args(["incremental-index", "--quiet", "--no-embed"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "fixture index build failed");
+    assert!(node_count(&db_path) > 0, "fixture must index some nodes");
+    (project, db_path)
+}
+
+#[test]
+fn read_command_reports_a_corrupt_index_instead_of_deleting_it() {
+    // The `INDEX_VERSION` wipe was moved off readers; the CORRUPTION wipe was
+    // not, so the documented invariant held for one trigger and not the other.
+    // Reproduced before the fix: a plain `health-check` (what the statusline
+    // polls on every render) deleted a 151 552-byte index holding real symbols
+    // and left a 4 096-byte empty one behind. Nothing rebuilds after a status
+    // poll, and the integrity probes then reported `quick_check: ok` — on the
+    // replacement — so the user lost the index and was told it was fine.
+    let (project, db_path) = indexed_fixture();
+    let size_before = std::fs::metadata(&db_path).unwrap().len();
+    clobber_header(&db_path);
+
+    let out = Command::new(cli_bin())
+        .args(["health-check", "--format", "json"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+
+    // The bytes are still there. This is the whole point: a passive consumer
+    // must not be the thing that destroys the user's index.
+    let size_after = std::fs::metadata(&db_path)
+        .expect("a read command must not DELETE the index file")
+        .len();
+    assert_eq!(
+        size_after, size_before,
+        "a read command rewrote the index (before {size_before} B, after {size_after} B)"
+    );
+
+    // And it must be diagnosable, not an opaque failure: same `issue` +
+    // `integrity.quick_check` shape a page-level corruption produces, which is
+    // what doctor's `index-corrupt` repair routes off.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("non-JSON stdout {stdout:?}: {e}"));
+    assert_eq!(v["healthy"], serde_json::json!(false));
+    let issue = v["issue"].as_str().unwrap_or_default();
+    assert!(
+        issue.contains("corrupt"),
+        "issue must name corruption, got {issue:?}"
+    );
+    assert!(
+        issue.contains("rebuild-index --confirm"),
+        "issue must carry the remedy so the user is not left guessing, got {issue:?}"
+    );
+    assert!(
+        v["integrity"]["quick_check"].is_string(),
+        "integrity.quick_check must carry the verdict doctor reads, got {}",
+        v["integrity"]
+    );
+    assert_eq!(out.status.code(), Some(1), "an unhealthy index must exit 1");
+}
+
+#[test]
+fn read_command_reports_a_sub_header_index_instead_of_deleting_it() {
+    // Second reader-side wipe with the same shape: `sub_header_size_guard`
+    // unconditionally removed main+wal+shm for any file under 100 bytes. Post-
+    // crash residue is a real recovery case, but performing it from a status
+    // poll destroys a truncated-but-present file that an indexer could have
+    // reported on. Distinct from the branch above (it never reaches
+    // `Connection::open`), so it needs its own guard.
+    let (project, db_path) = indexed_fixture();
+    std::fs::write(&db_path, b"short").unwrap();
+
+    let out = Command::new(cli_bin())
+        .args(["health-check", "--format", "json"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(&db_path).expect("a read command must not delete a truncated index"),
+        b"short",
+        "a read command rewrote the truncated index"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("non-JSON stdout {stdout:?}: {e}"));
+    assert_eq!(v["healthy"], serde_json::json!(false));
+    assert!(
+        v["issue"].as_str().unwrap_or_default().contains("corrupt"),
+        "issue must name corruption, got {}",
+        v["issue"]
+    );
+}
+
+#[test]
+fn indexer_still_self_heals_a_corrupt_index() {
+    // Negative control for both tests above. The wipe is not being removed, it
+    // is being confined to callers that rebuild in the same breath. If this
+    // goes red, the fix overshot and every user with a corrupt index is stuck
+    // instead of self-healing on the next index run.
+    let (project, db_path) = indexed_fixture();
+    clobber_header(&db_path);
+
+    let status = Command::new(cli_bin())
+        .args(["incremental-index", "--quiet", "--no-embed"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "an INDEXER must still recover from corruption by rebuilding"
+    );
+    assert!(
+        node_count(&db_path) > 0,
+        "indexer recovery must leave a populated index behind"
+    );
+}

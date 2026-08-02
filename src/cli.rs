@@ -1424,7 +1424,50 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
             return Ok(());
         }
     }
-    let ctx = CliContext::open(project_root)?;
+    // A corrupt index used to be invisible HERE: the reader open deleted the
+    // file and retried on a blank one, so this command reported an empty index
+    // (and `quick_check: ok`, on the replacement) while the user's symbols were
+    // gone. Readers no longer delete, so the open fails — and this is the one
+    // command whose whole job is to say what is wrong with the index, so it
+    // renders that as its normal corrupt verdict instead of an opaque error.
+    // Same `issue` wording and same `integrity.quick_check` shape as a
+    // quick_check failure below, so doctor's `index-corrupt` repair routes off
+    // it unchanged.
+    let ctx = match CliContext::open(project_root) {
+        Ok(c) => c,
+        Err(e) if Database::is_corrupt_index_error(&e) => {
+            let detail = e.to_string();
+            if format == "json" {
+                let payload = serde_json::json!({
+                    "healthy": false,
+                    // `reason` mirrors the `no_index` short-circuit above: a
+                    // machine-readable tag so consumers route without grepping
+                    // prose. `schema_version` is null and PRESENT rather than
+                    // omitted — the database cannot be opened, so the version is
+                    // genuinely unknown, and doctor's payload sniffer keys off
+                    // this field's existence.
+                    "reason": "corrupt",
+                    "schema_version": null,
+                    "issue": detail,
+                    "integrity": {"quick_check": detail, "fts_drift": null, "orphan_vectors": null},
+                    "nodes": 0, "edges": 0, "files": 0,
+                    "watching": false,
+                    "db_size_bytes": 0,
+                    "search_mode": "fts_only",
+                    "embedding_progress": "0/0",
+                    "embedding_coverage_pct": 0,
+                    "embedding_status": "unavailable",
+                    "model_available": cfg!(feature = "embed-model"),
+                    "snapshot": {"status": "absent", "source_url": null, "source_commit": null, "fetched_at": null, "commit_drift": null},
+                });
+                println!("{}", serde_json::to_string(&payload)?);
+            } else {
+                eprintln!("UNHEALTHY: {}", detail);
+            }
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e),
+    };
     // The reader open above is non-destructive: if the on-disk index was built by
     // an older INDEX_VERSION, the data is intact but a rebuild is owed. Report it
     // rather than (as before) silently wiping it on this status poll.
@@ -3933,7 +3976,24 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         );
     }
     if ctx.is_none() {
-        eprintln!("[code-graph] No index found. Run: code-graph-mcp incremental-index");
+        // `try_open` returns Option, so "absent" and "present but unreadable"
+        // arrive identically. They used to be the same situation in practice —
+        // a corrupt index was deleted by this very open, making "No index
+        // found" true by the time it printed. Readers no longer delete, so the
+        // file survives and that sentence became false: it names the wrong
+        // state and points at the wrong file. Distinguish by asking the disk.
+        let db_path = effective_read_root(project_root)
+            .join(CODE_GRAPH_DIR)
+            .join("index.db");
+        if db_path.exists() {
+            eprintln!(
+                "[code-graph] Index at {} could not be read (corrupt or unreadable). \
+                 Run: code-graph-mcp rebuild-index --confirm",
+                db_path.display()
+            );
+        } else {
+            eprintln!("[code-graph] No index found. Run: code-graph-mcp incremental-index");
+        }
         eprintln!("[code-graph] Showing plain grep results (no AST context).");
     }
 

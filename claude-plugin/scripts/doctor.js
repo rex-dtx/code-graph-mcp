@@ -123,6 +123,18 @@ function classifyHealthReport(hc) {
       { name: 'Embeddings', status: 'skip', detail: 'no index' },
     ];
   }
+  // The database could not be opened at all, so schema/nodes/embeddings are not
+  // unknown-but-probably-fine, they are unmeasurable. Reporting `Schema: ok
+  // vnull` off the zeroed payload would be a fabricated pass; the Integrity row
+  // below carries the real verdict and the `index-corrupt` fix.
+  if (hc.reason === 'corrupt') {
+    return [
+      { name: 'Schema', status: 'skip', detail: 'index unreadable' },
+      { name: 'Index', status: 'skip', detail: 'index unreadable' },
+      { name: 'Embeddings', status: 'skip', detail: 'index unreadable' },
+      classifyIntegrity(hc),
+    ];
+  }
   const rows = [];
   if (hc.issue && String(hc.issue).includes('schema')) {
     rows.push({ name: 'Schema', status: 'warn', detail: hc.issue, fixId: 'schema-mismatch' });
@@ -159,7 +171,13 @@ function parseHealthPayload(buf) {
   try {
     const obj = JSON.parse(buf.toString().trim());
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
-    const looksLikeReport = 'schema_version' in obj || obj.reason === 'no_index';
+    // `reason` covers payloads the binary emits BEFORE it can read a schema
+    // version (no_index, corrupt). Keying only on `schema_version` meant the
+    // corrupt payload — the one case where recovering the report matters most —
+    // was rejected and fell through to `binary-broken`. Caught by an end-to-end
+    // run against a real clobbered index; neither side's unit tests could see
+    // it, because each was asserted against its own fixture.
+    const looksLikeReport = 'schema_version' in obj || typeof obj.reason === 'string';
     return looksLikeReport ? obj : null;
   } catch {
     return null;

@@ -247,6 +247,50 @@ test('parseHealthPayload recovers the report from a nonzero-exit stdout, and onl
   assert.equal(parseHealthPayload('null'), null);
 });
 
+test('the corrupt-index payload the BINARY emits is routed, not rejected', () => {
+  // Cross-language contract. The Rust side gained a `reason: "corrupt"` payload
+  // for an index it cannot open; `parseHealthPayload` keyed only on
+  // `schema_version`, which that payload does not carry, so the one case where
+  // recovering the report matters most fell through to `binary-broken` — the
+  // fixId with no repair. Neither side's unit tests could see it: each was
+  // asserted against its own fixture. Caught only by running the real binary
+  // against a real clobbered index.
+  //
+  // These are the ACTUAL keys `health-check --json` emits on that path (checked
+  // against the binary), so drifting either side reds this.
+  const { parseHealthPayload, classifyHealthReport } = require('./doctor');
+  const payload = {
+    healthy: false,
+    reason: 'corrupt',
+    schema_version: null,
+    issue: 'index database is corrupt: file is not a database (/p/.code-graph/index.db). '
+      + 'The index is a rebuildable cache — run: code-graph-mcp rebuild-index --confirm',
+    integrity: {
+      quick_check: 'index database is corrupt: file is not a database (/p/.code-graph/index.db).',
+      fts_drift: null,
+      orphan_vectors: null,
+    },
+    nodes: 0, edges: 0, files: 0, watching: false, db_size_bytes: 0,
+    search_mode: 'fts_only', embedding_progress: '0/0', embedding_coverage_pct: 0,
+    embedding_status: 'unavailable', model_available: false,
+    snapshot: { status: 'absent' },
+  };
+
+  assert.ok(parseHealthPayload(JSON.stringify(payload)),
+    'the binary emits this on stdout before exiting 1 — it must be recognised as a report');
+
+  const byName = Object.fromEntries(classifyHealthReport(payload).map((r) => [r.name, r]));
+  assert.equal(byName.Integrity.status, 'error');
+  assert.equal(byName.Integrity.fixId, 'index-corrupt', 'must route to a repair that exists');
+  // The zeroed counters are "unmeasurable", not "measured as zero". Reporting
+  // `Schema: ok vnull` or `Index: warn empty -> index-empty` off them would
+  // fabricate a verdict and send the repair down the wrong path.
+  assert.equal(byName.Schema.status, 'skip');
+  assert.equal(byName.Index.status, 'skip');
+  assert.notEqual(byName.Index.fixId, 'index-empty',
+    'a corrupt index must not be repaired as an empty one');
+});
+
 test('classifyIntegrity: severity differs per probe, and an absent block is not a pass', () => {
   const { classifyIntegrity } = require('./doctor');
   const of = (integrity) => classifyIntegrity({ integrity });

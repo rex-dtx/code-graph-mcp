@@ -15,6 +15,17 @@ extern "C" {
 
 static VEC_INIT: Once = Once::new();
 
+/// Size of the SQLite database header per the on-disk format spec.
+/// A file shorter than this cannot be a database.
+/// <https://www.sqlite.org/fileformat.html#magic_header_string>
+const SQLITE_HEADER_SIZE: u64 = 100;
+
+/// Marker in the reader-side corruption error. Matched by
+/// [`Database::is_corrupt_index_error`] so `health-check` can tell a corrupt
+/// index apart from every other open failure without a bespoke error type
+/// threaded through `CliContext`.
+const CORRUPT_INDEX_PREFIX: &str = "index database is corrupt";
+
 fn register_sqlite_vec() {
     VEC_INIT.call_once(|| {
         // SAFETY: sqlite3_vec_init has the exact C ABI signature expected by
@@ -118,6 +129,23 @@ impl Database {
         })
     }
 
+    /// `revalidate` doubles as "this caller is an INDEXER". Only an indexer may
+    /// destroy the file, because only an indexer rebuilds it in the same breath.
+    ///
+    /// [`Database::open_nondestructive`] already carried that invariant in its
+    /// doc comment ("Readers must never trigger the wipe") but only enforced it
+    /// for the `INDEX_VERSION` sweep — the two wipes below ran for readers too.
+    /// Reproduced: clobbering the header and running a plain `health-check`
+    /// (a status poll, run by the statusline on every render) deleted a
+    /// 151 552-byte index holding real symbols and left a 4 096-byte empty one.
+    /// Nothing rebuilt it, and the integrity probes added for the same command
+    /// then reported `quick_check: ok` — on the replacement. The user loses the
+    /// index and is told everything is fine.
+    ///
+    /// For readers the corruption is now REPORTED instead: the error names the
+    /// one-line remedy, `health-check` turns it into its usual corrupt-index
+    /// verdict, and doctor's `index-corrupt` repair does the rebuild under a
+    /// caller that actually rebuilds.
     fn open_impl(path: &Path, enable_vec: bool, revalidate: bool) -> Result<Self> {
         // Proactive sub-header size guard: any pre-existing main file smaller
         // than the 100-byte SQLite database header cannot be a valid database.
@@ -128,11 +156,24 @@ impl Database {
         // sometimes is_corruption_error fires. The guard collapses every
         // sub-header state to one canonical recovery path: wipe the whole
         // triple (main + wal + shm) so the retry starts blank.
-        Self::sub_header_size_guard(path);
+        if revalidate {
+            Self::sub_header_size_guard(path);
+        } else if Self::is_sub_header(path) {
+            return Err(Self::corrupt_index_error(
+                path,
+                &format!(
+                    "file is {} bytes, shorter than the 100-byte SQLite header",
+                    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+                ),
+            ));
+        }
 
         match Self::open_impl_inner(path, enable_vec, revalidate) {
             Ok(db) => Ok(db),
             Err(e) if Self::is_corruption_error(&e) && path.exists() => {
+                if !revalidate {
+                    return Err(Self::corrupt_index_error(path, &e.to_string()));
+                }
                 tracing::warn!(
                     "[db] Database corrupt ({}), deleting for rebuild: {}",
                     path.display(),
@@ -155,13 +196,38 @@ impl Database {
         }
     }
 
+    /// The reader-side corruption verdict. Carries the remedy in the message
+    /// because every read command surfaces this string verbatim, and "file is
+    /// not a database" on its own tells the user nothing they can act on.
+    fn corrupt_index_error(path: &Path, detail: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "{}: {} ({}). The index is a rebuildable cache — run: \
+             code-graph-mcp rebuild-index --confirm",
+            CORRUPT_INDEX_PREFIX,
+            detail,
+            path.display()
+        )
+    }
+
+    /// True when a file exists but is shorter than the SQLite header, i.e. it
+    /// cannot be a database. Read-only counterpart of [`Self::sub_header_size_guard`].
+    fn is_sub_header(path: &Path) -> bool {
+        matches!(std::fs::metadata(path), Ok(m) if m.is_file() && m.len() < SQLITE_HEADER_SIZE)
+    }
+
+    /// Does this error come from the reader-side corruption path above?
+    /// Used by `health-check` to render a corrupt index as its normal
+    /// corrupt-index verdict rather than an opaque open failure.
+    pub(crate) fn is_corrupt_index_error(e: &anyhow::Error) -> bool {
+        e.to_string().contains(CORRUPT_INDEX_PREFIX)
+    }
+
     /// Wipe an existing main DB file plus any sibling .wal/.shm if the main
     /// file is shorter than the SQLite header (100 bytes). No-op when the
     /// main file is absent (fresh install) or already a proper size.
+    ///
+    /// INDEXER-ONLY (see [`Self::open_impl`]): the caller must rebuild.
     fn sub_header_size_guard(path: &Path) {
-        // 100 bytes = SQLite database header per the on-disk format spec.
-        // https://www.sqlite.org/fileformat.html#magic_header_string
-        const SQLITE_HEADER_SIZE: u64 = 100;
         let size = match std::fs::metadata(path) {
             Ok(m) if m.is_file() => m.len(),
             _ => return,
