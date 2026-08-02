@@ -1192,3 +1192,116 @@ test('a new target version clears a stale suspension clock', (t) => {
   assert.equal(state.updateAttempts, 1, 'fresh budget for the new release');
   assert.equal(state.suspendedAt, null, 'stale stamp from the old release must be dropped');
 });
+
+// ── checkForUpdate state carry-forward (audit 2026-08-01) ──────────────────
+//
+// Every saveState() in checkForUpdate spreads `...state` except one: the
+// hasUpdate branch rebuilt the object from scratch. Any key it did not name was
+// therefore erased on every check that found a new release — and the keys it
+// does not name are exactly selfHealGlobalPkgs', which that function returns as
+// `{}` once its retry cap is hit. So the capped global-npm heal got a fresh
+// budget every release: the treadmill the cap exists to stop.
+
+/**
+ * Drive the real checkForUpdate() against a sandboxed HOME with a stubbed
+ * GitHub response. The release names no downloadable assets, so the download
+ * chain fails immediately (no network, no marketplace clone) — which is the
+ * failure path these assertions are about.
+ */
+function updateStateSandbox(t, { manifestVersion, state, globalPkg }) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upd-state-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  const cache = path.join(home, '.cache', 'code-graph');
+  fs.mkdirSync(cache, { recursive: true });
+  fs.writeFileSync(path.join(cache, 'install-manifest.json'),
+    JSON.stringify({ version: manifestVersion, config: {} }));
+  fs.writeFileSync(path.join(cache, 'update-state.json'), JSON.stringify(state));
+
+  // NPM_CONFIG_PREFIX is globalNodeModulesCandidates' FIRST candidate, so this
+  // is how a "stale global package" is staged without touching the real one.
+  const prefix = path.join(root, 'npm-prefix');
+  if (globalPkg) {
+    const pkgDir = path.join(prefix, 'lib', 'node_modules', '@sdsrs', 'code-graph');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'),
+      JSON.stringify({ name: '@sdsrs/code-graph', version: globalPkg }));
+  } else {
+    fs.mkdirSync(prefix, { recursive: true });
+  }
+  return { root, home, prefix, statePath: path.join(cache, 'update-state.json') };
+}
+
+function runCheckForUpdate(sb, latestVersion) {
+  const script = `
+    const release = {
+      tag_name: 'v${latestVersion}',
+      tarball_url: 'http://127.0.0.1:1/src.tar.gz',
+      assets: [],
+    };
+    require(${JSON.stringify(path.join(__dirname, 'auto-update.js'))})
+      .checkForUpdate({ installMissing: true, requestJsonFn: async () => ({ statusCode: 200, body: JSON.stringify(release) }) })
+      .then(() => process.exit(0), () => process.exit(0));
+  `;
+  const { execFileSync } = require('node:child_process');
+  execFileSync(process.execPath, ['-e', script], {
+    cwd: path.dirname(__dirname),
+    env: {
+      ...cleanGitEnv(),
+      HOME: sb.home, USERPROFILE: sb.home,
+      TMPDIR: sb.root, TMP: sb.root, TEMP: sb.root,
+      NPM_CONFIG_PREFIX: sb.prefix,
+      CODE_GRAPH_AUTO_UPDATE_SILENT: '1',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 60000,
+  });
+  return JSON.parse(fs.readFileSync(sb.statePath, 'utf8'));
+}
+
+test('a failed update keeps the global-npm heal counters instead of resetting them', (t) => {
+  // globalPkgHealAttempts is AT the cap and the staged global package is stale,
+  // so selfHealGlobalPkgs returns {} (it has given up) and contributes nothing
+  // to the spread — the branch's own object is the only thing that can carry
+  // the counters, and it did not.
+  const sb = updateStateSandbox(t, {
+    manifestVersion: '0.0.1',
+    globalPkg: '0.0.1',
+    state: {
+      latestVersion: '9.9.9',
+      updateAttempts: 1,
+      globalPkgHealVersion: '9.9.9',
+      globalPkgHealAttempts: 3,   // == GLOBAL_PKG_HEAL_MAX_ATTEMPTS
+    },
+  });
+
+  const after = runCheckForUpdate(sb, '9.9.9');
+
+  assert.equal(after.globalPkgHealAttempts, 3,
+    'a capped heal must stay capped — resetting it hands the failing npm install a fresh budget every release');
+  assert.equal(after.globalPkgHealVersion, '9.9.9',
+    'and the version the cap is scoped to must survive, or the cap loses its anchor');
+  assert.equal(after.updateAttempts, 2, 'the failed download still counts (sanity: the branch under test ran)');
+});
+
+test('an out-of-band manual update clears the failure record', (t) => {
+  // The suspension notice tells the user to update manually. When they do, the
+  // next check finds nothing to install — and used to leave updateAttempts and
+  // suspendedAt untouched, so `doctor` kept warning "v9.9.9 failed to install
+  // 5× — auto-retry throttled" about a version already installed.
+  const sb = updateStateSandbox(t, {
+    manifestVersion: '0.0.1',            // now equal to latest → nothing to do
+    state: {
+      latestVersion: '0.0.1',
+      updateAvailable: true,
+      updateAttempts: 5,
+      suspendedAt: '2026-01-01T00:00:00.000Z',
+    },
+  });
+
+  const after = runCheckForUpdate(sb, '0.0.1');
+
+  assert.equal(after.updateAvailable, false, 'sanity: the no-update branch ran');
+  assert.equal(after.updateAttempts, 0, 'the failure counter describes an update that is no longer pending');
+  assert.equal(after.suspendedAt, null, 'and the suspension clock must not outlive the suspension');
+});

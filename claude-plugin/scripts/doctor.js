@@ -482,9 +482,9 @@ function relicRepairGuard({ log = console.log, relic = undefined } = {}) {
 function detectEmbedModel(binary, run = execFileSync) {
   if (!binary) return null;
   try {
-    const out = run(binary, ['health-check', '--json'], {
+    const out = run(binary, ['health-check', '--json'], hidden({
       timeout: 10000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-    });
+    }));
     return JSON.parse(out).model_available === true;
   } catch { return null; }
 }

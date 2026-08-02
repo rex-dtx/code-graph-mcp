@@ -12,7 +12,7 @@ const os = require('os');
 // ~/.claude/tmp/, so bare-tmp flags interleave with transcript captures —
 // diagnostic blindness + the §8 recursive-grep footgun (see tmp-dir.js). The
 // other hook scripts already route through here; this one was the lone holdout.
-const { cgTmpDir } = require('./tmp-dir');
+const { cgTmpDir, cwdHash } = require('./tmp-dir');
 const { hidden } = require('./proc-opts');
 
 // Mid-session install detection: hook fires but no manifest yet.
@@ -27,17 +27,24 @@ const COOLDOWNS = {
   symptom:   10 * 60 * 1000, // 10min — Phase E meta-advisory hint, low value to repeat
 };
 
-function isCoolingDown(type) {
+// Project-scoped (see cwdHash in tmp-dir.js). There are only five flag names
+// here, so an un-scoped flag was effectively a machine-wide mute: one `impact`
+// push in any repo silenced the next 30s of impact pushes in every other repo,
+// and `overview` did it for five minutes.
+function ctxFlagPath(type, cwd) {
+  return path.join(cgTmpDir(), `.code-graph-ctx-${cwdHash(cwd)}-${type}`);
+}
+
+function isCoolingDown(type, cwd = process.cwd()) {
   try {
-    const flag = path.join(cgTmpDir(), `.code-graph-ctx-${type}`);
-    const stat = fs.statSync(flag);
+    const stat = fs.statSync(ctxFlagPath(type, cwd));
     return Date.now() - stat.mtimeMs < (COOLDOWNS[type] || 60000);
   } catch { return false; }
 }
 
-function markCooldown(type) {
+function markCooldown(type, cwd = process.cwd()) {
   try {
-    fs.writeFileSync(path.join(cgTmpDir(), `.code-graph-ctx-${type}`), '');
+    fs.writeFileSync(ctxFlagPath(type, cwd), '');
   } catch { /* ok */ }
 }
 
@@ -424,7 +431,12 @@ function runMain() {
   // --- Read user message ---
   let message;
   try {
-    const input = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
+    // fd 0, not '/dev/stdin': the path form open(2)s the symlink target, which
+    // fails with ENXIO when stdin is a socketpair (e.g. spawnSync {input}).
+    // Reading the fd directly works for pipes, sockets, and files alike. Five
+    // sibling hooks already did this; this one was the holdout, so it read
+    // nothing under exactly the conditions verifyHooksFire spawns it with.
+    const input = JSON.parse(fs.readFileSync(0, 'utf8'));
     message = (input && input.message) || '';
   } catch {
     return;
@@ -445,14 +457,16 @@ function runMain() {
   const filePaths = extractFilePaths(message);
   const symbols = extractSymbols(message);
   const intents = detectIntents(message);
-  const query = determineQueryType(intents, symbols, filePaths, isCoolingDown, message);
+  // Key the cooldowns on the resolved project root, not the raw shell cwd, so a
+  // `cd` into a subdir does not read as a different project and re-fire.
+  const query = determineQueryType(intents, symbols, filePaths, (type) => isCoolingDown(type, cwd), message);
 
   if (!query) return;
 
   // Phase E: symptom-hint is prose-only (no CLI execution). Emit + cooldown
   // before the result-fetching paths so it can short-circuit cleanly.
   if (query.type === 'symptom-hint') {
-    markCooldown('symptom');
+    markCooldown('symptom', cwd);
     process.stdout.write(
       '[code-graph:hint] indexed repo — for vague-symptom prompts, try `semantic_code_search "<symptom>"` ' +
       'or `module_overview <suspected-dir>` to surface candidate code structurally. Skip if not searching code.\n'
@@ -467,8 +481,17 @@ function runMain() {
     search:    '[code-graph:search] Relevant code:',
   };
 
-  function run(cmd, args) {
-    return execFileSync(cmd, args, hidden({
+  // Resolve the binary the way every other hook does. The bare name relied on
+  // `code-graph-mcp` being on PATH, which it is not for plugin-only installs
+  // (the binary lives in ~/.cache/code-graph/bin), and when it IS on PATH it may
+  // be an unrelated or years-stale global shim — the same finding cg-answer.js
+  // and session-init.js were already fixed for. Null means no engine: nothing to
+  // run, and nothing to say about it.
+  const binary = require('./find-binary').findBinary();
+  if (!binary) return;
+
+  function run(args) {
+    return execFileSync(binary, args, hidden({
       cwd,
       timeout: 3000,
       encoding: 'utf8',
@@ -477,15 +500,21 @@ function runMain() {
     }));
   }
 
+  // Stamp the cooldown on ATTEMPT, not on success. Keyed on the outcome, a
+  // binary that fails or times out produced no flag, so the very next prompt of
+  // the same shape re-ran it — a 3s execFileSync timeout on EVERY turn, which is
+  // the worst case wearing the cheapest disguise. The cooldown's job is rate
+  // limiting; whether the run had something to say is a separate question.
+  markCooldown(query.type, cwd);
+
   try {
     let result = '';
-    if (query.type === 'impact') result = run('code-graph-mcp', ['impact', query.symbol]);
-    else if (query.type === 'callgraph') result = run('code-graph-mcp', ['callgraph', query.symbol, '--depth', '2']);
-    else if (query.type === 'overview') result = run('code-graph-mcp', ['overview', query.path]);
-    else if (query.type === 'search') result = run('code-graph-mcp', ['search', query.symbol, '--limit', '8']);
+    if (query.type === 'impact') result = run(['impact', query.symbol]);
+    else if (query.type === 'callgraph') result = run(['callgraph', query.symbol, '--depth', '2']);
+    else if (query.type === 'overview') result = run(['overview', query.path]);
+    else if (query.type === 'search') result = run(['search', query.symbol, '--limit', '8']);
 
     if (result && result.trim()) {
-      markCooldown(query.type);
       process.stdout.write(`${PREFIXES[query.type]}\n${result.trim()}\n`);
     }
   } catch {
@@ -497,4 +526,4 @@ if (require.main === module) {
   runMain();
 }
 
-module.exports = { shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS, buildRunEnv };
+module.exports = { COOLDOWNS, shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS, buildRunEnv };

@@ -945,6 +945,17 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
       else if (!sameTarget) nextSuspendedAt = null;
       else nextSuspendedAt = state.suspendedAt || null;
       const newState = {
+        // Carry the prior state forward. Every OTHER saveState in this function
+        // spreads `...state`; this one rebuilt from scratch, so any key it does
+        // not name was dropped on every update check that found a new release.
+        // The keys that matter are selfHealGlobalPkgs' — globalPkgHealAttempts /
+        // globalPkgHealVersion — because that function returns `{}` once the
+        // attempt cap is hit, meaning the spread below contributes nothing and
+        // the counter reset to zero. A capped-out global heal therefore got a
+        // fresh budget on every release, which is precisely the retry treadmill
+        // the cap exists to stop. Keys this object sets are overwritten below;
+        // nothing stale leaks through.
+        ...state,
         lastCheck: new Date().toISOString(),
         installedVersion: success ? latest.version : installedVersion,
         latestVersion: latest.version,
@@ -993,6 +1004,16 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
       lastCheck: new Date().toISOString(),
       latestVersion: latest.version,
       updateAvailable: false,
+      // Reaching here means the installed shell IS the latest release, so any
+      // failure record describes an update that is no longer pending. Leaving it
+      // set kept `doctor` warning "vX failed to install 5× — auto-retry
+      // throttled" about a version already installed, and left a suspension
+      // stamp that the next release then had to age out. The common way to get
+      // here from a suspended state is the manual route the suspension notice
+      // itself recommends (`npm install -g` / `/plugin update`) — the updater
+      // has to notice that its advice was taken.
+      updateAttempts: 0,
+      suspendedAt: null,
       rateLimited: false,
       binaryUpdated: selfHealedBinary || state.binaryUpdated,
       ...globalHeal,

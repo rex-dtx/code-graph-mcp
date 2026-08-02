@@ -43,7 +43,17 @@ function updateStuck(st = readUpdateState()) {
   return !!(st && st.updateAvailable && (st.updateAttempts || 0) >= STUCK_UPDATE_ATTEMPTS);
 }
 
-const disabledCleanup = cleanupDisabledStatusline();
+// The teardown is best-effort housekeeping, never a precondition for rendering.
+// It writes ~/.claude/settings.json and ~/.cache/code-graph/statusline-registry.json,
+// and on a read-only config dir (EROFS container mount, a `sudo` that left root
+// ownership behind, restrictive umask) those writes throw — from module scope,
+// where nothing catches them. The user's whole status line then goes blank plus a
+// node stack trace, for a cleanup they never asked for. Swallow it: the next run
+// with a writable dir does the work.
+let disabledCleanup = { cleaned: false };
+try {
+  disabledCleanup = cleanupDisabledStatusline();
+} catch { /* teardown is optional; rendering is not */ }
 if (disabledCleanup.cleaned) process.exit(0);
 
 // Only show status in projects that have a code-graph directory. The statusLine

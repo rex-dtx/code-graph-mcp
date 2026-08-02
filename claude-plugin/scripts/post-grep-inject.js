@@ -23,7 +23,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { cgTmpDir } = require('./tmp-dir');
+const { cgTmpDir, cwdHash } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
 const { runGrepAnswer, runShowAnswer, runCallgraphAnswer, sanitizeSearchPath } = require('./cg-answer');
 const { emitPostToolContext } = require('./hook-emit');
@@ -217,18 +217,20 @@ function commandHash(cmd) {
   return crypto.createHash('sha1').update(String(cmd)).digest('hex').slice(0, 12);
 }
 
-function flagPath(cmd) {
-  return path.join(cgTmpDir(), `.code-graph-postinject-${commandHash(cmd)}`);
+// Project-scoped for the same reason as pre-grep-guide's (see cwdHash in
+// tmp-dir.js): one shared tmp dir means an un-scoped flag is machine-global.
+function flagPath(cmd, cwd = process.cwd()) {
+  return path.join(cgTmpDir(), `.code-graph-postinject-${cwdHash(cwd)}-${commandHash(cmd)}`);
 }
 
-function isOnCooldown(cmd, now = Date.now(), windowMs = 60000) {
+function isOnCooldown(cmd, now = Date.now(), windowMs = 60000, cwd = process.cwd()) {
   try {
-    return now - fs.statSync(flagPath(cmd)).mtimeMs < windowMs;
+    return now - fs.statSync(flagPath(cmd, cwd)).mtimeMs < windowMs;
   } catch { return false; }
 }
 
-function markCooldown(cmd) {
-  try { fs.writeFileSync(flagPath(cmd), ''); } catch { /* ok */ }
+function markCooldown(cmd, cwd = process.cwd()) {
+  try { fs.writeFileSync(flagPath(cmd, cwd), ''); } catch { /* ok */ }
 }
 
 // --- Main execution ---
@@ -259,8 +261,8 @@ function runMain() {
   const found = findFoldableGrepSegment(cmd);
   if (!found) return;
 
-  if (isOnCooldown(rawCmd)) return;
-  markCooldown(rawCmd);
+  if (isOnCooldown(rawCmd, Date.now(), 60000, root)) return;
+  markCooldown(rawCmd, root);
 
   const { segment, block } = found;
   // Run the answer exactly like the deny path.

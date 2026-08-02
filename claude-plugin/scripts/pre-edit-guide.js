@@ -10,7 +10,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { findBinary } = require('./find-binary');
-const { cgTmpDir } = require('./tmp-dir');
+const { cgTmpDir, cwdHash } = require('./tmp-dir');
 const { resolveProjectRoot } = require('./project-root');
 const { recordRecommendation } = require('./recommendation-log');
 const { formatCoveringTests } = require('./covering-tests');
@@ -118,7 +118,11 @@ function isCommonKeyword(s) {
 }
 
 // --- Per-symbol cooldown: 2 minutes ---
-const cooldownFile = path.join(cgTmpDir(), `.cg-impact-${symbol}`);
+// Project-scoped (see cwdHash in tmp-dir.js). A symbol name is the LEAST
+// project-unique key there is — `main`, `run`, `new`, `parse` collide across
+// every repo on the machine, so editing `parse` in one project suppressed the
+// impact push for a completely different `parse` in another for two minutes.
+const cooldownFile = path.join(cgTmpDir(), `.cg-impact-${cwdHash(cwd)}-${symbol}`);
 try {
   if (Date.now() - fs.statSync(cooldownFile).mtimeMs < 120000) process.exit(0);
 } catch { /* first time for this symbol */ }

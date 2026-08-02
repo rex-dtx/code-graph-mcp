@@ -753,3 +753,140 @@ test('run() wires buildRunEnv() into execFileSync (no phantom use-event leak)', 
   assert.ok(i >= 0, 'run() helper present');
   assert.match(src.slice(i, i + 320), /env:\s*buildRunEnv\(\)/);
 });
+
+// ── End-to-end: binary resolution, cooldown timing, flag scoping ──────────
+// These three findings all live in runMain(), which the unit tests above cannot
+// reach (the file top-level-executes on require), so they are exercised by
+// actually spawning the hook against a sandboxed HOME + project fixture.
+
+const { spawnSync } = require('node:child_process');
+const os = require('node:os');
+
+/**
+ * A sandbox in which user-prompt-context.js reaches its CLI path: a redirected
+ * HOME carrying the install manifest plus a find-binary cache entry, a
+ * redirected TMPDIR for the cooldown flags, and a project fixture holding
+ * .code-graph/index.db.
+ *
+ * The binary is pinned through ~/.cache/code-graph/binary-path — the FIRST
+ * thing findBinary() consults — so what the hook runs does not depend on
+ * whether this machine happens to have target/release/code-graph-mcp built.
+ */
+function upcSandbox(t, binaryScript) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upc-e2e-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const home = path.join(root, 'home');
+  const cache = path.join(home, '.cache', 'code-graph');
+  fs.mkdirSync(path.join(cache, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(cache, 'install-manifest.json'), '{"version":"9.9.9","config":{}}');
+  const fake = path.join(cache, 'bin', 'code-graph-mcp');
+  fs.writeFileSync(fake, binaryScript, { mode: 0o755 });
+  fs.writeFileSync(path.join(cache, 'binary-path'), fake);
+
+  const markers = path.join(root, 'markers');
+  const tmp = path.join(root, 'tmp');
+  fs.mkdirSync(markers);
+  fs.mkdirSync(tmp);
+
+  return { root, home, markers, tmp, cgTmp: path.join(tmp, 'code-graph-mcp'),
+           project: upcProject(root, 'project') };
+}
+
+function upcProject(root, name) {
+  const dir = path.join(root, name);
+  fs.mkdirSync(path.join(dir, '.code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.code-graph', 'index.db'), '');
+  return dir;
+}
+
+function runUpc(sb, message, { cwd = sb.project, env = {} } = {}) {
+  return spawnSync(process.execPath, [path.join(__dirname, 'user-prompt-context.js')], {
+    input: JSON.stringify({ message }),
+    cwd,
+    env: {
+      ...process.env,
+      HOME: sb.home, USERPROFILE: sb.home,
+      TMPDIR: sb.tmp, TMP: sb.tmp, TEMP: sb.tmp,
+      CG_MARKER_DIR: sb.markers,
+      CODE_GRAPH_QUIET_HOOKS: '0',
+      ...env,
+    },
+    encoding: 'utf8',
+    timeout: 15000,
+  });
+}
+
+const posixOnly = process.platform === 'win32' && 'POSIX shell fixtures';
+
+test('the CLI is resolved through find-binary, never as a bare name on PATH', { skip: posixOnly }, (t) => {
+  // The four call sites passed the literal string 'code-graph-mcp' to
+  // execFileSync, so they ran whatever PATH resolved — nothing for a
+  // plugin-only install (the binary lives in ~/.cache/code-graph/bin and was
+  // never on PATH), or a years-stale global shim when PATH did have one. Two
+  // markers make the difference observable: only the resolved binary may run.
+  const sb = upcSandbox(t, '#!/bin/sh\ntouch "$CG_MARKER_DIR/resolved"\nexit 1\n');
+  const shimDir = path.join(sb.root, 'shim');
+  fs.mkdirSync(shimDir);
+  fs.writeFileSync(path.join(shimDir, 'code-graph-mcp'),
+    '#!/bin/sh\ntouch "$CG_MARKER_DIR/path-shim"\nexit 0\n', { mode: 0o755 });
+
+  const proc = runUpc(sb, 'where is parseConfig defined',
+    { env: { PATH: `${shimDir}${path.delimiter}${process.env.PATH}` } });
+
+  assert.equal(proc.status, 0, `hook must exit 0\n${proc.stderr}`);
+  assert.equal(fs.existsSync(path.join(sb.markers, 'path-shim')), false,
+    'the hook ran whatever `code-graph-mcp` PATH happened to point at');
+  assert.equal(fs.existsSync(path.join(sb.markers, 'resolved')), true,
+    'the hook must run the binary find-binary resolved');
+});
+
+test('the per-type cooldown is stamped on ATTEMPT, not only on a non-empty result', { skip: posixOnly }, (t) => {
+  // markCooldown() sat inside `if (result && result.trim())`, so a binary that
+  // failed, timed out, or simply had nothing to say left no flag — and the very
+  // next prompt of the same shape re-ran it. A broken binary therefore cost a
+  // 3s blocking execFileSync on EVERY turn, which is the expensive case wearing
+  // the cheap case's disguise.
+  const sb = upcSandbox(t, '#!/bin/sh\nexit 1\n');   // always fails, never prints
+
+  const proc = runUpc(sb, 'where is parseConfig defined');
+
+  assert.equal(proc.status, 0, `hook must stay silent-and-successful\n${proc.stderr}`);
+  assert.equal(proc.stdout, '', 'a failed run injects nothing');
+  const flags = fs.readdirSync(sb.cgTmp).filter((f) => f.startsWith('.code-graph-ctx-'));
+  assert.equal(flags.length, 1,
+    `a failing binary must still start the cooldown, else it re-runs every prompt (found: ${flags.join(', ')})`);
+  assert.match(flags[0], /^\.code-graph-ctx-[0-9a-f]{12}-search$/,
+    'and the flag must carry the project hash (see cwdHash in tmp-dir.js)');
+});
+
+test('cooldown flags are project-scoped: a push in one repo must not silence another', { skip: posixOnly }, (t) => {
+  // There are only five ctx flag names, and one shared tmp dir for the whole
+  // machine, so an un-scoped flag was a machine-wide mute: an `impact` push in
+  // any repo silenced impact pushes in every other repo for the next 30s, and
+  // `overview` did it for five minutes.
+  const sb = upcSandbox(t, '#!/bin/sh\nexit 1\n');
+  const projectB = upcProject(sb.root, 'project-b');
+
+  runUpc(sb, 'where is parseConfig defined');
+  runUpc(sb, 'where is parseConfig defined', { cwd: projectB });
+
+  const flags = fs.readdirSync(sb.cgTmp).filter((f) => f.startsWith('.code-graph-ctx-')).sort();
+  assert.equal(flags.length, 2,
+    `each project keeps its own cooldown; found ${flags.length}: ${flags.join(', ')}`);
+  assert.notEqual(flags[0], flags[1], 'the two projects must hash differently');
+});
+
+test('every hook reads stdin from fd 0, not the /dev/stdin path', () => {
+  // Source-level on purpose: the failure only reproduces when stdin is a
+  // socketpair (open(2) on /dev/stdin then fails ENXIO), and neither
+  // spawnSync({input}) nor a shell pipe produces one — so a behavioral test
+  // here would pass against the broken spelling and prove nothing. Five hooks
+  // already carried the fd-0 form with that comment; user-prompt-context.js was
+  // the holdout, and the sixth is exactly how a fixed class regrows.
+  const hooks = ['user-prompt-context.js', 'pre-grep-guide.js', 'post-grep-inject.js',
+                 'pre-read-guide.js', 'pre-edit-guide.js', 'session-init.js'];
+  const offenders = hooks.filter((h) =>
+    /readFileSync\(\s*['"]\/dev\/stdin['"]/.test(fs.readFileSync(path.join(__dirname, h), 'utf8')));
+  assert.deepEqual(offenders, [], 'these hooks re-open /dev/stdin instead of reading fd 0');
+});

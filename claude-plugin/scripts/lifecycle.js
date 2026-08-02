@@ -114,7 +114,13 @@ function readJsonResult(filePath) {
 
 // Lenient reader kept exactly as-is for its 20+ callers (manifests, registries,
 // plugin.json …) where "absent" and "unreadable" genuinely mean the same thing.
-// Only the settings write path needs readJsonResult's distinction.
+// A caller that will WRITE settings.json back must use readSettingsForWrite()
+// + tryWriteSettings() instead — the pair that detects the lossy/corrupt cases
+// and preserves the original bytes. Reading settings.json with THIS function is
+// fine as long as nothing is written back (isPluginInactive, syncLifecycleConfig's
+// self-heal probe); the destructive combination is `readJson(settingsPath())`
+// followed by a write, which is how cleanupDisabledStatusline and uninstall
+// destroyed non-UTF-8 bytes for four releases after the detector landed.
 function readJson(filePath) {
   try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch { return null; }
 }
@@ -158,9 +164,18 @@ function backupCorruptFile(filePath, raw) {
 // printing "Hooks ✅ 1 issue(s) auto-repaired" for a run that moved the user's
 // model / env / permissions into a `.corrupt-*` file it never mentioned. A
 // destructive repair has to be reported as one, with the path to get it back.
-function readSettingsForWrite() {
+//
+// `pre` lets a caller that ALREADY probed the file with readJsonResult reuse
+// that result instead of reading twice. It matters for more than speed: the
+// backup this function may take is a side effect, and a caller which only
+// writes conditionally (cleanupDisabledStatusline runs on every statusline
+// render) must be able to probe first and pay the backup only on the write
+// path — otherwise a lossy settings.json accumulates one `.corrupt-*` copy per
+// prompt. Passing `pre` also keeps the returned `settings` object IDENTICAL to
+// the one the caller already mutated.
+function readSettingsForWrite(pre) {
   const p = settingsPath();
-  const res = readJsonResult(p);
+  const res = pre || readJsonResult(p);
   if (res.value && res.lossy) {
     // Usable JSON whose bytes will not survive our rewrite (see readJsonResult).
     // Preserve the true bytes, then proceed with the parsed value — refusing
@@ -413,7 +428,11 @@ function detachStatuslineIntegration(settings, { compositeDoomed = true } = {}) 
 }
 
 function cleanupDisabledStatusline() {
-  const settings = readJson(settingsPath());
+  // Probe without side effects first — this runs on every statusline render and
+  // usually finds nothing to do. A corrupt/unreadable file yields no value and
+  // is left strictly alone (same outcome the old lenient readJson produced).
+  const probe = readJsonResult(settingsPath());
+  const settings = probe.value;
   if (!settings || !isPluginInactive(settings)) {
     return { cleaned: false, settingsChanged: false };
   }
@@ -425,7 +444,15 @@ function cleanupDisabledStatusline() {
   let settingsChanged = detachStatuslineIntegration(settings, { compositeDoomed: uninstalled });
   if (removeHooksFromSettings(settings)) settingsChanged = true;
   if (settingsChanged) {
-    writeJsonAtomic(settingsPath(), settings);
+    // Now that a write is certain, take the guarded path: readSettingsForWrite
+    // preserves bytes JSON.stringify would destroy (the lossy-UTF8 case) and
+    // returns null when it could not, and tryWriteSettings turns a read-only
+    // ~/.claude into a diagnosed no-op instead of an uncaught EACCES — this
+    // function is called at the top of statusline.js, where a throw blanks the
+    // user's status line. `guarded` is the same object we just mutated.
+    const { settings: guarded } = readSettingsForWrite(probe);
+    if (!guarded) return { cleaned: false, settingsChanged: false };
+    if (tryWriteSettings(guarded)) settingsChanged = false;
   }
 
   // Genuine uninstall (not a temporary disable): reclaim ~/.cache/code-graph
@@ -1071,7 +1098,13 @@ function defaultRunNpm(args) {
 }
 
 function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRunNpm, scanGlobalPkgs = installedGlobalPkgs } = {}) {
-  const settings = readJson(settingsPath());
+  // Same guarded pair as install()/update(): probe without side effects, and
+  // only take the backup + write path once there is something to write. Reading
+  // this file with the lenient readJson and writing it back raw is what
+  // destroyed non-UTF-8 bytes here — a teardown has even less license to lose
+  // the user's model / env / permissions than an install does.
+  const probe = readJsonResult(settingsPath());
+  const settings = probe.value;
   let settingsChanged = false;
 
   if (settings) {
@@ -1097,7 +1130,8 @@ function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRu
 
     // 4. Write settings if changed
     if (settingsChanged) {
-      writeJsonAtomic(settingsPath(), settings);
+      const { settings: guarded } = readSettingsForWrite(probe);
+      if (!guarded || tryWriteSettings(guarded)) settingsChanged = false;
     }
   }
 
@@ -1154,6 +1188,14 @@ function uninstall({ purgeGlobal = false, unadoptAll = false, runNpm = defaultRu
 
   // 6. Remove cache directory
   try { fs.rmSync(CACHE_DIR, { recursive: true, force: true }); } catch { /* ok */ }
+
+  // 6.5. The shared tmp dir (cooldown flags, read-fanout state, interrupted
+  // `update-*` staging). Nothing in it outlives an uninstall, and the periodic
+  // prune that keeps it bounded stops running the moment the hooks are gone —
+  // so without this it is residue with no remaining owner.
+  try {
+    fs.rmSync(require('./tmp-dir').CG_TMP_DIR, { recursive: true, force: true });
+  } catch { /* ok */ }
 
   // 7. Remove plugin files from cache (all known paths, including parent dirs)
   const cacheRoot = pluginsCacheDir();
@@ -1354,11 +1396,22 @@ function scanForBrokenPaths() {
   const settings = settingsRead.value || {};
   const issues = [];
 
+  // Every path extraction below goes through hookCmdScript, the same parser
+  // compositeSlotIsStale and surveyHookCoverage use. These three sites each had
+  // their own inline `/node\s+"([^"]+)"/`, which requires the literal word
+  // `node` followed by whitespace — so a command naming the interpreter by
+  // absolute path, the spelling a Windows install produces
+  // (`"C:\Program Files\nodejs\node.exe" "C:\…\script.js"`), matched nothing.
+  // A path this scan cannot READ is reported as no path at all, i.e. as healthy,
+  // which is the failure mode the whole function exists to prevent. Six sites,
+  // two spellings, one of them blind: collapse to one.
+  const scriptOf = (cmd) => hookCmdScript(cmd);
+
   // Check statusLine path
   if (isOurComposite(settings)) {
-    const m = settings.statusLine.command.match(/node\s+"([^"]+)"/);
-    if (m && m[1] && !fs.existsSync(m[1])) {
-      issues.push({ type: 'statusLine', path: m[1] });
+    const script = scriptOf(settings.statusLine.command);
+    if (script && !fs.existsSync(script)) {
+      issues.push({ type: 'statusLine', path: script });
     }
   }
 
@@ -1369,9 +1422,9 @@ function scanForBrokenPaths() {
       for (const entry of entries) {
         if (!isOurHookEntry(entry) || !entry.hooks) continue;
         for (const h of entry.hooks) {
-          const m = h.command && h.command.match(/node\s+"([^"]+)"/);
-          if (m && m[1] && !fs.existsSync(m[1])) {
-            issues.push({ type: 'hook', event, path: m[1] });
+          const script = h.command && scriptOf(h.command);
+          if (script && !fs.existsSync(script)) {
+            issues.push({ type: 'hook', event, path: script });
           }
         }
       }
@@ -1382,9 +1435,9 @@ function scanForBrokenPaths() {
   const registry = readRegistry();
   for (const provider of registry) {
     if (provider.id === '_previous') continue;
-    const m = provider.command && provider.command.match(/node\s+"([^"]+)"/);
-    if (m && m[1] && !fs.existsSync(m[1])) {
-      issues.push({ type: 'registry', id: provider.id, path: m[1] });
+    const script = provider.command && scriptOf(provider.command);
+    if (script && !fs.existsSync(script)) {
+      issues.push({ type: 'registry', id: provider.id, path: script });
     }
   }
 
@@ -1480,6 +1533,7 @@ module.exports = {
   removeHooksFromSettings, isOurHookEntry,
   registerHooksToSettings, buildSettingsHookEntries,                  // v0.32.0
   surveyHookCoverage, compositeCommand, compositeSlotIsStale,          // v0.49.1 — version-aware self-heal
+  hookCmdScript,                                                       // the ONE hook-command path parser (session-init reuses it)
   cacheDirVersion,                                                     // exported for the separator-agnostic test
 
   verifyHooksFire, defaultHookFireProbes,                              // v0.67.0 — firing self-test

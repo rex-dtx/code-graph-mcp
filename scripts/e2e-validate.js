@@ -216,6 +216,7 @@ async function main() {
   child = spawn(BIN, ["serve"], {
     cwd: process.cwd(),
     stdio: ["pipe", "pipe", "pipe"], // stdin, stdout, stderr
+    windowsHide: true, // no console flash — same rule as claude-plugin/scripts/proc-opts
   });
 
   // Suppress stderr (tracing logs)

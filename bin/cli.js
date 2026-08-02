@@ -131,9 +131,14 @@ if (!binary) {
 }
 
 // Spawn the binary, forwarding stdio for MCP JSON-RPC communication
+// windowsHide as a literal rather than via claude-plugin/scripts/proc-opts:
+// this file is the npm package's bin entry and ships in tarballs that may not
+// carry claude-plugin/. Same meaning — CREATE_NO_WINDOW, so a console-less
+// parent (the MCP client) does not flash a window; inherited stdio still works.
 const child = spawn(binary, process.argv.slice(2), {
   stdio: "inherit",
   env: process.env,
+  windowsHide: true,
 });
 
 child.on("error", (err) => {

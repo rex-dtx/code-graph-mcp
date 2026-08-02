@@ -6,7 +6,7 @@ const fs = require('fs');
 const {
   install, update, readManifest, getPluginVersion, checkScopeConflict,
   cleanupDisabledStatusline, isPluginInactive, isPluginUninstalled, removeCacheResidue,
-  readJson, CACHE_DIR, settingsPath, isStaleRelicContext,
+  readJson, CACHE_DIR, settingsPath, isStaleRelicContext, hookCmdScript,
 } = require('./lifecycle');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const { maybeAutoAdopt, isAdopted, unadopt } = require('./adopt');
@@ -251,9 +251,13 @@ function syncLifecycleConfig() {
     installReporting();
     return 'self-healed';
   }
-  // Also self-heal if composite path points to a non-existent script (path pollution)
-  const scriptMatch = settings.statusLine.command.match(/node\s+"([^"]+)"/);
-  if (scriptMatch && scriptMatch[1] && !fs.existsSync(scriptMatch[1])) {
+  // Also self-heal if composite path points to a non-existent script (path
+  // pollution). hookCmdScript, not another inline `/node\s+"…"/`: that spelling
+  // cannot read a command whose interpreter is an absolute path
+  // (`"C:\Program Files\nodejs\node.exe" "…\statusline-composite.js"`), and an
+  // unreadable command silently reads as a healthy one.
+  const compositeScript = hookCmdScript(settings.statusLine.command);
+  if (compositeScript && !fs.existsSync(compositeScript)) {
     installReporting();
     return 'self-healed-bad-path';
   }
@@ -282,8 +286,8 @@ function syncLifecycleConfig() {
       for (const entry of entries) {
         if (!entry.hooks) continue;
         for (const h of entry.hooks) {
-          const m = h.command && h.command.match(/node\s+"([^"]+)"/);
-          if (m && m[1] && m[1].includes('code-graph') && !fs.existsSync(m[1])) {
+          const script = h.command && hookCmdScript(h.command);
+          if (script && script.includes('code-graph') && !fs.existsSync(script)) {
             installReporting();
             return 'self-healed-bad-hook';
           }
@@ -509,13 +513,22 @@ function consistencyCheck(binary) {
 }
 
 function runSessionInit({ source } = {}) {
+  // GC the shared tmp dir before anything else, so it happens even on the
+  // inactive / non-project early returns below — those sessions still wrote
+  // cooldown flags on the way in. Cheap (one readdir + a stat per entry) and
+  // fully swallowed: reclaiming disk must never be able to fail a SessionStart.
+  try { require('./tmp-dir').pruneCgTmp(); } catch { /* best-effort GC */ }
+
   if (isPluginInactive()) {
     // Capture the uninstalled-vs-disabled verdict BEFORE cleanupDisabledStatusline()
     // runs — it removes our composite + registry entry, which are the very signals
     // isPluginUninstalled()/isPluginInactive() read, so calling it afterwards would
     // always see "no composite/registry" and report not-uninstalled (teardown skipped).
     const uninstalled = isPluginUninstalled();
-    cleanupDisabledStatusline();
+    // Third caller of the same unguarded teardown (statusline.js and
+    // statusline-composite.js are the others): a read-only ~/.claude turns this
+    // into an uncaught throw that takes down the whole SessionStart hook.
+    try { cleanupDisabledStatusline(); } catch { /* best-effort teardown */ }
     // Genuine uninstall (not a temporary disable) leaves residue the settings-only
     // self-heal can't reach: ~/.cache/code-graph (the ~40MB binary + state) and the
     // current project's CLAUDE.md adoption block. CC fires no uninstall hook, AND it

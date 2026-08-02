@@ -197,6 +197,7 @@ if (process.env.SYNC_VERSIONS_SKIP_BUILD === '1') {
   const result = spawnSync('cargo', buildArgs, {
     cwd: root,
     stdio: 'inherit',
+    windowsHide: true, // no console flash — same rule as claude-plugin/scripts/proc-opts
   });
   const dt = ((Date.now() - t0) / 1000).toFixed(1);
   if (result.status !== 0) {

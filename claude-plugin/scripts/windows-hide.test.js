@@ -56,6 +56,20 @@ function childProcessBindings(src) {
       if (alias && CALL_NAMES.includes(orig)) aliases.add(alias);
     }
   }
+  // Injected-seam spelling: `function detectEmbedModel(binary, run = execFileSync)`.
+  // The parameter's DEFAULT is the real child_process function, so every `run(...)`
+  // in that body spawns — and the scanner saw only a local identifier it had no
+  // reason to care about. doctor.js's detectEmbedModel was unguarded behind
+  // exactly this shape while the sweep reported the directory clean. `spawnFn` is
+  // in CALL_NAMES by hand for the same reason; this generalizes it so the next
+  // seam does not need a hand-edit.
+  // The `(?!\s*\()` matters: `const result = spawnSync('cargo', …)` assigns the
+  // RESULT, not the function, and treating `result` as a spawn alias would make
+  // the scanner flag unrelated calls that merely reuse the name.
+  for (const m of src.matchAll(/([\w$]+)\s*=\s*(execFileSync|execFile|execSync|spawnSync|spawn|exec)\b(?!\s*\()/g)) {
+    if (CALL_NAMES.includes(m[1])) continue;
+    aliases.add(m[1]);
+  }
   return { namespaces, aliases };
 }
 
@@ -235,6 +249,15 @@ test('the guard catches indirect spawn spellings, not just the direct call', () 
     'inner shadowed options binding must not hide behind an outer guarded one');
   assert.ok(caught("const cp = require('child_process');\ncp.exec('git status', { timeout: 1 });"),
     'bare .exec counts when the receiver is a child_process binding');
+  assert.ok(caught("function probe(bin, run = execFileSync) { return run(bin, ['x'], { timeout: 1 }); }"),
+    'injected seam whose parameter DEFAULT is the child_process function (doctor.js detectEmbedModel)');
+
+  // Guarded form of that same seam stays clean...
+  assert.deepEqual(findUnguarded("function probe(bin, run = execFileSync) { return run(bin, ['x'], hidden({})); }"), []);
+  // ...and assigning a spawn RESULT must not turn the variable into a spawn
+  // alias: `result(1)` below is an unrelated call and flagging it would be
+  // noise, which is how a guard gets muted.
+  assert.deepEqual(findUnguarded("const result = spawnSync('cargo', a, hidden({}));\nresult(1);"), []);
 
   // The reason `.exec(` is not simply added to the call names: it is
   // overwhelmingly a regex method, and flagging those would make the guard
@@ -244,39 +267,64 @@ test('the guard catches indirect spawn spellings, not just the direct call', () 
   assert.deepEqual(findUnguarded("const cp = require('child_process');\ncp.spawn(f, a, hidden({}));"), []);
 });
 
+// Every shipped JS directory, not just this one. `bin/cli.js` is the npm
+// package's entry point — the single most-executed script we ship — and it
+// spawned the MCP binary with no windowsHide at all while this guard reported
+// the tree clean, because the guard only ever looked at its own directory.
+// scripts/ (e2e-validate.js, sync-versions.js) had the same exemption.
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+const SCAN_DIRS = [__dirname, path.join(REPO_ROOT, 'bin'), path.join(REPO_ROOT, 'scripts')];
+
+/** Every scannable source file across SCAN_DIRS, as {label, src} sorted by label. */
+function scanTargets() {
+  const out = [];
+  for (const dir of SCAN_DIRS) {
+    let names;
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const f of names.filter((n) => n.endsWith('.js') && !n.endsWith('.test.js')).sort()) {
+      out.push({
+        label: `${path.relative(REPO_ROOT, dir)}/${f}`,
+        file: f,
+        src: fs.readFileSync(path.join(dir, f), 'utf8'),
+      });
+    }
+  }
+  return out;
+}
+
 test('the masker sees every file that spawns (guard-of-the-guard)', () => {
   // Cross-check with a dumb detector: any file that routes options through
   // hidden()/npmInvocation() must yield at least one call site to the scanner.
   // Zero would mean the masking silently swallowed that file's code — the
   // failure mode that shipped in the first version of this test.
-  const files = fs.readdirSync(__dirname).filter((f) => f.endsWith('.js') && !f.endsWith('.test.js'));
   const blind = [];
-  for (const f of files) {
-    if (f === 'proc-opts.js' || f === 'npm-exec.js') continue; // define the helpers, don't spawn
-    const src = fs.readFileSync(path.join(__dirname, f), 'utf8');
+  for (const { label, file, src } of scanTargets()) {
+    if (file === 'proc-opts.js' || file === 'npm-exec.js') continue; // define the helpers, don't spawn
     if (!/(?<![.\w$])(hidden|npmInvocation)\s*\(/.test(src)) continue;
     CALL_RE.lastIndex = 0;
-    if (!CALL_RE.test(maskLiterals(src))) blind.push(f);
+    if (!CALL_RE.test(maskLiterals(src))) blind.push(label);
   }
   assert.deepEqual(blind, [], 'the scanner found no call sites in files that demonstrably spawn');
 });
 
-test('every child_process call site in claude-plugin/scripts sets windowsHide', () => {
-  const files = fs.readdirSync(__dirname)
-    .filter((f) => f.endsWith('.js') && !f.endsWith('.test.js'))
-    .sort();
+test('every child_process call site in the shipped JS dirs sets windowsHide', () => {
   const failures = [];
   let scanned = 0;
-  for (const f of files) {
-    const src = fs.readFileSync(path.join(__dirname, f), 'utf8');
+  for (const { label, src } of scanTargets()) {
     const masked = maskLiterals(src);
     CALL_RE.lastIndex = 0;
     scanned += (masked.match(CALL_RE) || []).length;
-    for (const bad of findUnguarded(src)) failures.push(`${f}:${bad.line} — ${bad.name}(...)`);
+    for (const bad of findUnguarded(src)) failures.push(`${label}:${bad.line} — ${bad.name}(...)`);
   }
-  // Positive control on the scan itself: the sweep covered ~30 call sites when
-  // written. A rewrite that stops finding them must fail here, not pass empty.
-  assert.ok(scanned >= 25, `expected the scanner to still find the call sites, found ${scanned}`);
+  // Positive control on the scan itself. A near-exact bound, not a loose floor:
+  // the previous `>= 25` was so far under the real 47 that a rewrite could stop
+  // seeing HALF the call sites and still pass. Counted at the time of writing;
+  // -2 of slack absorbs an incidental removal without hiding a scanner that has
+  // gone blind. Adding call sites raises it — update the number deliberately.
+  const EXPECTED_CALL_SITES = 50;
+  assert.ok(scanned >= EXPECTED_CALL_SITES - 2,
+    `expected the scanner to still find ~${EXPECTED_CALL_SITES} call sites, found ${scanned} — ` +
+    'a drop this large means the scanner stopped seeing code, not that the code went away');
   assert.deepEqual(failures, [],
     'these child_process calls will flash a console window on Windows — wrap the options in hidden({...}) from ./proc-opts');
 });

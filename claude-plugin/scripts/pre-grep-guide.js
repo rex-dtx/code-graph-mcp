@@ -39,7 +39,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { cgTmpDir } = require('./tmp-dir');
+const { cgTmpDir, cwdHash } = require('./tmp-dir');
 const { recordRecommendation } = require('./recommendation-log');
 const { runGrepAnswer, runShowAnswer, sanitizeSearchPath } = require('./cg-answer');
 
@@ -513,18 +513,20 @@ function commandHash(cmd) {
   return crypto.createHash('sha1').update(cmd).digest('hex').slice(0, 12);
 }
 
-function flagPath(cmd) {
-  return path.join(cgTmpDir(), `.code-graph-bash-${commandHash(cmd)}`);
+// Project-scoped: the same `grep -rn "foo" src/` in two repos is two different
+// questions and must not share one 60s cooldown (see cwdHash in tmp-dir.js).
+function flagPath(cmd, cwd = process.cwd()) {
+  return path.join(cgTmpDir(), `.code-graph-bash-${cwdHash(cwd)}-${commandHash(cmd)}`);
 }
 
-function isOnCooldown(cmd, now = Date.now(), windowMs = 60000) {
+function isOnCooldown(cmd, now = Date.now(), windowMs = 60000, cwd = process.cwd()) {
   try {
-    return now - fs.statSync(flagPath(cmd)).mtimeMs < windowMs;
+    return now - fs.statSync(flagPath(cmd, cwd)).mtimeMs < windowMs;
   } catch { return false; }
 }
 
-function markCooldown(cmd) {
-  try { fs.writeFileSync(flagPath(cmd), ''); } catch { /* ok */ }
+function markCooldown(cmd, cwd = process.cwd()) {
+  try { fs.writeFileSync(flagPath(cmd, cwd), ''); } catch { /* ok */ }
 }
 
 function buildHint() {
@@ -720,7 +722,7 @@ function runMain() {
     return;
   }
 
-  if (isOnCooldown(rawCmd)) {
+  if (isOnCooldown(rawCmd, Date.now(), 60000, root)) {
     // Outcome proxy: a source grep re-issued within the cooldown window runs
     // silently (no deny/hint). Record it so `stats` sees the model's grep
     // fan-out — especially a re-grep right after cg answered the same query.
@@ -728,7 +730,7 @@ function runMain() {
     return;
   }
 
-  markCooldown(rawCmd);
+  markCooldown(rawCmd, root);
 
   const block = isBlockDisabled() ? null : classifyBlock(cmd);
   if (block) {

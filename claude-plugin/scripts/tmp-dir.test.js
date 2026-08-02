@@ -34,7 +34,7 @@ test.after(() => {
   try { fs.rmSync(TMP_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-const { cgTmpDir, CG_TMP_DIR } = require('./tmp-dir');
+const { cgTmpDir, CG_TMP_DIR, cwdHash, pruneCgTmp, PRUNE_MAX_AGE_MS } = require('./tmp-dir');
 
 test('CG_TMP_DIR is a "code-graph-mcp" subdir of os.tmpdir()', () => {
   assert.strictEqual(path.basename(CG_TMP_DIR), 'code-graph-mcp');
@@ -76,4 +76,71 @@ test('cgTmpDir() does not leak files into os.tmpdir() root', () => {
   } finally {
     try { fs.unlinkSync(flag); } catch { /* ok */ }
   }
+});
+
+// ── cwdHash: the scoping key the cooldown flags fold in ──
+
+test('cwdHash is stable, short and filename-safe, and separates projects', () => {
+  assert.strictEqual(cwdHash('/repo/a'), cwdHash('/repo/a'), 'stable across calls');
+  assert.notStrictEqual(cwdHash('/repo/a'), cwdHash('/repo/b'), 'different projects differ');
+  assert.match(cwdHash('/repo/a'), /^[0-9a-f]{12}$/, 'hex only — safe in a filename');
+});
+
+// ── pruneCgTmp: nothing ever deleted what cgTmpDir() collects ──
+
+test('pruneCgTmp removes entries past the window and keeps recent ones', () => {
+  const dir = cgTmpDir();
+  const old = path.join(dir, '.code-graph-bash-oldflag');
+  const fresh = path.join(dir, '.code-graph-bash-freshflag');
+  const oldDir = path.join(dir, 'update-1700000000000');
+  fs.writeFileSync(old, '');
+  fs.writeFileSync(fresh, '');
+  fs.mkdirSync(oldDir, { recursive: true });
+  // An interrupted download leaves real bytes behind, not just an inode.
+  fs.writeFileSync(path.join(oldDir, 'code-graph-mcp.tar.gz'), 'x'.repeat(4096));
+
+  const aged = Date.now() - (PRUNE_MAX_AGE_MS + 60_000);
+  fs.utimesSync(old, aged / 1000, aged / 1000);
+  fs.utimesSync(oldDir, aged / 1000, aged / 1000);
+
+  const removed = pruneCgTmp();
+
+  assert.ok(removed >= 2, `expected at least the two aged entries to go, removed ${removed}`);
+  assert.ok(!fs.existsSync(old), 'an aged flag file is reclaimed');
+  assert.ok(!fs.existsSync(oldDir), 'an aged update-* staging dir is reclaimed, contents and all');
+  assert.ok(fs.existsSync(fresh), 'a flag inside the window must survive — this is GC, not expiry');
+  fs.unlinkSync(fresh);
+});
+
+test('pruneCgTmp refuses a directory that is not ours', () => {
+  // The recursive delete makes the path parameter load-bearing. It exists only
+  // so tests can point at a sandbox; a caller passing something else must get a
+  // no-op, not an rm -rf.
+  const foreign = fs.mkdtempSync(path.join(TMP_SANDBOX, 'not-ours-'));
+  fs.writeFileSync(path.join(foreign, 'precious.txt'), 'keep me');
+  const aged = (Date.now() - (PRUNE_MAX_AGE_MS + 60_000)) / 1000;
+  fs.utimesSync(path.join(foreign, 'precious.txt'), aged, aged);
+
+  assert.strictEqual(pruneCgTmp({ dir: foreign }), 0);
+  assert.ok(fs.existsSync(path.join(foreign, 'precious.txt')),
+    'a path that is not the code-graph-mcp tmp dir must be left completely alone');
+  fs.rmSync(foreign, { recursive: true, force: true });
+});
+
+test('pruneCgTmp never throws, whatever it finds', () => {
+  // It runs from a SessionStart hook: a throw is a visible failure, unreclaimed
+  // disk is not.
+  assert.doesNotThrow(() => pruneCgTmp({ dir: path.join(TMP_SANDBOX, 'absent', 'code-graph-mcp') }));
+  assert.strictEqual(pruneCgTmp({ dir: path.join(TMP_SANDBOX, 'absent', 'code-graph-mcp') }), 0);
+});
+
+test('the prune window is longer than every cooldown that reads these files', () => {
+  // A prune shorter than a cooldown would silently shorten the cooldown. The
+  // longest reader is user-prompt-context's `overview` at 5 minutes.
+  const { COOLDOWNS } = require('./user-prompt-context');
+  assert.ok(COOLDOWNS && Object.keys(COOLDOWNS).length,
+    'read the real table — a fallback literal here would make this assertion vacuous');
+  const longest = Math.max(...Object.values(COOLDOWNS));
+  assert.ok(PRUNE_MAX_AGE_MS > longest * 10,
+    `prune window ${PRUNE_MAX_AGE_MS}ms must dwarf the longest cooldown ${longest}ms`);
 });

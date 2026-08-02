@@ -633,3 +633,239 @@ test('settings.json with a non-UTF-8 byte is preserved before the rewrite', (t) 
   assert.equal(rebuilt.model, 'opus', 'the parsed value is usable and must be carried forward');
   assert.ok(rebuilt.hooks, 'install() must still register its hooks');
 });
+
+// ── Audit 2026-08-01: the two settings writers that bypassed the guarded pair ──
+//
+// install() and update() were fixed to read through readSettingsForWrite (the
+// lossy-UTF8 detector + `.corrupt-*` backup) and write through tryWriteSettings.
+// cleanupDisabledStatusline() and uninstall() kept the raw
+// `readJson(settingsPath())` -> `writeJsonAtomic(settingsPath())` pair, so every
+// protection the detector added was absent on exactly the paths that run when
+// the user is DISABLING or REMOVING the plugin — the moment they are least
+// likely to be watching, and the one where losing their model / env /
+// permissions is least recoverable.
+
+/** settings.json bytes that are valid JSON but cannot survive a UTF-8 round-trip. */
+function lossySettings(extra) {
+  return Buffer.concat([
+    Buffer.from('{\n  "model": "opus",\n  "env": { "MY_PATH": "/home/andr', 'utf8'),
+    Buffer.from([0xe9]),                       // latin-1 'é' — not valid UTF-8
+    Buffer.from(`/bin" },\n${extra}\n}\n`, 'utf8'),
+  ]);
+}
+
+function corruptBackupsIn(dir) {
+  return fs.readdirSync(dir).filter((f) => f.startsWith('settings.json.corrupt-'));
+}
+
+test('uninstall() preserves non-UTF-8 bytes before rewriting settings.json', (t) => {
+  const homeDir = mkHome(t);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  const original = lossySettings('  "enabledPlugins": { "code-graph-mcp@code-graph-mcp": true }');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, original);
+
+  runScript(homeDir, lifecycleCli, ['uninstall']);
+
+  const backups = corruptBackupsIn(path.dirname(settingsPath));
+  assert.equal(backups.length, 1,
+    `uninstall() must preserve the true bytes before a rewrite that cannot round-trip them (found: ${backups.join(', ')})`);
+  assert.ok(fs.readFileSync(path.join(path.dirname(settingsPath), backups[0])).equals(original),
+    'the backup is the user\'s only copy, so it must be byte-identical');
+  // ...and the teardown must still have happened: backing up and then bailing
+  // would satisfy the assertion above while leaving our config wired in.
+  const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.equal(after.model, 'opus', 'unrelated user keys survive the teardown');
+  assert.equal(Object.prototype.hasOwnProperty.call(after.enabledPlugins || {}, 'code-graph-mcp@code-graph-mcp'),
+    false, 'and our enabledPlugins entry is gone');
+});
+
+/** A sandbox HOME in the disabled-but-still-wired state cleanupDisabledStatusline acts on. */
+function inactiveHome(t, settingsBytes, { registry } = {}) {
+  const homeDir = mkHome(t);
+  const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, settingsBytes);
+  // installed_plugins.json exists but does NOT list us => isPluginInactive.
+  writeJson(path.join(homeDir, '.claude', 'plugins', 'installed_plugins.json'),
+    { plugins: { 'someone-else@theirs': [{ scope: 'user' }] } });
+  if (registry) {
+    writeJson(path.join(homeDir, '.cache', 'code-graph', 'statusline-registry.json'), registry);
+  }
+  return { homeDir, settingsPath };
+}
+
+function callCleanup(homeDir) {
+  return execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    const r = require(${JSON.stringify(lifecycleCli)}).cleanupDisabledStatusline();
+    console.log(JSON.stringify(r));
+  `], { env: { ...process.env, HOME: homeDir }, cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+}
+
+test('cleanupDisabledStatusline() preserves non-UTF-8 bytes before rewriting settings.json', (t) => {
+  const original = lossySettings(
+    '  "statusLine": { "type": "command", "command": "node \\"/gone/statusline-composite.js\\"" }');
+  const { homeDir, settingsPath } = inactiveHome(t, original);
+
+  const out = callCleanup(homeDir);
+
+  assert.equal(JSON.parse(out.trim().split('\n').pop()).cleaned, true, 'the teardown ran');
+  const backups = corruptBackupsIn(path.dirname(settingsPath));
+  assert.equal(backups.length, 1,
+    `the disable path must preserve the bytes too (found: ${backups.join(', ')})`);
+  assert.ok(fs.readFileSync(path.join(path.dirname(settingsPath), backups[0])).equals(original),
+    'byte-identical, same contract as install()');
+  const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.equal(after.model, 'opus', 'user keys survive');
+  assert.equal(after.statusLine, undefined, 'and our composite was actually detached');
+});
+
+test('cleanupDisabledStatusline() takes no backup on the runs that change nothing', (t) => {
+  // Negative control with teeth: this function runs on EVERY statusline render.
+  // Reading it through readSettingsForWrite unconditionally would take a fresh
+  // `.corrupt-*` copy of a lossy settings.json once per prompt — turning a data
+  // -loss fix into a disk-filling one. The guarded read must happen only once a
+  // write is certain.
+  const original = lossySettings('  "statusLine": { "type": "command", "command": "node \\"/other/provider.js\\"" }');
+  // No composite, no registry => isPluginInactive is false => nothing to do.
+  const { homeDir, settingsPath } = inactiveHome(t, original);
+
+  for (let i = 0; i < 3; i++) {
+    assert.equal(JSON.parse(callCleanup(homeDir).trim().split('\n').pop()).cleaned, false);
+  }
+
+  assert.deepEqual(corruptBackupsIn(path.dirname(settingsPath)), [],
+    'a render that changes nothing must not copy the file aside');
+  assert.deepEqual(fs.readFileSync(settingsPath), original, 'and must not touch it at all');
+});
+
+test('the statusline renders instead of throwing when ~/.claude is read-only',
+  { skip: asRoot && 'running as root' }, (t) => {
+  // cleanupDisabledStatusline() ran at MODULE SCOPE in statusline.js with
+  // nothing to catch it. On a read-only config dir (EROFS mount, a `sudo` that
+  // left root ownership, restrictive umask) its registry/settings writes throw,
+  // so the user's whole status line was replaced by a node stack trace — for a
+  // cleanup they never asked for.
+  const { homeDir } = inactiveHome(t,
+    Buffer.from(JSON.stringify({
+      model: 'opus',
+      statusLine: { type: 'command', command: 'node "/gone/statusline-composite.js"' },
+    }, null, 2)),
+    // Two entries so the detach writes the registry file rather than unlinking it.
+    { registry: [{ id: 'code-graph', command: 'node "/gone/statusline.js"', needsStdin: false },
+                 { id: '_previous', command: 'echo prior', needsStdin: true }] });
+
+  const claudeDir = path.join(homeDir, '.claude');
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const emptyCwd = path.join(homeDir, 'scratch');   // no .code-graph anywhere above it
+  fs.mkdirSync(emptyCwd, { recursive: true });
+  fs.chmodSync(cacheDir, 0o555);
+  fs.chmodSync(claudeDir, 0o555);
+
+  let code = 0, stderr = '';
+  try {
+    execFileSync(process.execPath, [path.join(__dirname, 'statusline.js')], {
+      cwd: emptyCwd, env: { ...process.env, HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    code = err.status;
+    stderr = (err.stderr || '').toString();
+  }
+  // Restore before mkHome's cleanup hook, which cannot rm a 0555 directory.
+  fs.chmodSync(claudeDir, 0o755);
+  fs.chmodSync(cacheDir, 0o755);
+
+  assert.equal(code, 0, `the statusline must not fail on a read-only config dir\n${stderr}`);
+  assert.doesNotMatch(stderr, /EACCES|EROFS|at Object\.<anonymous>/,
+    `a housekeeping failure must not surface as a stack trace\n${stderr}`);
+});
+
+test('scanForBrokenPaths reads a hook command that names the node interpreter by path', (t) => {
+  // Six sites extracted the script path from a hook command; five used a strict
+  // `/node\s+"([^"]+)"/` that requires the literal word `node` followed by
+  // whitespace. A Windows install writes `"C:\Program Files\nodejs\node.exe"
+  // "C:\…\hook.js"`, which that pattern cannot read — so the health scan found
+  // no path, reported no issue, and a completely dead hook registration passed
+  // as healthy. hookCmdScript (already used by compositeSlotIsStale and
+  // surveyHookCoverage) handles both spellings; this is the sixth site adopting it.
+  const homeDir = mkHome(t);
+  const { SETTINGS_HOOK_DESC } = require('./lifecycle');
+  const deadScript = 'C:\\plugins\\code-graph-mcp\\scripts\\user-prompt-context.js';
+  writeJson(path.join(homeDir, '.claude', 'settings.json'), {
+    hooks: {
+      UserPromptSubmit: [{
+        description: SETTINGS_HOOK_DESC.userPromptSubmit,
+        matcher: '',
+        hooks: [{ type: 'command', command: `"C:\\Program Files\\nodejs\\node.exe" "${deadScript}"` }],
+      }],
+    },
+  });
+
+  const out = execFileSync(process.execPath, ['-e', `
+    process.env.HOME = ${JSON.stringify(homeDir)};
+    console.log(JSON.stringify(require(${JSON.stringify(lifecycleCli)}).scanForBrokenPaths()));
+  `], { env: { ...process.env, HOME: homeDir }, cwd: repoRoot }).toString();
+
+  const issues = JSON.parse(out.trim().split('\n').pop());
+  assert.deepEqual(issues.filter((i) => i.type === 'hook'),
+    [{ type: 'hook', event: 'UserPromptSubmit', path: deadScript }],
+    'a dead hook path must be reported whichever way the command names node');
+});
+
+test('SessionStart reclaims aged cgTmpDir residue', (t) => {
+  // Nothing ever deleted what cgTmpDir() collects — cooldown flags,
+  // read-fanout state, and interrupted `update-*` download staging. Measured on
+  // a working dev box before this landed: 281 entries, 232 of them over a day
+  // old. The prune has to hang off a path that actually runs, and SessionStart
+  // is the only one guaranteed to.
+  const homeDir = mkHome(t);
+  const tmpRoot = path.join(homeDir, 'tmp');
+  const cgTmp = path.join(tmpRoot, 'code-graph-mcp');
+  fs.mkdirSync(cgTmp, { recursive: true });
+
+  const aged = path.join(cgTmp, '.code-graph-bash-ancient');
+  const recent = path.join(cgTmp, '.code-graph-bash-recent');
+  const agedStaging = path.join(cgTmp, 'update-1700000000000');
+  fs.writeFileSync(aged, '');
+  fs.writeFileSync(recent, '');
+  fs.mkdirSync(agedStaging);
+  fs.writeFileSync(path.join(agedStaging, 'payload.tar.gz'), 'x'.repeat(4096));
+  const twoDaysAgo = (Date.now() - 2 * 24 * 3600 * 1000) / 1000;
+  fs.utimesSync(aged, twoDaysAgo, twoDaysAgo);
+  fs.utimesSync(agedStaging, twoDaysAgo, twoDaysAgo);
+
+  try {
+    execFileSync(process.execPath, [path.join(__dirname, 'session-init.js')], {
+      cwd: homeDir,
+      env: { ...process.env, HOME: homeDir, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot,
+             CODE_GRAPH_QUIET_HOOKS: '1' },
+      input: JSON.stringify({ source: 'startup' }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch { /* SessionStart is best-effort; the prune must run regardless */ }
+
+  assert.equal(fs.existsSync(aged), false, 'an aged cooldown flag must be reclaimed');
+  assert.equal(fs.existsSync(agedStaging), false, 'and so must an aged update-* staging dir');
+  assert.equal(fs.existsSync(recent), true, 'a flag inside the window must survive');
+});
+
+test('uninstall removes the shared tmp dir', (t) => {
+  // The prune that keeps cgTmpDir() bounded stops running the moment the hooks
+  // are gone, so an uninstall that leaves it behind leaves residue with no
+  // remaining owner.
+  const homeDir = mkHome(t);
+  const tmpRoot = path.join(homeDir, 'tmp');
+  const cgTmp = path.join(tmpRoot, 'code-graph-mcp');
+  fs.mkdirSync(cgTmp, { recursive: true });
+  fs.writeFileSync(path.join(cgTmp, '.code-graph-bash-recent'), '');   // fresh: prune would keep it
+
+  execFileSync(process.execPath, [lifecycleCli, 'uninstall'], {
+    cwd: repoRoot,
+    env: { ...process.env, HOME: homeDir, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  assert.equal(fs.existsSync(cgTmp), false,
+    'uninstall must reclaim the tmp dir, including entries the age-based prune would keep');
+});

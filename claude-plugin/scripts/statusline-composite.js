@@ -16,7 +16,14 @@ const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => 
 const SEPARATOR = ' \x1b[2m|\x1b[0m ';
 
 function main() {
-  const disabledCleanup = cleanupDisabledStatusline();
+  // Same reasoning as statusline.js: the teardown writes settings.json and the
+  // registry, both of which throw on a read-only config dir, and this is THE
+  // command Claude Code runs for the status line — an uncaught throw here blanks
+  // every provider's segment, not just ours.
+  let disabledCleanup = { cleaned: false };
+  try {
+    disabledCleanup = cleanupDisabledStatusline();
+  } catch { /* teardown is optional; rendering is not */ }
   if (disabledCleanup.cleaned) process.exit(0);
 
   // Collect stdin (Claude Code pipes JSON context)
