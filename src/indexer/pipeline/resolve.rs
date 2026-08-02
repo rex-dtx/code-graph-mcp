@@ -465,11 +465,10 @@ pub(super) struct ImportNarrowCache {
 /// same-name pool varied): 5/20/60 definers → 0.36/1.10/2.78 s full index, with
 /// Phase 2b-final creating 32 900 edges and Phase 2d deleting 31 860 of them.
 ///
-/// This is deliberately NOT a new policy: it returns exactly the subset prune
-/// would have left behind, which is why all three of prune's carve-outs are
-/// reproduced here rather than approximated. Getting any of them wrong deletes
-/// an edge prune would have KEPT, which is a correctness regression, not a
-/// performance one:
+/// It returns the subset prune would have left behind, which is why all three
+/// of prune's carve-outs are reproduced here rather than approximated. Getting
+/// any of them wrong deletes an edge prune would have KEPT, which is a
+/// correctness regression, not a performance one:
 ///   1. bare only — the caller gates on empty metadata, mirroring
 ///      `(e.metadata IS NULL OR e.metadata = '')`. A JS receiver ns-miss reaches
 ///      the same default chain but DOES carry metadata, so prune never touches
@@ -484,6 +483,17 @@ pub(super) struct ImportNarrowCache {
 /// to its normal resolution. An empty import set is `None`, not an empty
 /// result: a file that imports nothing by this name is precisely the case prune
 /// leaves alone.
+///
+/// NOT edge-neutral, and the first version of this said it was. The caller
+/// applies this INSTEAD of `refine_ambiguous_targets`, so the old chain's
+/// refine-then-reconcile is skipped, and the reconcile could not repair every
+/// case it produced: when a file imports one name from two places and a third
+/// same-name definition is path-closer, `refine` picked that third node, `bind`
+/// declined (it wants exactly one import target) and `prune` deleted the refined
+/// edge — the call ended up with no edge at all. Here it binds to both imported
+/// definitions. That is why `INDEX_VERSION` moved to 60; see the note there.
+/// Every OTHER narrowing outcome does self-heal through bind+prune, which is
+/// what made whole-graph diffs miss this one.
 pub(super) fn import_narrowed_targets(
     db: &Database,
     caller_rel_path: &str,

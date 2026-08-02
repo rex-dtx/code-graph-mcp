@@ -84,7 +84,7 @@ pub(super) const BATCH_SIZE: usize = 500;
 /// ANALYZE is pure overhead on the `ensure_file_indexed` query path (+10 ms of
 /// ~70 ms), and by a couple of hundred files it has already paid for itself
 /// (this repo's 232-file full index went 1.45 s -> 1.35 s, and a real
-/// 2 052-file repo 13.16 s -> 8.58 s). Anything in between is cheap either way,
+/// 2 052-file repo 13.16 s -> 8.52 s). Anything in between is cheap either way,
 /// so the exact value is not load-bearing — only that a single-file refresh
 /// falls below it and a real indexing run does not.
 const STATS_REFRESH_MIN_FILES: usize = 50;
@@ -1785,7 +1785,8 @@ pub(super) fn index_files(
         // the very END of the run, after they are done. Measured on a real
         // 2,052-file TypeScript repo: prune took 5.14 s of a 13.5 s full index
         // without statistics and 0.187 s with them. Paying ~30 ms here to make
-        // them available is the whole difference (13.16 s -> 8.58 s end to end).
+        // them available is the whole difference (13.16 s -> 8.52 s end to end, as
+        // shipped; 8.58 s was the ungated variant this gate replaced).
         //
         // Gated by size because `ensure_file_indexed` reaches this same block on
         // every query that touches an edited file: an unconditional ANALYZE cost

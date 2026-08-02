@@ -4740,13 +4740,39 @@ app.post('/api/login', handleLogin);
 
         // Throttle window elapsed → promote, and the promotion must leave the
         // index actually caught up (not merely flip a flag).
+        //
+        // Bounded poll rather than a single attempt, for the same reason the
+        // `indexed` loop below has one: the bootstrap server above spawns
+        // background work that owns its own handles, and `drop(holder)` frees
+        // OUR stand-in lock without proving that leftover work has finished with
+        // the file. When it has not, `try_promote_to_primary` correctly fails to
+        // flock and stays secondary — the contract is "promotes once the lock is
+        // free", which is eventual, not instantaneous. Asserting on the first
+        // attempt made this test fail roughly 1 run in 4 locally (it shipped that
+        // way in v0.113.0 and would have reddened the release gate at random).
+        // Bounded, so a promotion that never happens still fails the test.
         *lock_or_recover(&server.last_promotion_attempt, "last_promotion_attempt") =
             std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(7200))
                 .unwrap();
-        server.ensure_indexed().unwrap();
+        let mut promoted = false;
+        for _ in 0..40 {
+            // Re-open the throttle each round: `ensure_indexed` stamps
+            // `last_promotion_attempt` on every probe, so without this only the
+            // first iteration would actually retry.
+            *lock_or_recover(&server.last_promotion_attempt, "last_promotion_attempt") =
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(7200))
+                    .unwrap();
+            server.ensure_indexed().unwrap();
+            if server.is_primary() {
+                promoted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert!(
-            server.is_primary(),
+            promoted,
             "with the lock free and the throttle elapsed, the secondary must promote"
         );
         // Promotion also starts the background startup-repair thread, which writes

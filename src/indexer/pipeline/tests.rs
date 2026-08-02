@@ -3798,3 +3798,55 @@ fn test_import_narrowing_carveouts_unit() {
         "no import of this name -> prune would not fire, so neither may narrowing"
     );
 }
+
+#[test]
+fn test_import_narrowing_binds_both_when_one_name_is_imported_twice() {
+    // The shape the pre-tag review found, which had NO test and which the
+    // "edge-neutral" claim was wrong about (INDEX_VERSION 59 -> 60).
+    //
+    // A caller imports one name from TWO places — the `try/except ImportError`
+    // fallback idiom — while a THIRD same-name definition sits closer on the
+    // path. The old chain refined to that closest node, `bind` then declined to
+    // act (it requires `COUNT(DISTINCT import target) = 1`) and `prune` deleted
+    // the refined edge as import-contradicted, so the call ended up with NO
+    // edge at all. Narrowing binds it to both imported definitions instead.
+    //
+    // Pinned because it is the one case where the surrounding reconcile passes
+    // do NOT repair a difference — every other narrowing outcome self-heals via
+    // bind+prune, which is exactly why the whole-graph diffs missed this.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let root = project_dir.path();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::create_dir_all(root.join("zx")).unwrap();
+    fs::create_dir_all(root.join("zy")).unwrap();
+    fs::write(
+        root.join("app/aaa_main.py"),
+        "try:\n    from zx.mod import save\nexcept ImportError:\n    from zy.mod import save\n\ndef run():\n    save()\n",
+    )
+    .unwrap();
+    fs::write(root.join("zx/mod.py"), "def save():\n    pass\n").unwrap();
+    fs::write(root.join("zy/mod.py"), "def save():\n    pass\n").unwrap();
+    // Path-closest to the caller AND not imported by it — without this the two
+    // chains agree and the test proves nothing.
+    fs::write(root.join("app/zzz_util.py"), "def save():\n    pass\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    let (_, edges) = graph_projection(&db);
+    let mut targets: Vec<String> = edges
+        .iter()
+        .filter(|(_, sn, r, _, m)| {
+            sn == "run" && r == REL_CALLS && m.as_deref().map(str::is_empty).unwrap_or(true)
+        })
+        .map(|(_, _, _, t, _)| t.clone())
+        .collect();
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec!["zx/mod.py:save".to_string(), "zy/mod.py:save".to_string()],
+        "a name imported from two places must bind to both, not to the path-closest \
+         non-imported definition and not to nothing"
+    );
+}

@@ -2,12 +2,13 @@
 
 ## v0.114.0 (2026-08-02)
 
+**Migration note: this release bumps INDEX_VERSION (59 → 60).** The MCP server
+wipes and rebuilds the index automatically on its first start; a CLI-only setup
+rebuilds on the next `incremental-index` / `rebuild-index`.
+
 Follow-up to the v0.113.0 audit remediation: the two places that batch left
 unfinished, plus the reader-side half of an invariant this project has claimed
-since the daagu incident. **No `INDEX_VERSION` bump** — both performance changes
-were verified to produce byte-identical node and edge sets (confidence column
-included) on a 232-file and a 2,052-file repository, at two different batch
-sizes.
+since the daagu incident.
 
 ### Fixed
 - **A read-only command could delete your index.** `health-check`, which the
@@ -49,13 +50,25 @@ sizes.
   once statistics exist. Building them first costs ~30ms. Full index of that
   repository: 13.16s → 8.52s. Single-file refreshes are excluded, so the
   query-time path is unaffected.
-- **Repositories with a widely-repeated symbol name no longer create edges only
-  to delete them.** A bare call to a name defined in many files fanned out to
-  every candidate, and a later pass removed the contradicted ones. With 60 files
-  exporting the same name, that meant creating 32,900 edges to keep 1,680. The
-  binding decision now happens before the edges are written, when the caller's
-  file imports that name. A 600-file case of that shape went from 2.79s to
-  0.17s; a repository without repeated names is unaffected.
+- **A bare call to a widely-repeated symbol name no longer creates edges only to
+  delete them.** Such a call fanned out to every same-name candidate, and a later
+  pass removed the contradicted ones: with 60 files exporting one name, one pass
+  created 32,900 edges and the next deleted 31,860 of them. The binding decision
+  now happens before the edges are written, when the caller's file imports that
+  name. A 600-file case of that shape went from 2.79s to 0.17s; a repository
+  without repeated names is unaffected. This covers the post-batch resolution
+  pass, which is where the fan-out is concentrated; the batch-time path still
+  reconciles afterwards, and was measured to carry no residual cost.
+
+  **This changes which edges are produced in one case**, which is why
+  `INDEX_VERSION` moves. When a file imports the same name from two places — the
+  `try`/`except ImportError` fallback idiom — and a third definition of that name
+  sits closer on the path, the old chain narrowed to the closer definition and
+  then deleted it as contradicted, leaving the call with no edge at all. It now
+  binds to both imported definitions. Everything else about the change is
+  edge-neutral, verified on a 232-file and a 2,052-file repository at two batch
+  sizes; that pair of repositories does not contain this shape, which is why the
+  case was found in review rather than by those diffs.
 
 ## v0.113.0 (2026-08-02)
 
