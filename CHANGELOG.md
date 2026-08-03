@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.114.1 (2026-08-03)
+
+Documentation only — no behaviour change. The compiled binary is byte-for-byte
+equivalent in behaviour to v0.114.0; the only non-comment edits are inside a
+test. Released so the changelog that ships in the package is the accurate one.
+
+v0.114.0 described the statistics change's downside vaguely, as "a synthetic
+repository built for maximum same-name fan-out". That was too imprecise to act
+on. The trigger has since been isolated: it is import **density**, not
+repository size or fan-out on its own. The entry below now carries the measured
+boundary, and the same measurements plus the root cause are recorded next to the
+code so the trade-off does not have to be re-derived — including why
+`PRAGMA analysis_limit`, the obvious-looking insurance, measures 13× *worse*
+than what ships.
+
 ## v0.114.0 (2026-08-02)
 
 Follow-up to the v0.113.0 audit remediation: the two places that batch left
