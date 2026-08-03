@@ -572,10 +572,11 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// with `SEARCH ie USING idx_edges_relation (relation=?)`, and in a
     /// repository with almost no `imports` edges that driver matches ~0 rows and
     /// exits immediately. With statistics the planner sees `idx_edges_relation`
-    /// holding only two distinct values (so it estimates ~16,500 rows for
-    /// `relation=?`) and reorders to lead with `idx_nodes_name`, which it
-    /// estimates at 3 rows per name — except the fanned-out name really has 60.
-    /// It then pays that per candidate edge.
+    /// spread over very few distinct relation values (on the corpus below,
+    /// `33315 11105` — an estimate of ~11,105 rows for `relation=?`) and
+    /// reorders to lead with `idx_nodes_file`, reaching `idx_nodes_name` second
+    /// at an estimated 3 rows per name — except the fanned-out name really has
+    /// 60. It then pays that per candidate edge.
     ///
     /// The trigger is import DENSITY, not repository size. Measured on a
     /// 605-file synthetic with 60 files exporting one name, varying only how
@@ -605,6 +606,17 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// `analysis_limit=400`. Partial statistics produced a plan worse than
     /// having none, i.e. adding the limit would be a 13x regression against what
     /// ships. If you are here to bound this scan, measure that shape first.
+    ///
+    /// Scope that precisely: on the 0 %-import corpus above the limit measures
+    /// 0.56 s — between full ANALYZE (0.76 s) and none (0.36 s), not worst. The
+    /// 13x is real and reproduced on the high-density corpus; it is not a claim
+    /// that partial statistics are always the worst option.
+    ///
+    /// Untried lead, if someone wants both ends: `ANALYZE nodes;` alone, leaving
+    /// `idx_edges_relation` unanalyzed so the cheap relation-led driver survives
+    /// while the name-multiplicity estimate improves. Note that no single join
+    /// order wins both shapes — at 100 % density the relation-led plan is the
+    /// SLOW one (3.03 s vs 0.44 s) — so pinning the plan is not a way out.
     ///
     /// Best-effort: statistics are an optimization, never correctness, so a
     /// failure here must not fail the index run.

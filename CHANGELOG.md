@@ -2,9 +2,11 @@
 
 ## v0.114.1 (2026-08-03)
 
-Documentation only — no behaviour change. The compiled binary is byte-for-byte
-equivalent in behaviour to v0.114.0; the only non-comment edits are inside a
-test. Released so the changelog that ships in the package is the accurate one.
+Documentation only — no behaviour change. The compiled binary's `.text` section
+is byte-identical to v0.114.0's (the two binaries differ in 28 bytes total: the
+ELF build-id, a metadata hash, and four embedded panic line numbers shifted by
+the 40 comment lines added). The only non-comment edits are inside a test.
+Released so the changelog that ships in the package is the accurate one.
 
 v0.114.0 described the statistics change's downside vaguely, as "a synthetic
 repository built for maximum same-name fan-out". That was too imprecise to act
