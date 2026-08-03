@@ -566,6 +566,46 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// not yet accumulated them, which is exactly the fresh-index case this
     /// exists for. Measured at 30 ms on that repo — it buys back ~5 s.
     ///
+    /// KNOWN COUNTER-CASE, measured, not hypothetical. Statistics change which
+    /// plan SQLite picks, and for `prune_import_contradicted_call_edges` that is
+    /// not always the better one. Without statistics its first `EXISTS` leads
+    /// with `SEARCH ie USING idx_edges_relation (relation=?)`, and in a
+    /// repository with almost no `imports` edges that driver matches ~0 rows and
+    /// exits immediately. With statistics the planner sees `idx_edges_relation`
+    /// holding only two distinct values (so it estimates ~16,500 rows for
+    /// `relation=?`) and reorders to lead with `idx_nodes_name`, which it
+    /// estimates at 3 rows per name — except the fanned-out name really has 60.
+    /// It then pays that per candidate edge.
+    ///
+    /// The trigger is import DENSITY, not repository size. Measured on a
+    /// 605-file synthetic with 60 files exporting one name, varying only how
+    /// many of the 540 callers import what they call:
+    ///
+    /// | callers importing | `imports` edges | with ANALYZE | without |
+    /// |---|---|---|---|
+    /// | 0 %  | 10  | 0.76 s | **0.36 s** |
+    /// | 10 % | 64  | **0.72 s** | 0.84 s |
+    /// | 50 % | 280 | **0.60 s** | 2.33 s |
+    /// | 100 %| 550 | **0.44 s** | 2.95 s |
+    ///
+    /// So the loss needs a tree whose files essentially never import anything —
+    /// 10 import edges across 605 TypeScript files — and 10 % density already
+    /// flips it to a win. Real repositories measured land far on the winning
+    /// side (a 2,052-file TypeScript repo: 13.16 s -> 8.52 s). Deliberately NOT
+    /// gated on an import-density heuristic: the threshold would be tuned on one
+    /// synthetic corpus, and misjudging it forfeits a ~4.6 s win to avoid a
+    /// ~0.4 s loss.
+    ///
+    /// Deliberately NOT `PRAGMA analysis_limit`. SQLite documents that knob for
+    /// bounding ANALYZE on large tables, and it looks like the obvious insurance
+    /// here because the caller gates on files-touched rather than index size —
+    /// but measured, it is the worst of the three options. On a 605-file corpus
+    /// built for same-name fan-out, full index time was **0.49 s** with a
+    /// complete ANALYZE, **2.92 s** with no ANALYZE at all, and **6.52 s** with
+    /// `analysis_limit=400`. Partial statistics produced a plan worse than
+    /// having none, i.e. adding the limit would be a 13x regression against what
+    /// ships. If you are here to bound this scan, measure that shape first.
+    ///
     /// Best-effort: statistics are an optimization, never correctness, so a
     /// failure here must not fail the index run.
     pub fn refresh_query_stats(&self) {

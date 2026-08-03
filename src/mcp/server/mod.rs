@@ -4751,15 +4751,13 @@ app.post('/api/login', handleLogin);
         // attempt made this test fail roughly 1 run in 4 locally (it shipped that
         // way in v0.113.0 and would have reddened the release gate at random).
         // Bounded, so a promotion that never happens still fails the test.
-        *lock_or_recover(&server.last_promotion_attempt, "last_promotion_attempt") =
-            std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(7200))
-                .unwrap();
         let mut promoted = false;
         for _ in 0..40 {
             // Re-open the throttle each round: `ensure_indexed` stamps
             // `last_promotion_attempt` on every probe, so without this only the
-            // first iteration would actually retry.
+            // first iteration would actually retry. This is also what opens it
+            // for the FIRST iteration — the preceding stamp this replaced was
+            // redundant with it.
             *lock_or_recover(&server.last_promotion_attempt, "last_promotion_attempt") =
                 std::time::Instant::now()
                     .checked_sub(std::time::Duration::from_secs(7200))

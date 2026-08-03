@@ -47,15 +47,15 @@ since the daagu incident.
   repository: 13.16s → 8.52s. Single-file refreshes are excluded, so the
   query-time path is unaffected.
 
-  Statistics change which plan SQLite picks, and that is not universally a win:
-  on a synthetic repository built for maximum same-name fan-out (hundreds of
-  files exporting one name, all called bare) the same statement got slower and
-  the full index roughly doubled. Real repositories measured so far land firmly
-  on the other side — the 2,052-file case above, and this project's own. If you
-  see indexing get slower on this release, that shape is the thing to look for
-  and `CODE_GRAPH_*`-free rollback is just pinning the previous version; please
-  report it, because the gate is currently on files-touched rather than on
-  anything that predicts the plan risk.
+  Statistics change which plan SQLite picks, and that is not universally a win.
+  The one measured counter-case needs a repository whose files almost never
+  import anything: with 10 import edges across 605 TypeScript files — plus 60
+  files exporting one name that everything calls bare — indexing went 0.36s →
+  0.76s. Restoring imports to even 10% of those callers already flips it back to
+  a win, and at 100% it is 6.7× faster. Real repositories are far on the winning
+  side. If indexing gets slower for you on this release, that is the shape to
+  look for; please report it, since the trigger is import density and the gate
+  keys on files-touched.
 
 ## v0.113.0 (2026-08-02)
 
