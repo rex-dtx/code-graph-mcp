@@ -43,9 +43,19 @@ since the daagu incident.
   they planned against SQLite's built-in guesses. On a 2,052-file TypeScript
   repository that cost the import-contradiction prune 5.14s of a 13.5s full
   index; the identical statement against the identical database takes 0.187s
-  once statistics exist. Building them first costs ~30ms. Full index of that
+  once statistics exist. Building them first costs ~10-30ms. Full index of that
   repository: 13.16s → 8.52s. Single-file refreshes are excluded, so the
   query-time path is unaffected.
+
+  Statistics change which plan SQLite picks, and that is not universally a win:
+  on a synthetic repository built for maximum same-name fan-out (hundreds of
+  files exporting one name, all called bare) the same statement got slower and
+  the full index roughly doubled. Real repositories measured so far land firmly
+  on the other side — the 2,052-file case above, and this project's own. If you
+  see indexing get slower on this release, that shape is the thing to look for
+  and `CODE_GRAPH_*`-free rollback is just pinning the previous version; please
+  report it, because the gate is currently on files-touched rather than on
+  anything that predicts the plan risk.
 
 ## v0.113.0 (2026-08-02)
 
